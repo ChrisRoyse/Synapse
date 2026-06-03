@@ -12,7 +12,9 @@ mod platform;
 mod stats;
 
 pub use backend::{CaptureBackend, CaptureBackendPreference};
-#[cfg(windows)]
+// `screen_region_to_bgra_bitmap` is cross-platform (fails loud off Windows); the
+// WinRT `SoftwareBitmap` helpers in `bitmap` stay `#[cfg(windows)]`, so off
+// Windows this glob re-exports only the BGRA entry point that `synapse-mcp` calls.
 pub use bitmap::*;
 pub use config::{CaptureConfig, CaptureTarget, ResolvedCaptureTarget};
 pub use controller::{

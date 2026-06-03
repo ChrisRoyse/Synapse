@@ -198,6 +198,9 @@ pub fn spawn_capture_loop(config: CaptureConfig) -> Result<CaptureHandle, Captur
     })
 }
 #[derive(Clone)]
+// `tx`/`rx`/`stop` are consumed by the real Windows capture loop; off Windows the
+// capture entry points fail loudly without ever reading them.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct CaptureThreadContext {
     pub tx: Sender<CapturedFrame>,
     pub rx: Receiver<CapturedFrame>,
@@ -243,6 +246,9 @@ fn run_capture_thread(
         }
     }
 }
+// Only the real Windows capture loop pushes frames; off Windows capture fails
+// loudly before any frame is produced.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn push_frame(ctx: &CaptureThreadContext, frame: CapturedFrame) -> Result<(), CaptureError> {
     ctx.stats
         .record_captured_frame(frame.frame_seq, frame.width, frame.height);

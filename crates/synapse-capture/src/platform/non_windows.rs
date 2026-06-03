@@ -1,43 +1,60 @@
-use std::{sync::atomic::Ordering, thread, time::Duration};
-
-use synapse_core::Point;
+use synapse_core::{Point, Rect};
 
 use crate::{
-    CaptureConfig, CaptureError, CaptureThreadPriority, CapturedFrame, DpiAwarenessStatus,
-    controller::{CaptureThreadContext, push_frame},
+    CaptureConfig, CaptureError, CapturedBgraBitmap, CaptureThreadPriority, DpiAwarenessStatus,
+    controller::CaptureThreadContext,
 };
+
+/// Builds the error returned by every capture entry point on non-Windows builds.
+///
+/// Real screen capture in Synapse is implemented only on Windows (DXGI Desktop
+/// Duplication and `Windows.Graphics.Capture`). Earlier non-Windows builds
+/// produced *synthetic* placeholder frames here, which silently fed fabricated
+/// pixels into perception. That is mock data masquerading as a real capture and
+/// is intentionally removed: a build that cannot see the screen must fail loudly
+/// instead of pretending to succeed.
+#[cfg(not(windows))]
+fn capture_backend_unavailable() -> CaptureError {
+    let detail = format!(
+        "real screen capture is implemented only on Windows (DXGI Desktop Duplication / \
+         Windows.Graphics.Capture); this {} build has no capture backend. Run the Windows \
+         synapse-mcp build to perceive a real desktop. Synthetic/placeholder frames are \
+         intentionally not produced so perception never reports fabricated pixels.",
+        std::env::consts::OS
+    );
+    tracing::error!(
+        code = synapse_core::error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED,
+        platform = std::env::consts::OS,
+        "screen capture requested on a non-Windows build that has no capture backend"
+    );
+    CaptureError::GraphicsApiUnsupported { detail }
+}
 
 #[cfg(not(windows))]
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_graphics_capture(
-    config: CaptureConfig,
-    ctx: CaptureThreadContext,
+    _config: CaptureConfig,
+    _ctx: CaptureThreadContext,
 ) -> Result<(), CaptureError> {
-    run_synthetic_capture_loop(&config, &ctx)
+    Err(capture_backend_unavailable())
 }
 
 #[cfg(not(windows))]
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_dxgi_capture(
-    config: CaptureConfig,
-    ctx: CaptureThreadContext,
+    _config: CaptureConfig,
+    _ctx: CaptureThreadContext,
 ) -> Result<(), CaptureError> {
-    run_synthetic_capture_loop(&config, &ctx)
+    Err(capture_backend_unavailable())
 }
 
+/// Non-Windows stand-in for the Windows GDI region grab. Real region capture
+/// (`platform/windows/bitmap.rs`) exists only on Windows; off Windows this fails
+/// loudly with `CAPTURE_GRAPHICS_API_UNSUPPORTED` rather than returning blank or
+/// fabricated pixels, so OCR/detection callers never operate on mock image data.
 #[cfg(not(windows))]
-fn run_synthetic_capture_loop(
-    config: &CaptureConfig,
-    ctx: &CaptureThreadContext,
-) -> Result<(), CaptureError> {
-    let interval = Duration::from_millis(config.min_update_interval_ms.max(1));
-    let mut frame_seq = 0_u64;
-    while !ctx.stop.load(Ordering::Relaxed) {
-        push_frame(ctx, CapturedFrame::synthetic(frame_seq, 1920, 1080))?;
-        frame_seq = frame_seq.saturating_add(1);
-        thread::sleep(interval);
-    }
-    Ok(())
+pub fn screen_region_to_bgra_bitmap(_region: Rect) -> Result<CapturedBgraBitmap, CaptureError> {
+    Err(capture_backend_unavailable())
 }
 
 #[cfg(not(windows))]
@@ -84,4 +101,38 @@ pub fn validate_hwnd_impl(_hwnd: i64) -> Result<(), CaptureError> {
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 pub fn validate_monitor_impl(_monitor_index: u32) -> Result<(), CaptureError> {
     Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    /// The non-Windows capture path must fail loudly with the
+    /// `CAPTURE_GRAPHICS_API_UNSUPPORTED` code and a detail that explains the
+    /// real cause, instead of fabricating synthetic frames.
+    #[test]
+    fn capture_backend_unavailable_reports_graphics_api_unsupported() {
+        let err = capture_backend_unavailable();
+        assert_eq!(
+            err.code(),
+            synapse_core::error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED
+        );
+        match err {
+            CaptureError::GraphicsApiUnsupported { detail } => {
+                assert!(
+                    detail.contains("only on Windows"),
+                    "detail should name the Windows-only constraint: {detail}"
+                );
+                assert!(
+                    detail.to_lowercase().contains("synthetic"),
+                    "detail should state synthetic frames are not produced: {detail}"
+                );
+                assert!(
+                    detail.contains(std::env::consts::OS),
+                    "detail should name the current platform: {detail}"
+                );
+            }
+            other => panic!("expected GraphicsApiUnsupported, got {other:?}"),
+        }
+    }
 }

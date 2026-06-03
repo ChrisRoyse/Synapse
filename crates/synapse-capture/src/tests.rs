@@ -1,8 +1,9 @@
-use std::{
-    sync::{Mutex, atomic::Ordering},
-    thread,
-    time::Duration,
-};
+use std::sync::Mutex;
+// `Ordering`, `thread`, and `Duration` are only used by the Windows-only capture
+// loop tests below (real capture does not exist off Windows after the synthetic
+// mock removal).
+#[cfg(windows)]
+use std::{sync::atomic::Ordering, thread, time::Duration};
 
 use proptest::prelude::*;
 use synapse_core::{Point, error_codes};
@@ -10,27 +11,16 @@ use synapse_core::{Point, error_codes};
 use super::*;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+// Only the Windows-only capture loop tests serialize on this lock.
+#[cfg(windows)]
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(not(windows))]
-#[test]
-fn captured_frame_synthetic_shape_is_stable() {
-    let frame = CapturedFrame::synthetic(42, 1920, 1080);
-
-    assert_eq!(frame.width, 1920);
-    assert_eq!(frame.height, 1080);
-    assert_eq!(frame.frame_seq, 42);
-    assert_eq!(frame.format, DxgiFormat::Bgra8);
-    assert!(frame.dirty_region.is_none());
-}
-
-#[cfg(not(windows))]
-#[test]
-fn captured_frame_drop_loop_is_raii_safe_for_synthetic_texture() {
-    for seq in 0..1_000 {
-        let _frame = CapturedFrame::synthetic(seq, 16, 16);
-    }
-}
+// The previous `captured_frame_synthetic_shape_is_stable` and
+// `captured_frame_drop_loop_is_raii_safe_for_synthetic_texture` tests exercised
+// the non-Windows `CapturedFrame::synthetic` mock, which has been removed. The
+// non-Windows capture path is now covered by the fail-loud test in
+// `platform::non_windows::tests` (it asserts `GraphicsApiUnsupported` instead of
+// fabricating frames).
 
 #[cfg(windows)]
 #[test]
@@ -201,6 +191,9 @@ fn target_lost_error_surfaces_code() {
     assert_eq!(err.code(), error_codes::CAPTURE_TARGET_LOST);
 }
 
+// Real capture only exists on Windows; without the removed synthetic mock there
+// are no frames to drive this on other platforms, so it is Windows-only.
+#[cfg(windows)]
 #[test]
 fn capture_channel_capacity_is_exactly_two_and_drops_oldest() -> Result<(), CaptureError> {
     let _guard = CAPTURE_LOCK
@@ -238,6 +231,10 @@ fn capture_channel_capacity_is_exactly_two_and_drops_oldest() -> Result<(), Capt
     handle.stop()
 }
 
+// Windows-only: the capture thread now fails loudly off Windows (no real
+// backend), so `stop()` would surface that error. Non-Windows priority is
+// covered by `dpi_awareness_is_noop_off_windows`.
+#[cfg(windows)]
 #[test]
 fn capture_thread_priority_is_recorded() -> Result<(), CaptureError> {
     let _guard = CAPTURE_LOCK
@@ -295,6 +292,9 @@ fn coordinate_transform_manual_edge_cases_round_trip() {
     }
 }
 
+// Windows-only: switching sessions joins capture threads, which now return the
+// honest "unsupported" error off Windows instead of mock success.
+#[cfg(windows)]
 #[test]
 fn switching_capture_target_stops_previous_session() -> Result<(), CaptureError> {
     let _guard = CAPTURE_LOCK

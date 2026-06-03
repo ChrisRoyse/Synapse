@@ -64,7 +64,14 @@ pub struct CapturedSoftwareBitmap {
     pub bitmap: windows::Graphics::Imaging::SoftwareBitmap,
 }
 
-#[cfg(windows)]
+/// Raw BGRA pixels for a screen region.
+///
+/// This is a plain data struct (no Windows-specific types), so it is available
+/// on every platform: non-Windows `screen_region_to_bgra_bitmap` returns
+/// `Err(GraphicsApiUnsupported)` rather than a value, but the `synapse-mcp`
+/// callers still reference the type at compile time. Contrast
+/// `CapturedSoftwareBitmap`, which wraps a `WinRT` `SoftwareBitmap` and is
+/// therefore Windows-only.
 #[derive(Clone, Debug)]
 pub struct CapturedBgraBitmap {
     pub region: Rect,
@@ -73,19 +80,9 @@ pub struct CapturedBgraBitmap {
     pub bytes: Vec<u8>,
 }
 
-impl CapturedFrame {
-    #[cfg(not(windows))]
-    #[allow(clippy::default_constructed_unit_structs)]
-    #[must_use]
-    pub fn synthetic(frame_seq: u64, width: u32, height: u32) -> Self {
-        Self {
-            texture: SendablePtr::new(D3d11Texture::default()),
-            width,
-            height,
-            format: DxgiFormat::Bgra8,
-            captured_at: Instant::now(),
-            frame_seq,
-            dirty_region: None,
-        }
-    }
-}
+// Note: a `CapturedFrame::synthetic(..)` constructor used to exist here for
+// non-Windows builds. It fabricated placeholder frames so the capture loop on
+// Linux/macOS appeared to succeed while feeding mock pixels into perception. It
+// was removed deliberately: non-Windows builds now fail loudly in
+// `platform::non_windows` instead of producing fake frames. See
+// `crates/synapse-capture/src/platform/non_windows.rs`.

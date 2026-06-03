@@ -69,6 +69,7 @@ impl CaptureStats {
         })
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn record_captured_frame(&self, frame_seq: u64, width: u32, height: u32) {
         self.latest_frame_width.store(width, Ordering::Relaxed);
         self.latest_frame_height.store(height, Ordering::Relaxed);
@@ -76,6 +77,7 @@ impl CaptureStats {
         self.frames_captured.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn increment_dropped(&self) {
         self.frames_dropped.fetch_add(1, Ordering::Relaxed);
         synapse_telemetry::metrics::counter!(FRAMES_DROPPED_METRIC).increment(1);
