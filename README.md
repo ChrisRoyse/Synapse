@@ -240,6 +240,40 @@ me anything that needs my approval (e.g. installing the Rust toolchain).
 You'll need a stable **Rust toolchain** (`rustup` / `cargo`). If `cargo` is
 missing, grab it from <https://rustup.rs> first, or let the agent install it.
 
+### Setup scripts (Windows **or** WSL — Windows always controls both)
+
+Synapse has exactly **one controlling body**: the Windows-native
+`synapse-mcp.exe` HTTP daemon. It is the only process that can perform real Win32
+`SendInput`, UI Automation, and WGC/DXGI capture — and it controls **both**
+Windows programs (native windows) **and** WSL programs (WSLg GUI apps render as
+real Windows windows; `act_run_shell` / `act_launch` reach WSL CLIs via
+`wsl.exe`). Every MCP client — on Windows or in WSL — connects to that one
+daemon, so *wherever you install from, the result is identical*: one Windows
+daemon driving both worlds.
+
+**From WSL** (builds the Windows daemon through interop, then wires Claude Code
+and Codex on the WSL side):
+
+```bash
+./scripts/synapse-install.sh
+```
+
+**From native Windows** (PowerShell):
+
+```powershell
+./scripts/synapse-setup.ps1 -SourceDir (Resolve-Path .)
+```
+
+Both are idempotent and fail loud — each prerequisite is checked and a failure
+stops with the exact cause and fix (no silent fallbacks). They build the daemon
+from a **local** source path into a persistent target (re-installs are
+incremental, not a fresh RocksDB build), deploy the bundled profiles next to the
+binary, generate a loopback bearer token, register the auto-start daemon
+(interactive desktop session, single-writer DB) with `--profile-dir`, verify
+`health`, and wire the detected MCP clients (Claude Code via HTTP on Windows /
+the connect bridge in WSL; Codex and Claude Desktop via the connect bridge).
+Re-run any time to update; `-Remove` (PowerShell) uninstalls the daemon task.
+
 ### Build it yourself
 
 ```bash
