@@ -105,9 +105,27 @@ pub fn parse_profile_bytes(
     raw.into_loaded(path, modified, bounds)
 }
 
+/// Resolves the directory that holds the bundled application profiles.
+///
+/// Production installs ship the profiles **next to the installed binary** (the
+/// installer copies them beside `synapse-mcp.exe`), so we resolve relative to the
+/// running executable first. This keeps the path valid on any host regardless of
+/// where the binary was built — unlike a compile-time `CARGO_MANIFEST_DIR` path,
+/// which points at the *build machine's* source tree and does not exist on an
+/// installed host (and is a transient drive letter when the binary is built over
+/// a mapped network/9p mount). The source-tree path remains the fallback for dev
+/// runs (`cargo run`, tests) launched from a checkout.
 #[must_use]
 #[instrument]
 pub fn bundled_profiles_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        let beside_exe = exe_dir.join("profiles");
+        if beside_exe.is_dir() {
+            return beside_exe;
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("profiles")
 }
 
