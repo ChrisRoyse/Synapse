@@ -30,16 +30,32 @@ use super::{
 
 const SCHEMA_VERSION: u32 = 1;
 const MAILBOX_PREFIX: &str = "agent-mailbox/v1";
+/// CF_KV key prefix for sender-visible receipt rows (#908). Distinct from the
+/// recipient message prefix so receipts never appear in an agent's own inbox.
+const RECEIPT_PREFIX: &str = "agent-mailbox/v1/receipt";
+const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MESSAGE_TTL_MS: u64 = 5 * 60 * 1000;
 const MAX_MESSAGE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Read-receipt rows live long enough for an orchestrator to poll for them,
+/// independent of the original message's TTL (the message is gone once read).
+const RECEIPT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_MESSAGES: usize = 100;
 const MAX_MESSAGES_PER_READ: usize = 1000;
 const MAX_PAYLOAD_BYTES: usize = 65_536;
 const MAX_KIND_CHARS: usize = 128;
+const MAX_KIND_FILTER_ENTRIES: usize = 64;
+const MAX_BROADCAST_RECIPIENTS: usize = 1024;
 const MAX_ARTIFACT_HANDLE_CHARS: usize = 1024;
 const MAX_INBOX_ROWS_PER_RECIPIENT: usize = 10_000;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 1000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
+
+/// The reserved **steering-inbox contract** kind (#908): a well-behaved agent
+/// drains `steer`-kind messages between tool calls and splices their payload
+/// into context at the next safe point. The cooperative tier of `agent_steer`
+/// (#905) delivers through this kind; it is filterable via the `kinds` inbox
+/// filter so an agent can poll only its steering channel.
+pub(crate) const STEER_KIND: &str = "steer";
 
 static NEXT_MAILBOX_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -60,6 +76,13 @@ pub struct AgentSendParams {
     #[serde(default = "default_message_ttl_ms")]
     #[schemars(default = "default_message_ttl_ms", range(min = 1, max = 86_400_000))]
     pub ttl_ms: u64,
+    /// Request a read receipt: when the recipient drains this message, a
+    /// receipt row is written to the sender's receipt box, readable via
+    /// `agent_receipts`. Lets an orchestrating agent prove the message was
+    /// actually consumed (#908).
+    #[serde(default)]
+    #[schemars(default)]
+    pub request_receipt: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -73,6 +96,13 @@ pub struct AgentInboxParams {
     #[serde(default = "default_max_messages")]
     #[schemars(default = "default_max_messages", range(min = 1, max = 1000))]
     pub max_messages: usize,
+    /// Optional server-side kind filter (#908): when non-empty, only messages
+    /// whose `kind` is in this set are returned, and a drain deletes only those
+    /// matching rows — non-matching messages stay queued. Empty = all kinds.
+    /// Pass `["steer"]` to drain only the steering channel.
+    #[serde(default)]
+    #[schemars(default)]
+    pub kinds: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -90,6 +120,10 @@ pub struct AgentWaitParams {
     #[serde(default = "default_max_messages")]
     #[schemars(default = "default_max_messages", range(min = 1, max = 1000))]
     pub max_messages: usize,
+    /// Optional server-side kind filter, same semantics as `agent_inbox.kinds`.
+    #[serde(default)]
+    #[schemars(default)]
+    pub kinds: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -108,6 +142,10 @@ pub struct AgentMailboxMessage {
     pub ttl_ms: u64,
     pub expires_at_unix_ms: u64,
     pub delivery_attempts: u32,
+    /// Sender asked for a read receipt (#908). Persisted so the draining
+    /// recipient knows to write one. Defaults false for v1 rows.
+    #[serde(default)]
+    pub request_receipt: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -132,6 +170,127 @@ pub struct AgentSendResponse {
     pub expires_at_unix_ms: u64,
     pub queue_depth_after: usize,
     pub storage_readback: MailboxRowReadback,
+    /// Whether a read receipt was armed on this message (#908).
+    pub request_receipt: bool,
+}
+
+/// Broadcast addressing selector (#908). Exactly one selector must be active:
+/// `all`, a non-empty `agent_kinds`, or a non-empty `sessions`.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BroadcastTarget {
+    /// Every live MCP session except the sender.
+    #[serde(default)]
+    #[schemars(default)]
+    pub all: bool,
+    /// Every live session whose registry `agent_kind` is in this set.
+    #[serde(default)]
+    #[schemars(default)]
+    pub agent_kinds: Vec<String>,
+    /// An explicit list of session ids. Unknown/stale sessions are reported as
+    /// skipped, not silently dropped.
+    #[serde(default)]
+    #[schemars(default)]
+    pub sessions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSendBroadcastParams {
+    /// Who to fan out to.
+    pub to: BroadcastTarget,
+    /// Message kind (e.g. `steer`, `finding`, `stop`).
+    pub kind: String,
+    /// Opaque JSON payload, persisted as-is, bounded to 64 KiB per recipient.
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_handle: Option<String>,
+    #[serde(default = "default_message_ttl_ms")]
+    #[schemars(default = "default_message_ttl_ms", range(min = 1, max = 86_400_000))]
+    pub ttl_ms: u64,
+    /// Arm a read receipt on every fanned-out copy.
+    #[serde(default)]
+    #[schemars(default)]
+    pub request_receipt: bool,
+}
+
+/// One recipient's outcome in a broadcast fan-out.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecipientOutcome {
+    pub to_session: String,
+    /// `delivered` when a durable row was written; `skipped` otherwise.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_readback: Option<MailboxRowReadback>,
+    /// Why the recipient was skipped (e.g. queue full), when `status=skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSendBroadcastResponse {
+    pub ok: bool,
+    pub from_session: String,
+    pub kind: String,
+    pub sent_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub request_receipt: bool,
+    /// Live recipients the selector resolved to (before per-recipient outcome).
+    pub resolved_recipients: usize,
+    pub delivered_count: usize,
+    pub skipped_count: usize,
+    pub recipients: Vec<RecipientOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReceiptsParams {
+    /// Drain deletes returned receipts after reading; set false to peek.
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
+    pub drain: bool,
+    #[serde(default = "default_max_messages")]
+    #[schemars(default = "default_max_messages", range(min = 1, max = 1000))]
+    pub max_receipts: usize,
+}
+
+/// One read-receipt row: proof a recipient drained a `request_receipt` message.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxReceipt {
+    pub schema_version: u32,
+    pub receipt_id: String,
+    pub row_key: String,
+    /// The original sender (and receipt-box owner).
+    pub from_session: String,
+    /// The recipient that read the message.
+    pub recipient_session: String,
+    pub message_id: String,
+    pub message_kind: String,
+    /// `read` for now; `delivered` reserved for a future delivery receipt.
+    pub status: String,
+    pub read_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReceiptsResponse {
+    pub ok: bool,
+    pub this_session_id: String,
+    pub mode: String,
+    pub now_unix_ms: u64,
+    pub scanned_rows: usize,
+    pub expired_rows_deleted: usize,
+    pub returned_count: usize,
+    pub deleted_count: usize,
+    pub receipts: Vec<MailboxReceipt>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -226,6 +385,42 @@ impl SynapseService {
         let session_id = require_mailbox_session_id("agent_wait", &request_context)?;
         self.agent_wait_impl(params.0, &session_id).await.map(Json)
     }
+
+    #[tool(
+        description = "Broadcast one durable message to many live MCP sessions at once (#908): address `to: {all}` for every live peer, `to: {agent_kinds: [..]}` to filter by registry agent kind, or `to: {sessions: [..]}` for an explicit list. Fans out one durable CF_KV row per recipient (the sender is always excluded), returning a per-recipient delivered/skipped outcome. Reserve kind=\"steer\" for the steering-inbox contract."
+    )]
+    pub async fn agent_send_broadcast(
+        &self,
+        params: Parameters<AgentSendBroadcastParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentSendBroadcastResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "agent_send_broadcast",
+            "tool.invocation kind=agent_send_broadcast"
+        );
+        let from_session = require_mailbox_session_id("agent_send_broadcast", &request_context)?;
+        let response = self.agent_send_broadcast_impl(params.0, &from_session)?;
+        self.mailbox_notify_handle().notify_waiters();
+        Ok(Json(response))
+    }
+
+    #[tool(
+        description = "Read this session's durable read-receipt box: proof that recipients drained the messages this session sent with request_receipt=true (#908). By default this drains returned receipt rows from CF_KV; set drain=false to peek."
+    )]
+    pub async fn agent_receipts(
+        &self,
+        params: Parameters<AgentReceiptsParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentReceiptsResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "agent_receipts",
+            "tool.invocation kind=agent_receipts"
+        );
+        let session_id = require_mailbox_session_id("agent_receipts", &request_context)?;
+        self.agent_receipts_impl(params.0, &session_id).map(Json)
+    }
 }
 
 impl SynapseService {
@@ -273,6 +468,7 @@ impl SynapseService {
             ttl_ms: params.ttl_ms,
             expires_at_unix_ms: now_unix_ms.saturating_add(params.ttl_ms),
             delivery_attempts: 0,
+            request_receipt: params.request_receipt,
         };
         let encoded = encode_mailbox_message(&message)?;
         db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
@@ -312,6 +508,9 @@ impl SynapseService {
             recipient_lifecycle = %recipient.lifecycle,
             message_id,
             row_key,
+            kind = %message.kind,
+            is_steer = message.kind == STEER_KIND,
+            request_receipt = message.request_receipt,
             queue_depth_after,
             expired_rows_deleted_before,
             value_sha256 = %storage_readback.value_sha256,
@@ -329,6 +528,7 @@ impl SynapseService {
             expires_at_unix_ms: message.expires_at_unix_ms,
             queue_depth_after,
             storage_readback,
+            request_receipt: message.request_receipt,
         })
     }
 
@@ -347,6 +547,7 @@ impl SynapseService {
         now_unix_ms: u64,
     ) -> Result<AgentInboxResponse, ErrorData> {
         validate_inbox_params(params.max_messages)?;
+        validate_kind_filter(&params.kinds)?;
         validate_session_id(session_id)?;
         let db = self.mailbox_db()?;
         let mut scan = scan_inbox(&db, session_id, now_unix_ms)?;
@@ -358,6 +559,13 @@ impl SynapseService {
                         format!("delete expired mailbox rows for {session_id}: {error}"),
                     )
                 })?;
+        }
+
+        // Server-side kind filter (#908): keep only matching kinds, so a drain
+        // never deletes messages the caller did not ask for.
+        if !params.kinds.is_empty() {
+            scan.messages
+                .retain(|row| params.kinds.iter().any(|kind| kind == &row.message.kind));
         }
 
         if scan.messages.len() > params.max_messages {
@@ -409,6 +617,13 @@ impl SynapseService {
             super::agent_events::record_agent_events(&db, &receipts).map_err(|error| {
                 super::agent_events::agent_event_tool_error("agent_inbox", &error, false)
             })?;
+        }
+        // Write sender-visible read receipts (#908) for drained messages that
+        // asked for one — BEFORE deleting, so a receipt-write failure leaves the
+        // message queued and the drain is retry-safe. A message is acked exactly
+        // once: the row is deleted in the same drain that writes its receipt.
+        if params.drain {
+            write_read_receipts(&db, session_id, &scan.messages, now_unix_ms)?;
         }
         if !delete_keys.is_empty() {
             db.delete_batch(cf::CF_KV, delete_keys.clone())
@@ -523,6 +738,229 @@ impl SynapseService {
             )),
         }
     }
+
+    /// Live MCP sessions other than `exclude_session`, as `(session_id,
+    /// agent_kind)` pairs, read from the session registry.
+    fn live_session_reads(
+        &self,
+        exclude_session: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<(String, String)>, ErrorData> {
+        let guard = self.session_registry_ref().lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session registry lock poisoned while resolving broadcast recipients",
+            )
+        })?;
+        let live = guard
+            .reads(now_unix_ms)
+            .into_iter()
+            .filter(|entry| entry.lifecycle == "live" && entry.session_id != exclude_session)
+            .map(|entry| (entry.session_id, entry.agent_kind))
+            .collect::<Vec<_>>();
+        drop(guard);
+        Ok(live)
+    }
+
+    fn agent_send_broadcast_impl(
+        &self,
+        params: AgentSendBroadcastParams,
+        from_session: &str,
+    ) -> Result<AgentSendBroadcastResponse, ErrorData> {
+        self.agent_send_broadcast_impl_at(params, from_session, unix_time_ms_now())
+    }
+
+    fn agent_send_broadcast_impl_at(
+        &self,
+        params: AgentSendBroadcastParams,
+        from_session: &str,
+        now_unix_ms: u64,
+    ) -> Result<AgentSendBroadcastResponse, ErrorData> {
+        validate_session_id(from_session)?;
+        validate_broadcast_target(&params.to)?;
+        validate_kind(&params.kind)?;
+        validate_ttl_ms(params.ttl_ms)?;
+        validate_payload_size(&params.payload)?;
+        if let Some(artifact_handle) = &params.artifact_handle {
+            validate_artifact_handle(artifact_handle)?;
+        }
+
+        // Resolve the recipient set from live sessions, applying the selector.
+        let live = self.live_session_reads(from_session, now_unix_ms)?;
+        let recipients: Vec<String> = if params.to.all {
+            live.into_iter().map(|(session, _kind)| session).collect()
+        } else if !params.to.agent_kinds.is_empty() {
+            live.into_iter()
+                .filter(|(_session, kind)| params.to.agent_kinds.iter().any(|k| k == kind))
+                .map(|(session, _kind)| session)
+                .collect()
+        } else {
+            // Explicit list: keep only the ones that are actually live, in the
+            // caller's order; non-live ones surface as skipped below.
+            let live_set: std::collections::BTreeSet<String> =
+                live.into_iter().map(|(session, _kind)| session).collect();
+            params
+                .to
+                .sessions
+                .iter()
+                .filter(|session| session.as_str() != from_session)
+                .cloned()
+                .map(|session| (live_set.contains(&session), session))
+                .filter_map(|(is_live, session)| is_live.then_some(session))
+                .collect()
+        };
+
+        if recipients.len() > MAX_BROADCAST_RECIPIENTS {
+            return Err(params_error(format!(
+                "agent_send_broadcast resolved {} recipients, over the {MAX_BROADCAST_RECIPIENTS} cap; \
+                 narrow the selector",
+                recipients.len()
+            )));
+        }
+
+        let resolved_recipients = recipients.len();
+        let expires_at_unix_ms = now_unix_ms.saturating_add(params.ttl_ms);
+        let db = self.mailbox_db()?;
+        let _expired = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
+
+        let mut outcomes = Vec::with_capacity(recipients.len());
+        let mut delivered_count = 0_usize;
+        let mut skipped_count = 0_usize;
+        for to_session in recipients {
+            let depth = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
+            if depth >= MAX_INBOX_ROWS_PER_RECIPIENT {
+                skipped_count += 1;
+                outcomes.push(RecipientOutcome {
+                    to_session,
+                    status: "skipped".to_owned(),
+                    message_id: None,
+                    row_key: None,
+                    storage_readback: None,
+                    skip_reason: Some(format!("recipient mailbox full ({depth} rows)")),
+                });
+                continue;
+            }
+            let seq = NEXT_MAILBOX_SEQ.fetch_add(1, Ordering::Relaxed);
+            let message_id = format!("agentmsg-{now_unix_ms:020}-{seq:020}");
+            let row_key = mailbox_row_key(&to_session, now_unix_ms, seq, &message_id);
+            let message = AgentMailboxMessage {
+                schema_version: SCHEMA_VERSION,
+                message_id: message_id.clone(),
+                row_key: row_key.clone(),
+                from_session: from_session.to_owned(),
+                to_session: to_session.clone(),
+                kind: params.kind.trim().to_owned(),
+                payload: params.payload.clone(),
+                artifact_handle: params.artifact_handle.clone().map(|v| v.trim().to_owned()),
+                sent_at_unix_ms: now_unix_ms,
+                ttl_ms: params.ttl_ms,
+                expires_at_unix_ms,
+                delivery_attempts: 0,
+                request_receipt: params.request_receipt,
+            };
+            let encoded = encode_mailbox_message(&message)?;
+            db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
+                .map_err(|error| {
+                    mcp_error(error.code(), format!("write broadcast row {row_key}: {error}"))
+                })?;
+            let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
+            delivered_count += 1;
+            outcomes.push(RecipientOutcome {
+                to_session,
+                status: "delivered".to_owned(),
+                message_id: Some(message_id),
+                row_key: Some(row_key),
+                storage_readback: Some(storage_readback),
+                skip_reason: None,
+            });
+        }
+
+        tracing::info!(
+            code = "AGENT_MAILBOX_BROADCAST_COMMITTED",
+            from_session,
+            kind = %params.kind,
+            resolved_recipients,
+            delivered_count,
+            skipped_count,
+            "readback=agent_mailbox edge=broadcast_committed"
+        );
+
+        Ok(AgentSendBroadcastResponse {
+            ok: true,
+            from_session: from_session.to_owned(),
+            kind: params.kind.trim().to_owned(),
+            sent_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms,
+            request_receipt: params.request_receipt,
+            resolved_recipients,
+            delivered_count,
+            skipped_count,
+            recipients: outcomes,
+        })
+    }
+
+    fn agent_receipts_impl(
+        &self,
+        params: AgentReceiptsParams,
+        session_id: &str,
+    ) -> Result<AgentReceiptsResponse, ErrorData> {
+        self.agent_receipts_impl_at(params, session_id, unix_time_ms_now())
+    }
+
+    fn agent_receipts_impl_at(
+        &self,
+        params: AgentReceiptsParams,
+        session_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<AgentReceiptsResponse, ErrorData> {
+        if params.max_receipts == 0 || params.max_receipts > MAX_MESSAGES_PER_READ {
+            return Err(params_error(format!(
+                "agent_receipts max_receipts must be between 1 and {MAX_MESSAGES_PER_READ}"
+            )));
+        }
+        validate_session_id(session_id)?;
+        let db = self.mailbox_db()?;
+        let (mut receipts, expired_keys, scanned_rows) =
+            scan_receipts(&db, session_id, now_unix_ms)?;
+        if !expired_keys.is_empty() {
+            db.delete_batch(cf::CF_KV, expired_keys.clone()).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("delete expired receipt rows for {session_id}: {error}"),
+                )
+            })?;
+        }
+        if receipts.len() > params.max_receipts {
+            receipts.truncate(params.max_receipts);
+        }
+        let delete_keys: Vec<Vec<u8>> = if params.drain {
+            receipts
+                .iter()
+                .map(|receipt| receipt.row_key.as_bytes().to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !delete_keys.is_empty() {
+            db.delete_batch(cf::CF_KV, delete_keys.clone()).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("delete drained receipt rows for {session_id}: {error}"),
+                )
+            })?;
+        }
+        Ok(AgentReceiptsResponse {
+            ok: true,
+            this_session_id: session_id.to_owned(),
+            mode: if params.drain { "drain" } else { "peek" }.to_owned(),
+            now_unix_ms,
+            scanned_rows,
+            expired_rows_deleted: expired_keys.len(),
+            returned_count: receipts.len(),
+            deleted_count: delete_keys.len(),
+            receipts,
+        })
+    }
 }
 
 impl From<&AgentWaitParams> for AgentInboxParams {
@@ -530,6 +968,7 @@ impl From<&AgentWaitParams> for AgentInboxParams {
         Self {
             drain: value.drain,
             max_messages: value.max_messages,
+            kinds: value.kinds.clone(),
         }
     }
 }
@@ -762,7 +1201,156 @@ fn validate_wait_params(params: &AgentWaitParams) -> Result<(), ErrorData> {
             "agent_wait timeout_ms must be <= {MAX_WAIT_TIMEOUT_MS}"
         )));
     }
+    validate_kind_filter(&params.kinds)?;
     validate_inbox_params(params.max_messages)
+}
+
+fn validate_kind_filter(kinds: &[String]) -> Result<(), ErrorData> {
+    if kinds.len() > MAX_KIND_FILTER_ENTRIES {
+        return Err(params_error(format!(
+            "kinds filter must have at most {MAX_KIND_FILTER_ENTRIES} entries; got {}",
+            kinds.len()
+        )));
+    }
+    for kind in kinds {
+        validate_kind(kind)?;
+    }
+    Ok(())
+}
+
+fn validate_broadcast_target(target: &BroadcastTarget) -> Result<(), ErrorData> {
+    let selectors =
+        u8::from(target.all) + u8::from(!target.agent_kinds.is_empty()) + u8::from(!target.sessions.is_empty());
+    if selectors == 0 {
+        return Err(params_error(
+            "agent_send_broadcast `to` must set exactly one selector: all=true, a non-empty \
+             agent_kinds, or a non-empty sessions list",
+        ));
+    }
+    if selectors > 1 {
+        return Err(params_error(
+            "agent_send_broadcast `to` selectors are mutually exclusive: set only one of all / \
+             agent_kinds / sessions",
+        ));
+    }
+    for kind in &target.agent_kinds {
+        if kind.trim().is_empty() {
+            return Err(params_error("agent_send_broadcast agent_kinds entries must not be empty"));
+        }
+    }
+    for session in &target.sessions {
+        validate_session_id(session)?;
+    }
+    Ok(())
+}
+
+/// Writes a sender-visible read receipt for every drained message that asked
+/// for one. Receipts go to the *sender's* receipt box, never the reader's
+/// inbox. Idempotent at the message level: the row key embeds the message id,
+/// so re-draining the same message id overwrites rather than duplicates.
+fn write_read_receipts(
+    db: &Db,
+    recipient_session: &str,
+    rows: &[DecodedMailboxRow],
+    now_unix_ms: u64,
+) -> Result<(), ErrorData> {
+    let receipt_rows = rows
+        .iter()
+        .filter(|row| row.message.request_receipt)
+        .map(|row| {
+            let from_session = row.message.from_session.clone();
+            let receipt_id = format!("receipt-{}-{}", from_session_tag(&from_session), row.message.message_id);
+            let row_key = receipt_row_key(&from_session, &row.message.message_id);
+            let receipt = MailboxReceipt {
+                schema_version: RECEIPT_SCHEMA_VERSION,
+                receipt_id,
+                row_key: row_key.clone(),
+                from_session,
+                recipient_session: recipient_session.to_owned(),
+                message_id: row.message.message_id.clone(),
+                message_kind: row.message.kind.clone(),
+                status: "read".to_owned(),
+                read_at_unix_ms: now_unix_ms,
+                expires_at_unix_ms: now_unix_ms.saturating_add(RECEIPT_TTL_MS),
+            };
+            synapse_storage::encode_json(&receipt)
+                .map(|encoded| (row_key.into_bytes(), encoded))
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::STORAGE_WRITE_FAILED,
+                        format!("encode read receipt: {error}"),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if receipt_rows.is_empty() {
+        return Ok(());
+    }
+    db.put_batch_pressure_bypass(cf::CF_KV, receipt_rows)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("write read receipts for sender of {recipient_session}'s drained messages: {error}"),
+            )
+        })
+}
+
+fn from_session_tag(session_id: &str) -> String {
+    hex_bytes(session_id.as_bytes())
+}
+
+fn receipt_recipient_prefix(session_id: &str) -> String {
+    format!(
+        "{RECEIPT_PREFIX}/owner_hex/{}/rcpt/",
+        hex_bytes(session_id.as_bytes())
+    )
+}
+
+fn receipt_row_key(owner_session: &str, message_id: &str) -> String {
+    format!("{}{message_id}", receipt_recipient_prefix(owner_session))
+}
+
+#[allow(clippy::type_complexity)]
+fn scan_receipts(
+    db: &Db,
+    owner_session: &str,
+    now_unix_ms: u64,
+) -> Result<(Vec<MailboxReceipt>, Vec<Vec<u8>>, usize), ErrorData> {
+    let prefix = receipt_recipient_prefix(owner_session);
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let scanned_rows = rows.len();
+    let mut receipts = Vec::new();
+    let mut expired_keys = Vec::new();
+    for (key, encoded) in rows {
+        let receipt: MailboxReceipt = synapse_storage::decode_json(&encoded).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "decode receipt row {}: {error}",
+                    String::from_utf8_lossy(&key)
+                ),
+            )
+        })?;
+        if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "receipt row {} has schema_version {}, expected {RECEIPT_SCHEMA_VERSION}",
+                    String::from_utf8_lossy(&key),
+                    receipt.schema_version
+                ),
+            ));
+        }
+        if receipt.expires_at_unix_ms <= now_unix_ms {
+            expired_keys.push(key);
+        } else {
+            receipts.push(receipt);
+        }
+    }
+    receipts.sort_by_key(|receipt| receipt.read_at_unix_ms);
+    Ok((receipts, expired_keys, scanned_rows))
 }
 
 fn mailbox_full_error(from_session: &str, to_session: &str, queue_depth: usize) -> ErrorData {
@@ -934,6 +1522,7 @@ mod tests {
                 payload: json!({"n": 1}),
                 artifact_handle: None,
                 ttl_ms: 60_000,
+                request_receipt: false,
             },
             "sender",
             2_000,
@@ -945,6 +1534,7 @@ mod tests {
                 payload: json!({"n": 2}),
                 artifact_handle: Some("artifact://known".to_owned()),
                 ttl_ms: 60_000,
+                request_receipt: false,
             },
             "sender",
             2_001,
@@ -954,6 +1544,7 @@ mod tests {
             AgentInboxParams {
                 drain: false,
                 max_messages: 10,
+                kinds: Vec::new(),
             },
             "recipient",
             2_010,
@@ -968,6 +1559,7 @@ mod tests {
             AgentInboxParams {
                 drain: true,
                 max_messages: 10,
+                kinds: Vec::new(),
             },
             "recipient",
             2_020,
@@ -981,6 +1573,7 @@ mod tests {
             AgentInboxParams {
                 drain: true,
                 max_messages: 10,
+                kinds: Vec::new(),
             },
             "recipient",
             2_030,
@@ -1013,6 +1606,7 @@ mod tests {
                 payload: json!({"n": 1}),
                 artifact_handle: None,
                 ttl_ms: 60_000,
+                request_receipt: false,
             },
             "journal-sender",
             2_000,
@@ -1021,6 +1615,7 @@ mod tests {
             AgentInboxParams {
                 drain: true,
                 max_messages: 10,
+                kinds: Vec::new(),
             },
             "journal-recipient",
             2_010,
@@ -1094,6 +1689,7 @@ mod tests {
                 payload: json!({"n": 1}),
                 artifact_handle: None,
                 ttl_ms: 60_000,
+                request_receipt: false,
             },
             "sender",
             2_000,
@@ -1112,6 +1708,7 @@ mod tests {
                 payload: json!({"n": 1}),
                 artifact_handle: None,
                 ttl_ms: 60_000,
+                request_receipt: false,
             },
             "sender",
             2_000,
@@ -1144,6 +1741,7 @@ mod tests {
                 payload: json!({"ttl": 1}),
                 artifact_handle: None,
                 ttl_ms: 1,
+                request_receipt: false,
             },
             "sender",
             2_000,
@@ -1153,6 +1751,7 @@ mod tests {
             AgentInboxParams {
                 drain: true,
                 max_messages: 10,
+                kinds: Vec::new(),
             },
             "recipient",
             2_002,
@@ -1177,6 +1776,7 @@ mod tests {
                 payload: json!({"ttl": 1}),
                 artifact_handle: None,
                 ttl_ms: 1,
+                request_receipt: false,
             },
             "sender",
             2_000,
@@ -1199,6 +1799,7 @@ mod tests {
                 payload: json!({"expected": "old recipient row removed"}),
                 artifact_handle: None,
                 ttl_ms: 60_000,
+                request_receipt: false,
             },
             "sender",
             2_002,
@@ -1233,6 +1834,7 @@ mod tests {
                 timeout_ms: MAX_WAIT_TIMEOUT_MS + 1,
                 drain: true,
                 max_messages: 1,
+                kinds: Vec::new(),
             })
             .is_err()
         );
@@ -1251,6 +1853,7 @@ mod tests {
                     timeout_ms: 10,
                     drain: true,
                     max_messages: 10,
+                    kinds: Vec::new(),
                 },
                 "recipient",
             ),
@@ -1275,5 +1878,261 @@ mod tests {
         registry.record_seen("recipient", Some("test".to_owned()), 1_000);
         let read = registry.reads(1_001).remove(0);
         assert_eq!(read.lifecycle, "live");
+    }
+
+    // ---- #908 mailbox v2 ----
+
+    fn inbox_params(drain: bool, kinds: &[&str]) -> AgentInboxParams {
+        AgentInboxParams {
+            drain,
+            max_messages: 100,
+            kinds: kinds.iter().map(|k| (*k).to_owned()).collect(),
+        }
+    }
+
+    fn broadcast_params(to: BroadcastTarget, kind: &str, request_receipt: bool) -> AgentSendBroadcastParams {
+        AgentSendBroadcastParams {
+            to,
+            kind: kind.to_owned(),
+            payload: json!({"hello": kind}),
+            artifact_handle: None,
+            ttl_ms: 60_000,
+            request_receipt,
+        }
+    }
+
+    #[test]
+    fn broadcast_all_fans_out_one_row_per_live_recipient_excluding_sender() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 10_000;
+        for who in ["sender", "a", "b", "c"] {
+            register_session(&service, who, now)?;
+        }
+
+        let response = service.agent_send_broadcast_impl_at(
+            broadcast_params(
+                BroadcastTarget { all: true, agent_kinds: Vec::new(), sessions: Vec::new() },
+                "finding",
+                false,
+            ),
+            "sender",
+            now,
+        )?;
+        assert_eq!(response.resolved_recipients, 3, "a/b/c, sender excluded");
+        assert_eq!(response.delivered_count, 3);
+        assert_eq!(response.skipped_count, 0);
+
+        // FSV: each recipient has exactly one physical row; sender has none.
+        for who in ["a", "b", "c"] {
+            let inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), who, now + 1)?;
+            assert_eq!(inbox.returned_count, 1, "recipient {who}");
+            assert_eq!(inbox.messages[0].from_session, "sender");
+            assert_eq!(inbox.messages[0].kind, "finding");
+        }
+        let sender_inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), "sender", now + 1)?;
+        assert_eq!(sender_inbox.returned_count, 0, "sender must not receive its own broadcast");
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_agent_kinds_filter_discriminates() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 10_000;
+        for who in ["sender", "a", "b"] {
+            register_session(&service, who, now)?;
+        }
+
+        // record_seen yields agent_kind "unknown"; ["unknown"] matches both.
+        let matched = service.agent_send_broadcast_impl_at(
+            broadcast_params(
+                BroadcastTarget { all: false, agent_kinds: vec!["unknown".to_owned()], sessions: Vec::new() },
+                "steer",
+                false,
+            ),
+            "sender",
+            now,
+        )?;
+        assert_eq!(matched.delivered_count, 2);
+
+        // A kind no live session has matches nobody — honest zero.
+        let none = service.agent_send_broadcast_impl_at(
+            broadcast_params(
+                BroadcastTarget { all: false, agent_kinds: vec!["codex".to_owned()], sessions: Vec::new() },
+                "steer",
+                false,
+            ),
+            "sender",
+            now,
+        )?;
+        assert_eq!(none.resolved_recipients, 0);
+        assert_eq!(none.delivered_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_explicit_sessions_skip_non_live() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 10_000;
+        register_session(&service, "sender", now)?;
+        register_session(&service, "live-one", now)?;
+        // "ghost" is never registered -> not live.
+
+        let response = service.agent_send_broadcast_impl_at(
+            broadcast_params(
+                BroadcastTarget {
+                    all: false,
+                    agent_kinds: Vec::new(),
+                    sessions: vec!["live-one".to_owned(), "ghost".to_owned()],
+                },
+                "finding",
+                false,
+            ),
+            "sender",
+            now,
+        )?;
+        // Only the live one is resolved; the ghost is dropped before fan-out.
+        assert_eq!(response.resolved_recipients, 1);
+        assert_eq!(response.delivered_count, 1);
+        assert_eq!(response.recipients[0].to_session, "live-one");
+        let inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), "live-one", now + 1)?;
+        assert_eq!(inbox.returned_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_target_validation_rejects_zero_or_multiple_selectors() {
+        let none = validate_broadcast_target(&BroadcastTarget::default());
+        assert!(none.is_err(), "no selector must be rejected");
+        let multi = validate_broadcast_target(&BroadcastTarget {
+            all: true,
+            agent_kinds: vec!["x".to_owned()],
+            sessions: Vec::new(),
+        });
+        assert!(multi.is_err(), "two selectors must be rejected");
+    }
+
+    #[test]
+    fn inbox_kind_filter_returns_exactly_matching_and_drains_only_those() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 20_000;
+        register_session(&service, "sender", now)?;
+        register_session(&service, "recipient", now)?;
+
+        for (i, kind) in ["steer", "finding", "steer"].iter().enumerate() {
+            service.agent_send_impl_at(
+                AgentSendParams {
+                    to_session: "recipient".to_owned(),
+                    kind: (*kind).to_owned(),
+                    payload: json!({"i": i}),
+                    artifact_handle: None,
+                    ttl_ms: 60_000,
+                    request_receipt: false,
+                },
+                "sender",
+                now + i as u64,
+            )?;
+        }
+
+        // Drain only steer -> exactly the 2 steer messages, finding untouched.
+        let steer = service.agent_inbox_impl_at(inbox_params(true, &["steer"]), "recipient", now + 10)?;
+        assert_eq!(steer.returned_count, 2);
+        assert!(steer.messages.iter().all(|m| m.kind == "steer"));
+        assert_eq!(steer.deleted_count, 2);
+
+        // The non-matching finding survived the filtered drain.
+        let rest = service.agent_inbox_impl_at(inbox_params(false, &[]), "recipient", now + 11)?;
+        assert_eq!(rest.returned_count, 1);
+        assert_eq!(rest.messages[0].kind, "finding");
+        Ok(())
+    }
+
+    #[test]
+    fn read_receipt_is_written_to_sender_on_drain_and_readable() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 30_000;
+        register_session(&service, "sender", now)?;
+        register_session(&service, "recipient", now)?;
+
+        let sent = service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "recipient".to_owned(),
+                kind: "task".to_owned(),
+                payload: json!({"do": "the thing"}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+                request_receipt: true,
+            },
+            "sender",
+            now,
+        )?;
+        assert!(sent.request_receipt);
+
+        // Before the recipient reads it, there is no receipt.
+        let before = service.agent_receipts_impl_at(
+            AgentReceiptsParams { drain: false, max_receipts: 10 },
+            "sender",
+            now + 1,
+        )?;
+        assert_eq!(before.returned_count, 0, "no receipt before the message is read");
+
+        // Recipient drains -> a read receipt lands in the sender's receipt box.
+        let drained = service.agent_inbox_impl_at(inbox_params(true, &[]), "recipient", now + 2)?;
+        assert_eq!(drained.returned_count, 1);
+
+        let after = service.agent_receipts_impl_at(
+            AgentReceiptsParams { drain: true, max_receipts: 10 },
+            "sender",
+            now + 3,
+        )?;
+        assert_eq!(after.returned_count, 1, "sender sees exactly one read receipt");
+        let receipt = &after.receipts[0];
+        assert_eq!(receipt.recipient_session, "recipient");
+        assert_eq!(receipt.message_id, sent.message_id);
+        assert_eq!(receipt.message_kind, "task");
+        assert_eq!(receipt.status, "read");
+        assert_eq!(receipt.from_session, "sender");
+
+        // Drained: the receipt box is now empty.
+        let empty = service.agent_receipts_impl_at(
+            AgentReceiptsParams { drain: false, max_receipts: 10 },
+            "sender",
+            now + 4,
+        )?;
+        assert_eq!(empty.returned_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn no_receipt_written_when_not_requested() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 40_000;
+        register_session(&service, "sender", now)?;
+        register_session(&service, "recipient", now)?;
+        service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "recipient".to_owned(),
+                kind: "task".to_owned(),
+                payload: json!({}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+                request_receipt: false,
+            },
+            "sender",
+            now,
+        )?;
+        service.agent_inbox_impl_at(inbox_params(true, &[]), "recipient", now + 1)?;
+        let receipts = service.agent_receipts_impl_at(
+            AgentReceiptsParams { drain: false, max_receipts: 10 },
+            "sender",
+            now + 2,
+        )?;
+        assert_eq!(receipts.returned_count, 0, "no receipt without request_receipt");
+        Ok(())
     }
 }

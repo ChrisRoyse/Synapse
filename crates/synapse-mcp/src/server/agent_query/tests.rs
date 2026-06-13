@@ -344,7 +344,7 @@ async fn deep_times_out_to_not_answered_without_a_cooperating_agent() {
     // The request really was delivered: a status_request sits in the target's box.
     let inbox = service
         .agent_inbox_impl(
-            crate::server::agent_mailbox::AgentInboxParams { drain: false, max_messages: 10 },
+            crate::server::agent_mailbox::AgentInboxParams { drain: false, max_messages: 10, kinds: Vec::new() },
             SESSION,
         )
         .expect("read target inbox");
@@ -394,7 +394,7 @@ async fn deep_answered_when_agent_replies_cooperatively() {
         for _ in 0..200 {
             let inbox = responder_service
                 .agent_inbox_impl(
-                    crate::server::agent_mailbox::AgentInboxParams { drain: true, max_messages: 10 },
+                    crate::server::agent_mailbox::AgentInboxParams { drain: true, max_messages: 10, kinds: Vec::new() },
                     SESSION,
                 )
                 .expect("responder reads inbox");
@@ -414,6 +414,7 @@ async fn deep_answered_when_agent_replies_cooperatively() {
                             }),
                             artifact_handle: None,
                             ttl_ms: 60_000,
+                            request_receipt: false,
                         },
                         SESSION,
                     )
@@ -441,7 +442,7 @@ async fn deep_answered_when_agent_replies_cooperatively() {
     // The consumed reply was deleted from the caller's box (peek shows empty).
     let inbox = service
         .agent_inbox_impl(
-            crate::server::agent_mailbox::AgentInboxParams { drain: false, max_messages: 10 },
+            crate::server::agent_mailbox::AgentInboxParams { drain: false, max_messages: 10, kinds: Vec::new() },
             "caller",
         )
         .expect("read caller inbox");

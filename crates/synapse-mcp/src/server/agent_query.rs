@@ -545,6 +545,7 @@ impl SynapseService {
                     }),
                     artifact_handle: None,
                     ttl_ms: DEEP_REQUEST_TTL_MS,
+                    request_receipt: false,
                 },
                 caller,
             )
@@ -562,6 +563,7 @@ impl SynapseService {
                     super::agent_mailbox::AgentInboxParams {
                         drain: false,
                         max_messages: 1_000,
+                        kinds: Vec::new(),
                     },
                     caller,
                 )
