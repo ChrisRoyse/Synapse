@@ -1118,6 +1118,38 @@ pub(crate) fn unbound_reads(now_unix_ms: u64) -> Vec<AgentStateRead> {
         .unwrap_or_default()
 }
 
+/// Derive one agent's lifecycle read from an explicit set of journal records,
+/// using the exact reducer the live tracker uses, without touching the
+/// process-wide singleton (#911).
+///
+/// `records` must be in ascending `(ts_ns, seq)` order — the order journal
+/// scans return rows in. `lookup_id` is the MCP session id or spawn id the
+/// caller is interested in; anchor resolution follows the same session↔spawn
+/// linking the live tracker performs, so passing either id resolves the same
+/// agent once a `spawn_ready` row has linked them.
+///
+/// This is what makes `agent_query` deterministic and restart-robust: the
+/// CF_AGENT_EVENTS journal is the source of truth, and the live in-memory
+/// tracker is only a cache rebuilt from it. Reconstructing from the same rows
+/// the query already scanned guarantees the reported state is self-consistent
+/// with the events the query returns. Returns `None` when no scanned row
+/// resolves to `lookup_id`.
+pub(crate) fn read_from_journal_records(
+    records: &[AgentEventRecord],
+    lookup_id: &str,
+    now_unix_ms: u64,
+) -> Option<AgentStateRead> {
+    let mut local = AgentStateTracker::default();
+    for record in records {
+        if is_state_machine_row(record) {
+            local.apply_authoritative(record);
+        } else {
+            let _quiet_transition = local.apply_event(record);
+        }
+    }
+    local.read_for_session(lookup_id, now_unix_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use synapse_core::GenAiAttributes;

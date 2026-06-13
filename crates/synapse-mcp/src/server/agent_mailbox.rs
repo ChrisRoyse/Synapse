@@ -229,7 +229,7 @@ impl SynapseService {
 }
 
 impl SynapseService {
-    fn agent_send_impl(
+    pub(super) fn agent_send_impl(
         &self,
         params: AgentSendParams,
         from_session: &str,
@@ -332,7 +332,7 @@ impl SynapseService {
         })
     }
 
-    fn agent_inbox_impl(
+    pub(super) fn agent_inbox_impl(
         &self,
         params: AgentInboxParams,
         session_id: &str,

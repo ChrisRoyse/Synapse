@@ -161,6 +161,7 @@ pub(crate) mod agent_cost;
 pub(crate) mod agent_event_ingress;
 pub(crate) mod agent_events;
 mod agent_mailbox;
+pub(crate) mod agent_query;
 pub(crate) mod agent_state;
 pub(crate) mod agent_transcripts;
 mod audit_context;
@@ -191,7 +192,7 @@ mod lease_tools;
 mod m1_tools;
 mod m2_tools;
 mod m3_tools;
-mod m4_tools;
+pub(crate) mod m4_tools;
 mod notify_tools;
 mod reality;
 mod schema_sanitize;
@@ -517,6 +518,7 @@ impl SynapseService {
             + Self::session_tool_router()
             + Self::agent_mailbox_tool_router()
             + Self::agent_cost_tool_router()
+            + Self::agent_query_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()

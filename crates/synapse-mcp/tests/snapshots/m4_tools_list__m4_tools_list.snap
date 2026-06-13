@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 126,
+  "count": 131,
   "m4_defaults": [
     {
       "actual": 33,
@@ -229,7 +229,12 @@ expression: snapshot
     "act_type",
     "action_diagnostic_queue_full_setup",
     "action_diagnostic_rate_limit_override",
+    "agent_cost",
+    "agent_cost_price_delete",
+    "agent_cost_price_list",
+    "agent_cost_price_put",
     "agent_inbox",
+    "agent_query",
     "agent_send",
     "agent_wait",
     "audio_tail",
