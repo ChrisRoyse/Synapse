@@ -1696,6 +1696,8 @@ mod tests {
                 launched_at_unix_ms: 999,
                 launch_target: "pwsh.exe".to_owned(),
                 log_dir: r"C:\temp\spawn-test".to_owned(),
+                template_id: None,
+                template_version: None,
             }),
         }
     }

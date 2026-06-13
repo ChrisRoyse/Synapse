@@ -74,6 +74,13 @@ pub(crate) struct SpawnedAgentRead {
     pub launched_at_unix_ms: u64,
     pub launch_target: String,
     pub log_dir: String,
+    /// Spawn-template provenance (#909): set when this agent was rendered from a
+    /// durable template, so the session row records exactly which template
+    /// version produced the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u32>,
 }
 
 impl Default for SessionRegistry {
@@ -349,6 +356,8 @@ mod tests {
                 launched_at_unix_ms: 990,
                 launch_target: "pwsh.exe".to_owned(),
                 log_dir: "C:\\temp\\spawn-1".to_owned(),
+                template_id: None,
+                template_version: None,
             },
             1_050,
         );

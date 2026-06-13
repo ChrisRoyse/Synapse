@@ -3,7 +3,8 @@ use super::{
     ActRunShellCancelResponse, ActRunShellJobIdParams, ActRunShellParams, ActRunShellResponse,
     ActRunShellStartParams, ActRunShellStartResponse, ActRunShellStatusParams,
     ActRunShellStatusResponse, ActSpawnAgentCli, ActSpawnAgentLogPaths, ActSpawnAgentParams,
-    ActSpawnAgentResponse, ActSpawnAgentTarget, ErrorData, Json, LaunchWindowState,
+    ActSpawnAgentRequest, ActSpawnAgentResponse, ActSpawnAgentTarget, ErrorData, Json,
+    LaunchWindowState,
     MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, Parameters, RunShellAuthorization, ShellExecutionContext,
     SynapseService, assign_owned_process_job, authorize_run_shell, authorize_run_shell_start,
     cancel_shell_job, execute_combo, launch, launch_for_session, launch_process_history_row,
@@ -49,6 +50,12 @@ fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Value {
         "spawn_id": spawn_id,
         "cli": params.cli.as_str(),
         "model": params.model,
+        // Spawn-template provenance (#909): the exact template version + config
+        // hash this spawn was rendered from, or null for a direct spawn. The
+        // manifest is the physical source of truth for run reproducibility.
+        "template_id": params.template_id,
+        "template_version": params.template_version,
+        "template_config_hash": params.template_config_hash,
         "created_unix_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -366,26 +373,37 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Spawn a fully capable primary Codex or Claude agent as a hidden background process, wire it to the configured Synapse HTTP MCP daemon, require real MCP session registration, optionally bind a per-session target, and return only after session_list readback plus a validated task-start readiness artifact prove the spawned prompt began executing."
+        description = "Spawn a fully capable primary Codex or Claude agent as a hidden background process, wire it to the configured Synapse HTTP MCP daemon, require real MCP session registration, optionally bind a per-session target, and return only after session_list readback plus a validated task-start readiness artifact prove the spawned prompt began executing. Pass cli for a direct spawn, or template_id (+ template_params) to render the spawn from a durable agent_template; a template-rendered spawn records the exact (template_id, version, config_hash) used and rejects passing cli/model/prompt/working_dir/target alongside the template."
     )]
     pub async fn act_spawn_agent(
         &self,
-        params: Parameters<ActSpawnAgentParams>,
+        params: Parameters<ActSpawnAgentRequest>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActSpawnAgentResponse>, ErrorData> {
-        tracing::info!(
-            code = "MCP_TOOL_INVOCATION",
-            kind = ACT_SPAWN_AGENT,
-            cli = params.0.cli.as_str(),
-            "tool.invocation kind=act_spawn_agent"
-        );
         if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
             self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, &request_context);
             return Err(error);
         }
+        // Resolve the request — direct spawn or template-rendered — into the
+        // concrete spawn params before any side effect, so a bad template id or
+        // param contract fails loudly with nothing launched (#909).
+        let params = match self.resolve_spawn_request(params.0) {
+            Ok(params) => params,
+            Err(error) => {
+                self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, &request_context);
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = ACT_SPAWN_AGENT,
+            cli = params.cli.as_str(),
+            template_id = params.template_id.as_deref().unwrap_or(""),
+            template_version = params.template_version.unwrap_or(0),
+            "tool.invocation kind=act_spawn_agent"
+        );
         let started_by_session_id =
             super::context::mcp_session_id_from_request_context(&request_context)?;
-        let params = params.0;
         self.audit_action_started_with_details_for_request(
             ACT_SPAWN_AGENT,
             &agent_spawn_request_details(&params, started_by_session_id.as_deref()),
@@ -452,6 +470,90 @@ fn require_shell_session_id(
 }
 
 impl SynapseService {
+    /// Resolves a caller's spawn request into concrete spawn params. A direct
+    /// spawn (no `template_id`) passes its fields through; a template spawn
+    /// renders the params atomically from the durable template and stamps the
+    /// `(id, version, config_hash)` provenance. The two modes are mutually
+    /// exclusive and conflicts are rejected loudly — never silently merged.
+    fn resolve_spawn_request(
+        &self,
+        request: ActSpawnAgentRequest,
+    ) -> Result<ActSpawnAgentParams, ErrorData> {
+        match request.template_id {
+            Some(template_id) => {
+                let mut conflicts = Vec::new();
+                if request.cli.is_some() {
+                    conflicts.push("cli");
+                }
+                if request.model.is_some() {
+                    conflicts.push("model");
+                }
+                if request.prompt.is_some() {
+                    conflicts.push("prompt");
+                }
+                if request.working_dir.is_some() {
+                    conflicts.push("working_dir");
+                }
+                if request.target.is_some() {
+                    conflicts.push("target");
+                }
+                if !conflicts.is_empty() {
+                    return Err(mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!(
+                            "act_spawn_agent renders {conflicts:?} from template {template_id:?}; edit the template instead of passing these fields alongside template_id"
+                        ),
+                    ));
+                }
+                let rendered = self.resolve_spawn_template(
+                    &template_id,
+                    request.template_version,
+                    &request.template_params,
+                )?;
+                Ok(ActSpawnAgentParams {
+                    cli: rendered.cli,
+                    model: rendered.model,
+                    prompt: rendered.prompt,
+                    target: rendered.target,
+                    working_dir: rendered.working_dir,
+                    mcp_url: request.mcp_url,
+                    wait_timeout_ms: request.wait_timeout_ms,
+                    hold_open_ms: request.hold_open_ms,
+                    template_id: Some(rendered.provenance.template_id),
+                    template_version: Some(rendered.provenance.version),
+                    template_config_hash: Some(rendered.provenance.config_hash),
+                })
+            }
+            None => {
+                if request.template_version.is_some() || !request.template_params.is_empty() {
+                    return Err(mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "act_spawn_agent template_version/template_params require template_id to be set",
+                    ));
+                }
+                let cli = request.cli.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "act_spawn_agent requires cli for a direct spawn (or set template_id to render from a template)",
+                    )
+                })?;
+                Ok(ActSpawnAgentParams {
+                    cli,
+                    model: request.model,
+                    prompt: request.prompt,
+                    target: request.target,
+                    working_dir: request.working_dir,
+                    mcp_url: request.mcp_url,
+                    wait_timeout_ms: request.wait_timeout_ms,
+                    hold_open_ms: request.hold_open_ms,
+                    template_id: None,
+                    template_version: None,
+                    template_config_hash: None,
+                })
+            }
+        }
+    }
+
     async fn act_spawn_agent_impl(
         &self,
         params: ActSpawnAgentParams,
@@ -758,6 +860,8 @@ impl SynapseService {
             launched_at_unix_ms,
             launch_target: launch_params.target.clone(),
             log_dir: files.log_dir.display().to_string(),
+            template_id: params.template_id.clone(),
+            template_version: params.template_version,
         };
         if let Err(error) = self.record_spawned_agent_metadata(&matched.session_id, metadata) {
             let cleanup = crate::m4::terminate_owned_process_tree(launch_response.pid);
@@ -850,6 +954,9 @@ impl SynapseService {
             registered_at_unix_ms: matched.registered_at_unix_ms,
             task_started_at_unix_ms: task_started.started_at_unix_ms,
             target: params.target,
+            template_id: params.template_id,
+            template_version: params.template_version,
+            template_config_hash: params.template_config_hash,
             log_paths: files.to_response(),
         })
     }
@@ -1048,6 +1155,11 @@ impl SynapseService {
             "mcp_url": params.mcp_url,
             "wait_timeout_ms": params.wait_timeout_ms,
             "hold_open_ms": params.hold_open_ms,
+            // Spawn-template provenance (#909) so the journal records which
+            // template version drove the run, not just the rendered params.
+            "template_id": params.template_id,
+            "template_version": params.template_version,
+            "template_config_hash": params.template_config_hash,
         });
         super::agent_events::record_agent_event(&db, &record)
             .map(|_readback| ())
@@ -3222,6 +3334,9 @@ mod tests {
             mcp_url: "http://127.0.0.1:7700/mcp".to_owned(),
             wait_timeout_ms: 30_000,
             hold_open_ms: 1234,
+            template_id: None,
+            template_version: None,
+            template_config_hash: None,
         }
     }
 

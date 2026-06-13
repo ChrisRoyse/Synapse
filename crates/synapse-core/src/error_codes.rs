@@ -153,6 +153,9 @@ pub const STORAGE_CF_HARD_CAP_REACHED: &str = "STORAGE_CF_HARD_CAP_REACHED";
 // === Episodes (derived activity spans, issues #846/#847) ===
 pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
 
+// === Agent spawn templates (#909) ===
+pub const AGENT_TEMPLATE_NOT_FOUND: &str = "AGENT_TEMPLATE_NOT_FOUND";
+
 // === Models (06 section 8.7) ===
 pub const MODEL_DOWNLOAD_FAILED: &str = "MODEL_DOWNLOAD_FAILED";
 pub const MODEL_HASH_MISMATCH: &str = "MODEL_HASH_MISMATCH";

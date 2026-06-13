@@ -907,6 +907,82 @@ pub struct ActSpawnAgentParams {
     #[serde(default = "default_agent_spawn_hold_open_ms")]
     #[schemars(default = "default_agent_spawn_hold_open_ms", range(min = 0))]
     pub hold_open_ms: u64,
+    /// Spawn-template provenance (#909), stamped server-side when this spawn was
+    /// rendered from an `agent_template_*` template. Never set by callers
+    /// directly — `act_spawn_agent` resolves a template into these. Recorded in
+    /// the spawn manifest, response, and session row so every run is reproducible
+    /// and the fleet is auditable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_config_hash: Option<String>,
+}
+
+/// Caller-facing input for `act_spawn_agent` (#909). Either a direct spawn (set
+/// `cli` and the spawn fields) or a template-rendered spawn (set `template_id`
+/// and `template_params`). The two are mutually exclusive: when a template is
+/// used, the template fully defines `cli`/`model`/`prompt`/`working_dir`/`target`
+/// and supplying any of them is a loud error — an instance is rendered
+/// atomically from its versioned template, never assembled piecemeal.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActSpawnAgentRequest {
+    /// Spawn from this durable template id (see `agent_template_put`). When set,
+    /// `cli`/`model`/`prompt`/`working_dir`/`target` must be omitted.
+    #[serde(default)]
+    #[schemars(default)]
+    pub template_id: Option<String>,
+    /// Pin a specific template version snapshot. Omit to render from the current
+    /// version (whichever the pointer holds at request time); the version
+    /// actually rendered is recorded on the spawn.
+    #[serde(default)]
+    #[schemars(default)]
+    pub template_version: Option<u32>,
+    /// Values for the template's declared `required_params`. The key set must
+    /// equal the template's contract exactly — missing or unknown keys are
+    /// rejected. Empty for a template with no parameters or a direct spawn.
+    #[serde(default)]
+    #[schemars(default)]
+    pub template_params: BTreeMap<String, String>,
+    /// Direct-spawn agent CLI. Required when `template_id` is omitted; must be
+    /// omitted when `template_id` is set (the template supplies the kind).
+    #[serde(default)]
+    #[schemars(default)]
+    pub cli: Option<ActSpawnAgentCli>,
+    /// Direct-spawn model. Must be omitted when `template_id` is set.
+    #[serde(default)]
+    #[schemars(default)]
+    pub model: Option<String>,
+    /// Direct-spawn work prompt. Must be omitted when `template_id` is set.
+    #[serde(default)]
+    #[schemars(default)]
+    pub prompt: Option<String>,
+    /// Direct-spawn perception target. Must be omitted when `template_id` is set.
+    #[serde(default)]
+    #[schemars(default)]
+    pub target: Option<ActSpawnAgentTarget>,
+    /// Direct-spawn working directory. Must be omitted when `template_id` is set.
+    #[serde(default)]
+    #[schemars(default)]
+    pub working_dir: Option<String>,
+    /// Streamable HTTP MCP endpoint for the spawned agent. Applies to both
+    /// direct and template spawns (a runtime knob, not template config).
+    #[serde(default = "default_agent_spawn_mcp_url")]
+    #[schemars(default = "default_agent_spawn_mcp_url")]
+    pub mcp_url: String,
+    /// Readback wait budget. Runtime knob; applies to both spawn modes.
+    #[serde(default = "default_agent_spawn_wait_timeout_ms")]
+    #[schemars(
+        default = "default_agent_spawn_wait_timeout_ms",
+        range(min = 1, max = 1_800_000)
+    )]
+    pub wait_timeout_ms: u64,
+    /// Provision-only hold-open interval. Runtime knob; applies to both modes.
+    #[serde(default = "default_agent_spawn_hold_open_ms")]
+    #[schemars(default = "default_agent_spawn_hold_open_ms", range(min = 0))]
+    pub hold_open_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -927,6 +1003,14 @@ pub struct ActSpawnAgentResponse {
     pub task_started_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ActSpawnAgentTarget>,
+    /// Spawn-template provenance (#909): present when this spawn was rendered
+    /// from a template. The exact `(id, version, config_hash)` the run used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_config_hash: Option<String>,
     pub log_paths: ActSpawnAgentLogPaths,
 }
 

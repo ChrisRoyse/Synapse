@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 137] = [
+const EXPECTED_TOOLS: [&str; 141] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -34,6 +34,10 @@ const EXPECTED_TOOLS: [&str; 137] = [
     "agent_receipts",
     "agent_send",
     "agent_send_broadcast",
+    "agent_template_delete",
+    "agent_template_get",
+    "agent_template_list",
+    "agent_template_put",
     "agent_wait",
     "audio_tail",
     "audio_transcribe",

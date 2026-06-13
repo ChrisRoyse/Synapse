@@ -141,7 +141,8 @@ use crate::{
         ActRunShellCancelResponse, ActRunShellJobIdParams, ActRunShellParams, ActRunShellResponse,
         ActRunShellStartParams, ActRunShellStartResponse, ActRunShellStatusParams,
         ActRunShellStatusResponse, ActSpawnAgentCli, ActSpawnAgentLogPaths, ActSpawnAgentParams,
-        ActSpawnAgentResponse, ActSpawnAgentTarget, LaunchWindowState, M4ServiceConfig,
+        ActSpawnAgentRequest, ActSpawnAgentResponse, ActSpawnAgentTarget, LaunchWindowState,
+        M4ServiceConfig,
         MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, RunShellAuthorization, ShellExecutionContext,
         assign_owned_process_job, authorize_run_shell, authorize_run_shell_start, cancel_shell_job,
         execute_combo, launch, launch_for_session, launch_process_history_row,
@@ -163,6 +164,7 @@ pub(crate) mod agent_events;
 mod agent_mailbox;
 pub(crate) mod agent_query;
 pub(crate) mod agent_state;
+pub(crate) mod agent_templates;
 pub(crate) mod agent_transcripts;
 mod audit_context;
 mod context;
@@ -520,6 +522,7 @@ impl SynapseService {
             + Self::agent_mailbox_tool_router()
             + Self::agent_cost_tool_router()
             + Self::agent_query_tool_router()
+            + Self::agent_template_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
