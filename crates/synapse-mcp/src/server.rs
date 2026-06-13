@@ -173,6 +173,7 @@ mod agent_mailbox;
 pub(crate) mod agent_query;
 pub(crate) mod agent_state;
 pub(crate) mod agent_stats;
+pub(crate) mod agent_tasks;
 pub(crate) mod agent_templates;
 pub(crate) mod agent_transcripts;
 mod audit_context;
@@ -540,6 +541,7 @@ impl SynapseService {
             + Self::agent_query_tool_router()
             + Self::agent_control_tool_router()
             + Self::agent_template_tool_router()
+            + Self::agent_task_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()

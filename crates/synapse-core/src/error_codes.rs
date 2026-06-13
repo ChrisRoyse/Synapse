@@ -156,6 +156,10 @@ pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
 // === Agent spawn templates (#909) ===
 pub const AGENT_TEMPLATE_NOT_FOUND: &str = "AGENT_TEMPLATE_NOT_FOUND";
 
+// === Agent task queue (#910) ===
+pub const AGENT_TASK_NOT_FOUND: &str = "AGENT_TASK_NOT_FOUND";
+pub const AGENT_TASK_INVALID_TRANSITION: &str = "AGENT_TASK_INVALID_TRANSITION";
+
 // === Models (06 section 8.7) ===
 pub const MODEL_DOWNLOAD_FAILED: &str = "MODEL_DOWNLOAD_FAILED";
 pub const MODEL_HASH_MISMATCH: &str = "MODEL_HASH_MISMATCH";
