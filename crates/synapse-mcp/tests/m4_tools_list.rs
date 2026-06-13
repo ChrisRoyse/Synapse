@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 141] = [
+const EXPECTED_TOOLS: [&str; 149] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -137,6 +137,14 @@ const EXPECTED_TOOLS: [&str; 141] = [
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "task_cancel",
+    "task_claim",
+    "task_create",
+    "task_get",
+    "task_list",
+    "task_next",
+    "task_reconcile",
+    "task_update",
     "timeline_exclusions",
     "timeline_pause",
     "timeline_purge",
