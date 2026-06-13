@@ -33,6 +33,28 @@ use super::{
 };
 
 const ACT_SPAWN_AGENT: &str = "act_spawn_agent";
+/// Filename of the per-spawn manifest written into each spawn dir. The
+/// transcript ingester (#900/#949) reads it to learn the spawn's model when the
+/// CLI stream does not carry one (Codex).
+pub(crate) const AGENT_SPAWN_MANIFEST_FILENAME: &str = "spawn-manifest.json";
+/// Schema version stamped onto the spawn manifest.
+pub(crate) const AGENT_SPAWN_MANIFEST_VERSION: u32 = 1;
+
+/// Builds the per-spawn manifest JSON. Records the CLI and, when the operator
+/// pinned one, the model — the authoritative model source the transcript
+/// ingester reads (indispensable for Codex, whose stream omits it, #949).
+fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Value {
+    json!({
+        "version": AGENT_SPAWN_MANIFEST_VERSION,
+        "spawn_id": spawn_id,
+        "cli": params.cli.as_str(),
+        "model": params.model,
+        "created_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+    })
+}
 const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
 const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
 const AGENT_SPAWN_POLL_INTERVAL_MS: u64 = 250;
@@ -2212,6 +2234,28 @@ fn prepare_agent_spawn_files(
         })?;
     }
 
+    // Spawn manifest: the authoritative record of which CLI and (when the
+    // operator pinned one) which model this spawn was launched with. The
+    // transcript ingester reads it to attribute cost — indispensable for Codex,
+    // whose `exec --json` stream carries no model id (#949).
+    let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
+    let manifest = build_spawn_manifest(spawn_id, params);
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_spawn_agent failed to encode spawn manifest: {error}"),
+        )
+    })?;
+    fs::write(&manifest_path, manifest_bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to write spawn manifest {}: {error}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+
     Ok(AgentSpawnFiles {
         log_dir,
         prompt_path,
@@ -2511,10 +2555,19 @@ fn agent_spawn_powershell_script(
                 "notify=[\"powershell\",\"-NoLogo\",\"-NoProfile\",\"-NonInteractive\",\"-ExecutionPolicy\",\"Bypass\",\"-File\",{}]",
                 toml_string_literal(&notify_script_path.display().to_string())
             );
+            // The Codex `exec --json` stream carries no model id, so passing it
+            // here (and recording it in the spawn manifest) is the only way the
+            // transcript ingester can attribute the spawn's cost (#949).
+            let model_arg = params
+                .model
+                .as_deref()
+                .map(|model| format!(",'-m',{}", ps_single_quote(model)))
+                .unwrap_or_default();
             format!(
-                "$codexArgs = @('exec','-C',{working_dir},'-s','danger-full-access','--json','-o',{final_message_path},'-c',{mcp_url_config},'-c','mcp_servers.synapse.bearer_token_env_var=\"SYNAPSE_BEARER_TOKEN\"','-c',{notify_config},'-')\n\
+                "$codexArgs = @('exec'{model_arg},'-C',{working_dir},'-s','danger-full-access','--json','-o',{final_message_path},'-c',{mcp_url_config},'-c','mcp_servers.synapse.bearer_token_env_var=\"SYNAPSE_BEARER_TOKEN\"','-c',{notify_config},'-')\n\
 $prompt | & codex @codexArgs 1> {stdout_path} 2> {stderr_path}\n\
 ",
+                model_arg = model_arg,
                 working_dir = working_dir,
                 final_message_path = final_message_path,
                 mcp_url_config = ps_single_quote(&mcp_url_config),
@@ -2545,10 +2598,16 @@ $prompt | & codex @codexArgs 1> {stdout_path} 2> {stderr_path}\n\
             let debug_path = ps_single_quoted_path(debug_path);
             let mcp_config_path = ps_single_quoted_path(mcp_config_path);
             let hook_settings_path = ps_single_quoted_path(hook_settings_path);
+            let model_arg = params
+                .model
+                .as_deref()
+                .map(|model| format!(",'--model',{}", ps_single_quote(model)))
+                .unwrap_or_default();
             format!(
-                "$claudeArgs = @('-p','--verbose','--output-format','stream-json','--input-format','text','--permission-mode','bypassPermissions','--mcp-config',{mcp_config_path},'--strict-mcp-config','--settings',{hook_settings_path},'--add-dir',{working_dir},'--debug-file',{debug_path})\n\
+                "$claudeArgs = @('-p'{model_arg},'--verbose','--output-format','stream-json','--input-format','text','--permission-mode','bypassPermissions','--mcp-config',{mcp_config_path},'--strict-mcp-config','--settings',{hook_settings_path},'--add-dir',{working_dir},'--debug-file',{debug_path})\n\
 $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
 ",
+                model_arg = model_arg,
                 working_dir = working_dir,
                 mcp_config_path = mcp_config_path,
                 hook_settings_path = hook_settings_path,
@@ -3156,6 +3215,7 @@ mod tests {
     fn test_spawn_params() -> ActSpawnAgentParams {
         ActSpawnAgentParams {
             cli: ActSpawnAgentCli::Codex,
+            model: None,
             prompt: Some("write a report".to_owned()),
             target: None,
             working_dir: None,
@@ -3382,6 +3442,86 @@ mod tests {
             "claude args must inject the hook settings file: {script}"
         );
         assert!(script.contains("claude-hook-settings.json"));
+    }
+
+    #[test]
+    fn spawn_script_injects_model_arg_for_both_clis() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        // Codex: `-m <model>` injected right after `exec`.
+        let codex_files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: None,
+            mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: Some(dir.path().join("codex-notify.ps1")),
+        };
+        let mut codex_params = test_spawn_params();
+        codex_params.model = Some("gpt-5-codex".to_owned());
+        let codex_script = agent_spawn_powershell_script(&codex_params, &codex_files, dir.path())
+            .expect("codex script");
+        assert!(
+            codex_script.contains("@('exec','-m','gpt-5-codex','-C'"),
+            "codex args must inject -m <model> after exec: {codex_script}"
+        );
+
+        // Codex without a model: no `-m` arg appears.
+        let codex_no_model = agent_spawn_powershell_script(&test_spawn_params(), &codex_files, dir.path())
+            .expect("codex script");
+        assert!(
+            codex_no_model.contains("@('exec','-C'"),
+            "codex args must omit -m when no model is pinned: {codex_no_model}"
+        );
+        assert!(!codex_no_model.contains("'-m'"));
+
+        // Claude: `--model <model>` injected right after `-p`.
+        let claude_files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: Some(dir.path().join("claude-debug.log")),
+            mcp_config_path: Some(dir.path().join("claude-mcp-config.json")),
+            hook_settings_path: Some(dir.path().join("claude-hook-settings.json")),
+            notify_script_path: None,
+        };
+        let mut claude_params = test_spawn_params();
+        claude_params.cli = ActSpawnAgentCli::Claude;
+        claude_params.model = Some("claude-fable-5".to_owned());
+        let claude_script = agent_spawn_powershell_script(&claude_params, &claude_files, dir.path())
+            .expect("claude script");
+        assert!(
+            claude_script.contains("@('-p','--model','claude-fable-5','--verbose'"),
+            "claude args must inject --model after -p: {claude_script}"
+        );
+    }
+
+    #[test]
+    fn spawn_manifest_records_cli_and_model() {
+        // The manifest is the transcript ingester's authoritative model source.
+        let mut params = test_spawn_params();
+        params.model = Some("gpt-5-codex".to_owned());
+        let manifest = build_spawn_manifest("agent-spawn-manifest-fsv", &params);
+        assert_eq!(manifest["version"], AGENT_SPAWN_MANIFEST_VERSION);
+        assert_eq!(manifest["spawn_id"], "agent-spawn-manifest-fsv");
+        assert_eq!(manifest["cli"], "codex");
+        assert_eq!(manifest["model"], "gpt-5-codex");
+        assert!(manifest["created_unix_ms"].as_u64().is_some());
+
+        // No pinned model -> manifest carries an explicit null, never a guess.
+        params.model = None;
+        let manifest = build_spawn_manifest("agent-spawn-manifest-fsv", &params);
+        assert!(manifest["model"].is_null());
     }
 
     #[test]

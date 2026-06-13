@@ -43,6 +43,9 @@ const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u64 = 60_000;
 const MAX_AGENT_SPAWN_PROMPT_BYTES: usize = 128 * 1024;
+/// Upper bound on a spawn `model` id. Generous for provider/version/ARN-style
+/// ids (matches the cost table's `MODEL_PRICE_MAX_ID_CHARS`).
+const MAX_AGENT_SPAWN_MODEL_BYTES: usize = 256;
 const MAX_SHELL_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
@@ -859,6 +862,16 @@ pub enum ActSpawnAgentTarget {
 #[serde(deny_unknown_fields)]
 pub struct ActSpawnAgentParams {
     pub cli: ActSpawnAgentCli,
+    /// Optional model id for the spawned agent (Claude `--model`, Codex
+    /// `-m/--model`). When set it is also recorded in the spawn manifest so the
+    /// transcript ingester can attribute the spawn's cost — the Codex
+    /// `exec --json` stream carries no model id, so capturing it at spawn time
+    /// is the only authoritative source (#949). Omit to use the CLI's own
+    /// configured default; the spawn is then honestly reported as the model id
+    /// the stream surfaces, or `unknown`/unpriced if none.
+    #[serde(default)]
+    #[schemars(default)]
+    pub model: Option<String>,
     /// Optional work prompt for the spawned primary agent. Synapse prepends a
     /// mandatory provisioning preflight that calls health/tools through the real
     /// client MCP surface and binds the requested target.
@@ -1007,6 +1020,29 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 "act_spawn_agent working_dir must not be empty",
+            ));
+        }
+    }
+    if let Some(model) = &params.model {
+        if model.trim().is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent model must not be empty when provided",
+            ));
+        }
+        if model.len() > MAX_AGENT_SPAWN_MODEL_BYTES {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("act_spawn_agent model must be <= {MAX_AGENT_SPAWN_MODEL_BYTES} bytes"),
+            ));
+        }
+        // Model ids are passed to the CLI as a single argv element; reject
+        // anything that is not a printable, whitespace-free token so it cannot
+        // smuggle extra arguments or control characters into the launch.
+        if model.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent model must not contain whitespace or control characters",
             ));
         }
     }

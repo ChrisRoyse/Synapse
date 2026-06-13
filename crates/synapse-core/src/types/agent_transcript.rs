@@ -171,7 +171,15 @@ pub struct TranscriptToolCall {
 /// Codex `cached_input_tokens` maps to `cache_read_input_tokens`;
 /// `reasoning_output_tokens` is carried separately because no core `OTel`
 /// attribute exists for it yet.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// `cache_creation_input_tokens` is the *aggregate* cache-write count.
+/// Anthropic additionally splits it by TTL tier
+/// (`cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}`),
+/// which are billed at different multipliers (1.25x vs 2x base input, #949).
+/// Those tier counts are captured here when present so the cost engine can
+/// price each TTL exactly; their sum is always a subset of (normally equal to)
+/// the aggregate. They are absent on Codex rows, which have no cache writes.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,12 +190,28 @@ pub struct TranscriptUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Anthropic 5-minute-TTL cache-write tokens (subset of the aggregate),
+    /// billed at 1.25x base input. `None` when the stream did not report a
+    /// tier split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_input_tokens: Option<u64>,
+    /// Anthropic 1-hour-TTL cache-write tokens (subset of the aggregate),
+    /// billed at 2x base input. `None` when the stream did not report a split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_output_tokens: Option<u64>,
     /// Claude `result` lines report a total cost; stored in micro-USD so the
     /// record stays integer-exact (`total_cost_usd * 1_000_000`, rounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_micro_usd: Option<u64>,
+    /// Claude `result.modelUsage` per-model breakdown. A single session can use
+    /// several models (e.g. a primary model plus a fast sub-agent model); the
+    /// top-level `usage` reflects only the primary, so multi-model sessions
+    /// undercount without this map (#949). Empty on every non-`result` row and
+    /// on Codex rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_usage: Vec<TranscriptModelUsage>,
 }
 
 impl TranscriptUsage {
@@ -198,9 +222,29 @@ impl TranscriptUsage {
             && self.output_tokens.is_none()
             && self.cache_read_input_tokens.is_none()
             && self.cache_creation_input_tokens.is_none()
+            && self.cache_creation_5m_input_tokens.is_none()
+            && self.cache_creation_1h_input_tokens.is_none()
             && self.reasoning_output_tokens.is_none()
             && self.total_cost_micro_usd.is_none()
+            && self.model_usage.is_empty()
     }
+}
+
+/// One model's slice of a Claude `result.modelUsage` map (#949).
+///
+/// Token counts are disjoint exactly as the top-level Claude usage is;
+/// `cost_micro_usd` is the CLI's own per-model cost (`costUSD`), stored
+/// integer-exact in micro-USD for reconciliation cross-check.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptModelUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
 }
 
 impl AgentTranscriptRecord {

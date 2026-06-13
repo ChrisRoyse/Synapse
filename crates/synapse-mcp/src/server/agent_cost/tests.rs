@@ -93,8 +93,11 @@ fn claude_usage(
         output_tokens: Some(output),
         cache_read_input_tokens: Some(cr),
         cache_creation_input_tokens: Some(cc),
+        cache_creation_5m_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_output_tokens: None,
         total_cost_micro_usd: cost_micro,
+        model_usage: Vec::new(),
     }
 }
 
@@ -104,8 +107,11 @@ fn codex_usage(input: u64, output: u64, cached: u64, reasoning: u64) -> Transcri
         output_tokens: Some(output),
         cache_read_input_tokens: Some(cached),
         cache_creation_input_tokens: None,
+        cache_creation_5m_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_output_tokens: Some(reasoning),
         total_cost_micro_usd: None,
+        model_usage: Vec::new(),
     }
 }
 
@@ -117,6 +123,37 @@ fn fable_price() -> AgentCostPricePutParams {
         output_usd_per_mtok: 15.0,
         cache_read_usd_per_mtok: 0.30,
         cache_creation_usd_per_mtok: 3.75,
+        cache_creation_5m_usd_per_mtok: None,
+        cache_creation_1h_usd_per_mtok: None,
+    }
+}
+
+/// Real published Claude Fable 5 rates, including the distinct 5m/1h cache-write
+/// tiers, so a priced rollup reproduces Claude's own `modelUsage` cost exactly.
+fn fable_price_real() -> AgentCostPricePutParams {
+    AgentCostPricePutParams {
+        model_id: "claude-fable-5".to_owned(),
+        provider: Some("anthropic".to_owned()),
+        input_usd_per_mtok: 10.0,
+        output_usd_per_mtok: 50.0,
+        cache_read_usd_per_mtok: 1.0,
+        cache_creation_usd_per_mtok: 12.5, // aggregate == 5m write
+        cache_creation_5m_usd_per_mtok: Some(12.5),
+        cache_creation_1h_usd_per_mtok: Some(20.0),
+    }
+}
+
+/// Real published Claude Haiku 4.5 rates (the multi-model session's sub-agent).
+fn haiku_price_real() -> AgentCostPricePutParams {
+    AgentCostPricePutParams {
+        model_id: "claude-haiku-4-5-20251001".to_owned(),
+        provider: Some("anthropic".to_owned()),
+        input_usd_per_mtok: 1.0,
+        output_usd_per_mtok: 5.0,
+        cache_read_usd_per_mtok: 0.10,
+        cache_creation_usd_per_mtok: 1.25,
+        cache_creation_5m_usd_per_mtok: Some(1.25),
+        cache_creation_1h_usd_per_mtok: Some(2.0),
     }
 }
 
@@ -265,6 +302,8 @@ fn codex_takes_cumulative_max_and_subtracts_cache() {
             output_usd_per_mtok: 14.0,
             cache_read_usd_per_mtok: 0.175,
             cache_creation_usd_per_mtok: 0.0,
+            cache_creation_5m_usd_per_mtok: None,
+            cache_creation_1h_usd_per_mtok: None,
         })
         .expect("price");
 
@@ -456,7 +495,7 @@ fn authoritative_row(db: &Db, spawn_id: &str, want_kind_prefix: &str) -> AgentTr
 }
 
 #[test]
-fn fsv_claude_real_fixture_reconciles_with_cli_reported_cost() {
+fn fsv_claude_real_fixture_multi_model_attribution_reconciles_to_zero() {
     let temp = TempDir::new().expect("tempdir");
     let service = service_with_db(temp.path());
     let db = db_of(&service);
@@ -468,48 +507,121 @@ fn fsv_claude_real_fixture_reconciles_with_cli_reported_cost() {
     let outcome = ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
     assert_eq!(outcome.new_invalid_rows, 0, "a real capture must parse fully");
 
-    // 2. Source of truth: the physical result row carries the cumulative
-    //    session usage AND Claude's own total_cost_usd ($0.864631).
+    // 2. Source of truth: the physical result row carries the cache-creation
+    //    TTL split (#949 part 3) and the per-model breakdown (#949 part 2).
     let result = authoritative_row(&db, spawn, "result/");
     let usage = result.usage.expect("result row carries usage");
-    assert_eq!(usage.input_tokens, Some(4118));
-    assert_eq!(usage.output_tokens, Some(1906));
-    assert_eq!(usage.cache_read_input_tokens, Some(283_040));
     assert_eq!(usage.cache_creation_input_tokens, Some(22_189));
+    assert_eq!(usage.cache_creation_5m_input_tokens, Some(0));
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(22_189));
     assert_eq!(usage.total_cost_micro_usd, Some(864_631));
+    // The real session used TWO models; the top-level usage reflects only the
+    // primary (claude-fable-5), so the breakdown is required for exactness.
+    assert_eq!(usage.model_usage.len(), 2, "fixture is a multi-model session");
+    let fable = usage
+        .model_usage
+        .iter()
+        .find(|m| m.model == "claude-fable-5")
+        .expect("fable present");
+    assert_eq!(fable.input_tokens, 4118);
+    assert_eq!(fable.cache_creation_input_tokens, 22_189);
+    assert_eq!(fable.cost_micro_usd, Some(863_300)); // $0.8633
+    let haiku = usage
+        .model_usage
+        .iter()
+        .find(|m| m.model == "claude-haiku-4-5-20251001")
+        .expect("haiku present");
+    assert_eq!(haiku.input_tokens, 1246);
+    assert_eq!(haiku.cost_micro_usd, Some(1_331)); // $0.001331
     println!(
-        "FSV[claude] physical result row: in={:?} out={:?} cr={:?} cc={:?} cost_micro={:?} model={:?}",
-        usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens,
-        usage.cache_creation_input_tokens, usage.total_cost_micro_usd, result.model
+        "FSV[claude] modelUsage: fable={:?} haiku={:?} top_level_cc_1h={:?} session_cost_micro={:?}",
+        fable.cost_micro_usd, haiku.cost_micro_usd,
+        usage.cache_creation_1h_input_tokens, usage.total_cost_micro_usd
     );
 
-    // 3. Price the primary model and roll up.
-    service.agent_cost_price_put_impl(fable_price()).expect("price");
+    // 3. Price BOTH models at their real published rates (with TTL tiers) and
+    //    roll up.
+    service.agent_cost_price_put_impl(fable_price_real()).expect("price fable");
+    service.agent_cost_price_put_impl(haiku_price_real()).expect("price haiku");
     let out = service
         .agent_cost_impl(cost_params(Some(spawn), None, None))
         .expect("rollup");
     let s = &out.per_spawn[0];
 
-    // 4. Reconcile: billed usage == the physical result row exactly.
-    assert_eq!(s.usage.input_tokens, 4118);
-    assert_eq!(s.usage.output_tokens, 1906);
+    // 4. Billed usage == the SUM across models (not just the primary): the
+    //    multi-model session no longer undercounts.
+    assert_eq!(s.usage.input_tokens, 4118 + 1246); // 5364
+    assert_eq!(s.usage.output_tokens, 1906 + 17); // 1923
     assert_eq!(s.usage.cache_read_tokens, 283_040);
     assert_eq!(s.usage.cache_creation_tokens, 22_189);
-    // Computed cost is hand-verifiable (same arithmetic as the synthetic test).
+    assert_eq!(s.usage.cache_creation_1h_tokens, 22_189);
+
+    // 5. THE #949 ACCEPTANCE: exact per-model attribution + per-TTL cache
+    //    pricing drives the reconciliation delta to ZERO.
     let computed = match &s.cost {
         CostOutcome::Priced { cost } => cost.total_micro_usd,
         CostOutcome::Unpriced { .. } => panic!("priced"),
     };
-    assert_eq!(computed, 209_064);
-    // The CLI's own total ($0.864631) is surfaced for cross-check, and the
-    // reconciliation delta exposes the multi-model gap (#900 stores only the
-    // primary-model result usage) instead of hiding it.
+    assert_eq!(computed, 864_631, "computed == sum of per-model costs");
     assert_eq!(s.source_reported_micro_usd, Some(864_631));
-    assert_eq!(s.reconciliation_delta_micro_usd, Some(864_631 - 209_064));
+    assert_eq!(
+        s.reconciliation_delta_micro_usd,
+        Some(0),
+        "multi-model session reconciles exactly"
+    );
+
+    // 6. The per-spawn breakdown carries both priced models, each matching the
+    //    CLI's own per-model costUSD.
+    assert_eq!(s.models.len(), 2);
+    let fable_cost = s.models.iter().find(|m| m.model == "claude-fable-5").expect("fable");
+    let fable_computed = match &fable_cost.cost {
+        CostOutcome::Priced { cost } => cost.total_micro_usd,
+        CostOutcome::Unpriced { .. } => panic!("fable priced"),
+    };
+    assert_eq!(fable_computed, 863_300);
+    assert_eq!(fable_cost.source_reported_micro_usd, Some(863_300));
+    let haiku_cost = s.models.iter().find(|m| m.model == "claude-haiku-4-5-20251001").expect("haiku");
+    let haiku_computed = match &haiku_cost.cost {
+        CostOutcome::Priced { cost } => cost.total_micro_usd,
+        CostOutcome::Unpriced { .. } => panic!("haiku priced"),
+    };
+    assert_eq!(haiku_computed, 1_331);
     println!(
-        "FSV[claude] computed_micro={computed} source_reported_micro={:?} delta_micro={:?}",
+        "FSV[claude] computed_micro={computed} source_reported_micro={:?} delta_micro={:?} (fable={fable_computed} + haiku={haiku_computed})",
         s.source_reported_micro_usd, s.reconciliation_delta_micro_usd
     );
+
+    assert_eq!(out.fleet.computed_micro_usd, 864_631);
+    assert!(out.fleet.unpriced_models.is_empty(), "both models priced");
+}
+
+#[test]
+fn fsv_claude_partial_pricing_surfaces_unpriced_side_model() {
+    // When the operator prices only the primary model, the sub-agent model is
+    // honestly surfaced as unpriced and the delta exposes exactly its cost —
+    // never hidden, never guessed.
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    let root = TempDir::new().expect("spawn root");
+    let spawn = "agent-spawn-claudepartial";
+
+    let log_dir = plant_spawn_dir(root.path(), spawn, TranscriptSource::ClaudeStreamJson, CLAUDE_REAL_STREAM);
+    ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
+    service.agent_cost_price_put_impl(fable_price_real()).expect("price fable only");
+
+    let out = service
+        .agent_cost_impl(cost_params(Some(spawn), None, None))
+        .expect("rollup");
+    let s = &out.per_spawn[0];
+    let computed = match &s.cost {
+        CostOutcome::Priced { cost } => cost.total_micro_usd,
+        CostOutcome::Unpriced { .. } => panic!("fable is priced"),
+    };
+    assert_eq!(computed, 863_300, "only fable's cost is computed");
+    // Delta == exactly haiku's cost ($0.001331): the gap is surfaced, not hidden.
+    assert_eq!(s.reconciliation_delta_micro_usd, Some(864_631 - 863_300));
+    assert_eq!(out.fleet.unpriced_models, vec!["claude-haiku-4-5-20251001".to_owned()]);
 }
 
 #[test]
@@ -553,6 +665,73 @@ fn fsv_codex_real_fixture_bills_cumulative_turn_with_cache_subtracted() {
         CostOutcome::Priced { .. } => panic!("model was not priced"),
     }
     assert_eq!(s.total_tokens, 41_437 + 103_296 + 2_110);
+}
+
+#[test]
+fn fsv_codex_real_fixture_priced_via_spawn_manifest_model() {
+    // The Codex `exec --json` stream carries no model id (#949 part 1). The
+    // spawn manifest written at launch is the authoritative source; the ingester
+    // seeds the cursor from it so every Codex row is stamped and priceable.
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    let root = TempDir::new().expect("spawn root");
+    let spawn = "agent-spawn-codexmanifest";
+
+    let log_dir = plant_spawn_dir(root.path(), spawn, TranscriptSource::CodexExecJson, CODEX_REAL_STREAM);
+    // Write the real manifest shape act_spawn_agent emits.
+    std::fs::write(
+        log_dir.join("spawn-manifest.json"),
+        br#"{"version":1,"spawn_id":"agent-spawn-codexmanifest","cli":"codex","model":"gpt-5-codex","created_unix_ms":1781309519461}"#,
+    )
+    .expect("manifest");
+
+    let outcome = ingest_spawn_dir_once(&db, spawn, &log_dir, false).expect("ingest");
+    assert_eq!(outcome.new_invalid_rows, 0, "a real capture must parse fully");
+
+    // FSV: the physical turn.completed row now carries the manifest model.
+    let turn = authoritative_row(&db, spawn, "turn.completed");
+    assert_eq!(
+        turn.model.as_deref(),
+        Some("gpt-5-codex"),
+        "manifest model must be stamped onto Codex rows"
+    );
+    println!("FSV[codex] manifest-stamped model on physical row: {:?}", turn.model);
+
+    // Price the model and confirm the Codex spawn is now PRICED, not unknown.
+    service
+        .agent_cost_price_put_impl(AgentCostPricePutParams {
+            model_id: "gpt-5-codex".to_owned(),
+            provider: Some("openai".to_owned()),
+            input_usd_per_mtok: 1.25,
+            output_usd_per_mtok: 10.0,
+            cache_read_usd_per_mtok: 0.125,
+            cache_creation_usd_per_mtok: 0.0,
+            cache_creation_5m_usd_per_mtok: None,
+            cache_creation_1h_usd_per_mtok: None,
+        })
+        .expect("price");
+    let out = service
+        .agent_cost_impl(cost_params(Some(spawn), None, None))
+        .expect("rollup");
+    let s = &out.per_spawn[0];
+    assert_eq!(s.model.as_deref(), Some("gpt-5-codex"));
+    // input 144733 - cached 103296 = 41437 full-rate.
+    //   input      = 41437  * 1_250_000 /1e6 = 51_796 (floor 51796.25)
+    //   output     = 2110   * 10_000_000/1e6 = 21_100
+    //   cache_read = 103296 * 125_000   /1e6 = 12_912 (floor 12912.0)
+    //   total = 85_808
+    match &s.cost {
+        CostOutcome::Priced { cost } => {
+            assert_eq!(cost.input_micro_usd, 51_796);
+            assert_eq!(cost.output_micro_usd, 21_100);
+            assert_eq!(cost.cache_read_micro_usd, 12_912);
+            assert_eq!(cost.total_micro_usd, 85_808);
+            println!("FSV[codex] priced via manifest model: total_micro={}", cost.total_micro_usd);
+        }
+        CostOutcome::Unpriced { model_id } => panic!("must be priced, got unpriced {model_id}"),
+    }
+    assert!(out.fleet.unpriced_models.is_empty(), "model is priced");
 }
 
 #[test]

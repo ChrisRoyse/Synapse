@@ -71,10 +71,20 @@ pub struct ModelPrice {
     /// Cache-read (hit) token rate, micro-USD per million tokens. For Claude
     /// this is the 0.1x base read rate; for `OpenAI` the discounted cached rate.
     pub cache_read_micro_usd_per_mtok: u64,
-    /// Cache-creation (write) token rate, micro-USD per million tokens. For
-    /// Claude this is the 1.25x (5m) or 2x (1h) write rate; `OpenAI` does not
-    /// bill cache writes, so `0` is appropriate there.
+    /// Aggregate cache-creation (write) token rate, micro-USD per million
+    /// tokens. Used for cache-write tokens with no reported TTL tier (and as
+    /// the per-tier rate when the tier-specific rate below is unset). For
+    /// `OpenAI` this is `0` — `OpenAI` does not bill cache writes.
     pub cache_creation_micro_usd_per_mtok: u64,
+    /// Anthropic 5-minute-TTL cache-write rate (1.25x base input), micro-USD
+    /// per million tokens. `None` falls back to the aggregate rate above, so a
+    /// run that mixes TTLs is priced exactly once both tiers are set (#949).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_micro_usd_per_mtok: Option<u64>,
+    /// Anthropic 1-hour-TTL cache-write rate (2x base input), micro-USD per
+    /// million tokens. `None` falls back to the aggregate rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_micro_usd_per_mtok: Option<u64>,
     /// When this row was last written (unix nanoseconds).
     pub updated_ts_ns: u64,
 }
@@ -141,10 +151,34 @@ impl ModelPrice {
         let input = line(usage.input_tokens, self.input_micro_usd_per_mtok);
         let output = line(usage.output_tokens, self.output_micro_usd_per_mtok);
         let cache_read = line(usage.cache_read_tokens, self.cache_read_micro_usd_per_mtok);
-        let cache_creation = line(
-            usage.cache_creation_tokens,
-            self.cache_creation_micro_usd_per_mtok,
-        );
+        // Cache writes are billed per TTL tier (1.25x vs 2x base input). When
+        // the transcript reported a tier split, each tier is priced at its own
+        // rate; any untagged remainder (and the whole amount when no split was
+        // reported) is priced at the aggregate rate. A tier rate left unset on
+        // the price row falls back to the aggregate rate so a partially-priced
+        // table never silently drops a dimension.
+        let tagged = usage
+            .cache_creation_5m_tokens
+            .saturating_add(usage.cache_creation_1h_tokens);
+        if tagged > usage.cache_creation_tokens {
+            return Err(format!(
+                "MODEL_PRICE_USAGE_INVALID: tagged cache-creation tokens {tagged} (5m {} + 1h {}) \
+                 exceed the aggregate {} — the TTL split must be a subset",
+                usage.cache_creation_5m_tokens,
+                usage.cache_creation_1h_tokens,
+                usage.cache_creation_tokens
+            ));
+        }
+        let untagged = usage.cache_creation_tokens - tagged;
+        let rate_5m = self
+            .cache_creation_5m_micro_usd_per_mtok
+            .unwrap_or(self.cache_creation_micro_usd_per_mtok);
+        let rate_1h = self
+            .cache_creation_1h_micro_usd_per_mtok
+            .unwrap_or(self.cache_creation_micro_usd_per_mtok);
+        let cache_creation = line(usage.cache_creation_5m_tokens, rate_5m)
+            + line(usage.cache_creation_1h_tokens, rate_1h)
+            + line(untagged, self.cache_creation_micro_usd_per_mtok);
         let total = input + output + cache_read + cache_creation;
         let to_u64 = |value: u128, label: &str| -> Result<u64, String> {
             u64::try_from(value).map_err(|_e| {
@@ -176,8 +210,16 @@ pub struct BillableUsage {
     pub output_tokens: u64,
     /// Cache-read (hit) tokens, billed at the cache-read rate.
     pub cache_read_tokens: u64,
-    /// Cache-creation (write) tokens, billed at the cache-write rate.
+    /// Cache-creation (write) tokens, billed at the cache-write rate. This is
+    /// the aggregate; the two tier fields below are subsets of it.
     pub cache_creation_tokens: u64,
+    /// 5-minute-TTL portion of `cache_creation_tokens` (1.25x base input).
+    /// `0` when the source reported no tier split.
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    /// 1-hour-TTL portion of `cache_creation_tokens` (2x base input).
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
 }
 
 impl BillableUsage {
@@ -200,7 +242,9 @@ impl BillableUsage {
     }
 
     /// Builds canonical usage from a **Claude** usage block, whose dimensions
-    /// are already disjoint. The four counts map straight across.
+    /// are already disjoint. The four counts map straight across; the
+    /// cache-creation TTL tiers are left unsplit (priced at the aggregate
+    /// rate). Use [`Self::from_claude_with_ttl`] when the tier split is known.
     #[must_use]
     pub const fn from_claude(
         input_tokens: u64,
@@ -213,6 +257,32 @@ impl BillableUsage {
             output_tokens,
             cache_read_tokens: cache_read_input_tokens,
             cache_creation_tokens: cache_creation_input_tokens,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+        }
+    }
+
+    /// Builds canonical Claude usage carrying the cache-creation TTL split, so
+    /// the cost engine can price 5m and 1h writes at their distinct rates
+    /// (#949). The two tier counts must each be `<= cache_creation_input_tokens`
+    /// and their sum must not exceed it; the pricing function enforces the
+    /// subset invariant and surfaces a violation rather than clamping.
+    #[must_use]
+    pub const fn from_claude_with_ttl(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_creation_5m_tokens: u64,
+        cache_creation_1h_tokens: u64,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: cache_read_input_tokens,
+            cache_creation_tokens: cache_creation_input_tokens,
+            cache_creation_5m_tokens,
+            cache_creation_1h_tokens,
         }
     }
 
@@ -242,6 +312,8 @@ impl BillableUsage {
             output_tokens,
             cache_read_tokens: cached_input_tokens,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         })
     }
 }
@@ -282,6 +354,8 @@ mod tests {
             output_micro_usd_per_mtok: output,
             cache_read_micro_usd_per_mtok: cr,
             cache_creation_micro_usd_per_mtok: cc,
+            cache_creation_5m_micro_usd_per_mtok: None,
+            cache_creation_1h_micro_usd_per_mtok: None,
             updated_ts_ns: 1,
         }
     }
@@ -297,6 +371,62 @@ mod tests {
         assert_eq!(cost.cache_read_micro_usd, 300_000);
         assert_eq!(cost.cache_creation_micro_usd, 3_750_000);
         assert_eq!(cost.total_micro_usd, 22_050_000);
+    }
+
+    #[test]
+    fn cache_creation_ttl_tiers_priced_at_distinct_rates() {
+        // Real Claude Fable 5 published rates: $10 base input, $50 output,
+        // $1 cache read, $12.50 5m-write (1.25x), $20 1h-write (2x).
+        let p = ModelPrice {
+            version: MODEL_PRICE_VERSION,
+            model_id: "test-model".to_owned(),
+            provider: None,
+            input_micro_usd_per_mtok: 10_000_000,
+            output_micro_usd_per_mtok: 50_000_000,
+            cache_read_micro_usd_per_mtok: 1_000_000,
+            cache_creation_micro_usd_per_mtok: 12_500_000, // aggregate == 5m
+            cache_creation_5m_micro_usd_per_mtok: Some(12_500_000),
+            cache_creation_1h_micro_usd_per_mtok: Some(20_000_000),
+            updated_ts_ns: 1,
+        };
+        // The real claude_stream_real.jsonl Fable 5 slice: in=4118, out=1906,
+        // cache_read=283040, cache_creation=22189 ALL in the 1h tier.
+        let usage = BillableUsage::from_claude_with_ttl(4118, 1906, 283_040, 22_189, 0, 22_189);
+        let cost = p.cost_micro_usd(&usage).expect("prices");
+        assert_eq!(cost.input_micro_usd, 41_180); // 4118 * 10
+        assert_eq!(cost.output_micro_usd, 95_300); // 1906 * 50
+        assert_eq!(cost.cache_read_micro_usd, 283_040); // 283040 * 1
+        // Priced at the 1h rate ($20), NOT the 5m/aggregate rate ($12.50):
+        assert_eq!(cost.cache_creation_micro_usd, 443_780); // 22189 * 20
+        // 41180 + 95300 + 283040 + 443780 == 863300 micro == $0.8633, which is
+        // exactly the modelUsage costUSD Claude reported for claude-fable-5.
+        assert_eq!(cost.total_micro_usd, 863_300);
+    }
+
+    #[test]
+    fn untagged_cache_creation_uses_aggregate_rate() {
+        // No tier split reported (from_claude): the whole aggregate prices at
+        // the aggregate rate, preserving pre-#949 behavior.
+        let p = price(0, 0, 0, 3_750_000);
+        let usage = BillableUsage::from_claude(0, 0, 0, 1000);
+        assert_eq!(p.cost_micro_usd(&usage).expect("ok").cache_creation_micro_usd, 3_750);
+    }
+
+    #[test]
+    fn tier_rate_unset_falls_back_to_aggregate() {
+        // 1h tokens present but no 1h rate set -> aggregate rate used, never 0.
+        let p = price(0, 0, 0, 3_750_000);
+        let usage = BillableUsage::from_claude_with_ttl(0, 0, 0, 1000, 0, 1000);
+        assert_eq!(p.cost_micro_usd(&usage).expect("ok").cache_creation_micro_usd, 3_750);
+    }
+
+    #[test]
+    fn cache_creation_tier_overflow_is_rejected() {
+        let p = price(0, 0, 0, 1);
+        // Tagged (600 + 600 = 1200) exceeds the aggregate (1000): corrupt.
+        let usage = BillableUsage::from_claude_with_ttl(0, 0, 0, 1000, 600, 600);
+        let err = p.cost_micro_usd(&usage).expect_err("must reject");
+        assert!(err.contains("MODEL_PRICE_USAGE_INVALID"), "{err}");
     }
 
     #[test]

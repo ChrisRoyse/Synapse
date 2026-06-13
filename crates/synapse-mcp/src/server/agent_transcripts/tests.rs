@@ -144,7 +144,7 @@ fn claude_real_stream_reconciles_line_for_line() {
     let (_last, result) = rows.last().expect("rows");
     assert_eq!(result.role, Some(TranscriptRole::Result));
     assert_eq!(result.event_kind.as_deref(), Some("result/success"));
-    let usage = result.usage.expect("result line carries usage");
+    let usage = result.usage.as_ref().expect("result line carries usage");
     assert!(usage.input_tokens.is_some(), "usage must carry input tokens");
     assert!(
         usage.total_cost_micro_usd.is_some(),
@@ -213,7 +213,7 @@ fn codex_real_stream_reconciles_line_for_line() {
     let (_last_no, last) = rows.last().expect("rows");
     assert_eq!(last.event_kind.as_deref(), Some("turn.completed"));
     assert_eq!(last.conversation_id.as_deref(), Some(thread_id));
-    let usage = last.usage.expect("turn.completed carries usage");
+    let usage = last.usage.as_ref().expect("turn.completed carries usage");
     assert!(
         usage.cache_read_input_tokens.is_some(),
         "codex cached_input_tokens must map to cache_read_input_tokens"

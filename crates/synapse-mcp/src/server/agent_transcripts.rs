@@ -53,8 +53,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use synapse_core::{
     AGENT_TRANSCRIPT_MAX_SUMMARY_CHARS, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS,
-    AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS, AgentTranscriptRecord, TranscriptParseStatus,
-    TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
+    AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS, AgentTranscriptRecord, TranscriptModelUsage,
+    TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::{
     Db, agent_transcripts::agent_transcript_key, agent_transcripts::agent_transcript_spawn_prefix,
@@ -225,6 +225,23 @@ fn detect_source(log_dir: &Path) -> Result<TranscriptSource, String> {
     }
 }
 
+/// Reads the model id recorded in the spawn manifest, if present. This is the
+/// authoritative model source for Codex spawns, whose `exec --json` stream
+/// carries no model id (#949); for Claude it merely seeds the cursor until the
+/// stream's own (more specific) model id supersedes it. A missing or malformed
+/// manifest is not an error here — the spawn simply has no pinned model, and a
+/// model-less spawn is honestly reported as `unknown`/unpriced downstream.
+fn read_spawn_manifest_model(log_dir: &Path) -> Option<String> {
+    let path = log_dir.join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
+    let bytes = std::fs::read(&path).ok()?;
+    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
+    let model = manifest.get("model")?.as_str()?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    Some(model.to_owned())
+}
+
 fn load_cursor(db: &Db, spawn_id: &str) -> Result<Option<TranscriptCursor>, String> {
     let key = cursor_kv_key(spawn_id);
     let rows = db
@@ -351,7 +368,9 @@ pub(crate) fn ingest_spawn_dir_once(
                 turn_index: 0,
                 last_assistant_message_id: None,
                 conversation_id: None,
-                model: None,
+                // Seed from the spawn manifest. For Codex this is the only model
+                // source; for Claude the stream supersedes it (#949).
+                model: read_spawn_manifest_model(log_dir),
                 source_complete: false,
                 completed_reason: None,
                 error: None,
@@ -1071,6 +1090,12 @@ fn parse_claude_object(
                 let micro = (cost * 1_000_000.0).round().max(0.0) as u64;
                 usage.total_cost_micro_usd = Some(micro);
             }
+            // The per-model breakdown lets the cost engine attribute a
+            // multi-model session exactly; the top-level `usage` above reflects
+            // only the primary model (#949).
+            if let Some(model_usage) = object.get("modelUsage") {
+                usage.model_usage = claude_model_usage(model_usage)?;
+            }
             if !usage.is_empty() {
                 record.usage = Some(usage);
             }
@@ -1084,6 +1109,16 @@ fn parse_claude_object(
 }
 
 fn claude_usage(usage: &Value) -> TranscriptUsage {
+    // The cache-creation TTL split lives in a nested `cache_creation` object
+    // (`ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`); the two tiers
+    // are billed at 1.25x vs 2x base input, so capturing them lets the cost
+    // engine price a mixed-TTL run exactly (#949).
+    let cache_creation = usage.get("cache_creation");
+    let tier = |field: &str| -> Option<u64> {
+        cache_creation
+            .and_then(|cc| cc.get(field))
+            .and_then(Value::as_u64)
+    };
     TranscriptUsage {
         input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
         output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
@@ -1091,9 +1126,40 @@ fn claude_usage(usage: &Value) -> TranscriptUsage {
         cache_creation_input_tokens: usage
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64),
+        cache_creation_5m_input_tokens: tier("ephemeral_5m_input_tokens"),
+        cache_creation_1h_input_tokens: tier("ephemeral_1h_input_tokens"),
         reasoning_output_tokens: None,
         total_cost_micro_usd: None,
+        model_usage: Vec::new(),
     }
+}
+
+/// Parses a Claude `result.modelUsage` map into the per-model breakdown.
+/// Keys are model ids; values carry camelCase token counts and a per-model
+/// `costUSD`. Returns the entries sorted by model id for deterministic rows.
+fn claude_model_usage(model_usage: &Value) -> Result<Vec<TranscriptModelUsage>, String> {
+    let Some(map) = model_usage.as_object() else {
+        return Err("RESULT_MODEL_USAGE_NOT_OBJECT".to_owned());
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (model, entry) in map {
+        let field = |name: &str| -> u64 { entry.get(name).and_then(Value::as_u64).unwrap_or(0) };
+        let cost_micro_usd = entry.get("costUSD").and_then(Value::as_f64).map(|cost| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let micro = (cost * 1_000_000.0).round().max(0.0) as u64;
+            micro
+        });
+        out.push(TranscriptModelUsage {
+            model: model.clone(),
+            input_tokens: field("inputTokens"),
+            output_tokens: field("outputTokens"),
+            cache_read_input_tokens: field("cacheReadInputTokens"),
+            cache_creation_input_tokens: field("cacheCreationInputTokens"),
+            cost_micro_usd,
+        });
+    }
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    Ok(out)
 }
 
 /// Codex `exec --json` vocabulary, pinned to the event shapes captured from
@@ -1136,10 +1202,15 @@ fn parse_codex_object(
                 // Codex reports cache hits as `cached_input_tokens`.
                 cache_read_input_tokens: usage.get("cached_input_tokens").and_then(Value::as_u64),
                 cache_creation_input_tokens: None,
+                // Codex (OpenAI) does not bill cache writes, so there is no
+                // cache-creation tier split and no per-model breakdown.
+                cache_creation_5m_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
                 reasoning_output_tokens: usage
                     .get("reasoning_output_tokens")
                     .and_then(Value::as_u64),
                 total_cost_micro_usd: None,
+                model_usage: Vec::new(),
             });
             Ok(())
         }
