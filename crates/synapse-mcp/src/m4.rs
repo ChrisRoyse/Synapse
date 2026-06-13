@@ -1314,7 +1314,7 @@ pub async fn run_authorized_shell(
             requested_execution_mode,
         )
     } else {
-        run_allowlisted_shell(params, context).await?
+        run_allowlisted_shell(params, inline_await_limit_ms, context).await?
     };
     let trace_command_line = if let Some(job) = &result.job {
         job.command_line.as_str()
@@ -5997,7 +5997,9 @@ async fn monitor_shell_job(
         let timeout_ms = status.timeout_ms.unwrap_or_default();
         status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
         status.error_message = Some(format!(
-            "durable job timeout_ms cap expired after {timeout_ms} ms; process tree termination was requested"
+            "durable job timeout_ms cap expired after {timeout_ms} ms; the process tree was terminated. \
+             Durable jobs are unbounded by default — omit durable_timeout_ms (or raise it) to let the job \
+             run until it exits or is cancelled with act_run_shell_cancel."
         ));
         mark_shell_job_remote_cleanup_unverified(
             &mut status,
@@ -6548,6 +6550,7 @@ fn wait_for_shell_job_process_tree_exit(process_ids: &[u32], timeout: Duration) 
 
 async fn run_allowlisted_shell(
     params: ActRunShellParams,
+    inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
     let started = Instant::now();
@@ -6557,7 +6560,12 @@ async fn run_allowlisted_shell(
     let (exit_code, timed_out) = wait_shell_child(&mut spawned.child, params.timeout_ms).await?;
     let stdout = join_capped_stream(stdout_task, "stdout").await?;
     let stderr = join_capped_stream(stderr_task, "stderr").await?;
-    let (error_code, error_message) = shell_budget_error(timed_out, params.timeout_ms);
+    let (error_code, error_message) = shell_budget_error(
+        timed_out,
+        params.timeout_ms,
+        requested_execution_mode,
+        inline_await_limit_ms,
+    );
     Ok(ActRunShellResponse {
         exit_code,
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
@@ -6585,17 +6593,39 @@ async fn run_allowlisted_shell(
     })
 }
 
-fn shell_budget_error(timed_out: bool, timeout_ms: u64) -> (Option<String>, Option<String>) {
-    if timed_out {
-        (
-            Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned()),
-            Some(format!(
-                "caller timeout_ms budget expired after {timeout_ms} ms; process tree termination was requested"
-            )),
-        )
-    } else {
-        (None, None)
+fn shell_budget_error(
+    timed_out: bool,
+    timeout_ms: u64,
+    execution_mode: ActRunShellExecutionMode,
+    inline_await_limit_ms: u64,
+) -> (Option<String>, Option<String>) {
+    if !timed_out {
+        return (None, None);
     }
+    // The caller's own timeout_ms budget expired while running inline. The message must name the
+    // failure, the cause, and a concrete remediation the caller can act on without consulting docs
+    // (Google AIP-193 / "Fail Fast with Actionable Errors"): how to get more time in a single call.
+    let remediation = match execution_mode {
+        ActRunShellExecutionMode::Inline => {
+            "execution_mode=\"inline\" honors any timeout_ms with no daemon cap, so raise timeout_ms \
+             to allow more time, or switch to execution_mode=\"durable\" (or act_run_shell_start) for \
+             an unbounded background job polled with act_run_shell_status"
+                .to_owned()
+        }
+        // Durable execution backgrounds before reaching the inline path, so this arm is defensive.
+        ActRunShellExecutionMode::Auto | ActRunShellExecutionMode::Durable => format!(
+            "raise timeout_ms above the {inline_await_limit_ms} ms inline await limit to auto-background \
+             into a durable job polled with act_run_shell_status, or set execution_mode=\"inline\" to \
+             wait for any timeout_ms inline with no daemon cap"
+        ),
+    };
+    (
+        Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned()),
+        Some(format!(
+            "caller timeout_ms budget expired after {timeout_ms} ms; the process tree was terminated. \
+             To allow more time in a single call: {remediation}."
+        )),
+    )
 }
 
 struct SpawnedShellChild {
@@ -9158,6 +9188,92 @@ mod tests {
             Some(ActRunShellExecutionMode::Inline)
         );
         assert_eq!(response.job_id, None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_inline_mode_waits_past_inline_await_limit() {
+        // Regression for #954: a command that runs LONGER than the daemon inline await limit must
+        // still complete inline (no hard cap) when execution_mode="inline". The inline await limit
+        // only governs the auto→durable background decision, never inline execution itself.
+        let inline_await_limit_ms = 200;
+        let mut params = shell_params(
+            "powershell.exe",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep -Milliseconds 600; Write-Output inline-slow-ok",
+            ],
+            10_000,
+        );
+        params.execution_mode = ActRunShellExecutionMode::Inline;
+        let mut config = shell_config_for(&params);
+        config.run_shell_inline_await_limit_ms = inline_await_limit_ms;
+
+        println!(
+            "readback=act_run_shell edge=inline_waits_past_limit before=inline_await_limit_ms:{inline_await_limit_ms} command_runtime_ms:~600"
+        );
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("inline execution past the await limit should complete: {error}"),
+        };
+
+        println!("readback=act_run_shell edge=inline_waits_past_limit after=response:{response:?}");
+        assert!(
+            !response.timed_out,
+            "command shorter than timeout_ms must not be killed by the inline await limit: {response:?}"
+        );
+        assert_eq!(response.exit_code, Some(0), "{response:?}");
+        assert!(!response.backgrounded, "{response:?}");
+        assert!(
+            response.stdout.contains("inline-slow-ok"),
+            "command must run to completion inline: {response:?}"
+        );
+        assert!(
+            response.duration_ms >= inline_await_limit_ms as u32,
+            "execution must have outlasted the {inline_await_limit_ms} ms inline await limit: {response:?}"
+        );
+        assert!(response.error_code.is_none(), "{response:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_budget_expiry_message_is_actionable() {
+        // When the caller's own timeout_ms budget expires, the error must point at the concrete
+        // escape hatch (execution_mode="inline" / the inline await limit) instead of dead-ending.
+        let mut params = shell_params(
+            "powershell.exe",
+            vec!["-NoProfile", "-Command", "Start-Sleep -Milliseconds 5000"],
+            400,
+        );
+        params.execution_mode = ActRunShellExecutionMode::Auto;
+        let config = shell_config_for(&params);
+
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("expired-budget command should return a timeout response: {error}"),
+        };
+
+        println!("readback=act_run_shell edge=actionable_budget_error after=response:{response:?}");
+        assert!(response.timed_out, "{response:?}");
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some(error_codes::ACTION_BUDGET_EXPIRED),
+            "{response:?}"
+        );
+        let message = response
+            .error_message
+            .as_deref()
+            .expect("expired budget must carry an error message");
+        assert!(message.contains("400 ms"), "names the expired budget: {message}");
+        assert!(
+            message.contains("execution_mode=\"inline\""),
+            "names the inline escape hatch: {message}"
+        );
+        assert!(
+            message.contains("inline await limit"),
+            "names the configurable inline await limit: {message}"
+        );
     }
 
     #[cfg(windows)]
