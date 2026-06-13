@@ -984,6 +984,15 @@ fn emit_transitions(db: &Db, transitions: &[StateTransition]) {
             );
         }
     }
+    // #948: feed live attention-state transitions to the escalation engine
+    // after the authoritative rows commit. Replayed transitions go through
+    // `apply_event` directly (rebuild_from_journal), never here, so restart
+    // never re-fires historical escalations. A failure inside the engine is
+    // logged loudly there and never unwinds this committed write.
+    let now_unix_ms = now_ns / 1_000_000;
+    for transition in transitions {
+        super::escalation::note_transition(db, transition, now_unix_ms);
+    }
     if let Some(bus) = EVENT_BUS.get() {
         for transition in transitions {
             let report = bus.publish(Event {

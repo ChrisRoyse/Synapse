@@ -401,6 +401,13 @@ fn router(
         liveness_config,
         shutdown_cancel.child_token(),
     );
+    // #948: start the AFK escalation delivery worker (Tier 0 on-PC toast +
+    // operator-supplied Tier 1 webhook ladder). Installs the wake signal that
+    // `agent_state::emit_transitions` pulses on each live attention transition.
+    let _escalation_worker = crate::server::escalation::spawn_worker(
+        Arc::clone(&agent_events_db),
+        shutdown_cancel.child_token(),
+    );
     let session_request = session::SessionCleanupState::request_state(
         Arc::clone(&session_registry),
         terminated_sessions,
