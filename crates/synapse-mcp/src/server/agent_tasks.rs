@@ -561,7 +561,7 @@ impl SynapseService {
         Ok(None)
     }
 
-    fn read_all_tasks(db: &Db) -> Result<Vec<AgentTask>, ErrorData> {
+    pub(crate) fn read_all_tasks(db: &Db) -> Result<Vec<AgentTask>, ErrorData> {
         let prefix = task_prefix();
         let rows = db
             .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
@@ -1092,6 +1092,51 @@ impl SynapseService {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
+
+#[cfg(test)]
+impl SynapseService {
+    /// Test-only: create a task through the production `task_create_impl` path
+    /// (real CF_KV row + flush). Lets cross-module tests (e.g. #951 cost
+    /// rollups) seed real tasks without `task_create_impl` being public.
+    pub(crate) fn task_create_for_test(
+        &self,
+        task_id: &str,
+        template_id: &str,
+    ) -> Result<(), ErrorData> {
+        self.task_create_impl(TaskCreateParams {
+            task_id: task_id.to_owned(),
+            title: task_id.to_owned(),
+            description: None,
+            acceptance: None,
+            priority: 3,
+            template_id: template_id.to_owned(),
+            template_params: BTreeMap::new(),
+        })
+        .map(|_response| ())
+    }
+
+    /// Test-only: claim a task while binding a `spawn_id` + `template_version`
+    /// to the attempt — exactly what the #957 auto-dispatcher does via
+    /// `claim_internal`. Lets cost-rollup tests (#951) build real
+    /// `spawn -> task -> template` rows through the production claim path
+    /// instead of hand-writing CF_KV rows, without the live-spawn harness.
+    pub(crate) fn task_claim_with_spawn_for_test(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        spawn_id: &str,
+        template_version: u32,
+    ) -> Result<AgentTask, ErrorData> {
+        let db = self.agent_task_db()?;
+        Self::claim_internal(
+            &db,
+            task_id,
+            session_id,
+            Some(spawn_id.to_owned()),
+            Some(template_version),
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {

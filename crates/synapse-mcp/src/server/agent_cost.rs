@@ -46,8 +46,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use synapse_core::{
-    AgentTranscriptRecord, BillableUsage, CostBreakdown, CostOutcome, MODEL_PRICE_VERSION,
-    ModelPrice, TranscriptModelUsage, TranscriptSource, error_codes,
+    AgentEventKind, AgentEventRecord, AgentTranscriptRecord, BillableUsage, CostBreakdown,
+    CostOutcome, MODEL_PRICE_VERSION, ModelPrice, TranscriptModelUsage, TranscriptSource,
+    error_codes,
 };
 use synapse_storage::{
     Db, agent_transcripts::agent_transcript_spawn_prefix, agent_transcripts::decode_agent_transcript_key,
@@ -70,6 +71,21 @@ const MAX_SCAN_ROWS_PER_CALL: usize = 200_000;
 
 /// Rows pulled per `scan_cf_from` page.
 const SCAN_CHUNK_ROWS: usize = 4_096;
+
+/// Upper bound on `CF_AGENT_EVENTS` rows scanned to build the spawn→template
+/// join map for a `group_by: template` rollup. The journal carries many event
+/// kinds (only `SpawnRequested` rows carry template provenance), so it can be
+/// larger than the transcript stream; a truncated join would mis-attribute
+/// cost, so exhaustion is a loud error, never a silent partial map.
+const MAX_EVENT_SCAN_ROWS_PER_CALL: usize = 1_000_000;
+
+/// The reserved group key for cost that could not be attributed to any
+/// template/task. Parentheses are not legal in a kebab `template_id`/`task_id`
+/// (`[a-z0-9._-]`), so this can never collide with a real id. Surfacing the
+/// residual (rather than dropping it) keeps every group rollup reconciling
+/// exactly with the fleet total — the FinOps "no unallocated spend hidden"
+/// rule.
+const UNATTRIBUTED_KEY: &str = "(unattributed)";
 
 // ----------------------------------------------------------------------------
 // Price-table parameters and responses
@@ -155,6 +171,22 @@ pub struct AgentCostPriceDeleteResponse {
 // Cost rollup parameters and responses
 // ----------------------------------------------------------------------------
 
+/// Extra attribution dimension for an `agent_cost` rollup (#951). The per-spawn,
+/// per-model and fleet rollups are always returned; requesting one of these adds
+/// a derived-on-read join that buckets each spawn's cost by a higher-level
+/// identity recorded at spawn time.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCostGroupBy {
+    /// Bucket by the durable agent_template (#909) recorded on each spawn's
+    /// `SpawnRequested` journal event. Covers direct template spawns and
+    /// task-dispatched spawns alike.
+    Template,
+    /// Bucket by the durable task (#910) whose attempt bound the spawn
+    /// (`TaskAttempt.spawn_id`). Carries the task's dispatch `template_id`.
+    Task,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCostParams {
@@ -168,6 +200,13 @@ pub struct AgentCostParams {
     /// Upper bound (exclusive) on transcript-row ingestion time, unix ns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ns: Option<u64>,
+    /// Extra rollup dimensions. Each requested dimension adds a derived-on-read
+    /// rollup (`per_template` / `per_task`) that buckets the same per-spawn
+    /// costs by template or task. Costs that map to no template/task surface in
+    /// an explicit `(unattributed)` bucket so every rollup reconciles exactly
+    /// with the fleet total. Omit for the spawn/model/fleet rollups only.
+    #[serde(default)]
+    pub group_by: Vec<AgentCostGroupBy>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -257,6 +296,49 @@ pub struct AgentFleetCost {
     pub unpriced_models: Vec<String>,
 }
 
+/// One template's or task's slice of the fleet cost (#951). Built by joining the
+/// per-spawn costs to the template/task identity recorded at spawn time, then
+/// summing. The sum of every group's `computed_micro_usd` (including the
+/// `(unattributed)` bucket) equals `fleet.computed_micro_usd` exactly — the
+/// reconciliation invariant the FSV asserts.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentGroupCost {
+    /// The group identity: a `template_id` (for `per_template`), a `task_id`
+    /// (for `per_task`), or the reserved `(unattributed)` residual bucket.
+    pub key: String,
+    /// `false` only for the `(unattributed)` residual bucket — cost with no
+    /// template/task id to attribute to (a direct `cli` spawn, or a spawn whose
+    /// provenance row is missing).
+    pub attributed: bool,
+    /// Template versions observed across this group's spawns (`per_template`
+    /// only; empty for task groups). A group that ran two template versions
+    /// lists both, so a version bump is visible in the cost trend.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub template_versions: Vec<u32>,
+    /// The task's dispatch template (`per_task` only) — lets a task rollup be
+    /// cross-checked against the matching `per_template` group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    /// Spawns attributed to this group (complete + still-running).
+    pub spawns: usize,
+    /// Of `spawns`, those with an authoritative terminal usage row (billed).
+    pub spawns_complete: usize,
+    pub usage: BillableUsage,
+    pub total_tokens: u64,
+    /// Sum of locally-computed cost across this group's priced spawns, micro-USD.
+    pub computed_micro_usd: u64,
+    /// Sum of CLI self-reported cost where available, micro-USD.
+    pub source_reported_micro_usd: u64,
+    /// Models seen in this group with no price row (tokens counted, cost
+    /// excluded) — the same honesty marker the fleet rollup carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpriced_models: Vec<String>,
+    /// The spawn ids folded into this group, so a caller can verify the join
+    /// against the physical `SpawnRequested`/task rows (FSV).
+    pub spawn_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCostResponse {
@@ -270,9 +352,18 @@ pub struct AgentCostResponse {
     /// Total transcript rows scanned — the honesty figure that lets a caller
     /// confirm the rollup was not truncated.
     pub scanned_rows: u64,
+    /// `CF_AGENT_EVENTS` rows scanned to build the spawn→template join. `0` when
+    /// `group_by` did not request a template rollup.
+    pub scanned_event_rows: u64,
     pub fleet: AgentFleetCost,
     pub per_model: Vec<AgentModelCost>,
     pub per_spawn: Vec<AgentSpawnCost>,
+    /// Per-template rollup. Present only when `group_by` includes `template`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_template: Option<Vec<AgentGroupCost>>,
+    /// Per-task rollup. Present only when `group_by` includes `task`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_task: Option<Vec<AgentGroupCost>>,
 }
 
 // ----------------------------------------------------------------------------
@@ -536,12 +627,17 @@ impl SynapseService {
             unpriced_models: Vec::new(),
         };
         let mut unpriced_set: BTreeSet<String> = BTreeSet::new();
+        // Per-spawn rollup capture for the optional template/task joins (#951).
+        // Holds the same numbers folded into the fleet total, keyed by spawn id,
+        // so a group rollup is a regrouping of these — never a re-derivation.
+        let mut spawn_rollups: Vec<SpawnRollup> = Vec::new();
 
         for (spawn_id, acc) in spawns {
             fleet.spawns_total += 1;
             let resolved = acc.resolve()?;
             let Some(resolved) = resolved else {
                 fleet.spawns_incomplete += 1;
+                spawn_rollups.push(SpawnRollup::incomplete(spawn_id.clone()));
                 per_spawn.push(AgentSpawnCost {
                     spawn_id,
                     source: acc_source_label(&acc),
@@ -577,6 +673,7 @@ impl SynapseService {
             let mut spawn_models: Vec<AgentSpawnModelCost> = Vec::with_capacity(resolved.models.len());
             let mut spawn_computed: u64 = 0;
             let mut any_priced = false;
+            let mut spawn_unpriced: Vec<String> = Vec::new();
             for resolved_model in &resolved.models {
                 let model_label = resolved_model
                     .model
@@ -601,6 +698,7 @@ impl SynapseService {
                     }
                     None => {
                         unpriced_set.insert(model_label.clone());
+                        spawn_unpriced.push(model_label.clone());
                         (
                             CostOutcome::Unpriced {
                                 model_id: model_label.clone(),
@@ -693,6 +791,16 @@ impl SynapseService {
                 Vec::new()
             };
 
+            spawn_rollups.push(SpawnRollup {
+                spawn_id: spawn_id.clone(),
+                complete: true,
+                usage,
+                total_tokens,
+                computed_micro_usd: spawn_computed,
+                source_reported_micro_usd: resolved.source_reported_micro_usd.unwrap_or(0),
+                unpriced_models: spawn_unpriced,
+            });
+
             per_spawn.push(AgentSpawnCost {
                 spawn_id,
                 source: resolved.source_label(),
@@ -711,18 +819,52 @@ impl SynapseService {
         fleet.unpriced_models = unpriced_set.into_iter().collect();
         let per_model_vec = per_model.into_values().collect();
 
+        // Optional higher-level rollups (#951). Each is a pure regrouping of the
+        // per-spawn rollups above through a durable join recorded at spawn time,
+        // so the sum over groups reconciles exactly with the fleet total.
+        let want_template = params.group_by.contains(&AgentCostGroupBy::Template);
+        let want_task = params.group_by.contains(&AgentCostGroupBy::Task);
+        let mut scanned_event_rows: u64 = 0;
+        let per_template = if want_template {
+            let (spawn_template, scanned) = build_spawn_template_map(&db)?;
+            scanned_event_rows = scanned;
+            Some(group_rollups(&spawn_rollups, |spawn_id| {
+                spawn_template.get(spawn_id).map(|(template_id, version)| Attribution {
+                    key: template_id.clone(),
+                    template_id: None,
+                    template_version: *version,
+                })
+            }))
+        } else {
+            None
+        };
+        let per_task = if want_task {
+            let spawn_task = build_spawn_task_map(&db)?;
+            Some(group_rollups(&spawn_rollups, |spawn_id| {
+                spawn_task.get(spawn_id).map(|(task_id, template_id)| Attribution {
+                    key: task_id.clone(),
+                    template_id: Some(template_id.clone()),
+                    template_version: None,
+                })
+            }))
+        } else {
+            None
+        };
+
         Ok(AgentCostResponse {
             ok: true,
             now_ns: unix_time_ns_now(),
             since_ns: params.since_ns,
             until_ns: params.until_ns,
             scanned_rows,
+            scanned_event_rows,
             fleet,
             per_model: per_model_vec,
             per_spawn,
+            per_template,
+            per_task,
         })
     }
-
 }
 
 /// Loads the full operator price table from `CF_KV`, keyed by normalized model
@@ -1044,6 +1186,258 @@ fn add_usage(acc: &mut BillableUsage, add: &BillableUsage) {
     acc.cache_creation_1h_tokens = acc
         .cache_creation_1h_tokens
         .saturating_add(add.cache_creation_1h_tokens);
+}
+
+// ----------------------------------------------------------------------------
+// Higher-level rollups: per-template / per-task (#951)
+// ----------------------------------------------------------------------------
+
+/// One spawn's contribution to the rollup, captured during the per-spawn pass so
+/// the template/task groupings are a pure regrouping of these — never a second
+/// derivation from the transcript rows.
+struct SpawnRollup {
+    spawn_id: String,
+    complete: bool,
+    usage: BillableUsage,
+    total_tokens: u64,
+    computed_micro_usd: u64,
+    source_reported_micro_usd: u64,
+    unpriced_models: Vec<String>,
+}
+
+impl SpawnRollup {
+    /// A still-running spawn with no authoritative usage row yet: counted in its
+    /// group's `spawns`, but contributing zero tokens/cost.
+    fn incomplete(spawn_id: String) -> Self {
+        Self {
+            spawn_id,
+            complete: false,
+            usage: BillableUsage::default(),
+            total_tokens: 0,
+            computed_micro_usd: 0,
+            source_reported_micro_usd: 0,
+            unpriced_models: Vec::new(),
+        }
+    }
+}
+
+/// How one spawn attributes to a higher-level group.
+struct Attribution {
+    /// The group key (template_id or task_id).
+    key: String,
+    /// For task groups: the task's dispatch template. None for template groups.
+    template_id: Option<String>,
+    /// For template groups: the version this spawn ran. None for task groups.
+    template_version: Option<u32>,
+}
+
+/// Mutable group accumulator folded over the spawn rollups.
+struct GroupAcc {
+    key: String,
+    attributed: bool,
+    template_id: Option<String>,
+    versions: BTreeSet<u32>,
+    spawns: usize,
+    spawns_complete: usize,
+    usage: BillableUsage,
+    total_tokens: u64,
+    computed_micro_usd: u64,
+    source_reported_micro_usd: u64,
+    unpriced: BTreeSet<String>,
+    spawn_ids: Vec<String>,
+}
+
+impl GroupAcc {
+    fn new(key: String, attributed: bool, template_id: Option<String>) -> Self {
+        Self {
+            key,
+            attributed,
+            template_id,
+            versions: BTreeSet::new(),
+            spawns: 0,
+            spawns_complete: 0,
+            usage: BillableUsage::default(),
+            total_tokens: 0,
+            computed_micro_usd: 0,
+            source_reported_micro_usd: 0,
+            unpriced: BTreeSet::new(),
+            spawn_ids: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, rollup: &SpawnRollup, version: Option<u32>) {
+        self.spawns += 1;
+        if rollup.complete {
+            self.spawns_complete += 1;
+        }
+        add_usage(&mut self.usage, &rollup.usage);
+        self.total_tokens = self.total_tokens.saturating_add(rollup.total_tokens);
+        self.computed_micro_usd = self
+            .computed_micro_usd
+            .saturating_add(rollup.computed_micro_usd);
+        self.source_reported_micro_usd = self
+            .source_reported_micro_usd
+            .saturating_add(rollup.source_reported_micro_usd);
+        for model in &rollup.unpriced_models {
+            self.unpriced.insert(model.clone());
+        }
+        if let Some(version) = version {
+            self.versions.insert(version);
+        }
+        self.spawn_ids.push(rollup.spawn_id.clone());
+    }
+
+    fn into_group(self) -> AgentGroupCost {
+        AgentGroupCost {
+            key: self.key,
+            attributed: self.attributed,
+            template_versions: self.versions.into_iter().collect(),
+            template_id: self.template_id,
+            spawns: self.spawns,
+            spawns_complete: self.spawns_complete,
+            usage: self.usage,
+            total_tokens: self.total_tokens,
+            computed_micro_usd: self.computed_micro_usd,
+            source_reported_micro_usd: self.source_reported_micro_usd,
+            unpriced_models: self.unpriced.into_iter().collect(),
+            spawn_ids: self.spawn_ids,
+        }
+    }
+}
+
+/// Regroups the per-spawn rollups by the attribution `attr_of` returns for each
+/// spawn id. A spawn that attributes to no group folds into the reserved
+/// `(unattributed)` bucket, so the returned groups sum exactly to the fleet
+/// total. Groups are ordered by key with `(unattributed)` always last.
+fn group_rollups(
+    rollups: &[SpawnRollup],
+    attr_of: impl Fn(&str) -> Option<Attribution>,
+) -> Vec<AgentGroupCost> {
+    let mut groups: BTreeMap<String, GroupAcc> = BTreeMap::new();
+    for rollup in rollups {
+        let (key, attributed, template_id, version) = match attr_of(&rollup.spawn_id) {
+            Some(attr) => (attr.key, true, attr.template_id, attr.template_version),
+            None => (UNATTRIBUTED_KEY.to_owned(), false, None, None),
+        };
+        groups
+            .entry(key.clone())
+            .or_insert_with(|| GroupAcc::new(key, attributed, template_id))
+            .add(rollup, version);
+    }
+    // BTreeMap iterates by key; emit the real groups first and append the
+    // residual `(unattributed)` bucket last so it reads as a footer.
+    let mut out: Vec<AgentGroupCost> = Vec::with_capacity(groups.len());
+    let mut residual: Option<AgentGroupCost> = None;
+    for (_key, acc) in groups {
+        let group = acc.into_group();
+        if group.attributed {
+            out.push(group);
+        } else {
+            residual = Some(group);
+        }
+    }
+    if let Some(residual) = residual {
+        out.push(residual);
+    }
+    out
+}
+
+/// spawn_id → (template_id, template_version) join from the spawn journal.
+type SpawnTemplateMap = BTreeMap<String, (String, Option<u32>)>;
+/// spawn_id → (task_id, dispatch template_id) join from the task queue.
+type SpawnTaskMap = BTreeMap<String, (String, String)>;
+
+/// Builds the durable spawn→task join from the `CF_KV` task rows (#910): every
+/// task attempt that bound a `spawn_id` maps that spawn to the task and its
+/// dispatch template. A spawn bound by more than one attempt (a re-dispatch)
+/// attributes to the most recent attempt's task (attempts are append-ordered).
+fn build_spawn_task_map(db: &Db) -> Result<SpawnTaskMap, ErrorData> {
+    let tasks = SynapseService::read_all_tasks(db)?;
+    let mut map: SpawnTaskMap = BTreeMap::new();
+    for task in &tasks {
+        for attempt in &task.attempts {
+            if let Some(spawn_id) = &attempt.spawn_id {
+                map.insert(
+                    spawn_id.clone(),
+                    (task.task_id.clone(), task.template_id.clone()),
+                );
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Builds the durable spawn→template join (#909) by scanning the
+/// `CF_AGENT_EVENTS` journal for `SpawnRequested` rows, which record the
+/// `(template_id, template_version)` the spawn was rendered from. Direct `cli`
+/// spawns carry no `template_id` and are simply absent (→ they fall into the
+/// `(unattributed)` bucket). Returns the map and the rows scanned, and errors
+/// loudly if the journal exceeds the scan budget rather than returning a partial
+/// — a truncated join would mis-attribute cost.
+fn build_spawn_template_map(db: &Db) -> Result<(SpawnTemplateMap, u64), ErrorData> {
+    let mut map: BTreeMap<String, (String, Option<u32>)> = BTreeMap::new();
+    let mut scanned: u64 = 0;
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        if usize::try_from(scanned).unwrap_or(usize::MAX) >= MAX_EVENT_SCAN_ROWS_PER_CALL {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_EVENT_SCAN_BUDGET_EXHAUSTED after {MAX_EVENT_SCAN_ROWS_PER_CALL} \
+                     CF_AGENT_EVENTS rows building the spawn->template join; a truncated join \
+                     would mis-attribute cost"
+                ),
+            ));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_AGENT_EVENTS, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (_key, value) in &rows {
+            scanned += 1;
+            let record: AgentEventRecord = serde_json::from_slice(value).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("AGENT_EVENT_ROW_CORRUPT: row failed to decode: {error}"),
+                )
+            })?;
+            if !matches!(record.kind, AgentEventKind::SpawnRequested) {
+                continue;
+            }
+            let Some(spawn_id) = record.spawn_id.clone() else {
+                continue;
+            };
+            let Some(template_id) = record
+                .payload
+                .get("template_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if template_id.is_empty() {
+                continue;
+            }
+            let version = record
+                .payload
+                .get("template_version")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
+            // First SpawnRequested per spawn wins (spawn ids are unique; this is
+            // only defensive against a duplicated journal row).
+            map.entry(spawn_id)
+                .or_insert_with(|| (template_id.to_owned(), version));
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    Ok((map, scanned))
 }
 
 // ----------------------------------------------------------------------------
