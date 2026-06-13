@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 155,
+  "count": 157,
   "m4_defaults": [
     {
       "actual": 33,
@@ -356,10 +356,12 @@ expression: snapshot
     "target_claim_status",
     "target_release",
     "timeline_exclusions",
+    "timeline_get",
     "timeline_pause",
     "timeline_purge",
     "timeline_resume",
     "timeline_search",
+    "timeline_stats",
     "workspace_get",
     "workspace_list",
     "workspace_put",

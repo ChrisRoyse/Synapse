@@ -562,6 +562,17 @@ fn control_context(m3_state: &SharedM3State) -> Result<ControlContext, ErrorData
     Ok((db, control, recorder))
 }
 
+/// Read-only handle to the recorder control gate, for status tools (`#842`
+/// `timeline_stats`). Reuses [`control_context`] so the pause/exclusion state a
+/// status read reports is the exact same gate the recorder write-path consults
+/// — no second copy that could drift.
+pub fn recorder_control_handle(
+    m3_state: &SharedM3State,
+) -> Result<Arc<RecorderControl>, ErrorData> {
+    let (_db, control, _recorder) = control_context(m3_state)?;
+    Ok(control)
+}
+
 fn internal(error: &anyhow::Error) -> ErrorData {
     mcp_error(error_codes::TOOL_INTERNAL_ERROR, format!("{error:#}"))
 }
