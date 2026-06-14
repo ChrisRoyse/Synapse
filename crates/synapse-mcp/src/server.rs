@@ -220,6 +220,7 @@ mod target_claims;
 mod target_policy;
 #[cfg(test)]
 mod tests;
+mod timeline_digest;
 mod timeline_query;
 mod workspace_blackboard;
 
@@ -545,6 +546,7 @@ impl SynapseService {
             + Self::m3_tool_router()
             + Self::intent_tool_router()
             + Self::timeline_query_tool_router()
+            + Self::timeline_digest_tool_router()
             + Self::m4_tool_router()
             + Self::notify_tool_router()
             + Self::hygiene_report_tool_router()
