@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 149,
+  "count": 153,
   "m4_defaults": [
     {
       "actual": 33,
@@ -243,6 +243,9 @@ expression: snapshot
     "agent_template_list",
     "agent_template_put",
     "agent_wait",
+    "approval_decide",
+    "approval_list",
+    "approval_request",
     "audio_tail",
     "audio_transcribe",
     "audit_export_bundle",
@@ -293,6 +296,7 @@ expression: snapshot
     "health",
     "hidden_desktop_pip_frame",
     "hygiene_flags",
+    "hygiene_report",
     "hygiene_scan_storage",
     "hygiene_scan_text",
     "notify_human",

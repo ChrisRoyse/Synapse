@@ -192,6 +192,7 @@ mod everquest_world_model;
 mod everquest_world_summary;
 mod handler;
 mod health;
+mod hygiene_report;
 mod lease_tools;
 mod m1_tools;
 mod m2_tools;
@@ -531,6 +532,7 @@ impl SynapseService {
             + Self::m3_tool_router()
             + Self::m4_tool_router()
             + Self::notify_tool_router()
+            + Self::hygiene_report_tool_router()
             + Self::escalation_tool_router();
         // The EverQuest domain pack (25 tools) is off the general-agent surface
         // unless the operator opts in (SYNAPSE_ENABLE_EVERQUEST). No capability

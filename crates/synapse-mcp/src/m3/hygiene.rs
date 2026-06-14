@@ -4,7 +4,7 @@
 //! that point back to physical storage rows, but it never blocks content.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -14,18 +14,25 @@ use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use synapse_core::types::{TimelineActor, TimelineRecord};
+use synapse_core::types::{
+    RoutineGranularity, RoutineLifecycle, RoutineRecord, RoutineStateRecord, TimelineActor,
+    TimelineRecord,
+};
 use synapse_core::{
     OcrResult, SCHEMA_VERSION, StoredObservation, SuspectedInjectionAnnotation,
     SuspectedInjectionSpan, error_codes,
 };
 use synapse_reflex::ReflexRuntime;
-use synapse_storage::{cf, decode_json, encode_json};
+use synapse_storage::{
+    cf, decode_json, encode_json, episodes as episode_codec, routines as routine_codec,
+    timeline as timeline_codec,
+};
 
 use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
+    episodes::decode_episode_row,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -38,6 +45,23 @@ const MAX_STORAGE_ROW_LIMIT: u32 = 10_000;
 const DEFAULT_FLAG_LIMIT: u32 = 200;
 const MAX_FLAG_LIMIT: u32 = 1_000;
 const STORAGE_SCAN_CHUNK_ROWS: usize = 512;
+
+/// One local day in nanoseconds. Episodes are split at every local-midnight
+/// (`EpisodeBoundary::DayBoundary`), so no episode spans more than one local
+/// day. That makes a 24h guard a *provable* lower bound for the earliest
+/// episode that can still contain a flagged timeline timestamp: an episode
+/// covering `ts` has `start_ts_ns > ts - DAY_NS`. `hygiene_report` uses it to
+/// bound the `CF_EPISODES` scan instead of walking the whole store.
+const DAY_NS: u64 = 86_400 * 1_000_000_000;
+
+/// Upper bound on `CF_EPISODES` rows scanned in one `hygiene_report` call. A
+/// truncated derivation would silently under-report poisoned learned state, so
+/// exhaustion is a loud error, never a partial answer.
+const MAX_REPORT_EPISODE_SCAN_ROWS: usize = 500_000;
+
+/// Upper bound on `CF_ROUTINES` rows scanned in one `hygiene_report` call. The
+/// routine store holds at most a few hundred rows; this is a runaway backstop.
+const MAX_REPORT_ROUTINE_SCAN_ROWS: usize = 50_000;
 
 const SOURCE_CF_OBSERVATIONS: &str = cf::CF_OBSERVATIONS;
 const SOURCE_CF_TIMELINE: &str = cf::CF_TIMELINE;
@@ -177,6 +201,115 @@ pub struct HygieneFlagsResponse {
     pub scanned_rows: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneReportTimeRange {
+    /// Inclusive lower bound on a flag's `detected_at`, unix nanoseconds.
+    pub start_ns: u64,
+    /// Exclusive upper bound on a flag's `detected_at`, unix nanoseconds.
+    pub end_ns: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneReportParams {
+    /// Restrict to one source CF (`CF_TIMELINE`, `CF_OBSERVATIONS`,
+    /// `CF_OCR_CACHE`). Omit to report flags across every source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cf: Option<String>,
+    /// Restrict to one exact source row, hex-encoded. Requires `source_cf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_key_hex: Option<String>,
+    /// Minimum flag score to include (default 0, max 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<u32>,
+    /// Restrict to flags whose `detected_at` falls in `[start_ns, end_ns)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<HygieneReportTimeRange>,
+    /// Maximum flags returned (default 100, max 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Hex-encoded `CF_KV` key cursor from a previous response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// One episode a flagged timeline row fed (time-window containment over
+/// `CF_EPISODES`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneImpactedEpisode {
+    pub episode_id: String,
+    pub start_ts_ns: u64,
+    pub end_ts_ns: u64,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+}
+
+/// One mined routine whose evidence references an episode a flagged row fed.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneImpactedRoutine {
+    pub routine_id: String,
+    pub schedule_label: String,
+    pub granularity: String,
+    pub support_days: u32,
+    pub confidence: f64,
+    /// Operator lifecycle from `CF_ROUTINE_STATE` when present. A flagged row
+    /// feeding a `confirmed` routine is higher-stakes than one feeding an
+    /// unreviewed `candidate` — this lets the consumer prioritize cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    /// Operator-assigned routine label from `CF_ROUTINE_STATE`, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Impacted episode ids that link this flag to this routine (the
+    /// intersection of the flag's episodes with the routine's evidence).
+    pub via_episode_ids: Vec<String>,
+}
+
+/// One flagged row plus the derived state (episodes, routines) traceable to it.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneFlagImpact {
+    pub flag: HygieneStoredFlag,
+    /// Decoded source-row timestamp for `CF_TIMELINE` flags; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ts_ns: Option<u64>,
+    pub derived_episodes: Vec<HygieneImpactedEpisode>,
+    pub derived_routines: Vec<HygieneImpactedRoutine>,
+    /// Honest, human-readable explanation of the derivation (including why it
+    /// is empty).
+    pub derivation_note: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneReportSummary {
+    pub flags_total: u64,
+    /// Flags that fed at least one episode (poisoned derived state).
+    pub flags_with_downstream_impact: u64,
+    pub impacted_episode_count: u64,
+    pub impacted_routine_count: u64,
+    /// Subset of impacted routines the operator has `confirmed`.
+    pub impacted_confirmed_routine_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneReportResponse {
+    pub flags: Vec<HygieneFlagImpact>,
+    pub summary: HygieneReportSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub scanned_flag_rows: u64,
+    pub scanned_episode_rows: u64,
+    pub scanned_routine_rows: u64,
+}
+
 #[must_use]
 pub const fn hygiene_scan_text() -> M3ToolStub {
     M3ToolStub::new("hygiene_scan_text")
@@ -210,6 +343,11 @@ pub fn required_permissions_scan_storage(
 
 #[must_use]
 pub fn required_permissions_flags(_params: &HygieneFlagsParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_report(_params: &HygieneReportParams) -> RequiredPermissions {
     required([Permission::ReadStorage])
 }
 
@@ -498,6 +636,482 @@ pub fn query_flags(
         next_cursor,
         scanned_rows,
     })
+}
+
+/// Reports flagged rows together with the derived state traceable to them
+/// (#874): which `CF_EPISODES` rows a flagged `CF_TIMELINE` row fed, and which
+/// `CF_ROUTINES` were mined from those episodes.
+///
+/// The derivation join is exact and physical:
+/// - **flag → episode**: episodes are a deterministic function of `CF_TIMELINE`
+///   rows over a time window, so a flagged row at `ts` fed every episode whose
+///   `[start_ts_ns, end_ts_ns]` window contains `ts`. Containment is inclusive
+///   on both ends *deliberately*: at an app-switch boundary a row's timestamp
+///   equals both the closing episode's `end_ts_ns` and the opening episode's
+///   `start_ts_ns`, and for a poisoning audit a false negative (missing a
+///   poisoned routine) is far worse than naming an adjacent episode, so the
+///   report errs toward over-inclusion at exact boundaries.
+/// - **episode → routine**: a routine's persisted `evidence[].episode_ids` name
+///   the exact `ep1-…` ids it was mined from; a routine is impacted iff that
+///   set intersects the impacted episode ids.
+///
+/// Only `CF_TIMELINE` flags carry episode/routine derivation — episodes are
+/// segmented from `CF_TIMELINE` alone. Flags on `CF_OBSERVATIONS`/`CF_OCR_CACHE`
+/// are reported with an honest empty derivation and a note saying why, never
+/// silently dropped.
+pub fn report(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &HygieneReportParams,
+) -> Result<HygieneReportResponse, ErrorData> {
+    let source_cf = params
+        .source_cf
+        .as_deref()
+        .map(|raw| normalize_source_cf(raw, true))
+        .transpose()?;
+    let source_key_hex = params
+        .source_key_hex
+        .as_deref()
+        .map(|key| {
+            validate_hex_text(key, "source_key_hex")?;
+            Ok::<String, ErrorData>(key.to_ascii_lowercase())
+        })
+        .transpose()?;
+    if source_key_hex.is_some() && source_cf.is_none() {
+        return Err(invalid(
+            "hygiene_report source_key_hex requires source_cf so the prefix is exact",
+        ));
+    }
+    let min_score = validate_min_score(params.min_score, 0, "hygiene_report")?;
+    let limit = validate_limit(
+        params.limit.unwrap_or(100),
+        1,
+        MAX_FLAG_LIMIT,
+        "hygiene_report limit",
+    )?;
+    if let Some(range) = &params.time_range
+        && range.start_ns >= range.end_ns
+    {
+        return Err(invalid(format!(
+            "hygiene_report time_range.start_ns {} must be < end_ns {}",
+            range.start_ns, range.end_ns
+        )));
+    }
+    let prefix = flag_prefix(source_cf.as_deref(), source_key_hex.as_deref());
+    let mut start_key = match params.cursor.as_deref() {
+        Some(cursor) => key_after(
+            &hex_decode(cursor).ok_or_else(|| invalid("hygiene_report cursor is not valid hex"))?,
+        ),
+        None => prefix.as_bytes().to_vec(),
+    };
+
+    let runtime = lock_runtime(runtime)?;
+
+    // 1. Page over flag rows applying min_score + optional detected_at window.
+    let mut page: Vec<HygieneStoredFlag> = Vec::new();
+    let mut scanned_flag_rows = 0_u64;
+    let mut next_cursor = None;
+    let fetch_rows = STORAGE_SCAN_CHUNK_ROWS;
+    loop {
+        let rows = runtime
+            .storage_cf_prefix_rows_from(cf::CF_KV, prefix.as_bytes(), &start_key, fetch_rows)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        let rows_len = rows.len();
+        let mut last_key = None;
+        for (key, value) in rows {
+            scanned_flag_rows += 1;
+            last_key = Some(key.clone());
+            match decode_json::<HygieneFlagRecord>(&value) {
+                Ok(record)
+                    if record.score >= min_score
+                        && flag_in_time_range(&record, params.time_range.as_ref()) =>
+                {
+                    page.push(HygieneStoredFlag {
+                        kv_key_hex: hex_encode(&key),
+                        record,
+                    });
+                    if page.len() >= limit as usize {
+                        next_cursor = Some(hex_encode(&key));
+                        break;
+                    }
+                }
+                Ok(_record) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        code = "HYGIENE_FLAG_ROW_DECODE_FAILED",
+                        key_hex = %hex_encode(&key),
+                        %error,
+                        "hygiene_report skipped undecodable flag row"
+                    );
+                }
+            }
+        }
+        if next_cursor.is_some() || rows_len < fetch_rows {
+            break;
+        }
+        let Some(last_key) = last_key else {
+            break;
+        };
+        start_key = key_after(&last_key);
+    }
+
+    // 2. Decode each CF_TIMELINE flag's source key to its timeline timestamp.
+    //    A timeline flag whose key the timeline codec cannot decode is data
+    //    corruption — surfaced loudly, never silently skipped.
+    let mut source_ts: Vec<Option<u64>> = Vec::with_capacity(page.len());
+    let mut ts_set: BTreeSet<u64> = BTreeSet::new();
+    for flag in &page {
+        if flag.record.source_cf == SOURCE_CF_TIMELINE {
+            let key = hex_decode(&flag.record.source_key_hex).ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "HYGIENE_REPORT_FLAG_KEY_INVALID: flag {} has non-hex source_key_hex {}",
+                        flag.record.flag_id, flag.record.source_key_hex
+                    ),
+                )
+            })?;
+            let (ts_ns, _seq) = timeline_codec::decode_timeline_key(&key).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "HYGIENE_REPORT_TIMELINE_KEY_INVALID: flag {} source_key {} is not a \
+                         CF_TIMELINE codec key: {error}",
+                        flag.record.flag_id, flag.record.source_key_hex
+                    ),
+                )
+            })?;
+            source_ts.push(Some(ts_ns));
+            ts_set.insert(ts_ns);
+        } else {
+            source_ts.push(None);
+        }
+    }
+
+    // 3. One bounded CF_EPISODES scan: an episode is impacted iff its time
+    //    window contains a flagged timestamp. Bounded below by DAY_NS (no
+    //    episode spans a local-day boundary) and above by the largest ts.
+    let mut scanned_episode_rows = 0_u64;
+    let mut ts_to_episode_ids: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut episodes_by_id: BTreeMap<String, HygieneImpactedEpisode> = BTreeMap::new();
+    if let (Some(&min_ts), Some(&max_ts)) = (ts_set.iter().next(), ts_set.iter().next_back()) {
+        let mut start = episode_codec::episode_scan_start(min_ts.saturating_sub(DAY_NS));
+        'episodes: loop {
+            if usize::try_from(scanned_episode_rows).unwrap_or(usize::MAX)
+                >= MAX_REPORT_EPISODE_SCAN_ROWS
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "HYGIENE_REPORT_EPISODE_SCAN_BUDGET_EXHAUSTED after \
+                         {MAX_REPORT_EPISODE_SCAN_ROWS} CF_EPISODES rows; narrow source_key_hex or \
+                         time_range — a truncated derivation would under-report poisoned state"
+                    ),
+                ));
+            }
+            let (rows, more) = runtime
+                .storage_cf_rows_from(cf::CF_EPISODES, &start, STORAGE_SCAN_CHUNK_ROWS)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut last = None;
+            for (key, value) in &rows {
+                scanned_episode_rows += 1;
+                last = Some(key.clone());
+                let (_key_ts_ns, _ordinal, record) = decode_episode_row(key, value)?;
+                // Episodes are key-ordered by start_ts_ns; once start passes the
+                // largest flag ts, no later episode can contain any flag ts.
+                if record.start_ts_ns > max_ts {
+                    break 'episodes;
+                }
+                let contained: Vec<u64> = ts_set
+                    .range(record.start_ts_ns..=record.end_ts_ns)
+                    .copied()
+                    .collect();
+                if contained.is_empty() {
+                    continue;
+                }
+                for ts in contained {
+                    ts_to_episode_ids
+                        .entry(ts)
+                        .or_default()
+                        .push(record.episode_id.clone());
+                }
+                episodes_by_id
+                    .entry(record.episode_id.clone())
+                    .or_insert_with(|| HygieneImpactedEpisode {
+                        episode_id: record.episode_id.clone(),
+                        start_ts_ns: record.start_ts_ns,
+                        end_ts_ns: record.end_ts_ns,
+                        actor: actor_label(&record.actor),
+                        app: record.app.clone(),
+                        document: record.document.clone(),
+                    });
+            }
+            if !more {
+                break;
+            }
+            let Some(last) = last else {
+                break;
+            };
+            start = key_after(&last);
+        }
+    }
+
+    // 4. One bounded CF_ROUTINES scan: a routine is impacted iff its evidence
+    //    episode ids intersect the impacted episode ids. Build episode → routine.
+    let impacted_episode_ids: BTreeSet<String> = episodes_by_id.keys().cloned().collect();
+    let mut scanned_routine_rows = 0_u64;
+    let mut routines_by_id: BTreeMap<String, RoutineRecord> = BTreeMap::new();
+    let mut episode_to_routine_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if !impacted_episode_ids.is_empty() {
+        let mut start: Vec<u8> = Vec::new();
+        loop {
+            if usize::try_from(scanned_routine_rows).unwrap_or(usize::MAX)
+                >= MAX_REPORT_ROUTINE_SCAN_ROWS
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "HYGIENE_REPORT_ROUTINE_SCAN_BUDGET_EXHAUSTED after \
+                         {MAX_REPORT_ROUTINE_SCAN_ROWS} CF_ROUTINES rows; the routine store should \
+                         hold at most a few hundred rows — inspect CF_ROUTINES"
+                    ),
+                ));
+            }
+            let (rows, more) = runtime
+                .storage_cf_rows_from(cf::CF_ROUTINES, &start, STORAGE_SCAN_CHUNK_ROWS)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut last = None;
+            for (key, value) in &rows {
+                scanned_routine_rows += 1;
+                last = Some(key.clone());
+                routine_codec::decode_routine_key(key).map_err(|error| {
+                    mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "HYGIENE_REPORT_ROUTINE_KEY_INVALID in CF_ROUTINES at {}: {error}",
+                            hex_encode(key)
+                        ),
+                    )
+                })?;
+                let record = decode_json::<RoutineRecord>(value).map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "HYGIENE_REPORT_ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {}: {error}",
+                            hex_encode(key)
+                        ),
+                    )
+                })?;
+                let mut linked: BTreeSet<String> = BTreeSet::new();
+                for evidence in &record.evidence {
+                    for episode_id in &evidence.episode_ids {
+                        if impacted_episode_ids.contains(episode_id) {
+                            linked.insert(episode_id.clone());
+                        }
+                    }
+                }
+                if linked.is_empty() {
+                    continue;
+                }
+                for episode_id in &linked {
+                    episode_to_routine_ids
+                        .entry(episode_id.clone())
+                        .or_default()
+                        .insert(record.routine_id.clone());
+                }
+                routines_by_id.insert(record.routine_id.clone(), record);
+            }
+            if !more {
+                break;
+            }
+            let Some(last) = last else {
+                break;
+            };
+            start = key_after(&last);
+        }
+    }
+
+    // 5. Point-lookup operator lifecycle for each impacted routine.
+    let mut routine_state: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
+    for routine_id in routines_by_id.keys() {
+        let key = routine_codec::routine_state_key(routine_id).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!("HYGIENE_REPORT_ROUTINE_STATE_KEY_INVALID for {routine_id}: {error}"),
+            )
+        })?;
+        let rows = runtime
+            .storage_cf_prefix_rows(cf::CF_ROUTINE_STATE, &key, 1)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) {
+            let state = decode_json::<RoutineStateRecord>(&value).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "HYGIENE_REPORT_ROUTINE_STATE_DECODE_FAILED for {routine_id}: {error}"
+                    ),
+                )
+            })?;
+            routine_state.insert(
+                routine_id.clone(),
+                (lifecycle_label(state.lifecycle), state.label),
+            );
+        }
+    }
+
+    // 6. Assemble each flag's impact from the maps.
+    let mut flags_with_downstream_impact = 0_u64;
+    let mut flag_impacts = Vec::with_capacity(page.len());
+    for (flag, ts) in page.into_iter().zip(source_ts) {
+        let (derived_episodes, derived_routines, derivation_note) = match (ts, &flag) {
+            (Some(ts_ns), _) => {
+                let episode_ids = ts_to_episode_ids.get(&ts_ns).cloned().unwrap_or_default();
+                let derived_episodes: Vec<HygieneImpactedEpisode> = episode_ids
+                    .iter()
+                    .filter_map(|episode_id| episodes_by_id.get(episode_id).cloned())
+                    .collect();
+                // Routines reachable from this flag's episodes, with the exact
+                // linking episodes recorded per routine.
+                let mut routine_via: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                for episode_id in &episode_ids {
+                    if let Some(routine_ids) = episode_to_routine_ids.get(episode_id) {
+                        for routine_id in routine_ids {
+                            routine_via
+                                .entry(routine_id.clone())
+                                .or_default()
+                                .insert(episode_id.clone());
+                        }
+                    }
+                }
+                let derived_routines: Vec<HygieneImpactedRoutine> = routine_via
+                    .into_iter()
+                    .filter_map(|(routine_id, via)| {
+                        routines_by_id.get(&routine_id).map(|record| {
+                            let (lifecycle, label) = routine_state
+                                .get(&routine_id)
+                                .map(|(lifecycle, label)| {
+                                    (Some(lifecycle.clone()), label.clone())
+                                })
+                                .unwrap_or((None, None));
+                            HygieneImpactedRoutine {
+                                routine_id: record.routine_id.clone(),
+                                schedule_label: record.schedule_label.clone(),
+                                granularity: granularity_label(record.granularity),
+                                support_days: record.support_days,
+                                confidence: record.confidence,
+                                lifecycle,
+                                label,
+                                via_episode_ids: via.into_iter().collect(),
+                            }
+                        })
+                    })
+                    .collect();
+                let note = if derived_episodes.is_empty() {
+                    format!(
+                        "no CF_EPISODES row covers source ts {ts_ns}; the timeline row has not \
+                         been segmented (run episode_segment) or is outside episode retention"
+                    )
+                } else if derived_routines.is_empty() {
+                    format!(
+                        "fed {} episode(s); no mined routine references them (run routine_mine, \
+                         or none qualified)",
+                        derived_episodes.len()
+                    )
+                } else {
+                    format!(
+                        "fed {} episode(s) feeding {} mined routine(s)",
+                        derived_episodes.len(),
+                        derived_routines.len()
+                    )
+                };
+                (derived_episodes, derived_routines, note)
+            }
+            (None, flag) => (
+                Vec::new(),
+                Vec::new(),
+                format!(
+                    "source CF {} is not an episode-segmentation input (episodes derive from \
+                     CF_TIMELINE only); no episode/routine derivation",
+                    flag.record.source_cf
+                ),
+            ),
+        };
+        if !derived_episodes.is_empty() {
+            flags_with_downstream_impact += 1;
+        }
+        flag_impacts.push(HygieneFlagImpact {
+            flag,
+            source_ts_ns: ts,
+            derived_episodes,
+            derived_routines,
+            derivation_note,
+        });
+    }
+
+    let impacted_confirmed_routine_count = routine_state
+        .values()
+        .filter(|(lifecycle, _label)| lifecycle == "confirmed")
+        .count() as u64;
+    let summary = HygieneReportSummary {
+        flags_total: flag_impacts.len() as u64,
+        flags_with_downstream_impact,
+        impacted_episode_count: episodes_by_id.len() as u64,
+        impacted_routine_count: routines_by_id.len() as u64,
+        impacted_confirmed_routine_count,
+    };
+
+    Ok(HygieneReportResponse {
+        flags: flag_impacts,
+        summary,
+        next_cursor,
+        scanned_flag_rows,
+        scanned_episode_rows,
+        scanned_routine_rows,
+    })
+}
+
+fn flag_in_time_range(record: &HygieneFlagRecord, range: Option<&HygieneReportTimeRange>) -> bool {
+    let Some(range) = range else {
+        return true;
+    };
+    let Some(ns) = record.detected_at.timestamp_nanos_opt() else {
+        return false;
+    };
+    let ns = u64::try_from(ns).unwrap_or(0);
+    ns >= range.start_ns && ns < range.end_ns
+}
+
+fn actor_label(actor: &TimelineActor) -> String {
+    match actor {
+        TimelineActor::Human => "human".to_owned(),
+        TimelineActor::Agent { session_id } => format!("agent:{session_id}"),
+    }
+}
+
+fn lifecycle_label(lifecycle: RoutineLifecycle) -> String {
+    match lifecycle {
+        RoutineLifecycle::Candidate => "candidate",
+        RoutineLifecycle::Confirmed => "confirmed",
+        RoutineLifecycle::Disabled => "disabled",
+        RoutineLifecycle::Archived => "archived",
+    }
+    .to_owned()
+}
+
+fn granularity_label(granularity: RoutineGranularity) -> String {
+    match granularity {
+        RoutineGranularity::App => "app",
+        RoutineGranularity::AppDocument => "app_document",
+    }
+    .to_owned()
 }
 
 #[must_use]
@@ -1457,5 +2071,71 @@ mod tests {
                 .heuristics
                 .contains(&"instruction_override".to_owned())
         );
+    }
+
+    fn flag_at(detected_ns: i64) -> HygieneFlagRecord {
+        HygieneFlagRecord {
+            schema_version: SCHEMA_VERSION,
+            flag_id: "test".to_owned(),
+            detected_at: DateTime::<Utc>::from_timestamp_nanos(detected_ns),
+            source_cf: SOURCE_CF_TIMELINE.to_owned(),
+            source_key_hex: "00".to_owned(),
+            source_field: "/payload/title".to_owned(),
+            source_text_sha256: String::new(),
+            span_start: 0,
+            span_end: 1,
+            span_text: String::new(),
+            span_text_sha256: String::new(),
+            score: 90,
+            heuristics: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn time_range_is_inclusive_start_exclusive_end() {
+        let record = flag_at(1_000);
+        // No range admits everything.
+        assert!(flag_in_time_range(&record, None));
+        // [1000, 2000): start is inclusive.
+        assert!(flag_in_time_range(
+            &record,
+            Some(&HygieneReportTimeRange {
+                start_ns: 1_000,
+                end_ns: 2_000
+            })
+        ));
+        // End is exclusive: a flag exactly at end_ns is out.
+        assert!(!flag_in_time_range(
+            &record,
+            Some(&HygieneReportTimeRange {
+                start_ns: 0,
+                end_ns: 1_000
+            })
+        ));
+        // Below the window is out.
+        assert!(!flag_in_time_range(
+            &record,
+            Some(&HygieneReportTimeRange {
+                start_ns: 1_001,
+                end_ns: 2_000
+            })
+        ));
+        println!("readback=hygiene_time_range boundary=inclusive_start_exclusive_end ok=true");
+    }
+
+    #[test]
+    fn label_helpers_are_stable_strings() {
+        assert_eq!(lifecycle_label(RoutineLifecycle::Candidate), "candidate");
+        assert_eq!(lifecycle_label(RoutineLifecycle::Confirmed), "confirmed");
+        assert_eq!(lifecycle_label(RoutineLifecycle::Disabled), "disabled");
+        assert_eq!(lifecycle_label(RoutineLifecycle::Archived), "archived");
+        assert_eq!(granularity_label(RoutineGranularity::App), "app");
+        assert_eq!(
+            granularity_label(RoutineGranularity::AppDocument),
+            "app_document"
+        );
+        assert_eq!(actor_label(&TimelineActor::Human), "human");
+        println!("readback=hygiene_labels lifecycle/granularity/actor stable=true");
     }
 }
