@@ -2,6 +2,7 @@ pub mod defaults;
 pub mod episodes;
 pub mod error_codes;
 pub mod filter;
+pub mod intent;
 pub mod retention;
 pub mod routines;
 pub mod types;

@@ -1,10 +1,9 @@
 ---
 source: crates/synapse-mcp/tests/m4_tools_list.rs
-assertion_line: 56
 expression: snapshot
 ---
 {
-  "count": 154,
+  "count": 155,
   "m4_defaults": [
     {
       "actual": 33,
@@ -304,6 +303,7 @@ expression: snapshot
     "hygiene_report",
     "hygiene_scan_storage",
     "hygiene_scan_text",
+    "intent_current",
     "local_model_list",
     "local_model_probe",
     "local_model_register",

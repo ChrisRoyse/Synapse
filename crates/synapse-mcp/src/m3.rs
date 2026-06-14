@@ -6,6 +6,7 @@ pub mod audit_export;
 pub mod audit_retention;
 pub mod episodes;
 pub mod hygiene;
+pub mod intent;
 pub mod interaction_cadence;
 pub mod local_models;
 pub mod permissions;
@@ -564,7 +565,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 52] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 53] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -618,6 +619,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 52] {
         timeline_control::timeline_pause(),
         timeline_control::timeline_resume(),
         timeline_control::timeline_exclusions(),
+        intent::intent_current(),
     ]
 }
 

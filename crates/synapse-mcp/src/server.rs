@@ -203,6 +203,7 @@ mod everquest_world_summary;
 mod handler;
 mod health;
 mod hygiene_report;
+mod intent_tools;
 mod lease_tools;
 mod m1_tools;
 mod m2_tools;
@@ -541,6 +542,7 @@ impl SynapseService {
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
             + Self::m3_tool_router()
+            + Self::intent_tool_router()
             + Self::m4_tool_router()
             + Self::notify_tool_router()
             + Self::hygiene_report_tool_router()
