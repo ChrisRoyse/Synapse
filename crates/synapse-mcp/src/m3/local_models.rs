@@ -44,6 +44,15 @@ pub enum LocalModelApiShape {
     OpenAiChatCompletions,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalModelRuntimePreset {
+    #[default]
+    OpenAiCompatible,
+    DeepSeekV4FlashNonThinking,
+    DeepSeekV4Reasoning,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LocalModelRegisterParams {
@@ -52,6 +61,8 @@ pub struct LocalModelRegisterParams {
     pub model_id: String,
     #[serde(default)]
     pub api_shape: LocalModelApiShape,
+    #[serde(default)]
+    pub runtime_preset: LocalModelRuntimePreset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub context_length: Option<u32>,
@@ -95,6 +106,8 @@ pub struct LocalModelUpdateParams {
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_shape: Option<LocalModelApiShape>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_preset: Option<LocalModelRuntimePreset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub context_length: Option<u32>,
@@ -146,6 +159,8 @@ pub struct LocalModelRegistryRow {
     pub base_url: String,
     pub model_id: String,
     pub api_shape: LocalModelApiShape,
+    #[serde(default)]
+    pub runtime_preset: LocalModelRuntimePreset,
     pub context_length: Option<u32>,
     pub max_tools: Option<u32>,
     pub notes: Option<String>,
@@ -328,6 +343,7 @@ pub async fn register_local_model(
         base_url: normalize_base_url(&params.base_url)?,
         model_id: normalize_model_id(&params.model_id)?,
         api_shape: params.api_shape,
+        runtime_preset: params.runtime_preset,
         context_length: params.context_length,
         max_tools: params.max_tools,
         notes: normalize_optional_text(params.notes, "notes", MAX_NOTES_CHARS)?,
@@ -434,6 +450,10 @@ pub async fn update_local_model(
     }
     if let Some(api_shape) = params.api_shape {
         row.api_shape = api_shape;
+        probe_required = true;
+    }
+    if let Some(runtime_preset) = params.runtime_preset {
+        row.runtime_preset = runtime_preset;
         probe_required = true;
     }
     if params.clear_context_length {
@@ -598,9 +618,9 @@ async fn probe_row(row: &LocalModelRegistryRow, timeout_ms: Option<u64>) -> Loca
     };
 
     let nonce = format!("probe-{}", Uuid::now_v7().simple());
-    let mut request = client
-        .post(endpoint.clone())
-        .json(&probe_request(&row.model_id, &nonce));
+    let mut body = probe_request(&row.model_id, &nonce);
+    apply_runtime_preset(row, &mut body);
+    let mut request = client.post(endpoint.clone()).json(&body);
     if let Some(env_var) = row.api_key_env_var.as_deref() {
         match std::env::var(env_var) {
             Ok(token) if !token.trim().is_empty() => {
@@ -611,7 +631,7 @@ async fn probe_row(row: &LocalModelRegistryRow, timeout_ms: Option<u64>) -> Loca
                     observed_at_unix_ms,
                     endpoint.as_str(),
                     started.elapsed(),
-                    error_codes::TOOL_PARAMS_INVALID,
+                    error_codes::MODEL_API_KEY_MISSING,
                     format!("api_key_env_var {env_var:?} is not set to a non-empty value"),
                     None,
                 );
@@ -724,6 +744,22 @@ fn probe_request(model_id: &str, nonce: &str) -> serde_json::Value {
         "temperature": 0,
         "max_tokens": 128
     })
+}
+
+fn apply_runtime_preset(row: &LocalModelRegistryRow, body: &mut serde_json::Value) {
+    match row.runtime_preset {
+        LocalModelRuntimePreset::OpenAiCompatible => {}
+        LocalModelRuntimePreset::DeepSeekV4FlashNonThinking => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        LocalModelRuntimePreset::DeepSeekV4Reasoning => {
+            body["thinking"] = json!({ "type": "enabled" });
+            body["reasoning_effort"] = json!("max");
+            if let Some(object) = body.as_object_mut() {
+                object.remove("tool_choice");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1389,6 +1425,7 @@ mod tests {
             base_url,
             model_id,
             api_shape: LocalModelApiShape::OpenAiChatCompletions,
+            runtime_preset: LocalModelRuntimePreset::OpenAiCompatible,
             context_length: None,
             max_tools: None,
             notes: None,
@@ -1428,6 +1465,53 @@ mod tests {
         );
         println!("readback=local_model_probe_parser_plain after={result:?}");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_reports_missing_api_key_before_http_request() -> anyhow::Result<()> {
+        let env_var = "SYNAPSE_TEST_LOCAL_MODEL_PROBE_MISSING_KEY";
+        unsafe { std::env::remove_var(env_var) };
+        let row_key = registry_row_key("deepseek-missing-key")?;
+        let row = LocalModelRegistryRow {
+            schema_version: SCHEMA_VERSION,
+            row_key,
+            name: "deepseek-missing-key".to_owned(),
+            base_url: "https://api.deepseek.com".to_owned(),
+            model_id: "deepseek-v4-flash".to_owned(),
+            api_shape: LocalModelApiShape::OpenAiChatCompletions,
+            runtime_preset: LocalModelRuntimePreset::DeepSeekV4FlashNonThinking,
+            context_length: Some(1_000_000),
+            max_tools: Some(128),
+            notes: None,
+            enabled: true,
+            allow_non_loopback: true,
+            api_key_env_var: Some(env_var.to_owned()),
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            created_by_session: "test".to_owned(),
+            updated_by_session: "test".to_owned(),
+            last_probe: None,
+        };
+        println!("readback=local_model_probe_missing_key before=env:{env_var}:missing");
+        let probe = probe_row(&row, Some(1000)).await;
+        println!(
+            "readback=local_model_probe_missing_key after=healthy:{} code:{:?} detail:{:?}",
+            probe.healthy, probe.error_code, probe.error_detail
+        );
+        assert!(!probe.healthy);
+        assert_eq!(
+            probe.error_code.as_deref(),
+            Some(error_codes::MODEL_API_KEY_MISSING)
+        );
+        assert!(
+            probe
+                .error_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains(env_var)
+        );
+        assert!(probe.raw_response_sha256.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1494,6 +1578,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234/v1".to_owned(),
             model_id: "tool-model".to_owned(),
             api_shape: LocalModelApiShape::OpenAiChatCompletions,
+            runtime_preset: LocalModelRuntimePreset::OpenAiCompatible,
             context_length: Some(8192),
             max_tools: Some(32),
             notes: Some("known synthetic row".to_owned()),
@@ -1564,6 +1649,7 @@ mod tests {
             base_url: "http://192.0.2.10:1234/v1".to_owned(),
             model_id: "m".to_owned(),
             api_shape: LocalModelApiShape::OpenAiChatCompletions,
+            runtime_preset: LocalModelRuntimePreset::OpenAiCompatible,
             context_length: None,
             max_tools: None,
             notes: None,

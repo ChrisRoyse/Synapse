@@ -506,6 +506,13 @@ fn router(
                 DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
             )),
         )
+        .route("/dashboard/models", get(dashboard_model_list))
+        .route(
+            "/dashboard/api-model/register",
+            post(dashboard_api_model_register).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
         .route("/approval/activate", get(approval_activate));
     let app = Router::new()
         .merge(dashboard_routes)
@@ -1445,6 +1452,47 @@ struct DashboardLocalModelSpawnResponse {
     spawn: crate::m4::ActSpawnAgentResponse,
 }
 
+/// Browser-facing request to register an OpenAI-compatible cloud API model
+/// (DeepSeek first) into the local-model registry. `api_shape` is fixed to
+/// `open_ai_chat_completions` and `allow_non_loopback` to `true` server-side —
+/// these are the only valid settings for a remote https provider, so the UI
+/// never has to (and cannot) get them wrong. The secret is never sent here:
+/// only the `api_key_env_var` *name* the daemon already has in its environment.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardApiModelRegisterRequest {
+    name: String,
+    base_url: String,
+    model_id: String,
+    #[serde(default)]
+    runtime_preset: crate::m3::local_models::LocalModelRuntimePreset,
+    api_key_env_var: String,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    max_tools: Option<u32>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    probe_timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DashboardApiModelRegisterResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    register: crate::m3::local_models::LocalModelRegisterResponse,
+}
+
+#[derive(Serialize)]
+struct DashboardModelListResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    list: crate::m3::local_models::LocalModelListResponse,
+}
+
 #[derive(Serialize)]
 struct DashboardTranscriptSurface {
     source_of_truth: &'static str,
@@ -1662,10 +1710,13 @@ async fn dashboard_local_model_spawn(
     ) {
         return with_dashboard_security_headers(response);
     }
-    let params = match dashboard_local_model_spawn_params(request) {
+    let mut params = match dashboard_local_model_spawn_params(request) {
         Ok(params) => params,
         Err(response) => return with_dashboard_security_headers(response),
     };
+    // Anchor the spawned agent's MCP endpoint to THIS daemon's bind address so
+    // it phones home to the daemon that launched it (not the hardcoded default).
+    params.mcp_url = crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr);
     match state
         .health_service
         .dashboard_spawn_local_model_agent(params)
@@ -1731,6 +1782,113 @@ fn dashboard_local_model_spawn_params(
         template_id: None,
         template_version: None,
         template_config_hash: None,
+    })
+}
+
+async fn dashboard_api_model_register(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardApiModelRegisterRequest>,
+) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "POST",
+        "/dashboard/api-model/register",
+        CsrfPolicy::Required,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = match dashboard_api_model_register_params(request) {
+        Ok(params) => params,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    match state
+        .health_service
+        .dashboard_register_api_model(params)
+        .await
+    {
+        Ok(register) => with_dashboard_security_headers(
+            Json(DashboardApiModelRegisterResponse {
+                ok: true,
+                trigger: "dashboard.api_model_register",
+                source_of_truth: "CF_KV local_model_registry/v1/model/name_hex/",
+                register,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_model_list(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "GET",
+        "/dashboard/models",
+        CsrfPolicy::NotRequired,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_list_local_models() {
+        Ok(list) => with_dashboard_security_headers(
+            Json(DashboardModelListResponse {
+                ok: true,
+                trigger: "dashboard.model_list",
+                source_of_truth: "CF_KV local_model_registry/v1/model/name_hex/",
+                list,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+fn dashboard_api_model_register_params(
+    request: DashboardApiModelRegisterRequest,
+) -> Result<crate::m3::local_models::LocalModelRegisterParams, Response> {
+    fn require_non_empty(value: &str, field: &str) -> Result<String, Response> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(dashboard_error_response(
+                StatusCode::BAD_REQUEST,
+                synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                &format!("dashboard api-model register requires {field}"),
+                None,
+            ));
+        }
+        Ok(trimmed.to_owned())
+    }
+    let name = require_non_empty(&request.name, "name")?;
+    let base_url = require_non_empty(&request.base_url, "base_url")?;
+    let model_id = require_non_empty(&request.model_id, "model_id")?;
+    let api_key_env_var = require_non_empty(&request.api_key_env_var, "api_key_env_var")?;
+    Ok(crate::m3::local_models::LocalModelRegisterParams {
+        name,
+        base_url,
+        model_id,
+        // A remote cloud provider is OpenAI chat-completions over https; these
+        // two settings are not the operator's to get wrong, so we fix them here.
+        api_shape: crate::m3::local_models::LocalModelApiShape::OpenAiChatCompletions,
+        runtime_preset: request.runtime_preset,
+        context_length: request.context_length,
+        max_tools: request.max_tools,
+        notes: request
+            .notes
+            .and_then(|value| trim_optional_non_empty(&value)),
+        enabled: true,
+        allow_non_loopback: true,
+        api_key_env_var: Some(api_key_env_var),
+        probe_timeout_ms: request.probe_timeout_ms,
     })
 }
 
@@ -2026,12 +2184,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-Da2C2yR8.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-CcVpm2I5.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-C-punbR7.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-BJJmD3fP.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-Da2C2yR8.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CcVpm2I5.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-C-punbR7.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BJJmD3fP.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

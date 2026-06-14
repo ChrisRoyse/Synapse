@@ -139,6 +139,99 @@ export async function logoutDashboard(): Promise<void> {
   }
 }
 
+export interface ModelRow {
+  name: string;
+  base_url: string;
+  model_id: string;
+  api_shape: string;
+  runtime_preset?: string;
+  enabled: boolean;
+  allow_non_loopback: boolean;
+  api_key_env_var?: string | null;
+  context_length?: number | null;
+  max_tools?: number | null;
+  last_probe?: { healthy?: boolean; status?: string; latency_ms?: number } | null;
+}
+
+export interface RegisterApiModelRequest {
+  name: string;
+  base_url: string;
+  model_id: string;
+  runtime_preset: string;
+  api_key_env_var: string;
+  context_length?: number;
+  max_tools?: number;
+  notes?: string;
+  probe_timeout_ms?: number;
+}
+
+export interface SpawnRequest {
+  model_ref: string;
+  prompt: string;
+  working_dir?: string;
+  wait_timeout_ms?: number;
+  hold_open_ms?: number;
+}
+
+export type DashboardRouteReadback = Record<string, unknown>;
+
+function csrfHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  return headers;
+}
+
+async function readJsonOrThrow(response: Response): Promise<Record<string, unknown>> {
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await response.json()) as Record<string, unknown>;
+  } catch {
+    /* non-JSON error body */
+  }
+  if (!response.ok || body.ok === false) {
+    const code = typeof body.code === "string" ? body.code : `HTTP ${response.status}`;
+    const message = typeof body.message === "string" ? body.message : response.statusText;
+    throw new Error(`${code}: ${message}`);
+  }
+  return body;
+}
+
+export async function fetchModels(): Promise<ModelRow[]> {
+  const response = await fetch("/dashboard/models", {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  const body = await readJsonOrThrow(response);
+  const list = (body.list ?? {}) as { rows?: ModelRow[] };
+  return list.rows ?? [];
+}
+
+export async function registerApiModel(
+  request: RegisterApiModelRequest
+): Promise<DashboardRouteReadback> {
+  const response = await fetch("/dashboard/api-model/register", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: csrfHeaders(),
+    body: JSON.stringify(request)
+  });
+  return readJsonOrThrow(response);
+}
+
+export async function spawnLocalModelAgent(
+  request: SpawnRequest
+): Promise<DashboardRouteReadback> {
+  const response = await fetch("/dashboard/local-model-spawn", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: csrfHeaders(),
+    body: JSON.stringify(request)
+  });
+  return readJsonOrThrow(response);
+}
+
 export async function fetchDashboardState(): Promise<DashboardState> {
   const response = await fetch("/dashboard/state.json", {
     cache: "no-store",

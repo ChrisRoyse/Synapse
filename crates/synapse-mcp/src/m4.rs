@@ -1112,6 +1112,16 @@ pub fn default_agent_spawn_mcp_url() -> String {
     "http://127.0.0.1:7700/mcp".to_owned()
 }
 
+/// Builds the MCP URL a spawned agent should phone home to, anchored to the
+/// daemon's *actual* HTTP bind address rather than the hardcoded default. A
+/// daemon running on a non-default port (e.g. an isolated FSV instance, or a
+/// future multi-daemon layout) must hand its children its own endpoint, or they
+/// connect to the wrong daemon's tools. Loopback is preserved verbatim.
+#[must_use]
+pub fn agent_spawn_mcp_url_for_bind(bind_addr: std::net::SocketAddr) -> String {
+    format!("http://{bind_addr}/mcp")
+}
+
 #[must_use]
 pub const fn default_agent_spawn_wait_timeout_ms() -> u64 {
     DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS

@@ -26,6 +26,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+const SYNAPSE_TOOL_CATALOG: &str = "synapse_tool_catalog";
+const SYNAPSE_TOOL_CALL: &str = "synapse_tool";
+
 #[derive(Clone, Debug)]
 pub(crate) struct LocalAgentCli {
     pub model_name: Option<String>,
@@ -59,6 +62,7 @@ struct LocalModelRegistryRow {
     allow_non_loopback: bool,
     api_key_env_var: Option<String>,
     api_shape: String,
+    runtime_preset: Option<String>,
     context_length: Option<u64>,
     max_tools: Option<usize>,
     last_probe: Option<LocalModelProbe>,
@@ -131,6 +135,7 @@ struct Runner {
     endpoint_url: Url,
     endpoint_api_key: Option<String>,
     registry: LocalModelRegistryRow,
+    tool_exposure: ToolExposure,
     tools: Vec<Tool>,
     openai_tools: Vec<Value>,
     messages: Vec<Value>,
@@ -141,6 +146,21 @@ struct Runner {
     parse_error_count: u32,
     truncated_context_count: u32,
     http: reqwest::Client,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolExposure {
+    Direct,
+    Routed,
+}
+
+impl ToolExposure {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Routed => "routed",
+        }
+    }
 }
 
 pub(crate) async fn run_from_cli(cli: LocalAgentCli) -> anyhow::Result<ExitCode> {
@@ -244,7 +264,11 @@ impl Runner {
             None => None,
         };
         let event_url = agent_event_url(&cli.mcp_url, &spawn_id)?;
-        let openai_tools = tools.iter().map(openai_tool_from_mcp).collect::<Vec<_>>();
+        let tool_exposure = resolve_tool_exposure(&registry, tools.len());
+        let openai_tools = match tool_exposure {
+            ToolExposure::Direct => tools.iter().map(openai_tool_from_mcp).collect::<Vec<_>>(),
+            ToolExposure::Routed => routed_harness_tools(),
+        };
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cli.timeout_ms))
             .build()
@@ -263,7 +287,10 @@ impl Runner {
                 "endpoint_url": endpoint_url.as_str(),
                 "context_length": registry.context_length,
                 "registry_max_tools": registry.max_tools,
+                "runtime_preset": registry_runtime_preset(&registry),
+                "tool_exposure": tool_exposure.as_str(),
                 "mcp_tool_count": tools.len(),
+                "openai_tool_count": openai_tools.len(),
                 "started_at_unix_ms": unix_time_ms_now(),
             }),
         )?;
@@ -284,6 +311,8 @@ impl Runner {
                 "model": registry.model_id,
                 "conversation_id": conversation_id,
                 "tool_count": tools.len(),
+                "openai_tool_count": openai_tools.len(),
+                "tool_exposure": tool_exposure.as_str(),
                 "endpoint_url": endpoint_url.as_str(),
                 "started_at_unix_ms": unix_time_ms_now(),
             }),
@@ -303,7 +332,7 @@ impl Runner {
         let mut messages = Vec::new();
         messages.push(json!({
             "role": "system",
-            "content": system_prompt(),
+            "content": system_prompt(tool_exposure, &tools),
         }));
         messages.push(json!({
             "role": "user",
@@ -321,6 +350,7 @@ impl Runner {
             endpoint_url,
             endpoint_api_key,
             registry,
+            tool_exposure,
             tools,
             openai_tools,
             messages,
@@ -339,6 +369,9 @@ impl Runner {
             "model": runner.registry.model_id,
             "registry_name": runner.registry.name,
             "tool_count": runner.tools.len(),
+            "openai_tool_count": runner.openai_tools.len(),
+            "tool_exposure": runner.tool_exposure.as_str(),
+            "runtime_preset": registry_runtime_preset(&runner.registry),
         }))?;
         runner
             .post_event(json!({
@@ -350,6 +383,9 @@ impl Runner {
                 "state_to": "live",
                 "reason_code": "local_agent_started",
                 "tool_count": runner.tools.len(),
+                "openai_tool_count": runner.openai_tools.len(),
+                "tool_exposure": runner.tool_exposure.as_str(),
+                "runtime_preset": registry_runtime_preset(&runner.registry),
             }))
             .await?;
         Ok(runner)
@@ -449,6 +485,8 @@ impl Runner {
 
     async fn execute_tool_call(&mut self, call: OpenAiToolCall) -> anyhow::Result<()> {
         self.tool_call_count = self.tool_call_count.saturating_add(1);
+        let routed = call.name == SYNAPSE_TOOL_CALL;
+        let catalog = call.name == SYNAPSE_TOOL_CATALOG;
         self.write_line(json!({
             "type": "local.tool_call.started",
             "conversation_id": self.conversation_id,
@@ -457,6 +495,7 @@ impl Runner {
             "tool_name": call.name,
             "tool_call_id": call.id,
             "arguments": call.arguments,
+            "tool_exposure": self.tool_exposure.as_str(),
         }))?;
         self.post_event(json!({
             "event": "tool_call_started",
@@ -468,60 +507,79 @@ impl Runner {
             "tool_name": call.name,
             "tool_call_id": call.id,
             "tool_arguments": string_json_or_value(&call.arguments),
+            "tool_exposure": self.tool_exposure.as_str(),
         }))
         .await?;
-        let args = match parse_tool_arguments(&call.arguments) {
-            Ok(args) => args,
-            Err(error) => {
-                self.parse_error_count = self.parse_error_count.saturating_add(1);
-                let detail = format!("TOOL_CALL_ARGUMENTS_NOT_JSON: {error}");
-                let result_value = json!({ "error": detail });
-                self.write_line(json!({
-                    "type": "local.tool_parse_error",
-                    "conversation_id": self.conversation_id,
-                    "model": self.registry.model_id,
-                    "turn_index": self.turn_count,
-                    "tool_name": call.name,
-                    "tool_call_id": call.id,
-                    "error_code": "MODEL_TOOL_ARGUMENTS_INVALID",
-                    "error_detail": detail,
-                }))?;
-                self.messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": detail,
-                }));
-                self.post_event(json!({
-                    "event": "tool_call_finished",
-                    "session_id": self.mcp_session_id,
-                    "conversation_id": self.conversation_id,
-                    "model": self.registry.model_id,
-                    "registry_name": self.registry.name,
-                    "turn_index": self.turn_count,
-                    "tool_name": call.name,
-                    "tool_call_id": call.id,
-                    "tool_response": result_value,
-                    "error_code": "MODEL_TOOL_ARGUMENTS_INVALID",
-                }))
-                .await?;
-                if self.parse_error_count > self.cli.tool_parse_retry_limit {
-                    bail!(
-                        "MODEL_TOOLS_UNSUPPORTED: malformed tool-call arguments exceeded retry limit {}",
-                        self.cli.tool_parse_retry_limit
-                    );
+
+        if catalog {
+            let result_value = match self.tool_catalog_value(&call.arguments) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.record_tool_parse_error(&call, error).await?;
+                    return Ok(());
                 }
-                return Ok(());
+            };
+            let result_text = bounded_result_text(&result_value);
+            self.messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result_text,
+            }));
+            self.write_line(json!({
+                "type": "local.tool_call.finished",
+                "conversation_id": self.conversation_id,
+                "model": self.registry.model_id,
+                "turn_index": self.turn_count,
+                "tool_name": call.name,
+                "tool_call_id": call.id,
+                "status": "ok",
+                "result": result_value,
+                "tool_exposure": self.tool_exposure.as_str(),
+            }))?;
+            self.post_event(json!({
+                "event": "tool_call_finished",
+                "session_id": self.mcp_session_id,
+                "conversation_id": self.conversation_id,
+                "model": self.registry.model_id,
+                "registry_name": self.registry.name,
+                "turn_index": self.turn_count,
+                "tool_name": call.name,
+                "tool_call_id": call.id,
+                "tool_response": result_value,
+                "error_code": "",
+                "tool_exposure": self.tool_exposure.as_str(),
+            }))
+            .await?;
+            return Ok(());
+        }
+
+        let (tool_name, args) = if routed {
+            match parse_routed_tool_call(&call.arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.record_tool_parse_error(&call, error).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            match parse_tool_arguments(&call.arguments) {
+                Ok(args) => (call.name.clone(), args),
+                Err(error) => {
+                    self.record_tool_parse_error(&call, error).await?;
+                    return Ok(());
+                }
             }
         };
+
         let result = match self
             .mcp
             .peer()
-            .call_tool(CallToolRequestParams::new(call.name.clone()).with_arguments(args))
+            .call_tool(CallToolRequestParams::new(tool_name.clone()).with_arguments(args))
             .await
         {
             Ok(result) => result,
             Err(error) => {
-                let detail = format!("SYNAPSE_TOOL_CALL_FAILED: {}: {error}", call.name);
+                let detail = format!("SYNAPSE_TOOL_CALL_FAILED: {tool_name}: {error}");
                 let result_value = json!({ "error": detail });
                 self.messages.push(json!({
                     "role": "tool",
@@ -534,10 +592,12 @@ impl Runner {
                     "model": self.registry.model_id,
                     "turn_index": self.turn_count,
                     "tool_name": call.name,
+                    "routed_tool_name": if routed { Some(tool_name.as_str()) } else { None },
                     "tool_call_id": call.id,
                     "status": "error",
                     "error_code": "SYNAPSE_TOOL_CALL_FAILED",
                     "result": result_value,
+                    "tool_exposure": self.tool_exposure.as_str(),
                 }))?;
                 self.post_event(json!({
                     "event": "tool_call_finished",
@@ -547,9 +607,11 @@ impl Runner {
                     "registry_name": self.registry.name,
                     "turn_index": self.turn_count,
                     "tool_name": call.name,
+                    "routed_tool_name": if routed { Some(tool_name.as_str()) } else { None },
                     "tool_call_id": call.id,
                     "tool_response": result_value,
                     "error_code": "SYNAPSE_TOOL_CALL_FAILED",
+                    "tool_exposure": self.tool_exposure.as_str(),
                 }))
                 .await?;
                 bail!("{detail}");
@@ -557,7 +619,7 @@ impl Runner {
         };
         let is_error = result.is_error.unwrap_or(false);
         let result_value = tool_result_value(&result);
-        self.fail_if_tool_result_contains_control_shutdown(&call.name, &result_value)
+        self.fail_if_tool_result_contains_control_shutdown(&tool_name, &result_value)
             .await?;
         let result_text = bounded_result_text(&result_value);
         self.messages.push(json!({
@@ -571,10 +633,54 @@ impl Runner {
             "model": self.registry.model_id,
             "turn_index": self.turn_count,
             "tool_name": call.name,
+            "routed_tool_name": if routed { Some(tool_name.as_str()) } else { None },
             "tool_call_id": call.id,
             "status": if is_error { "error" } else { "ok" },
             "result": result_value,
+            "tool_exposure": self.tool_exposure.as_str(),
         }))?;
+        self.post_event(json!({
+            "event": "tool_call_finished",
+            "session_id": self.mcp_session_id,
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "registry_name": self.registry.name,
+            "turn_index": self.turn_count,
+            "tool_name": call.name,
+            "routed_tool_name": if routed { Some(tool_name.as_str()) } else { None },
+            "tool_call_id": call.id,
+            "tool_response": result_value,
+            "error_code": if is_error { "SYNAPSE_TOOL_ERROR" } else { "" },
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))
+        .await?;
+        Ok(())
+    }
+
+    async fn record_tool_parse_error(
+        &mut self,
+        call: &OpenAiToolCall,
+        error: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        self.parse_error_count = self.parse_error_count.saturating_add(1);
+        let detail = format!("TOOL_CALL_ARGUMENTS_NOT_JSON: {error}");
+        let result_value = json!({ "error": detail });
+        self.write_line(json!({
+            "type": "local.tool_parse_error",
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "turn_index": self.turn_count,
+            "tool_name": call.name,
+            "tool_call_id": call.id,
+            "error_code": "MODEL_TOOL_ARGUMENTS_INVALID",
+            "error_detail": detail,
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))?;
+        self.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": detail,
+        }));
         self.post_event(json!({
             "event": "tool_call_finished",
             "session_id": self.mcp_session_id,
@@ -585,10 +691,70 @@ impl Runner {
             "tool_name": call.name,
             "tool_call_id": call.id,
             "tool_response": result_value,
-            "error_code": if is_error { "SYNAPSE_TOOL_ERROR" } else { "" },
+            "error_code": "MODEL_TOOL_ARGUMENTS_INVALID",
+            "tool_exposure": self.tool_exposure.as_str(),
         }))
         .await?;
+        if self.parse_error_count > self.cli.tool_parse_retry_limit {
+            bail!(
+                "MODEL_TOOLS_UNSUPPORTED: malformed tool-call arguments exceeded retry limit {}",
+                self.cli.tool_parse_retry_limit
+            );
+        }
         Ok(())
+    }
+
+    fn tool_catalog_value(&self, raw_arguments: &str) -> anyhow::Result<Value> {
+        let args = parse_tool_arguments(raw_arguments)?;
+        let name_filter = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let mut rows = Vec::new();
+        for tool in &self.tools {
+            let tool_name = tool.name.as_ref();
+            let description = tool
+                .description
+                .as_ref()
+                .map(|desc| desc.as_ref())
+                .unwrap_or("");
+            let matches_name = name_filter.is_none_or(|name| tool_name == name);
+            let matches_query = query.as_ref().is_none_or(|query| {
+                tool_name.to_ascii_lowercase().contains(query)
+                    || description.to_ascii_lowercase().contains(query)
+            });
+            if matches_name && matches_query {
+                rows.push(json!({
+                    "name": tool_name,
+                    "description": description,
+                    "input_schema": Value::Object((*tool.input_schema).clone()),
+                }));
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(json!({
+            "source_of_truth": "MCP tools/list loaded by local-agent client",
+            "tool_count": self.tools.len(),
+            "returned_count": rows.len(),
+            "limit": limit,
+            "tool_exposure": self.tool_exposure.as_str(),
+            "call_tool": SYNAPSE_TOOL_CALL,
+            "tools": rows,
+        }))
     }
 
     async fn fail_if_tool_result_contains_control_shutdown(
@@ -709,6 +875,7 @@ impl Runner {
             "temperature": 0,
             "stream": !self.cli.no_stream,
         });
+        apply_runtime_preset(&self.registry, &mut body);
         if !self.cli.no_stream {
             body["stream_options"] = json!({"include_usage": true});
         }
@@ -962,6 +1129,93 @@ fn openai_tool_from_mcp(tool: &Tool) -> Value {
     })
 }
 
+fn routed_harness_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": SYNAPSE_TOOL_CATALOG,
+                "description": "Read the live Synapse MCP tool catalog loaded by this agent. Use name for an exact tool or query to search names/descriptions.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact Synapse MCP tool name to inspect."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Case-insensitive search across Synapse MCP tool names and descriptions."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 200,
+                            "description": "Maximum catalog rows to return."
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": SYNAPSE_TOOL_CALL,
+                "description": "Call any real Synapse MCP tool by name with a JSON object of arguments. The target tool must come from synapse_tool_catalog.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Real Synapse MCP tool name to call."
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "JSON object passed to that Synapse MCP tool.",
+                            "additionalProperties": true
+                        }
+                    },
+                    "required": ["name", "arguments"]
+                }
+            }
+        }),
+    ]
+}
+
+fn resolve_tool_exposure(row: &LocalModelRegistryRow, tool_count: usize) -> ToolExposure {
+    match row.max_tools {
+        Some(max_tools) if tool_count > max_tools => ToolExposure::Routed,
+        _ => ToolExposure::Direct,
+    }
+}
+
+fn parse_routed_tool_call(raw: &str) -> anyhow::Result<(String, JsonObject)> {
+    let mut args = parse_tool_arguments(raw)?;
+    let name = args
+        .remove("name")
+        .and_then(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .context("routed tool call requires non-empty name")?;
+    let arguments = match args.remove("arguments") {
+        Some(Value::Object(map)) => map,
+        Some(Value::String(raw)) => {
+            let value: Value =
+                serde_json::from_str(&raw).context("routed tool arguments string is not JSON")?;
+            value
+                .as_object()
+                .cloned()
+                .context("routed tool arguments string must decode to a JSON object")?
+        }
+        Some(other) => {
+            bail!("routed tool arguments must be a JSON object, got {other}");
+        }
+        None => Map::new(),
+    };
+    Ok((name, arguments))
+}
+
 fn resolve_task(task: Option<&str>, task_file: Option<&PathBuf>) -> anyhow::Result<String> {
     if let Some(task) = task.filter(|value| !value.trim().is_empty()) {
         return Ok(task.to_owned());
@@ -1028,6 +1282,28 @@ fn validate_registry_row(row: &LocalModelRegistryRow) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn registry_runtime_preset(row: &LocalModelRegistryRow) -> &str {
+    row.runtime_preset
+        .as_deref()
+        .unwrap_or("open_ai_compatible")
+}
+
+fn apply_runtime_preset(row: &LocalModelRegistryRow, body: &mut Value) {
+    match registry_runtime_preset(row) {
+        "deepseek_v4_flash_non_thinking" => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        "deepseek_v4_reasoning" => {
+            body["thinking"] = json!({ "type": "enabled" });
+            body["reasoning_effort"] = json!("max");
+            if let Some(object) = body.as_object_mut() {
+                object.remove("tool_choice");
+            }
+        }
+        _ => {}
+    }
 }
 
 fn chat_completions_endpoint(
@@ -1381,8 +1657,25 @@ fn local_agent_spawn_root_dir() -> anyhow::Result<PathBuf> {
         .join("agent-spawns"))
 }
 
-fn system_prompt() -> &'static str {
-    "You are a local Synapse agent. Use the provided MCP tools to inspect and change state. Never invent tool results. When a task asks for a stored artifact, call the relevant Synapse tool and then read it back. Finish with a concise summary only after the needed tool calls have succeeded."
+fn system_prompt(tool_exposure: ToolExposure, tools: &[Tool]) -> String {
+    let base = "You are a local Synapse agent. Use the provided MCP tools to inspect and change state. Never invent tool results. When a task asks for a stored artifact, call the relevant Synapse tool and then read it back. Finish with a concise summary only after the needed tool calls have succeeded.";
+    match tool_exposure {
+        ToolExposure::Direct => format!(
+            "{base}\n\nAll Synapse MCP tools from this session's strict tools/list are attached directly as model tools."
+        ),
+        ToolExposure::Routed => {
+            let names = tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{base}\n\nThis provider has a lower function-count cap than the live Synapse tool surface, so tools are exposed through a routed harness. Call {catalog} to inspect exact tool schemas and call {call_tool} with a real Synapse tool name plus arguments to execute it. The routed harness can call every real Synapse MCP tool loaded by this session, including file, shell, browser/perception, agent, dashboard, and local-model tools. Live tool names: {names}",
+                catalog = SYNAPSE_TOOL_CATALOG,
+                call_tool = SYNAPSE_TOOL_CALL,
+            )
+        }
+    }
 }
 
 fn error_code_from_detail(detail: &str) -> &str {
@@ -1478,6 +1771,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routed_tool_call_parses_real_tool_name_and_arguments() -> anyhow::Result<()> {
+        let (name, args) = parse_routed_tool_call(
+            r#"{"name":"workspace_put","arguments":{"run_id":"issue985","key":"ok","value":{"actual":true}}}"#,
+        )?;
+        assert_eq!(name, "workspace_put");
+        assert_eq!(args["run_id"], "issue985");
+        assert_eq!(args["value"]["actual"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_exposure_routes_when_provider_tool_cap_is_lower_than_synapse_surface() {
+        let mut row = test_local_agent_row();
+        row.max_tools = Some(128);
+        assert_eq!(resolve_tool_exposure(&row, 141), ToolExposure::Routed);
+        assert_eq!(resolve_tool_exposure(&row, 128), ToolExposure::Direct);
+    }
+
+    #[test]
+    fn deepseek_runtime_presets_shape_chat_body() {
+        let mut row = test_local_agent_row();
+        row.runtime_preset = Some("deepseek_v4_flash_non_thinking".to_owned());
+        let mut flash = json!({"tool_choice": "auto"});
+        apply_runtime_preset(&row, &mut flash);
+        assert_eq!(flash["thinking"]["type"], "disabled");
+        assert!(flash.get("tool_choice").is_some());
+
+        row.runtime_preset = Some("deepseek_v4_reasoning".to_owned());
+        let mut reasoning = json!({"tool_choice": "auto"});
+        apply_runtime_preset(&row, &mut reasoning);
+        assert_eq!(reasoning["thinking"]["type"], "enabled");
+        assert_eq!(reasoning["reasoning_effort"], "max");
+        assert!(reasoning.get("tool_choice").is_none());
+    }
+
     #[tokio::test]
     async fn local_model_endpoint_env_probe_requires_real_tool_call() -> anyhow::Result<()> {
         let base_url = match std::env::var("SYNAPSE_LOCAL_AGENT_ITEST_BASE_URL") {
@@ -1509,6 +1838,7 @@ mod tests {
             allow_non_loopback,
             api_key_env_var: None,
             api_shape: "open_ai_chat_completions".to_owned(),
+            runtime_preset: None,
             context_length: None,
             max_tools: None,
             last_probe: Some(LocalModelProbe {
@@ -1604,5 +1934,25 @@ mod tests {
                 .map(|usage| usage.completion_tokens)
         );
         Ok(())
+    }
+
+    fn test_local_agent_row() -> LocalModelRegistryRow {
+        LocalModelRegistryRow {
+            name: "deepseek-flash".to_owned(),
+            base_url: "https://api.deepseek.com".to_owned(),
+            model_id: "deepseek-v4-flash".to_owned(),
+            enabled: true,
+            allow_non_loopback: true,
+            api_key_env_var: Some("DEEPSEEK_API_KEY".to_owned()),
+            api_shape: "open_ai_chat_completions".to_owned(),
+            runtime_preset: Some("deepseek_v4_flash_non_thinking".to_owned()),
+            context_length: Some(1_000_000),
+            max_tools: Some(128),
+            last_probe: Some(LocalModelProbe {
+                healthy: true,
+                error_code: None,
+                error_detail: None,
+            }),
+        }
     }
 }
