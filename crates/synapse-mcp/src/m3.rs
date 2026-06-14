@@ -7,6 +7,7 @@ pub mod audit_retention;
 pub mod episodes;
 pub mod hygiene;
 pub mod intent;
+pub mod intent_events;
 pub mod interaction_cadence;
 pub mod local_models;
 pub mod permissions;
@@ -193,6 +194,10 @@ pub struct M3State {
     pub audio_runtime: Option<Arc<AudioRuntime>>,
     pub audit_session: Option<AuditSessionState>,
     pub mcp_audit_sessions: BTreeMap<SessionId, AuditSessionState>,
+    /// Shared intent state machine (#855), advanced by both the periodic intent
+    /// detector and the `intent_detect_tick` tool so transitions have one
+    /// source of truth. Cheap `Arc` clone hands a handle to either driver.
+    pub intent_tracker: intent_events::SharedIntentTracker,
 }
 
 #[derive(Clone, Debug)]
@@ -317,12 +322,21 @@ impl M3State {
             audio_runtime: None,
             audit_session: None,
             mcp_audit_sessions: BTreeMap::new(),
+            intent_tracker: intent_events::new_shared_tracker(),
         })
     }
 
     #[must_use]
     pub const fn scaffold_ready(&self) -> bool {
         !self.bind.is_empty()
+    }
+
+    /// Hands out a cheap `Arc` clone of the shared intent tracker (#855) so the
+    /// periodic detector and the `intent_detect_tick` tool advance one state
+    /// machine.
+    #[must_use]
+    pub fn intent_tracker(&self) -> intent_events::SharedIntentTracker {
+        Arc::clone(&self.intent_tracker)
     }
 
     pub fn ensure_profile_runtime(
@@ -565,7 +579,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 53] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 54] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -620,6 +634,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 53] {
         timeline_control::timeline_resume(),
         timeline_control::timeline_exclusions(),
         intent::intent_current(),
+        intent_events::intent_detect_tick(),
     ]
 }
 

@@ -291,6 +291,22 @@ impl SynapseService {
             })
     }
 
+    /// Shared intent tracker handle (#855), advanced by the periodic detector
+    /// and the `intent_detect_tick` tool.
+    pub(super) fn intent_tracker(
+        &self,
+    ) -> Result<crate::m3::intent_events::SharedIntentTracker, ErrorData> {
+        self.m3_state
+            .lock()
+            .map(|state| state.intent_tracker())
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "M3 service state lock poisoned",
+                )
+            })
+    }
+
     /// Opened M3 storage handle (the daemon-wide `RocksDB` instance).
     pub(super) fn m3_storage(&self) -> Result<Arc<synapse_storage::Db>, ErrorData> {
         let mut state = self.m3_state.lock().map_err(|_err| {

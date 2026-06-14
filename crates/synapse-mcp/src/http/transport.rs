@@ -283,6 +283,16 @@ pub(super) async fn serve(
     )
     .context("spawn periodic routine miner")?;
 
+    // Periodic intent detector (#855): re-evaluates the live intent snapshot on
+    // a fixed interval and publishes intent-detected/confirmed/abandoned events
+    // on the shared bus for reflexes and the suggestion engine. A misconfigured
+    // schedule or detection floor is a startup failure, not a silent default.
+    let _intent_detector_task = crate::m3::intent_events::spawn_intent_detector(
+        service.m3_state_handle(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic intent detector")?;
+
     // Periodic transcript ingester (#900): tails spawned-agent stdout JSONL
     // into CF_AGENT_TRANSCRIPTS. Same contract as the miner: a misconfigured
     // schedule is a startup failure, not a silently substituted default.

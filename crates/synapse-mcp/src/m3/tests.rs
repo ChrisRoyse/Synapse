@@ -127,6 +127,7 @@ fn m3_tool_stub_names_are_stable() {
         "timeline_resume",
         "timeline_exclusions",
         "intent_current",
+        "intent_detect_tick",
     ];
     println!("readback=m3_tool_stubs before=expected:{expected:?}");
     let actual = m3_tool_stubs().map(|stub| stub.name);
