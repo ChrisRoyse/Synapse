@@ -1189,7 +1189,7 @@ mod scope_gate_tests {
         let profiles = TempDir::new()?;
         let service = service_with_profiles(profiles.path(), false)?;
 
-        assert_eq!(crate::m3::m3_tool_stubs().len(), 44);
+        assert_eq!(crate::m3::m3_tool_stubs().len(), 47);
         assert!(service.instructions().contains("M3 scaffold"));
 
         Ok(())

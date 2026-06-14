@@ -40,6 +40,10 @@ use super::{
     ErrorData, Json, Parameters, SynapseService, mcp_error,
     session_registry::unix_time_ms_now, tool, tool_router,
 };
+use crate::m4::{
+    ActSpawnAgentRequest, default_agent_spawn_hold_open_ms, default_agent_spawn_mcp_url,
+    default_agent_spawn_wait_timeout_ms,
+};
 
 /// CF_KV key namespace for task rows. Versioned prefix so a format change is a
 /// clean re-key, never an in-place migration.
@@ -365,6 +369,64 @@ pub struct TaskReconcileResponse {
     pub flagged_orphans: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchOnceParams {
+    /// Max concurrently in-flight tasks; the dispatcher spawns nothing when the
+    /// queue is already at this cap.
+    #[serde(default = "default_cap")]
+    #[schemars(default = "default_cap", range(min = 1))]
+    pub concurrency_cap: usize,
+    /// Streamable HTTP MCP endpoint the spawned agent connects back to (runtime
+    /// knob, forwarded verbatim to act_spawn_agent).
+    #[serde(default = "default_agent_spawn_mcp_url")]
+    #[schemars(default = "default_agent_spawn_mcp_url")]
+    pub mcp_url: String,
+    /// Readback wait budget for the spawn (runtime knob, forwarded to
+    /// act_spawn_agent).
+    #[serde(default = "default_agent_spawn_wait_timeout_ms")]
+    #[schemars(
+        default = "default_agent_spawn_wait_timeout_ms",
+        range(min = 1, max = 1_800_000)
+    )]
+    pub wait_timeout_ms: u64,
+}
+
+/// What the dispatcher spawned, when a task was dispatched. The attempt bound to
+/// the dispatched task carries the same `spawn_id` + `session_id` +
+/// `template_version`, which is exactly the join #951 cost rollups walk.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchSpawnReadback {
+    pub spawn_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_id: Option<u32>,
+    pub launched_at_unix_ms: u64,
+    pub task_started_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchOnceResponse {
+    pub ok: bool,
+    /// `dispatched` (an agent was spawned + the task bound to it), `empty` (no
+    /// todo task), or `at_capacity:N` (queue already at the cap).
+    pub decision: String,
+    /// The task that was dispatched and moved to in_progress, when one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<AgentTask>,
+    /// The spawn that backs the dispatched task's live attempt, when one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<DispatchSpawnReadback>,
+    pub in_flight: usize,
+    pub concurrency_cap: usize,
+}
+
 // ---- key encoding & validation -------------------------------------------
 
 fn task_key(task_id: &str) -> String {
@@ -384,6 +446,18 @@ fn task_not_found(task_id: &str) -> ErrorData {
         error_codes::AGENT_TASK_NOT_FOUND,
         format!("agent_task not found: no task with id {task_id:?}"),
     )
+}
+
+/// The semantic string code an `mcp_error` carries in its `data.code` field
+/// (the numeric `ErrorData.code` is always the JSON-RPC sentinel). Used to put
+/// a meaningful code into a recorded dispatch-failure reason.
+fn error_code_str(error: &ErrorData) -> &str {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN")
 }
 
 fn is_kebab_id(value: &str) -> bool {
@@ -955,6 +1029,200 @@ impl SynapseService {
             flagged_orphans: flagged,
         })
     }
+
+    /// Appends a settled `Failed` attempt to a task **without** moving it out of
+    /// `todo`, so a spawn that never produced a live agent is recorded (audit +
+    /// the attempts UI) and the task remains dispatchable on the next tick. No
+    /// session is bound (the failure happened before/at launch), so reconcile —
+    /// which only inspects `Pending` attempts — ignores it. Errors loudly if the
+    /// task is no longer `todo`, which would mean a concurrent claim raced us.
+    fn record_failed_attempt_internal(
+        db: &Db,
+        task_id: &str,
+        reason: String,
+    ) -> Result<AgentTask, ErrorData> {
+        let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
+        if task.state != TaskState::Todo {
+            return Err(mcp_error(
+                error_codes::AGENT_TASK_INVALID_TRANSITION,
+                format!(
+                    "agent_task {task_id:?} cannot record a dispatch-failure attempt: it is {}, not todo (raced by another dispatcher?)",
+                    task.state.as_str()
+                ),
+            ));
+        }
+        let now = unix_time_ms_now();
+        let attempt_id = u32::try_from(task.attempts.len()).unwrap_or(u32::MAX) + 1;
+        task.attempts.push(TaskAttempt {
+            attempt_id,
+            session_id: String::new(),
+            spawn_id: None,
+            template_version: None,
+            outcome: AttemptOutcome::Failed,
+            started_unix_ms: now,
+            ended_unix_ms: Some(now),
+            reason: Some(reason),
+        });
+        task.updated_unix_ms = now;
+        Self::write_task(db, &task)?;
+        Ok(task)
+    }
+
+    /// The #957 auto-dispatcher: atomically select → render-template → spawn →
+    /// bind-attempt for one task. Reconciles orphans first, applies the #910
+    /// priority/fairness/FIFO selector under `concurrency_cap`, and on a
+    /// `Dispatch` decision spawns a real agent from the task's template via the
+    /// shared journaled spawn path, then binds the dispatched task's attempt to
+    /// the spawned `session_id` + `spawn_id` + `template_version`.
+    ///
+    /// Failure handling is loud, never silent: a spawn that fails leaves the task
+    /// `todo` with a recorded `Failed` attempt + the error reason and returns the
+    /// structured error. A claim that fails *after* a live spawn (a concurrent
+    /// dispatcher won the task) is a true orphaned agent — surfaced as a
+    /// `TOOL_INTERNAL_ERROR` carrying the live `spawn_id`/`session_id` so an
+    /// operator can `agent_kill` it. `task_dispatch_once` is intended to be
+    /// driven by a single serial dispatch loop; that guard catches the race.
+    async fn task_dispatch_once_impl(
+        &self,
+        params: TaskDispatchOnceParams,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        let db = self.agent_task_db()?;
+        self.reconcile_tasks(&db)?;
+        let tasks = Self::read_all_tasks(&db)?;
+        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
+        let decision = dispatch_decision(&tasks, params.concurrency_cap);
+        let task_id = match decision {
+            DispatchDecision::Empty => {
+                return Ok(TaskDispatchOnceResponse {
+                    ok: true,
+                    decision: "empty".to_owned(),
+                    task: None,
+                    spawn: None,
+                    in_flight,
+                    concurrency_cap: params.concurrency_cap,
+                });
+            }
+            DispatchDecision::AtCapacity { in_flight } => {
+                return Ok(TaskDispatchOnceResponse {
+                    ok: true,
+                    decision: format!("at_capacity:{in_flight}"),
+                    task: None,
+                    spawn: None,
+                    in_flight,
+                    concurrency_cap: params.concurrency_cap,
+                });
+            }
+            DispatchDecision::Dispatch { task_id } => task_id,
+        };
+
+        // Read the picked task to render its template into a spawn request. The
+        // task supplies the template id + params; act_spawn_agent renders the
+        // exact pinned version and records (id, version, config_hash) provenance.
+        let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
+        let request = ActSpawnAgentRequest {
+            template_id: Some(task.template_id.clone()),
+            template_version: None,
+            template_params: task.template_params.clone(),
+            cli: None,
+            model: None,
+            prompt: None,
+            target: None,
+            working_dir: None,
+            mcp_url: params.mcp_url.clone(),
+            wait_timeout_ms: params.wait_timeout_ms,
+            hold_open_ms: default_agent_spawn_hold_open_ms(),
+        };
+
+        tracing::info!(
+            code = "AGENT_TASK_DISPATCH_SPAWN",
+            task_id = %task_id,
+            template_id = %task.template_id,
+            "readback=agent_tasks edge=dispatch_spawn_begin"
+        );
+
+        let response = match self.spawn_agent_journaled(request, request_context).await {
+            Ok(response) => response,
+            Err(spawn_error) => {
+                // No live agent was produced — record the failure on the still-todo
+                // task and surface the structured error. The task stays dispatchable.
+                let error_code = error_code_str(&spawn_error);
+                let reason = format!(
+                    "dispatch spawn failed [{error_code}]: {}",
+                    spawn_error.message
+                );
+                Self::record_failed_attempt_internal(&db, &task_id, reason.clone())?;
+                tracing::error!(
+                    code = "AGENT_TASK_DISPATCH_SPAWN_FAILED",
+                    task_id = %task_id,
+                    template_id = %task.template_id,
+                    error_code = %error_code,
+                    "readback=agent_tasks edge=dispatch_spawn_failed reason={reason}"
+                );
+                return Err(spawn_error);
+            }
+        };
+
+        // The agent is live. Bind the dispatched task's attempt to it (todo ->
+        // in_progress). If this claim fails the task was raced out of todo while
+        // the spawn was in flight, leaving a live, unbound agent — surface it
+        // loudly with the spawn identity so it can be killed; never drop it.
+        let claimed = match Self::claim_internal(
+            &db,
+            &task_id,
+            &response.session_id,
+            Some(response.spawn_id.clone()),
+            response.template_version,
+        ) {
+            Ok(task) => task,
+            Err(claim_error) => {
+                tracing::error!(
+                    code = "AGENT_TASK_DISPATCH_ORPHAN",
+                    task_id = %task_id,
+                    spawn_id = %response.spawn_id,
+                    session_id = %response.session_id,
+                    "readback=agent_tasks edge=dispatch_claim_failed: live agent is unbound, kill it"
+                );
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "task_dispatch_once spawned agent session {:?} (spawn {:?}) for task {task_id:?} but could not bind the attempt: {}. The agent is LIVE and UNBOUND — agent_kill it. Underlying error: {}",
+                        response.session_id,
+                        response.spawn_id,
+                        claim_error.message,
+                        claim_error.message
+                    ),
+                ));
+            }
+        };
+
+        tracing::info!(
+            code = "AGENT_TASK_DISPATCH",
+            task_id = %task_id,
+            spawn_id = %response.spawn_id,
+            session_id = %response.session_id,
+            template_id = %task.template_id,
+            template_version = response.template_version.unwrap_or(0),
+            "readback=agent_tasks edge=dispatch"
+        );
+
+        Ok(TaskDispatchOnceResponse {
+            ok: true,
+            decision: "dispatched".to_owned(),
+            task: Some(claimed),
+            spawn: Some(DispatchSpawnReadback {
+                spawn_id: response.spawn_id,
+                session_id: response.session_id,
+                template_id: response.template_id,
+                template_version: response.template_version,
+                agent_process_id: response.agent_process_id,
+                launched_at_unix_ms: response.launched_at_unix_ms,
+                task_started_at_unix_ms: response.task_started_at_unix_ms,
+            }),
+            in_flight: in_flight + 1,
+            concurrency_cap: params.concurrency_cap,
+        })
+    }
 }
 
 #[tool_router(router = agent_task_tool_router, vis = "pub(super)")]
@@ -1086,6 +1354,25 @@ impl SynapseService {
             "tool.invocation kind=task_reconcile"
         );
         self.task_reconcile_impl().map(Json)
+    }
+
+    #[tool(
+        description = "Atomically dispatch the next eligible task: reconcile orphans, apply the priority/fairness/FIFO selector under concurrency_cap, then for a Dispatch decision spawn a real agent from the task's template and bind the task's attempt to the spawned session_id + spawn_id + template_version (todo -> in_progress). Returns 'empty' / 'at_capacity:N' with no spawn when nothing is eligible. A spawn failure leaves the task todo with a recorded failed attempt and returns the structured error (never a silent drop)."
+    )]
+    pub async fn task_dispatch_once(
+        &self,
+        params: Parameters<TaskDispatchOnceParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TaskDispatchOnceResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "task_dispatch_once",
+            concurrency_cap = params.0.concurrency_cap,
+            "tool.invocation kind=task_dispatch_once"
+        );
+        self.task_dispatch_once_impl(params.0, &request_context)
+            .await
+            .map(Json)
     }
 }
 
