@@ -1,0 +1,22 @@
+# Repo-local Cargo configuration.
+#
+# Cargo merges this with the user's global ~/.cargo/config.toml; for any key set
+# in both, this file wins. The global config supplies host build parallelism
+# (`[build] jobs = 16`) and `incremental = false`; this file adds codegen tuning
+# that should travel WITH the repo so every checkout / contributor / CI-less gate
+# produces the same optimized binary. See also Cargo.toml [profile.*].
+#
+# target-cpu = x86-64-v2 (chosen 2026-06-14):
+#   Raises the codegen baseline from generic x86-64 (v1) to v2 — adds SSE3, SSSE3,
+#   SSE4.1, SSE4.2, POPCNT, CMPXCHG16B. Every 64-bit Windows PC from ~2010 onward
+#   supports v2, so the produced binary stays portable across ANY modern Windows
+#   machine while letting LLVM auto-vectorize with the wider instruction set.
+#   Applies to all profiles (dev + release), so the shipped daemon AND the local
+#   test gates run on the same instruction baseline.
+#
+#   NOT v3 (AVX2): some still-shipping low-end Pentium/Celeron/Atom parts lack
+#   AVX2, and a v3 binary would crash (illegal-instruction / SIGILL) on them.
+#   To re-baseline higher (e.g. a known-modern fleet), change the value below to
+#   "x86-64-v3" or "x86-64-v4"; to pin to the local CPU only, use "native".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

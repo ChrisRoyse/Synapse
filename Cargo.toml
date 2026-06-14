@@ -131,15 +131,24 @@ debug = "line-tables-only"
 incremental = false
 lto = false
 
+# release is the SHIPPED profile: the daemon-reinstall flow copies
+# target/release/synapse-mcp.exe into ~/.cargo/bin. Tuned 2026-06-14 for maximum
+# runtime speed of that shipped binary at the cost of slower release builds:
+#   lto = "fat"        whole-program inlining across every crate (was "thin")
+#   codegen-units = 1  no parallel-codegen optimization barriers (was 16)
+# Combined with target-cpu=x86-64-v2 (.cargo/config.toml) this is the fastest
+# portable binary we can produce. Use `cargo build` (dev) for fast edit cycles.
 [profile.release]
 opt-level = 3
 debug = "limited"
 incremental = false
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 strip = true
 panic = "abort"
 
+# release-max now matches release (kept as an explicit alias / stable name for
+# scripts that reference it; both are fat-LTO single-CGU since 2026-06-14).
 [profile.release-max]
 inherits = "release"
 codegen-units = 1
