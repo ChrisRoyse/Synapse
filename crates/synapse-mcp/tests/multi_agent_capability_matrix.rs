@@ -6,7 +6,7 @@ use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
 const MATRIX_DOC: &str = include_str!("../../../docs/multi-agent-capability-matrix.md");
 
-const EXPECTED_MATRIX_TOOLS: [&str; 62] = [
+const EXPECTED_MATRIX_TOOLS: [&str; 73] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -27,8 +27,19 @@ const EXPECTED_MATRIX_TOOLS: [&str; 62] = [
     "act_type",
     "action_diagnostic_queue_full_setup",
     "action_diagnostic_rate_limit_override",
+    "agent_cost",
+    "agent_cost_price_delete",
+    "agent_cost_price_list",
+    "agent_cost_price_put",
     "agent_inbox",
+    "agent_query",
+    "agent_receipts",
     "agent_send",
+    "agent_send_broadcast",
+    "agent_template_delete",
+    "agent_template_get",
+    "agent_template_list",
+    "agent_template_put",
     "agent_wait",
     "audio_tail",
     "audio_transcribe",
