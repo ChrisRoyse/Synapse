@@ -1345,6 +1345,1193 @@ fn collect_json_strings(value: &Value, output: &mut BTreeSet<String>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Data-cleaning tools (#875): `timeline_redact` masks flagged spans in place
+// (preserving row structure for mining continuity) and the purge path hard
+// deletes by flag id. Both INVALIDATE derived state — every impacted routine,
+// episode, and profile-authoring candidate gets a taint record in the
+// `hygiene/taint/v1/` CF_KV ledger — and both are audit-logged with flag ids
+// and counts only, never the cleaned content.
+// ---------------------------------------------------------------------------
+
+/// CF_KV prefix for derived-state taint records written when poisoned source
+/// rows are cleaned. One record per impacted artifact; additive, so it never
+/// mutates the operator-owned `CF_ROUTINE_STATE`/`CF_EPISODES` rows themselves.
+const TAINT_PREFIX: &str = "hygiene/taint/v1/";
+/// Default replacement for a redacted span. Deliberately benign so a re-scan of
+/// the cleaned row never re-flags the marker itself.
+const DEFAULT_REDACTION_MARKER: &str = "[REDACTED]";
+/// Upper bound on flags one clean op resolves, so a `query` selector can never
+/// fan out into an unbounded rewrite.
+const MAX_CLEAN_FLAGS: usize = 5_000;
+
+const fn default_true() -> bool {
+    true
+}
+
+/// Operation tag recorded on taint + audit rows so a consumer can tell how a
+/// row was cleaned.
+pub const CLEAN_OP_REDACT: &str = "timeline_redact";
+pub const CLEAN_OP_PURGE: &str = "timeline_purge_by_flags";
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneRedactParams {
+    /// Explicit flag ids to redact. Mutually exclusive with the `source_*` /
+    /// `min_score` query selector. Every id must resolve to a stored flag or
+    /// the call fails loudly (a silently-skipped id would leave poison behind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag_ids: Option<Vec<String>>,
+    /// Query selector: restrict to one source CF (`CF_TIMELINE`,
+    /// `CF_OBSERVATIONS`, `CF_OCR_CACHE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cf: Option<String>,
+    /// Query selector: restrict to one exact source row, hex-encoded. Requires
+    /// `source_cf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_key_hex: Option<String>,
+    /// Query selector: minimum flag score to redact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<u32>,
+    /// Marker that replaces each flagged span (default `[REDACTED]`). Rejected
+    /// if it itself trips the injection scanner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// Resolve, verify, and report outcomes without mutating any row, taint
+    /// record, or audit row.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Write derived-state taint records for impacted routines/episodes/
+    /// candidates (default true).
+    #[serde(default = "default_true")]
+    pub invalidate: bool,
+}
+
+/// Per-flag redaction outcome — honest about every span the tool did NOT mask.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneFlagRedactOutcome {
+    pub flag_id: String,
+    pub source_cf: String,
+    pub source_key_hex: String,
+    pub source_field: String,
+    /// `redacted` (span masked), `already_redacted` (span already absent and
+    /// the marker present), `source_missing` (the physical row is gone),
+    /// `field_missing` (the JSON pointer no longer resolves to a string), or
+    /// `stale_source` (the flagged text is absent but the row was not cleaned
+    /// by us — content changed out from under the flag).
+    pub status: String,
+    pub detail: String,
+}
+
+/// One derived artifact tainted because a poisoned source row feeding it was
+/// cleaned. Persisted under [`TAINT_PREFIX`] and read back during FSV.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneTaintRecord {
+    pub schema_version: u32,
+    /// `routine`, `episode`, or `authoring_candidate`.
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    /// [`CLEAN_OP_REDACT`] or [`CLEAN_OP_PURGE`].
+    pub cleaning_op: String,
+    pub reason: String,
+    /// Flag ids whose cleaning poisoned this artifact.
+    pub source_flag_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleaning_audit_key_hex: Option<String>,
+    pub tainted_at_ns: u64,
+    pub by_session: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneInvalidationSummary {
+    pub tainted_routine_ids: Vec<String>,
+    pub tainted_episode_ids: Vec<String>,
+    pub tainted_authoring_candidate_ids: Vec<String>,
+    pub taint_records_written: u64,
+    pub scanned_episode_rows: u64,
+    pub scanned_routine_rows: u64,
+    pub scanned_authoring_candidate_rows: u64,
+    /// Honest explanation when nothing was tainted (e.g. no timeline flags, or
+    /// the rows were never segmented/mined).
+    pub note: String,
+}
+
+impl HygieneInvalidationSummary {
+    fn empty(note: impl Into<String>) -> Self {
+        Self {
+            tainted_routine_ids: Vec::new(),
+            tainted_episode_ids: Vec::new(),
+            tainted_authoring_candidate_ids: Vec::new(),
+            taint_records_written: 0,
+            scanned_episode_rows: 0,
+            scanned_routine_rows: 0,
+            scanned_authoring_candidate_rows: 0,
+            note: note.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneRedactResponse {
+    pub matched_flags: u64,
+    pub redacted_flags: u64,
+    /// Distinct physical rows rewritten.
+    pub redacted_rows: u64,
+    pub marker: String,
+    pub dry_run: bool,
+    pub outcomes: Vec<HygieneFlagRedactOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_key_hex: Option<String>,
+    pub invalidation: HygieneInvalidationSummary,
+    pub elapsed_ms: u64,
+}
+
+#[must_use]
+pub fn required_permissions_redact(_params: &HygieneRedactParams) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+/// How a clean op selected its flags. Built from either explicit ids or the
+/// `source_*`/`min_score` query, validated as mutually exclusive.
+pub(crate) enum CleanFlagSelector {
+    Ids(Vec<String>),
+    Query {
+        source_cf: Option<String>,
+        source_key_hex: Option<String>,
+        min_score: u32,
+    },
+}
+
+/// Resolves a [`CleanFlagSelector`] to the exact stored flags it names. For ids
+/// the whole flag store is scanned (bounded by [`MAX_CLEAN_FLAGS`] distinct
+/// ids) and every requested id MUST be found — an unresolved id is a hard error
+/// so a cleaning op can never silently leave a poisoned row untouched.
+pub(crate) fn resolve_clean_flags(
+    runtime: &ReflexRuntime,
+    selector: &CleanFlagSelector,
+) -> Result<Vec<HygieneStoredFlag>, ErrorData> {
+    match selector {
+        CleanFlagSelector::Ids(ids) => {
+            let mut wanted: BTreeSet<&str> = BTreeSet::new();
+            for id in ids {
+                if id.trim().is_empty() {
+                    return Err(invalid("flag_ids entries must not be empty"));
+                }
+                wanted.insert(id.as_str());
+            }
+            if wanted.is_empty() {
+                return Err(invalid("flag_ids must name at least one flag"));
+            }
+            if wanted.len() > MAX_CLEAN_FLAGS {
+                return Err(invalid(format!(
+                    "flag_ids names {} flags; the per-call ceiling is {MAX_CLEAN_FLAGS}",
+                    wanted.len()
+                )));
+            }
+            let mut found: BTreeMap<String, HygieneStoredFlag> = BTreeMap::new();
+            let prefix = FLAG_PREFIX.as_bytes();
+            let mut start = prefix.to_vec();
+            loop {
+                let rows = runtime
+                    .storage_cf_prefix_rows_from(cf::CF_KV, prefix, &start, STORAGE_SCAN_CHUNK_ROWS)
+                    .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+                if rows.is_empty() {
+                    break;
+                }
+                let rows_len = rows.len();
+                let mut last = None;
+                for (key, value) in rows {
+                    last = Some(key.clone());
+                    let record = decode_json::<HygieneFlagRecord>(&value).map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "HYGIENE_CLEAN_FLAG_ROW_DECODE_FAILED in CF_KV at {}: {error}",
+                                hex_encode(&key)
+                            ),
+                        )
+                    })?;
+                    if wanted.contains(record.flag_id.as_str()) {
+                        let kv_key_hex = hex_encode(&key);
+                        found
+                            .entry(record.flag_id.clone())
+                            .or_insert(HygieneStoredFlag { kv_key_hex, record });
+                    }
+                }
+                if found.len() == wanted.len() || rows_len < STORAGE_SCAN_CHUNK_ROWS {
+                    break;
+                }
+                let Some(last) = last else { break };
+                start = key_after(&last);
+            }
+            if found.len() != wanted.len() {
+                let missing: Vec<&str> = wanted
+                    .iter()
+                    .copied()
+                    .filter(|id| !found.contains_key(*id))
+                    .collect();
+                return Err(mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "HYGIENE_CLEAN_FLAG_IDS_UNRESOLVED: {} of {} flag id(s) not found: {:?}",
+                        missing.len(),
+                        wanted.len(),
+                        missing
+                    ),
+                ));
+            }
+            // Preserve the caller's id order for stable, reviewable output.
+            Ok(ids
+                .iter()
+                .filter_map(|id| found.remove(id))
+                .collect())
+        }
+        CleanFlagSelector::Query {
+            source_cf,
+            source_key_hex,
+            min_score,
+        } => {
+            let prefix = flag_prefix(source_cf.as_deref(), source_key_hex.as_deref());
+            let mut start = prefix.as_bytes().to_vec();
+            let mut flags = Vec::new();
+            loop {
+                let rows = runtime
+                    .storage_cf_prefix_rows_from(
+                        cf::CF_KV,
+                        prefix.as_bytes(),
+                        &start,
+                        STORAGE_SCAN_CHUNK_ROWS,
+                    )
+                    .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+                if rows.is_empty() {
+                    break;
+                }
+                let rows_len = rows.len();
+                let mut last = None;
+                for (key, value) in rows {
+                    last = Some(key.clone());
+                    let record = decode_json::<HygieneFlagRecord>(&value).map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "HYGIENE_CLEAN_FLAG_ROW_DECODE_FAILED in CF_KV at {}: {error}",
+                                hex_encode(&key)
+                            ),
+                        )
+                    })?;
+                    if record.score >= *min_score {
+                        flags.push(HygieneStoredFlag {
+                            kv_key_hex: hex_encode(&key),
+                            record,
+                        });
+                        if flags.len() > MAX_CLEAN_FLAGS {
+                            return Err(invalid(format!(
+                                "query selector matches more than {MAX_CLEAN_FLAGS} flags; narrow \
+                                 source_cf/source_key_hex/min_score or clean by explicit flag_ids"
+                            )));
+                        }
+                    }
+                }
+                if rows_len < STORAGE_SCAN_CHUNK_ROWS {
+                    break;
+                }
+                let Some(last) = last else { break };
+                start = key_after(&last);
+            }
+            Ok(flags)
+        }
+    }
+}
+
+/// Masks the flagged spans named by `params` in their physical source rows,
+/// preserving every row's JSON structure (only the flagged substring inside a
+/// string field is replaced), then invalidates derived state and writes one
+/// audit row. Content-anchored: each span is located by its recorded text +
+/// SHA-256, so the redaction is idempotent and resilient to offset drift from a
+/// prior redaction of the same field.
+pub fn redact(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &HygieneRedactParams,
+    by_session: &str,
+) -> Result<HygieneRedactResponse, ErrorData> {
+    let started = Instant::now();
+    let marker = params
+        .marker
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REDACTION_MARKER.to_owned());
+    if marker.trim().is_empty() {
+        return Err(invalid("timeline_redact marker must not be empty"));
+    }
+    if !scan_text(&marker, DEFAULT_MIN_SCORE).is_empty() {
+        return Err(invalid(
+            "timeline_redact marker itself trips the injection scanner; choose a benign marker",
+        ));
+    }
+    let selector = redact_selector(params)?;
+
+    let guard = lock_runtime(runtime)?;
+    let flags = resolve_clean_flags(&guard, &selector)?;
+    let matched_flags = flags.len() as u64;
+
+    // Group flags by physical source row so each row is read, mutated, and
+    // written exactly once even when it carries several flags.
+    let mut by_row: BTreeMap<(String, String), Vec<HygieneStoredFlag>> = BTreeMap::new();
+    for flag in flags {
+        by_row
+            .entry((flag.record.source_cf.clone(), flag.record.source_key_hex.clone()))
+            .or_default()
+            .push(flag);
+    }
+
+    let mut outcomes: Vec<HygieneFlagRedactOutcome> = Vec::new();
+    let mut redacted_flags = 0_u64;
+    let mut redacted_rows = 0_u64;
+    let mut redacted_flag_records: Vec<HygieneStoredFlag> = Vec::new();
+
+    for ((source_cf, source_key_hex), row_flags) in by_row {
+        let source_cf = normalize_source_cf(&source_cf, true)?;
+        let key = hex_decode(&source_key_hex).ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!("HYGIENE_REDACT_FLAG_KEY_INVALID: non-hex source_key_hex {source_key_hex}"),
+            )
+        })?;
+        let existing = guard
+            .storage_cf_prefix_rows(&source_cf, &key, 1)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let Some((_row_key, value)) = existing
+            .into_iter()
+            .find(|(row_key, _value)| row_key == &key)
+        else {
+            for flag in &row_flags {
+                outcomes.push(outcome(
+                    flag,
+                    "source_missing",
+                    format!("no row at {source_key_hex} in {source_cf}; nothing to redact"),
+                ));
+            }
+            continue;
+        };
+
+        let mut document: Value = serde_json::from_slice(&value).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_REDACT_ROW_DECODE_FAILED in {source_cf} at {source_key_hex}: {error}"
+                ),
+            )
+        })?;
+
+        let mut row_mutated = false;
+        let mut row_redacted_flags: Vec<HygieneStoredFlag> = Vec::new();
+        for flag in &row_flags {
+            match redact_one_span(&mut document, &flag.record, &marker)? {
+                SpanRedaction::Redacted => {
+                    row_mutated = true;
+                    redacted_flags += 1;
+                    row_redacted_flags.push(flag.clone());
+                    outcomes.push(outcome(flag, "redacted", "span masked".to_owned()));
+                }
+                SpanRedaction::AlreadyClean => outcomes.push(outcome(
+                    flag,
+                    "already_redacted",
+                    "flagged text already absent and marker present; idempotent no-op".to_owned(),
+                )),
+                SpanRedaction::FieldMissing => outcomes.push(outcome(
+                    flag,
+                    "field_missing",
+                    format!("JSON pointer {} no longer resolves to a string", flag.record.source_field),
+                )),
+                SpanRedaction::Stale => outcomes.push(outcome(
+                    flag,
+                    "stale_source",
+                    "flagged text absent without a redaction marker; row changed out from under \
+                     the flag — left untouched, re-scan to refresh"
+                        .to_owned(),
+                )),
+            }
+        }
+
+        if row_mutated && !params.dry_run {
+            let encoded = serde_json::to_vec(&document).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("HYGIENE_REDACT_ROW_ENCODE_FAILED at {source_key_hex}: {error}"),
+                )
+            })?;
+            guard
+                .storage_replace_rows(&source_cf, Vec::new(), vec![(key.clone(), encoded)])
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("HYGIENE_REDACT_WRITE_FAILED at {source_key_hex}: {error}"),
+                    )
+                })?;
+            verify_redacted_row(&guard, &source_cf, &key, &source_key_hex, &row_redacted_flags, &marker)?;
+        }
+        if row_mutated {
+            redacted_rows += 1;
+            redacted_flag_records.extend(row_redacted_flags);
+        }
+    }
+
+    // Invalidate derived state from the rows we actually cleaned (dry_run never
+    // mutates anything, including taint).
+    let (invalidation, audit_key_hex) = if params.dry_run {
+        (
+            HygieneInvalidationSummary::empty("dry_run: no rows, taint, or audit written"),
+            None,
+        )
+    } else {
+        let audit_payload = serde_json::json!({
+            "op": CLEAN_OP_REDACT,
+            "by_session": by_session,
+            "matched_flags": matched_flags,
+            "redacted_flags": redacted_flags,
+            "redacted_rows": redacted_rows,
+            "flag_ids": redacted_flag_records
+                .iter()
+                .map(|flag| flag.record.flag_id.clone())
+                .collect::<Vec<_>>(),
+            "marker": marker,
+        });
+        let audit_key_hex = if redacted_rows > 0 {
+            Some(crate::m3::timeline::write_cleaning_audit_row(&guard, audit_payload)?)
+        } else {
+            None
+        };
+        let invalidation = if params.invalidate {
+            invalidate_cleaned_flags(
+                &guard,
+                &redacted_flag_records,
+                CLEAN_OP_REDACT,
+                audit_key_hex.as_deref(),
+                by_session,
+            )?
+        } else {
+            HygieneInvalidationSummary::empty("invalidate=false: derived-state taint skipped")
+        };
+        (invalidation, audit_key_hex)
+    };
+    drop(guard);
+
+    tracing::info!(
+        code = "HYGIENE_REDACT_COMPLETED",
+        matched_flags,
+        redacted_flags,
+        redacted_rows,
+        dry_run = params.dry_run,
+        tainted_routines = invalidation.tainted_routine_ids.len(),
+        by_session,
+        "timeline_redact completed"
+    );
+
+    Ok(HygieneRedactResponse {
+        matched_flags,
+        redacted_flags,
+        redacted_rows,
+        marker,
+        dry_run: params.dry_run,
+        outcomes,
+        audit_key_hex,
+        invalidation,
+        elapsed_ms: elapsed_ms(started),
+    })
+}
+
+fn redact_selector(params: &HygieneRedactParams) -> Result<CleanFlagSelector, ErrorData> {
+    let has_query = params.source_cf.is_some()
+        || params.source_key_hex.is_some()
+        || params.min_score.is_some();
+    match (&params.flag_ids, has_query) {
+        (Some(_), true) => Err(invalid(
+            "timeline_redact flag_ids is mutually exclusive with the source_cf/source_key_hex/min_score query",
+        )),
+        (Some(ids), false) => Ok(CleanFlagSelector::Ids(ids.clone())),
+        (None, true) => {
+            let source_cf = params
+                .source_cf
+                .as_deref()
+                .map(|raw| normalize_source_cf(raw, true))
+                .transpose()?;
+            let source_key_hex = params
+                .source_key_hex
+                .as_deref()
+                .map(|key| {
+                    validate_hex_text(key, "source_key_hex")?;
+                    Ok::<String, ErrorData>(key.to_ascii_lowercase())
+                })
+                .transpose()?;
+            if source_key_hex.is_some() && source_cf.is_none() {
+                return Err(invalid(
+                    "timeline_redact source_key_hex requires source_cf so the prefix is exact",
+                ));
+            }
+            let min_score = validate_min_score(params.min_score, 0, "timeline_redact")?;
+            Ok(CleanFlagSelector::Query {
+                source_cf,
+                source_key_hex,
+                min_score,
+            })
+        }
+        (None, false) => Err(invalid(
+            "timeline_redact requires flag_ids or a query (source_cf/source_key_hex/min_score)",
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum SpanRedaction {
+    Redacted,
+    AlreadyClean,
+    FieldMissing,
+    Stale,
+}
+
+/// Masks a single flag's span in `document`, anchored on the recorded span text
+/// (verified by SHA-256), located by the recorded byte offsets first and a
+/// substring search as a fallback for offset drift.
+fn redact_one_span(
+    document: &mut Value,
+    flag: &HygieneFlagRecord,
+    marker: &str,
+) -> Result<SpanRedaction, ErrorData> {
+    // The stored flag must be internally consistent: span_text must hash to
+    // span_text_sha256. A mismatch is a corrupt flag, surfaced loudly.
+    if sha256_hex(flag.span_text.as_bytes()) != flag.span_text_sha256 {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "HYGIENE_REDACT_FLAG_SELF_INCONSISTENT: flag {} span_text does not match its \
+                 span_text_sha256",
+                flag.flag_id
+            ),
+        ));
+    }
+    let Some(target) = document.pointer_mut(&flag.source_field) else {
+        return Ok(SpanRedaction::FieldMissing);
+    };
+    let Value::String(current) = target else {
+        return Ok(SpanRedaction::FieldMissing);
+    };
+
+    let needle = &flag.span_text;
+    // Prefer the exact recorded offsets when they still bracket the needle.
+    let start = usize::try_from(flag.span_start).unwrap_or(usize::MAX);
+    let end = usize::try_from(flag.span_end).unwrap_or(usize::MAX);
+    let at_offset = start <= end
+        && end <= current.len()
+        && current.is_char_boundary(start)
+        && current.is_char_boundary(end)
+        && &current[start..end] == needle;
+    if at_offset {
+        let mut next = String::with_capacity(current.len() - (end - start) + marker.len());
+        next.push_str(&current[..start]);
+        next.push_str(marker);
+        next.push_str(&current[end..]);
+        *current = next;
+        return Ok(SpanRedaction::Redacted);
+    }
+    // Offset drifted (e.g. an earlier redaction shortened the field): locate the
+    // recorded text by content.
+    if let Some(found) = current.find(needle.as_str()) {
+        let next = current.replacen(needle.as_str(), marker, 1);
+        let _ = found;
+        *current = next;
+        return Ok(SpanRedaction::Redacted);
+    }
+    // Needle absent: already cleaned if the marker is present, otherwise the row
+    // changed for reasons we did not cause.
+    if current.contains(marker) {
+        Ok(SpanRedaction::AlreadyClean)
+    } else {
+        Ok(SpanRedaction::Stale)
+    }
+}
+
+/// FSV: re-reads the row from storage and proves every redacted flag's text is
+/// gone and the marker is present.
+fn verify_redacted_row(
+    runtime: &ReflexRuntime,
+    source_cf: &str,
+    key: &[u8],
+    source_key_hex: &str,
+    redacted_flags: &[HygieneStoredFlag],
+    marker: &str,
+) -> Result<(), ErrorData> {
+    let rows = runtime
+        .storage_cf_prefix_rows(source_cf, key, 1)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let (_row_key, value) = rows
+        .into_iter()
+        .find(|(row_key, _value)| row_key.as_slice() == key)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("HYGIENE_REDACT_READBACK_ABSENT: redacted row {source_key_hex} vanished"),
+            )
+        })?;
+    let document: Value = serde_json::from_slice(&value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("HYGIENE_REDACT_READBACK_DECODE_FAILED at {source_key_hex}: {error}"),
+        )
+    })?;
+    for flag in redacted_flags {
+        let field = document.pointer(&flag.record.source_field).and_then(Value::as_str);
+        let Some(field) = field else {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "HYGIENE_REDACT_READBACK_FIELD_LOST: {} missing after redacting flag {}",
+                    flag.record.source_field, flag.record.flag_id
+                ),
+            ));
+        };
+        if field.contains(flag.record.span_text.as_str()) {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "HYGIENE_REDACT_READBACK_TEXT_PRESENT: flag {} text survived redaction in {}",
+                    flag.record.flag_id, flag.record.source_field
+                ),
+            ));
+        }
+        if !field.contains(marker) {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "HYGIENE_REDACT_READBACK_MARKER_ABSENT: marker missing in {} after redacting \
+                     flag {}",
+                    flag.record.source_field, flag.record.flag_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn outcome(
+    flag: &HygieneStoredFlag,
+    status: &str,
+    detail: String,
+) -> HygieneFlagRedactOutcome {
+    HygieneFlagRedactOutcome {
+        flag_id: flag.record.flag_id.clone(),
+        source_cf: flag.record.source_cf.clone(),
+        source_key_hex: flag.record.source_key_hex.clone(),
+        source_field: flag.record.source_field.clone(),
+        status: status.to_owned(),
+        detail,
+    }
+}
+
+/// Computes the derived artifacts (episodes → routines → authoring candidates)
+/// reachable from a set of cleaned flags and writes one taint record per
+/// artifact into the [`TAINT_PREFIX`] ledger. Only `CF_TIMELINE` flags carry
+/// derivation (episodes are segmented from `CF_TIMELINE` alone), mirroring the
+/// `hygiene_report` join exactly.
+pub(crate) fn invalidate_cleaned_flags(
+    runtime: &ReflexRuntime,
+    flags: &[HygieneStoredFlag],
+    cleaning_op: &str,
+    audit_key_hex: Option<&str>,
+    by_session: &str,
+) -> Result<HygieneInvalidationSummary, ErrorData> {
+    // 1. Timeline source timestamps of the cleaned flags.
+    let mut ts_set: BTreeSet<u64> = BTreeSet::new();
+    let mut ts_to_flag_ids: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    for flag in flags {
+        if flag.record.source_cf != SOURCE_CF_TIMELINE {
+            continue;
+        }
+        let key = hex_decode(&flag.record.source_key_hex).ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_INVALIDATE_FLAG_KEY_INVALID: flag {} has non-hex source_key_hex {}",
+                    flag.record.flag_id, flag.record.source_key_hex
+                ),
+            )
+        })?;
+        let (ts_ns, _seq) = timeline_codec::decode_timeline_key(&key).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_INVALIDATE_TIMELINE_KEY_INVALID: flag {} key is not a CF_TIMELINE \
+                     codec key: {error}",
+                    flag.record.flag_id
+                ),
+            )
+        })?;
+        ts_set.insert(ts_ns);
+        ts_to_flag_ids
+            .entry(ts_ns)
+            .or_default()
+            .insert(flag.record.flag_id.clone());
+    }
+    if ts_set.is_empty() {
+        return Ok(HygieneInvalidationSummary::empty(
+            "no CF_TIMELINE flags among the cleaned set; only timeline rows feed derived state",
+        ));
+    }
+
+    // 2. Impacted episodes (time-window containment) — same join as hygiene_report.
+    let (ts_to_episode_ids, episodes_by_id, scanned_episode_rows) =
+        scan_impacted_episodes(runtime, &ts_set)?;
+    let impacted_episode_ids: BTreeSet<String> = episodes_by_id.keys().cloned().collect();
+
+    // 3. Impacted routines (evidence episode-id intersection).
+    let (episode_to_routine_ids, routines_by_id, scanned_routine_rows) =
+        scan_impacted_routines(runtime, &impacted_episode_ids)?;
+    let impacted_routine_ids: BTreeSet<String> = routines_by_id.keys().cloned().collect();
+
+    // 4. Impacted authoring candidates (reference impacted routine/episode ids).
+    let (impacted_candidate_ids, scanned_authoring_candidate_rows) =
+        scan_impacted_candidate_ids(runtime, &impacted_routine_ids, &impacted_episode_ids)?;
+
+    // Map each impacted artifact back to the flag ids that poisoned it so the
+    // taint record carries an honest provenance trail.
+    let mut episode_flag_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (ts, episode_ids) in &ts_to_episode_ids {
+        let Some(flag_ids) = ts_to_flag_ids.get(ts) else {
+            continue;
+        };
+        for episode_id in episode_ids {
+            episode_flag_ids
+                .entry(episode_id.clone())
+                .or_default()
+                .extend(flag_ids.iter().cloned());
+        }
+    }
+    let mut routine_flag_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (episode_id, routine_ids) in &episode_to_routine_ids {
+        let Some(flag_ids) = episode_flag_ids.get(episode_id) else {
+            continue;
+        };
+        for routine_id in routine_ids {
+            routine_flag_ids
+                .entry(routine_id.clone())
+                .or_default()
+                .extend(flag_ids.iter().cloned());
+        }
+    }
+
+    let all_flag_ids: Vec<String> = flags
+        .iter()
+        .map(|flag| flag.record.flag_id.clone())
+        .collect();
+
+    // 5. Write one taint record per impacted artifact, then read one back to
+    //    prove the ledger landed.
+    let tainted_at_ns = now_ns();
+    let mut taint_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut routine_ids: Vec<String> = impacted_routine_ids.iter().cloned().collect();
+    routine_ids.sort();
+    for routine_id in &routine_ids {
+        let source_flag_ids = routine_flag_ids
+            .get(routine_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_else(|| all_flag_ids.clone());
+        taint_rows.push(taint_row(
+            "routine",
+            routine_id,
+            cleaning_op,
+            "mined from cleaned poisoned timeline rows; re-mine before trusting",
+            source_flag_ids,
+            audit_key_hex,
+            tainted_at_ns,
+            by_session,
+        )?);
+    }
+    let mut episode_ids: Vec<String> = impacted_episode_ids.iter().cloned().collect();
+    episode_ids.sort();
+    for episode_id in &episode_ids {
+        let source_flag_ids = episode_flag_ids
+            .get(episode_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_else(|| all_flag_ids.clone());
+        taint_rows.push(taint_row(
+            "episode",
+            episode_id,
+            cleaning_op,
+            "segmented from cleaned poisoned timeline rows; re-segment before trusting",
+            source_flag_ids,
+            audit_key_hex,
+            tainted_at_ns,
+            by_session,
+        )?);
+    }
+    let mut candidate_ids: Vec<String> = impacted_candidate_ids.iter().cloned().collect();
+    candidate_ids.sort();
+    for candidate_id in &candidate_ids {
+        taint_rows.push(taint_row(
+            "authoring_candidate",
+            candidate_id,
+            cleaning_op,
+            "references impacted routines/episodes; re-review before installing",
+            all_flag_ids.clone(),
+            audit_key_hex,
+            tainted_at_ns,
+            by_session,
+        )?);
+    }
+
+    let taint_records_written = taint_rows.len() as u64;
+    if !taint_rows.is_empty() {
+        let sample_key = taint_rows[0].0.clone();
+        runtime
+            .storage_replace_rows(cf::CF_KV, Vec::new(), taint_rows)
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("HYGIENE_INVALIDATE_TAINT_WRITE_FAILED: {error}"),
+                )
+            })?;
+        // FSV: the ledger must be physically present, not just acked.
+        let rows = runtime
+            .storage_cf_prefix_rows(cf::CF_KV, &sample_key, 1)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows
+            .first()
+            .map(|(row_key, _value)| row_key.as_slice())
+            != Some(sample_key.as_slice())
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "HYGIENE_INVALIDATE_TAINT_READBACK_ABSENT: taint record absent on readback",
+            ));
+        }
+    }
+
+    let note = if taint_records_written == 0 {
+        format!(
+            "{} timeline flag(s) cleaned but no episode/routine/candidate derives from them \
+             (unsegmented, unmined, or outside retention)",
+            ts_set.len()
+        )
+    } else {
+        format!(
+            "tainted {} routine(s), {} episode(s), {} authoring candidate(s) from {} timeline \
+             flag(s)",
+            routine_ids.len(),
+            episode_ids.len(),
+            candidate_ids.len(),
+            ts_set.len()
+        )
+    };
+
+    Ok(HygieneInvalidationSummary {
+        tainted_routine_ids: routine_ids,
+        tainted_episode_ids: episode_ids,
+        tainted_authoring_candidate_ids: candidate_ids,
+        taint_records_written,
+        scanned_episode_rows,
+        scanned_routine_rows,
+        scanned_authoring_candidate_rows,
+        note,
+    })
+}
+
+#[allow(clippy::too_many_arguments, reason = "one flat taint-record builder")]
+fn taint_row(
+    artifact_kind: &str,
+    artifact_id: &str,
+    cleaning_op: &str,
+    reason: &str,
+    source_flag_ids: Vec<String>,
+    audit_key_hex: Option<&str>,
+    tainted_at_ns: u64,
+    by_session: &str,
+) -> Result<(Vec<u8>, Vec<u8>), ErrorData> {
+    let record = HygieneTaintRecord {
+        schema_version: SCHEMA_VERSION,
+        artifact_kind: artifact_kind.to_owned(),
+        artifact_id: artifact_id.to_owned(),
+        cleaning_op: cleaning_op.to_owned(),
+        reason: reason.to_owned(),
+        source_flag_ids,
+        cleaning_audit_key_hex: audit_key_hex.map(str::to_owned),
+        tainted_at_ns,
+        by_session: by_session.to_owned(),
+    };
+    let key = format!("{TAINT_PREFIX}{artifact_kind}/{artifact_id}").into_bytes();
+    let value = encode_json(&record).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("HYGIENE_TAINT_ENCODE_FAILED for {artifact_kind}/{artifact_id}: {error}"),
+        )
+    })?;
+    Ok((key, value))
+}
+
+/// Reads the taint record for one artifact, if present. Used by FSV and by the
+/// upcoming taint-surfacing consumers deciding whether learned state is
+/// poisoned (a routine_inspect / hygiene_report taint column, #875 follow-up).
+#[allow(dead_code, reason = "taint-ledger reader for the #875 follow-up taint-surfacing tool")]
+pub(crate) fn read_taint_record(
+    runtime: &ReflexRuntime,
+    artifact_kind: &str,
+    artifact_id: &str,
+) -> Result<Option<HygieneTaintRecord>, ErrorData> {
+    let key = format!("{TAINT_PREFIX}{artifact_kind}/{artifact_id}").into_bytes();
+    let rows = runtime
+        .storage_cf_prefix_rows(cf::CF_KV, &key, 1)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
+        return Ok(None);
+    };
+    let record = decode_json::<HygieneTaintRecord>(&value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("HYGIENE_TAINT_DECODE_FAILED for {artifact_kind}/{artifact_id}: {error}"),
+        )
+    })?;
+    Ok(Some(record))
+}
+
+/// `(flag-ts → impacted episode ids, impacted episodes by id, rows scanned)`.
+type EpisodeImpactIndex = (
+    BTreeMap<u64, Vec<String>>,
+    BTreeMap<String, HygieneImpactedEpisode>,
+    u64,
+);
+
+/// `(impacted episode id → routine ids, impacted routines by id, rows scanned)`.
+type RoutineImpactIndex = (
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, RoutineRecord>,
+    u64,
+);
+
+/// One bounded `CF_EPISODES` scan: an episode is impacted iff its inclusive time
+/// window contains a flagged timestamp. Mirrors `hygiene_report` step 3.
+fn scan_impacted_episodes(
+    runtime: &ReflexRuntime,
+    ts_set: &BTreeSet<u64>,
+) -> Result<EpisodeImpactIndex, ErrorData> {
+    let mut scanned = 0_u64;
+    let mut ts_to_episode_ids: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut episodes_by_id: BTreeMap<String, HygieneImpactedEpisode> = BTreeMap::new();
+    let (Some(&min_ts), Some(&max_ts)) = (ts_set.iter().next(), ts_set.iter().next_back()) else {
+        return Ok((ts_to_episode_ids, episodes_by_id, scanned));
+    };
+    let mut start = episode_codec::episode_scan_start(min_ts.saturating_sub(DAY_NS));
+    'episodes: loop {
+        if usize::try_from(scanned).unwrap_or(usize::MAX) >= MAX_REPORT_EPISODE_SCAN_ROWS {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_INVALIDATE_EPISODE_SCAN_BUDGET_EXHAUSTED after \
+                     {MAX_REPORT_EPISODE_SCAN_ROWS} CF_EPISODES rows; a truncated derivation would \
+                     under-taint poisoned state"
+                ),
+            ));
+        }
+        let (rows, more) = runtime
+            .storage_cf_rows_from(cf::CF_EPISODES, &start, STORAGE_SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut last = None;
+        for (key, value) in &rows {
+            scanned += 1;
+            last = Some(key.clone());
+            let (_key_ts_ns, _ordinal, record) = decode_episode_row(key, value)?;
+            if record.start_ts_ns > max_ts {
+                break 'episodes;
+            }
+            let contained: Vec<u64> = ts_set
+                .range(record.start_ts_ns..=record.end_ts_ns)
+                .copied()
+                .collect();
+            if contained.is_empty() {
+                continue;
+            }
+            for ts in contained {
+                ts_to_episode_ids
+                    .entry(ts)
+                    .or_default()
+                    .push(record.episode_id.clone());
+            }
+            episodes_by_id
+                .entry(record.episode_id.clone())
+                .or_insert_with(|| HygieneImpactedEpisode {
+                    episode_id: record.episode_id.clone(),
+                    start_ts_ns: record.start_ts_ns,
+                    end_ts_ns: record.end_ts_ns,
+                    actor: actor_label(&record.actor),
+                    app: record.app.clone(),
+                    document: record.document.clone(),
+                });
+        }
+        if !more {
+            break;
+        }
+        let Some(last) = last else { break };
+        start = key_after(&last);
+    }
+    Ok((ts_to_episode_ids, episodes_by_id, scanned))
+}
+
+/// One bounded `CF_ROUTINES` scan: a routine is impacted iff its evidence
+/// episode ids intersect the impacted episode ids. Mirrors `hygiene_report`
+/// step 4.
+fn scan_impacted_routines(
+    runtime: &ReflexRuntime,
+    impacted_episode_ids: &BTreeSet<String>,
+) -> Result<RoutineImpactIndex, ErrorData> {
+    let mut scanned = 0_u64;
+    let mut routines_by_id: BTreeMap<String, RoutineRecord> = BTreeMap::new();
+    let mut episode_to_routine_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if impacted_episode_ids.is_empty() {
+        return Ok((episode_to_routine_ids, routines_by_id, scanned));
+    }
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        if usize::try_from(scanned).unwrap_or(usize::MAX) >= MAX_REPORT_ROUTINE_SCAN_ROWS {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_INVALIDATE_ROUTINE_SCAN_BUDGET_EXHAUSTED after \
+                     {MAX_REPORT_ROUTINE_SCAN_ROWS} CF_ROUTINES rows"
+                ),
+            ));
+        }
+        let (rows, more) = runtime
+            .storage_cf_rows_from(cf::CF_ROUTINES, &start, STORAGE_SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut last = None;
+        for (key, value) in &rows {
+            scanned += 1;
+            last = Some(key.clone());
+            routine_codec::decode_routine_key(key).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "HYGIENE_INVALIDATE_ROUTINE_KEY_INVALID in CF_ROUTINES at {}: {error}",
+                        hex_encode(key)
+                    ),
+                )
+            })?;
+            let record = decode_json::<RoutineRecord>(value).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "HYGIENE_INVALIDATE_ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {}: {error}",
+                        hex_encode(key)
+                    ),
+                )
+            })?;
+            let mut linked: BTreeSet<String> = BTreeSet::new();
+            for evidence in &record.evidence {
+                for episode_id in &evidence.episode_ids {
+                    if impacted_episode_ids.contains(episode_id) {
+                        linked.insert(episode_id.clone());
+                    }
+                }
+            }
+            if linked.is_empty() {
+                continue;
+            }
+            for episode_id in &linked {
+                episode_to_routine_ids
+                    .entry(episode_id.clone())
+                    .or_default()
+                    .insert(record.routine_id.clone());
+            }
+            routines_by_id.insert(record.routine_id.clone(), record);
+        }
+        if !more {
+            break;
+        }
+        let Some(last) = last else { break };
+        start = key_after(&last);
+    }
+    Ok((episode_to_routine_ids, routines_by_id, scanned))
+}
+
+/// One bounded `CF_PROFILES` candidate scan: a candidate is impacted iff its
+/// JSON references an impacted routine or episode id. Mirrors `hygiene_report`
+/// step 6 but returns only the impacted ids.
+fn scan_impacted_candidate_ids(
+    runtime: &ReflexRuntime,
+    impacted_routine_ids: &BTreeSet<String>,
+    impacted_episode_ids: &BTreeSet<String>,
+) -> Result<(BTreeSet<String>, u64), ErrorData> {
+    let mut scanned = 0_u64;
+    let mut impacted: BTreeSet<String> = BTreeSet::new();
+    if impacted_routine_ids.is_empty() && impacted_episode_ids.is_empty() {
+        return Ok((impacted, scanned));
+    }
+    let prefix = PROFILE_AUTHORING_CANDIDATE_PREFIX.as_bytes();
+    let mut start = prefix.to_vec();
+    loop {
+        if usize::try_from(scanned).unwrap_or(usize::MAX)
+            >= MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_INVALIDATE_AUTHORING_CANDIDATE_SCAN_BUDGET_EXHAUSTED after \
+                     {MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS} CF_PROFILES candidate rows"
+                ),
+            ));
+        }
+        let rows = runtime
+            .storage_cf_prefix_rows_from(cf::CF_PROFILES, prefix, &start, STORAGE_SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        let rows_len = rows.len();
+        let mut last = None;
+        for (key, value) in rows {
+            scanned += 1;
+            last = Some(key.clone());
+            let candidate = decode_json::<ProfileAuthoringCandidate>(&value).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "HYGIENE_INVALIDATE_AUTHORING_CANDIDATE_ROW_DECODE_FAILED in CF_PROFILES \
+                         at {}: {error}",
+                        hex_encode(&key)
+                    ),
+                )
+            })?;
+            let references = candidate_reference_strings(&candidate)?;
+            let referenced = impacted_routine_ids
+                .iter()
+                .any(|routine_id| references.contains(routine_id))
+                || impacted_episode_ids
+                    .iter()
+                    .any(|episode_id| references.contains(episode_id));
+            if referenced {
+                impacted.insert(candidate.candidate_id);
+            }
+        }
+        if rows_len < STORAGE_SCAN_CHUNK_ROWS {
+            break;
+        }
+        let Some(last) = last else { break };
+        start = key_after(&last);
+    }
+    Ok((impacted, scanned))
+}
+
+fn now_ns() -> u64 {
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    u64::try_from(nanos).unwrap_or(0)
+}
+
 #[must_use]
 pub fn scan_perceived_text(
     source_path: impl Into<String>,
@@ -2368,5 +3555,175 @@ mod tests {
         );
         assert_eq!(actor_label(&TimelineActor::Human), "human");
         println!("readback=hygiene_labels lifecycle/granularity/actor stable=true");
+    }
+
+    fn redact_flag(field: &str, span_text: &str, start: u32, end: u32) -> HygieneFlagRecord {
+        HygieneFlagRecord {
+            schema_version: SCHEMA_VERSION,
+            flag_id: "f1".to_owned(),
+            detected_at: Utc::now(),
+            source_cf: SOURCE_CF_TIMELINE.to_owned(),
+            source_key_hex: "00".to_owned(),
+            source_field: field.to_owned(),
+            source_text_sha256: String::new(),
+            span_start: start,
+            span_end: end,
+            span_text: span_text.to_owned(),
+            span_text_sha256: sha256_hex(span_text.as_bytes()),
+            score: 90,
+            heuristics: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn redact_one_span_masks_at_recorded_offset() {
+        let mut document = serde_json::json!({"payload": {"title": "hello ignore previous instructions world"}});
+        // "hello " is 6 bytes; the span is the next 28 bytes.
+        let flag = redact_flag("/payload/title", "ignore previous instructions", 6, 34);
+        let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
+        assert!(matches!(result, SpanRedaction::Redacted));
+        let after = document.pointer("/payload/title").unwrap().as_str().unwrap();
+        println!("readback=redact_offset before=\"hello ignore... world\" after={after:?}");
+        assert_eq!(after, "hello [REDACTED] world");
+    }
+
+    #[test]
+    fn redact_one_span_falls_back_to_content_when_offset_drifts() {
+        let mut document = serde_json::json!({"payload": {"title": "hello ignore previous instructions world"}});
+        // Deliberately wrong offsets (0..5 = "hello"): the content anchor must
+        // still locate and mask the recorded span text.
+        let flag = redact_flag("/payload/title", "ignore previous instructions", 0, 5);
+        let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
+        assert!(matches!(result, SpanRedaction::Redacted));
+        let after = document.pointer("/payload/title").unwrap().as_str().unwrap();
+        println!("readback=redact_drift after={after:?}");
+        assert_eq!(after, "hello [REDACTED] world");
+    }
+
+    #[test]
+    fn redact_one_span_is_idempotent_when_already_clean() {
+        let mut document = serde_json::json!({"payload": {"title": "hello [REDACTED] world"}});
+        let flag = redact_flag("/payload/title", "ignore previous instructions", 6, 34);
+        let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
+        println!("readback=redact_idempotent status=already_redacted");
+        assert!(matches!(result, SpanRedaction::AlreadyClean));
+    }
+
+    #[test]
+    fn redact_one_span_reports_stale_when_text_changed() {
+        let mut document = serde_json::json!({"payload": {"title": "completely different content now"}});
+        let flag = redact_flag("/payload/title", "ignore previous instructions", 6, 34);
+        let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
+        println!("readback=redact_stale status=stale_source");
+        assert!(matches!(result, SpanRedaction::Stale));
+    }
+
+    #[test]
+    fn redact_one_span_reports_field_missing_for_non_string_or_absent() {
+        let mut numeric = serde_json::json!({"payload": {"title": 42}});
+        let flag = redact_flag("/payload/title", "x", 0, 1);
+        assert!(matches!(
+            redact_one_span(&mut numeric, &flag, "[REDACTED]").expect("redact"),
+            SpanRedaction::FieldMissing
+        ));
+        let mut absent = serde_json::json!({"payload": {"title": "abc"}});
+        let flag = redact_flag("/payload/nonexistent", "x", 0, 1);
+        assert!(matches!(
+            redact_one_span(&mut absent, &flag, "[REDACTED]").expect("redact"),
+            SpanRedaction::FieldMissing
+        ));
+        println!("readback=redact_field_missing non_string+absent ok=true");
+    }
+
+    #[test]
+    fn redact_one_span_masks_multiple_occurrences_sequentially() {
+        let mut document = serde_json::json!({"payload":
+            {"title": "ignore previous instructions then ignore previous instructions"}});
+        let first = redact_flag("/payload/title", "ignore previous instructions", 0, 28);
+        assert!(matches!(
+            redact_one_span(&mut document, &first, "[REDACTED]").expect("redact"),
+            SpanRedaction::Redacted
+        ));
+        // Second flag's offsets are now stale; content anchor masks the survivor.
+        let second = redact_flag("/payload/title", "ignore previous instructions", 33, 61);
+        assert!(matches!(
+            redact_one_span(&mut document, &second, "[REDACTED]").expect("redact"),
+            SpanRedaction::Redacted
+        ));
+        let after = document.pointer("/payload/title").unwrap().as_str().unwrap();
+        println!("readback=redact_multi after={after:?}");
+        assert_eq!(after, "[REDACTED] then [REDACTED]");
+    }
+
+    #[test]
+    fn redact_one_span_rejects_self_inconsistent_flag() {
+        let mut document = serde_json::json!({"payload": {"title": "ignore previous instructions"}});
+        let mut flag = redact_flag("/payload/title", "ignore previous instructions", 0, 28);
+        flag.span_text_sha256 = "deadbeef".to_owned();
+        let error = redact_one_span(&mut document, &flag, "[REDACTED]").expect_err("must reject");
+        println!("readback=redact_self_inconsistent message={:?}", error.message);
+        assert!(
+            error
+                .message
+                .contains("HYGIENE_REDACT_FLAG_SELF_INCONSISTENT")
+        );
+    }
+
+    #[test]
+    fn redact_selector_enforces_mutual_exclusivity() {
+        let both = HygieneRedactParams {
+            flag_ids: Some(vec!["a".to_owned()]),
+            min_score: Some(50),
+            ..Default::default()
+        };
+        assert!(redact_selector(&both).is_err());
+
+        let neither = HygieneRedactParams::default();
+        assert!(redact_selector(&neither).is_err());
+
+        let ids = HygieneRedactParams {
+            flag_ids: Some(vec!["a".to_owned()]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            redact_selector(&ids).expect("ids ok"),
+            CleanFlagSelector::Ids(_)
+        ));
+
+        let query = HygieneRedactParams {
+            source_cf: Some(SOURCE_CF_TIMELINE.to_owned()),
+            min_score: Some(70),
+            ..Default::default()
+        };
+        assert!(matches!(
+            redact_selector(&query).expect("query ok"),
+            CleanFlagSelector::Query { .. }
+        ));
+        println!("readback=redact_selector mutual_exclusivity ok=true");
+    }
+
+    #[test]
+    fn taint_row_round_trips_and_keys_by_artifact() {
+        let (key, value) = taint_row(
+            "routine",
+            "rt-123",
+            CLEAN_OP_REDACT,
+            "test reason",
+            vec!["f1".to_owned(), "f2".to_owned()],
+            Some("abcd"),
+            42,
+            "sess-1",
+        )
+        .expect("taint row");
+        assert_eq!(key, b"hygiene/taint/v1/routine/rt-123".to_vec());
+        let decoded: HygieneTaintRecord = decode_json(&value).expect("decode");
+        println!("readback=taint_row key={:?} record={decoded:?}", String::from_utf8_lossy(&key));
+        assert_eq!(decoded.artifact_kind, "routine");
+        assert_eq!(decoded.artifact_id, "rt-123");
+        assert_eq!(decoded.cleaning_op, CLEAN_OP_REDACT);
+        assert_eq!(decoded.source_flag_ids, vec!["f1".to_owned(), "f2".to_owned()]);
+        assert_eq!(decoded.cleaning_audit_key_hex.as_deref(), Some("abcd"));
+        assert_eq!(decoded.tainted_at_ns, 42);
     }
 }

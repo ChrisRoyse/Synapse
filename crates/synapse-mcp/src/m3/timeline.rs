@@ -545,6 +545,15 @@ pub struct TimelinePurgeParams {
     /// `human` or `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// Hard delete the exact `CF_TIMELINE` rows named by these hygiene flag ids
+    /// (#875). Mutually exclusive with every scan filter and with `all`: flag
+    /// ids resolve to exact physical keys, so no scan is performed. Every id
+    /// must resolve to a `CF_TIMELINE` flag — a flag on another source CF is
+    /// rejected (use `timeline_redact` to mask those). Deleting poisoned rows
+    /// invalidates derived state (impacted routines/episodes/candidates are
+    /// tainted), exactly like `timeline_redact`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag_ids: Option<Vec<String>>,
     /// Explicit full-timeline purge. Mutually exclusive with every filter;
     /// without it, at least one filter is required.
     #[serde(default)]
@@ -602,6 +611,15 @@ pub fn purge_timeline(
         || params.text.is_some()
         || params.kinds.is_some()
         || params.actor.is_some();
+    if let Some(flag_ids) = params.flag_ids.as_deref() {
+        if has_filter || params.all {
+            return Err(invalid(
+                "timeline_purge flag_ids is mutually exclusive with scan filters and all=true; \
+                 flag ids resolve to exact rows",
+            ));
+        }
+        return purge_timeline_by_flags(runtime, flag_ids, params.dry_run, by_session);
+    }
     if params.all && has_filter {
         return Err(invalid(
             "timeline_purge all=true is mutually exclusive with filters; drop the filters or drop all",
@@ -726,6 +744,7 @@ pub fn purge_timeline(
         }
         let resume_cursor_pending = matches!(stopped_because, "scan_budget_exhausted");
         let audit_payload = json!({
+            "op": "timeline_purge",
             "deleted_rows": deleted_rows,
             "matched_rows": matched_rows,
             "scanned_rows": scanned_rows,
@@ -744,7 +763,7 @@ pub fn purge_timeline(
                 "all": params.all,
             },
         });
-        audit_key_hex = Some(write_purge_audit_row(&runtime_guard, audit_payload)?);
+        audit_key_hex = Some(write_cleaning_audit_row(&runtime_guard, audit_payload)?);
     }
     drop(runtime_guard);
 
@@ -779,10 +798,162 @@ pub fn purge_timeline(
     })
 }
 
-/// Writes the purge audit row with the pressure bypass (an audit obligation
-/// must not shed), flushes it, and proves it by reading the exact key back.
-fn write_purge_audit_row(
-    runtime: &MutexGuard<'_, ReflexRuntime>,
+/// Hard deletes the exact `CF_TIMELINE` rows named by hygiene flag ids (#875),
+/// then invalidates derived state and writes one audit row. Reuses the same
+/// delete → compact → audit mechanics as the scan-based purge; the only
+/// difference is the rows are selected by resolving flag ids to physical keys
+/// rather than by a filter scan.
+fn purge_timeline_by_flags(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    flag_ids: &[String],
+    dry_run: bool,
+    by_session: &str,
+) -> Result<TimelinePurgeResponse, ErrorData> {
+    let guard = lock_runtime(runtime)?;
+    let flags = crate::m3::hygiene::resolve_clean_flags(
+        &guard,
+        &crate::m3::hygiene::CleanFlagSelector::Ids(flag_ids.to_vec()),
+    )?;
+    // Purge only deletes timeline rows; a flag on another source CF must be
+    // masked with timeline_redact, never silently ignored.
+    for flag in &flags {
+        if flag.record.source_cf != cf::CF_TIMELINE {
+            return Err(invalid(format!(
+                "timeline_purge flag {} targets {} (not CF_TIMELINE); use timeline_redact to mask \
+                 non-timeline sources",
+                flag.record.flag_id, flag.record.source_cf
+            )));
+        }
+    }
+
+    // Resolve to distinct physical keys, confirming each row's presence.
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut absent_rows = 0_u64;
+    for flag in &flags {
+        let key = hex_decode(&flag.record.source_key_hex).ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "TIMELINE_PURGE_FLAG_KEY_INVALID: flag {} has non-hex source_key_hex {}",
+                    flag.record.flag_id, flag.record.source_key_hex
+                ),
+            )
+        })?;
+        // Confirm the key is a real CF_TIMELINE codec key before deleting it.
+        timeline_codec::decode_timeline_key(&key).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "TIMELINE_PURGE_TIMELINE_KEY_INVALID: flag {} key is not a CF_TIMELINE codec \
+                     key: {error}",
+                    flag.record.flag_id
+                ),
+            )
+        })?;
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let rows = guard
+            .storage_cf_prefix_rows(cf::CF_TIMELINE, &key, 1)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.iter().any(|(row_key, _value)| row_key == &key) {
+            keys.push(key);
+        } else {
+            absent_rows += 1;
+        }
+    }
+
+    let matched_rows = keys.len() as u64;
+    let scanned_rows = flags.len() as u64;
+    let mut deleted_rows = 0_u64;
+    let mut compacted = false;
+    let mut audit_key_hex = None;
+    if !dry_run {
+        if let (Some(first), Some(last)) = (keys.first().cloned(), keys.last().cloned()) {
+            // Keys are collected in flag (resolution) order; sort so the compact
+            // range brackets the full deleted span.
+            let mut sorted = keys.clone();
+            sorted.sort();
+            let compact_start = sorted.first().cloned().unwrap_or(first);
+            let compact_end = key_after(sorted.last().unwrap_or(&last));
+            deleted_rows = matched_rows;
+            guard
+                .storage_delete_rows(cf::CF_TIMELINE, keys)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("timeline_purge flag delete_batch failed; no audit row was written: {error}"),
+                    )
+                })?;
+            guard
+                .storage_compact_cf_range(cf::CF_TIMELINE, &compact_start, &compact_end)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "timeline_purge deleted {deleted_rows} rows by flag but compacting failed: {error}"
+                        ),
+                    )
+                })?;
+            compacted = true;
+        }
+        let audit_payload = json!({
+            "op": crate::m3::hygiene::CLEAN_OP_PURGE,
+            "deleted_rows": deleted_rows,
+            "matched_rows": matched_rows,
+            "scanned_rows": scanned_rows,
+            "absent_rows": absent_rows,
+            "by_session": by_session,
+            "flag_ids": flags
+                .iter()
+                .map(|flag| flag.record.flag_id.clone())
+                .collect::<Vec<_>>(),
+        });
+        audit_key_hex = Some(write_cleaning_audit_row(&guard, audit_payload)?);
+        // Invalidate derived state from the purged rows.
+        crate::m3::hygiene::invalidate_cleaned_flags(
+            &guard,
+            &flags,
+            crate::m3::hygiene::CLEAN_OP_PURGE,
+            audit_key_hex.as_deref(),
+            by_session,
+        )?;
+    }
+    drop(guard);
+
+    tracing::info!(
+        code = "TIMELINE_PURGE_BY_FLAGS_COMPLETED",
+        deleted_rows,
+        matched_rows,
+        scanned_rows,
+        absent_rows,
+        dry_run,
+        by_session,
+        "timeline purge by flag ids completed"
+    );
+
+    Ok(TimelinePurgeResponse {
+        matched_rows,
+        deleted_rows,
+        scanned_rows,
+        invalid_rows: absent_rows,
+        protected_audit_rows: 0,
+        dry_run,
+        audit_key_hex,
+        compacted,
+        next_cursor: None,
+        stopped_because: "flag_ids".to_owned(),
+    })
+}
+
+/// Writes a cleaning audit row (purge or redact) with the pressure bypass (an
+/// audit obligation must not shed), flushes it, and proves it by reading the
+/// exact key back. The payload's `op` field distinguishes the cleaning tool;
+/// the row is a [`TimelineKind::Purge`] record so the existing self-purge
+/// protection covers every cleaning audit, not just `timeline_purge`.
+pub(crate) fn write_cleaning_audit_row(
+    runtime: &ReflexRuntime,
     payload: Value,
 ) -> Result<String, ErrorData> {
     let ts_ns = now_ts_ns();
