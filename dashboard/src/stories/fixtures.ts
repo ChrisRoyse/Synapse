@@ -243,9 +243,58 @@ export function transcriptSample() {
     line_no: 7,
     record: {
       role: "assistant",
-      event_kind: "local.assistant.message",
+      event_kind: "assistant",
+      model: "claude-opus-4-8",
       content_summary: "Rendered **Markdown** is sanitized and raw rows stay collapsed.",
-      tool_calls: [toolCall("success")]
+      content_truncated: false,
+      tool_calls: [
+        {
+          tool_name: "act_run_shell",
+          tool_call_id: "toolu_01abc",
+          arguments: '{"command":"cargo test -p synapse-mcp","execution_mode":"inline"}',
+          arguments_bytes: 63,
+          arguments_truncated: false
+        }
+      ],
+      usage: { input_tokens: 1820, output_tokens: 246 }
+    }
+  };
+}
+
+/// A transcript row whose entire payload is a tool call with no assistant text
+/// — the shape that regressed to "No assistant text recorded." before the
+/// renderer learned to draw `tool_calls`.
+export function transcriptToolOnlySample() {
+  return {
+    spawn_id: "agent-spawn-ambient-claude-4764d40e",
+    line_no: 88,
+    record: {
+      role: "assistant",
+      event_kind: "assistant",
+      model: "claude-opus-4-8",
+      tool_calls: [
+        {
+          tool_name: "Grep",
+          tool_call_id: "toolu_02def",
+          arguments: '{"pattern":"content_summary","output_mode":"files_with_matches"}',
+          arguments_bytes: 61,
+          arguments_truncated: false
+        }
+      ]
+    }
+  };
+}
+
+/// A pure session-metadata row (`mode`) — carries no human-readable content and
+/// must be filtered out of the panel, not rendered as an empty card.
+export function transcriptMetadataSample() {
+  return {
+    spawn_id: "agent-spawn-ambient-claude-4764d40e",
+    line_no: 124,
+    record: {
+      role: "system",
+      event_kind: "mode",
+      model: "claude-opus-4-8"
     }
   };
 }

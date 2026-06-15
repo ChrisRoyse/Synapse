@@ -53,7 +53,8 @@ import {
   Section,
   StatCard,
   ToolCallCard,
-  TranscriptTurn
+  TranscriptTurn,
+  transcriptRowHasContent
 } from "@/primitives";
 import {
   buildAgents,
@@ -114,23 +115,35 @@ const routeDefinitions: RouteDefinition[] = [
   { id: "fleet", label: "Fleet", title: "Fleet Overview", icon: Gauge },
   { id: "agent", label: "Agent", title: "Agent Detail", icon: UserRound },
   { id: "tasks", label: "Tasks", title: "Task Board", icon: ClipboardList },
-  { id: "approvals", label: "Approvals", title: "Approvals Inbox", icon: CheckCircle2 },
   { id: "system", label: "System", title: "System, Storage & Activity", icon: ServerCog },
   { id: "audit", label: "Audit", title: "Audit Explorer", icon: ShieldCheck }
 ];
 
-// `analytics` and `timeline` were merged into the System view (#927 follow-up).
-// They remain valid route ids (persisted UI state, saved views, and bookmarked
-// `#/analytics` / `#/timeline` links) but normalize to `system` so old links and
-// stored state land on the unified page instead of a blank route.
+// Alias routes resolve to a canonical view but stay valid as deep-link / stored
+// route ids (so bookmarks, saved views, and persisted UI state never land on a
+// blank route).
+//   - `analytics` / `timeline` merged into the System view (#927 follow-up).
+//   - `approvals` merged INTO the Fleet manager (#1027): the approval/attention
+//     inbox is now a section at the top of the Fleet page, so `#/approvals`
+//     deep-links there instead of maintaining a divergent second surface.
 const ROUTE_ALIASES: Partial<Record<DashboardRouteId, DashboardRouteId>> = {
   analytics: "system",
-  timeline: "system"
+  timeline: "system",
+  approvals: "fleet"
 };
 
 function normalizeRoute(route: DashboardRouteId): DashboardRouteId {
   return ROUTE_ALIASES[route] ?? route;
 }
+
+// Every id that is a legal route target from a hash / stored state: the
+// canonical nav routes plus the alias source keys above. `isDashboardRouteId`
+// must accept the alias keys too, otherwise `routeFromHash` drops `#/approvals`
+// (and `#/analytics`/`#/timeline`) on the floor and the deep-link never resolves.
+const VALID_ROUTE_IDS = new Set<string>([
+  ...routeDefinitions.map((item) => item.id),
+  ...Object.keys(ROUTE_ALIASES)
+]);
 
 const auditTextFields = ["cursor", "start_ts_ns", "end_ts_ns", "session_id", "tool", "status", "error_code", "row_kind"] as const;
 
@@ -460,7 +473,6 @@ export function App() {
       ) : null}
       {normalizedRoute === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onAuditKeySelect={focusAuditKey} /> : null}
       {normalizedRoute === "tasks" ? <TasksView agents={agents} attentionCount={attentionCount} /> : null}
-      {normalizedRoute === "approvals" ? <ApprovalsView state={state} onDecided={() => query.refetch()} /> : null}
       {normalizedRoute === "system" ? (
         <SystemView state={state} agents={agents} attentionCount={attentionCount} toolCalls={toolCalls} stale={stale} onRefresh={() => query.refetch()} />
       ) : null}
@@ -742,6 +754,12 @@ function FleetView({
   return (
     <>
       <OverviewBand state={state} agents={agents} attentionCount={attentionCount} stale={stale} />
+      {/* #1027: the approval/attention inbox lives INSIDE the fleet manager so every
+          agent that has stopped — awaiting approval, asking a question, or ready for
+          review — is actionable here, across all model kinds. `#/approvals` aliases
+          to this page. Reuses the same ApprovalsView component (single, non-divergent
+          surface) fed from the same `state.approvals` panel. */}
+      <ApprovalsView state={state} onDecided={onSpawned} />
       <Section
         title="Spawn Console"
         tier="triage"
@@ -805,7 +823,6 @@ function FleetView({
           </Section>
         </aside>
       </div>
-      <TranscriptSamples state={state} />
     </>
   );
 }
@@ -3584,17 +3601,33 @@ function SystemShape({ state }: { state?: DashboardState }) {
 }
 
 function TranscriptSamples({ state }: { state?: DashboardState }) {
-  const rows = asArray<Record<string, unknown>>(asRecord(panelData(state?.agent_transcripts)).rows).slice(0, 4);
+  const allRows = asArray<Record<string, unknown>>(asRecord(panelData(state?.agent_transcripts)).rows);
+  // The store keeps one row per source line (assistant text, tool calls, tool
+  // results, AND session-metadata records like `mode`/`file-history-snapshot`).
+  // Only rows with something a human can read are worth a card; metadata rows
+  // would otherwise crowd the panel with empty placeholders. The count of what
+  // we hide is surfaced, never silently dropped.
+  const renderable = allRows.filter(transcriptRowHasContent);
+  const shown = renderable.slice(0, 6);
+  const hiddenMetadata = allRows.length - renderable.length;
   return (
     <Section title="Transcript Samples" tier="drill-down" questions={["What did recent agents say?", "Was output sanitized before render?", "Where is the source row?"]}>
-      {rows.length ? (
-        <div className="grid gap-3 lg:grid-cols-2">
-          {rows.map((row, index) => (
-            <TranscriptTurn key={`${rawText(row.spawn_id)}-${rawText(row.line_no)}-${index}`} row={row} />
-          ))}
-        </div>
+      {shown.length ? (
+        <>
+          <div className="grid gap-3 lg:grid-cols-2">
+            {shown.map((row, index) => (
+              <TranscriptTurn key={`${rawText(row.spawn_id)}-${rawText(row.line_no)}-${index}`} row={row} />
+            ))}
+          </div>
+          {hiddenMetadata > 0 ? (
+            <p className="mt-3 text-xs text-muted">
+              Showing {shown.length} of {renderable.length} content rows · {hiddenMetadata} session-metadata row
+              {hiddenMetadata === 1 ? "" : "s"} hidden (no transcript content).
+            </p>
+          ) : null}
+        </>
       ) : (
-        <EmptyStateArt title="No transcript rows" />
+        <EmptyStateArt title={allRows.length ? "No transcript content in recent rows" : "No transcript rows"} />
       )}
     </Section>
   );
@@ -3624,7 +3657,7 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
 }
 
 function isDashboardRouteId(value: unknown): value is DashboardRouteId {
-  return typeof value === "string" && routeDefinitions.some((item) => item.id === value);
+  return typeof value === "string" && VALID_ROUTE_IDS.has(value);
 }
 
 function isDensity(value: unknown): value is Density {

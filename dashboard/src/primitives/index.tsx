@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { FlagBadge, StatusBadge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { AgentSummary, FleetStatus, ToolCallSummary } from "@/lib/dashboard-state";
-import { boundedText, cn, nsToTime, rawText, timeAgo } from "@/lib/utils";
+import { asArray, asRecord, boundedText, cn, nsToTime, rawText, timeAgo } from "@/lib/utils";
 
 export function AppShell({ sidebar, children }: { sidebar: ReactNode; children: ReactNode }) {
   return (
@@ -256,25 +256,134 @@ export function FleetRow({
   );
 }
 
+/// True when a transcript row carries anything a human can read: assistant /
+/// system text, one or more tool calls (request args or result body), or a
+/// source/parse error. Session-metadata rows (`mode`,
+/// `file-history-snapshot`, redacted-thinking-only assistant blocks, ...) carry
+/// none of these and return false. Selection (TranscriptSamples) and rendering
+/// (TranscriptTurn) share this single predicate so they never disagree about
+/// what is worth showing.
+export function transcriptRowHasContent(row: Record<string, unknown>): boolean {
+  const record = asRecord(row.record);
+  if (rawText(record.content_summary).trim().length > 0) return true;
+  if (rawText(record.source_error).trim().length > 0) return true;
+  if (rawText(record.parse_error).trim().length > 0) return true;
+  for (const call of asArray<Record<string, unknown>>(record.tool_calls)) {
+    const tool = asRecord(call);
+    if (
+      rawText(tool.tool_name).trim().length > 0 ||
+      rawText(tool.arguments).trim().length > 0 ||
+      rawText(tool.result_summary).trim().length > 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function TranscriptToolLine({ call }: { call: Record<string, unknown> }) {
+  const name = rawText(call.tool_name) || "tool";
+  const isResult = name === "tool_result";
+  const status = rawText(call.status);
+  const exitCode = call.exit_code;
+  const rawPayload = isResult ? call.result_summary : call.arguments;
+  const payload =
+    rawPayload === undefined || rawPayload === null || rawText(rawPayload).length === 0
+      ? null
+      : boundedText(rawPayload, 600);
+  const sourceTruncated = isResult ? call.result_truncated === true : call.arguments_truncated === true;
+  return (
+    <div className="rounded-md border border-border-subtle bg-surface-2 p-2">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <TerminalSquare aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-info" />
+        <span className="font-mono font-medium text-primary">{name}</span>
+        {status ? <FlagBadge tone={status === "error" ? "danger" : "warn"}>{status}</FlagBadge> : null}
+        {exitCode !== undefined && exitCode !== null ? (
+          <span className="text-muted">exit {rawText(exitCode)}</span>
+        ) : null}
+      </div>
+      {payload ? (
+        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-secondary">
+          {payload.text}
+        </pre>
+      ) : null}
+      {payload && (payload.flags.length > 0 || sourceTruncated) ? (
+        <div className="mt-1 flex flex-wrap gap-1">
+          {payload.flags.map((flag) => (
+            <FlagBadge key={flag} tone={flag === "hygiene" ? "danger" : "warn"}>
+              {flag}
+            </FlagBadge>
+          ))}
+          {sourceTruncated ? <FlagBadge tone="warn">source-truncated</FlagBadge> : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function TranscriptTurn({ row }: { row: Record<string, unknown> }) {
-  const record = (row.record && typeof row.record === "object" ? row.record : {}) as Record<string, unknown>;
-  const text = rawText(record.content_summary || record.source_error || record.parse_error || "");
+  const record = asRecord(row.record);
+  const text = rawText(record.content_summary).trim();
+  const contentTruncated = record.content_truncated === true;
+  const sourceError = rawText(record.source_error).trim();
+  const parseError = rawText(record.parse_error).trim();
+  const toolCalls = asArray<Record<string, unknown>>(record.tool_calls).map(asRecord);
+  const usage = asRecord(record.usage);
+  const inTokens = Number(usage.input_tokens ?? 0);
+  const outTokens = Number(usage.output_tokens ?? 0);
+  const usageParts: string[] = [];
+  if (Number.isFinite(inTokens) && inTokens > 0) usageParts.push(`${inTokens} in`);
+  if (Number.isFinite(outTokens) && outTokens > 0) usageParts.push(`${outTokens} out`);
+  const hasContent = transcriptRowHasContent(row);
+  const eventKind = rawText(record.event_kind);
+
   return (
     <article className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <FileText aria-hidden="true" className="h-4 w-4 text-info" />
+          <FileText aria-hidden="true" className="h-4 w-4 shrink-0 text-info" />
           <h3 className="truncate text-md font-medium tracking-normal text-primary">
             {rawText(row.spawn_id) || "transcript"}
           </h3>
         </div>
-        <FlagBadge>{rawText(record.role || record.event_kind || "event")}</FlagBadge>
+        <FlagBadge>{rawText(record.role) || eventKind || "event"}</FlagBadge>
       </div>
-      <div className="markdown-body text-sm text-secondary">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
-          {text || "No assistant text recorded."}
-        </ReactMarkdown>
-      </div>
+
+      {parseError || sourceError ? (
+        <p className="mb-2 rounded-md border border-danger-border bg-danger-bg p-2 text-sm text-danger-fg">
+          {parseError || sourceError}
+        </p>
+      ) : null}
+
+      {text ? (
+        <div className="markdown-body text-sm text-secondary">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
+            {text}
+          </ReactMarkdown>
+          {contentTruncated ? (
+            <div className="mt-1">
+              <FlagBadge tone="warn">summary-truncated</FlagBadge>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {toolCalls.length > 0 ? (
+        <div className={cn("grid gap-2", text || parseError || sourceError ? "mt-2" : "")}>
+          {toolCalls.map((call, index) => (
+            <TranscriptToolLine key={`${rawText(call.tool_call_id) || rawText(call.tool_name)}-${index}`} call={call} />
+          ))}
+        </div>
+      ) : null}
+
+      {!hasContent ? (
+        <p className="text-sm text-muted">Session metadata — no transcript content{eventKind ? ` (${eventKind})` : ""}.</p>
+      ) : null}
+
+      {usageParts.length > 0 ? (
+        <p className="mt-2 text-xs text-muted">{usageParts.join(" · ")} tokens</p>
+      ) : null}
+
       <div className="mt-2">
         <RawValue value={row} label="Transcript row" />
       </div>

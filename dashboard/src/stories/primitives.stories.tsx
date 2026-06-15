@@ -19,7 +19,12 @@ import {
   ToolCallCard,
   TranscriptTurn
 } from "@/primitives";
-import { attentionAgent, toolCall, transcriptSample } from "@/stories/fixtures";
+import {
+  attentionAgent,
+  toolCall,
+  transcriptSample,
+  transcriptToolOnlySample
+} from "@/stories/fixtures";
 
 const meta = {
   title: "Command Center/Primitives",
@@ -136,6 +141,16 @@ export const TranscriptTurnSanitizedMarkdown: Story = {
   render: () => (
     <div className="w-[640px]">
       <TranscriptTurn row={transcriptSample()} />
+    </div>
+  )
+};
+
+export const TranscriptTurnToolOnly: Story = {
+  name: "TranscriptTurn / Tool Call Only",
+  parameters: { docs: { description: { story: "coverage:TranscriptTurn" } } },
+  render: () => (
+    <div className="w-[640px]">
+      <TranscriptTurn row={transcriptToolOnlySample()} />
     </div>
   )
 };
