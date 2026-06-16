@@ -175,42 +175,26 @@ Chrome session, the supported attach path is:
    `chrome.debugger.attach` without `--silent-debugger-extension-api`; Synapse's
    normal bridge therefore cannot use that API. DOM attach for a normal Chrome
    profile requires raw CDP on a dedicated Synapse-launched automation profile.
-10. The verifier fails closed if the live Chrome profile has another active
-   extension with the `debugger` permission, or if Chrome is already running an
-   external native-messaging wrapper process. Those surfaces can display the
-   same user-visible debugger/native-host popup even though Synapse is not the
-   caller. The remediation is to disable/remove the external extension or apply
-   a Chrome `ExtensionSettings.blocked_permissions` policy.
-   Windows setup applies the supported policy remediation by default:
-   `scripts\synapse-setup.ps1` uses `-ChromePolicyHive Auto`, tries HKCU first
-   and then HKLM, and accepts setup only after a separate readback proves
-   `blocked_permissions=["debugger","nativeMessaging"]` is present in the
-   wildcard `"*"` policy entry, so current and future extensions cannot load
-   with those permissions. If the current process cannot write either hive,
-   setup fails closed with per-hive ACL/readback evidence. Passing
-   `-AutoElevateChromePolicy:$true` explicitly permits a one-time elevated
-   PowerShell helper for HKLM and reads back the helper's JSON evidence file
-   before continuing; that opt-in can show UAC and is not used by background
-   end-user setup. Canceling UAC, missing evidence, or a failed elevated
-   registry readback remains a hard failure. Before attempting any policy write,
-   the standalone bridge verifier
-   reads HKCU/HKLM and accepts an already-compliant policy as `existing_policy`
-   so repeated setup runs do not launch any helper for no state change. The
-   standalone bridge verifier applies the same policy by default
-   with `scripts\install-synapse-chrome-debugger.ps1`.
-   Passing `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and
-   cannot certify a popup-free end-user host. `-ChromePolicyBlockScope
-   DetectedExtensions` limits the merge to currently discovered extension IDs.
-   The scripts fail with
-   `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED_ALL_HIVES` if no allowed
-   policy hive, including the elevated HKLM helper when allowed, can persist
-   and read back the required policy. After policy is written, refresh/restart
-   Chrome and rerun the verifier; do not certify popup-free readiness until the
-   separate profile/process readback shows the external surface is gone. If the
-   policy readback is already correct but Chrome's running profile/process
-   still reports the external surface, the verifier fails closed with
-   `SYNAPSE_CHROME_POLICY_PENDING_CHROME_RELOAD` and includes the policy,
-   profile, and process readback that must change before acceptance.
+10. The verifier observes (for diagnostics only) whether the live Chrome profile
+   has another active extension with the `debugger` permission, or whether Chrome
+   is running an external native-messaging wrapper process. Those surfaces can
+   display a user-visible debugger/native-host popup even though Synapse is not
+   the caller. Synapse NEVER disables those extensions and NEVER modifies the
+   Chrome `ExtensionSettings` policy: that policy governs the user's own
+   extensions, and blocking an installed extension's permissions disables it,
+   which is unacceptable end-user behavior. Popup-free background automation is
+   achieved entirely on Synapse's own side — the bundled bridge is tabs-only, and
+   deep CDP runs in a dedicated Synapse-launched automation profile started with
+   `--silent-debugger-extension-api`.
+   Windows setup (`scripts\synapse-setup.ps1`) and the standalone verifier
+   (`scripts\install-synapse-chrome-debugger.ps1`) also perform a one-way
+   self-heal: they remove any `debugger`/`nativeMessaging` blockers a prior
+   Synapse version wrote into `ExtensionSettings` (identified by Synapse's
+   `blocked_install_message` marker) from HKCU and HKLM, restoring the user's
+   extensions on previously-affected machines. Admin- or user-authored
+   `ExtensionSettings` entries are left untouched. Run
+   `scripts\install-synapse-chrome-debugger.ps1 -RemoveExternalDebuggerPolicyOnly`
+   to perform only this self-heal.
    Runtime `observe` diagnostics also include a live
    `external_chrome_popup_risk` profile/process summary when Synapse refuses a
    normal-profile attach-capable command, so remaining popups are attributed to

@@ -37,10 +37,12 @@ Install/verify the local bridge registration with:
 scripts\install-synapse-chrome-debugger.ps1
 ```
 
-That verifier applies the same Chrome `ExtensionSettings` policy remediation as
-the full setup path by default, blocking `debugger` and `nativeMessaging`
-permissions so external extensions cannot surface the Chrome
-"started debugging this browser" banner during Synapse background work.
+Synapse never modifies the Chrome `ExtensionSettings` policy and never disables
+the user's other extensions. The verifier registers the bridge and performs a
+one-way self-heal: it removes any `debugger`/`nativeMessaging` blockers that an
+earlier Synapse version wrote into `ExtensionSettings` (identified by Synapse's
+`blocked_install_message` marker), so running the latest build restores
+extensions on previously-affected machines.
 
 Then load this directory as an unpacked extension from `chrome://extensions`.
 The extension registers with the loopback daemon at `http://127.0.0.1:7700`,
@@ -97,14 +99,14 @@ stale daemon command or stale permission grant cannot surface Chrome's
 "started debugging this browser" warning from the Synapse bridge. DOM attach
 requires raw CDP on a dedicated Synapse-launched automation profile.
 
-The install verifier also fails closed when the live Chrome profile contains an
-active external extension with the `debugger` permission, or when Chrome has a
-live external native-messaging wrapper process. Those are separate browser
-surfaces that can produce the same end-user popup/window even though Synapse's
-bridge is tabs-only. The verifier names the extension ID, profile, and process
-SoT so the host can remove the external surface or apply a Chrome
-`ExtensionSettings.blocked_permissions` policy before treating the system as
-popup-free.
+The install verifier also observes (for diagnostics only) whether the live
+Chrome profile contains an active external extension with the `debugger`
+permission, or a live external native-messaging wrapper process. Those are
+separate browser surfaces that can produce an end-user popup/window even though
+Synapse's bridge is tabs-only. The verifier names the extension ID, profile, and
+process SoT, but Synapse never disables those extensions or modifies Chrome
+policy; deep CDP work runs in a dedicated Synapse-launched automation profile
+started with `--silent-debugger-extension-api` instead.
 
 Runtime Chrome observations follow the same rule. If raw CDP is unavailable and
 Synapse refuses a normal-profile attach-capable command, the diagnostic detail
@@ -115,49 +117,32 @@ reported as an ambiguous Synapse bridge failure. Background normal-profile tab
 commands follow the same runtime guard; they are available only after the
 external profile/process readback is popup-free. If registration itself is
 refused, normal-profile tab commands are unavailable; use raw CDP on a dedicated
-Synapse-launched automation profile until policy/profile readback is clean.
+Synapse-launched automation profile started with `--silent-debugger-extension-api`.
 
-The full Windows setup script applies the supported Chrome policy remediation by
-default:
+The full Windows setup script never modifies the Chrome `ExtensionSettings`
+policy:
 
 ```powershell
 scripts\synapse-setup.ps1
 ```
 
-That default setup path uses `-ChromePolicyHive Auto`: it tries HKCU first, then
-HKLM, and accepts the setup only after a separate policy readback proves that
-`blocked_permissions=["debugger","nativeMessaging"]` was merged into the Chrome
-`ExtensionSettings` wildcard `"*"` policy entry. This blocks current and future
-extensions from loading with those permissions.
-Before attempting a policy write, the verifier reads HKCU/HKLM and accepts an
-already-compliant policy as `existing_policy=true`; repeated setup runs should
-not launch any helper when the policy Source of Truth is already correct.
-If the current process cannot write either hive, setup fails closed with
-per-hive ACL/readback evidence. Passing `-AutoElevateChromePolicy:$true`
-explicitly permits a one-time elevated PowerShell helper that writes the same
-supported policy to HKLM and returns a JSON evidence file; that opt-in can show
-UAC and is not used by background end-user setup.
-Passing `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and cannot
-certify an end-user host as popup-free.
+Setup registers the bridge and runs the same one-way self-heal described above,
+removing any `debugger`/`nativeMessaging` blockers a prior Synapse version wrote
+into `ExtensionSettings` so the user's extensions are restored. It does not write
+any blocking policy, never shows a UAC prompt to modify Chrome policy, and never
+disables the user's extensions.
 
-The standalone bridge verifier applies the same supported Chrome policy
-remediation by default:
+To heal an affected machine without a full setup run, invoke the standalone
+verifier's maintenance entry point:
 
 ```powershell
-scripts\install-synapse-chrome-debugger.ps1
+scripts\install-synapse-chrome-debugger.ps1 -RemoveExternalDebuggerPolicyOnly
 ```
 
-Use `-ChromePolicyBlockScope DetectedExtensions` only when the operator
-intentionally wants to limit remediation to the currently discovered extension
-IDs. If no allowed hive can persist the policy, the script fails with
-`SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED_ALL_HIVES` and includes the
-per-hive registry path, ACL/readback failure, elevated-helper evidence path when
-attempted, and remediation.
-After policy is written, Chrome must reload policy or restart; the verifier
-still fails closed until the profile/process SoT shows the external debugger or
-native-messaging surface is gone. When the registry policy is correct but the
-running Chrome profile/process SoT has not consumed it yet, the verifier reports
-`SYNAPSE_CHROME_POLICY_PENDING_CHROME_RELOAD` with the policy, profile, and
-process readback instead of the generic external-surface error.
-Passing `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and
-cannot certify the host as popup-free.
+That removes only Synapse-authored blockers (matched by the
+`blocked_install_message` marker) from HKCU and HKLM and reports a per-hive
+result; admin- or user-authored `ExtensionSettings` entries are left untouched.
+Popup-free background automation is achieved entirely on Synapse's own side: the
+bundled bridge is tabs-only over localhost WebSocket (no `debugger`/
+`nativeMessaging` permission), and deep CDP runs in a dedicated Synapse-launched
+automation profile started with `--silent-debugger-extension-api`.

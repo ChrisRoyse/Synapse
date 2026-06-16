@@ -61,44 +61,15 @@
   does not install or launch native messaging because Chrome may create a
   visible cmd.exe wrapper for native hosts.
 
-.PARAMETER ApplyExternalChromeDebuggerPolicy
-  Disabled by default. Opt-in only. When NOT passed, setup never touches the
-  Chrome ExtensionSettings policy and never blocks setup on the presence of
-  external debugger/nativeMessaging extensions; the user's other Chrome
-  extensions (including the Claude extension) are left untouched. This is the
-  safe default because the wildcard "*" block previously broke legitimate
-  extensions that legitimately require those permissions.
-
-  Passing -ApplyExternalChromeDebuggerPolicy explicitly re-enables the Chrome
-  ExtensionSettings remediation: it merges blocked_permissions=["debugger",
-  "nativeMessaging"]. The policy scope defaults to the wildcard "*" entry (see
-  -ChromePolicyBlockScope to narrow it to DetectedExtensions). With enforcement
-  enabled, setup fails closed until Chrome policy/profile and process readback
-  prove the external surface is gone; if policy is persisted but the running
-  Chrome profile/process has not consumed it, setup reports
-  SYNAPSE_CHROME_POLICY_PENDING_CHROME_RELOAD. Already-compliant policy is
-  accepted before any write/elevation attempt.
-
-.PARAMETER ChromePolicyHive
-  Chrome policy hive used with -ApplyExternalChromeDebuggerPolicy. Defaults to
-  Auto, which tries HKCU first and then HKLM. HKLM requires a principal that can
-  write machine policy. Setup fails closed with per-hive ACL/readback evidence
-  if no allowed hive can persist the required policy.
-
-.PARAMETER ChromePolicyBlockScope
-  Chrome ExtensionSettings scope used with -ApplyExternalChromeDebuggerPolicy.
-  The default, AllExtensions, writes the wildcard "*" blocked_permissions entry
-  so current and future extensions cannot request debugger/nativeMessaging.
-  DetectedExtensions limits the policy merge to the offending extension IDs
-  found in the current Chrome profile/process Source of Truth.
-
-.PARAMETER AutoElevateChromePolicy
-  Disabled by default. Background end-user setup must not create visible UAC or
-  helper windows while trying to suppress Chrome debugger/native-host popups. If
-  HKCU/HKLM Chrome policy writes fail from the current process, setup fails
-  closed with per-hive ACL/readback evidence. Passing
-  -AutoElevateChromePolicy:$true explicitly permits a one-time elevated
-  PowerShell helper to write HKLM policy and return a JSON evidence file.
+  Synapse never modifies the Chrome ExtensionSettings policy and never disables
+  the user's Chrome extensions. Popup-free background automation is achieved
+  entirely on Synapse's own side: the bundled bridge is tabs-only over localhost
+  WebSocket (no debugger/nativeMessaging permission), and deep CDP work runs in a
+  dedicated Synapse-launched automation profile started with
+  --silent-debugger-extension-api. The Chrome bridge verifier also performs a
+  one-way self-heal that removes any debugger/nativeMessaging blockers a prior
+  Synapse version wrote into ExtensionSettings, so running the latest build
+  restores extensions (including the Claude extension) on affected machines.
 
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
@@ -123,12 +94,6 @@ param(
     [string]$Bind        = '127.0.0.1:7700',
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
-    [switch]$ApplyExternalChromeDebuggerPolicy = $false,
-    [ValidateSet('Auto', 'HKCU', 'HKLM')]
-    [string]$ChromePolicyHive = 'Auto',
-    [ValidateSet('AllExtensions', 'DetectedExtensions')]
-    [string]$ChromePolicyBlockScope = 'AllExtensions',
-    [bool]$AutoElevateChromePolicy = $false,
     [string]$CargoTarget = "$env:LOCALAPPDATA\synapse\build-target",
     [string]$DbPath      = "$env:LOCALAPPDATA\synapse\db-daemon",
     [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles",
@@ -154,13 +119,7 @@ function Invoke-SynapseChromeBridgeVerifier {
         [Parameter(Mandatory = $true)]
         [string]$InstallerPath,
         [Parameter(Mandatory = $true)]
-        [string]$NativeHostExePath,
-        [switch]$ApplyExternalPolicy,
-        [ValidateSet('Auto', 'HKCU', 'HKLM')]
-        [string]$PolicyHive = 'Auto',
-        [ValidateSet('AllExtensions', 'DetectedExtensions')]
-        [string]$PolicyBlockScope = 'AllExtensions',
-        [bool]$AutoElevatePolicy = $true
+        [string]$NativeHostExePath
     )
 
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
@@ -168,12 +127,6 @@ function Invoke-SynapseChromeBridgeVerifier {
     }
     $chromeBridgeArgs = @{
         SynapseNativeHostExe = $NativeHostExePath
-        ChromePolicyHive = $PolicyHive
-        ChromePolicyBlockScope = $PolicyBlockScope
-        AutoElevateChromePolicy = $AutoElevatePolicy
-    }
-    if ($ApplyExternalPolicy) {
-        $chromeBridgeArgs.ApplyExternalChromeDebuggerPolicy = $true
     }
     $readback = & $InstallerPath @chromeBridgeArgs
     if (-not $readback.ok) {
@@ -2420,18 +2373,13 @@ Step "Preflighting Chrome direct localhost bridge before daemon handoff"
 $chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
 $chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
     -InstallerPath $chromeBridgeInstaller `
-    -NativeHostExePath $ChromeNativeHostExePath `
-    -ApplyExternalPolicy:$ApplyExternalChromeDebuggerPolicy `
-    -PolicyHive $ChromePolicyHive `
-    -PolicyBlockScope $ChromePolicyBlockScope `
-    -AutoElevatePolicy $AutoElevateChromePolicy
-Info ("Chrome direct bridge preflight accepted transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4} policy_block_scope={5}" -f `
+    -NativeHostExePath $ChromeNativeHostExePath
+Info ("Chrome direct bridge preflight accepted transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4}" -f `
     $chromeBridgePreflight.daemon_bridge_transport, `
     $chromeBridgePreflight.extension_id, `
     $chromeBridgePreflight.native_host_registry_present, `
     $chromeBridgePreflight.native_host_manifest_present, `
-    $chromeBridgePreflight.chrome_policy_scope, `
-    $chromeBridgePreflight.chrome_policy_block_scope)
+    (($chromeBridgePreflight.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','))
 
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon, then install the proven binary
@@ -2474,18 +2422,13 @@ Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha
 Step "Verifying Chrome direct localhost bridge"
 $chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
     -InstallerPath $chromeBridgeInstaller `
-    -NativeHostExePath $ChromeNativeHostExePath `
-    -ApplyExternalPolicy:$ApplyExternalChromeDebuggerPolicy `
-    -PolicyHive $ChromePolicyHive `
-    -PolicyBlockScope $ChromePolicyBlockScope `
-    -AutoElevatePolicy $AutoElevateChromePolicy
-Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4} policy_block_scope={5}" -f `
+    -NativeHostExePath $ChromeNativeHostExePath
+Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4}" -f `
     $chromeBridgeReadback.daemon_bridge_transport, `
     $chromeBridgeReadback.extension_id, `
     $chromeBridgeReadback.native_host_registry_present, `
     $chromeBridgeReadback.native_host_manifest_present, `
-    $chromeBridgeReadback.chrome_policy_scope, `
-    $chromeBridgeReadback.chrome_policy_block_scope)
+    (($chromeBridgeReadback.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','))
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +

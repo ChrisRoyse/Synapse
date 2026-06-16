@@ -1,16 +1,11 @@
 param(
     [string]$SynapseNativeHostExe = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
     [string]$ExtensionId = "leoocgnkjnplbfdbklajepahofecgfbk",
-    [switch]$ApplyExternalChromeDebuggerPolicy = $false,
-    [ValidateSet('Auto', 'HKCU', 'HKLM')]
-    [string]$ChromePolicyHive = 'Auto',
-    [ValidateSet('AllExtensions', 'DetectedExtensions')]
-    [string]$ChromePolicyBlockScope = 'AllExtensions',
-    [bool]$AutoElevateChromePolicy = $false,
-    [switch]$AllowExternalChromeDebuggerOrNativeMessaging,
-    [switch]$ChromePolicyOnly,
-    [string[]]$ChromePolicyExternalExtensionIds = @(),
-    [string]$ChromePolicyEvidencePath
+    # Maintenance/self-heal entry point: run ONLY the one-way removal of any
+    # debugger/nativeMessaging blockers a previous Synapse version wrote into the
+    # Chrome ExtensionSettings policy, print the result, and exit. Synapse never
+    # writes such blockers anymore; it must never disable a user's extensions.
+    [switch]$RemoveExternalDebuggerPolicyOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,22 +77,6 @@ function Get-ChromePolicyHiveCandidates {
     return @($Hive)
 }
 
-function Quote-ProcessArgument {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    if ($Value.Length -eq 0) {
-        return '""'
-    }
-    if ($Value -notmatch '[\s"]') {
-        return $Value
-    }
-    return '"' + ($Value -replace '"', '\"') + '"'
-}
-
-function Quote-PowerShellLiteral {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    return "'" + ($Value -replace "'", "''") + "'"
-}
-
 function Read-ChromeExtensionSettingsPolicy {
     param(
         [ValidateSet('HKCU', 'HKLM')]
@@ -133,389 +112,115 @@ function Read-ChromeExtensionSettingsPolicy {
     return $settings
 }
 
-function Write-ChromeExternalDebuggerPolicy {
-    param(
-        [ValidateSet('HKCU', 'HKLM')]
-        [string]$Hive,
-        [string[]]$ExternalExtensionIds,
-        [ValidateSet('AllExtensions', 'DetectedExtensions')]
-        [string]$BlockScope = 'AllExtensions'
-    )
+# Exact blocked_install_message a previous Synapse version stamped onto every
+# ExtensionSettings entry it authored. It is the ONLY reliable marker that lets
+# the self-heal below distinguish Synapse-authored blockers from policy an
+# enterprise admin or the user set themselves. Do not change this string: it
+# must match byte-for-byte what shipped installers wrote, or old installs will
+# not be healed.
+$script:SynapseChromeBlockedInstallMessage = 'Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.'
 
-    $ids = @($ExternalExtensionIds | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique)
-    $policyEntries = @()
-    if ($BlockScope -eq 'AllExtensions') {
-        $policyEntries += '*'
-    }
-    $policyEntries += $ids
-    $policyEntries = @($policyEntries | Sort-Object -Unique)
-
-    if ($policyEntries.Count -eq 0) {
-        return [pscustomobject]@{
-            hive = $Hive
-            path = Get-ChromePolicyRoot -Hive $Hive
-            value_name = 'ExtensionSettings'
-            blocked_extension_ids = @()
-            block_scope = $BlockScope
-            policy_entries = @()
-            readback_ok = $true
-            policy_json = ConvertTo-CompressedJson -Value ([ordered]@{})
+function Remove-SynapseChromeExternalDebuggerPolicy {
+    # One-way self-heal. Synapse NEVER disables a user's Chrome extensions. This
+    # only undoes the debugger/nativeMessaging blockers that earlier Synapse
+    # versions wrote into Chrome ExtensionSettings, identified strictly by the
+    # Synapse blocked_install_message marker. Entries Synapse did not author are
+    # left byte-for-byte untouched. Best-effort per hive: a hive we cannot write
+    # is reported with ACL evidence, never silently swallowed, and never fatal.
+    $results = @()
+    foreach ($hive in (Get-ChromePolicyHiveCandidates -Hive 'Auto')) {
+        $policyRoot = Get-ChromePolicyRoot -Hive $hive
+        if (-not (Test-Path -LiteralPath $policyRoot)) {
+            $results += [pscustomobject]@{ hive = $hive; path = $policyRoot; changed = $false; reason = 'policy_root_absent' }
+            continue
         }
-    }
-
-    $policyRoot = Get-ChromePolicyRoot -Hive $Hive
-    try {
-        New-Item -ItemType Directory -Force -Path $policyRoot | Out-Null
-        $settings = Read-ChromeExtensionSettingsPolicy -Hive $Hive
-        foreach ($policyEntry in $policyEntries) {
-            if (-not $settings.Contains($policyEntry)) {
-                $settings[$policyEntry] = [ordered]@{}
-            }
-            $entry = $settings[$policyEntry]
-            $blocked = @()
-            if ($entry.Contains('blocked_permissions')) {
-                $blocked = @($entry['blocked_permissions'])
-            }
-            $blocked = @($blocked + @('debugger', 'nativeMessaging') | Sort-Object -Unique)
-            $entry['blocked_permissions'] = $blocked
-            if (-not $entry.Contains('blocked_install_message')) {
-                $entry['blocked_install_message'] = 'Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.'
-            }
+        $raw = (Get-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -ErrorAction SilentlyContinue).ExtensionSettings
+        if ([string]::IsNullOrWhiteSpace([string]$raw)) {
+            $results += [pscustomobject]@{ hive = $hive; path = $policyRoot; changed = $false; reason = 'no_extension_settings' }
+            continue
         }
-        $json = ConvertTo-CompressedJson -Value $settings
-        New-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -PropertyType String -Value $json -Force | Out-Null
-        $readback = Read-ChromeExtensionSettingsPolicy -Hive $Hive
-        $missing = @()
-        foreach ($policyEntry in $policyEntries) {
-            if (-not $readback.Contains($policyEntry)) {
-                $missing += "${policyEntry}:missing_entry"
+        try {
+            $settings = Read-ChromeExtensionSettingsPolicy -Hive $hive
+        } catch {
+            # A policy we cannot parse is NOT ours to rewrite; surface it loudly
+            # and leave it intact rather than risk corrupting admin policy.
+            $results += [pscustomobject]@{ hive = $hive; path = $policyRoot; changed = $false; reason = "parse_error:$($_.Exception.Message)" }
+            continue
+        }
+        $changed = $false
+        $cleaned = [ordered]@{}
+        $removedEntries = @()
+        $strippedEntries = @()
+        foreach ($name in @($settings.Keys)) {
+            $entry = $settings[$name]
+            $isSynapseAuthored = ($entry -is [System.Collections.Specialized.OrderedDictionary]) -and
+                $entry.Contains('blocked_install_message') -and
+                ([string]$entry['blocked_install_message'] -eq $script:SynapseChromeBlockedInstallMessage)
+            if (-not $isSynapseAuthored) {
+                $cleaned[$name] = $entry
                 continue
             }
-            $blocked = @($readback[$policyEntry]['blocked_permissions'])
-            foreach ($permission in @('debugger', 'nativeMessaging')) {
-                if ($blocked -notcontains $permission) {
-                    $missing += "${policyEntry}:missing_$permission"
-                }
+            $changed = $true
+            $blocked = @()
+            if ($entry.Contains('blocked_permissions')) {
+                $blocked = @($entry['blocked_permissions'] | Where-Object { $_ -ne 'debugger' -and $_ -ne 'nativeMessaging' })
+            }
+            $entry.Remove('blocked_install_message')
+            if ($blocked.Count -gt 0) {
+                $entry['blocked_permissions'] = $blocked
+            } elseif ($entry.Contains('blocked_permissions')) {
+                $entry.Remove('blocked_permissions')
+            }
+            # Drop the entry entirely only if Synapse's blockers were all it held;
+            # otherwise preserve whatever else (e.g. an admin installation_mode).
+            if ($entry.Keys.Count -gt 0) {
+                $cleaned[$name] = $entry
+                $strippedEntries += $name
+            } else {
+                $removedEntries += $name
             }
         }
-        if ($missing.Count -gt 0) {
-            throw "SYNAPSE_CHROME_POLICY_READBACK_MISMATCH hive=$Hive path=$policyRoot missing=$($missing -join ',') remediation=Chrome ExtensionSettings policy write did not persist the required blocked_permissions"
+        if (-not $changed) {
+            $results += [pscustomobject]@{ hive = $hive; path = $policyRoot; changed = $false; reason = 'no_synapse_authored_blocks' }
+            continue
         }
-        return [pscustomobject]@{
-            hive = $Hive
-            path = $policyRoot
-            value_name = 'ExtensionSettings'
-            blocked_extension_ids = $ids
-            block_scope = $BlockScope
-            policy_entries = $policyEntries
-            readback_ok = $true
-            policy_json = ConvertTo-CompressedJson -Value $readback
-        }
-    } catch {
-        $aclDiagnostic = Get-RegistryAclDiagnostic -Path $policyRoot
-        throw "SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED hive=$Hive path=$policyRoot block_scope=$BlockScope policy_entries=$($policyEntries -join ',') blocked_extension_ids=$($ids -join ',') detail=$($_.Exception.Message) acl_detail=$aclDiagnostic remediation=run setup from a principal that can write Chrome policy or disable/remove the named external Chrome extension, then refresh/restart Chrome and rerun this verifier"
-    }
-}
-
-function Write-ChromeExternalDebuggerPolicyAuto {
-    param(
-        [ValidateSet('Auto', 'HKCU', 'HKLM')]
-        [string]$Hive,
-        [string[]]$ExternalExtensionIds,
-        [ValidateSet('AllExtensions', 'DetectedExtensions')]
-        [string]$BlockScope = 'AllExtensions',
-        [bool]$AutoElevate = $true
-    )
-
-    $attempts = @()
-    foreach ($candidateHive in (Get-ChromePolicyHiveCandidates -Hive $Hive)) {
         try {
-            $result = Write-ChromeExternalDebuggerPolicy `
-                -Hive $candidateHive `
-                -ExternalExtensionIds $ExternalExtensionIds `
-                -BlockScope $BlockScope
-            $attempts += [pscustomobject]@{
-                hive = $candidateHive
-                ok = $true
-                path = $result.path
-                policy_entries = $result.policy_entries
+            if ($cleaned.Keys.Count -gt 0) {
+                $json = ConvertTo-CompressedJson -Value $cleaned
+                New-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -PropertyType String -Value $json -Force | Out-Null
+            } else {
+                Remove-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -ErrorAction Stop
             }
-            $result | Add-Member -NotePropertyName requested_hive -NotePropertyValue $Hive -Force
-            $result | Add-Member -NotePropertyName attempted_hives -NotePropertyValue $attempts -Force
-            return $result
-        } catch {
-            $attempts += [pscustomobject]@{
-                hive = $candidateHive
-                ok = $false
-                path = Get-ChromePolicyRoot -Hive $candidateHive
-                error = $_.Exception.Message
-            }
-        }
-    }
-
-    if ($AutoElevate -and ($Hive -eq 'Auto' -or $Hive -eq 'HKLM')) {
-        try {
-            $result = Invoke-ElevatedChromeExternalDebuggerPolicy `
-                -ExternalExtensionIds $ExternalExtensionIds `
-                -BlockScope $BlockScope
-            $attempts += [pscustomobject]@{
-                hive = 'HKLM'
-                ok = $true
-                elevated = $true
-                path = $result.path
-                policy_entries = $result.policy_entries
-                evidence_path = $result.elevation_evidence_path
-            }
-            $result | Add-Member -NotePropertyName requested_hive -NotePropertyValue $Hive -Force
-            $result | Add-Member -NotePropertyName attempted_hives -NotePropertyValue $attempts -Force
-            return $result
-        } catch {
-            $attempts += [pscustomobject]@{
-                hive = 'HKLM'
-                ok = $false
-                elevated = $true
-                path = Get-ChromePolicyRoot -Hive 'HKLM'
-                error = $_.Exception.Message
-            }
-        }
-    }
-
-    $attemptDetail = ConvertTo-CompressedJson -Value ([object[]]@($attempts)) -Depth 10
-    throw "SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED_ALL_HIVES requested_hive=$Hive block_scope=$BlockScope auto_elevate=$AutoElevate attempts=$attemptDetail remediation=setup could not persist Chrome ExtensionSettings blocked_permissions=[debugger,nativeMessaging] in any allowed hive; approve the one-time elevated HKLM policy writer, rerun setup elevated, repair HKCU Software\Policies ACL so the current user can write, or disable/remove the named external Chrome extension/native host before certifying popup-free state"
-}
-
-function Test-ChromePolicyReadbackBlocksPopupSurfaces {
-    param(
-        [object]$PolicyReadback,
-        [string[]]$ExternalExtensionIds
-    )
-
-    if ($null -eq $PolicyReadback -or -not $PolicyReadback.readback_ok) {
-        return $false
-    }
-    $policyJson = [string]$PolicyReadback.policy_json
-    if ([string]::IsNullOrWhiteSpace($policyJson)) {
-        return $false
-    }
-    try {
-        $settings = $policyJson | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        return $false
-    }
-
-    function Test-PolicyEntryBlocksPopupPermissions {
-        param(
-            [Parameter(Mandatory = $true)]
-            [object]$Settings,
-            [Parameter(Mandatory = $true)]
-            [string]$EntryName
-        )
-
-        $property = @($Settings.PSObject.Properties | Where-Object { $_.Name -eq $EntryName } | Select-Object -First 1)
-        if ($property.Count -eq 0) {
-            return $false
-        }
-        $blocked = @($property[0].Value.blocked_permissions)
-        return ($blocked -contains 'debugger' -and $blocked -contains 'nativeMessaging')
-    }
-
-    if (Test-PolicyEntryBlocksPopupPermissions -Settings $settings -EntryName '*') {
-        return $true
-    }
-
-    $ids = @($ExternalExtensionIds | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique)
-    if ($ids.Count -eq 0) {
-        return $false
-    }
-    foreach ($id in $ids) {
-        if (-not (Test-PolicyEntryBlocksPopupPermissions -Settings $settings -EntryName $id)) {
-            return $false
-        }
-    }
-    return $true
-}
-
-function Read-ExistingChromeExternalDebuggerPolicy {
-    param(
-        [ValidateSet('Auto', 'HKCU', 'HKLM')]
-        [string]$Hive,
-        [string[]]$ExternalExtensionIds,
-        [ValidateSet('AllExtensions', 'DetectedExtensions')]
-        [string]$BlockScope = 'AllExtensions'
-    )
-
-    $ids = @($ExternalExtensionIds | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique)
-    $attempts = @()
-    foreach ($candidateHive in (Get-ChromePolicyHiveCandidates -Hive $Hive)) {
-        try {
-            $settings = Read-ChromeExtensionSettingsPolicy -Hive $candidateHive
-            $readback = [pscustomobject]@{
-                hive = $candidateHive
-                path = Get-ChromePolicyRoot -Hive $candidateHive
-                value_name = 'ExtensionSettings'
-                blocked_extension_ids = $ids
-                block_scope = $BlockScope
-                policy_entries = @()
-                readback_ok = $true
-                policy_json = ConvertTo-CompressedJson -Value $settings
-                existing_policy = $true
-                requested_hive = $Hive
-                attempted_hives = $null
-            }
-            $blocks = Test-ChromePolicyReadbackBlocksPopupSurfaces `
-                -PolicyReadback $readback `
-                -ExternalExtensionIds $ids
-            $attempts += [pscustomobject]@{
-                hive = $candidateHive
-                ok = $blocks
-                existing_policy = $true
-                path = $readback.path
-            }
-            if ($blocks) {
-                $entries = @()
-                $parsed = $readback.policy_json | ConvertFrom-Json
-                foreach ($entryName in @('*') + $ids) {
-                    $property = @($parsed.PSObject.Properties | Where-Object { $_.Name -eq $entryName } | Select-Object -First 1)
-                    if ($property.Count -gt 0) {
-                        $entries += $entryName
-                    }
-                }
-                $readback.policy_entries = @($entries | Sort-Object -Unique)
-                $readback.attempted_hives = $attempts
-                return $readback
+            $results += [pscustomobject]@{
+                hive = $hive
+                path = $policyRoot
+                changed = $true
+                reason = 'removed_synapse_authored_blocks'
+                removed_entries = @($removedEntries)
+                stripped_entries = @($strippedEntries)
+                extension_settings_remaining = ($cleaned.Keys.Count -gt 0)
             }
         } catch {
-            $attempts += [pscustomobject]@{
-                hive = $candidateHive
-                ok = $false
-                existing_policy = $true
-                path = Get-ChromePolicyRoot -Hive $candidateHive
-                error = $_.Exception.Message
+            $results += [pscustomobject]@{
+                hive = $hive
+                path = $policyRoot
+                changed = $false
+                reason = "write_failed:$($_.Exception.Message)"
+                acl_detail = (Get-RegistryAclDiagnostic -Path $policyRoot)
             }
         }
     }
-    return $null
+    return @($results)
 }
 
-function Invoke-ElevatedChromeExternalDebuggerPolicy {
-    param(
-        [string[]]$ExternalExtensionIds,
-        [ValidateSet('AllExtensions', 'DetectedExtensions')]
-        [string]$BlockScope = 'AllExtensions'
-    )
-
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or -not (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
-        throw "SYNAPSE_CHROME_POLICY_ELEVATION_SCRIPT_PATH_MISSING path=$PSCommandPath remediation=run the verifier from a real .ps1 file so the elevated helper can execute the same audited policy writer"
+if ($RemoveExternalDebuggerPolicyOnly) {
+    $cleanup = Remove-SynapseChromeExternalDebuggerPolicy
+    [pscustomobject]@{
+        ok = $true
+        mode = 'chrome_policy_cleanup_only'
+        chrome_policy_cleanup = $cleanup
     }
-    $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
-        throw "SYNAPSE_CHROME_POLICY_ELEVATION_POWERSHELL_MISSING path=$powershellExe remediation=repair Windows PowerShell or rerun setup from an elevated PowerShell host"
-    }
-
-    $evidenceRoot = Join-Path $env:TEMP 'synapse-chrome-policy-elevation'
-    New-Item -ItemType Directory -Force -Path $evidenceRoot | Out-Null
-    $evidencePath = Join-Path $evidenceRoot ("policy-{0}.json" -f ([guid]::NewGuid().ToString('n')))
-    $runnerPath = Join-Path $evidenceRoot ("policy-runner-{0}.ps1" -f ([guid]::NewGuid().ToString('n')))
-    $ids = @($ExternalExtensionIds | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique)
-    $idsLiteral = '@(' + (($ids | ForEach-Object { Quote-PowerShellLiteral $_ }) -join ',') + ')'
-    $policyCommand = @(
-        '&',
-        (Quote-PowerShellLiteral $PSCommandPath),
-        '-ChromePolicyOnly',
-        '-ChromePolicyHive', 'HKLM',
-        '-ChromePolicyBlockScope', (Quote-PowerShellLiteral $BlockScope),
-        '-AutoElevateChromePolicy', '$false',
-        '-ChromePolicyEvidencePath', (Quote-PowerShellLiteral $evidencePath),
-        '-ChromePolicyExternalExtensionIds', $idsLiteral
-    ) -join ' '
-    $runner = @"
-`$ErrorActionPreference = 'Stop'
-try {
-    $policyCommand
-    exit `$LASTEXITCODE
-} catch {
-    `$payload = [ordered]@{
-        ok = `$false
-        mode = 'chrome_policy_elevated_runner'
-        error = `$_.Exception.Message
-    }
-    Set-Content -LiteralPath $(Quote-PowerShellLiteral $evidencePath) -Value (`$payload | ConvertTo-Json -Depth 12 -Compress) -Encoding UTF8
-    Write-Error `$_.Exception.Message
-    exit 1
-}
-"@
-    Set-Content -LiteralPath $runnerPath -Value $runner -Encoding UTF8
-    $argumentTokens = @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', (Quote-ProcessArgument $runnerPath)
-    )
-
-    try {
-        $process = Start-Process `
-            -FilePath $powershellExe `
-            -ArgumentList ($argumentTokens -join ' ') `
-            -Verb RunAs `
-            -WindowStyle Hidden `
-            -Wait `
-            -PassThru `
-            -ErrorAction Stop
-    } catch {
-        Remove-Item -LiteralPath $runnerPath -Force -ErrorAction SilentlyContinue
-        throw "SYNAPSE_CHROME_POLICY_ELEVATION_START_FAILED path=$powershellExe evidence_path=$evidencePath detail=$($_.Exception.Message) remediation=approve the one-time UAC prompt, rerun setup from an elevated shell, or disable/remove the named external Chrome extension/native host"
-    }
-    Remove-Item -LiteralPath $runnerPath -Force -ErrorAction SilentlyContinue
-
-    if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
-        throw "SYNAPSE_CHROME_POLICY_ELEVATION_NO_EVIDENCE exit_code=$($process.ExitCode) evidence_path=$evidencePath remediation=elevated helper did not write its policy evidence file; inspect Windows event logs/UAC denial and rerun setup elevated"
-    }
-    try {
-        $payload = Get-Content -Raw -LiteralPath $evidencePath | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        throw "SYNAPSE_CHROME_POLICY_ELEVATION_EVIDENCE_INVALID exit_code=$($process.ExitCode) evidence_path=$evidencePath detail=$($_.Exception.Message) remediation=elevated helper evidence was not valid JSON"
-    }
-    if ($process.ExitCode -ne 0 -or -not $payload.ok) {
-        $detail = ConvertTo-CompressedJson -Value $payload -Depth 10
-        throw "SYNAPSE_CHROME_POLICY_ELEVATION_FAILED exit_code=$($process.ExitCode) evidence_path=$evidencePath detail=$detail remediation=elevated HKLM Chrome policy write failed; rerun setup elevated or repair policy registry permissions"
-    }
-    $result = $payload.result
-    $result | Add-Member -NotePropertyName elevated -NotePropertyValue $true -Force
-    $result | Add-Member -NotePropertyName elevation_evidence_path -NotePropertyValue $evidencePath -Force
-    return $result
-}
-
-if ($ChromePolicyOnly) {
-    try {
-        # Policy-only is the elevated child contract; never recurse into elevation.
-        $policyOnlyReadback = Write-ChromeExternalDebuggerPolicyAuto `
-            -Hive $ChromePolicyHive `
-            -ExternalExtensionIds $ChromePolicyExternalExtensionIds `
-            -BlockScope $ChromePolicyBlockScope `
-            -AutoElevate:$false
-        $payload = [ordered]@{
-            ok = $true
-            mode = 'chrome_policy_only'
-            result = $policyOnlyReadback
-        }
-        if (-not [string]::IsNullOrWhiteSpace($ChromePolicyEvidencePath)) {
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ChromePolicyEvidencePath) | Out-Null
-            Set-Content -LiteralPath $ChromePolicyEvidencePath -Value (ConvertTo-CompressedJson -Value $payload -Depth 12) -Encoding UTF8
-        }
-        [pscustomobject]$payload
-        exit 0
-    } catch {
-        $payload = [ordered]@{
-            ok = $false
-            mode = 'chrome_policy_only'
-            error = $_.Exception.Message
-        }
-        if (-not [string]::IsNullOrWhiteSpace($ChromePolicyEvidencePath)) {
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ChromePolicyEvidencePath) | Out-Null
-            Set-Content -LiteralPath $ChromePolicyEvidencePath -Value (ConvertTo-CompressedJson -Value $payload -Depth 12) -Encoding UTF8
-        }
-        Write-Error $_.Exception.Message
-        exit 1
-    }
+    exit 0
 }
 
 function Get-SynapseNativeHostRegistryTargets {
@@ -836,51 +541,18 @@ $externalHazardExtensionIds = @(
     @($externalNativeMessagingProcesses | ForEach-Object { $_.ExtensionId })
 ) | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique
 
-$chromePolicyReadback = $null
-if ($ApplyExternalChromeDebuggerPolicy -and
-    ($externalHazardExtensionIds.Count -gt 0 -or $ChromePolicyBlockScope -eq 'AllExtensions')) {
-    $chromePolicyReadback = Read-ExistingChromeExternalDebuggerPolicy `
-        -Hive $ChromePolicyHive `
-        -ExternalExtensionIds $externalHazardExtensionIds `
-        -BlockScope $ChromePolicyBlockScope
-    if ($null -eq $chromePolicyReadback) {
-        $chromePolicyReadback = Write-ChromeExternalDebuggerPolicyAuto `
-            -Hive $ChromePolicyHive `
-            -ExternalExtensionIds $externalHazardExtensionIds `
-            -BlockScope $ChromePolicyBlockScope
-    }
-}
-
-if ($ApplyExternalChromeDebuggerPolicy -and
-    -not $AllowExternalChromeDebuggerOrNativeMessaging -and
-    ($externalDebuggerOrNativeExtensions.Count -gt 0 -or $externalNativeMessagingProcesses.Count -gt 0)) {
-    $policyBlocksPopupSurfaces = Test-ChromePolicyReadbackBlocksPopupSurfaces `
-        -PolicyReadback $chromePolicyReadback `
-        -ExternalExtensionIds $externalHazardExtensionIds
-    $errorCode = if ($policyBlocksPopupSurfaces) {
-        'SYNAPSE_CHROME_POLICY_PENDING_CHROME_RELOAD'
-    } else {
-        'SYNAPSE_CHROME_EXTERNAL_DEBUGGER_OR_NATIVE_SURFACE_PRESENT'
-    }
-    $remediation = if ($policyBlocksPopupSurfaces) {
-        'Chrome ExtensionSettings blocked_permissions=[debugger,nativeMessaging] is persisted, but the running Chrome profile/process Source of Truth still exposes the external surface; reload Chrome policies from chrome://policy or restart Chrome, then rerun this verifier. Synapse will not certify popup-free readiness until the separate profile/process readback is clean.'
-    } else {
-        'HKCU/HKLM Chrome ExtensionSettings wildcard "*" blocked_permissions=[debugger,nativeMessaging], or disable/remove the offending extension, then refresh/restart Chrome and rerun this verifier'
-    }
-    $detail = [pscustomobject]@{
-        external_debugger_or_native_extensions = $externalDebuggerOrNativeExtensions
-        external_disabled_debugger_or_native_extensions = $externalDisabledDebuggerOrNativeExtensions
-        external_debugger_extensions = $externalDebuggerExtensions
-        external_native_messaging_processes = $externalNativeMessagingProcesses
-        external_hazard_extension_ids = $externalHazardExtensionIds
-        current_chrome_processes = $chromeProcesses
-        chrome_policy_readback = $chromePolicyReadback
-        chrome_policy_blocks_popup_surfaces = $policyBlocksPopupSurfaces
-        chrome_policy_pending_chrome_reload = $policyBlocksPopupSurfaces
-        chrome_policy_remediation = $remediation
-    } | ConvertTo-Json -Depth 8 -Compress
-    throw "$errorCode detail=$detail remediation=$remediation"
-}
+# Synapse NEVER disables a user's Chrome extensions. External extensions and
+# native-messaging hosts that use debugger/nativeMessaging are observed for
+# diagnostics only (reported below) and are never blocked. Popup-free background
+# automation is achieved entirely on Synapse's own side: the bundled bridge is
+# tabs-only over localhost WebSocket (no debugger/nativeMessaging), and deep CDP
+# work runs in a dedicated Synapse-launched automation profile started with
+# --silent-debugger-extension-api.
+#
+# As a one-way remediation we remove any debugger/nativeMessaging blockers that
+# an earlier Synapse version wrote into Chrome ExtensionSettings, so running the
+# latest build self-heals previously-affected machines.
+$chromePolicyCleanup = Remove-SynapseChromeExternalDebuggerPolicy
 
 [pscustomobject]@{
     ok = $true
@@ -916,10 +588,7 @@ if ($ApplyExternalChromeDebuggerPolicy -and
     silent_debugger_switch_required_for_attach_commands = $false
     silent_debugger_switch = $null
     current_chrome_processes = $chromeProcesses
-    chrome_policy_scope = if ($chromePolicyReadback) { $chromePolicyReadback.hive } else { $ChromePolicyHive }
-    chrome_policy_requested_scope = $ChromePolicyHive
-    chrome_policy_block_scope = $ChromePolicyBlockScope
-    chrome_policy_readback = $chromePolicyReadback
+    chrome_policy_cleanup = $chromePolicyCleanup
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     external_hazard_extension_ids = $externalHazardExtensionIds
     external_debugger_or_native_extensions = $externalDebuggerOrNativeExtensions

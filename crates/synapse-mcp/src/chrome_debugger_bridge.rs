@@ -201,7 +201,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "normal Synapse Chrome Bridge refused attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal end-user bridge is tabs-only and contains no daemon-side chrome.debugger attach transport{external_surface_hint} remediation=use raw CDP from a Synapse-launched automation profile for DOM/action CDP; if an end-user popup remains, disable/remove the named external Chrome extension or apply Chrome ExtensionSettings blocked_permissions=[debugger,nativeMessaging] and rerun scripts\\install-synapse-chrome-debugger.ps1"
+                "normal Synapse Chrome Bridge refused attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal end-user bridge is tabs-only and contains no daemon-side chrome.debugger attach transport{external_surface_hint} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for DOM/action CDP; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched"
             ),
         }
     }
@@ -210,7 +210,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing it to Chrome; hwnd={hwnd} reason=the current Chrome profile/process Source of Truth is not popup-free because another active extension or native host can use debugger/nativeMessaging; external_chrome_popup_risk={} remediation=apply Chrome ExtensionSettings wildcard blocked_permissions=[debugger,nativeMessaging], disable/remove the named external extension/native host, refresh or restart Chrome, then rerun scripts\\install-synapse-chrome-debugger.ps1; use raw CDP from a Synapse-launched automation profile for background browser work until the normal profile is certified",
+                "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing it to Chrome; hwnd={hwnd} reason=the current Chrome profile/process Source of Truth is not popup-free because another active extension or native host can use debugger/nativeMessaging; external_chrome_popup_risk={} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for background browser work; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched",
                 format_external_chrome_popup_risks(risks)
             ),
         }
@@ -220,7 +220,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "normal Synapse Chrome Bridge refused direct registration before accepting a Chrome-hosted command channel; reason=the current Chrome profile/process Source of Truth is not popup-free because another active extension or native host can use debugger/nativeMessaging; external_chrome_popup_risk={} remediation=apply Chrome ExtensionSettings wildcard blocked_permissions=[debugger,nativeMessaging], disable/remove the named external extension/native host, refresh or restart Chrome, then rerun scripts\\install-synapse-chrome-debugger.ps1; use raw CDP from a Synapse-launched automation profile for background browser work until the normal profile is certified",
+                "normal Synapse Chrome Bridge refused direct registration before accepting a Chrome-hosted command channel; reason=the current Chrome profile/process Source of Truth is not popup-free because another active extension or native host can use debugger/nativeMessaging; external_chrome_popup_risk={} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for background browser work; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched",
                 format_external_chrome_popup_risks(risks)
             ),
         }
@@ -3184,6 +3184,9 @@ mod tests {
                 .contains("normal end-user bridge is tabs-only")
         );
         assert!(error.detail().contains("raw CDP"));
+        assert!(error.detail().contains("--silent-debugger-extension-api"));
+        assert!(!error.detail().contains("blocked_permissions"));
+        assert!(!error.detail().contains("ExtensionSettings"));
     }
 
     #[test]
@@ -3203,9 +3206,13 @@ mod tests {
         assert_eq!(error.cdp_status(), CdpStatus::AttachFailed);
         assert!(error.detail().contains("before queueing it to Chrome"));
         assert!(error.detail().contains("Source of Truth is not popup-free"));
-        assert!(error.detail().contains("ExtensionSettings wildcard"));
         assert!(error.detail().contains("fcoeoabgfenejglbffodgkkbkcdhcgfn"));
         assert!(error.detail().contains("raw CDP"));
+        // Synapse must steer to its own-side remediation and NEVER instruct
+        // disabling the user's extensions or modifying Chrome policy.
+        assert!(error.detail().contains("--silent-debugger-extension-api"));
+        assert!(!error.detail().contains("blocked_permissions"));
+        assert!(!error.detail().contains("ExtensionSettings"));
     }
 
     #[test]
@@ -3230,6 +3237,9 @@ mod tests {
         assert!(error.detail().contains("Source of Truth is not popup-free"));
         assert!(error.detail().contains("fcoeoabgfenejglbffodgkkbkcdhcgfn"));
         assert!(error.detail().contains("raw CDP"));
+        assert!(error.detail().contains("--silent-debugger-extension-api"));
+        assert!(!error.detail().contains("blocked_permissions"));
+        assert!(!error.detail().contains("ExtensionSettings"));
     }
 
     #[test]
