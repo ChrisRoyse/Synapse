@@ -1,7 +1,7 @@
 param(
     [string]$SynapseNativeHostExe = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
     [string]$ExtensionId = "leoocgnkjnplbfdbklajepahofecgfbk",
-    [switch]$ApplyExternalChromeDebuggerPolicy = $true,
+    [switch]$ApplyExternalChromeDebuggerPolicy = $false,
     [ValidateSet('Auto', 'HKCU', 'HKLM')]
     [string]$ChromePolicyHive = 'Auto',
     [ValidateSet('AllExtensions', 'DetectedExtensions')]
@@ -851,7 +851,8 @@ if ($ApplyExternalChromeDebuggerPolicy -and
     }
 }
 
-if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
+if ($ApplyExternalChromeDebuggerPolicy -and
+    -not $AllowExternalChromeDebuggerOrNativeMessaging -and
     ($externalDebuggerOrNativeExtensions.Count -gt 0 -or $externalNativeMessagingProcesses.Count -gt 0)) {
     $policyBlocksPopupSurfaces = Test-ChromePolicyReadbackBlocksPopupSurfaces `
         -PolicyReadback $chromePolicyReadback `

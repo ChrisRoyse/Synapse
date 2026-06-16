@@ -62,17 +62,22 @@
   visible cmd.exe wrapper for native hosts.
 
 .PARAMETER ApplyExternalChromeDebuggerPolicy
-  Enabled by default for end-user setup. Attempt the supported Chrome
-  ExtensionSettings remediation by merging
-  blocked_permissions=["debugger","nativeMessaging"]. The default policy scope
-  is the wildcard "*" entry so current and future external debugger/nativeMessaging
-  extensions cannot load. Setup still fails closed until Chrome policy/profile
-  and process readback prove the external surface is gone. If policy is
-  persisted but the running Chrome profile/process has not consumed it, setup
-  reports SYNAPSE_CHROME_POLICY_PENDING_CHROME_RELOAD. Already-compliant
-  policy is accepted before any write/elevation attempt. Passing
-  -ApplyExternalChromeDebuggerPolicy:$false is diagnostic-only and cannot certify
-  a popup-free end-user host.
+  Disabled by default. Opt-in only. When NOT passed, setup never touches the
+  Chrome ExtensionSettings policy and never blocks setup on the presence of
+  external debugger/nativeMessaging extensions; the user's other Chrome
+  extensions (including the Claude extension) are left untouched. This is the
+  safe default because the wildcard "*" block previously broke legitimate
+  extensions that legitimately require those permissions.
+
+  Passing -ApplyExternalChromeDebuggerPolicy explicitly re-enables the Chrome
+  ExtensionSettings remediation: it merges blocked_permissions=["debugger",
+  "nativeMessaging"]. The policy scope defaults to the wildcard "*" entry (see
+  -ChromePolicyBlockScope to narrow it to DetectedExtensions). With enforcement
+  enabled, setup fails closed until Chrome policy/profile and process readback
+  prove the external surface is gone; if policy is persisted but the running
+  Chrome profile/process has not consumed it, setup reports
+  SYNAPSE_CHROME_POLICY_PENDING_CHROME_RELOAD. Already-compliant policy is
+  accepted before any write/elevation attempt.
 
 .PARAMETER ChromePolicyHive
   Chrome policy hive used with -ApplyExternalChromeDebuggerPolicy. Defaults to
@@ -118,7 +123,7 @@ param(
     [string]$Bind        = '127.0.0.1:7700',
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
-    [switch]$ApplyExternalChromeDebuggerPolicy = $true,
+    [switch]$ApplyExternalChromeDebuggerPolicy = $false,
     [ValidateSet('Auto', 'HKCU', 'HKLM')]
     [string]$ChromePolicyHive = 'Auto',
     [ValidateSet('AllExtensions', 'DetectedExtensions')]
