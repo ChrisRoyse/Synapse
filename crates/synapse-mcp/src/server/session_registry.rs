@@ -31,6 +31,9 @@ pub(crate) struct SessionRegistryEntry {
     pub closed_at_unix_ms: Option<u64>,
     pub last_action: Option<String>,
     pub last_reason_code: Option<String>,
+    pub last_tools_list_unix_ms: Option<u64>,
+    pub last_tools_list_visible_tool_count: Option<usize>,
+    pub last_tools_list_visible_tool_sha256: Option<String>,
     pub spawned_agent: Option<SpawnedAgentRead>,
 }
 
@@ -57,6 +60,12 @@ pub(crate) struct SessionRegistryRead {
     pub last_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tools_list_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tools_list_visible_tool_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tools_list_visible_tool_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_agent: Option<SpawnedAgentRead>,
 }
@@ -165,6 +174,9 @@ impl SessionRegistry {
                     closed_at_unix_ms: None,
                     last_action: None,
                     last_reason_code: None,
+                    last_tools_list_unix_ms: None,
+                    last_tools_list_visible_tool_count: None,
+                    last_tools_list_visible_tool_sha256: None,
                     spawned_agent: None,
                 }
             });
@@ -200,6 +212,9 @@ impl SessionRegistry {
                 closed_at_unix_ms: None,
                 last_action: None,
                 last_reason_code: None,
+                last_tools_list_unix_ms: None,
+                last_tools_list_visible_tool_count: None,
+                last_tools_list_visible_tool_sha256: None,
                 spawned_agent: None,
             });
         entry.last_seen_unix_ms = now_unix_ms;
@@ -237,6 +252,9 @@ impl SessionRegistry {
                 closed_at_unix_ms: None,
                 last_action: None,
                 last_reason_code: None,
+                last_tools_list_unix_ms: None,
+                last_tools_list_visible_tool_count: None,
+                last_tools_list_visible_tool_sha256: None,
                 spawned_agent: None,
             });
         let transitioned = entry.closed_at_unix_ms.is_none();
@@ -267,6 +285,9 @@ impl SessionRegistry {
                 closed_at_unix_ms: None,
                 last_action: None,
                 last_reason_code: None,
+                last_tools_list_unix_ms: None,
+                last_tools_list_visible_tool_count: None,
+                last_tools_list_visible_tool_sha256: None,
                 spawned_agent: None,
             });
         if entry.agent_kind == "unknown" {
@@ -285,6 +306,27 @@ impl SessionRegistry {
         self.entries
             .get(session_id)
             .map(|entry| entry.agent_kind.clone())
+    }
+
+    pub(crate) fn record_tools_list_surface(
+        &mut self,
+        session_id: &str,
+        visible_tool_count: usize,
+        visible_tool_sha256: String,
+        now_unix_ms: u64,
+    ) {
+        self.record_seen(session_id, Some("tools/list".to_owned()), now_unix_ms);
+        if let Some(entry) = self.entries.get_mut(session_id) {
+            entry.last_tools_list_unix_ms = Some(now_unix_ms);
+            entry.last_tools_list_visible_tool_count = Some(visible_tool_count);
+            entry.last_tools_list_visible_tool_sha256 = Some(visible_tool_sha256);
+        }
+    }
+
+    pub(crate) fn read(&self, session_id: &str, now_unix_ms: u64) -> Option<SessionRegistryRead> {
+        self.entries
+            .get(session_id)
+            .map(|entry| self.entry_read(entry, now_unix_ms))
     }
 
     pub(crate) fn reads(&self, now_unix_ms: u64) -> Vec<SessionRegistryRead> {
@@ -322,6 +364,9 @@ impl SessionRegistry {
             closed_at_unix_ms: entry.closed_at_unix_ms,
             last_action: entry.last_action.clone(),
             last_reason_code: entry.last_reason_code.clone(),
+            last_tools_list_unix_ms: entry.last_tools_list_unix_ms,
+            last_tools_list_visible_tool_count: entry.last_tools_list_visible_tool_count,
+            last_tools_list_visible_tool_sha256: entry.last_tools_list_visible_tool_sha256.clone(),
             spawned_agent: entry.spawned_agent.clone(),
         }
     }
@@ -421,5 +466,21 @@ mod tests {
         let read = registry.reads(2_001).remove(0);
         assert_eq!(read.last_seen_unix_ms, 2_000);
         assert_eq!(read.last_action.as_deref(), Some("tools/list"));
+    }
+
+    #[test]
+    fn registry_records_tools_list_surface_readback() {
+        let mut registry = SessionRegistry::default();
+        registry.record_initialized("s1", &state("codex"), "http", 1_000);
+        registry.record_tools_list_surface("s1", 85, "sha256:normal".to_owned(), 2_000);
+
+        let read = registry.read("s1", 2_001).expect("session readback");
+        assert_eq!(read.last_action.as_deref(), Some("tools/list"));
+        assert_eq!(read.last_tools_list_unix_ms, Some(2_000));
+        assert_eq!(read.last_tools_list_visible_tool_count, Some(85));
+        assert_eq!(
+            read.last_tools_list_visible_tool_sha256.as_deref(),
+            Some("sha256:normal")
+        );
     }
 }

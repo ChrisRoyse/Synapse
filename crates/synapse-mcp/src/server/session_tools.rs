@@ -488,6 +488,9 @@ fn synthetic_registry_read(
         closed_at_unix_ms: None,
         last_action: None,
         last_reason_code: None,
+        last_tools_list_unix_ms: None,
+        last_tools_list_visible_tool_count: None,
+        last_tools_list_visible_tool_sha256: None,
         spawned_agent: None,
     }
 }

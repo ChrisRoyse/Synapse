@@ -15,6 +15,51 @@ impl ServerHandler for SynapseService {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
+        self.dispatch_tool_call_with_profile_policy(request, context)
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
+        // Normalize schemas before they reach the client, then apply the
+        // session's durable tool profile. The policy gate in `call_tool` uses
+        // the same profile row so hand-written calls cannot bypass discovery.
+        let tools = self.tools_for_session_profile(mcp_session_id.as_deref())?;
+        if let Some(session_id) = mcp_session_id.as_deref() {
+            self.record_tools_list_surface_readback(session_id, &tools)?;
+        }
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "synapse-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(self.instructions())
+    }
+}
+
+impl SynapseService {
+    pub(crate) async fn dispatch_tool_call_with_profile_policy(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
         let lifecycle_guard =
@@ -102,40 +147,6 @@ impl ServerHandler for SynapseService {
             }
         }
     }
-
-    async fn list_tools(
-        &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
-        let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
-        // Normalize schemas before they reach the client, then apply the
-        // session's durable tool profile. The policy gate in `call_tool` uses
-        // the same profile row so hand-written calls cannot bypass discovery.
-        let tools = self.tools_for_session_profile(mcp_session_id.as_deref())?;
-        Ok(rmcp::model::ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        })
-    }
-
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .build(),
-        )
-        .with_server_info(Implementation::new(
-            "synapse-mcp",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions(self.instructions())
-    }
-}
-
-impl SynapseService {
     fn reject_terminated_session_tool_call(
         &self,
         tool_name: &str,

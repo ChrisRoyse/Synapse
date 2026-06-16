@@ -96,6 +96,8 @@ fn error_codes_match_literal_names() {
     assert_literal!(SUBSCRIPTION_NOT_FOUND);
     assert_literal!(SUBSCRIPTION_CAP_REACHED);
     assert_literal!(TOOL_NOT_FOUND);
+    assert_literal!(TOOL_PROFILE_POLICY_DENIED);
+    assert_literal!(TOOL_PROFILE_LIST_CHANGED_NOTIFY_FAILED);
     assert_literal!(TOOL_PARAMS_INVALID);
     assert_literal!(TOOL_INTERNAL_ERROR);
     assert_literal!(HTTP_BIND_NON_LOOPBACK_REFUSED);

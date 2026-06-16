@@ -1912,6 +1912,9 @@ mod tests {
             closed_at_unix_ms: closed.then_some(1_100),
             last_action: Some("tools/call:act_launch".to_owned()),
             last_reason_code: None,
+            last_tools_list_unix_ms: None,
+            last_tools_list_visible_tool_count: None,
+            last_tools_list_visible_tool_sha256: None,
             spawned_agent: Some(SpawnedAgentRead {
                 spawn_id: "spawn-test".to_owned(),
                 cli: "claude".to_owned(),

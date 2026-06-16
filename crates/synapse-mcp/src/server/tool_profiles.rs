@@ -1,12 +1,16 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rmcp::{ErrorData, RoleServer, model::ErrorCode, model::Tool, service::RequestContext};
+use rmcp::{
+    ErrorData, RoleServer,
+    model::{CallToolRequestParams, CallToolResult, Content, ErrorCode, Tool},
+    service::RequestContext,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_action::lease;
 use synapse_core::error_codes;
@@ -19,6 +23,7 @@ const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<ses
 const TOOL_PROFILE_ROW_KIND: &str = "mcp_tool_profile";
 const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
+const TOOL_PROFILE_CALL_TOOL: &str = "tool_profile_call";
 
 const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "act_run_shell",
@@ -87,6 +92,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "timeline_get",
     "timeline_search",
     "timeline_stats",
+    "tool_profile_call",
     "tool_profile_set",
     "tool_profile_status",
     "workspace_get",
@@ -127,6 +133,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "tool_profile_call",
     "tool_profile_set",
     "tool_profile_status",
     "workspace_get",
@@ -273,12 +280,59 @@ pub(crate) struct ToolProfileSnapshot {
     pub denied_break_glass_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_row: Option<ToolProfileRowReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tools_list_readback: Option<ToolProfileClientToolsListReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileClientToolsListReadback {
+    pub source_of_truth: &'static str,
+    pub session_id: String,
+    pub profile_stored_at_unix_ms: u64,
+    pub profile_allowed_tool_count: usize,
+    pub profile_allowed_tool_sha256: String,
+    pub registry_row_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tools_list_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tools_list_visible_tool_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tools_list_visible_tool_sha256: Option<String>,
+    pub observed_after_profile_write: bool,
+    pub current_surface_observed_after_profile_write: bool,
+    pub status: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolProfileStatusResponse {
     pub snapshot: ToolProfileSnapshot,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileCallParams {
+    /// Registered MCP tool name to call through the current durable profile policy.
+    #[serde(default)]
+    pub name: String,
+    /// Target tool arguments. This remains arbitrary JSON but is schema-sanitized
+    /// at the tools/list boundary so strict clients see an explicit schema, not
+    /// schemars' bare boolean `true`.
+    #[serde(default)]
+    pub arguments: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileCallResponse {
+    pub source_of_truth: &'static str,
+    pub session_id: String,
+    pub target_tool: String,
+    pub profile_before: ToolProfileKind,
+    pub target_visible_before: bool,
+    pub target_result_is_error: bool,
+    pub target_result: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -310,9 +364,34 @@ pub(crate) struct ToolProfileSetResponse {
     pub before: ToolProfileSnapshot,
     pub after: ToolProfileSnapshot,
     pub row_readback: ToolProfileRowReadback,
+    pub tool_list_changed_notification: ToolProfileListChangedNotificationReadback,
     pub intent_audit: ToolProfileAuditReadback,
     pub final_audit: ToolProfileAuditReadback,
     pub lease_proof: ToolProfileLeaseProof,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileListChangedNotificationReadback {
+    pub source_of_truth: &'static str,
+    pub notification_method: &'static str,
+    pub session_id: String,
+    pub visible_tool_set_changed: bool,
+    pub before_visible_tool_count: usize,
+    pub after_visible_tool_count: usize,
+    pub before_visible_tool_sha256: String,
+    pub after_visible_tool_sha256: String,
+    pub attempted: bool,
+    pub queued_to_rmcp_session_worker: bool,
+    pub status: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitted_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_row_readback: Option<ToolProfileRowReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_error: Option<String>,
 }
 
 #[tool_router(router = tool_profile_tool_router, vis = "pub(super)")]
@@ -333,6 +412,72 @@ impl SynapseService {
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         Ok(Json(ToolProfileStatusResponse {
             snapshot: self.tool_profile_snapshot(session_id.as_deref())?,
+        }))
+    }
+
+    #[tool(
+        description = "Stable policy-gated MCP tool broker for sessions whose client did not refresh tools/list after tool_profile_set. Calls a registered target tool only if that target is visible under this session's current durable tool profile. It is always listed under normal_agent/browser_control so raw foreground tools can stay hidden from discovery until an explicit break_glass/full-capability profile allows them."
+    )]
+    pub async fn tool_profile_call(
+        &self,
+        params: Parameters<ToolProfileCallParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<ToolProfileCallResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "tool_profile_call",
+            "tool.invocation kind=tool_profile_call"
+        );
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::HTTP_SESSION_INVALID,
+                    "tool_profile_call requires an MCP session id so the target tool can be checked against the durable profile row",
+                )
+            })?;
+        let params = params.0;
+        let target_tool = params.name.trim();
+        if target_tool.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "tool_profile_call requires non-empty target tool name",
+            ));
+        }
+        if target_tool == TOOL_PROFILE_CALL_TOOL {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "tool_profile_call cannot call itself",
+            ));
+        }
+        let full_tool_names = self.full_tool_names();
+        if !full_tool_names.iter().any(|name| name == target_tool) {
+            return Err(mcp_error(
+                error_codes::TOOL_NOT_FOUND,
+                format!("tool_profile_call target tool not found: {target_tool}"),
+            ));
+        }
+
+        let before = self.tool_profile_snapshot(Some(&session_id))?;
+        self.admit_tool_call_for_profile(target_tool, Some(&session_id))?;
+        let target_visible_before = before
+            .visible_tool_names
+            .iter()
+            .any(|name| name == target_tool);
+        let target_arguments: Map<String, Value> = params.arguments.into_iter().collect();
+        let target_result = self
+            .dispatch_tool_call_with_profile_policy(
+                CallToolRequestParams::new(target_tool.to_owned()).with_arguments(target_arguments),
+                request_context,
+            )
+            .await?;
+        Ok(Json(ToolProfileCallResponse {
+            source_of_truth: "target call dispatched through SynapseService::dispatch_tool_call_with_profile_policy after CF_SESSIONS profile admission",
+            session_id,
+            target_tool: target_tool.to_owned(),
+            profile_before: before.profile,
+            target_visible_before,
+            target_result_is_error: target_result.is_error.unwrap_or(false),
+            target_result: call_tool_result_value(&target_result),
         }))
     }
 
@@ -447,34 +592,188 @@ impl SynapseService {
             }
         };
         let after = self.tool_profile_snapshot(Some(&session_id))?;
-        let final_audit = audit_readback(self.command_audit_final(
-            super::command_audit::CommandAuditInput::mcp(
-                "tool_profile_set",
-                "profile_set",
+        let mut tool_list_changed_notification =
+            notify_tool_list_changed_if_profile_surface_changed(
+                &request_context,
+                &session_id,
+                &before,
+                &after,
+            )
+            .await;
+        if !tool_list_changed_notification.queued_to_rmcp_session_worker
+            && tool_list_changed_notification.visible_tool_set_changed
+        {
+            match self.write_tool_profile_assignment(
+                &session_id,
+                before.profile,
+                "tool_profile_set_notification_queue_failed_rollback",
+                Some("notifications/tools/list_changed queue failed".to_owned()),
                 Some(session_id.clone()),
-                Some(session_id),
-                command_payload,
-                command_before,
-                json!({
-                    "source_of_truth": TOOL_PROFILE_SOURCE_OF_TRUTH,
-                    "after_profile": after.profile.as_str(),
-                    "after_visible_tool_count": after.visible_tool_count,
-                    "row_readback": row_readback,
-                    "lease_proof": lease_proof,
-                }),
-                "ok",
-            ),
-        )?);
+            ) {
+                Ok(rollback_row) => {
+                    tool_list_changed_notification.rollback_row_readback = Some(rollback_row);
+                }
+                Err(error) => {
+                    tool_list_changed_notification.rollback_error = Some(error.message.to_string());
+                }
+            }
+        }
+        let notification_error = (!tool_list_changed_notification.queued_to_rmcp_session_worker
+            && tool_list_changed_notification.visible_tool_set_changed)
+            .then(|| {
+                tool_profile_list_changed_notification_error(
+                    &session_id,
+                    &tool_list_changed_notification,
+                )
+            });
+        let mut final_input = super::command_audit::CommandAuditInput::mcp(
+            "tool_profile_set",
+            "profile_set",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": TOOL_PROFILE_SOURCE_OF_TRUTH,
+                "after_profile": after.profile.as_str(),
+                "after_visible_tool_count": after.visible_tool_count,
+                "row_readback": row_readback,
+                "tool_list_changed_notification": tool_list_changed_notification,
+                "lease_proof": lease_proof,
+            }),
+            if notification_error.is_some() {
+                "error"
+            } else {
+                "ok"
+            },
+        );
+        if let Some(error) = notification_error.as_ref() {
+            final_input = final_input.with_error(
+                super::command_audit::command_audit_error_from_error_data(error),
+            );
+        }
+        let final_audit = audit_readback(self.command_audit_final(final_input)?);
+
+        if let Some(error) = notification_error {
+            return Err(error);
+        }
 
         Ok(Json(ToolProfileSetResponse {
             before,
             after,
             row_readback,
+            tool_list_changed_notification,
             intent_audit,
             final_audit,
             lease_proof,
         }))
     }
+}
+
+async fn notify_tool_list_changed_if_profile_surface_changed(
+    request_context: &RequestContext<RoleServer>,
+    session_id: &str,
+    before: &ToolProfileSnapshot,
+    after: &ToolProfileSnapshot,
+) -> ToolProfileListChangedNotificationReadback {
+    let visible_tool_set_changed = tool_profile_visible_tool_set_changed(before, after);
+    let base = ToolProfileListChangedNotificationReadback {
+        source_of_truth: "RMCP peer.notify_tool_list_changed() acceptance into the session worker/cache; client refresh verdict is session_registry last_tools_list_*",
+        notification_method: "notifications/tools/list_changed",
+        session_id: session_id.to_owned(),
+        visible_tool_set_changed,
+        before_visible_tool_count: before.visible_tool_count,
+        after_visible_tool_count: after.visible_tool_count,
+        before_visible_tool_sha256: before.visible_tool_sha256.clone(),
+        after_visible_tool_sha256: after.visible_tool_sha256.clone(),
+        attempted: false,
+        queued_to_rmcp_session_worker: false,
+        status: "not_needed",
+        emitted_unix_ms: None,
+        error: None,
+        rollback_row_readback: None,
+        rollback_error: None,
+    };
+    if !visible_tool_set_changed {
+        return base;
+    }
+
+    let emitted_unix_ms = unix_ms_now();
+    match request_context.peer.notify_tool_list_changed().await {
+        Ok(()) => ToolProfileListChangedNotificationReadback {
+            attempted: true,
+            queued_to_rmcp_session_worker: true,
+            status: "queued_to_rmcp_session_worker",
+            emitted_unix_ms: Some(emitted_unix_ms),
+            ..base
+        },
+        Err(error) => ToolProfileListChangedNotificationReadback {
+            attempted: true,
+            status: "failed",
+            emitted_unix_ms: Some(emitted_unix_ms),
+            error: Some(error.to_string()),
+            ..base
+        },
+    }
+}
+
+fn tool_profile_visible_tool_set_changed(
+    before: &ToolProfileSnapshot,
+    after: &ToolProfileSnapshot,
+) -> bool {
+    before.visible_tool_sha256 != after.visible_tool_sha256
+        || before.visible_tool_count != after.visible_tool_count
+}
+
+fn tool_profile_list_changed_notification_error(
+    session_id: &str,
+    readback: &ToolProfileListChangedNotificationReadback,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "tool_profile_set changed the visible MCP tool surface for session {session_id}, but notifications/tools/list_changed was not queued"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PROFILE_LIST_CHANGED_NOTIFY_FAILED,
+            "session_id": session_id,
+            "notification_method": readback.notification_method,
+            "notification_status": readback.status,
+            "notification_error": readback.error,
+            "before_visible_tool_count": readback.before_visible_tool_count,
+            "after_visible_tool_count": readback.after_visible_tool_count,
+            "before_visible_tool_sha256": readback.before_visible_tool_sha256,
+            "after_visible_tool_sha256": readback.after_visible_tool_sha256,
+            "source_of_truth": readback.source_of_truth,
+            "rollback_profile": readback
+                .rollback_row_readback
+                .as_ref()
+                .map(|row| row.record.profile.as_str()),
+            "rollback_error": readback.rollback_error,
+            "resolution": "keep the prior profile row active, repair notifications/tools/list_changed queueing, then re-run tools/list and verify session_registry last_tools_list_*",
+        })),
+    )
+}
+
+fn call_tool_result_value(result: &CallToolResult) -> Value {
+    if let Some(value) = &result.structured_content {
+        return value.clone();
+    }
+    let text = result
+        .content
+        .iter()
+        .filter_map(content_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&text).unwrap_or(Value::String(text))
+    }
+}
+
+fn content_text(content: &Content) -> Option<String> {
+    content.as_text().map(|text| text.text.clone())
 }
 
 impl SynapseService {
@@ -489,6 +788,29 @@ impl SynapseService {
         }
         sort_tools_for_profile(&mut tools, snapshot.profile);
         Ok(tools)
+    }
+
+    pub(crate) fn record_tools_list_surface_readback(
+        &self,
+        session_id: &str,
+        tools: &[Tool],
+    ) -> Result<(), ErrorData> {
+        let visible_tool_names: Vec<String> =
+            tools.iter().map(|tool| tool.name.to_string()).collect();
+        let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
+        let mut registry = self.session_registry_ref().lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session registry lock poisoned while recording tools/list surface readback",
+            )
+        })?;
+        registry.record_tools_list_surface(
+            session_id,
+            visible_tool_names.len(),
+            visible_tool_sha256,
+            super::session_registry::unix_time_ms_now(),
+        );
+        Ok(())
     }
 
     pub(crate) fn tool_profile_snapshot(
@@ -515,6 +837,12 @@ impl SynapseService {
         };
         let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
         let denied_break_glass_tools = denied_break_glass_tools(&visible_tool_names);
+        let client_tools_list_readback = match (session_id, policy_row.as_ref()) {
+            (Some(session_id), Some(row)) => {
+                Some(self.client_tools_list_readback_for_profile(session_id, row)?)
+            }
+            _ => None,
+        };
         Ok(ToolProfileSnapshot {
             source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
             session_id: session_id.map(ToOwned::to_owned),
@@ -527,6 +855,7 @@ impl SynapseService {
             visible_tool_names,
             denied_break_glass_tools,
             policy_row,
+            client_tools_list_readback,
         })
     }
 
@@ -650,6 +979,63 @@ impl SynapseService {
             .and_then(|registry| registry.agent_kind_for(session_id))
             .as_deref()
             == Some("local-model")
+    }
+
+    fn client_tools_list_readback_for_profile(
+        &self,
+        session_id: &str,
+        row: &ToolProfileRowReadback,
+    ) -> Result<ToolProfileClientToolsListReadback, ErrorData> {
+        let registry_read = {
+            let registry = self.session_registry_ref().lock().map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned while reading tools/list surface readback",
+                )
+            })?;
+            registry.read(session_id, super::session_registry::unix_time_ms_now())
+        };
+        let registry_row_present = registry_read.is_some();
+        let last_tools_list_unix_ms = registry_read
+            .as_ref()
+            .and_then(|read| read.last_tools_list_unix_ms);
+        let last_tools_list_visible_tool_count = registry_read
+            .as_ref()
+            .and_then(|read| read.last_tools_list_visible_tool_count);
+        let last_tools_list_visible_tool_sha256 = registry_read
+            .as_ref()
+            .and_then(|read| read.last_tools_list_visible_tool_sha256.clone());
+        let observed_after_profile_write = last_tools_list_unix_ms
+            .is_some_and(|listed_at| listed_at >= row.record.stored_at_unix_ms);
+        let current_surface_observed_after_profile_write = observed_after_profile_write
+            && last_tools_list_visible_tool_count == Some(row.record.allowed_tool_count)
+            && last_tools_list_visible_tool_sha256.as_deref()
+                == Some(row.record.allowed_tool_sha256.as_str());
+        let status = if !registry_row_present {
+            "no_session_registry_row"
+        } else if last_tools_list_unix_ms.is_none() {
+            "no_tools_list_observed_for_session"
+        } else if current_surface_observed_after_profile_write {
+            "current_surface_observed_after_profile_write"
+        } else if observed_after_profile_write {
+            "tools_list_observed_after_profile_write_but_surface_mismatch"
+        } else {
+            "stale_tools_list_observed_before_profile_write"
+        };
+        Ok(ToolProfileClientToolsListReadback {
+            source_of_truth: "session_registry last_tools_list_* compared to CF_SESSIONS mcp/tool-profile/v1/<session_id>",
+            session_id: session_id.to_owned(),
+            profile_stored_at_unix_ms: row.record.stored_at_unix_ms,
+            profile_allowed_tool_count: row.record.allowed_tool_count,
+            profile_allowed_tool_sha256: row.record.allowed_tool_sha256.clone(),
+            registry_row_present,
+            last_tools_list_unix_ms,
+            last_tools_list_visible_tool_count,
+            last_tools_list_visible_tool_sha256,
+            observed_after_profile_write,
+            current_surface_observed_after_profile_write,
+            status,
+        })
     }
 
     fn read_tool_profile_assignment(
@@ -1011,6 +1397,7 @@ mod tests {
                 "cdp_open_tab",
                 "health",
                 "session_list",
+                "tool_profile_call",
                 "tool_profile_set",
                 "tool_profile_status",
             ]
@@ -1020,11 +1407,33 @@ mod tests {
         names
     }
 
+    fn snapshot_with_visible_surface(
+        profile: ToolProfileKind,
+        visible_tool_count: usize,
+        visible_tool_sha256: &str,
+    ) -> ToolProfileSnapshot {
+        ToolProfileSnapshot {
+            source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
+            session_id: Some("s1".to_owned()),
+            profile,
+            profile_label: profile.label(),
+            source: "test".to_owned(),
+            implementation_tool_count: 147,
+            visible_tool_count,
+            visible_tool_sha256: visible_tool_sha256.to_owned(),
+            visible_tool_names: Vec::new(),
+            denied_break_glass_tools: Vec::new(),
+            policy_row: None,
+            client_tools_list_readback: None,
+        }
+    }
+
     #[test]
     fn normal_profile_hides_foreground_primitives() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::NormalAgent, &names());
         assert!(visible.contains(&"act_run_shell".to_owned()));
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
+        assert!(visible.contains(&"tool_profile_call".to_owned()));
         assert!(visible.contains(&"tool_profile_set".to_owned()));
         assert!(!visible.contains(&"act_click".to_owned()));
         assert!(!visible.contains(&"act_type".to_owned()));
@@ -1036,6 +1445,7 @@ mod tests {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BrowserControl, &names());
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"session_list".to_owned()));
+        assert!(visible.contains(&"tool_profile_call".to_owned()));
         assert!(!visible.contains(&"act_run_shell".to_owned()));
         assert!(!visible.contains(&"act_click".to_owned()));
     }
@@ -1047,6 +1457,128 @@ mod tests {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BreakGlass, &names());
         assert_eq!(visible, expected);
         assert!(denied_break_glass_tools(&visible).is_empty());
+    }
+
+    #[test]
+    fn tool_profile_surface_change_uses_visible_count_and_hash() {
+        let before = snapshot_with_visible_surface(ToolProfileKind::NormalAgent, 85, "sha256:a");
+        let same = snapshot_with_visible_surface(ToolProfileKind::NormalAgent, 85, "sha256:a");
+        let count_changed =
+            snapshot_with_visible_surface(ToolProfileKind::BreakGlass, 147, "sha256:a");
+        let hash_changed =
+            snapshot_with_visible_surface(ToolProfileKind::BreakGlass, 85, "sha256:b");
+
+        assert!(!tool_profile_visible_tool_set_changed(&before, &same));
+        assert!(tool_profile_visible_tool_set_changed(
+            &before,
+            &count_changed
+        ));
+        assert!(tool_profile_visible_tool_set_changed(
+            &before,
+            &hash_changed
+        ));
+    }
+
+    #[test]
+    fn tool_profile_list_changed_failure_has_structured_error_code() {
+        let readback = ToolProfileListChangedNotificationReadback {
+            source_of_truth: "RMCP peer.notify_tool_list_changed() acceptance into the session worker/cache; client refresh verdict is session_registry last_tools_list_*",
+            notification_method: "notifications/tools/list_changed",
+            session_id: "s1".to_owned(),
+            visible_tool_set_changed: true,
+            before_visible_tool_count: 85,
+            after_visible_tool_count: 147,
+            before_visible_tool_sha256: "sha256:before".to_owned(),
+            after_visible_tool_sha256: "sha256:after".to_owned(),
+            attempted: true,
+            queued_to_rmcp_session_worker: false,
+            status: "failed",
+            emitted_unix_ms: Some(1_000),
+            error: Some("transport closed".to_owned()),
+            rollback_row_readback: None,
+            rollback_error: None,
+        };
+        let error = tool_profile_list_changed_notification_error("s1", &readback);
+        let data = error.data.as_ref().expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::TOOL_PROFILE_LIST_CHANGED_NOTIFY_FAILED)
+        );
+        assert_eq!(
+            data.get("notification_method").and_then(Value::as_str),
+            Some("notifications/tools/list_changed")
+        );
+        assert_eq!(
+            data.get("after_visible_tool_count").and_then(Value::as_u64),
+            Some(147)
+        );
+    }
+
+    #[test]
+    fn tool_profile_snapshot_reports_tools_list_refresh_status() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let session_id = "issue1020-refresh-status-session";
+        seed_session_client(&service, session_id, "codex-cli");
+        let row = service
+            .write_tool_profile_assignment(
+                session_id,
+                ToolProfileKind::BreakGlass,
+                "test_break_glass",
+                Some("issue1020 refresh status".to_owned()),
+                Some(session_id.to_owned()),
+            )
+            .expect("write profile row");
+
+        {
+            let mut registry = service
+                .session_registry_ref()
+                .lock()
+                .expect("session registry lock");
+            registry.record_tools_list_surface(
+                session_id,
+                row.record.allowed_tool_count,
+                row.record.allowed_tool_sha256.clone(),
+                row.record.stored_at_unix_ms.saturating_sub(1),
+            );
+        }
+        let stale = service
+            .tool_profile_snapshot(Some(session_id))
+            .expect("snapshot");
+        let stale_readback = stale
+            .client_tools_list_readback
+            .as_ref()
+            .expect("client readback");
+        assert_eq!(
+            stale_readback.status,
+            "stale_tools_list_observed_before_profile_write"
+        );
+        assert!(!stale_readback.current_surface_observed_after_profile_write);
+
+        {
+            let mut registry = service
+                .session_registry_ref()
+                .lock()
+                .expect("session registry lock");
+            registry.record_tools_list_surface(
+                session_id,
+                row.record.allowed_tool_count,
+                row.record.allowed_tool_sha256.clone(),
+                row.record.stored_at_unix_ms,
+            );
+        }
+        let current = service
+            .tool_profile_snapshot(Some(session_id))
+            .expect("snapshot");
+        let current_readback = current
+            .client_tools_list_readback
+            .as_ref()
+            .expect("client readback");
+        assert_eq!(
+            current_readback.status,
+            "current_surface_observed_after_profile_write"
+        );
+        assert!(current_readback.current_surface_observed_after_profile_write);
     }
 
     #[test]
@@ -1443,8 +1975,7 @@ mod tests {
             })
         };
 
-        let openai_tools: Vec<serde_json::Value> =
-            tools.iter().map(openai_tool_from_mcp).collect();
+        let openai_tools: Vec<serde_json::Value> = tools.iter().map(openai_tool_from_mcp).collect();
 
         // The actual `tools` field of the chat-completion request body.
         let openai_tools_json =
