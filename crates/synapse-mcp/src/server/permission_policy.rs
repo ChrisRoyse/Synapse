@@ -293,6 +293,10 @@ const SAFE_MCP_TOOLS: &[&str] = &[
     "get_target",
     "health",
     "agent_query",
+    // Asking the operator a question is the human-in-the-loop itself, not a
+    // hazardous action — it must not be double-gated by the permission gate
+    // (#1028). The answer flows back through the agent_question approval row.
+    "agent_ask_operator",
     "agent_inbox",
     "agent_receipts",
     "session_status",

@@ -125,6 +125,16 @@ pub struct ApprovalGateParams {
     pub spawn_id: Option<String>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAskOperatorParams {
+    /// The question to put to the human operator. Required, non-empty.
+    pub question: String,
+    /// Spawn id of the asking agent, for attribution (see `ApprovalGateParams`).
+    #[serde(default)]
+    pub spawn_id: Option<String>,
+}
+
 #[tool_router(router = permission_gate_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
@@ -168,6 +178,34 @@ impl SynapseService {
             spawn_id.as_deref(),
         )
         .await
+    }
+
+    #[tool(
+        description = "Ask the human operator a question and BLOCK until they answer (#1028). Creates a needs-input item in the fleet approval inbox; the operator's typed answer is returned as {\"answered\":true,\"operator_response\":\"…\"}. If the operator declines or no answer arrives before the deadline, you receive {\"answered\":false,…} with the reason and must proceed without it or stop. Use ONLY when you genuinely need operator input to continue — not for status updates."
+    )]
+    pub async fn agent_ask_operator(
+        &self,
+        params: Parameters<AgentAskOperatorParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = params.0;
+        let question = params.question.trim();
+        if question.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "agent_ask_operator requires a non-empty question",
+            ));
+        }
+        self.require_m3_permissions(
+            "agent_ask_operator",
+            &required([Permission::ReadStorage, Permission::WriteStorage]),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let spawn_id =
+            header_value(&request_context, SPAWN_ID_HEADER).or(params.spawn_id.clone());
+        self.run_question_gate(question, &by_session, spawn_id.as_deref())
+            .await
     }
 }
 
@@ -213,6 +251,92 @@ impl SynapseService {
         self.block_for_decision(&db, &approval_id, input, now).await
     }
 
+    /// #1028 ask-operator path: create a Pending `AgentQuestion` row (a
+    /// needs-input item in the fleet inbox) and BLOCK until the operator answers
+    /// (Accept + response), declines (Decline + note), or the deadline elapses.
+    /// Returns the operator's answer to the still-running agent as its tool
+    /// result — it never executes a tool. Fail-closed: a storage error is a loud
+    /// MCP error, never a fabricated answer.
+    pub(crate) async fn run_question_gate(
+        &self,
+        question: &str,
+        by_session: &str,
+        spawn_id: Option<&str>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let db = self.m3_storage()?;
+        let request = build_question_request(question, spawn_id)?;
+        let created = approvals::request_approval(&db, &request, by_session)?;
+        let approval_id = created.item.approval_id.clone();
+        tracing::warn!(
+            code = "AGENT_QUESTION_PENDING",
+            approval_id = %approval_id,
+            spawn_id = ?spawn_id,
+            "agent_ask_operator is blocking on a human answer"
+        );
+        self.block_for_question(&db, &approval_id).await
+    }
+
+    async fn block_for_question(
+        &self,
+        db: &Arc<synapse_storage::Db>,
+        approval_id: &str,
+    ) -> Result<CallToolResult, ErrorData> {
+        let notify = register_waiter(approval_id);
+        let deadline = Instant::now() + gate_timeout();
+        let result = loop {
+            let item = approvals::get_approval(db, approval_id)?
+                .map(|queued| queued.item)
+                .ok_or_else(|| {
+                    mcp_internal(format!(
+                        "agent_ask_operator approval row {approval_id} vanished while blocked"
+                    ))
+                })?;
+            match item.status {
+                ApprovalStatus::Accepted => {
+                    // The operator answered; deliver the exact text back.
+                    let answer = item.operator_response.clone().unwrap_or_default();
+                    break Ok(question_answered_result(&answer));
+                }
+                ApprovalStatus::Declined | ApprovalStatus::Ignored => {
+                    let message = item
+                        .decision_note
+                        .clone()
+                        .unwrap_or_else(|| "Operator declined to answer.".to_owned());
+                    break Ok(question_declined_result(&message));
+                }
+                ApprovalStatus::Pending | ApprovalStatus::Snoozed => {}
+            }
+            if Instant::now() >= deadline {
+                let message =
+                    "No operator answer before the deadline; proceeding without one.".to_owned();
+                let decline = ApprovalDecideParams {
+                    approval_id: approval_id.to_owned(),
+                    decision: ApprovalDecision::Decline,
+                    note: Some(message.clone()),
+                    snooze_ms: None,
+                    edited_args: None,
+                    response: None,
+                };
+                if let Err(error) =
+                    approvals::decide_approval(db, &decline, "agent_question_timeout")
+                {
+                    tracing::error!(
+                        code = "AGENT_QUESTION_TIMEOUT_DECLINE_FAILED",
+                        approval_id = %approval_id,
+                        detail = %error.message,
+                        "agent_ask_operator could not record its timeout decline; returning unanswered anyway"
+                    );
+                }
+                break Ok(question_declined_result(&message));
+            }
+            tokio::select! {
+                () = notify.notified() => {}
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+        };
+        unregister_waiter(approval_id);
+        result
+    }
 
     async fn block_for_decision(
         &self,
