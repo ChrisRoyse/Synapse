@@ -2,6 +2,7 @@
 
 mod cdp;
 mod cdp_action;
+mod cdp_console;
 mod cdp_dom;
 mod error;
 mod events;
@@ -17,6 +18,7 @@ pub use cdp::*;
 pub use cdp_action::*;
 #[cfg(windows)]
 pub use cdp_action::{CdpMouseStrokePoint, cdp_mouse_stroke_target};
+pub use cdp_console::*;
 pub use cdp_dom::*;
 pub use error::*;
 pub use events::*;

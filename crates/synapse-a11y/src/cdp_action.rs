@@ -2973,7 +2973,7 @@ async fn get_page_with_discovery(
         })
 }
 
-async fn get_target_page_with_discovery(
+pub(crate) async fn get_target_page_with_discovery(
     browser: &chromiumoxide::Browser,
     target_id: &str,
 ) -> A11yResult<chromiumoxide::Page> {

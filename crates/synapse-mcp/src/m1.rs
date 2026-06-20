@@ -1158,6 +1158,101 @@ pub struct BrowserContentResponse {
     pub required_foreground: bool,
 }
 
+/// Parameters for `browser_console_messages` (#1091/#1092/#1093/#1094): list the
+/// console output + page errors captured from the calling session's owned CDP
+/// page target. The first call arms a persistent per-target capture; subsequent
+/// calls read the bounded buffer with optional filters and delta cursoring.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserConsoleMessagesParams {
+    /// CDP TargetID to read. Defaults to the active session CDP target. Must be
+    /// owned by this session; the human foreground tab is never an implicit
+    /// fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Return only entries with `seq` strictly greater than this cursor (delta
+    /// semantics). Pass the prior response's `next_cursor` to poll incrementally.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// Exact level filter (case-insensitive): `log`, `info`, `warning`, `error`,
+    /// `debug`, `trace`, `verbose`, …
+    #[serde(default)]
+    pub level: Option<String>,
+    /// Exact source-class filter: `console-api`, `page-error`,
+    /// `unhandled-rejection`, or `browser-log`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Case-insensitive substring filter on the entry display text.
+    #[serde(default)]
+    pub text_contains: Option<String>,
+    /// Maximum entries to return (default 200). Entries are returned oldest-first
+    /// after the cursor.
+    #[serde(default)]
+    pub max_messages: Option<usize>,
+}
+
+/// One captured console / page-error / browser-log record.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConsoleMessage {
+    /// Monotonic per-target sequence number; the cursor for delta reads.
+    pub seq: u64,
+    /// Origin class: `console-api`, `page-error`, `unhandled-rejection`, or
+    /// `browser-log`.
+    pub source: String,
+    /// Severity / call type string (`log`, `warning`, `error`, `verbose`, …).
+    pub level: String,
+    /// Rendered, space-joined display text (the args, or the exception message).
+    pub text: String,
+    /// Structured rendered arguments (primitives as JSON; objects/arrays from
+    /// their CDP preview — never `[object Object]`). Empty for page errors.
+    pub args: Vec<serde_json::Value>,
+    /// Source URL of the call / error, when CDP reports a location.
+    pub url: Option<String>,
+    /// 1-based source line, when known.
+    pub line: Option<u32>,
+    /// 1-based source column, when known.
+    pub column: Option<u32>,
+    /// Formatted stack trace, when known.
+    pub stack: Option<String>,
+    /// `Log.entryAdded` sub-source (`network`, `security`, …); null otherwise.
+    pub category: Option<String>,
+    /// Event timestamp, milliseconds since the Unix epoch.
+    pub timestamp_ms: f64,
+}
+
+/// Response for `browser_console_messages`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserConsoleMessagesResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    /// `true` if this call established the capture; `false` if it reused a live
+    /// one. A freshly-armed target only captures messages emitted after arming.
+    pub newly_armed: bool,
+    /// When capture for this target was armed (Unix ms).
+    pub armed_at_unix_ms: f64,
+    /// Filtered, cursor-delimited entries.
+    pub messages: Vec<ConsoleMessage>,
+    /// Highest `seq` currently buffered — pass back as `since_seq` next call.
+    pub next_cursor: u64,
+    /// Entries returned after filtering.
+    pub returned: usize,
+    /// Entries currently held in the ring buffer (pre-filter).
+    pub total_buffered: usize,
+    /// Entries evicted over the target's lifetime because the buffer was full.
+    pub dropped: u64,
+    pub readback_backend: String,
+    pub required_foreground: bool,
+}
+
 /// Parameters for `browser_inspect` (#1160/#1161/#1162/#1163): typed
 /// introspection of a single DOM element.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]

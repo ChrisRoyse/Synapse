@@ -1,14 +1,15 @@
 use super::{
-    BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
-    BrowserInspectParams, BrowserInspectResponse, BrowserLayoutRelation, BrowserLocateEngine,
-    BrowserLocateParams, BrowserLocateResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
+    BrowserConsoleMessagesParams, BrowserConsoleMessagesResponse, BrowserContentParams,
+    BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse, BrowserInspectParams,
+    BrowserInspectResponse, BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams,
+    BrowserLocateResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
     CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo,
     CdpBridgeHostReadback, CdpBridgeReloadAckReadback, CdpBridgeReloadParams,
     CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse, CdpLargestContentfulPaintInfo,
     CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams,
     CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
-    CdpTargetInfoResponse, CdpTargetOwner, ElementInspection, ErrorData, FindParams, FindResponse,
-    Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
+    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
+    FindParams, FindResponse, Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
     HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters, ReadTextParams, SessionTarget,
     SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
     SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
@@ -1774,6 +1775,76 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_content_impl(&session_id, window_hwnd, &cdp_target_id, max_bytes)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "List console output and uncaught page errors captured from the calling session's owned background browser tab via raw CDP (the Playwright page.on('console')/page.on('pageerror') analogue). A persistent per-target listener is armed on first call: it enables the CDP Runtime + Log domains and buffers Runtime.consoleAPICalled (console.log/info/warn/error/debug/trace), Runtime.exceptionThrown (uncaught throws AND unhandled promise rejections, recorded distinctly via the `source` field), and Log.entryAdded (browser-internal network/security/deprecation logs) into a bounded ring buffer. Object/array arguments are reconstructed from their CDP preview into structured JSON (never [object Object]); stacks and source url:line:col are preserved. Because capture starts at arm time and Chrome does not replay console history, a target only captures messages emitted after its first call (or after it was opened with cdp_open_tab, which arms it eagerly). Filter by level/source/text_contains; poll incrementally with since_seq (pass back next_cursor). Requires an active session CDP target or an explicit cdp_target_id owned by this session; never the human foreground tab. Read-only, background-safe: never activates the tab or uses OS foreground input. Raw CDP only; the debugger-free normal Chrome bridge fails closed because it never attaches the debugger."
+    )]
+    pub async fn browser_console_messages(
+        &self,
+        params: Parameters<BrowserConsoleMessagesParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserConsoleMessagesResponse>, ErrorData> {
+        const TOOL: &str = "browser_console_messages";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_console_messages"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        if let Some(target_id) = params.0.cdp_target_id.as_deref() {
+            validate_cdp_target_id(target_id)?;
+        }
+        let max_messages = params
+            .0
+            .max_messages
+            .unwrap_or(DEFAULT_BROWSER_CONSOLE_MESSAGES)
+            .min(MAX_BROWSER_CONSOLE_MESSAGES);
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "since_seq": params.0.since_seq,
+            "level": params.0.level,
+            "source": params.0.source,
+            "max_messages": max_messages,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "since_seq": params.0.since_seq,
+            "level": params.0.level,
+            "source": params.0.source,
+            "max_messages": max_messages,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_console_messages_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                &params.0,
+                max_messages,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -3652,6 +3723,113 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_console_messages_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        params: &BrowserConsoleMessagesParams,
+        max_messages: usize,
+    ) -> Result<BrowserConsoleMessagesResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(
+                "browser_console_messages",
+                window_hwnd,
+            ));
+        };
+        // Arm (idempotent) the persistent per-target console capture. The first
+        // call establishes the listener; later calls reuse the live one.
+        let status = synapse_a11y::console_capture_ensure(
+            &endpoint,
+            cdp_target_id,
+            synapse_a11y::DEFAULT_CONSOLE_BUFFER_CAPACITY,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser_console_messages capture arm failed: {error}"),
+            )
+        })?;
+        // Independent page-context read-back (FSV source-of-truth correlation):
+        // the url/title/readyState the messages were captured against.
+        let state =
+            synapse_a11y::cdp_evaluate_expression(&endpoint, cdp_target_id, "null", false, true)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("browser_console_messages page state read-back failed: {error}"),
+                    )
+                })?;
+        let filter = synapse_a11y::ConsoleReadFilter {
+            since_seq: params.since_seq,
+            level: params.level.as_deref(),
+            source: params.source.as_deref(),
+            text_contains: params.text_contains.as_deref(),
+            max: max_messages,
+        };
+        let read = synapse_a11y::console_capture_read(cdp_target_id, &filter).ok_or_else(|| {
+            mcp_error(
+                error_codes::OBSERVE_INTERNAL,
+                format!(
+                    "browser_console_messages: capture for target {cdp_target_id} is not armed immediately after ensure succeeded"
+                ),
+            )
+        })?;
+        let messages: Vec<ConsoleMessage> = read
+            .entries
+            .into_iter()
+            .map(console_message_from_entry)
+            .collect();
+        tracing::info!(
+            code = "CDP_BACKGROUND_CONSOLE",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %state.target_id,
+            newly_armed = status.newly_armed,
+            returned = read.returned,
+            total_buffered = read.total_buffered,
+            dropped = read.dropped,
+            target_url = %state.url,
+            "readback=Runtime.consoleAPICalled+Runtime.exceptionThrown+Log.entryAdded outcome=console_messages_read"
+        );
+        Ok(BrowserConsoleMessagesResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: state.target_id,
+            newly_armed: status.newly_armed,
+            armed_at_unix_ms: status.armed_at_unix_ms,
+            messages,
+            next_cursor: read.next_cursor,
+            returned: read.returned,
+            total_buffered: read.total_buffered,
+            dropped: read.dropped,
+            readback_backend: "Runtime.consoleAPICalled+Runtime.exceptionThrown+Log.entryAdded"
+                .to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_console_messages_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _params: &BrowserConsoleMessagesParams,
+        _max_messages: usize,
+    ) -> Result<BrowserConsoleMessagesResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_console_messages is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_inspect_impl(
         &self,
         session_id: &str,
@@ -4720,6 +4898,28 @@ fn validate_cdp_target_id(cdp_target_id: &str) -> Result<(), ErrorData> {
         ));
     }
     Ok(())
+}
+
+/// Default and ceiling on `browser_console_messages` entries returned per call.
+const DEFAULT_BROWSER_CONSOLE_MESSAGES: usize = 200;
+const MAX_BROWSER_CONSOLE_MESSAGES: usize = 5_000;
+
+/// Projects a captured [`synapse_a11y::ConsoleEntry`] into the MCP response shape.
+#[cfg(windows)]
+fn console_message_from_entry(entry: synapse_a11y::ConsoleEntry) -> ConsoleMessage {
+    ConsoleMessage {
+        seq: entry.seq,
+        source: entry.source.to_owned(),
+        level: entry.level,
+        text: entry.text,
+        args: entry.args,
+        url: entry.url,
+        line: entry.line,
+        column: entry.column,
+        stack: entry.stack,
+        category: entry.category,
+        timestamp_ms: entry.timestamp_ms,
+    }
 }
 
 /// Upper bound on the evaluated expression size. Generous enough for injected
