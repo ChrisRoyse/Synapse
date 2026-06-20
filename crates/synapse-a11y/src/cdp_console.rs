@@ -93,8 +93,10 @@ pub struct ConsoleEntry {
 #[derive(Clone, Debug, Serialize)]
 pub struct ConsoleReadResult {
     pub entries: Vec<ConsoleEntry>,
-    /// Highest `seq` currently buffered — pass back as `since_seq` next call to
-    /// receive only newer entries. Stable even when the returned slice is empty.
+    /// Exclusive upper bound of buffered sequence numbers (the seq the next
+    /// captured entry will receive). Pass back as `since_seq` next call to
+    /// receive only entries added since this read. Stable even when the returned
+    /// slice is empty.
     pub next_cursor: u64,
     /// Entries returned after filtering + capping.
     pub returned: usize,
@@ -121,7 +123,8 @@ pub struct ConsoleCaptureStatus {
 /// Optional filters for [`console_capture_read`].
 #[derive(Clone, Debug, Default)]
 pub struct ConsoleReadFilter<'a> {
-    /// Only entries strictly newer than this cursor (delta semantics).
+    /// Only entries with `seq >= since_seq` (delta semantics). Pass the prior
+    /// read's `next_cursor` to receive only entries added since.
     pub since_seq: Option<u64>,
     /// Exact level match (case-insensitive), e.g. `error`, `warning`.
     pub level: Option<&'a str>,
@@ -371,7 +374,7 @@ pub fn console_capture_read(
     let entries: Vec<ConsoleEntry> = buffer
         .entries
         .iter()
-        .filter(|e| filter.since_seq.is_none_or(|since| e.seq > since))
+        .filter(|e| filter.since_seq.is_none_or(|since| e.seq >= since))
         .filter(|e| {
             filter
                 .level
@@ -833,8 +836,10 @@ mod tests {
         buf.push(entry("first log", "log", "console-api"));
         buf.push(entry("an error", "error", "console-api"));
         buf.push(entry("boom", "error", "page-error"));
-        // Manual filter pass mirroring console_capture_read's predicate chain.
-        let after_first: Vec<&ConsoleEntry> = buf.entries.iter().filter(|e| e.seq > 0).collect();
+        // Manual filter pass mirroring console_capture_read's predicate chain:
+        // since_seq=1 means "seq >= 1", returning the two entries after the
+        // zeroth (delta cursor semantics).
+        let after_first: Vec<&ConsoleEntry> = buf.entries.iter().filter(|e| e.seq >= 1).collect();
         assert_eq!(after_first.len(), 2);
         let only_errors: Vec<&ConsoleEntry> = buf
             .entries

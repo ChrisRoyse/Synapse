@@ -1174,8 +1174,8 @@ pub struct BrowserConsoleMessagesParams {
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
     pub window_hwnd: Option<i64>,
-    /// Return only entries with `seq` strictly greater than this cursor (delta
-    /// semantics). Pass the prior response's `next_cursor` to poll incrementally.
+    /// Return only entries with `seq >= since_seq` (delta semantics). Pass the
+    /// prior response's `next_cursor` to receive only entries added since.
     #[serde(default)]
     pub since_seq: Option<u64>,
     /// Exact level filter (case-insensitive): `log`, `info`, `warning`, `error`,
