@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-file-upload-v2";
-const BRIDGE_BUILD_SHA256 = "6a557863fa6472214e3c2f521a52079209c9a7d23f209f49b7c1647cc48e0b95";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-24-mousedown-click-v3";
+const BRIDGE_BUILD_SHA256 = "2c6eaf29f67712e0f4fda80921698ba1f39f1ca2df1c9fb6a2d7bcfea55549fb";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 let captureVisibleTabQueue = Promise.resolve();
@@ -16583,6 +16583,22 @@ async function performDomActionInPage(request) {
     let readback;
     try {
       if (!needsSyntheticEvents && typeof element.click === "function") {
+        // A real left click always emits the pointer/mouse press-release sequence
+        // before activation. Many components (e.g. react-select's control, which
+        // opens on `mousedown`, not `click`) never respond to a bare
+        // element.click() that fires only a `click` event. Emit the real
+        // pointerdown/mousedown/pointerup/mouseup sequence first, then use the
+        // native click() for trusted activation defaults (checkbox/link/form
+        // submit). This is a strict superset of the prior behavior. (#1311)
+        const point = elementClickPoint(element, null);
+        dispatchPointerLikeEvent(element, "pointerdown", point, button, modifiers, 1, true);
+        events.push("pointerdown");
+        dispatchMouseLikeEvent(element, "mousedown", point, button, modifiers, 1, true);
+        events.push("mousedown");
+        dispatchPointerLikeEvent(element, "pointerup", point, button, modifiers, 1, false);
+        events.push("pointerup");
+        dispatchMouseLikeEvent(element, "mouseup", point, button, modifiers, 1, false);
+        events.push("mouseup");
         element.click();
         events.push("click");
         readback = {
@@ -16591,7 +16607,8 @@ async function performDomActionInPage(request) {
           modifiers,
           position: null,
           activation_event: "click",
-          native_click_method: true
+          native_click_method: true,
+          synthetic_press_sequence: true
         };
       } else {
         const point = elementClickPoint(element, options?.position || null);
