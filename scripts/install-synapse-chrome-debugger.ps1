@@ -772,9 +772,21 @@ function Test-SynapseChromeBridgeProfileRow {
         $missingActiveApiPermissions = @($requiredApiPermissions | Where-Object {
                 $activeApiPermissions -notcontains $_
             })
-        $ready = $manifestMatches -and
-            ($disableReasons.Count -eq 0) -and
+        # enabled_and_permissioned is PATH-INDEPENDENT: it proves the loaded extension
+        # is enabled (no disable_reasons) and holds every required API permission,
+        # without requiring its recorded load path to equal the latest stable dir. The
+        # Synapse bridge extension ID is derived from the manifest key and is therefore
+        # the same regardless of which directory Chrome loaded it from, so a non-stable
+        # path does not make a working bridge any less the Synapse bridge.
+        $enabledAndPermissioned = ($disableReasons.Count -eq 0) -and
             ($missingActiveApiPermissions.Count -eq 0)
+        # manifest_dir_exists confirms the directory Chrome loaded the unpacked
+        # extension from is still present on disk with a manifest. If a prior install's
+        # directory was deleted, the row is stale and a genuine reinstall is required.
+        $manifestDirExists = (-not [string]::IsNullOrWhiteSpace($manifestPath)) -and
+            (Test-Path -LiteralPath $manifestPath -PathType Container) -and
+            (Test-Path -LiteralPath (Join-Path $manifestPath 'manifest.json') -PathType Leaf)
+        $ready = $manifestMatches -and $enabledAndPermissioned
         return [pscustomobject]@{
             installed = $true
             profile = $ProfileName
@@ -782,11 +794,13 @@ function Test-SynapseChromeBridgeProfileRow {
             pref_path = $prefPath
             manifest_path = $manifestPath
             manifest_path_matches = $manifestMatches
+            manifest_dir_exists = $manifestDirExists
             active_api_permissions = $activeApiPermissions
             granted_api_permissions = $grantedApiPermissions
             disable_reasons = $disableReasons
             required_api_permissions = $requiredApiPermissions
             missing_active_api_permissions = $missingActiveApiPermissions
+            enabled_and_permissioned = $enabledAndPermissioned
             ready = $ready
         }
     }
@@ -798,11 +812,13 @@ function Test-SynapseChromeBridgeProfileRow {
         pref_path = $null
         manifest_path = $null
         manifest_path_matches = $false
+        manifest_dir_exists = $false
         active_api_permissions = @()
         granted_api_permissions = @()
         disable_reasons = @()
         required_api_permissions = Get-SynapseChromeBridgeManifestApiPermissions -ExtensionDir $ExtensionDir
         missing_active_api_permissions = Get-SynapseChromeBridgeManifestApiPermissions -ExtensionDir $ExtensionDir
+        enabled_and_permissioned = $false
         ready = $false
     }
 }
@@ -1099,6 +1115,38 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         $missing = if ($before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $before.missing_active_api_permissions -join ',' }
         $disableReasons = if ($before.disable_reasons.Count -eq 0) { '<none>' } else { $before.disable_reasons -join ',' }
         throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; setup refuses to steal foreground for chrome://extensions repair. Enable/permission the existing extension in the already-open profile or remove it and rerun setup for a first-time Load unpacked install; once a live bridge host exists, setup uses cdp_bridge_reload for code reconvergence."
+    }
+
+    # Same extension ID already loaded, enabled, and fully permissioned, but registered
+    # from a directory other than the current stable dir (e.g. a pre-#1307 repo-checkout
+    # install). The bridge extension ID is derived from the manifest key and is therefore
+    # path-independent: a working same-ID host IS the Synapse bridge no matter which
+    # directory Chrome loaded it from. Chrome cannot relocate an already-loaded unpacked
+    # extension in place — the only ways to change its load directory are re-running
+    # "Load unpacked" (the fragile chrome://extensions UI-Automation path) or a Chrome
+    # relaunch, and there is no supported in-place mechanism for an off-Web-Store
+    # extension. Driving UI Automation to "re-install" a bridge that is already loaded and
+    # healthy is precisely the failure mode that broke the daemon handoff (see #1313), so
+    # we refuse to do it. The stable directory has already been deployed for future
+    # first-time installs; the live daemon reconverges the extension's code in place via
+    # cdp_bridge_reload after handoff, and the post-handoff /health check is the live
+    # source of truth that fails loud if the bridge is not actually serving. We surface
+    # the pending path migration in the readback so health and operators can see that the
+    # bridge is still loaded from a non-stable directory.
+    if ($before.installed -and $before.enabled_and_permissioned -and $before.manifest_dir_exists) {
+        return [pscustomobject]@{
+            attempted = $true
+            changed = $false
+            reason = 'existing_ready_extension_nonstable_path_code_reload_deferred_to_daemon'
+            active_profile = $activeProfile
+            required_foreground = $false
+            bridge_self_reload_command = 'cdp_bridge_reload'
+            path_migration_pending = $true
+            loaded_manifest_path = $before.manifest_path
+            expected_stable_path = $ExtensionDir
+            before = $before
+            after = $before
+        }
     }
 
     Initialize-SynapseChromeBridgeAutoInstallInterop
