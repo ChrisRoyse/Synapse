@@ -191,6 +191,9 @@ pub struct BrowserAssertLocator {
     pub limit: Option<usize>,
 }
 
+// The `To`-prefix is intentional domain naming: these mirror Playwright's
+// assertion comparison operators (to_be_visible, to_have_text, ...).
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserAssertMatcher {
@@ -1202,7 +1205,7 @@ async fn browser_assert_bridge_poll(
             located.title,
             located.ready_state,
             params,
-        ));
+        )?);
     }
     if located.match_count == 0 {
         return Ok(AssertPoll {
@@ -1246,7 +1249,7 @@ async fn browser_assert_bridge_poll(
             message: format!("{ASSERT_TOOL} locator returned no inspectable element state"),
         });
     };
-    Ok(assert_element_poll(
+    assert_element_poll(
         params,
         AssertElementState {
             tag_name: state.tag_name,
@@ -1262,7 +1265,7 @@ async fn browser_assert_bridge_poll(
         located.url,
         located.title,
         located.ready_state,
-    ))
+    )
 }
 
 #[cfg(windows)]
@@ -1282,7 +1285,7 @@ async fn browser_assert_poll(
             )
         })?;
     if matches!(params.matcher, BrowserAssertMatcher::ToHaveCount) {
-        return Ok(assert_count_poll(&located, params));
+        return Ok(assert_count_poll(&located, params)?);
     }
     if located.match_count == 0 {
         let poll = AssertPoll {
@@ -1374,7 +1377,7 @@ async fn browser_assert_poll(
     let element_id =
         synapse_a11y::cdp_element_id_for_target(window_hwnd, &located.target_id, backend_node_id)
             .to_string();
-    Ok(assert_element_poll(
+    assert_element_poll(
         params,
         state,
         located.match_count,
@@ -1382,7 +1385,7 @@ async fn browser_assert_poll(
         evaluated.url,
         evaluated.title,
         evaluated.ready_state,
-    ))
+    )
 }
 
 #[cfg(windows)]
@@ -1446,7 +1449,7 @@ fn layout_relation_to_a11y(relation: BrowserLayoutRelation) -> synapse_a11y::Cdp
 fn assert_count_poll(
     located: &synapse_a11y::CdpLocateResult,
     params: &NormalizedBrowserAssertParams,
-) -> AssertPoll {
+) -> Result<AssertPoll, ErrorData> {
     assert_count_poll_from_count(
         located.match_count,
         located.url.clone(),
@@ -1462,11 +1465,16 @@ fn assert_count_poll_from_count(
     title: String,
     ready_state: String,
     params: &NormalizedBrowserAssertParams,
-) -> AssertPoll {
-    let expected_count = params.expected_count.expect("validated expected_count");
+) -> Result<AssertPoll, ErrorData> {
+    let expected_count = params.expected_count.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("{ASSERT_TOOL} to_have_count poll missing validated expected_count"),
+        )
+    })?;
     let base_pass = match_count == expected_count;
     let pass = apply_negate(base_pass, params.negate);
-    AssertPoll {
+    Ok(AssertPoll {
         pass,
         url,
         title,
@@ -1476,7 +1484,7 @@ fn assert_count_poll_from_count(
         actual: json!({"count": match_count}),
         expected: json!({"count": expected_count}),
         message: assertion_message(pass, params.negate, "count", match_count, expected_count),
-    }
+    })
 }
 
 fn assert_element_poll(
@@ -1487,7 +1495,7 @@ fn assert_element_poll(
     url: String,
     title: String,
     ready_state: String,
-) -> AssertPoll {
+) -> Result<AssertPoll, ErrorData> {
     let (base_pass, actual, expected, message) = match params.matcher {
         BrowserAssertMatcher::ToBeVisible => {
             let expected = params.expected_bool.unwrap_or(true);
@@ -1538,10 +1546,12 @@ fn assert_element_poll(
             )
         }
         BrowserAssertMatcher::ToHaveText => {
-            let expected_raw = params
-                .expected_text
-                .as_deref()
-                .expect("validated expected_text");
+            let expected_raw = params.expected_text.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{ASSERT_TOOL} to_have_text poll missing validated expected_text"),
+                )
+            })?;
             let actual_text = if params.normalize_whitespace {
                 normalize_whitespace(&state.text)
             } else {
@@ -1569,10 +1579,12 @@ fn assert_element_poll(
             )
         }
         BrowserAssertMatcher::ToHaveValue => {
-            let expected = params
-                .expected_value
-                .as_deref()
-                .expect("validated expected_value");
+            let expected = params.expected_value.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{ASSERT_TOOL} to_have_value poll missing validated expected_value"),
+                )
+            })?;
             let actual = state.value.unwrap_or_default();
             (
                 actual == expected,
@@ -1588,10 +1600,12 @@ fn assert_element_poll(
             )
         }
         BrowserAssertMatcher::ToHaveAttribute => {
-            let attribute = params
-                .attribute_name
-                .as_deref()
-                .expect("validated attribute_name");
+            let attribute = params.attribute_name.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{ASSERT_TOOL} to_have_attribute poll missing validated attribute_name"),
+                )
+            })?;
             let actual = state.attributes.get(attribute).cloned();
             let matched = match params.expected_attribute_value.as_deref() {
                 Some(expected) => actual.as_deref() == Some(expected),
@@ -1615,7 +1629,7 @@ fn assert_element_poll(
         BrowserAssertMatcher::ToHaveCount => unreachable!("count handled before element inspect"),
     };
     let pass = apply_negate(base_pass, params.negate);
-    AssertPoll {
+    Ok(AssertPoll {
         pass,
         url,
         title,
@@ -1625,7 +1639,7 @@ fn assert_element_poll(
         actual,
         expected,
         message,
-    }
+    })
 }
 
 fn apply_negate(pass: bool, negate: bool) -> bool {

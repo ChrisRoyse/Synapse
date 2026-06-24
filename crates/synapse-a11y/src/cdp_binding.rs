@@ -326,8 +326,8 @@ pub async fn binding_capture_remove(
         })?;
         state.active_names.remove(name)
     };
-    if was_active {
-        if let Err(err) = slot
+    if was_active
+        && let Err(err) = slot
             .page
             .execute(RemoveBindingParams::new(name.to_owned()))
             .await
@@ -339,7 +339,6 @@ pub async fn binding_capture_remove(
                 detail: format!("Runtime.removeBinding({name:?}): {err}"),
             });
         }
-    }
     status_from_slot(&slot, name, false, false, was_active)
 }
 

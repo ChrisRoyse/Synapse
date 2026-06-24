@@ -1989,7 +1989,7 @@ async fn locate_via_injected_js(
         let mut resolve = ResolveNodeParams::builder()
             .backend_node_id(BackendNodeId::new(root_backend))
             .object_group(SYNAPSE_LOCATE_OBJECT_GROUP);
-        if let Some(context) = frame_context.clone() {
+        if let Some(context) = frame_context {
             resolve = resolve.execution_context_id(context);
         }
         let resolve = resolve.build();
@@ -2712,6 +2712,10 @@ pub async fn cdp_wait_for_load_state(
     result
 }
 
+// Assembles the load-state wait result from ten independent scalar observations
+// (state, timings, in-flight/network counters) captured at the call site; bundling
+// them into a params struct would only relocate the same fields.
+#[allow(clippy::too_many_arguments)]
 fn cdp_load_state_wait_result(
     target_id: String,
     state: CdpLoadState,

@@ -769,13 +769,12 @@ fn validate_geolocation_optional_range(
 }
 
 fn validate_geolocation_optional_finite(field: &str, value: Option<f64>) -> A11yResult<()> {
-    if let Some(value) = value {
-        if !value.is_finite() {
+    if let Some(value) = value
+        && !value.is_finite() {
             return Err(A11yError::CdpAxtreeFailed {
                 detail: format!("geolocation {field} must be finite, got {value}"),
             });
         }
-    }
     Ok(())
 }
 

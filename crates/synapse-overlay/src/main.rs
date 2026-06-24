@@ -138,8 +138,8 @@ mod tray {
             )?;
             spawn_poll_thread(hwnd, Arc::clone(&app));
             message_loop();
-            let mut data = notify_data(hwnd, "Synapse");
-            let _ = Shell_NotifyIconW(NIM_DELETE, &mut data);
+            let data = notify_data(hwnd, "Synapse");
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
         }
         Ok(())
     }
@@ -213,19 +213,17 @@ mod tray {
             }
             WM_TRAY => {
                 let event = lparam.0 as u32;
-                if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
-                    if let Some(app) = app_from_window(hwnd) {
+                if (event == WM_RBUTTONUP || event == WM_LBUTTONUP)
+                    && let Some(app) = app_from_window(hwnd) {
                         let _ = show_menu(hwnd, app);
                     }
-                }
                 LRESULT(0)
             }
             WM_STATUS => {
-                if let Some(app) = app_from_window(hwnd) {
-                    if let Ok(state) = app.state.lock() {
+                if let Some(app) = app_from_window(hwnd)
+                    && let Ok(state) = app.state.lock() {
                         let _ = add_or_update_icon(hwnd, &state, NIM_MODIFY);
                     }
-                }
                 LRESULT(0)
             }
             WM_COMMAND => {
@@ -313,8 +311,8 @@ mod tray {
         state: &DaemonState,
         action: NOTIFY_ICON_MESSAGE,
     ) -> Result<()> {
-        let mut data = notify_data(hwnd, &state.tip());
-        if !Shell_NotifyIconW(action, &mut data).as_bool() {
+        let data = notify_data(hwnd, &state.tip());
+        if !Shell_NotifyIconW(action, &data).as_bool() {
             bail!("Shell_NotifyIconW failed: {:?}", GetLastError());
         }
         Ok(())

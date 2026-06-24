@@ -2982,7 +2982,7 @@ fn terminal_ws_parse_resize(payload: &[u8]) -> Result<(u16, u16), String> {
         return terminal_ws_validate_size(cols, rows);
     }
     let parts: Vec<&str> = text
-        .split(|ch: char| matches!(ch, 'x' | 'X' | ',' | ' '))
+        .split(['x', 'X', ',', ' '])
         .filter(|part| !part.is_empty())
         .collect();
     if parts.len() != 2 {

@@ -434,30 +434,28 @@ impl RingBuffer {
         seq
     }
 
-    fn entry_for_event(&mut self, request_id: &str) -> usize {
+    fn entry_for_event(&mut self, request_id: &str) -> &mut CdpNetworkEntry {
         let seq = self.reserve_seq();
-        if let Some(index) = self.entries.iter().position(|e| e.request_id == request_id) {
-            if let Some(entry) = self.entries.get_mut(index) {
-                entry.seq = seq;
+        let index = if let Some(index) =
+            self.entries.iter().position(|e| e.request_id == request_id)
+        {
+            index
+        } else {
+            while self.entries.len() >= self.capacity {
+                self.entries.pop_front();
+                self.dropped += 1;
             }
-            return index;
-        }
-
-        while self.entries.len() >= self.capacity {
-            self.entries.pop_front();
-            self.dropped += 1;
-        }
-        self.entries
-            .push_back(CdpNetworkEntry::new(seq, request_id.to_owned()));
-        self.entries.len() - 1
+            self.entries
+                .push_back(CdpNetworkEntry::new(seq, request_id.to_owned()));
+            self.entries.len() - 1
+        };
+        let entry = &mut self.entries[index];
+        entry.seq = seq;
+        entry
     }
 
     fn apply_request_will_be_sent(&mut self, event: &EventRequestWillBeSent) {
-        let index = self.entry_for_event(event.request_id.inner());
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_event inserted or found entry");
+        let entry = self.entry_for_event(event.request_id.inner());
 
         if let Some(redirect) = &event.redirect_response {
             let resource_type = event.r#type.as_ref().map(enum_str);
@@ -492,11 +490,7 @@ impl RingBuffer {
     }
 
     fn apply_response_received(&mut self, event: &EventResponseReceived) {
-        let index = self.entry_for_event(event.request_id.inner());
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_event inserted or found entry");
+        let entry = self.entry_for_event(event.request_id.inner());
         entry.loader_id = Some(event.loader_id.inner().clone());
         entry.frame_id = event.frame_id.as_ref().map(|id| id.inner().clone());
         entry.resource_type = Some(enum_str(&event.r#type));
@@ -515,11 +509,7 @@ impl RingBuffer {
     }
 
     fn apply_loading_finished(&mut self, event: &EventLoadingFinished) {
-        let index = self.entry_for_event(event.request_id.inner());
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_event inserted or found entry");
+        let entry = self.entry_for_event(event.request_id.inner());
         entry.loading_finished = true;
         entry.loading_failed = false;
         entry.finished_timestamp_s = Some(timestamp_s(&event.timestamp));
@@ -527,11 +517,7 @@ impl RingBuffer {
     }
 
     fn apply_loading_failed(&mut self, event: &EventLoadingFailed) {
-        let index = self.entry_for_event(event.request_id.inner());
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_event inserted or found entry");
+        let entry = self.entry_for_event(event.request_id.inner());
         entry.resource_type = Some(enum_str(&event.r#type));
         entry.loading_finished = false;
         entry.loading_failed = true;
@@ -573,30 +559,28 @@ impl WebSocketRingBuffer {
         seq
     }
 
-    fn entry_for_seq(&mut self, request_id: &str, seq: u64) -> usize {
-        if let Some(index) = self.entries.iter().position(|e| e.request_id == request_id) {
-            if let Some(entry) = self.entries.get_mut(index) {
-                entry.seq = seq;
+    fn entry_for_seq(&mut self, request_id: &str, seq: u64) -> &mut CdpWebSocketEntry {
+        let index = if let Some(index) =
+            self.entries.iter().position(|e| e.request_id == request_id)
+        {
+            index
+        } else {
+            while self.entries.len() >= self.capacity {
+                self.entries.pop_front();
+                self.dropped = self.dropped.saturating_add(1);
             }
-            return index;
-        }
-
-        while self.entries.len() >= self.capacity {
-            self.entries.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-        }
-        self.entries
-            .push_back(CdpWebSocketEntry::new(seq, request_id.to_owned()));
-        self.entries.len() - 1
+            self.entries
+                .push_back(CdpWebSocketEntry::new(seq, request_id.to_owned()));
+            self.entries.len() - 1
+        };
+        let entry = &mut self.entries[index];
+        entry.seq = seq;
+        entry
     }
 
     fn apply_created(&mut self, event: &EventWebSocketCreated) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.created = true;
         entry.created_at_unix_ms = Some(now_unix_ms());
         entry.url = Some(event.url.clone());
@@ -610,11 +594,7 @@ impl WebSocketRingBuffer {
 
     fn apply_handshake_request(&mut self, event: &EventWebSocketWillSendHandshakeRequest) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.handshake_request_timestamp_s = Some(timestamp_s(&event.timestamp));
         entry.handshake_request_wall_time_ms = Some(timestamp_s(&event.wall_time) * 1000.0);
         entry.handshake_request_headers = Some(headers_value(&event.request.headers));
@@ -622,11 +602,7 @@ impl WebSocketRingBuffer {
 
     fn apply_handshake_response(&mut self, event: &EventWebSocketHandshakeResponseReceived) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.handshake_response_timestamp_s = Some(timestamp_s(&event.timestamp));
         entry.status = Some(event.response.status);
         entry.status_text = Some(event.response.status_text.clone());
@@ -639,11 +615,7 @@ impl WebSocketRingBuffer {
 
     fn apply_frame_sent(&mut self, event: &EventWebSocketFrameSent) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.sent_frame_count = entry.sent_frame_count.saturating_add(1);
         push_websocket_frame(
             entry,
@@ -658,11 +630,7 @@ impl WebSocketRingBuffer {
 
     fn apply_frame_received(&mut self, event: &EventWebSocketFrameReceived) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.received_frame_count = entry.received_frame_count.saturating_add(1);
         push_websocket_frame(
             entry,
@@ -677,11 +645,7 @@ impl WebSocketRingBuffer {
 
     fn apply_frame_error(&mut self, event: &EventWebSocketFrameError) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.frame_error_count = entry.frame_error_count.saturating_add(1);
         push_websocket_frame(
             entry,
@@ -703,11 +667,7 @@ impl WebSocketRingBuffer {
 
     fn apply_closed(&mut self, event: &EventWebSocketClosed) {
         let seq = self.reserve_seq();
-        let index = self.entry_for_seq(event.request_id.inner(), seq);
-        let entry = self
-            .entries
-            .get_mut(index)
-            .expect("entry_for_seq inserted or found websocket entry");
+        let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.closed = true;
         entry.closed_timestamp_s = Some(timestamp_s(&event.timestamp));
     }
@@ -1900,11 +1860,10 @@ fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRout
     {
         return false;
     }
-    if let Some(resource_type) = rule.resource_type.as_deref() {
-        if !enum_str(&event.resource_type).eq_ignore_ascii_case(resource_type) {
+    if let Some(resource_type) = rule.resource_type.as_deref()
+        && !enum_str(&event.resource_type).eq_ignore_ascii_case(resource_type) {
             return false;
         }
-    }
     true
 }
 
@@ -2070,25 +2029,23 @@ fn validate_fetch_route_fulfill(fulfill: &CdpFetchRouteFulfill) -> A11yResult<()
             detail: "Fetch route fulfill status must be between 100 and 599".to_owned(),
         });
     }
-    if let Some(response_phrase) = fulfill.response_phrase.as_deref() {
-        if response_phrase.contains(['\r', '\n', '\0']) {
+    if let Some(response_phrase) = fulfill.response_phrase.as_deref()
+        && response_phrase.contains(['\r', '\n', '\0']) {
             return Err(A11yError::CdpAttachFailed {
                 detail: "Fetch route response_phrase must not contain control line breaks or NUL"
                     .to_owned(),
             });
         }
-    }
     for (name, value) in &fulfill.headers {
         validate_header_name(name)?;
         validate_header_value(value)?;
     }
-    if let Some(body_base64) = fulfill.body_base64.as_deref() {
-        if body_base64.contains('\0') {
+    if let Some(body_base64) = fulfill.body_base64.as_deref()
+        && body_base64.contains('\0') {
             return Err(A11yError::CdpAttachFailed {
                 detail: "Fetch route body_base64 must not contain NUL".to_owned(),
             });
         }
-    }
     Ok(())
 }
 
@@ -2102,14 +2059,13 @@ fn validate_fetch_route_continue(continue_rule: &CdpFetchRouteContinue) -> A11yR
             detail: "Fetch route continue requires at least one override".to_owned(),
         });
     }
-    if let Some(url) = continue_rule.url.as_deref() {
-        if url.trim() != url || url.is_empty() || url.contains('\0') {
+    if let Some(url) = continue_rule.url.as_deref()
+        && (url.trim() != url || url.is_empty() || url.contains('\0')) {
             return Err(A11yError::CdpAttachFailed {
                 detail: "Fetch route continue url must be non-empty without surrounding whitespace or NUL"
                     .to_owned(),
             });
         }
-    }
     if let Some(method) = continue_rule.method.as_deref() {
         validate_http_method(method)?;
     }
@@ -2117,13 +2073,12 @@ fn validate_fetch_route_continue(continue_rule: &CdpFetchRouteContinue) -> A11yR
         validate_header_name(name)?;
         validate_header_value(value)?;
     }
-    if let Some(post_data_base64) = continue_rule.post_data_base64.as_deref() {
-        if post_data_base64.contains('\0') {
+    if let Some(post_data_base64) = continue_rule.post_data_base64.as_deref()
+        && post_data_base64.contains('\0') {
             return Err(A11yError::CdpAttachFailed {
                 detail: "Fetch route continue post_data_base64 must not contain NUL".to_owned(),
             });
         }
-    }
     Ok(())
 }
 

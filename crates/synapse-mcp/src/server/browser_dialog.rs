@@ -289,7 +289,13 @@ impl SynapseService {
                 (Some(status), None)
             }
             BrowserHandleDialogOperation::SetPolicy => {
-                let policy = dialog.default_policy.expect("validated policy");
+                let policy = dialog.default_policy.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_handle_dialog set_policy requires default_policy but it was None"
+                            .to_string(),
+                    )
+                })?;
                 let status = synapse_a11y::dialog_capture_ensure(
                     &endpoint,
                     cdp_target_id,

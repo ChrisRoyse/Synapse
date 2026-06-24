@@ -16,17 +16,14 @@ const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserCookiesOperation {
+    #[default]
     Get,
     Set,
     Clear,
 }
 
-impl Default for BrowserCookiesOperation {
-    fn default() -> Self {
-        Self::Get
-    }
-}
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -89,7 +86,9 @@ pub struct BrowserCookiesResponse {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserStorageOperation {
+    #[default]
     Get,
     Set,
     Clear,
@@ -97,24 +96,16 @@ pub enum BrowserStorageOperation {
     LoadState,
 }
 
-impl Default for BrowserStorageOperation {
-    fn default() -> Self {
-        Self::Get
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserStorageStore {
+    #[default]
     Local,
     Session,
 }
 
-impl Default for BrowserStorageStore {
-    fn default() -> Self {
-        Self::Local
-    }
-}
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -1952,10 +1952,14 @@ impl SynapseService {
         };
         let result = match conditions.operation {
             BrowserNetworkConditionsOperation::Set => {
-                let requested = conditions
-                    .requested
-                    .as_ref()
-                    .expect("validated network conditions override");
+                let requested = conditions.requested.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{CONDITIONS_TOOL} requested network conditions override missing for set operation"
+                        ),
+                    )
+                })?;
                 synapse_a11y::cdp_set_network_conditions(
                     &endpoint,
                     cdp_target_id,
@@ -2543,21 +2547,30 @@ fn validate_browser_route_params(
     let route = match params.operation {
         BrowserRouteOperation::AddFulfill => Some(normalize_route_fulfill(
             params,
-            route_id
-                .clone()
-                .expect("add_fulfill always has a generated route id"),
+            route_id.clone().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{ROUTE_TOOL} add_fulfill missing generated route_id"),
+                )
+            })?,
         )?),
         BrowserRouteOperation::AddAbort => Some(normalize_route_abort(
             params,
-            route_id
-                .clone()
-                .expect("add_abort always has a generated route id"),
+            route_id.clone().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{ROUTE_TOOL} add_abort missing generated route_id"),
+                )
+            })?,
         )?),
         BrowserRouteOperation::AddContinue => Some(normalize_route_continue(
             params,
-            route_id
-                .clone()
-                .expect("add_continue always has a generated route id"),
+            route_id.clone().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{ROUTE_TOOL} add_continue missing generated route_id"),
+                )
+            })?,
         )?),
         BrowserRouteOperation::Remove
         | BrowserRouteOperation::Clear

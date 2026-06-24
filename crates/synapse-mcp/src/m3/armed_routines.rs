@@ -171,17 +171,14 @@ pub struct ArmedRoutineRunRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ArmedRoutineTickTriggerMode {
     Schedule,
     Intent,
+    #[default]
     Both,
 }
 
-impl Default for ArmedRoutineTickTriggerMode {
-    fn default() -> Self {
-        Self::Both
-    }
-}
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

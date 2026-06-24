@@ -3381,7 +3381,13 @@ impl SynapseService {
                 window_hwnd,
                 &cdp_target_id,
                 &params.0.element_id,
-                backend_node_id.expect("raw CDP element id has backend node id"),
+                backend_node_id.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_inspect: raw CDP element id is missing its backend node id"
+                            .to_string(),
+                    )
+                })?,
                 max_html_bytes,
             )
             .await
@@ -3472,7 +3478,13 @@ impl SynapseService {
                 window_hwnd,
                 &cdp_target_id,
                 &params.0.element_id,
-                backend_node_id.expect("raw CDP element id has backend node id"),
+                backend_node_id.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_scroll_into_view: raw CDP element id is missing its backend node id"
+                            .to_string(),
+                    )
+                })?,
             )
             .await
         };
@@ -5107,10 +5119,13 @@ impl SynapseService {
                         None,
                     )
                     .await?;
-                let requested = params
-                    .cdp_target_id
-                    .as_deref()
-                    .expect("validated select target");
+                let requested = params.cdp_target_id.as_deref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_tabs operation=select is missing its validated cdp_target_id"
+                            .to_string(),
+                    )
+                })?;
                 let selected = response
                     .tabs
                     .iter()
@@ -5150,7 +5165,12 @@ impl SynapseService {
                 Ok(response)
             }
             BrowserTabsOperation::New => {
-                let url = params.url.clone().expect("validated new url");
+                let url = params.url.clone().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_tabs operation=new is missing its validated url".to_string(),
+                    )
+                })?;
                 if synapse_a11y::endpoint_for_window(window_context.hwnd).is_some() {
                     return Err(mcp_error(
                         error_codes::ACTION_TARGET_INVALID,
@@ -5189,10 +5209,13 @@ impl SynapseService {
                 .await
             }
             BrowserTabsOperation::Close => {
-                let target_id = params
-                    .cdp_target_id
-                    .clone()
-                    .expect("validated close target");
+                let target_id = params.cdp_target_id.clone().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_tabs operation=close is missing its validated cdp_target_id"
+                            .to_string(),
+                    )
+                })?;
                 let (owner_key, owner) = self.cdp_target_owner_for_close(session_id, &target_id)?;
                 if owner.window_hwnd != window_context.hwnd {
                     return Err(mcp_error(

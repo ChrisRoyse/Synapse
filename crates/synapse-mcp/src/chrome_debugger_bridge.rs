@@ -6264,6 +6264,11 @@ pub(crate) async fn wait_for_url(
     })
 }
 
+// The CDP network-wait predicates carry the full match surface (hwnd, target, url
+// pattern, method, status, resource type, timeout and polling knobs) as distinct
+// scalars captured at the call site; bundling them into a params struct would only
+// relocate the same fields.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn wait_for_request(
     hwnd: i64,
     target_id: &str,
@@ -6289,6 +6294,7 @@ pub(crate) async fn wait_for_request(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn wait_for_response(
     hwnd: i64,
     target_id: &str,
@@ -6315,6 +6321,7 @@ pub(crate) async fn wait_for_response(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_network(
     kind: &'static str,
     hwnd: i64,

@@ -24,68 +24,53 @@ const DEFAULT_BRIDGE_VIEWPORT_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserResizeOperation {
+    #[default]
     Set,
     Reset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserDeviceOperation {
+    #[default]
     Set,
     Reset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserGeolocationOperation {
+    #[default]
     Set,
     Reset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserLocaleOperation {
+    #[default]
     Set,
     Reset,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BrowserMediaOperation {
+    #[default]
     Set,
     Reset,
 }
 
-impl Default for BrowserMediaOperation {
-    fn default() -> Self {
-        Self::Set
-    }
-}
 
-impl Default for BrowserLocaleOperation {
-    fn default() -> Self {
-        Self::Set
-    }
-}
 
-impl Default for BrowserGeolocationOperation {
-    fn default() -> Self {
-        Self::Set
-    }
-}
 
-impl Default for BrowserDeviceOperation {
-    fn default() -> Self {
-        Self::Set
-    }
-}
 
-impl Default for BrowserResizeOperation {
-    fn default() -> Self {
-        Self::Set
-    }
-}
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -842,12 +827,19 @@ impl SynapseService {
         };
         let result = match params.operation {
             BrowserResizeOperation::Set => {
-                let width = params.width.expect("validated set width");
-                let height = params.height.expect("validated set height");
-                let device_scale_factor = params
-                    .device_scale_factor
-                    .expect("validated set device_scale_factor");
-                let is_mobile = params.is_mobile.expect("validated set is_mobile");
+                let (Some(width), Some(height), Some(device_scale_factor), Some(is_mobile)) = (
+                    params.width,
+                    params.height,
+                    params.device_scale_factor,
+                    params.is_mobile,
+                ) else {
+                    return Err(mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{RESIZE_TOOL} set operation reached dispatch without validated viewport fields"
+                        ),
+                    ));
+                };
                 synapse_a11y::cdp_set_viewport_size_with_mobile(
                     &endpoint,
                     cdp_target_id,
@@ -953,10 +945,14 @@ impl SynapseService {
         };
         let result = match params.operation {
             BrowserDeviceOperation::Set => {
-                let descriptor = params
-                    .descriptor
-                    .as_ref()
-                    .expect("validated device descriptor");
+                let descriptor = params.descriptor.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{DEVICE_TOOL} set operation reached dispatch without validated device descriptor"
+                        ),
+                    )
+                })?;
                 synapse_a11y::cdp_apply_device_descriptor(
                     &endpoint,
                     cdp_target_id,
@@ -1078,10 +1074,14 @@ impl SynapseService {
         };
         let result = match params.operation {
             BrowserGeolocationOperation::Set => {
-                let geolocation = params
-                    .geolocation
-                    .as_ref()
-                    .expect("validated geolocation override");
+                let geolocation = params.geolocation.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{GEOLOCATION_TOOL} set operation reached dispatch without validated geolocation override"
+                        ),
+                    )
+                })?;
                 synapse_a11y::cdp_set_geolocation_override(
                     &endpoint,
                     cdp_target_id,
@@ -1207,10 +1207,14 @@ impl SynapseService {
         };
         let result = match params.operation {
             BrowserLocaleOperation::Set => {
-                let requested = params
-                    .requested
-                    .as_ref()
-                    .expect("validated locale override");
+                let requested = params.requested.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{LOCALE_TOOL} set operation reached dispatch without validated locale override"
+                        ),
+                    )
+                })?;
                 synapse_a11y::cdp_set_locale_timezone_override(
                     &endpoint,
                     cdp_target_id,
@@ -1315,7 +1319,14 @@ impl SynapseService {
         };
         let result = match params.operation {
             BrowserMediaOperation::Set => {
-                let requested = params.requested.as_ref().expect("validated media override");
+                let requested = params.requested.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{MEDIA_TOOL} set operation reached dispatch without validated media override"
+                        ),
+                    )
+                })?;
                 synapse_a11y::cdp_set_media_override(
                     &endpoint,
                     cdp_target_id,
