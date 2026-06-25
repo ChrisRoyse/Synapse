@@ -1823,12 +1823,34 @@ if (-not $PreserveExternalDebuggerExtensions) {
     $policyShieldExtensions += @($allExternalDebuggerOrNativeExtensions)
 }
 $chromePolicyPopupShield = Set-SynapseChromeExternalDebuggerPolicy -Extensions $policyShieldExtensions
-$blockingPolicyShieldRows = @($chromePolicyPopupShield | Where-Object {
-    $_.blocking -eq $true -or [string]$_.warning_code -eq 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
+# The popup shield writes HKCU\Software\Policies\Google\Chrome\ExtensionSettings — a
+# Chrome MANAGED-POLICY key. On a correctly-secured Windows install that key is
+# admin-only (owner SYSTEM, standard users get ReadKey) BY DESIGN, precisely so a
+# non-admin process cannot grant itself Chrome policy. A non-elevated setup therefore
+# cannot write it, and that denial is expected hardening — not a misconfiguration to
+# "repair". Crucially, the popup shield is NOT the hazard enforcement boundary: the
+# bridge manifest is REQUIRED to hold chrome.management (enforced earlier in this
+# script), and the daemon uses it to suppress the same debugger/nativeMessaging hazards
+# at runtime and to FAIL CLOSED before any Chrome command if suppression is not
+# confirmed — this is verified post-handoff by the live /health chrome_bridge check in
+# synapse-setup.ps1. Making an admin-only, defense-in-depth policy write a hard
+# dependency would brick `synapse-update` on every properly-secured machine. So a
+# write-denied shield is surfaced LOUDLY (with exact failure + remediation) but is
+# non-fatal; only an UNEXPECTED shield failure (not the known admin-only policy-root
+# denial) still aborts setup.
+$popupShieldWriteDeniedRows = @($chromePolicyPopupShield | Where-Object {
+    [string]$_.warning_code -eq 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
 })
-if ($blockingPolicyShieldRows.Count -gt 0) {
-    $detail = ConvertTo-CompressedJson -Value $blockingPolicyShieldRows -Depth 10
-    throw "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_BLOCKING detail=$detail remediation=repair HKCU\Software\Policies\Google\Chrome ACL or run from an elevated maintenance PowerShell so Synapse can write the reversible ExtensionSettings self-shield; setup refuses to continue with only a soft warning because the bridge must not depend on an unverified popup-shield fallback"
+$unexpectedBlockingShieldRows = @($chromePolicyPopupShield | Where-Object {
+    $_.blocking -eq $true -and [string]$_.warning_code -ne 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
+})
+if ($unexpectedBlockingShieldRows.Count -gt 0) {
+    $detail = ConvertTo-CompressedJson -Value $unexpectedBlockingShieldRows -Depth 10
+    throw "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_FAILED detail=$detail remediation=the Synapse popup shield failed for an unexpected reason (not the admin-only HKCU managed-policy-root write denial); inspect detail.error/detail.acl and repair before rerunning setup"
+}
+if ($popupShieldWriteDeniedRows.Count -gt 0) {
+    $deniedDetail = ConvertTo-CompressedJson -Value $popupShieldWriteDeniedRows -Depth 10
+    Write-Warning "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING the HKCU Chrome managed-policy key is admin-only on this host, so the non-elevated popup shield could not be written. This is not fatal: the bridge's required chrome.management permission enforces the same debugger/nativeMessaging hazard suppression at runtime and fails closed if suppression is not confirmed (verified post-handoff by /health chrome_bridge). To also apply the policy-level defense-in-depth, run setup once from an elevated PowerShell. detail=$deniedDetail"
 }
 
 if ($staleSynapseActivePermissions.Count -gt 0) {
