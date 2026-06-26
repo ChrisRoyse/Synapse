@@ -57,11 +57,36 @@ async fn post_key_sequence_impl(
     hold_ms: u32,
 ) -> Result<HwndKeyboardTargetState, ActionError> {
     let key_specs = keys.iter().map(key_spec).collect::<Result<Vec<_>, _>>()?;
+    let chord_label = keys.iter().map(key_label).collect::<Vec<_>>().join("+");
+    let has_command_modifier = key_specs
+        .iter()
+        .any(|spec| matches!(spec.label, "ctrl" | "alt" | "super"));
     let mut release_keys = false;
     let target_hwnd = {
         let target = best_keyboard_target(root_hwnd)?;
         if is_ctrl_a_shortcut(&key_specs) {
             select_all_edit_target(&target)?;
+            hwnd_to_i64(target.hwnd)
+        } else if has_command_modifier {
+            // A Ctrl/Alt/Win + key chord cannot be delivered by posting
+            // WM_KEYDOWN: PostMessage does not update the OS keyboard shift
+            // state, so the target's GetKeyState/GetAsyncKeyState see no
+            // modifier held and the accelerator never fires (documented in
+            // "You can't simulate keyboard input with PostMessage", Raymond
+            // Chen). Worse, the target's own TranslateMessage turns the posted
+            // WM_KEYDOWN into a stray literal WM_CHAR that corrupts the window.
+            // We deliver the well-known edit shortcuts as their semantic window
+            // message instead, and fail loud for every other chord so the
+            // caller escalates to the foreground SendInput tier rather than
+            // silently corrupting the target.
+            let Some((message, message_name)) = edit_semantic_message(&key_specs) else {
+                return Err(ActionError::BackendUnavailable {
+                    detail: format!(
+                        "act_press PostMessage background tier cannot deliver modifier chord {chord_label:?}: posting WM_KEYDOWN cannot set the OS modifier key-state the target reads via GetKeyState/GetAsyncKeyState, so application accelerators never fire and a stray literal character would corrupt the target. Deliver this chord through the foreground SendInput tier (acquire the input lease and foreground the window) or a CDP target instead."
+                    ),
+                });
+            };
+            send_edit_semantic_message(&target, message, message_name)?;
             hwnd_to_i64(target.hwnd)
         } else if is_plain_printable_text(&key_specs) {
             post_char_messages(target.hwnd, &key_specs)?;
@@ -258,6 +283,79 @@ fn select_all_edit_target(target: &WindowCandidate) -> Result<(), ActionError> {
         return Err(ActionError::BackendUnavailable {
             detail: format!(
                 "act_press PostMessage Ctrl+A EM_SETSEL timed out or failed for hwnd 0x{:x}",
+                hwnd_to_i64(target.hwnd)
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Map an exact `Ctrl+<letter>` clipboard/undo chord to the semantic window
+/// message that standard EDIT and RICHEDIT controls implement without any
+/// dependency on OS modifier key-state. Returns `None` for everything else,
+/// including `Ctrl+C` (copy) and `Ctrl+Y`/`Ctrl+Shift+Z` (redo): their effect
+/// lives in the clipboard, which the HWND-text Source-of-Truth verify path
+/// cannot prove, so they fail loud and escalate rather than report an
+/// unverifiable success.
+#[cfg(windows)]
+fn edit_semantic_message(key_specs: &[KeySpec]) -> Option<(u32, &'static str)> {
+    const WM_CUT: u32 = 0x0300;
+    const WM_PASTE: u32 = 0x0302;
+    const EM_UNDO: u32 = 0x00C7;
+    if key_specs.len() != 2 || key_specs[0].label != "ctrl" || key_specs[1].label != "letter" {
+        return None;
+    }
+    match key_specs[1].char_code {
+        Some(code) if code == u16::from(b'v') => Some((WM_PASTE, "WM_PASTE")),
+        Some(code) if code == u16::from(b'x') => Some((WM_CUT, "WM_CUT")),
+        Some(code) if code == u16::from(b'z') => Some((EM_UNDO, "EM_UNDO")),
+        _ => None,
+    }
+}
+
+/// Deliver a clipboard/undo edit shortcut to an edit/rich-edit target via its
+/// semantic window message. Fails loud when the resolved target is not an
+/// edit-class control (the message would be a no-op there) so the caller
+/// escalates to the foreground SendInput tier. The actual effect is proven by
+/// the caller's Source-of-Truth text-delta verification, not by this return.
+#[cfg(windows)]
+fn send_edit_semantic_message(
+    target: &WindowCandidate,
+    message: u32,
+    message_name: &'static str,
+) -> Result<(), ActionError> {
+    use windows::Win32::{
+        Foundation::{LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW},
+    };
+
+    let class_name = target.class_name.to_ascii_lowercase();
+    if !(class_name.contains("edit") || class_name.contains("richedit")) {
+        return Err(ActionError::BackendUnavailable {
+            detail: format!(
+                "act_press PostMessage {message_name} background delivery requires an edit/rich-edit target; resolved hwnd 0x{:x} class {:?}. Deliver this chord through the foreground SendInput tier or a CDP target instead.",
+                hwnd_to_i64(target.hwnd),
+                target.class_name
+            ),
+        });
+    }
+
+    const TIMEOUT_MS: u32 = 250;
+    let result = unsafe {
+        SendMessageTimeoutW(
+            target.hwnd,
+            message,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            TIMEOUT_MS,
+            None,
+        )
+    };
+    if result.0 == 0 {
+        return Err(ActionError::BackendUnavailable {
+            detail: format!(
+                "act_press PostMessage {message_name} (0x{message:04x}) timed out or was not handled by hwnd 0x{:x}",
                 hwnd_to_i64(target.hwnd)
             ),
         });
@@ -590,4 +688,62 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    fn ctrl() -> KeySpec {
+        KeySpec {
+            label: "ctrl",
+            vk: 0x11,
+            char_code: None,
+            ctrl_char_code: None,
+        }
+    }
+
+    fn letter(byte: u8) -> KeySpec {
+        KeySpec {
+            label: "letter",
+            vk: u16::from(byte.to_ascii_uppercase()),
+            char_code: Some(u16::from(byte.to_ascii_lowercase())),
+            ctrl_char_code: Some(u16::from(byte.to_ascii_uppercase() - b'A' + 1)),
+        }
+    }
+
+    // Only the clipboard/undo edit shortcuts that EDIT/RICHEDIT controls
+    // implement as window messages map to a semantic message; everything else
+    // returns None so the caller fails loud instead of corrupting the target.
+    #[test]
+    fn edit_semantic_message_maps_only_paste_cut_undo() {
+        assert_eq!(
+            edit_semantic_message(&[ctrl(), letter(b'v')]),
+            Some((0x0302, "WM_PASTE"))
+        );
+        assert_eq!(
+            edit_semantic_message(&[ctrl(), letter(b'x')]),
+            Some((0x0300, "WM_CUT"))
+        );
+        assert_eq!(
+            edit_semantic_message(&[ctrl(), letter(b'z')]),
+            Some((0x00C7, "EM_UNDO"))
+        );
+    }
+
+    #[test]
+    fn edit_semantic_message_refuses_copy_and_app_accelerators() {
+        // Copy lives in the clipboard (unverifiable via the HWND-text SoT) and
+        // app accelerators have no edit message: both must fail loud.
+        assert_eq!(edit_semantic_message(&[ctrl(), letter(b'c')]), None);
+        assert_eq!(edit_semantic_message(&[ctrl(), letter(b'n')]), None);
+        assert_eq!(edit_semantic_message(&[ctrl(), letter(b's')]), None);
+        // A bare letter with no Ctrl is not an edit shortcut.
+        assert_eq!(edit_semantic_message(&[letter(b'v')]), None);
+        // Three-key chords (e.g. Ctrl+Shift+Z redo) are out of scope here.
+        assert_eq!(
+            edit_semantic_message(&[ctrl(), ctrl(), letter(b'z')]),
+            None
+        );
+    }
 }

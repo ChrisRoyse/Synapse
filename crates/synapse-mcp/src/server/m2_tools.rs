@@ -2354,6 +2354,9 @@ enum HwndKeyboardExpectedEffect {
     AnyDelta,
     PrintableText { text: String },
     SelectAll,
+    ClipboardPaste,
+    ClipboardCut,
+    Undo,
 }
 
 #[derive(Clone, Debug)]
@@ -4313,6 +4316,20 @@ fn hwnd_keyboard_expected_effect(
     if labels == ["ctrl", "a"] {
         return Ok(HwndKeyboardExpectedEffect::SelectAll);
     }
+    // Edit-semantic chords delivered via WM_PASTE / WM_CUT / EM_UNDO each have a
+    // specific, verifiable effect on the target's text Source-of-Truth. Pinning
+    // them here (instead of letting them fall through to AnyDelta) is what turns
+    // the previous silent false-positive — any text change, including stray
+    // modifier-drop corruption, counting as success — into a fail-loud check.
+    if labels == ["ctrl", "v"] {
+        return Ok(HwndKeyboardExpectedEffect::ClipboardPaste);
+    }
+    if labels == ["ctrl", "x"] {
+        return Ok(HwndKeyboardExpectedEffect::ClipboardCut);
+    }
+    if labels == ["ctrl", "z"] {
+        return Ok(HwndKeyboardExpectedEffect::Undo);
+    }
     let has_command_modifier = labels
         .iter()
         .any(|label| matches!(label.as_str(), "ctrl" | "alt" | "super"));
@@ -4381,6 +4398,39 @@ fn hwnd_keyboard_effect_mismatch(
             }
             None
         }
+        HwndKeyboardExpectedEffect::ClipboardPaste => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying Ctrl+V paste delivery");
+            }
+            if before.target.text_sha256 == after.target.text_sha256 {
+                return Some(
+                    "Ctrl+V paste did not change the target text (empty clipboard, or the target ignored WM_PASTE)",
+                );
+            }
+            None
+        }
+        HwndKeyboardExpectedEffect::ClipboardCut => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying Ctrl+X cut delivery");
+            }
+            if before.target.text_sha256 == after.target.text_sha256 {
+                return Some(
+                    "Ctrl+X cut did not change the target text (empty selection, or the target ignored WM_CUT)",
+                );
+            }
+            None
+        }
+        HwndKeyboardExpectedEffect::Undo => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying Ctrl+Z undo delivery");
+            }
+            if before.target.text_sha256 == after.target.text_sha256 {
+                return Some(
+                    "Ctrl+Z undo did not change the target text (nothing to undo, or the target ignored EM_UNDO)",
+                );
+            }
+            None
+        }
     }
 }
 
@@ -4410,6 +4460,9 @@ fn hwnd_keyboard_expected_effect_name(
         HwndKeyboardExpectedEffect::AnyDelta => "any_delta",
         HwndKeyboardExpectedEffect::PrintableText { .. } => "printable_text",
         HwndKeyboardExpectedEffect::SelectAll => "select_all",
+        HwndKeyboardExpectedEffect::ClipboardPaste => "clipboard_paste",
+        HwndKeyboardExpectedEffect::ClipboardCut => "clipboard_cut",
+        HwndKeyboardExpectedEffect::Undo => "undo",
     }
 }
 
