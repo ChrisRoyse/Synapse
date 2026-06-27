@@ -3301,6 +3301,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "spawns real Notepad windows on the operator desktop; opt-in via `cargo test -- --ignored`. Kept out of the default suite so ordinary `cargo test` never flashes/leaks GUI windows and concurrent test binaries don't contend for the foreground (see launch_notepad fixture)."]
     async fn recorder_writes_real_foreground_rows_into_cf_timeline() {
         let _live_window_lock = ACTIVITY_RECORDER_LIVE_WINDOW_LOCK.lock().await;
         let _ = tracing_subscriber::fmt()
@@ -3461,6 +3462,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "spawns real Notepad windows on the operator desktop; opt-in via `cargo test -- --ignored`. Kept out of the default suite so ordinary `cargo test` never flashes/leaks GUI windows and concurrent test binaries don't contend for the foreground (see launch_notepad fixture)."]
     async fn pause_and_exclusion_gates_suppress_real_rows() {
         let _live_window_lock = ACTIVITY_RECORDER_LIVE_WINDOW_LOCK.lock().await;
         let _ = tracing_subscriber::fmt()

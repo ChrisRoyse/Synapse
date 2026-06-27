@@ -61,6 +61,7 @@ async fn post_key_sequence_impl(
     let has_command_modifier = key_specs
         .iter()
         .any(|spec| matches!(spec.label, "ctrl" | "alt" | "super"));
+    let has_shift = key_specs.iter().any(|spec| spec.label == "shift");
     let mut release_keys = false;
     let target_hwnd = {
         let target = best_keyboard_target(root_hwnd)?;
@@ -91,6 +92,24 @@ async fn post_key_sequence_impl(
         } else if is_plain_printable_text(&key_specs) {
             post_char_messages(target.hwnd, &key_specs)?;
             hwnd_to_i64(target.hwnd)
+        } else if has_shift {
+            // A Shift + key chord has the same fatal limitation as a command
+            // modifier (#1332): PostMessage does not update the OS Shift
+            // key-state read via GetKeyState/GetAsyncKeyState. Posting
+            // WM_KEYDOWN for a navigation key (Home/End/Arrow/PageUp...) with
+            // no real Shift held makes the control *move the caret and collapse
+            // the selection* instead of extending it — a silent wrong result —
+            // and a Shift + character chord drops to the unshifted character.
+            // There is no key-state-independent semantic message that can carry
+            // the caller's intended selection anchor in the general case
+            // (EM_GETSEL returns only min/max, not the anchor, and multi-line
+            // Home/End needs line metrics), so we fail loud rather than corrupt
+            // the caret or insert the wrong character.
+            return Err(ActionError::BackendUnavailable {
+                detail: format!(
+                    "act_press PostMessage background tier cannot deliver Shift chord {chord_label:?}: posting WM_KEYDOWN cannot set the OS Shift key-state the target reads via GetKeyState/GetAsyncKeyState, so a Shift+navigation chord silently moves the caret without extending the selection and a Shift+character chord drops to the unshifted character. Deliver this chord through the foreground SendInput tier (acquire the input lease and foreground the window) or a CDP target instead."
+                ),
+            });
         } else {
             for spec in &key_specs {
                 post_key_message(
@@ -290,27 +309,58 @@ fn select_all_edit_target(target: &WindowCandidate) -> Result<(), ActionError> {
     Ok(())
 }
 
-/// Map an exact `Ctrl+<letter>` clipboard/undo chord to the semantic window
-/// message that standard EDIT and RICHEDIT controls implement without any
-/// dependency on OS modifier key-state. Returns `None` for everything else,
-/// including `Ctrl+C` (copy) and `Ctrl+Y`/`Ctrl+Shift+Z` (redo): their effect
-/// lives in the clipboard, which the HWND-text Source-of-Truth verify path
-/// cannot prove, so they fail loud and escalate rather than report an
-/// unverifiable success.
+/// Map an exact `Ctrl+<letter>` clipboard/undo/redo chord to the semantic
+/// window message that standard EDIT and RICHEDIT controls implement without
+/// any dependency on OS modifier key-state. Returns `None` for everything else
+/// (app accelerators like `Ctrl+N`/`Ctrl+S`), which have no semantic message
+/// and must fail loud so the caller escalates to the foreground SendInput tier.
+///
+/// `Ctrl+C` (copy) maps to `WM_COPY`: its effect lives in the clipboard, not
+/// the target text, so the caller verifies it against the clipboard
+/// Source-of-Truth (sequence number) rather than the HWND text (#1331).
+/// `Ctrl+Y` (redo) maps to the RichEdit `EM_REDO` message; plain EDIT controls
+/// do not implement redo, so it is caught fail-loud by the text-delta verify
+/// (no text change) there.
 #[cfg(windows)]
 fn edit_semantic_message(key_specs: &[KeySpec]) -> Option<(u32, &'static str)> {
     const WM_CUT: u32 = 0x0300;
+    const WM_COPY: u32 = 0x0301;
     const WM_PASTE: u32 = 0x0302;
     const EM_UNDO: u32 = 0x00C7;
+    // RichEdit redo: WM_USER (0x0400) + 84.
+    const EM_REDO: u32 = 0x0454;
     if key_specs.len() != 2 || key_specs[0].label != "ctrl" || key_specs[1].label != "letter" {
         return None;
     }
     match key_specs[1].char_code {
         Some(code) if code == u16::from(b'v') => Some((WM_PASTE, "WM_PASTE")),
         Some(code) if code == u16::from(b'x') => Some((WM_CUT, "WM_CUT")),
+        Some(code) if code == u16::from(b'c') => Some((WM_COPY, "WM_COPY")),
         Some(code) if code == u16::from(b'z') => Some((EM_UNDO, "EM_UNDO")),
+        Some(code) if code == u16::from(b'y') => Some((EM_REDO, "EM_REDO")),
         _ => None,
     }
+}
+
+/// Read the window-station clipboard sequence number, the documented
+/// Source-of-Truth for "did the clipboard contents change". It increments
+/// whenever the clipboard is written or emptied, so a `WM_COPY`/`WM_CUT`
+/// delivery can be proven (vs. a silent no-op on an empty selection) by
+/// comparing this value before and after. Returns `None` when the daemon lacks
+/// `WINSTA_ACCESSCLIPBOARD` access (`GetClipboardSequenceNumber` returns 0),
+/// which the verify path treats as a loud, unverifiable failure rather than a
+/// false success.
+#[cfg(windows)]
+pub(crate) fn clipboard_sequence_number() -> Option<u32> {
+    use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    (seq != 0).then_some(seq)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn clipboard_sequence_number() -> Option<u32> {
+    None
 }
 
 /// Deliver a clipboard/undo edit shortcut to an edit/rich-edit target via its
@@ -712,11 +762,29 @@ mod tests {
         }
     }
 
-    // Only the clipboard/undo edit shortcuts that EDIT/RICHEDIT controls
+    fn shift() -> KeySpec {
+        KeySpec {
+            label: "shift",
+            vk: 0x10,
+            char_code: None,
+            ctrl_char_code: None,
+        }
+    }
+
+    fn named(label: &'static str, vk: u16) -> KeySpec {
+        KeySpec {
+            label,
+            vk,
+            char_code: None,
+            ctrl_char_code: None,
+        }
+    }
+
+    // The clipboard/undo/redo edit shortcuts that EDIT/RICHEDIT controls
     // implement as window messages map to a semantic message; everything else
     // returns None so the caller fails loud instead of corrupting the target.
     #[test]
-    fn edit_semantic_message_maps_only_paste_cut_undo() {
+    fn edit_semantic_message_maps_paste_cut_copy_undo_redo() {
         assert_eq!(
             edit_semantic_message(&[ctrl(), letter(b'v')]),
             Some((0x0302, "WM_PASTE"))
@@ -725,25 +793,47 @@ mod tests {
             edit_semantic_message(&[ctrl(), letter(b'x')]),
             Some((0x0300, "WM_CUT"))
         );
+        // #1331: copy is delivered via WM_COPY and verified against the
+        // clipboard sequence-number Source-of-Truth, not the HWND text.
+        assert_eq!(
+            edit_semantic_message(&[ctrl(), letter(b'c')]),
+            Some((0x0301, "WM_COPY"))
+        );
         assert_eq!(
             edit_semantic_message(&[ctrl(), letter(b'z')]),
             Some((0x00C7, "EM_UNDO"))
         );
+        // #1331: redo via the RichEdit EM_REDO (WM_USER + 84) message.
+        assert_eq!(
+            edit_semantic_message(&[ctrl(), letter(b'y')]),
+            Some((0x0454, "EM_REDO"))
+        );
     }
 
     #[test]
-    fn edit_semantic_message_refuses_copy_and_app_accelerators() {
-        // Copy lives in the clipboard (unverifiable via the HWND-text SoT) and
-        // app accelerators have no edit message: both must fail loud.
-        assert_eq!(edit_semantic_message(&[ctrl(), letter(b'c')]), None);
+    fn edit_semantic_message_refuses_app_accelerators_and_non_chords() {
+        // App accelerators have no edit message: must fail loud.
         assert_eq!(edit_semantic_message(&[ctrl(), letter(b'n')]), None);
         assert_eq!(edit_semantic_message(&[ctrl(), letter(b's')]), None);
         // A bare letter with no Ctrl is not an edit shortcut.
         assert_eq!(edit_semantic_message(&[letter(b'v')]), None);
-        // Three-key chords (e.g. Ctrl+Shift+Z redo) are out of scope here.
+        // Three-key chords (e.g. Ctrl+Shift+Z) are out of scope here.
         assert_eq!(
-            edit_semantic_message(&[ctrl(), ctrl(), letter(b'z')]),
+            edit_semantic_message(&[ctrl(), shift(), letter(b'z')]),
             None
         );
+    }
+
+    // #1332: a Shift-bearing chord that reaches the raw post path must be
+    // detected so the caller fails loud rather than silently moving the caret
+    // (Shift+navigation) or dropping to the unshifted character (Shift+letter).
+    #[test]
+    fn shift_chords_are_detected_for_fail_loud() {
+        let shift_end = [shift(), named("end", 0x23)];
+        assert!(shift_end.iter().any(|spec| spec.label == "shift"));
+        // Bare navigation (no Shift) is correct via WM_KEYDOWN and must NOT be
+        // flagged — only the modifier-dependent chords fail loud.
+        let bare_end = [named("end", 0x23)];
+        assert!(!bare_end.iter().any(|spec| spec.label == "shift"));
     }
 }

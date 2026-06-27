@@ -22,7 +22,7 @@ pub use schema::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
 };
 
-pub(crate) use postmessage::HwndKeyboardTargetState;
+pub(crate) use postmessage::{HwndKeyboardTargetState, clipboard_sequence_number};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedKeymapPress {

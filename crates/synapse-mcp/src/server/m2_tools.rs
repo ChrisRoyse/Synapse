@@ -27,7 +27,8 @@ use crate::m2::{
     act_stroke_request_details, action_from_press_params, action_from_type_params,
     attach_click_tier_attempts, click_params_can_route_background_first,
     click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
-    click_tier_failed, emitted_text, hwnd_keyboard_target_state, resolve_keymap_press,
+    click_tier_failed, clipboard_sequence_number, emitted_text, hwnd_keyboard_target_state,
+    resolve_keymap_press,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -2347,6 +2348,12 @@ struct CdpKeyboardDeltaSignature {
 #[serde(deny_unknown_fields)]
 struct HwndKeyboardDeltaSignature {
     target: HwndKeyboardTargetState,
+    /// Window-station clipboard sequence number at capture time, the
+    /// Source-of-Truth for proving a background `Ctrl+C` / `Ctrl+X` actually
+    /// wrote the clipboard (it increments on any clipboard change). `None` when
+    /// the daemon cannot read it; the copy verify path treats that as a loud,
+    /// unverifiable failure rather than a false success.
+    clipboard_seq: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2356,7 +2363,9 @@ enum HwndKeyboardExpectedEffect {
     SelectAll,
     ClipboardPaste,
     ClipboardCut,
+    ClipboardCopy,
     Undo,
+    Redo,
 }
 
 #[derive(Clone, Debug)]
@@ -4026,6 +4035,7 @@ impl SynapseService {
     ) -> Result<HwndKeyboardDeltaSignature, ErrorData> {
         Ok(HwndKeyboardDeltaSignature {
             target: hwnd_keyboard_target_state(root_hwnd)?,
+            clipboard_seq: clipboard_sequence_number(),
         })
     }
 
@@ -4272,7 +4282,14 @@ fn verify_hwnd_keyboard_delta_signature(
 ) -> Result<ActPostcondition, ErrorData> {
     let before_hash = hash_json(&before)?;
     let after_hash = hash_json(&after)?;
-    if before == after {
+    // The generic "nothing changed" guard is keyed on the target text/selection
+    // Source-of-Truth. Ctrl+C copy is intentionally non-mutating — its SoT is
+    // the clipboard, not the text — so it is exempt here and deferred to the
+    // clipboard-aware mismatch check below, which emits a specific, actionable
+    // message (e.g. empty-selection no-op) instead of the generic delta error.
+    let text_is_source_of_truth =
+        !matches!(expected_effect, HwndKeyboardExpectedEffect::ClipboardCopy);
+    if text_is_source_of_truth && before == after {
         return Err(source_no_observed_delta_error(
             tool,
             source_of_truth,
@@ -4327,8 +4344,21 @@ fn hwnd_keyboard_expected_effect(
     if labels == ["ctrl", "x"] {
         return Ok(HwndKeyboardExpectedEffect::ClipboardCut);
     }
+    // Ctrl+C (WM_COPY) does not mutate the target text — its effect lives in the
+    // clipboard. It is verified against the clipboard sequence-number
+    // Source-of-Truth (must increment) plus an assertion that the target text
+    // did NOT change, so an empty-selection no-op fails loud instead of being
+    // rubber-stamped (#1331).
+    if labels == ["ctrl", "c"] {
+        return Ok(HwndKeyboardExpectedEffect::ClipboardCopy);
+    }
     if labels == ["ctrl", "z"] {
         return Ok(HwndKeyboardExpectedEffect::Undo);
+    }
+    // Ctrl+Y (EM_REDO) re-applies an undone edit; verified as a text change like
+    // undo. Plain EDIT controls have no redo, so it fails loud (no delta) there.
+    if labels == ["ctrl", "y"] {
+        return Ok(HwndKeyboardExpectedEffect::Redo);
     }
     let has_command_modifier = labels
         .iter()
@@ -4420,6 +4450,33 @@ fn hwnd_keyboard_effect_mismatch(
             }
             None
         }
+        HwndKeyboardExpectedEffect::ClipboardCopy => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying Ctrl+C copy delivery");
+            }
+            if before.target.text_sha256 != after.target.text_sha256
+                || before.target.text_len != after.target.text_len
+            {
+                return Some("Ctrl+C copy mutated the target text instead of leaving it unchanged");
+            }
+            // The clipboard sequence number is the Source-of-Truth that the copy
+            // actually wrote the clipboard. Unreadable (None) is a loud failure,
+            // not a pass; an unchanged number means WM_COPY was a no-op (e.g.
+            // empty selection) and must fail loud rather than report success.
+            let (Some(before_seq), Some(after_seq)) =
+                (before.clipboard_seq, after.clipboard_seq)
+            else {
+                return Some(
+                    "Ctrl+C copy could not be verified: clipboard sequence number is unreadable (daemon lacks clipboard access)",
+                );
+            };
+            if before_seq == after_seq {
+                return Some(
+                    "Ctrl+C copy did not change the clipboard (empty selection, or the target ignored WM_COPY)",
+                );
+            }
+            None
+        }
         HwndKeyboardExpectedEffect::Undo => {
             if !same_hwnd_keyboard_target(before, after) {
                 return Some("target HWND changed while verifying Ctrl+Z undo delivery");
@@ -4427,6 +4484,17 @@ fn hwnd_keyboard_effect_mismatch(
             if before.target.text_sha256 == after.target.text_sha256 {
                 return Some(
                     "Ctrl+Z undo did not change the target text (nothing to undo, or the target ignored EM_UNDO)",
+                );
+            }
+            None
+        }
+        HwndKeyboardExpectedEffect::Redo => {
+            if !same_hwnd_keyboard_target(before, after) {
+                return Some("target HWND changed while verifying Ctrl+Y redo delivery");
+            }
+            if before.target.text_sha256 == after.target.text_sha256 {
+                return Some(
+                    "Ctrl+Y redo did not change the target text (nothing to redo, or the target ignored EM_REDO — plain EDIT controls have no redo)",
                 );
             }
             None
@@ -4462,7 +4530,9 @@ fn hwnd_keyboard_expected_effect_name(
         HwndKeyboardExpectedEffect::SelectAll => "select_all",
         HwndKeyboardExpectedEffect::ClipboardPaste => "clipboard_paste",
         HwndKeyboardExpectedEffect::ClipboardCut => "clipboard_cut",
+        HwndKeyboardExpectedEffect::ClipboardCopy => "clipboard_copy",
         HwndKeyboardExpectedEffect::Undo => "undo",
+        HwndKeyboardExpectedEffect::Redo => "redo",
     }
 }
 
@@ -8048,6 +8118,161 @@ mod tests {
         assert_eq!(postcondition.status, "observed_delta");
     }
 
+    fn act_press_params_with_keys(keys: &[&str]) -> ActPressParams {
+        let mut params = act_press_params(true, false, None, None);
+        params.keys = keys.iter().map(|key| (*key).to_owned()).collect();
+        params
+    }
+
+    #[test]
+    fn hwnd_keyboard_expected_effect_routes_copy_and_redo_to_dedicated_checks() {
+        // #1331: Ctrl+C and Ctrl+Y must no longer fall through to AnyDelta.
+        assert!(matches!(
+            hwnd_keyboard_expected_effect(&act_press_params_with_keys(&["ctrl", "c"]))
+                .expect("ctrl+c effect"),
+            HwndKeyboardExpectedEffect::ClipboardCopy
+        ));
+        assert!(matches!(
+            hwnd_keyboard_expected_effect(&act_press_params_with_keys(&["ctrl", "y"]))
+                .expect("ctrl+y effect"),
+            HwndKeyboardExpectedEffect::Redo
+        ));
+        // Regression: the existing edit-semantic chords still route correctly.
+        assert!(matches!(
+            hwnd_keyboard_expected_effect(&act_press_params_with_keys(&["ctrl", "v"]))
+                .expect("ctrl+v effect"),
+            HwndKeyboardExpectedEffect::ClipboardPaste
+        ));
+    }
+
+    #[test]
+    fn hwnd_keyboard_ctrl_c_copy_requires_clipboard_change_without_text_mutation() {
+        // Happy path: text unchanged, clipboard sequence number incremented.
+        let before = hwnd_keyboard_signature_with_clipboard("alpha beta gamma", 0, 16, Some(7));
+        let after_copied =
+            hwnd_keyboard_signature_with_clipboard("alpha beta gamma", 0, 16, Some(8));
+        let postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            after_copied,
+            HwndKeyboardExpectedEffect::ClipboardCopy,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect("Ctrl+C should pass when the clipboard changed and the text did not");
+        assert_eq!(postcondition.status, "observed_delta");
+
+        // Empty-selection no-op: clipboard sequence unchanged must fail loud.
+        let after_noop =
+            hwnd_keyboard_signature_with_clipboard("alpha beta gamma", 0, 16, Some(7));
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            after_noop,
+            HwndKeyboardExpectedEffect::ClipboardCopy,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("Ctrl+C with no clipboard change must fail loud");
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail"))
+                .and_then(Value::as_str),
+            Some("Ctrl+C copy did not change the clipboard (empty selection, or the target ignored WM_COPY)")
+        );
+
+        // Text mutation under a "copy" is corruption (must not happen).
+        let after_mutated =
+            hwnd_keyboard_signature_with_clipboard("alpha beta gammac", 17, 17, Some(8));
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            after_mutated,
+            HwndKeyboardExpectedEffect::ClipboardCopy,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("Ctrl+C that mutates the text must fail loud");
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail"))
+                .and_then(Value::as_str),
+            Some("Ctrl+C copy mutated the target text instead of leaving it unchanged")
+        );
+
+        // Unreadable clipboard (None) is a loud, unverifiable failure, not a pass.
+        let before_unreadable =
+            hwnd_keyboard_signature_with_clipboard("alpha beta gamma", 0, 16, None);
+        let after_unreadable =
+            hwnd_keyboard_signature_with_clipboard("alpha beta gamma", 0, 16, None);
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before_unreadable,
+            after_unreadable,
+            HwndKeyboardExpectedEffect::ClipboardCopy,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("Ctrl+C with unreadable clipboard must fail loud");
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail"))
+                .and_then(Value::as_str),
+            Some("Ctrl+C copy could not be verified: clipboard sequence number is unreadable (daemon lacks clipboard access)")
+        );
+    }
+
+    #[test]
+    fn hwnd_keyboard_ctrl_y_redo_requires_text_change() {
+        let before = hwnd_keyboard_signature("alpha beta", 10, 10);
+        let after_redone = hwnd_keyboard_signature("alpha beta gamma", 16, 16);
+        let postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            after_redone,
+            HwndKeyboardExpectedEffect::Redo,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect("Ctrl+Y should pass when redo re-applies text");
+        assert_eq!(postcondition.status, "observed_delta");
+
+        // Nothing to redo (or plain EDIT with no redo support) leaves the whole
+        // signature identical, so the generic no-observed-delta guard fires
+        // first — the real no-op contract (matching the #1329 cut-no-op FSV),
+        // not a false success.
+        let after_noop = hwnd_keyboard_signature("alpha beta", 10, 10);
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before,
+            after_noop,
+            HwndKeyboardExpectedEffect::Redo,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("Ctrl+Y with no text change must fail loud");
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::ACTION_NO_OBSERVED_DELTA)
+        );
+    }
+
     #[test]
     fn act_type_browser_url_policy_requires_verify_delta_before_input() {
         let params = act_type_params(false, Some("^file:///synapse-810\\.html$"));
@@ -9083,6 +9308,15 @@ mod tests {
         selection_start: u32,
         selection_end: u32,
     ) -> HwndKeyboardDeltaSignature {
+        hwnd_keyboard_signature_with_clipboard(text, selection_start, selection_end, None)
+    }
+
+    fn hwnd_keyboard_signature_with_clipboard(
+        text: &str,
+        selection_start: u32,
+        selection_end: u32,
+        clipboard_seq: Option<u32>,
+    ) -> HwndKeyboardDeltaSignature {
         HwndKeyboardDeltaSignature {
             target: HwndKeyboardTargetState {
                 root_hwnd: 0x1000,
@@ -9093,6 +9327,7 @@ mod tests {
                 selection_start: Some(selection_start),
                 selection_end: Some(selection_end),
             },
+            clipboard_seq,
         }
     }
 
