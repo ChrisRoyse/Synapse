@@ -11949,9 +11949,12 @@ fn parse_chrome_bridge_element_target(element_id: &str) -> Result<Option<String>
         || frame_id.is_empty()
         || !frame_id.bytes().all(|byte| byte.is_ascii_digit())
         || path.is_empty()
-        || !path
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        || !path.split('.').all(|part| {
+            // Numeric child index, or the "s" shadow-host-hop token (#1335): the
+            // bridge encodes open-shadow-root crossings as a literal "s" segment
+            // (e.g. 0.1.1.s.0). Light-DOM paths remain all-numeric.
+            !part.is_empty() && (part == "s" || part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
     {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
