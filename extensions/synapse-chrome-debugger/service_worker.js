@@ -15960,7 +15960,9 @@ function parseChromeBridgeElementId(value, expectedTabId, commandName) {
   if (!raw) {
     return { raw: null, frameId: null, path: null };
   }
-  const match = /^chrome-tab:(\d+):frame:(\d+):path:([0-9.]+)$/.exec(raw);
+  // Path segments are numeric child indices or the literal "s" shadow-host-hop
+  // token (#1335), e.g. 0.1.1.s.0; light-DOM paths stay all-numeric.
+  const match = /^chrome-tab:(\d+):frame:(\d+):path:((?:s|\d+)(?:\.(?:s|\d+))*)$/.exec(raw);
   if (!match) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
