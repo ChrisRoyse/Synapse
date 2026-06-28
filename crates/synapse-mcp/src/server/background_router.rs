@@ -451,6 +451,8 @@ impl SynapseService {
                                     region: None,
                                     window_hwnd: Some(window_hwnd),
                                     overwrite: true,
+                                    max_pixels: None,
+                                    max_long_edge: None,
                                 }),
                                 request_context,
                             )
@@ -476,6 +478,8 @@ impl SynapseService {
                                 region: None,
                                 window_hwnd: None,
                                 overwrite: true,
+                                max_pixels: None,
+                                max_long_edge: None,
                             }),
                             request_context,
                         )

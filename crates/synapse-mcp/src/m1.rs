@@ -319,6 +319,19 @@ pub struct CaptureScreenshotParams {
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub overwrite: bool,
+    /// Optional vision pixel budget: downscale (aspect-preserving) so the written
+    /// image's total pixels never exceed this. Mirrors Anthropic computer-use
+    /// resolution guidance (e.g. 1_150_000 for the 4.6 family, 3_750_000 for
+    /// Opus 4.7). No-op when the native capture already fits. Must be > 0.
+    #[serde(default)]
+    pub max_pixels: Option<u64>,
+    /// Optional vision pixel budget: downscale (aspect-preserving) so the written
+    /// image's longest edge never exceeds this many pixels (e.g. 1568 for the 4.6
+    /// family, 2576 for Opus 4.7). Combined with `max_pixels`, the more
+    /// restrictive constraint wins. No-op when the native capture already fits.
+    /// Must be > 0.
+    #[serde(default)]
+    pub max_long_edge: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -328,8 +341,17 @@ pub struct CaptureScreenshotResponse {
     pub format: CaptureScreenshotFormat,
     pub capture_backend: String,
     pub region: Rect,
+    /// Written image width in pixels (after any `max_pixels`/`max_long_edge` downscale).
     pub width: u32,
+    /// Written image height in pixels (after any `max_pixels`/`max_long_edge` downscale).
     pub height: u32,
+    /// Source capture width in pixels before any downscale (equals `width` when not downscaled).
+    pub native_width: u32,
+    /// Source capture height in pixels before any downscale (equals `height` when not downscaled).
+    pub native_height: u32,
+    /// Downscale ratio applied = written_long_edge / native_long_edge. 1.0 when not downscaled.
+    /// Multiply a coordinate read off the written image by `1.0 / scale` to map it back to native pixels.
+    pub scale: f64,
     pub bytes_written: u64,
     pub bitmap_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,6 +406,16 @@ pub struct BrowserScreenshotParams {
     /// Optional caller wait budget, capped by the bridge command timeout.
     #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
+    /// Optional vision pixel budget: downscale (aspect-preserving) so the written
+    /// image's total pixels never exceed this. See `CaptureScreenshotParams::max_pixels`.
+    /// No-op when the captured page image already fits. Must be > 0.
+    #[serde(default)]
+    pub max_pixels: Option<u64>,
+    /// Optional vision pixel budget: downscale (aspect-preserving) so the written
+    /// image's longest edge never exceeds this many pixels. See
+    /// `CaptureScreenshotParams::max_long_edge`. No-op when it already fits. Must be > 0.
+    #[serde(default)]
+    pub max_long_edge: Option<u32>,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -415,8 +447,16 @@ pub struct BrowserScreenshotResponse {
     pub capture_backend: String,
     pub scope: BrowserScreenshotScope,
     pub page_region: Rect,
+    /// Written image width in pixels (after any `max_pixels`/`max_long_edge` downscale).
     pub width: u32,
+    /// Written image height in pixels (after any `max_pixels`/`max_long_edge` downscale).
     pub height: u32,
+    /// Source capture width in pixels before any downscale (equals `width` when not downscaled).
+    pub native_width: u32,
+    /// Source capture height in pixels before any downscale (equals `height` when not downscaled).
+    pub native_height: u32,
+    /// Downscale ratio applied = written_long_edge / native_long_edge. 1.0 when not downscaled.
+    pub scale: f64,
     pub bytes_written: u64,
     pub bitmap_sha256: String,
     pub cdp_target_id: String,

@@ -440,7 +440,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a PNG/JPEG screenshot. With an active session raw CDP target, captures that exact browser tab through Page.captureScreenshot. The normal authenticated Chrome bridge is debugger-free and refuses Page.captureScreenshot before queueing any Chrome command, because Chrome's debugger infobar changes viewport/layout and breaks coordinate truth; use raw CDP on a dedicated silent automation profile or passive window capture instead. With window_hwnd or a window target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path."
+        description = "Capture a PNG/JPEG screenshot. With an active session raw CDP target, captures that exact browser tab through Page.captureScreenshot. The normal authenticated Chrome bridge is debugger-free and refuses Page.captureScreenshot before queueing any Chrome command, because Chrome's debugger infobar changes viewport/layout and breaks coordinate truth; use raw CDP on a dedicated silent automation profile or passive window capture instead. With window_hwnd or a window target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving (Lanczos3) to fit a vision-model pixel budget (e.g. max_long_edge=1568 / max_pixels=1150000 for the Claude 4.6 family, 2576 / 3750000 for Opus 4.7; the more restrictive wins). They are no-ops when the native capture already fits. The response always reports native_width/native_height and the applied scale (written_long_edge/native_long_edge, 1.0 when not downscaled) so a coordinate read off the written image maps back to native pixels by multiplying by 1.0/scale. To inspect a small or dense UI region at full native resolution (the computer-use 'zoom' affordance), pass a tight client-relative region and omit the pixel budget."
     )]
     pub async fn capture_screenshot(
         &self,
@@ -568,7 +568,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. Uses chrome.scripting for page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback."
+        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. Uses chrome.scripting for page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
     )]
     pub async fn browser_screenshot(
         &self,
@@ -1456,6 +1456,8 @@ impl SynapseService {
             region: Some(bitmap.region),
             window_hwnd: None,
             overwrite: params.overwrite,
+            max_pixels: params.max_pixels,
+            max_long_edge: params.max_long_edge,
         };
         let screenshot = write_screenshot_bitmap_with_quality(
             &write_params,
@@ -1476,6 +1478,9 @@ impl SynapseService {
             page_region,
             width: screenshot.width,
             height: screenshot.height,
+            native_width: screenshot.native_width,
+            native_height: screenshot.native_height,
+            scale: screenshot.scale,
             bytes_written: screenshot.bytes_written,
             bitmap_sha256: screenshot.bitmap_sha256,
             cdp_target_id: captured.target_id,
@@ -1763,6 +1768,8 @@ impl SynapseService {
             region: params.region,
             window_hwnd: Some(params.window_hwnd),
             overwrite: params.overwrite,
+            max_pixels: None,
+            max_long_edge: None,
         };
         let screenshot = self.capture_hidden_desktop_screenshot_to_file(
             &screenshot_params,
@@ -13310,6 +13317,11 @@ fn write_screenshot_bitmap_with_quality(
             ),
         ));
     }
+    let source_region = captured.region;
+    let native_width = captured.width;
+    let native_height = captured.height;
+    let (captured, scale) =
+        downscale_captured_bitmap(captured, params.max_pixels, params.max_long_edge)?;
     save_screenshot_bitmap_with_quality(&captured, &temp_path, format, jpeg_quality)?;
     install_screenshot_file(&temp_path, &output_path, params.overwrite)?;
     let metadata = std::fs::metadata(&output_path).map_err(|error| {
@@ -13334,13 +13346,116 @@ fn write_screenshot_bitmap_with_quality(
         path: output_path.to_string_lossy().into_owned(),
         format,
         capture_backend: capture_backend.to_owned(),
-        region: captured.region,
+        region: source_region,
         width: captured.width,
         height: captured.height,
+        native_width,
+        native_height,
+        scale,
         bytes_written: metadata.len(),
         bitmap_sha256,
         foreground,
     })
+}
+
+/// Compute the aspect-preserving downscale factor for a `width`x`height` bitmap
+/// so it fits within an optional `max_pixels` total-pixel budget and an optional
+/// `max_long_edge` longest-edge budget. Returns the scale in `(0.0, 1.0]`; `1.0`
+/// means no downscale is required. The more restrictive constraint wins. Loudly
+/// rejects zero budgets so a caller never silently gets an un-scaled image.
+fn screenshot_downscale_scale(
+    width: u32,
+    height: u32,
+    max_pixels: Option<u64>,
+    max_long_edge: Option<u32>,
+) -> Result<f64, ErrorData> {
+    if let Some(0) = max_pixels {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "capture_screenshot max_pixels must be greater than zero",
+        ));
+    }
+    if let Some(0) = max_long_edge {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "capture_screenshot max_long_edge must be greater than zero",
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot cannot scale an empty {width}x{height} bitmap"),
+        ));
+    }
+    let mut scale = 1.0_f64;
+    if let Some(max_long_edge) = max_long_edge {
+        let long_edge = width.max(height);
+        if long_edge > max_long_edge {
+            scale = scale.min(f64::from(max_long_edge) / f64::from(long_edge));
+        }
+    }
+    if let Some(max_pixels) = max_pixels {
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > max_pixels {
+            // Area scales with the square of the linear factor.
+            scale = scale.min((max_pixels as f64 / pixels as f64).sqrt());
+        }
+    }
+    Ok(scale.min(1.0))
+}
+
+/// Downscale a captured BGRA bitmap (aspect-preserving) to fit the optional vision
+/// pixel budget, returning the possibly-resized bitmap and the applied scale
+/// (`written_long_edge / native_long_edge`). A scale of `1.0` returns the bitmap
+/// untouched. Uses Lanczos3 resampling via the `image` crate already linked here.
+fn downscale_captured_bitmap(
+    captured: synapse_capture::CapturedBgraBitmap,
+    max_pixels: Option<u64>,
+    max_long_edge: Option<u32>,
+) -> Result<(synapse_capture::CapturedBgraBitmap, f64), ErrorData> {
+    let scale =
+        screenshot_downscale_scale(captured.width, captured.height, max_pixels, max_long_edge)?;
+    if scale >= 1.0 {
+        return Ok((captured, 1.0));
+    }
+    let native_long_edge = captured.width.max(captured.height);
+    let target_width = ((f64::from(captured.width) * scale).round() as u32).max(1);
+    let target_height = ((f64::from(captured.height) * scale).round() as u32).max(1);
+    // Build an RgbaImage from the BGRA source, resize, then swap back to BGRA so the
+    // downstream encoder (which expects BGRA) keeps working unchanged.
+    let mut rgba = captured.bytes;
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let source = RgbaImage::from_raw(captured.width, captured.height, rgba).ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "capture_screenshot could not build image buffer from {}x{} bitmap before downscale",
+                captured.width, captured.height
+            ),
+        )
+    })?;
+    let resized = image::imageops::resize(
+        &source,
+        target_width,
+        target_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let resized_width = resized.width();
+    let resized_height = resized.height();
+    let mut bgra = resized.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let applied_scale = f64::from(resized_width.max(resized_height)) / f64::from(native_long_edge);
+    let bitmap = synapse_capture::CapturedBgraBitmap {
+        region: bitmap_full_region(resized_width, resized_height)?,
+        width: resized_width,
+        height: resized_height,
+        bytes: bgra,
+    };
+    Ok((bitmap, applied_scale))
 }
 
 fn hidden_desktop_pip_ended_response(
@@ -15590,6 +15705,7 @@ mod tests {
         SynapseService, TargetWire, attach_find_hygiene_annotations,
         attach_ocr_hygiene_annotations, browser_wait_for_selector_condition,
         cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
+        downscale_captured_bitmap, screenshot_downscale_scale,
         chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
         hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
         page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
@@ -15630,6 +15746,125 @@ mod tests {
     use synapse_storage::cf;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    // Builds a synthetic BGRA bitmap of known dimensions whose pixels encode a
+    // predictable gradient, so a resize can be checked for plausible content
+    // (not all-zero/garbage) in addition to dimensions.
+    fn synthetic_bgra(width: u32, height: u32) -> synapse_capture::CapturedBgraBitmap {
+        let mut bytes = vec![0u8; (width as usize) * (height as usize) * 4];
+        for (i, pixel) in bytes.chunks_exact_mut(4).enumerate() {
+            let v = (i % 251) as u8;
+            pixel[0] = v; // B
+            pixel[1] = v.wrapping_add(40); // G
+            pixel[2] = v.wrapping_add(80); // R
+            pixel[3] = 255; // A
+        }
+        synapse_capture::CapturedBgraBitmap {
+            region: Rect {
+                x: 0,
+                y: 0,
+                w: width as i32,
+                h: height as i32,
+            },
+            width,
+            height,
+            bytes,
+        }
+    }
+
+    // #1336 — pure scale math. Known input → known output (X+X=Y style):
+    // a 4000x2000 native image under a 1568 long-edge budget must scale by
+    // exactly 1568/4000 = 0.392.
+    #[test]
+    fn screenshot_downscale_scale_honors_long_edge_budget() {
+        let scale = screenshot_downscale_scale(4000, 2000, None, Some(1568))
+            .expect("valid long-edge budget");
+        assert!((scale - 1568.0 / 4000.0).abs() < 1e-9, "scale was {scale}");
+    }
+
+    // Pixel budget: 2000x1000 = 2_000_000 px under a 1_150_000 px budget must
+    // scale by sqrt(1_150_000/2_000_000) so output area lands at the budget.
+    #[test]
+    fn screenshot_downscale_scale_honors_pixel_budget() {
+        let scale = screenshot_downscale_scale(2000, 1000, Some(1_150_000), None)
+            .expect("valid pixel budget");
+        let expected = (1_150_000.0_f64 / 2_000_000.0).sqrt();
+        assert!((scale - expected).abs() < 1e-9, "scale was {scale}");
+    }
+
+    // The MORE restrictive of the two constraints wins.
+    #[test]
+    fn screenshot_downscale_scale_picks_more_restrictive() {
+        // long-edge 1568/4000=0.392 vs pixels sqrt(1_150_000/8_000_000)=0.379 -> pixels wins
+        let scale = screenshot_downscale_scale(4000, 2000, Some(1_150_000), Some(1568))
+            .expect("valid budgets");
+        let expected = (1_150_000.0_f64 / 8_000_000.0).sqrt();
+        assert!((scale - expected).abs() < 1e-9, "scale was {scale}");
+    }
+
+    // Edge case: a budget larger than the native image is a no-op (scale == 1.0).
+    #[test]
+    fn screenshot_downscale_scale_noop_when_within_budget() {
+        let scale = screenshot_downscale_scale(800, 600, Some(10_000_000), Some(4096))
+            .expect("valid budgets");
+        assert_eq!(scale, 1.0);
+        // No budget at all is also a no-op.
+        let none = screenshot_downscale_scale(800, 600, None, None).expect("no budget");
+        assert_eq!(none, 1.0);
+    }
+
+    // Edge case: zero budgets must fail loudly, never silently skip scaling.
+    #[test]
+    fn screenshot_downscale_scale_rejects_zero_budgets() {
+        let pixels_err =
+            screenshot_downscale_scale(800, 600, Some(0), None).expect_err("zero max_pixels");
+        assert_eq!(
+            pixels_err
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        let edge_err =
+            screenshot_downscale_scale(800, 600, None, Some(0)).expect_err("zero max_long_edge");
+        assert_eq!(
+            edge_err
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    // End-to-end on real bytes: a 1000x500 bitmap downscaled to a 200 long-edge
+    // budget must produce a 200x100 BGRA buffer (aspect preserved, 4 bytes/px)
+    // and report scale 0.2.
+    #[test]
+    fn downscale_captured_bitmap_resizes_real_bytes() {
+        let native = synthetic_bgra(1000, 500);
+        let (resized, scale) =
+            downscale_captured_bitmap(native, None, Some(200)).expect("resize ok");
+        assert_eq!(resized.width, 200);
+        assert_eq!(resized.height, 100);
+        assert_eq!(
+            resized.bytes.len(),
+            (resized.width as usize) * (resized.height as usize) * 4
+        );
+        assert!((scale - 0.2).abs() < 1e-9, "scale was {scale}");
+        // Alpha must remain opaque after resampling (sanity that BGRA layout held).
+        assert!(resized.bytes.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    // No-op path returns the bitmap untouched and scale 1.0.
+    #[test]
+    fn downscale_captured_bitmap_noop_returns_native() {
+        let native = synthetic_bgra(640, 480);
+        let (out, scale) = downscale_captured_bitmap(native, Some(10_000_000), None).expect("noop");
+        assert_eq!((out.width, out.height), (640, 480));
+        assert_eq!(scale, 1.0);
+    }
 
     // Locks the MCP→a11y selector-engine enum mapping (#1110): every wire engine
     // and layout relation must route to its a11y counterpart 1:1, so a new engine

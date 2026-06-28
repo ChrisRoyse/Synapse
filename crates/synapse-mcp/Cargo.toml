@@ -72,6 +72,8 @@ windows.workspace = true
 x11rb.workspace = true
 
 [dev-dependencies]
+# Integration tests decode the written PNG/JPEG to physically verify pixel dimensions.
+image.workspace = true
 insta.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
