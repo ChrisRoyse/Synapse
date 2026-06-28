@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-25-set-field-element-id-v1";
-const BRIDGE_BUILD_SHA256 = "9e86887b4adca69e359078527fb16f1bc30ebe10576e4073d2707f1415541a0b";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-shadow-dom-pierce-v1";
+const BRIDGE_BUILD_SHA256 = "420e9a0d082cb9be706631a174c23d22ff61cc9a86a1a0fa731ba09586f962d5";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -3388,16 +3388,34 @@ function pageScreenshotSetupInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
+    // Shadow-aware: "s" token re-enters the current element's open shadowRoot.
+    const parts = String(path).split(".");
     let node = document.documentElement;
-    if (parts.length === 1 && parts[0] === 0) {
+    if (Number(parts[0]) !== 0) {
+      return null;
+    }
+    if (parts.length === 1) {
       return node;
     }
-    for (const index of parts.slice(1)) {
-      if (!node || !node.children || !Number.isSafeInteger(index) || index < 0 || index >= node.children.length) {
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
+      let scope = node;
+      if (enterShadow) {
+        if (!node || !node.shadowRoot) {
+          return null;
+        }
+        scope = node.shadowRoot;
+        enterShadow = false;
+      }
+      if (!scope || !scope.children || !Number.isSafeInteger(index) || index < 0 || index >= scope.children.length) {
         return null;
       }
-      node = node.children[index];
+      node = scope.children[index];
     }
     return node;
   };
@@ -9918,16 +9936,33 @@ function fileUploadResolveInputInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
-    let current = document.documentElement;
-    if (parts[0] !== 0) {
+    // Shadow-aware path: numeric tokens index into children; the literal token
+    // "s" means the next numeric token indexes into the current element's open
+    // shadowRoot.children. Pure-numeric (legacy light-DOM) paths still resolve.
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
       return null;
     }
-    for (const index of parts.slice(1)) {
+    let current = document.documentElement;
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
       if (!current || !Number.isSafeInteger(index) || index < 0) {
         return null;
       }
-      current = current.children[index] || null;
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children[index] || null;
     }
     return current instanceof Element ? current : null;
   }
@@ -12659,9 +12694,18 @@ function runAssertPollInPage(request) {
     if (!query.trim()) {
       return [];
     }
-    const found = Array.from(rootElement.querySelectorAll(query));
-    if (rootElement.matches?.(query)) {
-      found.unshift(rootElement);
+    const found = [];
+    if (rootElement instanceof Element && rootElement.matches?.(query)) {
+      found.push(rootElement);
+    }
+    // Run the selector inside each tree scope (light DOM + every open shadow
+    // root) and union the results. An invalid selector throws from the first
+    // querySelectorAll and is reported as ERROR_SELECTOR_INVALID upstream.
+    for (const scope of shadowScopes(rootElement)) {
+      const matches = scope.querySelectorAll(query);
+      for (const node of matches) {
+        found.push(node);
+      }
     }
     return uniqueElements(found);
   }
@@ -12790,11 +12834,50 @@ function runAssertPollInPage(request) {
   }
 
   function allElements(rootElement) {
-    const list = Array.from(rootElement.querySelectorAll("*"));
-    if (rootElement instanceof Element) {
-      list.unshift(rootElement);
+    // Deep, shadow-piercing enumeration in document order. Descends into every
+    // open shadowRoot (closed roots are unreachable by spec). Mirrors the
+    // raw-CDP path and Playwright's default open-shadow piercing.
+    const out = [];
+    const seen = new Set();
+    collect(rootElement);
+    return out;
+
+    function collect(node) {
+      if (!node) {
+        return;
+      }
+      if (node instanceof Element) {
+        if (seen.has(node)) {
+          return;
+        }
+        seen.add(node);
+        out.push(node);
+        if (node.shadowRoot) {
+          for (const child of node.shadowRoot.children) {
+            collect(child);
+          }
+        }
+      }
+      const kids = node.children;
+      if (kids) {
+        for (const child of kids) {
+          collect(child);
+        }
+      }
     }
-    return uniqueElements(list);
+  }
+
+  function shadowScopes(rootElement) {
+    // The rootElement's own tree scope plus every open shadowRoot reachable from
+    // it. Each scope supports scope-local querySelectorAll (CSS combinators only
+    // resolve within a single tree scope, matching Playwright semantics).
+    const scopes = [rootElement];
+    for (const element of allElements(rootElement)) {
+      if (element.shadowRoot) {
+        scopes.push(element.shadowRoot);
+      }
+    }
+    return scopes;
   }
 
   function uniqueElements(elements) {
@@ -12867,11 +12950,16 @@ function runAssertPollInPage(request) {
   }
 
   function accessibleName(element) {
+    // Resolve id-based references within the element's own tree scope (its
+    // shadow root, or the document for light DOM) so labels inside shadow
+    // components are found. getElementById/querySelector exist on both
+    // Document and ShadowRoot.
+    const scope = (element.getRootNode && element.getRootNode()) || document;
     const labelledBy = String(element.getAttribute("aria-labelledby") || "").trim();
     if (labelledBy) {
       const text = labelledBy
         .split(/\s+/)
-        .map((id) => document.getElementById(id)?.textContent || "")
+        .map((id) => scope.getElementById?.(id)?.textContent || "")
         .join(" ")
         .trim();
       if (text) {
@@ -12885,7 +12973,7 @@ function runAssertPollInPage(request) {
       }
     }
     if (element.id) {
-      const label = document.querySelector(`label[for="${cssEscapeLocal(element.id)}"]`);
+      const label = scope.querySelector?.(`label[for="${cssEscapeLocal(element.id)}"]`);
       if (label?.textContent?.trim()) {
         return label.textContent;
       }
@@ -12949,16 +13037,33 @@ function runAssertPollInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
-    let current = document.documentElement;
-    if (parts[0] !== 0) {
+    // Shadow-aware path: numeric tokens index into children; the literal token
+    // "s" means the next numeric token indexes into the current element's open
+    // shadowRoot.children. Pure-numeric (legacy light-DOM) paths still resolve.
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
       return null;
     }
-    for (const index of parts.slice(1)) {
+    let current = document.documentElement;
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
       if (!current || !Number.isSafeInteger(index) || index < 0) {
         return null;
       }
-      current = current.children[index] || null;
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children[index] || null;
     }
     return current instanceof Element ? current : null;
   }
@@ -12968,11 +13073,21 @@ function runAssertPollInPage(request) {
     let current = element;
     while (current && current instanceof Element && current !== document.documentElement) {
       const parent = current.parentElement;
-      if (!parent) {
-        break;
+      if (parent) {
+        parts.unshift(Array.prototype.indexOf.call(parent.children, current));
+        current = parent;
+        continue;
       }
-      parts.unshift(Array.prototype.indexOf.call(parent.children, current));
-      current = parent;
+      // No element parent: if we are at the top of an open shadow tree, cross the
+      // boundary via the host and emit an "s" marker so elementByPath can re-enter.
+      const root = current.parentNode;
+      if (root && root instanceof ShadowRoot) {
+        parts.unshift(Array.prototype.indexOf.call(root.children, current));
+        parts.unshift("s");
+        current = root.host;
+        continue;
+      }
+      break;
     }
     parts.unshift(0);
     return parts.join(".");
@@ -13395,16 +13510,33 @@ async function runBridgeElementCommandInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
-    let current = document.documentElement;
-    if (parts[0] !== 0) {
+    // Shadow-aware path: numeric tokens index into children; the literal token
+    // "s" means the next numeric token indexes into the current element's open
+    // shadowRoot.children. Pure-numeric (legacy light-DOM) paths still resolve.
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
       return null;
     }
-    for (const index of parts.slice(1)) {
+    let current = document.documentElement;
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
       if (!current || !Number.isSafeInteger(index) || index < 0) {
         return null;
       }
-      current = current.children[index] || null;
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children[index] || null;
     }
     return current instanceof Element ? current : null;
   }
@@ -13414,11 +13546,19 @@ async function runBridgeElementCommandInPage(request) {
     let current = target;
     while (current && current instanceof Element && current !== document.documentElement) {
       const parent = current.parentElement;
-      if (!parent) {
-        break;
+      if (parent) {
+        parts.unshift(Array.prototype.indexOf.call(parent.children, current));
+        current = parent;
+        continue;
       }
-      parts.unshift(Array.prototype.indexOf.call(parent.children, current));
-      current = parent;
+      const root = current.parentNode;
+      if (root && root instanceof ShadowRoot) {
+        parts.unshift(Array.prototype.indexOf.call(root.children, current));
+        parts.unshift("s");
+        current = root.host;
+        continue;
+      }
+      break;
     }
     parts.unshift(0);
     return parts.join(".");
@@ -13943,16 +14083,31 @@ function bridgeElementByPath(path) {
   if (!path) {
     return null;
   }
-  const parts = String(path).split(".").map((part) => Number(part));
-  let current = document.documentElement;
-  if (parts[0] !== 0) {
+  // Shadow-aware: "s" token re-enters the current element's open shadowRoot.
+  const parts = String(path).split(".");
+  if (Number(parts[0]) !== 0) {
     return null;
   }
-  for (const index of parts.slice(1)) {
+  let current = document.documentElement;
+  let enterShadow = false;
+  for (const raw of parts.slice(1)) {
+    if (raw === "s") {
+      enterShadow = true;
+      continue;
+    }
+    const index = Number(raw);
     if (!current || !Number.isSafeInteger(index) || index < 0) {
       return null;
     }
-    current = current.children[index] || null;
+    let scope = current;
+    if (enterShadow) {
+      if (!current.shadowRoot) {
+        return null;
+      }
+      scope = current.shadowRoot;
+      enterShadow = false;
+    }
+    current = scope.children[index] || null;
   }
   return current instanceof Element ? current : null;
 }
@@ -13962,11 +14117,19 @@ function bridgeDomPath(element) {
   let current = element;
   while (current && current instanceof Element && current !== document.documentElement) {
     const parent = current.parentElement;
-    if (!parent) {
-      break;
+    if (parent) {
+      parts.unshift(Array.prototype.indexOf.call(parent.children, current));
+      current = parent;
+      continue;
     }
-    parts.unshift(Array.prototype.indexOf.call(parent.children, current));
-    current = parent;
+    const root = current.parentNode;
+    if (root && root instanceof ShadowRoot) {
+      parts.unshift(Array.prototype.indexOf.call(root.children, current));
+      parts.unshift("s");
+      current = root.host;
+      continue;
+    }
+    break;
   }
   parts.unshift(0);
   return parts.join(".");
@@ -14238,16 +14401,33 @@ function runAriaSnapshotInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
-    let current = document.documentElement;
-    if (parts[0] !== 0) {
+    // Shadow-aware path: numeric tokens index into children; the literal token
+    // "s" means the next numeric token indexes into the current element's open
+    // shadowRoot.children. Pure-numeric (legacy light-DOM) paths still resolve.
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
       return null;
     }
-    for (const index of parts.slice(1)) {
+    let current = document.documentElement;
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
       if (!current || !Number.isSafeInteger(index) || index < 0) {
         return null;
       }
-      current = current.children[index] || null;
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children[index] || null;
     }
     return current instanceof Element ? current : null;
   }
@@ -14257,11 +14437,21 @@ function runAriaSnapshotInPage(request) {
     let current = element;
     while (current && current instanceof Element && current !== document.documentElement) {
       const parent = current.parentElement;
-      if (!parent) {
-        break;
+      if (parent) {
+        parts.unshift(Array.prototype.indexOf.call(parent.children, current));
+        current = parent;
+        continue;
       }
-      parts.unshift(Array.prototype.indexOf.call(parent.children, current));
-      current = parent;
+      // No element parent: if we are at the top of an open shadow tree, cross the
+      // boundary via the host and emit an "s" marker so elementByPath can re-enter.
+      const root = current.parentNode;
+      if (root && root instanceof ShadowRoot) {
+        parts.unshift(Array.prototype.indexOf.call(root.children, current));
+        parts.unshift("s");
+        current = root.host;
+        continue;
+      }
+      break;
     }
     parts.unshift(0);
     return parts.join(".");
@@ -15418,18 +15608,62 @@ function setFieldValueInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
-    if (!Number.isSafeInteger(parts[0]) || parts[0] !== 0) {
+    // Shadow-aware: "s" token re-enters the current element's open shadowRoot.
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
       return null;
     }
     let current = document.documentElement;
-    for (const index of parts.slice(1)) {
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
       if (!current || !Number.isSafeInteger(index) || index < 0) {
         return null;
       }
-      current = current.children ? current.children[index] : null;
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children ? scope.children[index] : null;
     }
     return current instanceof Element ? current : null;
+  }
+
+  function deepQueryAllLocal(sel) {
+    // Shadow-piercing querySelectorAll union across the document and every open
+    // shadow root. Throws on an invalid selector.
+    const out = [];
+    const seen = new Set();
+    const scopes = [document];
+    const stack = [document];
+    while (stack.length) {
+      const node = stack.pop();
+      const all = node.querySelectorAll ? node.querySelectorAll("*") : [];
+      for (const el of all) {
+        if (el.shadowRoot) {
+          scopes.push(el.shadowRoot);
+          stack.push(el.shadowRoot);
+        }
+      }
+    }
+    for (const scope of scopes) {
+      const matches = scope.querySelectorAll(sel);
+      for (const el of matches) {
+        if (!seen.has(el)) {
+          seen.add(el);
+          out.push(el);
+        }
+      }
+    }
+    return out;
   }
 
   function isEditable(el) {
@@ -15484,7 +15718,7 @@ function setFieldValueInPage(request) {
   if (selector) {
     let nodes;
     try {
-      nodes = Array.from(document.querySelectorAll(selector));
+      nodes = deepQueryAllLocal(selector);
     } catch (error) {
       return {
         ok: false,
@@ -16587,7 +16821,7 @@ async function performDomActionInPage(request) {
     if (loc.selector) {
       resolvedBy = "selector";
       try {
-        candidates = Array.from(document.querySelectorAll(loc.selector));
+        candidates = deepQueryAllLocal(loc.selector);
       } catch (error) {
         return fail(ERROR_SELECTOR_INVALID, `invalid selector ${JSON.stringify(loc.selector)}: ${errorMessageLocal(error)}`);
       }
@@ -16645,37 +16879,83 @@ async function performDomActionInPage(request) {
     if (!path) {
       return null;
     }
-    const parts = String(path).split(".").map((part) => Number(part));
-    let current = document.documentElement;
-    if (parts[0] !== 0) {
+    // Shadow-aware: "s" token re-enters the current element's open shadowRoot.
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
       return null;
     }
-    for (const index of parts.slice(1)) {
+    let current = document.documentElement;
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
       if (!current || !Number.isSafeInteger(index) || index < 0) {
         return null;
       }
-      current = current.children[index] || null;
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children[index] || null;
     }
     return current instanceof Element ? current : null;
   }
 
+  function deepQueryAllLocal(selector) {
+    // Shadow-piercing querySelectorAll: run the selector in the document scope
+    // and in every reachable open shadow root, union the results. CSS combinators
+    // resolve within a single tree scope (Playwright semantics). Throws on an
+    // invalid selector so the caller can report it.
+    const out = [];
+    const seen = new Set();
+    const scopes = [document];
+    const stack = [document];
+    while (stack.length) {
+      const node = stack.pop();
+      const all = node.querySelectorAll ? node.querySelectorAll("*") : [];
+      for (const el of all) {
+        if (el.shadowRoot) {
+          scopes.push(el.shadowRoot);
+          stack.push(el.shadowRoot);
+        }
+      }
+    }
+    for (const scope of scopes) {
+      const matches = scope.querySelectorAll(selector);
+      for (const el of matches) {
+        if (!seen.has(el)) {
+          seen.add(el);
+          out.push(el);
+        }
+      }
+    }
+    return out;
+  }
+
   function semanticCandidates(actionName) {
     if (["dispatch_event", "focus", "blur", "select_text"].includes(actionName)) {
-      return Array.from(document.querySelectorAll("*"));
+      return deepQueryAllLocal("*");
     }
     if (actionName === "clear") {
-      return Array.from(document.querySelectorAll("input,textarea,[contenteditable],[role='textbox']"));
+      return deepQueryAllLocal("input,textarea,[contenteditable],[role='textbox']");
     }
     if (actionName === "check" || actionName === "uncheck") {
-      return Array.from(document.querySelectorAll("input[type='checkbox'],input[type='radio'],[role='checkbox'],[role='radio']"));
+      return deepQueryAllLocal("input[type='checkbox'],input[type='radio'],[role='checkbox'],[role='radio']");
     }
     if (actionName === "select") {
-      return Array.from(document.querySelectorAll("select,[role='combobox'],[role='listbox']"));
+      return deepQueryAllLocal("select,[role='combobox'],[role='listbox']");
     }
     if (actionName === "submit") {
-      return Array.from(document.querySelectorAll("form,button,input[type='submit'],input[type='image'],input[type='button'],[role='button']"));
+      return deepQueryAllLocal("form,button,input[type='submit'],input[type='image'],input[type='button'],[role='button']");
     }
-    return Array.from(document.querySelectorAll("button,a[href],input[type='button'],input[type='submit'],input[type='reset'],summary,[role='button'],[role='link'],[role='menuitem'],[role='tab'],[tabindex]"));
+    return deepQueryAllLocal("button,a[href],input[type='button'],input[type='submit'],input[type='reset'],summary,[role='button'],[role='link'],[role='menuitem'],[role='tab'],[tabindex]");
   }
 
   function performClick(element, actionName, count, options, events) {
