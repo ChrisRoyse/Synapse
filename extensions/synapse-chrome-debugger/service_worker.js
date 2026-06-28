@@ -15200,7 +15200,13 @@ function readPageVitalsInPage() {
 }
 
 function readActiveElementInPage() {
-  const element = document.activeElement;
+  // Descend into open shadow roots: document.activeElement reports the shadow
+  // HOST, not the focused element inside it (#1335). Walk to the innermost
+  // focused node so readback reflects a focused shadow-DOM editor.
+  let element = document.activeElement;
+  while (element && element.shadowRoot && element.shadowRoot.activeElement) {
+    element = element.shadowRoot.activeElement;
+  }
   if (!element) {
     return {
       has_active_element: false,
@@ -15254,7 +15260,10 @@ function readActiveElementInPage() {
 }
 
 function typeActiveElementInPage(text) {
-  const element = document.activeElement;
+  let element = document.activeElement;
+  while (element && element.shadowRoot && element.shadowRoot.activeElement) {
+    element = element.shadowRoot.activeElement;
+  }
   const before = readActiveElementLocal();
   if (!element || !before.has_active_element) {
     return {
@@ -15316,7 +15325,10 @@ function typeActiveElementInPage(text) {
   };
 
   function readActiveElementLocal() {
-    const active = document.activeElement;
+    let active = document.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+      active = active.shadowRoot.activeElement;
+    }
     if (!active) {
       return {
         has_active_element: false,
