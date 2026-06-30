@@ -19,9 +19,8 @@ use super::{
     BrowserWaitForResponse, BrowserWaitForSelectorParams, BrowserWaitForSelectorResponse,
     BrowserWaitForSelectorState, BrowserWaitForState, BrowserWaitForUrlMatchKind,
     BrowserWaitForUrlParams, BrowserWaitForUrlResponse, BrowserWaitParams, BrowserWaitResponse,
-    CaptureScreenshotFormat,
-    CaptureScreenshotParams, CaptureScreenshotResponse, CdpActivateTabParams,
-    CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
+    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
+    CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
     CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
     CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
@@ -2709,7 +2708,9 @@ impl SynapseService {
         let missing = |field: &str| {
             mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                format!("browser_wait_for condition={condition:?} requires the `{field}` spec object"),
+                format!(
+                    "browser_wait_for condition={condition:?} requires the `{field}` spec object"
+                ),
             )
         };
         match condition {
@@ -4649,7 +4650,7 @@ impl SynapseService {
         }
     }
 
-    fn cdp_target_owner_for_readback(
+    pub(super) fn cdp_target_owner_for_readback(
         &self,
         tool: &str,
         session_id: &str,
@@ -4686,6 +4687,26 @@ impl SynapseService {
             owned_by_session,
         )
         .map(|(_key, owner)| Some(owner))
+    }
+
+    fn active_cdp_target_owner_for_window(
+        &self,
+        tool: &str,
+        session_id: &str,
+        window_hwnd: i64,
+    ) -> Result<Option<CdpTargetOwner>, ErrorData> {
+        let active_target = self.session_target(Some(session_id))?;
+        let Some(SessionTarget::Cdp {
+            window_hwnd: active_window_hwnd,
+            cdp_target_id,
+        }) = active_target
+        else {
+            return Ok(None);
+        };
+        if active_window_hwnd != window_hwnd {
+            return Ok(None);
+        }
+        self.cdp_target_owner_for_readback(tool, session_id, &cdp_target_id)
     }
 
     fn cdp_target_owners_for_target_id(
@@ -4881,10 +4902,14 @@ impl SynapseService {
         }
 
         let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
+        let expected_chrome_window_id = self
+            .active_cdp_target_owner_for_window("cdp_open_tab", session_id, window_hwnd)?
+            .and_then(|owner| owner.chrome_window_id);
         let opened = crate::chrome_debugger_bridge::open_tab(
             window_hwnd,
             requested_url,
             Some(session_id),
+            expected_chrome_window_id,
             Some(window_bounds),
             Some(window_title),
         )
@@ -5447,8 +5472,12 @@ impl SynapseService {
                 ),
             ));
         }
+        let expected_chrome_window_id = self
+            .active_cdp_target_owner_for_window("browser_tabs", session_id, window_context.hwnd)?
+            .and_then(|owner| owner.chrome_window_id);
         let listed = crate::chrome_debugger_bridge::list_tabs(
             window_context.hwnd,
+            expected_chrome_window_id,
             Some(window_context.window_bounds),
             Some(&window_context.window_title),
         )
@@ -12666,8 +12695,12 @@ fn capture_target_window_screenshot_to_file(
 /// service worker drops its WebSocket on some GPU/WebGL-heavy pages). This is the
 /// recoverable case where a passive WGC window capture is a valid substitute.
 fn browser_screenshot_bridge_disconnected(error: &ErrorData) -> bool {
-    error.message.contains("disconnected before command response")
-        || error.message.contains("client closed direct HTTP WebSocket")
+    error
+        .message
+        .contains("disconnected before command response")
+        || error
+            .message
+            .contains("client closed direct HTTP WebSocket")
 }
 
 /// #1341/#1343: produce a browser_screenshot result from a passive per-window WGC
@@ -15989,21 +16022,20 @@ mod tests {
         SynapseService, TargetWire, attach_find_hygiene_annotations,
         attach_ocr_hygiene_annotations, browser_wait_for_selector_condition,
         cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
-        downscale_captured_bitmap, screenshot_downscale_scale,
         chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
-        hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-        page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
-        resolve_capture_target_window_context, select_single_active_browser_tab, sha256_hex,
-        target_wire, template_value, unavailable_page_vitals_info,
-        validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
-        validate_browser_add_style_tag_params, validate_browser_downloads_params,
-        validate_browser_evaluate_params, validate_browser_expose_binding_params,
-        validate_browser_frame_locator, validate_browser_set_content_params,
-        validate_browser_tabs_params, validate_browser_wait_for_function_params,
-        validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
-        validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
-        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
-        validate_target_window,
+        downscale_captured_bitmap, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
+        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
+        resolve_browser_tag_source, resolve_capture_target_window_context,
+        screenshot_downscale_scale, select_single_active_browser_tab, sha256_hex, target_wire,
+        template_value, unavailable_page_vitals_info, validate_browser_add_init_script_params,
+        validate_browser_add_script_tag_params, validate_browser_add_style_tag_params,
+        validate_browser_downloads_params, validate_browser_evaluate_params,
+        validate_browser_expose_binding_params, validate_browser_frame_locator,
+        validate_browser_set_content_params, validate_browser_tabs_params,
+        validate_browser_wait_for_function_params, validate_browser_wait_for_load_state_params,
+        validate_browser_wait_for_params, validate_browser_wait_for_request_params,
+        validate_browser_wait_for_response_params, validate_browser_wait_for_selector_params,
+        validate_browser_wait_for_url_params, validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,

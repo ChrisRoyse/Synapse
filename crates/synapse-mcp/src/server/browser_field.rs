@@ -356,10 +356,24 @@ impl SynapseService {
             Locator::ElementId(element_id) => (None, Some(element_id.as_str()), false),
             Locator::ActiveElement => (None, None, true),
         };
+        let owner = self.cdp_target_owner_for_readback(TOOL, session_id, cdp_target_id)?;
+        if let Some(owner) = owner.as_ref()
+            && owner.window_hwnd != window_hwnd
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{TOOL} refused target {cdp_target_id:?}: owner window {:#x} does not match requested window {:#x}",
+                    owner.window_hwnd, window_hwnd
+                ),
+            ));
+        }
+        let expected_chrome_window_id = owner.as_ref().and_then(|owner| owner.chrome_window_id);
 
         let result = crate::chrome_debugger_bridge::set_field_value(
             window_hwnd,
             cdp_target_id,
+            expected_chrome_window_id,
             selector_arg,
             element_id_arg,
             active_arg,
@@ -383,6 +397,17 @@ impl SynapseService {
                 format!("{TOOL} bridge returned no after_value for target {cdp_target_id:?}"),
             )
         })?;
+        if let Some(expected_window_id) = expected_chrome_window_id
+            && result.chrome_window_id != Some(expected_window_id)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "{TOOL} bridge returned Chrome window {:?} for target {cdp_target_id:?}, expected Chrome window {expected_window_id}",
+                    result.chrome_window_id
+                ),
+            ));
+        }
 
         // SoT #1: the in-page post-set value must equal the requested text.
         if !value_matches(&after_value, text) {
@@ -400,7 +425,7 @@ impl SynapseService {
         let info = crate::chrome_debugger_bridge::target_info(
             window_hwnd,
             cdp_target_id,
-            None,
+            expected_chrome_window_id,
             expected_context.as_ref().map(|context| context.window_bounds),
             expected_context
                 .as_ref()
@@ -416,6 +441,17 @@ impl SynapseService {
                     ),
                 )
             })?;
+        if let Some(expected_window_id) = expected_chrome_window_id
+            && info.chrome_window_id != Some(expected_window_id)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "{TOOL} separate active-element readback returned Chrome window {:?} for target {cdp_target_id:?}, expected Chrome window {expected_window_id}",
+                    info.chrome_window_id
+                ),
+            ));
+        }
         let independent = info
             .active_element
             .as_ref()
@@ -435,6 +471,12 @@ impl SynapseService {
         let before_len = char_len(&before_value);
         let after_len = char_len(&after_value);
         let changed = before_value != after_value;
+        let trusted_text_backend = result.readback_backend.contains("chrome.debugger.Input");
+        let source_of_truth = if trusted_text_backend {
+            "chrome.debugger.Input text dispatch + chrome.scripting editable readback + separate chrome.tabs active-element readback"
+        } else {
+            SOURCE_OF_TRUTH
+        };
 
         tracing::info!(
             code = "BROWSER_SET_VALUE_READBACK",
@@ -444,11 +486,13 @@ impl SynapseService {
             resolved_by = %result.resolved_by,
             match_count = result.match_count,
             tag_name = %result.tag_name,
+            readback_backend = %result.readback_backend,
+            trusted_text_backend,
             before_len,
             after_len,
             requested_len,
             changed,
-            "readback=browser_set_value method=chrome.scripting.executeScript dual_verified=true"
+            "readback=browser_set_value dual_verified=true"
         );
 
         Ok(BrowserSetValueResponse {
@@ -460,7 +504,7 @@ impl SynapseService {
             resolved_by: result.resolved_by,
             match_count: result.match_count,
             tag_name: result.tag_name,
-            source_of_truth: SOURCE_OF_TRUTH.to_owned(),
+            source_of_truth: source_of_truth.to_owned(),
             requested_len,
             before_len,
             after_len,

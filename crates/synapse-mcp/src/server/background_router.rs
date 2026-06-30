@@ -761,8 +761,14 @@ impl SynapseService {
                     // press a named button/link = a real trusted click on the
                     // bridge target; keep the synthetic "press" DOM-action only as
                     // the raw-CDP/native fallback (#1348 headline #2).
-                    target_act_dom_locator_pointer(self, "click", "press", &params, &request_context)
-                        .await?
+                    target_act_dom_locator_pointer(
+                        self,
+                        "click",
+                        "press",
+                        &params,
+                        &request_context,
+                    )
+                    .await?
                 }
             }
             "select" => {
@@ -893,9 +899,7 @@ impl SynapseService {
                 }
             }
             "scroll" => target_act_scroll(self, &params, &request_context).await?,
-            "set_window_bounds" => {
-                target_act_set_window_bounds(self, &params, &request_context)?
-            }
+            "set_window_bounds" => target_act_set_window_bounds(self, &params, &request_context)?,
             other => return Err(target_act_unknown_verb_error(other)),
         };
 
@@ -3307,8 +3311,7 @@ async fn target_act_coordinate_click(
                     ));
                 }
             };
-            if let Err(error) =
-                target_act_window_coordinate_foreground_preflight(hwnd, &session_id)
+            if let Err(error) = target_act_window_coordinate_foreground_preflight(hwnd, &session_id)
             {
                 service.audit_action_denied_with_details_for_session(
                     "target_act",
@@ -3998,9 +4001,11 @@ async fn target_act_bridge_cdp_input(
             action,
             selector: params.selector.as_deref(),
             element_id: params.element_id.as_deref(),
+            active_element: false,
             role: params.role.as_deref(),
             name: params.name.as_deref(),
             value: params.value.as_deref(),
+            text: params.text.as_deref(),
             x: coordinate.map(|value| value.x),
             y: coordinate.map(|value| value.y),
             coordinate_space,
@@ -4677,8 +4682,18 @@ async fn target_act_scroll(
             )
         })
     };
-    let dx = params.args.first().map(|s| parse_delta(s)).transpose()?.unwrap_or(0);
-    let dy = params.args.get(1).map(|s| parse_delta(s)).transpose()?.unwrap_or(0);
+    let dx = params
+        .args
+        .first()
+        .map(|s| parse_delta(s))
+        .transpose()?
+        .unwrap_or(0);
+    let dy = params
+        .args
+        .get(1)
+        .map(|s| parse_delta(s))
+        .transpose()?
+        .unwrap_or(0);
     if dx == 0 && dy == 0 {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -6335,7 +6350,10 @@ fn target_act_foreground_lost_error(
         "target_act native/window coordinate click: the target 0x{target_root:x} is not the OS foreground at click time; foreground moved to root=0x{foreground_root:x} process={} title={:?}. {remediation}.{}",
         foreground.process_name,
         foreground.window_title,
-        extra.as_ref().map(|e| format!(" ({e})")).unwrap_or_default()
+        extra
+            .as_ref()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default()
     );
     ErrorData::new(
         rmcp::model::ErrorCode(-32099),

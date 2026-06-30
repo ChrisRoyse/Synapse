@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-28-html5realdrag-v5";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-30-window-id-v2";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "46bc726e7c179786b61eb18186811a58aacf6f3ccabf5cbde929be6e9782146d";
+    "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -1688,6 +1688,8 @@ pub(crate) struct ChromeDebuggerTypeActiveElementResult {
 pub(crate) struct ChromeDebuggerSetFieldValueResult {
     pub target_id: String,
     pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
     #[serde(default)]
     pub chars_requested: u32,
     pub readback_backend: String,
@@ -5490,6 +5492,7 @@ pub(crate) async fn open_tab(
     hwnd: i64,
     url: &str,
     agent_session_id: Option<&str>,
+    expected_chrome_window_id: Option<i64>,
     expected_window_bounds: Option<Rect>,
     expected_window_title: Option<&str>,
 ) -> Result<ChromeDebuggerOpenTabResult, ChromeDebuggerBridgeError> {
@@ -5501,6 +5504,7 @@ pub(crate) async fn open_tab(
                 "hwnd": hwnd,
                 "url": url,
                 "agentSessionId": agent_session_id,
+                "expectedChromeWindowId": expected_chrome_window_id,
                 "expectedWindowBounds": expected_window_bounds.map(|bounds| json!({
                     "x": bounds.x,
                     "y": bounds.y,
@@ -5520,6 +5524,7 @@ pub(crate) async fn open_tab(
 
 pub(crate) async fn list_tabs(
     hwnd: i64,
+    expected_chrome_window_id: Option<i64>,
     expected_window_bounds: Option<Rect>,
     expected_window_title: Option<&str>,
 ) -> Result<ChromeDebuggerListTabsResult, ChromeDebuggerBridgeError> {
@@ -5529,6 +5534,7 @@ pub(crate) async fn list_tabs(
             "listTabs",
             json!({
                 "hwnd": hwnd,
+                "expectedChromeWindowId": expected_chrome_window_id,
                 "expectedWindowBounds": expected_window_bounds.map(|bounds| json!({
                     "x": bounds.x,
                     "y": bounds.y,
@@ -5958,13 +5964,15 @@ pub(crate) async fn type_active_element(
     target_id: &str,
     text: &str,
 ) -> Result<ChromeDebuggerTypeActiveElementResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "typeActiveElement")?;
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "cdpInput")?;
     let result = bridge()
         .send_command(
-            "typeActiveElement",
+            "cdpInput",
             json!({
                 "hwnd": hwnd,
                 "targetIdHint": target_id,
+                "action": "type_text",
+                "activeElement": true,
                 "text": text,
             }),
         )
@@ -5986,6 +5994,7 @@ pub(crate) async fn type_active_element(
 pub(crate) async fn set_field_value(
     hwnd: i64,
     target_id: &str,
+    expected_chrome_window_id: Option<i64>,
     selector: Option<&str>,
     element_id: Option<&str>,
     active_element: bool,
@@ -5998,6 +6007,7 @@ pub(crate) async fn set_field_value(
             json!({
                 "hwnd": hwnd,
                 "targetIdHint": target_id,
+                "expectedChromeWindowId": expected_chrome_window_id,
                 "selector": selector,
                 "elementId": element_id,
                 "activeElement": active_element,
@@ -6808,9 +6818,11 @@ pub(crate) struct ChromeDebuggerCdpInputRequest<'a> {
     pub action: &'a str,
     pub selector: Option<&'a str>,
     pub element_id: Option<&'a str>,
+    pub active_element: bool,
     pub role: Option<&'a str>,
     pub name: Option<&'a str>,
     pub value: Option<&'a str>,
+    pub text: Option<&'a str>,
     pub x: Option<i32>,
     pub y: Option<i32>,
     pub coordinate_space: Option<&'a str>,
@@ -6845,9 +6857,11 @@ pub(crate) async fn cdp_input(
                 "action": request.action,
                 "selector": request.selector,
                 "elementId": request.element_id,
+                "activeElement": request.active_element,
                 "role": request.role,
                 "name": request.name,
                 "value": request.value,
+                "text": request.text,
                 "x": request.x,
                 "y": request.y,
                 "coordinateSpace": request.coordinate_space,

@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-html5realdrag-v5";
-const BRIDGE_BUILD_SHA256 = "46bc726e7c179786b61eb18186811a58aacf6f3ccabf5cbde929be6e9782146d";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-30-window-id-v2";
+const BRIDGE_BUILD_SHA256 = "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -4088,55 +4088,22 @@ function base64ByteLength(value) {
 async function handleTypeActiveElement(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const text = String(params.text ?? "");
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
-    );
-  }
-  let results;
-  try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId: selected.tabId, allFrames: true },
-      func: typeActiveElementInPage,
-      args: [text]
-    });
-  } catch (error) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `chrome.scripting.executeScript typeActiveElement(${selected.tabId}) failed: ${errorMessage(error)}`
-    );
-  }
-  const frameResults = frameExecutionResults(results);
-  const okFrames = frameResults.filter((frame) => frame.result && frame.result.ok);
-  const first = okFrames[0] || frameResults.find((frame) => frame.result) || null;
-  const result = first?.result;
-  if (!result || typeof result !== "object") {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      "chrome.scripting.executeScript typeActiveElement returned no structured result"
-    );
-  }
-  if (!result.ok) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `typeActiveElement failed: code=${String(result.error_code || "UNKNOWN")} detail=${String(result.error_detail || "")}`
-    );
-  }
-  return {
-    extension_id: chrome.runtime.id,
-    target_id: selected.target.id,
-    tab_id: selected.tabId,
-    chars_typed: [...text].length,
-    readback_backend: "chrome.scripting.executeScript",
-    frame_id: first.frame_id,
-    frame_document_id: first.document_id,
-    frame_result_count: frameResults.length,
-    frame_results: frameResults.map(summarizeFrameExecutionResult),
-    target_candidate_count: selected.targetCandidateCount,
-    target_selection_reason: selected.selectionReason,
-    ...result
-  };
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforePageText = await tabPageTextState(selected.tabId);
+  return await handleCdpInputText(
+    selected,
+    "type_text",
+    {
+      ...params,
+      activeElement: true,
+      text
+    },
+    before,
+    beforePageText,
+    5000,
+    true,
+    5000
+  );
 }
 
 async function createDomActionPopupTabs(selected, beforeState, actionResult) {
@@ -4685,6 +4652,18 @@ async function handleCdpInput(params) {
       autoWaitTimeoutMs
     );
   }
+  if (action === "set_text" || action === "type_text") {
+    return await handleCdpInputText(
+      selected,
+      action,
+      params,
+      before,
+      beforePageText,
+      waitTimeoutMs,
+      autoWait,
+      autoWaitTimeoutMs
+    );
+  }
   let point;
   let frameId = 0;
   let resolved = {
@@ -4847,6 +4826,740 @@ async function handleCdpInput(params) {
     tab_activation_for_touch: touchActivation,
     ...resolved
   };
+}
+
+async function handleCdpInputText(
+  selected,
+  action,
+  params,
+  before,
+  beforePageText,
+  waitTimeoutMs,
+  autoWait,
+  autoWaitTimeoutMs
+) {
+  const text = String(params.text ?? "");
+  if (action === "type_text" && text.length === 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "cdpInput type_text requires non-empty text; use set_text with an explicit editable target to clear or replace text"
+    );
+  }
+  const tabActivation = await activateTabForCdpTouch(selected.tabId, before, action);
+  const prepared = await cdpTextInputTargetScript(selected, action, params, {
+    operation: "prepare",
+    autoWait,
+    autoWaitTimeoutMs
+  });
+  const dispatch = await dispatchCdpTextInput(selected.tabId, action, text);
+  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
+  const afterPageText = await tabPageTextState(selected.tabId);
+  const readback = await cdpTextInputTargetScript(selected, action, params, {
+    operation: "read",
+    autoWait: false,
+    autoWaitTimeoutMs: 0
+  });
+  const afterValue = String(readback.after_value ?? "");
+  if (action === "set_text" && afterValue !== text) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED,
+      `cdpInput set_text postcondition failed: requested_len=${text.length} after_len=${afterValue.length} ` +
+        `resolved_by=${String(readback.resolved_by || prepared.resolved_by)} frame_id=${String(readback.frame_id ?? prepared.frame_id)}`
+    );
+  }
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.chrome_window_id,
+    action,
+    before_page: before,
+    after_page: after,
+    before_page_text: beforePageText,
+    after_page_text: afterPageText,
+    readback_backend: "chrome.debugger.Input.insertText+chrome.scripting.executeScript(editable readback)",
+    required_foreground: false,
+    frame_id: readback.frame_id ?? prepared.frame_id,
+    frame_document_id: readback.frame_document_id ?? prepared.frame_document_id,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason,
+    method: dispatch.method,
+    dispatched_events: dispatch.dispatched_events,
+    debugger_protocol_version: dispatch.protocol_version,
+    tab_activation_for_input: tabActivation,
+    viewport_point: prepared.action_point || null,
+    resolved_by: readback.resolved_by || prepared.resolved_by,
+    match_count: readback.match_count ?? prepared.match_count,
+    matched_count: readback.match_count ?? prepared.match_count,
+    tag_name: readback.tag_name || prepared.tag_name,
+    is_editable: true,
+    editable_kind: readback.editable_kind || prepared.editable_kind,
+    selection_mode: prepared.selection_mode,
+    before_value: prepared.before_value,
+    after_value: afterValue,
+    expected_value: action === "set_text" ? text : afterValue,
+    chars_requested: Array.from(text).length,
+    chars_typed: Array.from(text).length,
+    before_active_element: prepared.before_active_element,
+    after_active_element: readback.after_active_element,
+    before_element: prepared.before_element,
+    after_element: readback.after_element,
+    auto_wait: prepared.auto_wait,
+    auto_wait_readback: prepared.auto_wait_readback,
+    frame_result_count: prepared.frame_result_count,
+    frame_results: prepared.frame_results
+  };
+}
+
+async function cdpTextInputTargetInPage(request) {
+  const ERROR_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
+  const ERROR_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
+  const ERROR_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONABLE";
+  const ERROR_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
+  const ERROR_BROWSER_WAIT_TIMEOUT = "BROWSER_WAIT_TIMEOUT";
+
+  const action = String(request?.action || "").trim().toLowerCase();
+  const operation = String(request?.operation || "read").trim().toLowerCase();
+  const selector = request?.selector == null ? "" : String(request.selector).trim();
+  const elementPath = request?.elementPath == null ? "" : String(request.elementPath).trim();
+  const wantActive = Boolean(request?.activeElement);
+  const autoWait = Boolean(request?.autoWait);
+  const autoWaitTimeoutMs = Number.isSafeInteger(request?.autoWaitTimeoutMs)
+    ? Math.max(50, Math.min(request.autoWaitTimeoutMs, 30000))
+    : 2000;
+  const locatorCount = (selector ? 1 : 0) + (elementPath ? 1 : 0) + (wantActive ? 1 : 0);
+  if (!["set_text", "type_text"].includes(action)) {
+    return fail(ERROR_ACTION_UNSUPPORTED, `unsupported cdp text action ${JSON.stringify(action)}`);
+  }
+  if (!["prepare", "read"].includes(operation)) {
+    return fail(ERROR_ACTION_UNSUPPORTED, `unsupported cdp text operation ${JSON.stringify(operation)}`);
+  }
+  if (locatorCount !== 1) {
+    return fail(
+      ERROR_ACTION_UNSUPPORTED,
+      `cdpInput ${action} requires exactly one of selector, elementId, or activeElement=true`
+    );
+  }
+
+  const resolved = resolveEditableElement();
+  if (!resolved.ok) {
+    return resolved;
+  }
+  const element = resolved.element;
+  const beforeElement = elementSummary(element);
+  const beforeActiveElement = readActiveElementLocal();
+  const beforeValue = readValue(element);
+
+  if (operation === "read") {
+    return {
+      ok: true,
+      action,
+      operation,
+      resolved_by: resolved.resolvedBy,
+      match_count: resolved.matchCount,
+      tag_name: tag(element),
+      editable_kind: editableKind(element),
+      before_value: beforeValue,
+      after_value: beforeValue,
+      before_active_element: beforeActiveElement,
+      after_active_element: readActiveElementLocal(),
+      before_element: beforeElement,
+      after_element: elementSummary(element),
+      selection_mode: "read_only",
+      auto_wait: false,
+      auto_wait_readback: null
+    };
+  }
+
+  let actionability = actionabilitySnapshot(element);
+  let autoWaitReadback = null;
+  if (autoWait && !actionability.ok) {
+    autoWaitReadback = await waitForActionability(element, autoWaitTimeoutMs);
+    actionability = autoWaitReadback.last_actionability || actionability;
+    if (!autoWaitReadback.ok) {
+      return fail(
+        ERROR_BROWSER_WAIT_TIMEOUT,
+        `cdpInput ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for editable actionability; unmet predicates: ${autoWaitReadback.predicate_detail}`,
+        {
+          resolved_by: resolved.resolvedBy,
+          match_count: resolved.matchCount,
+          before_element: beforeElement,
+          before_active_element: beforeActiveElement,
+          auto_wait: true,
+          auto_wait_readback: autoWaitReadback
+        }
+      );
+    }
+  }
+  if (!actionability.ok) {
+    return fail(ERROR_ELEMENT_NOT_ACTIONABLE, `resolved editable is not actionable: ${actionability.predicate_detail}`, {
+      resolved_by: resolved.resolvedBy,
+      match_count: resolved.matchCount,
+      before_element: beforeElement,
+      before_active_element: beforeActiveElement,
+      actionability
+    });
+  }
+
+  const actionPoint = elementClickPoint(element);
+  let selectionMode = "focused";
+  try {
+    if (typeof element.focus === "function") {
+      element.focus({ preventScroll: true });
+    }
+  } catch (_) {
+    try {
+      element.focus();
+    } catch (_) {
+      // The active-element readback below is the verdict.
+    }
+  }
+  if (action === "set_text") {
+    selectionMode = selectAllEditable(element);
+  }
+  const afterActiveElement = readActiveElementLocal();
+  if (!activeMatchesElement(element)) {
+    return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "focused editable did not become the active input target before CDP text dispatch", {
+      resolved_by: resolved.resolvedBy,
+      match_count: resolved.matchCount,
+      before_element: beforeElement,
+      before_active_element: beforeActiveElement,
+      after_active_element: afterActiveElement,
+      selection_mode: selectionMode
+    });
+  }
+
+  return {
+    ok: true,
+    action,
+    operation,
+    resolved_by: resolved.resolvedBy,
+    match_count: resolved.matchCount,
+    tag_name: tag(element),
+    editable_kind: editableKind(element),
+    before_value: beforeValue,
+    after_value: readValue(element),
+    before_active_element: beforeActiveElement,
+    after_active_element: afterActiveElement,
+    before_element: beforeElement,
+    after_element: elementSummary(element),
+    action_point: actionPoint,
+    selection_mode: selectionMode,
+    auto_wait: autoWait,
+    auto_wait_readback: autoWaitReadback
+  };
+
+  function resolveEditableElement() {
+    let element = null;
+    let resolvedBy = "";
+    let matchCount = 0;
+    if (selector) {
+      let nodes;
+      try {
+        nodes = deepQueryAllLocal(selector);
+      } catch (error) {
+        return fail("CHROME_DOM_SELECTOR_INVALID", `querySelectorAll(${selector}) threw: ${String(error?.message || error)}`);
+      }
+      const editable = nodes.filter((node) => editableKind(node) && isElementVisible(node));
+      matchCount = editable.length;
+      if (editable.length === 0) {
+        return fail(ERROR_ELEMENT_NOT_FOUND, `selector matched ${nodes.length} node(s), 0 editable+visible`, {
+          selector_match_count: nodes.length,
+          match_count: 0
+        });
+      }
+      if (editable.length > 1) {
+        return fail(ERROR_ELEMENT_AMBIGUOUS, `selector matched ${editable.length} editable+visible nodes; refine the selector`, {
+          editable_match_count: editable.length,
+          match_count: editable.length
+        });
+      }
+      element = editable[0];
+      resolvedBy = "selector";
+    } else if (elementPath) {
+      element = elementByPath(elementPath);
+      matchCount = element ? 1 : 0;
+      resolvedBy = "element_id";
+      if (!element) {
+        return fail(ERROR_ELEMENT_NOT_FOUND, `bridge element path ${elementPath} did not resolve in this frame`, {
+          element_path: elementPath,
+          match_count: 0
+        });
+      }
+    } else if (wantActive) {
+      element = activeElementLocal();
+      matchCount = element ? 1 : 0;
+      resolvedBy = "active_element";
+      if (!element) {
+        return fail("CHROME_ACTIVE_ELEMENT_MISSING", "document.activeElement is absent", { match_count: 0 });
+      }
+    }
+    if (!element || !(element instanceof Element)) {
+      return fail(ERROR_ELEMENT_NOT_FOUND, "no editable element resolved", { match_count: 0 });
+    }
+    const kind = editableKind(element);
+    if (!kind) {
+      return fail("CHROME_ACTIVE_ELEMENT_NOT_EDITABLE", `resolved element ${tag(element)} is not a supported editable target`, {
+        resolved_by: resolvedBy,
+        match_count: matchCount,
+        before_element: elementSummary(element)
+      });
+    }
+    return { ok: true, element, resolvedBy, matchCount };
+  }
+
+  function waitForActionability(element, timeoutMs) {
+    const started = Date.now();
+    const deadline = started + timeoutMs;
+    let pollCount = 0;
+    let last = null;
+    return new Promise((resolve) => {
+      const poll = () => {
+        last = actionabilitySnapshot(element);
+        pollCount += 1;
+        if (last.ok || Date.now() >= deadline) {
+          resolve({
+            ok: Boolean(last.ok),
+            requirement: "editable_action_ready",
+            timeout_ms: timeoutMs,
+            poll_count: pollCount,
+            elapsed_ms: Math.max(0, Date.now() - started),
+            unmet_predicates: last.unmet_predicates,
+            predicate_detail: last.predicate_detail,
+            last_actionability: last
+          });
+          return;
+        }
+        setTimeout(poll, 50);
+      };
+      poll();
+    });
+  }
+
+  function actionabilitySnapshot(element) {
+    const attached = Boolean(element && element.isConnected);
+    const editable = Boolean(editableKind(element));
+    const enabled = attached && isElementEnabled(element);
+    const visible = attached && isElementVisible(element);
+    const hit = visible ? hitTest(element) : { receives_events: false, detail: "not_visible" };
+    const unmet = [];
+    if (!attached) unmet.push({ predicate: "attached", reason: "detached" });
+    if (!editable) unmet.push({ predicate: "editable", reason: "not_editable" });
+    if (!enabled) unmet.push({ predicate: "enabled", reason: "disabled_or_aria_disabled" });
+    if (!visible) unmet.push({ predicate: "visible", reason: "not_visible" });
+    if (!hit.receives_events) unmet.push({ predicate: "receives_events", reason: hit.detail || "hit_test_failed" });
+    return {
+      ok: unmet.length === 0,
+      attached,
+      editable,
+      enabled,
+      visible,
+      hit_test: hit,
+      unmet_predicates: unmet,
+      predicate_detail: unmet.length ? unmet.map((item) => item.predicate).join(",") : "none"
+    };
+  }
+
+  function hitTest(element) {
+    const point = elementClickPoint(element);
+    const top = document.elementFromPoint(point.x, point.y);
+    const receives = Boolean(top && (top === element || element.contains(top) || top.contains(element)));
+    return {
+      receives_events: receives,
+      point,
+      top_tag_name: top instanceof Element ? tag(top) : null,
+      top_id: top instanceof Element ? String(top.id || "") : null,
+      detail: receives ? "ok" : "covered_or_outside"
+    };
+  }
+
+  function elementClickPoint(element) {
+    try {
+      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    } catch (_) {
+      try {
+        element.scrollIntoView();
+      } catch (_) {
+        // Fall through to the current box.
+      }
+    }
+    const rect = element.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2)),
+      y: Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2))
+    };
+  }
+
+  function selectAllEditable(element) {
+    const kind = editableKind(element);
+    if (kind === "value") {
+      if (typeof element.select === "function") {
+        element.select();
+      } else if (typeof element.setSelectionRange === "function") {
+        const value = String(element.value ?? "");
+        element.setSelectionRange(0, value.length);
+      } else {
+        throw new Error(`value editable ${tag(element)} does not expose select() or setSelectionRange()`);
+      }
+      return "selected_value";
+    }
+    if (kind === "contenteditable") {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return "selected_contenteditable";
+    }
+    throw new Error(`resolved ${tag(element)} is not editable`);
+  }
+
+  function activeMatchesElement(element) {
+    const active = activeElementLocal();
+    return Boolean(active && (active === element || element.contains(active)));
+  }
+
+  function activeElementLocal() {
+    let active = document.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+      active = active.shadowRoot.activeElement;
+    }
+    return active instanceof Element ? active : null;
+  }
+
+  function readActiveElementLocal() {
+    const active = activeElementLocal();
+    if (!active) {
+      return {
+        available: true,
+        readback_source: "chrome.scripting.executeScript",
+        has_active_element: false,
+        is_editable: false,
+        tag_name: "",
+        id: "",
+        name: "",
+        value: null,
+        selected_text: null
+      };
+    }
+    return {
+      available: true,
+      readback_source: "chrome.scripting.executeScript",
+      has_active_element: true,
+      is_editable: Boolean(editableKind(active)),
+      tag_name: String(active.tagName || ""),
+      id: String(active.id || ""),
+      name: String(active.getAttribute("name") || ""),
+      value: editableKind(active) ? readValue(active) : null,
+      selected_text: selectedText(active)
+    };
+  }
+
+  function selectedText(active) {
+    try {
+      if (typeof active.selectionStart === "number" && typeof active.selectionEnd === "number" && "value" in active) {
+        return String(active.value ?? "").slice(active.selectionStart, active.selectionEnd);
+      }
+      const selection = window.getSelection();
+      return selection && selection.rangeCount > 0 ? String(selection.toString() || "") : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function elementSummary(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+    const value = readValue(element);
+    return {
+      tag_name: tag(element),
+      role: String(element.getAttribute("role") || ""),
+      id: String(element.id || ""),
+      name_attr: String(element.getAttribute("name") || ""),
+      type_attr: String(element.getAttribute("type") || ""),
+      text: trimForReadback(element.textContent || "", 160),
+      value_len: value.length,
+      visible: isElementVisible(element),
+      enabled: isElementEnabled(element),
+      editable_kind: editableKind(element)
+    };
+  }
+
+  function elementByPath(path) {
+    if (!path) {
+      return null;
+    }
+    const parts = String(path).split(".");
+    if (Number(parts[0]) !== 0) {
+      return null;
+    }
+    let current = document.documentElement;
+    let enterShadow = false;
+    for (const raw of parts.slice(1)) {
+      if (raw === "s") {
+        enterShadow = true;
+        continue;
+      }
+      const index = Number(raw);
+      if (!current || !Number.isSafeInteger(index) || index < 0) {
+        return null;
+      }
+      let scope = current;
+      if (enterShadow) {
+        if (!current.shadowRoot) {
+          return null;
+        }
+        scope = current.shadowRoot;
+        enterShadow = false;
+      }
+      current = scope.children ? scope.children[index] : null;
+    }
+    return current instanceof Element ? current : null;
+  }
+
+  function deepQueryAllLocal(sel) {
+    const out = [];
+    const seen = new Set();
+    const scopes = [document];
+    const stack = [document];
+    while (stack.length) {
+      const node = stack.pop();
+      const all = node.querySelectorAll ? node.querySelectorAll("*") : [];
+      for (const el of all) {
+        if (el.shadowRoot) {
+          scopes.push(el.shadowRoot);
+          stack.push(el.shadowRoot);
+        }
+      }
+    }
+    for (const scope of scopes) {
+      const matches = scope.querySelectorAll(sel);
+      for (const el of matches) {
+        if (!seen.has(el)) {
+          seen.add(el);
+          out.push(el);
+        }
+      }
+    }
+    return out;
+  }
+
+  function editableKind(element) {
+    if (!(element instanceof Element) || element.disabled || element.readOnly) {
+      return null;
+    }
+    const lower = tag(element);
+    if (lower === "textarea") {
+      return "value";
+    }
+    if (lower === "input") {
+      const type = String(element.getAttribute("type") || "text").toLowerCase();
+      const nonText = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
+      return nonText.includes(type) ? null : "value";
+    }
+    if (
+      element.isContentEditable ||
+      String(element.getAttribute("contenteditable") || "").toLowerCase() === "true"
+    ) {
+      return "contenteditable";
+    }
+    return null;
+  }
+
+  function readValue(element) {
+    const kind = editableKind(element);
+    if (kind === "value" && "value" in element) {
+      return String(element.value ?? "");
+    }
+    if (kind === "contenteditable") {
+      return readContentEditableValue(element);
+    }
+    return "";
+  }
+
+  function readContentEditableValue(element) {
+    const textContent = String(element.textContent ?? "");
+    if (textContent.length === 0) {
+      return "";
+    }
+    return String(element.innerText || textContent || "");
+  }
+
+  function isElementEnabled(element) {
+    if (Boolean(element.disabled)) {
+      return false;
+    }
+    return String(element.getAttribute("aria-disabled") || "").toLowerCase() !== "true";
+  }
+
+  function isElementVisible(element) {
+    if (!(element instanceof Element) || !element.isConnected) {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    if (!style || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+      return false;
+    }
+    if (Number(style.opacity) === 0) {
+      return false;
+    }
+    const rects = element.getClientRects();
+    return rects && rects.length > 0 && Array.from(rects).some((rect) => rect.width > 0 && rect.height > 0);
+  }
+
+  function tag(element) {
+    return String(element?.localName || element?.tagName || "").toLowerCase();
+  }
+
+  function trimForReadback(value, maxLen) {
+    const text = String(value ?? "");
+    return text.length > maxLen ? text.slice(0, maxLen) : text;
+  }
+
+  function fail(code, detail, extra = {}) {
+    return {
+      ok: false,
+      error_code: code,
+      error_detail: detail,
+      ...extra
+    };
+  }
+}
+
+async function cdpTextInputTargetScript(selected, action, params, options) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  const requestedElementId = stringOrNull(params.elementId);
+  const bridgeElement = requestedElementId && requestedElementId.startsWith("chrome-tab:")
+    ? parseChromeBridgeElementId(requestedElementId, selected.tabId, "cdpInput")
+    : { raw: requestedElementId, frameId: null, path: null };
+  const request = {
+    action,
+    operation: String(options.operation || "read"),
+    selector: stringOrNull(params.selector),
+    elementId: requestedElementId,
+    elementPath: bridgeElement.path,
+    activeElement: Boolean(params.activeElement),
+    autoWait: Boolean(options.autoWait),
+    autoWaitTimeoutMs: Number.isSafeInteger(options.autoWaitTimeoutMs) ? options.autoWaitTimeoutMs : 2000
+  };
+  if (!request.selector && !request.elementId && !request.activeElement) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `cdpInput ${action} requires selector, elementId, or activeElement=true`
+    );
+  }
+  const scriptTarget = { tabId: selected.tabId };
+  if (Number.isSafeInteger(bridgeElement.frameId)) {
+    scriptTarget.frameIds = [bridgeElement.frameId];
+  } else {
+    scriptTarget.allFrames = true;
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: scriptTarget,
+      func: cdpTextInputTargetInPage,
+      args: [request]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript cdpInput(${selected.tabId}, ${action}, ${request.operation}) failed: ${errorMessage(error)}`
+    );
+  }
+  const frameResults = frameExecutionResults(injected);
+  const okFrames = frameResults.filter((frame) => frame.result && frame.result.ok);
+  const totalMatches = frameResults.reduce((sum, frame) => sum + frameResolvedMatchCount(frame), 0);
+  const ambiguousFrames = frameResults.filter((frame) =>
+    frame.result?.error_code === ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS
+  );
+  if (okFrames.length > 1 || totalMatches > 1 || ambiguousFrames.length > 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS,
+      `cdpInput ${action} ${request.operation} matched ${totalMatches} editable element(s) across ${frameResults.length} frame(s); ` +
+        `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
+    );
+  }
+  const first = okFrames[0] || null;
+  if (!first || !first.result || typeof first.result !== "object") {
+    const failed = frameResults.find((frame) => frame.result)?.result;
+    throw bridgeError(
+      String(failed?.error_code || ERROR_CHROME_DOM_ELEMENT_NOT_FOUND),
+      `cdpInput ${action} ${request.operation} failed across ${frameResults.length} frame(s): ${String(failed?.error_detail || "no matching frame result")}; ` +
+        `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
+    );
+  }
+  if (first.frame_id !== 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `cdpInput ${action} currently supports top-frame text targets only because chrome.debugger Input text dispatch uses the active page selection; ` +
+        `resolved frame_id=${first.frame_id}. Re-resolve a top-frame editor or use a raw-CDP frame-aware target.`
+    );
+  }
+  return {
+    ...first.result,
+    frame_id: first.frame_id,
+    frame_document_id: first.document_id,
+    frame_result_count: frameResults.length,
+    frame_results: frameResults.map(summarizeFrameExecutionResult)
+  };
+}
+
+async function dispatchCdpTextInput(tabId, action, text) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    if (action === "set_text" && text.length === 0) {
+      await sendDebuggerCommand(debuggee, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        key: "Delete",
+        code: "Delete",
+        windowsVirtualKeyCode: 46,
+        nativeVirtualKeyCode: 46,
+        commands: ["deleteForward"]
+      });
+      await sendDebuggerCommand(debuggee, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "Delete",
+        code: "Delete",
+        windowsVirtualKeyCode: 46,
+        nativeVirtualKeyCode: 46
+      });
+      return {
+        method: "Input.dispatchKeyEvent(Delete)",
+        dispatched_events: ["rawKeyDown(Delete)", "keyUp(Delete)"],
+        protocol_version: protocolVersion
+      };
+    }
+    await sendDebuggerCommand(debuggee, "Input.insertText", { text });
+    return {
+      method: "Input.insertText",
+      dispatched_events: ["insertText"],
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger ${action} text dispatch failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for text input tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
 }
 
 async function handleViewportEmulation(params) {
@@ -5264,6 +5977,8 @@ function normalizeCdpInputAction(value) {
     action === "tap" ||
     action === "click" ||
     action === "dblclick" ||
+    action === "set_text" ||
+    action === "type_text" ||
     action === "drag" ||
     action === "html5_drag" ||
     action === "html5_real_drag"
@@ -5272,7 +5987,7 @@ function normalizeCdpInputAction(value) {
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `cdpInput action must be hover, tap, click, dblclick, drag, html5_drag, or html5_real_drag; got ${JSON.stringify(value)}`
+    `cdpInput action must be hover, tap, click, dblclick, set_text, type_text, drag, html5_drag, or html5_real_drag; got ${JSON.stringify(value)}`
   );
 }
 
@@ -10285,17 +11000,7 @@ async function selectTabTarget(params, options = {}) {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.query returned no tab targets");
   }
   const targetIdHint = String(params.targetIdHint || "").trim();
-  let expectedWindowId = optionalInteger(params.expectedChromeWindowId);
-  const expectedWindow = await expectedChromeWindowForHwndHint(params);
-  if (Number.isInteger(expectedWindow?.windowId)) {
-    if (Number.isInteger(expectedWindowId) && expectedWindowId !== expectedWindow.windowId) {
-      throw bridgeError(
-        ERROR_AXTREE_FAILED,
-        `expectedChromeWindowId ${expectedWindowId} disagrees with hwnd ${String(params.hwnd)} mapping ${expectedWindow.windowId}`
-      );
-    }
-    expectedWindowId = expectedWindow.windowId;
-  }
+  const expectedWindowId = optionalInteger(params.expectedChromeWindowId);
   const tabIdHint = tabIdFromTargetId(targetIdHint);
   if (Number.isInteger(tabIdHint)) {
     const selectedById = tabs.find((target) => target.tabId === tabIdHint);
@@ -10325,10 +11030,24 @@ async function selectTabTarget(params, options = {}) {
         : `targetIdHint is required for mutating tab navigation; expected ${TAB_TARGET_PREFIX}<tabId>`
     );
   }
+  let effectiveExpectedWindowId = expectedWindowId;
+  const expectedWindow = await expectedChromeWindowForHwndHint(params);
+  if (Number.isInteger(expectedWindow?.windowId)) {
+    if (Number.isInteger(effectiveExpectedWindowId) && effectiveExpectedWindowId !== expectedWindow.windowId) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `expectedChromeWindowId ${effectiveExpectedWindowId} disagrees with hwnd ${String(params.hwnd)} mapping ${expectedWindow.windowId}`
+      );
+    }
+    effectiveExpectedWindowId = expectedWindow.windowId;
+  }
+  const scopedTabs = Number.isInteger(effectiveExpectedWindowId)
+    ? tabs.filter((target) => target.chromeWindowId === effectiveExpectedWindowId)
+    : tabs;
   const urlHint = String(params.foregroundUrlHint || "").trim();
   const titleHint = String(params.foregroundTitle || "").trim();
   if (urlHint) {
-    const matches = tabs.filter((target) => urlMatchesHint(target.url || "", urlHint));
+    const matches = scopedTabs.filter((target) => urlMatchesHint(target.url || "", urlHint));
     if (matches.length === 1) {
       return selectedPage(matches[0], tabs.length, "url_hint");
     }
@@ -10337,7 +11056,7 @@ async function selectTabTarget(params, options = {}) {
     }
   }
   if (titleHint) {
-    const matches = tabs.filter((target) => {
+    const matches = scopedTabs.filter((target) => {
       const title = target.title || "";
       return title && (titleHint.includes(title) || title.includes(titleHint));
     });
@@ -10347,6 +11066,21 @@ async function selectTabTarget(params, options = {}) {
     if (matches.length > 1) {
       throw bridgeError(ERROR_AXTREE_FAILED, `title hint matched ${matches.length} tab targets`);
     }
+  }
+  if (Number.isInteger(effectiveExpectedWindowId)) {
+    if (scopedTabs.length === 1) {
+      return selectedPage(scopedTabs[0], tabs.length, "expected_chrome_window_id_single_tab");
+    }
+    if (scopedTabs.length > 1) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `expectedChromeWindowId ${effectiveExpectedWindowId} contains ${scopedTabs.length} tab targets; targetIdHint is required`
+      );
+    }
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `expectedChromeWindowId ${effectiveExpectedWindowId} matched no tab targets`
+    );
   }
   return selectedPage(tabs[0], tabs.length, "fallback_first_tab");
 }
@@ -10447,7 +11181,30 @@ async function selectOpenWindowForHwndHint(params) {
     candidate.activeTabTitle = String(activeTab?.title || "");
     candidate.activeTabUrl = String(activeTab?.url || "");
   }));
+  const expectedWindowId = optionalInteger(params.expectedChromeWindowId);
+  if (Number.isInteger(expectedWindowId)) {
+    const selected = candidates.find((windowInfo) => windowInfo.id === expectedWindowId);
+    if (!selected) {
+      const candidateSummary = candidates
+        .map((windowInfo) => chromeWindowCandidateSummaryItem(windowInfo, normalizeExpectedWindowBounds(params.expectedWindowBounds)))
+        .join(",");
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `Chrome window mapping refused hwnd hint ${String(params.hwnd)}: expectedChromeWindowId ${expectedWindowId} was not present; ` +
+          `candidate_count=${candidates.length} candidates=[${candidateSummary}]`
+      );
+    }
+    return {
+      windowId: selected.id,
+      focused: selected.focused,
+      state: selected.state,
+      selectionReason: "expected_chrome_window_id_for_hwnd_hint",
+      candidateCount: candidates.length,
+      nonFocusedCount: candidates.filter((windowInfo) => !windowInfo.focused).length
+    };
+  }
   const expectedBounds = normalizeExpectedWindowBounds(params.expectedWindowBounds);
+  let ambiguousBoundsMatches = [];
   if (expectedBounds) {
     const boundsMatches = candidates
       .map((windowInfo) => ({
@@ -10468,15 +11225,13 @@ async function selectOpenWindowForHwndHint(params) {
       };
     }
     if (boundsMatches.length > 1) {
-      throw bridgeError(
-        ERROR_AXTREE_FAILED,
-        `Chrome window mapping refused hwnd hint ${String(params.hwnd)}: expected_window_bounds matched ${boundsMatches.length} Chrome windows within ${OPEN_WINDOW_BOUNDS_TOLERANCE_PX}px`
-      );
+      ambiguousBoundsMatches = boundsMatches.map((candidate) => candidate.windowInfo);
     }
   }
   const expectedTitle = normalizeExpectedWindowTitle(params.expectedWindowTitle);
   if (expectedTitle) {
-    const titleMatches = candidates.filter((windowInfo) =>
+    const titleCandidates = ambiguousBoundsMatches.length > 0 ? ambiguousBoundsMatches : candidates;
+    const titleMatches = titleCandidates.filter((windowInfo) =>
       chromeWindowTitleMatches(windowInfo.activeTabTitle, expectedTitle)
     );
     if (titleMatches.length === 1) {
@@ -10485,7 +11240,9 @@ async function selectOpenWindowForHwndHint(params) {
         windowId: selected.id,
         focused: selected.focused,
         state: selected.state,
-        selectionReason: "passive_active_tab_title_match_for_hwnd_hint",
+        selectionReason: ambiguousBoundsMatches.length > 0
+          ? "passive_window_bounds_and_title_match_for_hwnd_hint"
+          : "passive_active_tab_title_match_for_hwnd_hint",
         candidateCount: candidates.length,
         nonFocusedCount: candidates.filter((windowInfo) => !windowInfo.focused).length
       };
@@ -10496,6 +11253,12 @@ async function selectOpenWindowForHwndHint(params) {
         `Chrome window mapping refused hwnd hint ${String(params.hwnd)}: expected_window_title matched ${titleMatches.length} Chrome windows`
       );
     }
+  }
+  if (ambiguousBoundsMatches.length > 1) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `Chrome window mapping refused hwnd hint ${String(params.hwnd)}: expected_window_bounds matched ${ambiguousBoundsMatches.length} Chrome windows within ${OPEN_WINDOW_BOUNDS_TOLERANCE_PX}px and expected_window_title did not disambiguate`
+    );
   }
   if (expectedBounds || expectedTitle) {
     throw bridgeError(
@@ -15395,7 +16158,7 @@ function readActiveElementInPage() {
   if (valueCapable) {
     value = String(element.value ?? "");
   } else if (contentEditable) {
-    value = String(element.innerText || element.textContent || "");
+    value = readContentEditableValue(element);
   }
   let selectedText = null;
   try {
@@ -15419,6 +16182,14 @@ function readActiveElementInPage() {
     value,
     selected_text: selectedText
   };
+
+  function readContentEditableValue(el) {
+    const textContent = String(el.textContent ?? "");
+    if (textContent.length === 0) {
+      return "";
+    }
+    return String(el.innerText || textContent || "");
+  }
 }
 
 function typeActiveElementInPage(text) {
@@ -15517,7 +16288,7 @@ function typeActiveElementInPage(text) {
     if (valueCapable) {
       value = String(active.value ?? "");
     } else if (contentEditable) {
-      value = String(active.innerText || active.textContent || "");
+      value = readContentEditableValue(active);
     }
     let selectedText = null;
     try {
@@ -15588,9 +16359,17 @@ function typeActiveElementInPage(text) {
       } else {
         active.appendChild(document.createTextNode(inputText));
       }
-      return String(active.innerText || active.textContent || "");
+      return readContentEditableValue(active);
     }
     throw new Error(`active element ${tagName || "unknown"} is not text editable`);
+  }
+
+  function readContentEditableValue(active) {
+    const textContent = String(active.textContent ?? "");
+    if (textContent.length === 0) {
+      return "";
+    }
+    return String(active.innerText || textContent || "");
   }
 
   function dispatchSyntheticInputEventLocal(active, type, inputText, cancelable) {
@@ -15687,6 +16466,25 @@ async function handleSetFieldValue(params) {
         `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
     );
   }
+  if (String(first.result.editable_kind || "") === "contenteditable") {
+    const before = await tabPageState(selected.tabId, selected.target);
+    const beforePageText = await tabPageTextState(selected.tabId);
+    return await handleCdpInputText(
+      selected,
+      "set_text",
+      {
+        selector,
+        elementId,
+        activeElement,
+        text
+      },
+      before,
+      beforePageText,
+      5000,
+      true,
+      5000
+    );
+  }
 
   let actionResults;
   try {
@@ -15721,6 +16519,7 @@ async function handleSetFieldValue(params) {
     extension_id: chrome.runtime.id,
     target_id: selected.target.id,
     tab_id: selected.tabId,
+    chrome_window_id: selected.target.chromeWindowId,
     chars_requested: [...text].length,
     readback_backend: "chrome.scripting.executeScript",
     frame_id: first.frame_id,
@@ -15803,26 +16602,29 @@ function setFieldValueInPage(request) {
     return out;
   }
 
-  function isEditable(el) {
+  function editableKind(el) {
     if (!el || el.nodeType !== 1) {
-      return false;
+      return null;
     }
     if (el.disabled || el.readOnly) {
-      return false;
+      return null;
     }
     const tag = String(el.tagName || "").toLowerCase();
     if (tag === "textarea") {
-      return true;
+      return "value";
     }
     if (tag === "input") {
       const type = String(el.getAttribute("type") || "text").toLowerCase();
       const nonText = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
-      return !nonText.includes(type);
+      return nonText.includes(type) ? null : "value";
     }
-    return Boolean(
+    return (
       el.isContentEditable ||
         String(el.getAttribute && el.getAttribute("contenteditable") || "").toLowerCase() === "true"
-    );
+    ) ? "contenteditable" : null;
+  }
+  function isEditable(el) {
+    return Boolean(editableKind(el));
   }
   function isVisible(el) {
     if (!el || typeof el.getClientRects !== "function") {
@@ -15839,7 +16641,21 @@ function setFieldValueInPage(request) {
     if ((tag === "input" || tag === "textarea") && "value" in el) {
       return String(el.value ?? "");
     }
+    if (
+      el.isContentEditable ||
+      String((el.getAttribute && el.getAttribute("contenteditable")) || "").toLowerCase() === "true"
+    ) {
+      return readContentEditableValue(el);
+    }
     return String(el.innerText || el.textContent || "");
+  }
+
+  function readContentEditableValue(el) {
+    const textContent = String(el.textContent ?? "");
+    if (textContent.length === 0) {
+      return "";
+    }
+    return String(el.innerText || textContent || "");
   }
 
   let element = null;
@@ -15920,12 +16736,14 @@ function setFieldValueInPage(request) {
 
   const beforeValue = readValue(element);
   const tag = String(element.tagName || "").toLowerCase();
+  const kind = editableKind(element);
   if (resolveOnly) {
     return {
       ok: true,
       resolved_by: resolvedBy,
       match_count: matchCount,
       tag_name: tag,
+      editable_kind: kind,
       is_editable: true,
       before_value: beforeValue
     };
@@ -15977,7 +16795,7 @@ function setFieldValueInPage(request) {
     expected = String(element.value ?? "");
   } else {
     element.textContent = inputText;
-    expected = String(element.innerText || element.textContent || "");
+    expected = readValue(element);
   }
 
   let inputEvent;
@@ -16009,6 +16827,7 @@ function setFieldValueInPage(request) {
     resolved_by: resolvedBy,
     match_count: matchCount,
     tag_name: tag,
+    editable_kind: kind,
     is_editable: true,
     before_value: beforeValue,
     after_value: afterValue,
