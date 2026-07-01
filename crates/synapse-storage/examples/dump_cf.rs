@@ -8,7 +8,11 @@
 //!
 //! Usage: `cargo run -p synapse-storage --example dump_cf -- <db_path> <cf_name>`
 
-use std::error::Error;
+use std::{
+    error::Error,
+    fmt,
+    io::{self, Write},
+};
 
 use rocksdb::{DB, Options};
 use synapse_storage::{cf, timeline};
@@ -35,11 +39,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut row_count = 0_usize;
     let mut rows = Vec::new();
     for item in db.iterator_cf(&handle, rocksdb::IteratorMode::Start) {
-        let (key, value) = item?;
+        let (key, value) =
+            item.map_err(|error| format!("DUMP_CF_ROW_READ_FAILED cf={cf_name}: {error}"))?;
         rows.push((key.to_vec(), value.to_vec()));
         row_count += 1;
     }
-    println!("dump_cf db_path={db_path} cf={cf_name} mode=read_only row_count={row_count}");
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    if !write_stdout_line(
+        &mut stdout,
+        format_args!("dump_cf db_path={db_path} cf={cf_name} mode=read_only row_count={row_count}"),
+    )? {
+        return Ok(());
+    }
     for (index, (key, value)) in rows.iter().enumerate() {
         let key_hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
         let decoded_key = if cf_name == cf::CF_TIMELINE {
@@ -50,10 +62,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             String::new()
         };
-        println!(
-            "row[{index}] key_hex={key_hex}{decoded_key} value={}",
-            String::from_utf8_lossy(value)
-        );
+        if !write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "row[{index}] key_hex={key_hex}{decoded_key} value={}",
+                String::from_utf8_lossy(value)
+            ),
+        )? {
+            return Ok(());
+        }
     }
     Ok(())
+}
+
+fn write_stdout_line(
+    stdout: &mut impl Write,
+    args: fmt::Arguments<'_>,
+) -> Result<bool, Box<dyn Error>> {
+    match stdout
+        .write_fmt(args)
+        .and_then(|()| stdout.write_all(b"\n"))
+    {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(format!(
+            "DUMP_CF_STDOUT_WRITE_FAILED kind={:?}: {error}",
+            error.kind()
+        )
+        .into()),
+    }
 }
