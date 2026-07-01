@@ -62,3 +62,30 @@ Parallel issue work created many throwaway git worktrees, each with its own
 multi-GB Cargo `target/`. Git does not automatically remove worktrees, and Cargo
 does not garbage-collect old `target/` artifacts. Scheduled worktree pruning plus
 `cargo sweep` keeps the checkout set and build artifacts bounded.
+
+## MCP Helper Process Hygiene
+
+Some external stdio MCP servers are launched as helper process trees under the
+client that requested them. For the configured Exa launcher, the expected live
+tree is:
+
+```text
+codex.exe or claude.exe
+  -> cmd.exe ... C:\Users\hotra\.codex\bin\exa-mcp-server.cmd
+      -> node.exe ... exa-mcp-server\smithery\stdio\index.cjs
+```
+
+Classify these helpers from the process table before cleanup:
+
+- Live transport: wrapper `cmd.exe` parent is a live `codex.exe` or
+  `claude.exe`, and the Exa `node.exe` parent is that wrapper PID. Leave it
+  running; it belongs to an active MCP client.
+- Owned probe: wrapper PID was spawned and recorded by the current operation.
+  Close the MCP client first, then verify the wrapper and child PIDs are gone.
+- Orphaned helper: wrapper/node command lines exactly match the Exa launcher,
+  the parent client PID is absent, and no active client owns the tree. Cleanup
+  may target only those exact helper PIDs after before/after process readback.
+
+Never kill broad `cmd.exe`, terminal, IDE, WSL, Codex, or Claude process sets to
+clean MCP helpers. If ownership cannot be proven, print the process Source of
+Truth and leave the process running.
