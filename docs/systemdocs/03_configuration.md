@@ -254,6 +254,15 @@ All derivations assume Windows (the supported platform). Non-Windows fallbacks u
 
 > **Capitalization note:** `db`/`logs`/`models`/`replays`/`runs` live under `%LOCALAPPDATA%\synapse\` (lowercase), while shell job/session dirs use `%LOCALAPPDATA%\Synapse\` (capital S) — this is exactly as written in the respective source files.
 
+### 4.1 WSL host configuration
+
+WSL has two separate configuration sources. Keep them distinct:
+
+- `%USERPROFILE%\.wslconfig` is the Windows-side global WSL2 VM Source of Truth. Put `[wsl2]` and `[experimental]` keys here, including `autoMemoryReclaim` and `sparseVhd`.
+- `/etc/wsl.conf` is the per-distro Source of Truth. Use it for distro settings such as `[boot]`, `[automount]`, `[network]`, `[user]`, and `[interop]`.
+
+Do not put `[experimental]`, `autoMemoryReclaim`, or `sparseVhd` in `/etc/wsl.conf`. Current WSL builds report those as unknown per-distro keys on every `wsl.exe` invocation, which pollutes stderr for WSL-backed MCP wrappers and host readbacks.
+
 See [04_storage_and_persistence.md](04_storage_and_persistence.md) for the RocksDB internals.
 
 ---
