@@ -18031,6 +18031,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn screenshot_facade_gif_rejects_invalid_timing_bounds() {
+        let mut short_duration =
+            screenshot_params(ScreenshotOperation::Gif, "C:\\tmp\\synapse-screenshot.gif");
+        short_duration.duration_ms = Some(99);
+        let error = validate_screenshot_gif_facade_params(&short_duration)
+            .expect_err("gif must reject short duration_ms");
+        assert_eq!(
+            screenshot_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            screenshot_error_field(&error, "source_id").as_deref(),
+            Some("duration_ms")
+        );
+
+        let mut long_duration =
+            screenshot_params(ScreenshotOperation::Gif, "C:\\tmp\\synapse-screenshot.gif");
+        long_duration.duration_ms = Some(60_001);
+        let error = validate_screenshot_gif_facade_params(&long_duration)
+            .expect_err("gif must reject long duration_ms");
+        assert_eq!(
+            screenshot_error_field(&error, "source_id").as_deref(),
+            Some("duration_ms")
+        );
+
+        let mut short_interval =
+            screenshot_params(ScreenshotOperation::Gif, "C:\\tmp\\synapse-screenshot.gif");
+        short_interval.interval_ms = Some(99);
+        let error = validate_screenshot_gif_facade_params(&short_interval)
+            .expect_err("gif must reject short interval_ms");
+        assert_eq!(
+            screenshot_error_field(&error, "source_id").as_deref(),
+            Some("interval_ms")
+        );
+    }
+
     // End-to-end on real bytes: a 1000x500 bitmap downscaled to a 200 long-edge
     // budget must produce a 200x100 BGRA buffer (aspect preserved, 4 bytes/px)
     // and report scale 0.2.

@@ -17,7 +17,8 @@ use image::{
     Delay, Frame, RgbaImage,
     codecs::gif::{GifEncoder, Repeat},
 };
-use rmcp::{RoleServer, service::RequestContext};
+use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
+use serde_json::json;
 
 use super::{
     CaptureGifParams, CaptureGifResponse, ErrorData, Json, Parameters, SessionTarget,
@@ -49,14 +50,7 @@ impl SynapseService {
             "tool.invocation kind=capture_gif"
         );
 
-        let duration_ms = params
-            .duration_ms
-            .unwrap_or(DEFAULT_DURATION_MS)
-            .clamp(MIN_INTERVAL_MS, MAX_DURATION_MS);
-        let interval_ms = params
-            .interval_ms
-            .unwrap_or(DEFAULT_INTERVAL_MS)
-            .max(MIN_INTERVAL_MS);
+        let (duration_ms, interval_ms) = capture_gif_timing(&params)?;
         let max_long_edge = params.max_long_edge.unwrap_or(DEFAULT_MAX_LONG_EDGE);
 
         let window_hwnd = self.capture_gif_resolve_window(params.window_hwnd, &request_context)?;
@@ -229,6 +223,53 @@ impl SynapseService {
     }
 }
 
+fn capture_gif_timing(params: &CaptureGifParams) -> Result<(u64, u64), ErrorData> {
+    let duration_ms = params.duration_ms.unwrap_or(DEFAULT_DURATION_MS);
+    if !(MIN_INTERVAL_MS..=MAX_DURATION_MS).contains(&duration_ms) {
+        return Err(capture_gif_bounds_error(
+            "duration_ms",
+            format!("{MIN_INTERVAL_MS}..={MAX_DURATION_MS}"),
+            duration_ms,
+            "pass duration_ms between 100 and 60000, or omit it for the default",
+        ));
+    }
+
+    let interval_ms = params.interval_ms.unwrap_or(DEFAULT_INTERVAL_MS);
+    if interval_ms < MIN_INTERVAL_MS {
+        return Err(capture_gif_bounds_error(
+            "interval_ms",
+            format!(">={MIN_INTERVAL_MS}"),
+            interval_ms,
+            "pass interval_ms >= 100, or omit it for the default",
+        ));
+    }
+
+    Ok((duration_ms, interval_ms))
+}
+
+fn capture_gif_bounds_error(
+    field: &'static str,
+    accepted_range: String,
+    actual_value: u64,
+    remediation: &'static str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("capture_gif {field} must be {accepted_range}; got {actual_value}"),
+        Some(json!({
+            "code": synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "tool": "capture_gif",
+            "operation": "record",
+            "field": field,
+            "source_id": field,
+            "accepted_range": accepted_range,
+            "actual_value": actual_value,
+            "source_of_truth": "MCP request parameters",
+            "remediation": remediation,
+        })),
+    )
+}
+
 fn capture_gif_target_dims(width: u32, height: u32, max_long_edge: u32) -> (u32, u32) {
     if max_long_edge == 0 || (width <= max_long_edge && height <= max_long_edge) {
         return (width.max(1), height.max(1));
@@ -264,4 +305,97 @@ fn bgra_to_rgba(bgra: &[u8], width: u32, height: u32) -> Result<RgbaImage, Error
             "capture_gif could not build RGBA frame buffer",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> CaptureGifParams {
+        CaptureGifParams {
+            path: "C:\\tmp\\synapse-capture.gif".to_owned(),
+            duration_ms: None,
+            interval_ms: None,
+            window_hwnd: Some(0x1234),
+            max_long_edge: None,
+            overwrite: false,
+        }
+    }
+
+    fn error_field(error: &ErrorData, field: &str) -> Option<String> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    }
+
+    fn error_actual_value(error: &ErrorData) -> Option<u64> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("actual_value"))
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    #[test]
+    fn capture_gif_timing_defaults_and_boundaries_are_accepted() {
+        let defaults = capture_gif_timing(&params()).expect("defaults must be valid");
+        assert_eq!(defaults, (DEFAULT_DURATION_MS, DEFAULT_INTERVAL_MS));
+
+        let mut min_duration = params();
+        min_duration.duration_ms = Some(MIN_INTERVAL_MS);
+        assert_eq!(
+            capture_gif_timing(&min_duration)
+                .expect("min duration must be valid")
+                .0,
+            MIN_INTERVAL_MS
+        );
+
+        let mut max_duration = params();
+        max_duration.duration_ms = Some(MAX_DURATION_MS);
+        assert_eq!(
+            capture_gif_timing(&max_duration)
+                .expect("max duration must be valid")
+                .0,
+            MAX_DURATION_MS
+        );
+
+        let mut min_interval = params();
+        min_interval.interval_ms = Some(MIN_INTERVAL_MS);
+        assert_eq!(
+            capture_gif_timing(&min_interval)
+                .expect("min interval must be valid")
+                .1,
+            MIN_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn capture_gif_timing_rejects_out_of_range_values() {
+        let mut short_duration = params();
+        short_duration.duration_ms = Some(MIN_INTERVAL_MS - 1);
+        let error =
+            capture_gif_timing(&short_duration).expect_err("short duration must fail closed");
+        assert_eq!(
+            error_field(&error, "code").as_deref(),
+            Some(synapse_core::error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(error_field(&error, "field").as_deref(), Some("duration_ms"));
+        assert_eq!(error_actual_value(&error), Some(MIN_INTERVAL_MS - 1));
+
+        let mut long_duration = params();
+        long_duration.duration_ms = Some(MAX_DURATION_MS + 1);
+        let error = capture_gif_timing(&long_duration).expect_err("long duration must fail closed");
+        assert_eq!(error_field(&error, "field").as_deref(), Some("duration_ms"));
+        assert_eq!(error_actual_value(&error), Some(MAX_DURATION_MS + 1));
+
+        let mut short_interval = params();
+        short_interval.interval_ms = Some(MIN_INTERVAL_MS - 1);
+        let error =
+            capture_gif_timing(&short_interval).expect_err("short interval must fail closed");
+        assert_eq!(error_field(&error, "field").as_deref(), Some("interval_ms"));
+        assert_eq!(error_actual_value(&error), Some(MIN_INTERVAL_MS - 1));
+    }
 }
