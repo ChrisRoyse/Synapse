@@ -136,7 +136,7 @@ cargo test --workspace
 
 **Build prerequisite (from MEMORY):** the workspace links `librocksdb-sys`; the build/test compile can fail with `STATUS_DLL_NOT_FOUND` unless `libclang.dll` (VS BuildTools `VC\Tools\Llvm\x64\bin`) is on `PATH`.
 
-**Pre-push gate** (`.githooks/pre-push`, enabled once via `git config core.hooksPath .githooks`): runs `cargo clippy --workspace --all-targets` on any push touching `.rs`/`Cargo.*`, blocks on failure, skips docs-only pushes. It deliberately does **not** run `cargo test --workspace` (too slow). Bypass: `git push --no-verify`.
+**Pre-push gate** (`.githooks/pre-push`, enabled once via `git config core.hooksPath .githooks`): runs `cargo clippy --workspace --all-targets` on any push touching `.rs`/`Cargo.*`, blocks on failure, skips docs-only pushes. Warning-only clippy output is accepted by policy, captured to a local Git-private log, and summarized with a warning count so push output distinguishes accepted warnings from deny-level failures. It deliberately does **not** run `cargo test --workspace` (too slow). Bypass: `git push --no-verify`.
 
 ### Test-relevant environment variables (from `StdioMcpClient`)
 

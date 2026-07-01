@@ -13,7 +13,9 @@
 # Scope: clippy --workspace --all-targets compiles + lints everything (the full
 # `cargo test --workspace` suite is intentionally NOT run here — it is minutes
 # long and the agent runs it manually per doctrine D1/D5). This hook is the fast
-# compile+lint backstop, not a substitute for manual FSV.
+# compile+lint backstop, not a substitute for manual FSV. The gate is deny-level:
+# warning-only output is accepted, captured to a local log, and summarized so
+# push output clearly distinguishes accepted warnings from blocking failures.
 
 set -e
 
@@ -42,12 +44,35 @@ if [ "$needs_gate" -eq 0 ]; then
 fi
 
 echo "pre-push: running local clippy gate (cargo clippy --workspace --all-targets) ..."
-if ! cargo clippy --workspace --all-targets; then
+log_dir=$(git rev-parse --git-path synapse-pre-push-logs 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")
+mkdir -p "$log_dir"
+log_path="$log_dir/clippy-$(date +%Y%m%dT%H%M%S)-$$.log"
+
+if cargo clippy --workspace --all-targets >"$log_path" 2>&1; then
+  warning_count=$(grep -c '^warning:' "$log_path" 2>/dev/null || true)
+  warning_count=${warning_count:-0}
+  if [ "$warning_count" -gt 0 ]; then
+    echo "pre-push: clippy gate green with ${warning_count} accepted warning lines; deny-level failures=0."
+    echo "pre-push: full clippy log: $log_path"
+  else
+    rm -f "$log_path"
+    echo "pre-push: clippy gate green (0 warnings)."
+  fi
+else
+  status=$?
+  echo ""
+  echo "pre-push: BLOCKED — clippy gate failed. Full clippy log: $log_path"
+  echo "pre-push: first 240 log lines follow:"
+  sed -n '1,240p' "$log_path" || true
+  total_lines=$(wc -l <"$log_path" 2>/dev/null | tr -d ' ' || true)
+  total_lines=${total_lines:-0}
+  if [ "$total_lines" -gt 240 ]; then
+    echo "pre-push: output truncated; inspect the full log above for all diagnostics."
+  fi
   echo ""
   echo "pre-push: BLOCKED — clippy gate failed. Fix the lint/build errors above, or"
   echo "          re-run with 'git push --no-verify' only if this is a genuine"
   echo "          non-compiling emergency. Local cargo gates are the source of truth (#351)."
-  exit 1
+  exit "$status"
 fi
-echo "pre-push: clippy gate green."
 exit 0
