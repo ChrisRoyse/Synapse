@@ -3,10 +3,70 @@
 //! (`tests/fixtures/claude_session_real.jsonl`) — never synthesized shapes.
 
 use super::*;
+use std::{
+    ffi::OsString,
+    sync::{Mutex, MutexGuard},
+};
 
 /// Eight real records: mode, file-history-snapshot, user/meta, user/prompt,
 /// assistant+tool_use, user/tool_result, assistant/end_turn, system.
 const REAL_FIXTURE: &str = include_str!("../../../tests/fixtures/claude_session_real.jsonl");
+const AMBIENT_ENV_VARS: [&str; 5] = [
+    ROOT_ENV,
+    "CLAUDE_CONFIG_DIR",
+    "USERPROFILE",
+    "HOME",
+    "LOCALAPPDATA",
+];
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvGuard {
+    fn new(vars: &[&'static str]) -> Self {
+        Self {
+            saved: vars
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+}
+
+fn set_test_env(name: &str, value: &str) {
+    unsafe {
+        std::env::set_var(name, value);
+    }
+}
+
+fn remove_test_env(name: &str) {
+    unsafe {
+        std::env::remove_var(name);
+    }
+}
 
 fn fresh_cursor() -> AmbientCursor {
     seed_cursor(
@@ -234,18 +294,72 @@ fn session_stem_accepts_uuid_rejects_sidecars() {
 
 #[test]
 fn projects_root_override_wins() {
-    // SAFETY: single-threaded test process mutation of a process-local env var.
-    unsafe {
-        std::env::set_var(ROOT_ENV, "C:/tmp/ambient-test-projects");
-    }
+    let _env_lock = env_lock();
+    let _env_guard = EnvGuard::new(&AMBIENT_ENV_VARS);
+    set_test_env(ROOT_ENV, "C:/tmp/ambient-test-projects");
     let root = claude_projects_root().expect("override resolves");
     assert_eq!(
         root,
         std::path::PathBuf::from("C:/tmp/ambient-test-projects")
     );
-    unsafe {
-        std::env::remove_var(ROOT_ENV);
-    }
+}
+
+#[test]
+fn explicit_projects_root_allows_custom_db() {
+    let _env_lock = env_lock();
+    let _env_guard = EnvGuard::new(&AMBIENT_ENV_VARS);
+    set_test_env(ROOT_ENV, "C:/tmp/ambient-explicit-projects");
+    set_test_env("USERPROFILE", "C:/Users/test");
+    let decision =
+        ambient_projects_root_for_db(std::path::Path::new("C:/scratch/synapse/issue/db"))
+            .expect("explicit root resolves")
+            .expect("custom DB is allowed only because root is explicit");
+    assert_eq!(
+        decision.root,
+        std::path::PathBuf::from("C:/tmp/ambient-explicit-projects")
+    );
+    assert_eq!(decision.scope, AmbientRootScope::ExplicitEnv);
+}
+
+#[test]
+fn configured_daemon_db_allows_host_projects_root() {
+    let _env_lock = env_lock();
+    let _env_guard = EnvGuard::new(&AMBIENT_ENV_VARS);
+    remove_test_env(ROOT_ENV);
+    remove_test_env("CLAUDE_CONFIG_DIR");
+    set_test_env("LOCALAPPDATA", "C:/Users/test/AppData/Local");
+    set_test_env("USERPROFILE", "C:/Users/test");
+    set_test_env("HOME", "C:/Users/test-home");
+
+    let decision = ambient_projects_root_for_db(&crate::m3::default_daemon_db_path())
+        .expect("host projects root resolves")
+        .expect("configured daemon DB may discover host ambient sessions");
+
+    assert_eq!(
+        decision.root,
+        std::path::PathBuf::from("C:/Users/test")
+            .join(".claude")
+            .join("projects")
+    );
+    assert_eq!(decision.scope, AmbientRootScope::ConfiguredDaemonDb);
+}
+
+#[test]
+fn custom_db_without_explicit_projects_root_disables_host_discovery() {
+    let _env_lock = env_lock();
+    let _env_guard = EnvGuard::new(&AMBIENT_ENV_VARS);
+    remove_test_env(ROOT_ENV);
+    remove_test_env("CLAUDE_CONFIG_DIR");
+    set_test_env("LOCALAPPDATA", "C:/Users/test/AppData/Local");
+    set_test_env("USERPROFILE", "C:/Users/test");
+    set_test_env("HOME", "C:/Users/test-home");
+
+    let decision = ambient_projects_root_for_db(std::path::Path::new(
+        "C:/Users/test/AppData/Local/synapse/issue-1427/db",
+    ))
+    .expect("custom DB decision is deterministic");
+
+    assert_eq!(decision, None);
 }
 
 // ---------------------------------------------------------------------------

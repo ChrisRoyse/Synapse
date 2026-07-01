@@ -174,7 +174,7 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | `SYNAPSE_AMBIENT_INGEST_INTERVAL_SECS` | `server/ambient_agents.rs` | u64 (s) | `5` | Ambient (Claude transcript) ingest cycle interval. |
 | `SYNAPSE_AMBIENT_INGEST_STARTUP_DELAY_SECS` | same | u64 (s) | `8` | Delay before first ambient cycle. |
 | `SYNAPSE_AMBIENT_MAX_IDLE_SECS` | same (`MAX_IDLE_ENV`) | u64 (s) | `86400` (24 h) | Only ingest sessions modified within this window. |
-| `SYNAPSE_AMBIENT_CLAUDE_PROJECTS_DIR` | same (`ROOT_ENV`) | path | discovered (CLAUDE_CONFIG_DIR/USERPROFILE/HOME) | Override Claude `projects` dir. |
+| `SYNAPSE_AMBIENT_CLAUDE_PROJECTS_DIR` | same (`ROOT_ENV`) | path | discovered only for configured daemon DBs | Explicit Claude `projects` dir for custom/scratch DB runs. Without this override, host-home discovery is enabled only for `%LOCALAPPDATA%\synapse\db-daemon` and the normal M3 default `%LOCALAPPDATA%\synapse\db`; custom DBs log `AMBIENT_INGEST_CUSTOM_DB_UNSCOPED` and skip ambient ingest. |
 | `CLAUDE_CONFIG_DIR` | `server/ambient_agents.rs` | path | none | Claude config dir for transcript discovery. |
 | `SYNAPSE_TRANSCRIPT_INGEST_INTERVAL_SECS` | `server/agent_transcripts.rs` | u64 (s) | `15` | Agent-transcript ingest interval. |
 | `SYNAPSE_TRANSCRIPT_INGEST_STARTUP_DELAY_SECS` | same | u64 (s) | `10` | Delay before first transcript ingest. |

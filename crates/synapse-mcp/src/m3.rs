@@ -595,10 +595,18 @@ fn audio_event_sink(event_bus: EventBus) -> synapse_audio::AudioEventSink {
 
 #[must_use]
 pub fn default_db_path() -> PathBuf {
+    local_synapse_dir().join("db")
+}
+
+#[must_use]
+pub fn default_daemon_db_path() -> PathBuf {
+    local_synapse_dir().join("db-daemon")
+}
+
+fn local_synapse_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("synapse")
-        .join("db")
 }
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct M3ToolStub {

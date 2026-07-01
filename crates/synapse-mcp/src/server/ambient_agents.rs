@@ -74,7 +74,7 @@ use synapse_storage::{Db, agent_transcripts::agent_transcript_key, cf, decode_js
 use tokio_util::sync::CancellationToken;
 
 use super::agent_events::{provider_for_agent_kind, record_agent_events, unix_time_ns_now};
-use crate::m3::M3State;
+use crate::m3::{M3State, default_daemon_db_path, default_db_path};
 
 /// Seconds between ambient ingest cycles.
 pub(crate) const INTERVAL_ENV: &str = "SYNAPSE_AMBIENT_INGEST_INTERVAL_SECS";
@@ -107,6 +107,27 @@ static SESSIONS_REGISTERED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INGEST_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PRESSURE_DEFERRALS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CYCLES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AmbientRootScope {
+    ExplicitEnv,
+    ConfiguredDaemonDb,
+}
+
+impl AmbientRootScope {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ExplicitEnv => "explicit_env",
+            Self::ConfiguredDaemonDb => "configured_daemon_db",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AmbientRootDecision {
+    root: PathBuf,
+    scope: AmbientRootScope,
+}
 
 /// Process-lifetime ambient ingest counters for `GET /agent-transcripts/stats`.
 pub(crate) fn ingest_stats() -> Value {
@@ -236,6 +257,10 @@ fn claude_projects_root() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os(ROOT_ENV) {
         return Ok(PathBuf::from(dir));
     }
+    claude_projects_root_from_host_env()
+}
+
+fn claude_projects_root_from_host_env() -> Result<PathBuf, String> {
     if let Some(cfg) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         // CLAUDE_CONFIG_DIR may list several dirs; the first is the writable one.
         let raw = cfg.to_string_lossy().into_owned();
@@ -257,6 +282,45 @@ fn claude_projects_root() -> Result<PathBuf, String> {
          cannot locate ~/.claude/projects to discover ambient agents"
             .to_owned(),
     )
+}
+
+fn ambient_projects_root_for_db(db_path: &Path) -> Result<Option<AmbientRootDecision>, String> {
+    if let Some(dir) = std::env::var_os(ROOT_ENV) {
+        return Ok(Some(AmbientRootDecision {
+            root: PathBuf::from(dir),
+            scope: AmbientRootScope::ExplicitEnv,
+        }));
+    }
+    if !ambient_host_root_allowed_for_db(db_path) {
+        return Ok(None);
+    }
+    Ok(Some(AmbientRootDecision {
+        root: claude_projects_root()?,
+        scope: AmbientRootScope::ConfiguredDaemonDb,
+    }))
+}
+
+fn ambient_host_root_allowed_for_db(db_path: &Path) -> bool {
+    [default_db_path(), default_daemon_db_path()]
+        .iter()
+        .any(|allowed| paths_equivalent(db_path, allowed))
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
+}
+
+fn path_key(path: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
+    let mut raw = path.to_string_lossy().replace('/', "\\");
+    while raw.ends_with('\\') {
+        raw.pop();
+    }
+    #[cfg(windows)]
+    {
+        raw.make_ascii_lowercase();
+    }
+    raw
 }
 
 /// True when `stem` is a canonical 8-4-4-4-12 hex UUID — the shape of a Claude
@@ -800,15 +864,30 @@ pub(crate) fn spawn_periodic_ambient_ingest(
         );
         return Ok(None);
     }
-    // Fail at startup if the home anchor cannot be resolved, rather than running
-    // a watcher that silently observes nothing.
-    let root = claude_projects_root().map_err(|detail| anyhow::anyhow!(detail))?;
+    let db_path = configured_db_path(&m3_state)?;
+    let Some(root_decision) =
+        ambient_projects_root_for_db(&db_path).map_err(|detail| anyhow::anyhow!(detail))?
+    else {
+        tracing::warn!(
+            code = "AMBIENT_INGEST_CUSTOM_DB_UNSCOPED",
+            db_path = %db_path.display(),
+            default_db_path = %default_db_path().display(),
+            default_daemon_db_path = %default_daemon_db_path().display(),
+            explicit_root_env = ROOT_ENV,
+            remediation = "set SYNAPSE_AMBIENT_CLAUDE_PROJECTS_DIR for this run or use the configured daemon DB path",
+            "periodic ambient agent discovery disabled for custom DB without an explicit ambient root"
+        );
+        return Ok(None);
+    };
+    let AmbientRootDecision { root, scope } = root_decision;
     tracing::info!(
         code = "AMBIENT_INGEST_PERIODIC_SCHEDULED",
         interval_secs,
         startup_delay_secs,
         max_idle_secs,
         root = %root.display(),
+        root_scope = scope.as_str(),
+        db_path = %db_path.display(),
         "periodic ambient agent discovery scheduled"
     );
     let handle = tokio::spawn(async move {
@@ -829,6 +908,13 @@ pub(crate) fn spawn_periodic_ambient_ingest(
         }
     });
     Ok(Some(handle))
+}
+
+fn configured_db_path(m3_state: &Arc<Mutex<M3State>>) -> anyhow::Result<PathBuf> {
+    let state = m3_state
+        .lock()
+        .map_err(|_poisoned| anyhow::anyhow!("m3 state lock poisoned"))?;
+    Ok(state.db_path.clone().unwrap_or_else(default_db_path))
 }
 
 fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path, max_idle_secs: u64) {
