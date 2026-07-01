@@ -52,7 +52,8 @@ impl ApprovalOperation {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalParams {
-    pub operation: ApprovalOperation,
+    #[serde(default)]
+    pub operation: Option<ApprovalOperation>,
     #[serde(default)]
     pub request: Option<ApprovalRequestParams>,
     #[serde(default)]
@@ -63,6 +64,17 @@ pub struct ApprovalParams {
     pub gate: Option<ApprovalGateParams>,
     #[serde(default)]
     pub ask_operator: Option<AgentAskOperatorParams>,
+    /// Claude Code `--permission-prompt-tool` calls one MCP tool directly with
+    /// the gate payload shape. These top-level fields are accepted only when
+    /// `operation` is omitted and are normalized to `operation=gate`.
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub spawn_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -78,6 +90,20 @@ pub struct ApprovalResponse {
     pub operation: ApprovalOperation,
     pub source_of_truth: String,
     pub readback_source_of_truth: String,
+    /// Top-level Claude Code permission-prompt compatibility fields. Claude
+    /// reads the MCP tool text as a JSON permission verdict; keeping these at
+    /// the top level lets the public `approval` facade serve as the gate tool
+    /// without re-exposing the hidden `approval_gate` implementation tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<String>,
+    #[serde(
+        default,
+        rename = "updatedInput",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub updated_input: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<ApprovalRequestResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,7 +169,7 @@ pub struct EscalationResponse {
 #[tool_router(router = approval_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for durable approval queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations delegate to the real approval_request/approval_decide/approval_gate/agent_ask_operator paths and return physical CF_KV readback metadata."
+        description = "Facade for durable approval queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Claude permission-prompt compatibility may omit operation only when sending the direct gate payload shape. Mutating operations delegate to the real approval_request/approval_decide/approval_gate/agent_ask_operator paths and return physical CF_KV readback metadata."
     )]
     pub async fn approval(
         &self,
@@ -151,7 +177,7 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ApprovalResponse>, ErrorData> {
         validate_approval_facade_params(&params.0)?;
-        let operation = params.0.operation;
+        let operation = approval_operation(&params.0)?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = APPROVAL_TOOL,
@@ -248,7 +274,8 @@ impl SynapseService {
                 )))
             }
             ApprovalOperation::Gate => {
-                let spec = params.0.gate.ok_or_else(|| missing_approval_spec("gate"))?;
+                let spec =
+                    approval_gate_spec(&params.0).ok_or_else(|| missing_approval_spec("gate"))?;
                 let source_id = spec
                     .tool_use_id
                     .clone()
@@ -273,7 +300,10 @@ impl SynapseService {
                         readback.content_text.len(),
                         value_kind(&readback.value)
                     ),
-                    |out| out.gate = Some(readback),
+                    |out| {
+                        apply_permission_prompt_verdict(out, &readback);
+                        out.gate = Some(readback);
+                    },
                 )))
             }
             ApprovalOperation::AskOperator => {
@@ -429,17 +459,70 @@ impl SynapseService {
 }
 
 fn validate_approval_facade_params(params: &ApprovalParams) -> Result<(), ErrorData> {
+    let operation = approval_operation(params)?;
+    if params.operation.is_some() && approval_direct_gate_present(params) {
+        return Err(facade_params_error(
+            APPROVAL_TOOL,
+            operation.as_str(),
+            "approval direct Claude permission-prompt fields require operation to be omitted",
+            "omit operation and pass only tool_name/input/tool_use_id/spawn_id, or use operation=gate with gate={...}",
+        ));
+    }
+    if params.gate.is_some() && approval_direct_gate_present(params) {
+        return Err(facade_params_error(
+            APPROVAL_TOOL,
+            operation.as_str(),
+            "approval received both nested gate spec and direct Claude permission-prompt fields",
+            "pass exactly one gate shape: either gate={...} with operation=gate, or direct fields with operation omitted",
+        ));
+    }
     validate_exact_operation_spec(
         APPROVAL_TOOL,
-        params.operation.as_str(),
+        operation.as_str(),
         &[
             ("request", params.request.is_some()),
             ("list", params.list.is_some()),
             ("decide", params.decide.is_some()),
-            ("gate", params.gate.is_some()),
+            (
+                "gate",
+                params.gate.is_some() || approval_direct_gate_present(params),
+            ),
             ("ask_operator", params.ask_operator.is_some()),
         ],
     )
+}
+
+fn approval_operation(params: &ApprovalParams) -> Result<ApprovalOperation, ErrorData> {
+    if let Some(operation) = params.operation {
+        return Ok(operation);
+    }
+    if approval_direct_gate_present(params) {
+        return Ok(ApprovalOperation::Gate);
+    }
+    Err(facade_params_error(
+        APPROVAL_TOOL,
+        "unknown",
+        "approval requires operation unless called as a Claude permission-prompt gate payload",
+        "pass operation=<request|list|decide|gate|ask_operator> with the matching spec, or pass direct Claude permission-prompt fields tool_name/input/tool_use_id/spawn_id",
+    ))
+}
+
+fn approval_direct_gate_present(params: &ApprovalParams) -> bool {
+    params.tool_name.is_some()
+        || params.input.is_some()
+        || params.tool_use_id.is_some()
+        || params.spawn_id.is_some()
+}
+
+fn approval_gate_spec(params: &ApprovalParams) -> Option<ApprovalGateParams> {
+    params.gate.clone().or_else(|| {
+        approval_direct_gate_present(params).then(|| ApprovalGateParams {
+            tool_name: params.tool_name.clone(),
+            input: params.input.clone(),
+            tool_use_id: params.tool_use_id.clone(),
+            spawn_id: params.spawn_id.clone(),
+        })
+    })
 }
 
 fn validate_escalation_facade_params(params: &EscalationParams) -> Result<(), ErrorData> {
@@ -595,6 +678,9 @@ fn approval_response(
             operation.as_str()
         ),
         readback_source_of_truth,
+        behavior: None,
+        updated_input: None,
+        message: None,
         request: None,
         list: None,
         decide: None,
@@ -603,6 +689,24 @@ fn approval_response(
     };
     populate(&mut response);
     response
+}
+
+fn apply_permission_prompt_verdict(
+    response: &mut ApprovalResponse,
+    readback: &ApprovalVerdictReadback,
+) {
+    let Some(verdict) = readback.value.as_object() else {
+        return;
+    };
+    response.behavior = verdict
+        .get("behavior")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    response.updated_input = verdict.get("updatedInput").cloned();
+    response.message = verdict
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 }
 
 fn escalation_response(
@@ -668,12 +772,16 @@ mod tests {
 
     fn empty_approval_params(operation: ApprovalOperation) -> ApprovalParams {
         ApprovalParams {
-            operation,
+            operation: Some(operation),
             request: None,
             list: None,
             decide: None,
             gate: None,
             ask_operator: None,
+            tool_name: None,
+            input: None,
+            tool_use_id: None,
+            spawn_id: None,
         }
     }
 
@@ -689,6 +797,27 @@ mod tests {
 
     #[test]
     fn approval_facade_params_require_exact_matching_spec() {
+        let missing_operation = validate_approval_facade_params(&ApprovalParams {
+            operation: None,
+            request: None,
+            list: None,
+            decide: None,
+            gate: None,
+            ask_operator: None,
+            tool_name: None,
+            input: None,
+            tool_use_id: None,
+            spawn_id: None,
+        })
+        .expect_err("operation-less non-gate params should fail");
+        assert!(
+            missing_operation
+                .message
+                .to_string()
+                .contains("requires operation"),
+            "{missing_operation:?}"
+        );
+
         let missing =
             validate_approval_facade_params(&empty_approval_params(ApprovalOperation::Decide))
                 .expect_err("missing decide spec should fail");
@@ -716,6 +845,77 @@ mod tests {
                 .to_string()
                 .contains("received invalid operation specs"),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn approval_facade_accepts_claude_permission_prompt_gate_payload() {
+        let params = ApprovalParams {
+            operation: None,
+            request: None,
+            list: None,
+            decide: None,
+            gate: None,
+            ask_operator: None,
+            tool_name: Some("Read".to_owned()),
+            input: Some(json!({"file_path": "Cargo.toml"})),
+            tool_use_id: Some("toolu-test".to_owned()),
+            spawn_id: Some("agent-spawn-test".to_owned()),
+        };
+
+        validate_approval_facade_params(&params)
+            .expect("Claude permission-prompt payload should infer gate operation");
+        assert_eq!(
+            approval_operation(&params).expect("operation"),
+            ApprovalOperation::Gate
+        );
+        let gate = approval_gate_spec(&params).expect("gate spec");
+        assert_eq!(gate.tool_name.as_deref(), Some("Read"));
+        assert_eq!(gate.tool_use_id.as_deref(), Some("toolu-test"));
+    }
+
+    #[test]
+    fn approval_facade_rejects_direct_gate_fields_with_operation() {
+        let mut params = empty_approval_params(ApprovalOperation::List);
+        params.list = Some(ApprovalListParams::default());
+        params.tool_name = Some("Read".to_owned());
+        params.input = Some(Value::Null);
+
+        let error = validate_approval_facade_params(&params)
+            .expect_err("direct gate fields with explicit operation should fail");
+        assert!(
+            error
+                .message
+                .to_string()
+                .contains("direct Claude permission-prompt fields require operation to be omitted"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn approval_response_promotes_gate_verdict_for_permission_prompt_tool() {
+        let readback = ApprovalVerdictReadback {
+            value: json!({
+                "behavior": "allow",
+                "updatedInput": {"file_path": "Cargo.toml"}
+            }),
+            content_text: r#"{"behavior":"allow","updatedInput":{"file_path":"Cargo.toml"}}"#
+                .to_owned(),
+        };
+
+        let response =
+            approval_response(ApprovalOperation::Gate, "test readback".to_owned(), |out| {
+                apply_permission_prompt_verdict(out, &readback);
+                out.gate = Some(readback);
+            });
+
+        assert_eq!(response.behavior.as_deref(), Some("allow"));
+        assert_eq!(
+            response
+                .updated_input
+                .as_ref()
+                .and_then(|value| value.get("file_path")),
+            Some(&Value::String("Cargo.toml".to_owned()))
         );
     }
 

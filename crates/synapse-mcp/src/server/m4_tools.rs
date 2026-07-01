@@ -1866,7 +1866,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Spawn a fully capable primary Codex, Claude, or local_model agent as a hidden background process, wire it to the configured Synapse HTTP MCP daemon, require real MCP session registration, optionally bind a per-session target, and return only after session_list readback plus a validated task-start readiness artifact prove the spawned prompt began executing. Pass cli/kind plus a non-empty prompt for a direct spawn, or template_id (+ template_params) to render the spawn from a durable agent_template; a template-rendered spawn records the exact (template_id, version, config_hash) used and rejects passing cli/kind/model/model_ref/prompt/working_dir/target alongside the template."
+        description = "Spawn a fully capable primary Codex, Claude, or local_model agent as a hidden background process, wire it to the configured Synapse HTTP MCP daemon, require real MCP session registration, optionally bind a per-session target, and return only after public session facade readback plus a validated task-start readiness artifact prove the spawned prompt began executing. Pass cli/kind plus a non-empty prompt for a direct spawn, or template_id (+ template_params) to render the spawn from a durable agent_template; a template-rendered spawn records the exact (template_id, version, config_hash) used and rejects passing cli/kind/model/model_ref/prompt/working_dir/target alongside the template."
     )]
     pub async fn act_spawn_agent(
         &self,
@@ -1879,7 +1879,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Spawned-agent cooperative readiness: after the spawned agent has called health/session_list and verified its target, call this tool with the daemon-issued spawn_id. The daemon uses the real MCP request session id to atomically write task-started.json, avoiding permission-gated local shell readiness helpers."
+        description = "Spawned-agent cooperative readiness: after the spawned agent has called health/session facade and verified its target, call this tool with the daemon-issued spawn_id. The daemon uses the real MCP request session id to atomically write task-started.json, avoiding permission-gated local shell readiness helpers."
     )]
     pub async fn agent_spawn_task_started(
         &self,
@@ -5288,20 +5288,6 @@ fn prepare_agent_spawn_files(
         .is_local_model()
         .then(|| log_dir.join("local-model-runner.json"));
 
-    if agent_kind == ActSpawnAgentCli::Claude {
-        let task_started_script =
-            build_agent_spawn_task_start_script(spawn_id, params, &task_started_path);
-        fs::write(&task_started_script_path, task_started_script).map_err(|error| {
-            mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "act_spawn_agent failed to write task-start script {}: {error}",
-                    task_started_script_path.display()
-                ),
-            )
-        })?;
-    }
-
     let prompt = build_agent_spawn_prompt(
         spawn_id,
         params,
@@ -5326,13 +5312,13 @@ fn prepare_agent_spawn_files(
                     "url": params.mcp_url,
                     "headers": {
                         "Authorization": "Bearer ${SYNAPSE_BEARER_TOKEN}",
-                        // Lets the approval_gate tool attribute a permission
+                        // Lets the approval facade's delegated gate attribute a permission
                         // request to THIS spawn (#927); the bearer is shared
                         // across spawns and can't distinguish them. Read by
                         // server::permission_gate::SPAWN_ID_HEADER (case-insensitive).
                         "X-Synapse-Spawn-Id": spawn_id
                     },
-                    // Per-server tool-call wall-clock (ms). The approval_gate
+                    // Per-server tool-call wall-clock (ms). The approval facade
                     // call blocks while a human decides; Claude's default
                     // MCP_TOOL_TIMEOUT (~28h) is plenty, but we pin 30 min here
                     // so a forgotten approval can't pin the agent forever — the
@@ -5359,12 +5345,8 @@ fn prepare_agent_spawn_files(
     }
 
     if let Some(settings_path) = &hook_settings_path {
-        let settings = build_claude_hook_settings(
-            spawn_id,
-            &params.mcp_url,
-            params.require_approval_gate,
-            &task_started_script_path,
-        )?;
+        let settings =
+            build_claude_hook_settings(spawn_id, &params.mcp_url, params.require_approval_gate)?;
         let encoded = serde_json::to_vec_pretty(&settings).map_err(|error| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -5486,7 +5468,6 @@ fn build_claude_hook_settings(
     spawn_id: &str,
     mcp_url: &str,
     require_approval_gate: bool,
-    task_started_script_path: &Path,
 ) -> Result<Value, ErrorData> {
     let ingress_url = agent_event_ingress_url(spawn_id, mcp_url, "claude_code_hooks")?;
     let hook_entry = json!({
@@ -5511,32 +5492,29 @@ fn build_claude_hook_settings(
         "httpHookAllowedEnvVars": ["SYNAPSE_BEARER_TOKEN"],
     });
     if require_approval_gate {
-        // Static allow rules are consulted BEFORE the permission-prompt-tool,
-        // so listing the read-only / low-consequence tools here lets them run
-        // without a gate round-trip (#927). Anything not matched falls through
-        // to mcp__synapse__approval_gate, whose server-side policy is the
-        // authoritative backstop (server::permission_policy).
+        // Static allow rules are consulted BEFORE the permission-prompt-tool.
+        // Only public facade tool names are valid here: spawned Claude runs on
+        // the same <=40 normal-agent tool surface as production clients.
+        // Anything unmatched falls through to mcp__synapse__approval, which
+        // delegates to the hidden approval_gate implementation internally.
         let mut allow_rules: Vec<String> = CLAUDE_AUTO_ALLOW_RULES
             .iter()
             .map(|rule| (*rule).to_owned())
             .collect();
         allow_rules.extend(
-            super::permission_policy::SYNAPSE_COORDINATION_MCP_TOOLS
+            CLAUDE_COORDINATION_FACADE_MCP_TOOLS
                 .iter()
                 .map(|tool| format!("mcp__synapse__{tool}")),
         );
-        allow_rules.push(format!(
-            "PowerShell({} *)",
-            task_started_script_path.display()
-        ));
         settings["permissions"] = json!({ "allow": allow_rules });
     }
     Ok(settings)
 }
 
 /// Tools pre-approved in a gated Claude spawn's `--settings` so they skip the
-/// approval_gate round-trip. Mirrors the auto-allow side of
-/// [`super::permission_policy`]; the gate still backstops anything unmatched.
+/// approval facade round-trip. Mirrors the auto-allow side of
+/// [`super::permission_policy`]; the delegated gate still backstops anything
+/// unmatched.
 const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "Read",
     "Glob",
@@ -5549,11 +5527,10 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "BashOutput",
     "Task",
     "mcp__synapse__health",
-    "mcp__synapse__session_list",
-    "mcp__synapse__tool_profile_status",
-    "mcp__synapse__get_target",
-    "mcp__synapse__set_target",
+    "mcp__synapse__session",
+    "mcp__synapse__target",
     "mcp__synapse__agent",
+    "mcp__synapse__approval",
     "Edit",
     "Write",
     "MultiEdit",
@@ -5579,6 +5556,8 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "Bash(cargo clippy:*)",
     "Bash(cargo fmt:*)",
 ];
+
+const CLAUDE_COORDINATION_FACADE_MCP_TOOLS: &[&str] = &["workspace"];
 
 /// Codex `notify` program: receives the notification JSON as its final argv
 /// argument and POSTs it verbatim to the ingress. Codex spawns it
@@ -5648,11 +5627,11 @@ fn build_agent_spawn_prompt(
                 )
             })?;
             format!(
-                "3. Call the Synapse MCP set_target tool with exactly this JSON as the target value: {target_json}\n4. Call the Synapse MCP get_target tool and verify its current target exactly matches that JSON."
+                "3. Call the real Synapse MCP target facade with exactly this JSON: {{\"operation\":\"set\",\"target\":{target_json}}}\n4. Call the real Synapse MCP target facade with exactly this JSON: {{\"operation\":\"get\"}} and verify its current target exactly matches that JSON."
             )
         }
         None => {
-            "3. Call the Synapse MCP get_target tool and report the returned session_id/current target.".to_owned()
+            "3. Call the real Synapse MCP target facade with exactly this JSON: {\"operation\":\"get\"} and report the returned session_id/current target.".to_owned()
         }
     };
     let assigned_prompt = params.prompt.as_deref().unwrap_or("").trim();
@@ -5693,7 +5672,7 @@ Windows shell contract:\n\
 - Write evidence/report files as UTF-8.\n\
 Mandatory provisioning checks:\n\
 1. Use the real Synapse MCP health tool through your normal configured MCP client. Do not use curl, direct HTTP, helper scripts, or local storage writes as a substitute.\n\
-2. Use the real Synapse MCP session_list tool through your normal configured MCP client.\n\
+2. Use the real Synapse MCP session facade with exactly this JSON through your normal configured MCP client: {{\"operation\":\"list\"}}\n\
 {target_instruction}\n\
 5. If any Synapse MCP tool is missing or fails, stop and report the exact tool/error.\n\
 6. Before performing the assigned task or hold-open sleep, write the required task-start readiness artifact to: {task_started_path}\n\
@@ -5713,94 +5692,6 @@ Mandatory provisioning checks:\n\
         assigned_block = assigned_block,
         hold_instruction = hold_instruction,
     ))
-}
-
-fn build_agent_spawn_task_start_script(
-    spawn_id: &str,
-    params: &ActSpawnAgentParams,
-    task_started_path: &Path,
-) -> String {
-    let agent_kind = params.effective_cli().ok();
-    let agent_kind = agent_kind
-        .map(ActSpawnAgentCli::as_str)
-        .unwrap_or("invalid");
-    let spawn_id = ps_single_quote(spawn_id);
-    let cli = ps_single_quote(agent_kind);
-    let task_started_path = ps_single_quoted_path(task_started_path);
-    let assigned_prompt_present = if params
-        .prompt
-        .as_deref()
-        .is_some_and(|prompt| !prompt.trim().is_empty())
-    {
-        "$true"
-    } else {
-        "$false"
-    };
-    format!(
-        "param(\n\
-    [Parameter(Mandatory = $true)]\n\
-    [ValidateNotNullOrEmpty()]\n\
-    [string]$SessionId\n\
-)\n\
-$ErrorActionPreference = 'Stop'\n\
-Set-StrictMode -Version Latest\n\
-$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)\n\
-function Write-TextNoBom {{\n\
-    param(\n\
-        [Parameter(Mandatory = $true)][string]$Path,\n\
-        [Parameter(Mandatory = $true)][string]$Text\n\
-    )\n\
-    [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)\n\
-}}\n\
-$taskStartedPath = {task_started_path}\n\
-$taskStartedTempPath = \"$taskStartedPath.tmp.$PID\"\n\
-$taskStarted = [ordered]@{{\n\
-    schema_version = 1\n\
-    spawn_id = {spawn_id}\n\
-    cli = {cli}\n\
-    session_id = $SessionId\n\
-    status = 'started'\n\
-    health_ok = $true\n\
-    target_ok = $true\n\
-    assigned_prompt_present = {assigned_prompt_present}\n\
-    task_started_path = $taskStartedPath\n\
-    started_at_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
-}}\n\
-[System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($taskStartedPath)) | Out-Null\n\
-$taskStartedJson = $taskStarted | ConvertTo-Json -Depth 8\n\
-Write-TextNoBom -Path $taskStartedTempPath -Text $taskStartedJson\n\
-Move-Item -LiteralPath $taskStartedTempPath -Destination $taskStartedPath -Force\n\
-\n\
-$readBack = Get-Content -LiteralPath $taskStartedPath -Raw -Encoding UTF8 | ConvertFrom-Json\n\
-$expected = [ordered]@{{\n\
-    schema_version = 1\n\
-    spawn_id = {spawn_id}\n\
-    cli = {cli}\n\
-    session_id = $SessionId\n\
-    status = 'started'\n\
-    health_ok = $true\n\
-    target_ok = $true\n\
-    assigned_prompt_present = {assigned_prompt_present}\n\
-    task_started_path = $taskStartedPath\n\
-}}\n\
-foreach ($key in $expected.Keys) {{\n\
-    $property = $readBack.PSObject.Properties.Item($key)\n\
-    if ($null -eq $property) {{ throw (\"task-started missing field {{0}}\" -f $key) }}\n\
-    $actual = $property.Value\n\
-    $expectedValue = $expected[$key]\n\
-    if ($actual -ne $expectedValue) {{\n\
-        throw (\"task-started mismatch for {{0}}: expected '{{1}}' actual '{{2}}'\" -f $key, $expectedValue, $actual)\n\
-    }}\n\
-}}\n\
-if ($null -eq $readBack.started_at_unix_ms -or [int64]$readBack.started_at_unix_ms -le 0) {{\n\
-    throw 'task-started missing valid started_at_unix_ms'\n\
-}}\n\
-$readBack | ConvertTo-Json -Depth 8\n",
-        task_started_path = task_started_path,
-        spawn_id = spawn_id,
-        cli = cli,
-        assigned_prompt_present = assigned_prompt_present,
-    )
 }
 
 fn write_agent_spawn_task_started_from_session(
@@ -6257,11 +6148,12 @@ fn agent_spawn_powershell_script(
             // Approvals inbox. `--permission-mode default` consults the static
             // `permissions.allow` rules in the --settings file first (so safe
             // tools never pause), then delegates anything unmatched to the
-            // approval_gate MCP tool, which blocks until a human decides.
+            // public approval facade, which delegates to the gate and blocks
+            // until a human decides.
             // The auto-approve-everything behavior is opt-in via
             // require_approval_gate=false (trusted unattended automation).
             let permission_args = if params.require_approval_gate {
-                "'--permission-mode','default','--permission-prompt-tool','mcp__synapse__approval_gate'"
+                "'--permission-mode','default','--permission-prompt-tool','mcp__synapse__approval'"
             } else {
                 "'--permission-mode','bypassPermissions'"
             };
@@ -6750,6 +6642,14 @@ fn read_agent_spawn_task_start_artifact(
             "task_start_artifact"
         }
     };
+    if matches!(
+        agent_kind,
+        ActSpawnAgentCli::Claude | ActSpawnAgentCli::Codex
+    ) && readiness_source != "agent_spawn_task_started_tool"
+    {
+        validation_errors
+            .push("readiness_source must be agent_spawn_task_started_tool for claude/codex spawns");
+    }
 
     if !validation_errors.is_empty() {
         return Err(json!({
@@ -7744,21 +7644,17 @@ mod tests {
         assert!(!prompt.contains("agent_spawn_task_started"));
         assert!(!prompt.contains("write-task-started.ps1"));
 
-        let script = build_agent_spawn_task_start_script(
-            "agent-spawn-test",
-            &test_spawn_params(),
-            &task_started_path,
-        );
-        assert!(script.contains("-f $key, $expectedValue, $actual"));
-        assert!(!script.contains("$key:"));
-        assert!(script.contains("assigned_prompt_present = $true"));
-        assert!(script.contains("$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)"));
-        assert!(script.contains("Write-TextNoBom -Path $taskStartedTempPath"));
-        assert!(!script.contains("Set-Content -LiteralPath $taskStartedTempPath -Encoding UTF8"));
+        let prompt_json = serde_json::to_string(&prompt).expect("prompt serializes");
+        assert!(!prompt_json.contains("write-task-started.ps1"));
+        assert!(!prompt_json.contains("session_list"));
+        assert!(!prompt_json.contains("get_target"));
+        assert!(!prompt_json.contains("set_target"));
+        assert!(prompt.contains("session facade"));
+        assert!(prompt.contains("target facade"));
     }
 
     #[test]
-    fn codex_spawn_files_do_not_materialize_task_started_helper() {
+    fn agent_spawn_files_do_not_materialize_task_started_helper() {
         struct EnvRestore {
             key: &'static str,
             value: Option<std::ffi::OsString>,
@@ -7808,8 +7704,18 @@ mod tests {
                 .expect("prepare claude spawn files");
 
         assert!(
-            claude_files.task_started_script_path.exists(),
-            "Claude gated-spawn settings still reference the helper path"
+            !claude_files.task_started_script_path.exists(),
+            "Claude readiness must go through agent operation=task_started, not a helper script"
+        );
+        let claude_settings_path = claude_files
+            .hook_settings_path
+            .as_ref()
+            .expect("Claude hook settings path");
+        let claude_settings =
+            fs::read_to_string(claude_settings_path).expect("read Claude hook settings");
+        assert!(
+            !claude_settings.contains("write-task-started.ps1"),
+            "Claude hook settings must not allowlist a task-start helper script"
         );
     }
 
@@ -8023,6 +7929,7 @@ mod tests {
                 "target_ok": true,
                 "assigned_prompt_present": true,
                 "task_started_path": files.task_started_path.display().to_string(),
+                "readiness_source": "agent_spawn_task_started_tool",
                 "started_at_unix_ms": 1234
             }))
             .expect("encode task start"),
@@ -8057,7 +7964,7 @@ mod tests {
     }
 
     #[test]
-    fn task_start_artifact_validation_accepts_matching_artifact() {
+    fn task_start_artifact_validation_rejects_legacy_direct_artifact_for_codex() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let files = AgentSpawnFiles {
             log_dir: dir.path().to_path_buf(),
@@ -8101,10 +8008,85 @@ mod tests {
             registered_at_unix_ms: 1000,
             agent_process_id: Some(42),
         };
-        let read = read_agent_spawn_task_start_artifact(
+        let error = read_agent_spawn_task_start_artifact(
             &files,
             &test_spawn_params(),
             ActSpawnAgentCli::Codex,
+            "agent-spawn-test",
+            &matched,
+        )
+        .expect_err("Codex must not accept direct task-start artifacts");
+
+        assert_eq!(
+            error.get("reason").and_then(Value::as_str),
+            Some("task_start_artifact_invalid")
+        );
+        assert!(
+            error
+                .get("validation_errors")
+                .and_then(Value::as_array)
+                .expect("validation errors")
+                .iter()
+                .any(|entry| entry.as_str()
+                    == Some(
+                        "readiness_source must be agent_spawn_task_started_tool for claude/codex spawns"
+                    ))
+        );
+    }
+
+    #[test]
+    fn task_start_artifact_validation_accepts_legacy_local_model_artifact() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: None,
+            mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: None,
+            codex_app_server_runner_path: None,
+            codex_app_server_control_path: None,
+            codex_app_server_events_path: None,
+            codex_app_server_stdout_path: None,
+            codex_app_server_stderr_path: None,
+            local_model_runner_path: None,
+        };
+        fs::write(
+            &files.task_started_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "spawn_id": "agent-spawn-test",
+                "cli": "local-model",
+                "session_id": "expected-session",
+                "status": "started",
+                "health_ok": true,
+                "target_ok": true,
+                "assigned_prompt_present": true,
+                "task_started_path": files.task_started_path.display().to_string(),
+                "started_at_unix_ms": 1234
+            }))
+            .expect("encode task start"),
+        )
+        .expect("write task start");
+        let matched = MatchedSpawnSession {
+            session_id: "expected-session".to_owned(),
+            registered_at_unix_ms: 1000,
+            agent_process_id: Some(42),
+        };
+        let mut params = test_spawn_params();
+        params.cli = None;
+        params.kind = Some(ActSpawnAgentCli::LocalModel);
+        params.model_ref = Some("ollama-gemma4-e4b".to_owned());
+        let read = read_agent_spawn_task_start_artifact(
+            &files,
+            &params,
+            ActSpawnAgentCli::LocalModel,
             "agent-spawn-test",
             &matched,
         )
@@ -8319,6 +8301,7 @@ mod tests {
                 "target_ok": true,
                 "assigned_prompt_present": true,
                 "task_started_path": files.task_started_path.display().to_string(),
+                "readiness_source": "agent_spawn_task_started_tool",
                 "started_at_unix_ms": 1234
             }))
             .expect("encode task start"),
@@ -8999,16 +8982,9 @@ mod tests {
 
     #[test]
     fn claude_hook_settings_subscribe_every_ingress_event_with_bearer() {
-        let helper = Path::new(
-            r"C:\Users\hotra\AppData\Local\Synapse\agent-spawns\agent-spawn-test\write-task-started.ps1",
-        );
-        let settings = build_claude_hook_settings(
-            "agent-spawn-test",
-            "http://127.0.0.1:7700/mcp",
-            true,
-            helper,
-        )
-        .expect("settings build");
+        let settings =
+            build_claude_hook_settings("agent-spawn-test", "http://127.0.0.1:7700/mcp", true)
+                .expect("settings build");
         let hooks = settings["hooks"].as_object().expect("hooks object");
         for event in super::super::agent_event_ingress::CLAUDE_HOOK_SUBSCRIBED_EVENTS {
             let entry = &hooks[*event][0]["hooks"][0];
@@ -9038,33 +9014,36 @@ mod tests {
         assert!(allow.iter().any(|rule| rule == "Read"));
         assert!(allow.iter().any(|rule| rule == "Bash(git status:*)"));
         assert!(allow.iter().any(|rule| rule == "mcp__synapse__agent"));
-        for tool in crate::server::permission_policy::SYNAPSE_COORDINATION_MCP_TOOLS {
+        assert!(allow.iter().any(|rule| rule == "mcp__synapse__approval"));
+        assert!(allow.iter().any(|rule| rule == "mcp__synapse__session"));
+        assert!(allow.iter().any(|rule| rule == "mcp__synapse__target"));
+        for tool in CLAUDE_COORDINATION_FACADE_MCP_TOOLS {
             let expected = format!("mcp__synapse__{tool}");
             assert!(
                 allow.iter().any(|rule| rule == &expected),
                 "Claude static allow list must include {expected}"
             );
         }
-        assert!(allow.iter().any(|rule| {
-            rule.as_str()
-                == Some(
-                    r"PowerShell(C:\Users\hotra\AppData\Local\Synapse\agent-spawns\agent-spawn-test\write-task-started.ps1 *)",
-                )
-        }));
+        let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        assert!(!encoded.contains("write-task-started.ps1"));
+        assert!(!encoded.contains("mcp__synapse__approval_gate"));
+        assert!(!encoded.contains("mcp__synapse__session_list"));
+        assert!(!encoded.contains("mcp__synapse__tool_profile_status"));
+        assert!(!encoded.contains("mcp__synapse__get_target"));
+        assert!(!encoded.contains("mcp__synapse__set_target"));
+        assert!(
+            !allow.iter().any(|rule| rule
+                .as_str()
+                .is_some_and(|rule| rule.starts_with("PowerShell("))),
+            "Claude gated allowlist must not preserve task-start helper PowerShell rules"
+        );
     }
 
     #[test]
     fn claude_hook_settings_omit_permissions_when_gate_disabled() {
-        let helper = Path::new(
-            r"C:\Users\hotra\AppData\Local\Synapse\agent-spawns\agent-spawn-test\write-task-started.ps1",
-        );
-        let settings = build_claude_hook_settings(
-            "agent-spawn-test",
-            "http://127.0.0.1:7700/mcp",
-            false,
-            helper,
-        )
-        .expect("settings build");
+        let settings =
+            build_claude_hook_settings("agent-spawn-test", "http://127.0.0.1:7700/mcp", false)
+                .expect("settings build");
         assert!(
             settings.get("permissions").is_none(),
             "ungated spawn (bypassPermissions) must not inject allow rules"

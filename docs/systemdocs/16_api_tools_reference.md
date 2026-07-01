@@ -204,6 +204,8 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 | `escalation_list` | List durable escalations + ladder state | `anchor?`, `status?`, `severity?`, `limit?`, `after_id?` | read-only |
 | `escalation_ack` | Acknowledge an escalation (stop ladder) | `escalation_id` (req), `note?` | writes ack to audit log |
 
+Public <=40-tool clients use the `approval` facade for Claude permission prompts; it accepts Claude's direct `tool_name`/`input` payload and delegates to hidden `approval_gate`.
+
 ## 16.10 Agents & orchestration
 
 ### 16.10.1 Lifecycle control — `agent_control.rs`

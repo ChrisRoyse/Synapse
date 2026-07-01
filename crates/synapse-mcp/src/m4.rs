@@ -994,9 +994,9 @@ pub struct ActSpawnAgentParams {
     #[schemars(default = "default_agent_spawn_hold_open_ms", range(min = 0))]
     pub hold_open_ms: u64,
     /// Gate spawned Claude risky tool calls through the human Approvals inbox
-    /// (#927). When true (the default) Claude uses
-    /// `mcp__synapse__approval_gate`; when false Claude uses
-    /// `bypassPermissions` for trusted unattended automation. Local-model
+    /// (#927). When true (the default) Claude uses the public
+    /// `mcp__synapse__approval` facade, which delegates to the hidden gate;
+    /// when false Claude uses `bypassPermissions` for trusted unattended automation. Local-model
     /// workers ignore this knob: they execute autonomously after prompt/exact
     /// contract prevalidation, with target/lease/tool-level invariants still
     /// failing closed.
@@ -1142,10 +1142,10 @@ pub struct ActSpawnAgentResponse {
     pub launched_at_unix_ms: u64,
     pub registered_at_unix_ms: u64,
     pub task_started_at_unix_ms: u64,
-    /// How task-start readiness was proven: `task_start_artifact` (the agent ran
-    /// the cooperative write-task-started helper) or
+    /// How task-start readiness was proven: current spawns use
     /// `agent_spawn_task_started_tool` (the agent called the daemon MCP
     /// readiness tool, which wrote the artifact from the real request session).
+    /// `task_start_artifact` is retained only for older spawn-dir readback.
     #[serde(default = "default_task_readiness_source")]
     pub task_readiness_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1171,6 +1171,9 @@ pub struct ActSpawnAgentLogPaths {
     pub final_message_path: String,
     pub completion_status_path: String,
     pub task_started_path: String,
+    /// Legacy compatibility path. Current Claude/Codex spawned-agent readiness
+    /// does not materialize this helper; readiness must go through
+    /// `agent operation=task_started`.
     pub task_started_script_path: String,
     pub terminal_asciicast_path: String,
     pub terminal_capture_status_path: String,
