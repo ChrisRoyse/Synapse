@@ -116,6 +116,11 @@ pub enum TranscriptSource {
     /// Codex `exec --json` stdout (verified against the
     /// `thread.*`/`turn.*`/`item.*` event vocabulary).
     CodexExecJson,
+    /// Codex app-server JSON-RPC/notification stdout. This is distinct from
+    /// `codex exec --json`: app-server lines are request/response envelopes
+    /// with `method`/`params` or `id`/`result`/`error`, not top-level `type`
+    /// events.
+    CodexAppServerJsonRpc,
     /// Synapse local-model runner stdout (`synapse-mcp --mode local-agent`)
     /// event vocabulary.
     LocalModelJson,

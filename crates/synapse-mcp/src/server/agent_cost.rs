@@ -1608,6 +1608,15 @@ impl SpawnAccumulator {
                 entry.cached = entry.cached.max(usage.cache_read_input_tokens.unwrap_or(0));
                 entry.line_no = entry.line_no.max(record.line_no);
             }
+            TranscriptSource::CodexAppServerJsonRpc
+                if kind == "codex_app_server/thread/tokenUsage/updated" =>
+            {
+                let entry = self.codex_max.get_or_insert_with(CodexMax::default);
+                entry.input = entry.input.max(usage.input_tokens.unwrap_or(0));
+                entry.output = entry.output.max(usage.output_tokens.unwrap_or(0));
+                entry.cached = entry.cached.max(usage.cache_read_input_tokens.unwrap_or(0));
+                entry.line_no = entry.line_no.max(record.line_no);
+            }
             TranscriptSource::LocalModelJson if kind == "local.turn.finished" => {
                 let entry = self.local_sum.get_or_insert_with(LocalSum::default);
                 entry.input = entry.input.saturating_add(usage.input_tokens.unwrap_or(0));
@@ -1631,6 +1640,9 @@ impl SpawnAccumulator {
                 kind == "assistant"
             }
             TranscriptSource::CodexExecJson => kind == "turn.completed",
+            TranscriptSource::CodexAppServerJsonRpc => {
+                kind == "codex_app_server/thread/tokenUsage/updated"
+            }
             TranscriptSource::LocalModelJson => kind == "local.turn.finished",
         };
         if is_turn_usage_row && let Some(turn_index) = record.turn_index {
@@ -1718,12 +1730,20 @@ impl SpawnAccumulator {
                     line_no: result.line_no,
                 }))
             }
-            (Some(TranscriptSource::CodexExecJson), _, Some(codex), _) => {
+            (
+                Some(
+                    source @ (TranscriptSource::CodexExecJson
+                    | TranscriptSource::CodexAppServerJsonRpc),
+                ),
+                _,
+                Some(codex),
+                _,
+            ) => {
                 let usage =
                     BillableUsage::from_codex_cumulative(codex.input, codex.output, codex.cached)
                         .map_err(|detail| mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail))?;
                 Ok(Some(ResolvedSpawn {
-                    source: TranscriptSource::CodexExecJson,
+                    source,
                     model: self.model.clone(),
                     models: vec![ResolvedModel {
                         model: self.model.clone(),
@@ -1819,6 +1839,11 @@ fn build_spawn_turns(
 
     let (method, output_basis, exact) = match resolved.source {
         TranscriptSource::CodexExecJson => ("codex_cumulative_delta", TurnOutputBasis::Exact, true),
+        TranscriptSource::CodexAppServerJsonRpc => (
+            "codex_app_server_cumulative_delta",
+            TurnOutputBasis::Exact,
+            true,
+        ),
         TranscriptSource::ClaudeStreamJson | TranscriptSource::ClaudeSessionJsonl => (
             "claude_per_message",
             TurnOutputBasis::PartialSnapshot,
@@ -1834,7 +1859,7 @@ fn build_spawn_turns(
 
     for (&turn_index, raw) in &acc.turns {
         let usage = match resolved.source {
-            TranscriptSource::CodexExecJson => {
+            TranscriptSource::CodexExecJson | TranscriptSource::CodexAppServerJsonRpc => {
                 let delta_input = raw.input.checked_sub(prev_cumulative.0);
                 let delta_output = raw.output.checked_sub(prev_cumulative.1);
                 let delta_cached = raw.cache_read.checked_sub(prev_cumulative.2);
@@ -1912,6 +1937,7 @@ fn source_label(source: TranscriptSource) -> String {
         TranscriptSource::ClaudeStreamJson => "claude_stream_json".to_owned(),
         TranscriptSource::ClaudeSessionJsonl => "claude_session_jsonl".to_owned(),
         TranscriptSource::CodexExecJson => "codex_exec_json".to_owned(),
+        TranscriptSource::CodexAppServerJsonRpc => "codex_app_server_json_rpc".to_owned(),
         TranscriptSource::LocalModelJson => "local_model_json".to_owned(),
     }
 }

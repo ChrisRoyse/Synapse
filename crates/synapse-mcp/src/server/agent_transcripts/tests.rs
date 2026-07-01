@@ -19,6 +19,16 @@ const CLAUDE_REAL_STREAM: &str = include_str!("../../../tests/fixtures/claude_st
 /// Real captured Codex `exec --json` run (18 lines, ends with
 /// `turn.completed`).
 const CODEX_REAL_STREAM: &str = include_str!("../../../tests/fixtures/codex_exec_real.jsonl");
+/// Byte-for-byte Codex app-server stdout lines captured from
+/// `agent-spawn-019ec7e6-95bb-74c2-b357-579f75b053ce` during #1425.
+const CODEX_APP_SERVER_REAL_STREAM: &str = r#"{"id":1,"result":{"userAgent":"synapse-act-spawn-agent/0.139.0 (Windows 10.0.26200; x86_64) unknown (synapse-act-spawn-agent; 0.1.0)","codexHome":"C:\\Users\\hotra\\.codex","platformFamily":"windows","platformOs":"windows"}}
+{"method":"thread/started","params":{"thread":{"id":"019ec7e6-99d1-7132-b3dc-a5005af88f47","sessionId":"019ec7e6-99d1-7132-b3dc-a5005af88f47","forkedFromId":null,"parentThreadId":null,"preview":"","ephemeral":true,"modelProvider":"openai","createdAt":1781470239,"updatedAt":1781470239,"status":{"type":"idle"},"path":null,"cwd":"C:\\code\\Synapse","cliVersion":"0.139.0","source":"vscode","threadSource":"subagent","agentNickname":null,"agentRole":null,"gitInfo":null,"name":null,"turns":[]}}}
+{"method":"turn/started","params":{"threadId":"019ec7e6-99d1-7132-b3dc-a5005af88f47","turn":{"id":"019ec7e6-9a11-7be1-9993-48e7a0125c9e","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":1781470239,"completedAt":null,"durationMs":null}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"019ec7e6-99d1-7132-b3dc-a5005af88f47","turnId":"019ec7e6-9a11-7be1-9993-48e7a0125c9e","itemId":"msg_0a7de64c6c34ee41016a2f142a95cc8197b76a8c4b87d6478f","delta":"I"}}
+{"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"call_BNQFKVunuXkRF6B2aRP3AfWx","server":"synapse","tool":"health","status":"inProgress","arguments":{},"pluginId":null,"result":null,"error":null,"durationMs":null},"threadId":"019ec7e6-99d1-7132-b3dc-a5005af88f47","turnId":"019ec7e6-9a11-7be1-9993-48e7a0125c9e","startedAtMs":1781470256712}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"019ec7e6-99d1-7132-b3dc-a5005af88f47","turnId":"019ec7e6-9a11-7be1-9993-48e7a0125c9e","tokenUsage":{"total":{"totalTokens":14404,"inputTokens":13987,"cachedInputTokens":4480,"outputTokens":417,"reasoningOutputTokens":333},"last":{"totalTokens":14404,"inputTokens":13987,"cachedInputTokens":4480,"outputTokens":417,"reasoningOutputTokens":333},"modelContextWindow":258400}}}
+{"method":"turn/completed","params":{"threadId":"019ec7e6-99d1-7132-b3dc-a5005af88f47","turn":{"id":"019ec7e6-9a11-7be1-9993-48e7a0125c9e","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1781470239,"completedAt":1781470467,"durationMs":228069}}}
+"#;
 const LOCAL_MODEL_STREAM: &str = r#"{"type":"local.thread.started","conversation_id":"local-model-test-thread","model":"gemma4:e4b","registry_name":"ollama-gemma4-e4b","tool_count":107}
 {"type":"local.turn.started","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1}
 {"type":"local.assistant.message","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1,"content":"","finish_reason":"tool_calls","raw_response_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
@@ -59,6 +69,7 @@ fn plant_spawn_dir(
     let marker = match source {
         TranscriptSource::ClaudeStreamJson => "claude-mcp-config.json",
         TranscriptSource::CodexExecJson => "codex-notify.ps1",
+        TranscriptSource::CodexAppServerJsonRpc => "codex-app-server-runner.ps1",
         TranscriptSource::LocalModelJson => "local-model-runner.json",
         // Session-file transcripts are not spawn-dir sourced; this helper never
         // builds one. Panic loudly if a test ever asks for it here.
@@ -284,6 +295,121 @@ fn codex_real_stream_reconciles_line_for_line() {
             .iter()
             .any(|call| call.exit_code == Some(0) && call.status.as_deref() == Some("completed")),
         "the real capture contains a completed command with exit 0"
+    );
+}
+
+#[test]
+fn codex_app_server_real_stream_reconciles_without_invalid_rows() {
+    let (_temp, db) = open_temp_db();
+    let root = tempfile::tempdir().expect("spawn root");
+    let spawn_id = "agent-spawn-codex-app-server-real";
+    let log_dir = plant_spawn_dir(
+        root.path(),
+        spawn_id,
+        TranscriptSource::CodexAppServerJsonRpc,
+        CODEX_APP_SERVER_REAL_STREAM,
+    );
+    // Current app-server spawns also carry the Codex notify marker; detection
+    // must still choose the app-server parser first.
+    std::fs::write(log_dir.join("codex-notify.ps1"), "$null").expect("write codex marker");
+    mark_completed(&log_dir);
+
+    let outcome =
+        ingest_spawn_dir_once(&db, spawn_id, &log_dir, false).expect("ingest must succeed");
+    let source_lines = CODEX_APP_SERVER_REAL_STREAM.lines().count() as u64;
+    println!(
+        "edge=codex_app_server parsed={} invalid={} total={}",
+        outcome.new_parsed_rows, outcome.new_invalid_rows, outcome.lines_ingested_total
+    );
+    assert_eq!(outcome.lines_ingested_total, source_lines);
+    assert_eq!(
+        outcome.new_invalid_rows, 0,
+        "real app-server JSON-RPC lines must not flood invalid rows"
+    );
+    assert!(outcome.source_complete);
+
+    let rows = scan_spawn_rows(&db, spawn_id);
+    assert_eq!(rows.len() as u64, source_lines);
+    assert!(
+        rows.iter()
+            .all(|(_line, record)| record.source == TranscriptSource::CodexAppServerJsonRpc),
+        "every row must carry the app-server source"
+    );
+
+    let response = &rows[0].1;
+    assert_eq!(
+        response.event_kind.as_deref(),
+        Some("codex_app_server/response/result")
+    );
+    assert_eq!(response.status, TranscriptParseStatus::Parsed);
+
+    let thread_started = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| record.event_kind.as_deref() == Some("codex_app_server/thread/started"))
+        .expect("thread started row");
+    assert_eq!(thread_started.role, Some(TranscriptRole::System));
+    assert_eq!(
+        thread_started.conversation_id.as_deref(),
+        Some("019ec7e6-99d1-7132-b3dc-a5005af88f47")
+    );
+
+    let delta = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| {
+            record.event_kind.as_deref() == Some("codex_app_server/item/agentMessage/delta")
+        })
+        .expect("delta row");
+    assert_eq!(delta.role, Some(TranscriptRole::Assistant));
+    assert_eq!(delta.content_summary.as_deref(), Some("I"));
+
+    let tool = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| {
+            record.event_kind.as_deref() == Some("codex_app_server/item/started/mcpToolCall")
+        })
+        .expect("tool row");
+    assert_eq!(tool.role, Some(TranscriptRole::Tool));
+    assert_eq!(tool.tool_calls[0].tool_name, "synapse.health");
+
+    let usage = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| {
+            record.event_kind.as_deref() == Some("codex_app_server/thread/tokenUsage/updated")
+        })
+        .and_then(|record| record.usage.as_ref())
+        .expect("usage row");
+    assert_eq!(usage.input_tokens, Some(13_987));
+    assert_eq!(usage.output_tokens, Some(417));
+    assert_eq!(usage.cache_read_input_tokens, Some(4_480));
+    assert_eq!(usage.reasoning_output_tokens, Some(333));
+}
+
+#[test]
+fn malformed_codex_app_server_envelope_is_invalid() {
+    let (_temp, db) = open_temp_db();
+    let root = tempfile::tempdir().expect("spawn root");
+    let spawn_id = "agent-spawn-codex-app-server-malformed";
+    let content = "{\"params\":{\"threadId\":\"thread-without-method-or-id\"}}\n";
+    let log_dir = plant_spawn_dir(
+        root.path(),
+        spawn_id,
+        TranscriptSource::CodexAppServerJsonRpc,
+        content,
+    );
+
+    let outcome = ingest_spawn_dir_once(&db, spawn_id, &log_dir, true).expect("ingest");
+    assert_eq!(outcome.new_invalid_rows, 1);
+    let rows = scan_spawn_rows(&db, spawn_id);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.status, TranscriptParseStatus::Invalid);
+    let parse_error = rows[0].1.parse_error.as_deref().expect("detail");
+    assert!(
+        parse_error.contains("CODEX_APP_SERVER_MESSAGE_MISSING_METHOD_OR_ID"),
+        "malformed app-server envelopes must stay fail-closed: {parse_error}"
     );
 }
 

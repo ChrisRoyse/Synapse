@@ -210,11 +210,17 @@ fn detect_source(log_dir: &Path) -> Result<TranscriptSource, String> {
     let claude = log_dir.join("claude-mcp-config.json").is_file()
         || log_dir.join("claude-hook-settings.json").is_file()
         || log_dir.join("claude-debug.log").is_file();
-    let codex = log_dir.join("codex-notify.ps1").is_file();
+    let codex_app_server = log_dir.join("codex-app-server-runner.ps1").is_file()
+        || log_dir.join("codex-control.json").is_file()
+        || log_dir.join("codex-app-server-events.jsonl").is_file();
+    let codex = !codex_app_server && log_dir.join("codex-notify.ps1").is_file();
     let local = log_dir.join("local-model-runner.json").is_file();
     let mut matches = Vec::new();
     if claude {
         matches.push(TranscriptSource::ClaudeStreamJson);
+    }
+    if codex_app_server {
+        matches.push(TranscriptSource::CodexAppServerJsonRpc);
     }
     if codex {
         matches.push(TranscriptSource::CodexExecJson);
@@ -849,6 +855,9 @@ fn parse_line(
     let result = match cursor.source {
         TranscriptSource::ClaudeStreamJson => parse_claude_object(object, &mut record, cursor),
         TranscriptSource::CodexExecJson => parse_codex_object(object, &mut record, cursor),
+        TranscriptSource::CodexAppServerJsonRpc => {
+            parse_codex_app_server_object(object, &mut record, cursor)
+        }
         TranscriptSource::LocalModelJson => parse_local_model_object(object, &mut record, cursor),
         // The spawn-dir ingester never owns a session-file cursor; that
         // vocabulary is tailed by `ambient_agents`. Seeing it here is a routing
@@ -1380,6 +1389,294 @@ fn parse_codex_object(
         }
         other => Err(format!("UNKNOWN_EVENT_TYPE: {other}")),
     }
+}
+
+/// Codex app-server stdout is a JSON-RPC-style event stream, not Codex
+/// `exec --json`. Notifications carry `method` + `params`; responses carry
+/// `id` plus either `result` or `error`. The method namespace is intentionally
+/// open, so unknown app-server methods are preserved as generic system rows
+/// instead of treated as parser drift.
+fn parse_codex_app_server_object(
+    object: &Map<String, Value>,
+    record: &mut AgentTranscriptRecord,
+    cursor: &mut TranscriptCursor,
+) -> Result<(), String> {
+    if let Some(method) = object.get("method").and_then(Value::as_str) {
+        let params = object.get("params").unwrap_or(&Value::Null);
+        stamp_codex_app_server_identity(params, cursor);
+        record.event_kind = Some(format!("codex_app_server/{method}"));
+        match method {
+            "turn/started" => {
+                cursor.turn_index += 1;
+                record.role = Some(TranscriptRole::System);
+                set_json_content(record, params);
+            }
+            "turn/completed" => {
+                record.role = Some(TranscriptRole::Result);
+                set_json_content(record, params);
+                if let Some(error) = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("error"))
+                    .filter(|error| !error.is_null())
+                {
+                    record.source_error = Some(error.to_string());
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                record.role = Some(TranscriptRole::Result);
+                if let Some(usage) = params.get("tokenUsage") {
+                    record.usage = Some(codex_app_server_usage(usage));
+                }
+                set_json_content(record, params);
+            }
+            "item/agentMessage/delta" => {
+                record.role = Some(TranscriptRole::Assistant);
+                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                    set_content(record, delta);
+                } else {
+                    set_json_content(record, params);
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                record.role = Some(TranscriptRole::Tool);
+                let (result_summary, result_bytes, result_truncated) = params
+                    .get("delta")
+                    .map(|delta| bounded_json_string(delta, AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS))
+                    .unwrap_or_default();
+                record.tool_calls.push(TranscriptToolCall {
+                    tool_name: "command_execution".to_owned(),
+                    tool_call_id: params
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    result_summary: Some(result_summary),
+                    result_bytes: Some(result_bytes),
+                    result_truncated,
+                    ..TranscriptToolCall::default()
+                });
+            }
+            "item/started" | "item/completed" => {
+                parse_codex_app_server_item(method, params, record)?;
+            }
+            _ => {
+                record.role = Some(TranscriptRole::System);
+                set_json_content(record, params);
+            }
+        }
+        return Ok(());
+    }
+
+    if !object.contains_key("id") {
+        return Err(
+            "CODEX_APP_SERVER_MESSAGE_MISSING_METHOD_OR_ID: expected notification or response"
+                .to_owned(),
+        );
+    }
+    if let Some(result) = object.get("result") {
+        record.role = Some(TranscriptRole::System);
+        record.event_kind = Some("codex_app_server/response/result".to_owned());
+        set_json_content(record, result);
+        if let Some(model) = result.get("model").and_then(Value::as_str) {
+            cursor.model = Some(model.to_owned());
+            record.model = Some(model.to_owned());
+        }
+        if let Some(thread_id) = result
+            .get("thread")
+            .and_then(|thread| thread.get("id").or_else(|| thread.get("sessionId")))
+            .and_then(Value::as_str)
+        {
+            cursor.conversation_id = Some(thread_id.to_owned());
+        }
+        return Ok(());
+    }
+    if let Some(error) = object.get("error") {
+        record.role = Some(TranscriptRole::Result);
+        record.event_kind = Some("codex_app_server/response/error".to_owned());
+        record.source_error = Some(error.to_string());
+        set_json_content(record, error);
+        return Ok(());
+    }
+    Err("CODEX_APP_SERVER_RESPONSE_MISSING_RESULT_OR_ERROR".to_owned())
+}
+
+fn parse_codex_app_server_item(
+    method: &str,
+    params: &Value,
+    record: &mut AgentTranscriptRecord,
+) -> Result<(), String> {
+    let item = params
+        .get("item")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{method}: missing `item` object"))?;
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{method}: item has no string `type`"))?;
+    record.event_kind = Some(format!("codex_app_server/{method}/{item_type}"));
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    match item_type {
+        "agentMessage" | "reasoning" => {
+            record.role = Some(TranscriptRole::Assistant);
+            if let Some(text) = codex_app_server_item_text(item) {
+                set_content(record, &text);
+            } else {
+                set_json_content(record, &Value::Object(item.clone()));
+            }
+        }
+        "userMessage" => {
+            record.role = Some(TranscriptRole::System);
+            if let Some(text) = codex_app_server_item_text(item) {
+                set_content(record, &text);
+            } else {
+                set_json_content(record, &Value::Object(item.clone()));
+            }
+        }
+        "mcpToolCall" => {
+            record.role = Some(TranscriptRole::Tool);
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+            let tool = item
+                .get("tool")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "CODEX_APP_SERVER_MCP_TOOL_CALL_MISSING_TOOL".to_owned())?;
+            let tool_name = if server.is_empty() {
+                tool.to_owned()
+            } else {
+                format!("{server}.{tool}")
+            };
+            let (arguments, arguments_bytes, arguments_truncated) = item
+                .get("arguments")
+                .map(|arguments| {
+                    bounded_json_string(arguments, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS)
+                })
+                .unwrap_or_default();
+            let result = item
+                .get("result")
+                .filter(|value| !value.is_null())
+                .map(|result| bounded_json_string(result, AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS));
+            record.tool_calls.push(TranscriptToolCall {
+                tool_name,
+                tool_call_id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                arguments: Some(arguments),
+                arguments_bytes: Some(arguments_bytes),
+                arguments_truncated,
+                result_summary: result.as_ref().map(|(text, _, _)| text.clone()),
+                result_bytes: result.as_ref().map(|(_, bytes, _)| *bytes),
+                result_truncated: result.as_ref().is_some_and(|(_, _, truncated)| *truncated),
+                status,
+                exit_code: None,
+            });
+        }
+        "commandExecution" => {
+            record.role = Some(TranscriptRole::Tool);
+            let (arguments, arguments_bytes, arguments_truncated) = item
+                .get("command")
+                .map(|command| bounded_json_string(command, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS))
+                .unwrap_or_default();
+            let result = item
+                .get("aggregatedOutput")
+                .or_else(|| item.get("aggregated_output"))
+                .filter(|value| !value.is_null())
+                .map(|output| bounded_json_string(output, AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS));
+            record.tool_calls.push(TranscriptToolCall {
+                tool_name: "command_execution".to_owned(),
+                tool_call_id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                arguments: Some(arguments),
+                arguments_bytes: Some(arguments_bytes),
+                arguments_truncated,
+                result_summary: result.as_ref().map(|(text, _, _)| text.clone()),
+                result_bytes: result.as_ref().map(|(_, bytes, _)| *bytes),
+                result_truncated: result.as_ref().is_some_and(|(_, _, truncated)| *truncated),
+                status,
+                exit_code: item
+                    .get("exitCode")
+                    .or_else(|| item.get("exit_code"))
+                    .and_then(Value::as_i64),
+            });
+        }
+        _ => {
+            record.role = Some(TranscriptRole::System);
+            set_json_content(record, &Value::Object(item.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn codex_app_server_item_text(item: &Map<String, Value>) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    let content = item.get("content")?.as_array()?;
+    let parts: Vec<&str> = content
+        .iter()
+        .filter_map(|block| {
+            block
+                .as_object()
+                .and_then(|object| object.get("text"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn codex_app_server_usage(usage: &Value) -> TranscriptUsage {
+    let total = usage.get("total").unwrap_or(usage);
+    TranscriptUsage {
+        input_tokens: u64_field(total, &["inputTokens", "input_tokens"]),
+        output_tokens: u64_field(total, &["outputTokens", "output_tokens"]),
+        cache_read_input_tokens: u64_field(total, &["cachedInputTokens", "cached_input_tokens"]),
+        cache_creation_input_tokens: None,
+        cache_creation_5m_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
+        reasoning_output_tokens: u64_field(
+            total,
+            &["reasoningOutputTokens", "reasoning_output_tokens"],
+        ),
+        total_cost_micro_usd: None,
+        model_usage: Vec::new(),
+    }
+}
+
+fn u64_field(value: &Value, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_u64))
+}
+
+fn stamp_codex_app_server_identity(params: &Value, cursor: &mut TranscriptCursor) {
+    if let Some(thread_id) = params
+        .get("threadId")
+        .or_else(|| params.get("thread_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("thread")
+                .and_then(|thread| thread.get("id").or_else(|| thread.get("sessionId")))
+                .and_then(Value::as_str)
+        })
+    {
+        cursor.conversation_id = Some(thread_id.to_owned());
+    }
+    if let Some(model) = params.get("model").and_then(Value::as_str).or_else(|| {
+        params
+            .get("thread")
+            .and_then(|thread| thread.get("model"))
+            .and_then(Value::as_str)
+    }) {
+        cursor.model = Some(model.to_owned());
+    }
+}
+
+fn set_json_content(record: &mut AgentTranscriptRecord, value: &Value) {
+    set_content(record, &value.to_string());
 }
 
 fn parse_local_model_object(

@@ -489,6 +489,70 @@ fn codex_takes_cumulative_max_and_subtracts_cache() {
 }
 
 #[test]
+fn codex_app_server_usage_uses_cumulative_token_updates() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+    service
+        .agent_cost_price_put_impl(AgentCostPricePutParams {
+            model_id: "gpt-5.2".to_owned(),
+            provider: Some("openai".to_owned()),
+            input_usd_per_mtok: 1.75,
+            output_usd_per_mtok: 14.0,
+            cache_read_usd_per_mtok: 0.175,
+            cache_creation_usd_per_mtok: 0.0,
+            cache_creation_5m_usd_per_mtok: None,
+            cache_creation_1h_usd_per_mtok: None,
+        })
+        .expect("price");
+
+    let spawn = "agent-spawn-codex-app-server-cost";
+    write_row(
+        &db,
+        spawn,
+        1,
+        200,
+        TranscriptSource::CodexAppServerJsonRpc,
+        "codex_app_server/turn/started",
+        Some("gpt-5.2"),
+        TranscriptRole::System,
+        None,
+    );
+    write_row(
+        &db,
+        spawn,
+        2,
+        210,
+        TranscriptSource::CodexAppServerJsonRpc,
+        "codex_app_server/thread/tokenUsage/updated",
+        Some("gpt-5.2"),
+        TranscriptRole::Result,
+        Some(codex_usage(50_000, 1_000, 30_000, 500)),
+    );
+    write_row(
+        &db,
+        spawn,
+        3,
+        220,
+        TranscriptSource::CodexAppServerJsonRpc,
+        "codex_app_server/thread/tokenUsage/updated",
+        Some("gpt-5.2"),
+        TranscriptRole::Result,
+        Some(codex_usage(144_733, 2_110, 103_296, 1_380)),
+    );
+
+    let out = service
+        .agent_cost_impl(cost_params(Some(spawn), None, None))
+        .expect("rollup");
+    let s = &out.per_spawn[0];
+    assert_eq!(s.status, "complete");
+    assert_eq!(s.source.as_deref(), Some("codex_app_server_json_rpc"));
+    assert_eq!(s.usage.input_tokens, 144_733 - 103_296);
+    assert_eq!(s.usage.cache_read_tokens, 103_296);
+    assert_eq!(s.usage.output_tokens, 2_110);
+}
+
+#[test]
 fn local_model_usage_sums_per_turn_finished_rows() {
     let temp = TempDir::new().expect("tempdir");
     let service = service_with_db(temp.path());
@@ -756,6 +820,7 @@ fn plant_spawn_dir(root: &Path, spawn_id: &str, source: TranscriptSource, stdout
     let marker = match source {
         TranscriptSource::ClaudeStreamJson => "claude-mcp-config.json",
         TranscriptSource::CodexExecJson => "codex-notify.ps1",
+        TranscriptSource::CodexAppServerJsonRpc => "codex-app-server-runner.ps1",
         TranscriptSource::LocalModelJson => "local-model-runner.json",
         TranscriptSource::ClaudeSessionJsonl => {
             unreachable!("cost spawn-dir helper does not handle ClaudeSessionJsonl")
