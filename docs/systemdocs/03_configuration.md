@@ -178,6 +178,7 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | `CLAUDE_CONFIG_DIR` | `server/ambient_agents.rs` | path | none | Claude config dir for transcript discovery. |
 | `SYNAPSE_TRANSCRIPT_INGEST_INTERVAL_SECS` | `server/agent_transcripts.rs` | u64 (s) | `15` | Agent-transcript ingest interval. |
 | `SYNAPSE_TRANSCRIPT_INGEST_STARTUP_DELAY_SECS` | same | u64 (s) | `10` | Delay before first transcript ingest. |
+| `SYNAPSE_TRANSCRIPT_INGEST_SPAWN_ROOT` | same (`ROOT_ENV`) | path | host spawn root only for configured daemon DBs | Explicit spawned-agent transcript root for custom/scratch DB runs. Without this override, host-global `%LOCALAPPDATA%\Synapse\agent-spawns` ingestion is enabled only for `%LOCALAPPDATA%\synapse\db-daemon` and the normal M3 default `%LOCALAPPDATA%\synapse\db`; custom DBs log `TRANSCRIPT_INGEST_CUSTOM_DB_UNSCOPED` and skip periodic transcript ingest. |
 
 ### 3.7 Action / safety / approvals
 

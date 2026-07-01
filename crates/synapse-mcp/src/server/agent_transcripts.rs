@@ -41,7 +41,7 @@
 
 use std::{
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -62,12 +62,14 @@ use synapse_storage::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::m3::M3State;
+use crate::m3::{M3State, default_daemon_db_path, default_db_path};
 
 /// Environment variable: seconds between periodic ingest cycles.
 pub(crate) const INTERVAL_ENV: &str = "SYNAPSE_TRANSCRIPT_INGEST_INTERVAL_SECS";
 /// Environment variable: delay before the first cycle.
 pub(crate) const STARTUP_DELAY_ENV: &str = "SYNAPSE_TRANSCRIPT_INGEST_STARTUP_DELAY_SECS";
+/// Environment variable: explicit spawn-root scope for custom/scratch DB runs.
+pub(crate) const ROOT_ENV: &str = "SYNAPSE_TRANSCRIPT_INGEST_SPAWN_ROOT";
 const DEFAULT_INTERVAL_SECS: u64 = 15;
 const DEFAULT_STARTUP_DELAY_SECS: u64 = 10;
 
@@ -147,6 +149,27 @@ pub(crate) struct SpawnIngestOutcome {
     pub source_complete: bool,
     pub deferred_for_pressure: bool,
     pub skipped: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TranscriptRootDecision {
+    root: PathBuf,
+    scope: TranscriptRootScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranscriptRootScope {
+    ExplicitEnv,
+    ConfiguredDaemonDb,
+}
+
+impl TranscriptRootScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitEnv => "explicit_env",
+            Self::ConfiguredDaemonDb => "configured_daemon_db",
+        }
+    }
 }
 
 fn cursor_kv_key(spawn_id: &str) -> Vec<u8> {
@@ -736,10 +759,29 @@ pub(crate) fn spawn_periodic_transcript_ingest(
         );
         return Ok(None);
     }
+    let db_path = configured_db_path(&m3_state)?;
+    let Some(root_decision) =
+        transcript_spawn_root_for_db(&db_path).map_err(|detail| anyhow::anyhow!(detail))?
+    else {
+        tracing::warn!(
+            code = "TRANSCRIPT_INGEST_CUSTOM_DB_UNSCOPED",
+            db_path = %db_path.display(),
+            default_db_path = %default_db_path().display(),
+            default_daemon_db_path = %default_daemon_db_path().display(),
+            explicit_root_env = ROOT_ENV,
+            remediation = "set SYNAPSE_TRANSCRIPT_INGEST_SPAWN_ROOT for this run or use the configured daemon DB path",
+            "periodic transcript ingestion disabled for custom DB without an explicit spawn root"
+        );
+        return Ok(None);
+    };
+    let TranscriptRootDecision { root, scope } = root_decision;
     tracing::info!(
         code = "TRANSCRIPT_INGEST_PERIODIC_SCHEDULED",
         interval_secs,
         startup_delay_secs,
+        root = %root.display(),
+        root_scope = scope.as_str(),
+        db_path = %db_path.display(),
         "periodic transcript ingestion scheduled"
     );
     let handle = tokio::spawn(async move {
@@ -755,14 +797,71 @@ pub(crate) fn spawn_periodic_transcript_ingest(
                 }
                 () = tokio::time::sleep(delay) => {}
             }
-            run_cycle(&m3_state);
+            run_cycle(&m3_state, &root);
             delay = std::time::Duration::from_secs(interval_secs);
         }
     });
     Ok(Some(handle))
 }
 
-fn run_cycle(m3_state: &Arc<Mutex<M3State>>) {
+fn configured_db_path(m3_state: &Arc<Mutex<M3State>>) -> anyhow::Result<PathBuf> {
+    let state = m3_state
+        .lock()
+        .map_err(|_poisoned| anyhow::anyhow!("m3 state lock poisoned"))?;
+    Ok(state.db_path.clone().unwrap_or_else(default_db_path))
+}
+
+fn transcript_spawn_root_for_db(db_path: &Path) -> Result<Option<TranscriptRootDecision>, String> {
+    let explicit_root = std::env::var_os(ROOT_ENV).map(PathBuf::from);
+    transcript_spawn_root_for_db_with(db_path, explicit_root, || {
+        super::m4_tools::agent_spawn_root_dir().map_err(|error| error.message.to_string())
+    })
+}
+
+fn transcript_spawn_root_for_db_with(
+    db_path: &Path,
+    explicit_root: Option<PathBuf>,
+    host_spawn_root: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<Option<TranscriptRootDecision>, String> {
+    if let Some(root) = explicit_root {
+        return Ok(Some(TranscriptRootDecision {
+            root,
+            scope: TranscriptRootScope::ExplicitEnv,
+        }));
+    }
+    if !transcript_host_root_allowed_for_db(db_path) {
+        return Ok(None);
+    }
+    Ok(Some(TranscriptRootDecision {
+        root: host_spawn_root()?,
+        scope: TranscriptRootScope::ConfiguredDaemonDb,
+    }))
+}
+
+fn transcript_host_root_allowed_for_db(db_path: &Path) -> bool {
+    [default_db_path(), default_daemon_db_path()]
+        .iter()
+        .any(|allowed| paths_equivalent(db_path, allowed))
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
+}
+
+fn path_key(path: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| PathBuf::from(path));
+    let mut raw = path.to_string_lossy().replace('/', "\\");
+    while raw.ends_with('\\') {
+        raw.pop();
+    }
+    #[cfg(windows)]
+    {
+        raw.make_ascii_lowercase();
+    }
+    raw
+}
+
+fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path) {
     let db = {
         let mut state = match m3_state.lock() {
             Ok(state) => state,
@@ -787,18 +886,7 @@ fn run_cycle(m3_state: &Arc<Mutex<M3State>>) {
             }
         }
     };
-    let root = match super::m4_tools::agent_spawn_root_dir() {
-        Ok(root) => root,
-        Err(error) => {
-            tracing::error!(
-                code = "TRANSCRIPT_INGEST_CYCLE_FAILED",
-                detail = %error.message,
-                "transcript ingest cycle could not resolve the spawn root"
-            );
-            return;
-        }
-    };
-    let _summary = ingest_all_spawn_dirs_once(&db, &root);
+    let _summary = ingest_all_spawn_dirs_once(&db, root);
 }
 
 fn parse_secs_env(name: &str, default: u64) -> anyhow::Result<u64> {

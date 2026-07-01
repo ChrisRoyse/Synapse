@@ -56,6 +56,73 @@ fn open_temp_db() -> (tempfile::TempDir, Db) {
     (temp, db)
 }
 
+#[test]
+fn custom_db_without_explicit_transcript_root_disables_host_spawn_scan() {
+    let custom = tempfile::tempdir().expect("custom db root");
+    let host_root = tempfile::tempdir().expect("host spawn root");
+
+    let decision = transcript_spawn_root_for_db_with(custom.path(), None, || {
+        Ok(host_root.path().to_path_buf())
+    })
+    .expect("root decision");
+
+    println!(
+        "edge=custom_db_no_explicit_root db={} host_root={} decision={decision:?}",
+        custom.path().display(),
+        host_root.path().display()
+    );
+    assert!(
+        decision.is_none(),
+        "custom DBs must not scan the host-global spawn root without an explicit root"
+    );
+}
+
+#[test]
+fn custom_db_with_explicit_transcript_root_uses_only_that_root() {
+    let custom = tempfile::tempdir().expect("custom db root");
+    let explicit_root = tempfile::tempdir().expect("explicit spawn root");
+    let host_root = tempfile::tempdir().expect("host spawn root");
+
+    let decision = transcript_spawn_root_for_db_with(
+        custom.path(),
+        Some(explicit_root.path().to_path_buf()),
+        || Ok(host_root.path().to_path_buf()),
+    )
+    .expect("root decision")
+    .expect("explicit root should enable ingest");
+
+    println!(
+        "edge=custom_db_explicit_root db={} explicit_root={} host_root={} selected={} scope={}",
+        custom.path().display(),
+        explicit_root.path().display(),
+        host_root.path().display(),
+        decision.root.display(),
+        decision.scope.as_str()
+    );
+    assert_eq!(decision.root, explicit_root.path());
+    assert_eq!(decision.scope, TranscriptRootScope::ExplicitEnv);
+}
+
+#[test]
+fn configured_daemon_db_without_explicit_root_keeps_default_host_spawn_scan() {
+    let host_root = tempfile::tempdir().expect("host spawn root");
+
+    let decision = transcript_spawn_root_for_db_with(&default_daemon_db_path(), None, || {
+        Ok(host_root.path().to_path_buf())
+    })
+    .expect("root decision")
+    .expect("configured daemon DB should keep host spawn ingest");
+
+    println!(
+        "edge=configured_daemon_db db={} selected={} scope={}",
+        default_daemon_db_path().display(),
+        decision.root.display(),
+        decision.scope.as_str()
+    );
+    assert_eq!(decision.root, host_root.path());
+    assert_eq!(decision.scope, TranscriptRootScope::ConfiguredDaemonDb);
+}
+
 /// Builds a real-shaped spawn dir: the CLI marker file decides the parser,
 /// exactly like a live `act_spawn_agent` dir does.
 fn plant_spawn_dir(
