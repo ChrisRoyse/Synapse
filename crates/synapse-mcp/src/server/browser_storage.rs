@@ -17,6 +17,8 @@ const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const REDACTION_POLICY: &str = "browser_storage_secret_value_v1";
 const REDACTED_VALUE: &str = "[redacted]";
 
+mod load_state_validation;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -434,11 +436,8 @@ fn validate_storage_params(params: &BrowserStorageParams) -> Result<(), ErrorDat
             "browser_storage operation=set requires non-empty key",
         ));
     }
-    if matches!(params.operation, BrowserStorageOperation::LoadState) && params.state.is_none() {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "browser_storage operation=load_state requires state",
-        ));
+    if matches!(params.operation, BrowserStorageOperation::LoadState) {
+        load_state_validation::validate_load_state_params(params)?;
     }
     Ok(())
 }
