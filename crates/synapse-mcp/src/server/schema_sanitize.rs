@@ -47,7 +47,7 @@
 //! non-standard format — can never reintroduce the warning. Enforced by
 //! `real_tool_schemas_have_no_nonstandard_formats_after_sanitize`.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use rmcp::model::Tool;
 use serde_json::{Map, Value};
@@ -104,10 +104,49 @@ const STANDARD_JSON_SCHEMA_FORMATS: &[&str] = &[
     "uuid",
 ];
 
+/// JSON Schema annotation fields that are fed directly to MCP clients and LLMs.
+/// Keep these ASCII-only so Windows console/code-page boundaries cannot turn
+/// valid UTF-8 punctuation into mojibake in `tools/list`.
+const TEXT_ANNOTATION_KEYS: &[&str] = &["$comment", "description", "title"];
+
 /// True if `format` is a standard JSON Schema 2020-12 format that compliant MCP
 /// clients recognize and therefore must be preserved.
 fn is_standard_format(format: &str) -> bool {
     STANDARD_JSON_SCHEMA_FORMATS.binary_search(&format).is_ok()
+}
+
+fn normalize_metadata_text(input: &str) -> Cow<'_, str> {
+    if input.is_ascii() {
+        return Cow::Borrowed(input);
+    }
+
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\u{00a0}' => output.push(' '),
+            '\u{00b1}' => output.push_str("+/-"),
+            '\u{00d7}' => output.push('x'),
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2212}' => {
+                output.push('-');
+            }
+            '\u{2014}' => output.push('-'),
+            '\u{2018}' | '\u{2019}' => output.push('\''),
+            '\u{201c}' | '\u{201d}' => output.push('"'),
+            '\u{2026}' => output.push_str("..."),
+            '\u{2190}' => output.push_str("<-"),
+            '\u{2192}' => output.push_str("->"),
+            '\u{21d2}' => output.push_str("=>"),
+            '\u{2208}' => output.push_str("in"),
+            '\u{2209}' => output.push_str("not in"),
+            '\u{03a3}' | '\u{2211}' => output.push_str("sum"),
+            '\u{2264}' => output.push_str("<="),
+            '\u{2265}' => output.push_str(">="),
+            '\u{2713}' => output.push_str("check"),
+            _ => output.push(ch),
+        }
+    }
+
+    Cow::Owned(output)
 }
 
 /// Removes a non-standard `format` annotation from a single schema object,
@@ -131,6 +170,11 @@ pub fn sanitize_tools(tools: Vec<Tool>) -> Vec<Tool> {
 }
 
 fn sanitize_tool(mut tool: Tool) -> Tool {
+    if let Some(description) = tool.description.as_ref() {
+        if let Cow::Owned(normalized) = normalize_metadata_text(description.as_ref()) {
+            tool.description = Some(Cow::Owned(normalized));
+        }
+    }
     tool.input_schema = sanitize_schema_object(&tool.input_schema);
     if let Some(output) = &tool.output_schema {
         tool.output_schema = Some(sanitize_schema_object(output));
@@ -204,7 +248,13 @@ fn rewrite_schema_value(value: &mut Value) {
 
 fn rewrite_map(map: &mut Map<String, Value>) {
     for (key, child) in map.iter_mut() {
-        if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) {
+        if TEXT_ANNOTATION_KEYS.contains(&key.as_str()) {
+            if let Value::String(text) = child
+                && let Cow::Owned(normalized) = normalize_metadata_text(text)
+            {
+                *text = normalized;
+            }
+        } else if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) {
             if let Value::Object(members) = child {
                 for member in members.values_mut() {
                     rewrite_schema_value(member);
@@ -295,6 +345,47 @@ mod tests {
         }
     }
 
+    fn text_metadata_issue(text: &str) -> Option<String> {
+        if text.contains('â')
+            || text.contains('Â')
+            || text.contains('\u{fffd}')
+            || text.contains("\\u00e2")
+            || text.contains("\\u00c2")
+            || text
+                .chars()
+                .any(|ch| ('\u{0080}'..='\u{009f}').contains(&ch))
+        {
+            return Some("mojibake sentinel".to_owned());
+        }
+        if let Some(ch) = text.chars().find(|ch| !ch.is_ascii()) {
+            return Some(format!("non-ascii U+{:04X}", ch as u32));
+        }
+        None
+    }
+
+    fn text_metadata_issues(value: &Value, path: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let child_path = format!("{path}.{key}");
+                    if TEXT_ANNOTATION_KEYS.contains(&key.as_str())
+                        && let Value::String(text) = child
+                        && let Some(issue) = text_metadata_issue(text)
+                    {
+                        out.push(format!("{child_path}: {issue}: {text:?}"));
+                    }
+                    text_metadata_issues(child, &child_path, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    text_metadata_issues(item, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Full real tool surface, sanitized, must contain ZERO bare-boolean schema
     /// positions. This is the regression gate that keeps any current or future
     /// `serde_json::Value` tool field from breaking strict MCP clients.
@@ -321,6 +412,42 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "sanitized tool schemas still contain bare boolean schemas (strict MCP clients reject these): {offenders:#?}"
+        );
+    }
+
+    #[test]
+    fn real_tool_metadata_text_has_no_mojibake_or_non_ascii_after_sanitize() {
+        let tools = sanitize_tools(super::super::SynapseService::tool_router().list_all());
+        let mut offenders = Vec::new();
+        for tool in &tools {
+            if let Some(description) = tool.description.as_ref()
+                && let Some(issue) = text_metadata_issue(description.as_ref())
+            {
+                offenders.push(format!(
+                    "{}.description: {issue}: {:?}",
+                    tool.name,
+                    description.as_ref()
+                ));
+            }
+
+            let input = Value::Object((*tool.input_schema).clone());
+            text_metadata_issues(
+                &input,
+                &format!("{}.inputSchema", tool.name),
+                &mut offenders,
+            );
+            if let Some(output) = &tool.output_schema {
+                let output = Value::Object((**output).clone());
+                text_metadata_issues(
+                    &output,
+                    &format!("{}.outputSchema", tool.name),
+                    &mut offenders,
+                );
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "sanitized tool metadata still contains mojibake sentinel or non-ASCII annotation text: {offenders:#?}"
         );
     }
 
@@ -454,6 +581,17 @@ mod tests {
         // Standard string formats preserved.
         assert_eq!(props["id"]["format"], "uuid");
         assert_eq!(props["when"]["format"], "date-time");
+    }
+
+    #[test]
+    fn normalize_metadata_text_rewrites_known_unicode_punctuation() {
+        let text = "a — b – c … x → y ← z ⇒ ok ∈ set ∉ set Σ total ±10 ×6 ≤7 ≥5 “q” ‘s’";
+        let normalized = normalize_metadata_text(text);
+        assert!(normalized.is_ascii(), "{normalized}");
+        assert_eq!(
+            normalized,
+            "a - b - c ... x -> y <- z => ok in set not in set sum total +/-10 x6 <=7 >=5 \"q\" 's'"
+        );
     }
 
     #[test]

@@ -3032,7 +3032,7 @@ pub struct BrowserScrollIntoViewResponse {
     pub required_foreground: bool,
 }
 
-/// Selector engine for `browser_locate` (#1110) — the full Playwright locator
+/// Selector engine for `browser_locate` (#1110) - the full Playwright locator
 /// surface. Each engine resolves to Synapse element ids consumable by every
 /// action tool.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -3059,7 +3059,7 @@ pub enum BrowserLocateEngine {
     /// `getByTestId`: a configurable attribute (default `data-testid`).
     #[serde(rename = "testid")]
     TestId,
-    /// Layout / relational (`:near`/`:right-of`/…), ranked by box geometry.
+    /// Layout / relational (`:near`/`:right-of`/...), ranked by box geometry.
     Layout,
 }
 
@@ -3080,7 +3080,7 @@ pub enum BrowserLayoutRelation {
     Below,
 }
 
-/// Parameters for `browser_locate` (#1110–#1119): resolve any Playwright-style
+/// Parameters for `browser_locate` (#1110-#1119): resolve any Playwright-style
 /// selector to element ids in the calling session's owned CDP page target.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -3241,7 +3241,7 @@ pub struct BrowserLocateResponse {
     pub returned_count: usize,
     /// True when `match_count` exceeded the returned cap (false when `nth` set).
     pub truncated: bool,
-    /// Resolved element ids — feed directly into `browser_inspect`, `act_*`, etc.
+    /// Resolved element ids - feed directly into `browser_inspect`, `act_*`, etc.
     pub element_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<BrowserLocatedFrame>,
