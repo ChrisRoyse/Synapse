@@ -2718,6 +2718,10 @@ pub(crate) struct ChromeDebuggerViewportReadback {
     pub outer_width: i64,
     pub outer_height: i64,
     #[serde(default)]
+    pub scroll_width: i64,
+    #[serde(default)]
+    pub scroll_height: i64,
+    #[serde(default)]
     pub visual_viewport_width: Option<f64>,
     #[serde(default)]
     pub visual_viewport_height: Option<f64>,
@@ -3524,6 +3528,28 @@ pub(crate) struct ChromeDebuggerPageVitals {
     pub error_code: Option<String>,
     #[serde(default)]
     pub error_detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageVitalsResult {
+    pub extension_id: Option<String>,
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    pub url: String,
+    pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub viewport: Option<ChromeDebuggerViewportReadback>,
+    #[serde(default)]
+    pub viewport_error_detail: Option<String>,
+    pub page_vitals: ChromeDebuggerPageVitals,
+    #[serde(default)]
+    pub readback_backend: String,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -5799,6 +5825,27 @@ pub(crate) async fn media_emulation(
     })
 }
 
+pub(crate) async fn page_vitals(
+    hwnd: i64,
+    target_id: &str,
+) -> Result<ChromeDebuggerPageVitalsResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "pageVitals")?;
+    let result = bridge()
+        .send_command(
+            "pageVitals",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerPageVitalsResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger pageVitals response: {error}"
+        ))
+    })
+}
+
 pub(crate) struct ChromeDebuggerNetworkConditionsRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
@@ -7783,6 +7830,25 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "chrome_window_id": result.get("chrome_window_id"),
+            "url": result.get("url"),
+            "title": result.get("title"),
+            "ready_state": result.get("ready_state"),
+            "viewport_inner_width": result
+                .get("viewport")
+                .and_then(|value| value.get("inner_width")),
+            "viewport_inner_height": result
+                .get("viewport")
+                .and_then(|value| value.get("inner_height")),
+            "viewport_device_pixel_ratio": result
+                .get("viewport")
+                .and_then(|value| value.get("device_pixel_ratio")),
+            "viewport_scroll_width": result
+                .get("viewport")
+                .and_then(|value| value.get("scroll_width")),
+            "viewport_scroll_height": result
+                .get("viewport")
+                .and_then(|value| value.get("scroll_height")),
+            "viewport_error_present": result.get("viewport_error_detail").is_some(),
             "visibility_state": result
                 .get("page_vitals")
                 .and_then(|value| value.get("visibility_state")),

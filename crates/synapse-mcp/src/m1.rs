@@ -574,6 +574,14 @@ pub struct BrowserScreenshotResponse {
     pub restored_human_os_foreground: bool,
     pub backend_tier_used: String,
     pub source_of_truth: String,
+    /// Stable machine-readable code when the screenshot was degraded from the
+    /// normal page-screenshot lane. Absent on a full-fidelity bridge capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_code: Option<String>,
+    /// Physical readback source used to preserve target metadata during a
+    /// degraded capture. Absent on a full-fidelity bridge capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_metadata_source: Option<String>,
     /// #1341/#1343: set when the normal Chrome bridge `captureVisibleTab` lane
     /// disconnected mid-capture (the MV3 service worker drops the WebSocket on
     /// some GPU/WebGL-heavy pages) and the screenshot was instead produced by a

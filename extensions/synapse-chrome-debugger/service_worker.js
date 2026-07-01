@@ -1589,6 +1589,13 @@ async function handlePageVitals(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const state = await tabPageState(selected.tabId, selected.target);
   const pageVitals = await tabPageVitalsState(selected.tabId);
+  let viewport = null;
+  let viewportErrorDetail = null;
+  try {
+    viewport = await tabViewportMetricsState(selected.tabId);
+  } catch (error) {
+    viewportErrorDetail = errorMessage(error);
+  }
   return {
     extension_id: chrome.runtime.id,
     target_id: state.target_id || selected.target.id,
@@ -1598,6 +1605,8 @@ async function handlePageVitals(params) {
     title: state.title || "",
     ready_state: state.ready_state || "",
     readback_backend: "chrome.tabs.get+chrome.scripting.executeScript",
+    viewport,
+    viewport_error_detail: viewportErrorDetail,
     page_vitals: pageVitals,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
@@ -15985,6 +15994,8 @@ function readViewportMetricsInPage() {
     screen_height: Math.round(globalThis.screen ? globalThis.screen.height || 0 : 0),
     outer_width: Math.round(globalThis.outerWidth || 0),
     outer_height: Math.round(globalThis.outerHeight || 0),
+    scroll_width: Math.round(globalThis.document?.documentElement?.scrollWidth || 0),
+    scroll_height: Math.round(globalThis.document?.documentElement?.scrollHeight || 0),
     visual_viewport_width: viewport ? Number(viewport.width) : null,
     visual_viewport_height: viewport ? Number(viewport.height) : null
   };
@@ -16008,6 +16019,8 @@ function readDeviceMetricsInPage() {
       screen_height: Math.round(globalThis.screen ? globalThis.screen.height || 0 : 0),
       outer_width: Math.round(globalThis.outerWidth || 0),
       outer_height: Math.round(globalThis.outerHeight || 0),
+      scroll_width: Math.round(globalThis.document?.documentElement?.scrollWidth || 0),
+      scroll_height: Math.round(globalThis.document?.documentElement?.scrollHeight || 0),
       visual_viewport_width: viewport ? Number(viewport.width) : null,
       visual_viewport_height: viewport ? Number(viewport.height) : null
     },

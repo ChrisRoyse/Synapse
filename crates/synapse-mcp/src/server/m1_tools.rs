@@ -102,6 +102,8 @@ const BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH: &str =
     "target-scoped browser wait predicate readback from DOM/URL/load/network/function state";
 const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_wait_for condition response plus daemon-tool-events.jsonl";
+const BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK_CODE: &str =
+    "BROWSER_SCREENSHOT_BRIDGE_DISCONNECTED_PASSIVE_WINDOW_FALLBACK";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -802,7 +804,13 @@ impl SynapseService {
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
-            .browser_screenshot_impl(&params.0, &validation, window_hwnd, &cdp_target_id)
+            .browser_screenshot_impl(
+                &params.0,
+                &validation,
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -1678,6 +1686,7 @@ impl SynapseService {
         &self,
         params: &BrowserScreenshotParams,
         validation: &BrowserScreenshotValidation,
+        session_id: &str,
         window_hwnd: i64,
         cdp_target_id: &str,
     ) -> Result<BrowserScreenshotResponse, ErrorData> {
@@ -1691,6 +1700,36 @@ impl SynapseService {
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
         let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
+        let owner_metadata = match self.cdp_target_owner_for_readback(
+            "browser_screenshot",
+            session_id,
+            cdp_target_id,
+        ) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let error_code = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("UNKNOWN");
+                tracing::warn!(
+                    code = "BROWSER_SCREENSHOT_FALLBACK_OWNER_METADATA_UNAVAILABLE",
+                    hwnd = window_hwnd,
+                    cdp_target_id = %cdp_target_id,
+                    error_code = %error_code,
+                    error = %error.message,
+                    "browser_screenshot could not read durable owner metadata before capture; fallback metadata will rely on live Chrome readback"
+                );
+                None
+            }
+        };
+        let fallback_metadata = browser_screenshot_fallback_metadata_snapshot(
+            owner_metadata.as_ref(),
+            window_hwnd,
+            cdp_target_id,
+        )
+        .await;
         // #1359: serialize the brief foreground-capture critical section so
         // concurrent browser_screenshot captures (multi-agent / batched) cannot
         // interleave their Chrome-window activation and corrupt each other's
@@ -1739,6 +1778,7 @@ impl SynapseService {
                     cdp_target_id,
                     &foreground_readback,
                     &error,
+                    fallback_metadata,
                 )
                 .await;
             }
@@ -1830,6 +1870,8 @@ impl SynapseService {
             source_of_truth:
                 "human OS foreground readback plus normal Chrome bridge chrome.scripting page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
                     .to_owned(),
+            degradation_code: None,
+            fallback_metadata_source: None,
             fallback_reason: None,
         })
     }
@@ -13840,6 +13882,212 @@ fn browser_screenshot_bridge_disconnected(error: &ErrorData) -> bool {
             .contains("client closed direct HTTP WebSocket")
 }
 
+#[derive(Clone, Debug)]
+struct BrowserScreenshotFallbackMetadata {
+    cdp_target_id: String,
+    tab_id: Option<u32>,
+    chrome_window_id: Option<i64>,
+    url: String,
+    title: String,
+    device_pixel_ratio: Option<f64>,
+    viewport_width_css: Option<f64>,
+    viewport_height_css: Option<f64>,
+    scroll_width_css: Option<f64>,
+    scroll_height_css: Option<f64>,
+    sources: Vec<String>,
+}
+
+impl BrowserScreenshotFallbackMetadata {
+    fn new(cdp_target_id: &str) -> Self {
+        Self {
+            cdp_target_id: cdp_target_id.to_owned(),
+            tab_id: None,
+            chrome_window_id: None,
+            url: String::new(),
+            title: String::new(),
+            device_pixel_ratio: None,
+            viewport_width_css: None,
+            viewport_height_css: None,
+            scroll_width_css: None,
+            scroll_height_css: None,
+            sources: Vec::new(),
+        }
+    }
+
+    fn note_source(&mut self, source: &str) {
+        if !self.sources.iter().any(|existing| existing == source) {
+            self.sources.push(source.to_owned());
+        }
+    }
+
+    fn apply_owner(&mut self, owner: &CdpTargetOwner) {
+        self.chrome_window_id = self.chrome_window_id.or(owner.chrome_window_id);
+        if !owner.target_url.trim().is_empty() {
+            self.url.clone_from(&owner.target_url);
+        } else if !owner.requested_url.trim().is_empty() {
+            self.url.clone_from(&owner.requested_url);
+        }
+        self.note_source("session_cdp_target_owner");
+    }
+
+    fn apply_tab_target(
+        &mut self,
+        tab: &crate::chrome_debugger_bridge::ChromeDebuggerTabTarget,
+        source: &str,
+    ) {
+        if !cdp_target_ids_equal(&tab.target_id, &self.cdp_target_id) {
+            return;
+        }
+        self.tab_id = Some(tab.tab_id);
+        self.chrome_window_id = tab.chrome_window_id.or(self.chrome_window_id);
+        if !tab.url.trim().is_empty() {
+            self.url.clone_from(&tab.url);
+        }
+        if !tab.title.trim().is_empty() {
+            self.title.clone_from(&tab.title);
+        }
+        self.note_source(source);
+    }
+
+    fn apply_activate_result(
+        &mut self,
+        activated: &crate::chrome_debugger_bridge::ChromeDebuggerActivateTabResult,
+    ) {
+        if !cdp_target_ids_equal(&activated.target_id, &self.cdp_target_id) {
+            return;
+        }
+        self.tab_id = Some(activated.tab_id);
+        self.chrome_window_id = activated.chrome_window_id.or(self.chrome_window_id);
+        if !activated.url.trim().is_empty() {
+            self.url.clone_from(&activated.url);
+        }
+        if !activated.title.trim().is_empty() {
+            self.title.clone_from(&activated.title);
+        }
+        self.note_source("chrome.tabs.update_activateTab_fallback_readback");
+    }
+
+    fn apply_page_vitals(
+        &mut self,
+        vitals: &crate::chrome_debugger_bridge::ChromeDebuggerPageVitalsResult,
+    ) {
+        if !cdp_target_ids_equal(&vitals.target_id, &self.cdp_target_id) {
+            return;
+        }
+        self.tab_id = Some(vitals.tab_id);
+        self.chrome_window_id = vitals.chrome_window_id.or(self.chrome_window_id);
+        if !vitals.url.trim().is_empty() {
+            self.url.clone_from(&vitals.url);
+        }
+        if !vitals.title.trim().is_empty() {
+            self.title.clone_from(&vitals.title);
+        }
+        if let Some(viewport) = vitals.viewport.as_ref() {
+            if let Some(value) = positive_finite_f64(viewport.device_pixel_ratio) {
+                self.device_pixel_ratio = Some(value);
+            }
+            if let Some(value) = positive_i64_as_f64(viewport.inner_width) {
+                self.viewport_width_css = Some(value);
+            }
+            if let Some(value) = positive_i64_as_f64(viewport.inner_height) {
+                self.viewport_height_css = Some(value);
+            }
+            if let Some(value) = positive_i64_as_f64(viewport.scroll_width) {
+                self.scroll_width_css = Some(value);
+            }
+            if let Some(value) = positive_i64_as_f64(viewport.scroll_height) {
+                self.scroll_height_css = Some(value);
+            }
+        }
+        self.note_source("chrome.tabs.get_pageVitals_pre_capture");
+    }
+
+    fn source(&self) -> Option<String> {
+        if self.sources.is_empty() {
+            None
+        } else {
+            Some(self.sources.join("+"))
+        }
+    }
+}
+
+fn positive_i64_as_f64(value: i64) -> Option<f64> {
+    let value = u32::try_from(value).ok()?;
+    (value > 0).then_some(f64::from(value))
+}
+
+fn positive_finite_f64(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+async fn browser_screenshot_fallback_metadata_snapshot(
+    owner: Option<&CdpTargetOwner>,
+    window_hwnd: i64,
+    cdp_target_id: &str,
+) -> BrowserScreenshotFallbackMetadata {
+    let mut metadata = BrowserScreenshotFallbackMetadata::new(cdp_target_id);
+    if let Some(owner) = owner {
+        metadata.apply_owner(owner);
+    }
+
+    let expected_context = validate_target_window_context(window_hwnd).ok();
+    let expected_chrome_window_id = owner.and_then(|owner| owner.chrome_window_id);
+    match crate::chrome_debugger_bridge::list_tabs(
+        window_hwnd,
+        expected_chrome_window_id,
+        expected_context
+            .as_ref()
+            .map(|context| context.window_bounds),
+        expected_context
+            .as_ref()
+            .map(|context| context.window_title.as_str()),
+    )
+    .await
+    {
+        Ok(listed) => {
+            if let Some(tab) = listed
+                .tabs
+                .iter()
+                .find(|tab| cdp_target_ids_equal(&tab.target_id, cdp_target_id))
+            {
+                metadata.apply_tab_target(tab, "chrome.tabs.query_pre_capture");
+            } else {
+                tracing::warn!(
+                    code = "BROWSER_SCREENSHOT_FALLBACK_METADATA_TARGET_MISSING",
+                    hwnd = window_hwnd,
+                    cdp_target_id = %cdp_target_id,
+                    tab_count = listed.tabs.len(),
+                    "browser_screenshot pre-capture metadata readback did not contain requested target"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = "BROWSER_SCREENSHOT_FALLBACK_METADATA_LIST_TABS_FAILED",
+                hwnd = window_hwnd,
+                cdp_target_id = %cdp_target_id,
+                detail = %error.detail(),
+                "browser_screenshot pre-capture chrome.tabs.query metadata readback failed"
+            );
+        }
+    }
+
+    match crate::chrome_debugger_bridge::page_vitals(window_hwnd, cdp_target_id).await {
+        Ok(vitals) => metadata.apply_page_vitals(&vitals),
+        Err(error) => {
+            tracing::warn!(
+                code = "BROWSER_SCREENSHOT_FALLBACK_METADATA_PAGE_VITALS_FAILED",
+                hwnd = window_hwnd,
+                cdp_target_id = %cdp_target_id,
+                detail = %error.detail(),
+                "browser_screenshot pre-capture pageVitals viewport metadata readback failed"
+            );
+        }
+    }
+
+    metadata
+}
+
 /// #1341/#1343: produce a browser_screenshot result from a passive per-window WGC
 /// capture of the owning Chrome window when the bridge captureVisibleTab lane
 /// disconnected mid-capture. WGC captures occluded/background windows and never
@@ -13853,6 +14101,7 @@ async fn browser_screenshot_passive_window_fallback(
     cdp_target_id: &str,
     foreground: &BrowserScreenshotForegroundReadback,
     bridge_error: &ErrorData,
+    mut fallback_metadata: BrowserScreenshotFallbackMetadata,
 ) -> Result<BrowserScreenshotResponse, ErrorData> {
     // Best-effort activate the target tab in its window so the passive WGC frame
     // shows the intended page, not whichever tab was previously active. activateTab
@@ -13864,7 +14113,8 @@ async fn browser_screenshot_passive_window_fallback(
     let mut activated = false;
     for attempt in 0..5u32 {
         match crate::chrome_debugger_bridge::activate_tab(window_hwnd, cdp_target_id, 2_000).await {
-            Ok(_) => {
+            Ok(activated_tab) => {
+                fallback_metadata.apply_activate_result(&activated_tab);
                 activated = true;
                 // Let the activated (possibly background) tab paint before WGC.
                 tokio::time::sleep(std::time::Duration::from_millis(450)).await;
@@ -13926,14 +14176,21 @@ async fn browser_screenshot_passive_window_fallback(
     )?;
     tracing::warn!(
         code = "BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK",
+        degradation_code = BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK_CODE,
         hwnd = window_hwnd,
         cdp_target_id = %cdp_target_id,
         bridge_error = %bridge_error.message,
+        fallback_metadata_source = %fallback_metadata.source().unwrap_or_else(|| "unavailable".to_owned()),
+        fallback_url_present = !fallback_metadata.url.trim().is_empty(),
+        fallback_title_present = !fallback_metadata.title.trim().is_empty(),
+        fallback_viewport_present = fallback_metadata.viewport_width_css.is_some()
+            && fallback_metadata.viewport_height_css.is_some(),
         output_path = %validation.output_path.display(),
         native_width = screenshot.native_width,
         native_height = screenshot.native_height,
         "readback=passive_wgc_window outcome=bridge_disconnect_fallback"
     );
+    let fallback_metadata_source = fallback_metadata.source();
     Ok(BrowserScreenshotResponse {
         path: screenshot.path,
         format: screenshot.format,
@@ -13948,15 +14205,15 @@ async fn browser_screenshot_passive_window_fallback(
         bytes_written: screenshot.bytes_written,
         bitmap_sha256: screenshot.bitmap_sha256,
         cdp_target_id: cdp_target_id.to_owned(),
-        tab_id: 0,
-        chrome_window_id: None,
-        url: String::new(),
-        title: String::new(),
-        device_pixel_ratio: 0.0,
-        viewport_width_css: 0.0,
-        viewport_height_css: 0.0,
-        scroll_width_css: 0.0,
-        scroll_height_css: 0.0,
+        tab_id: fallback_metadata.tab_id.unwrap_or(0),
+        chrome_window_id: fallback_metadata.chrome_window_id,
+        url: fallback_metadata.url,
+        title: fallback_metadata.title,
+        device_pixel_ratio: fallback_metadata.device_pixel_ratio.unwrap_or(0.0),
+        viewport_width_css: fallback_metadata.viewport_width_css.unwrap_or(0.0),
+        viewport_height_css: fallback_metadata.viewport_height_css.unwrap_or(0.0),
+        scroll_width_css: fallback_metadata.scroll_width_css.unwrap_or(0.0),
+        scroll_height_css: fallback_metadata.scroll_height_css.unwrap_or(0.0),
         tile_count: 0,
         mask_count: 0,
         omit_background: params.omit_background,
@@ -13969,6 +14226,8 @@ async fn browser_screenshot_passive_window_fallback(
         source_of_truth:
             "passive per-window WGC capture of the owning Chrome window (normal bridge captureVisibleTab lane disconnected mid-capture)"
                 .to_owned(),
+        degradation_code: Some(BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK_CODE.to_owned()),
+        fallback_metadata_source,
         fallback_reason: Some(bridge_error.message.to_string()),
     })
 }
@@ -14068,6 +14327,18 @@ fn validate_browser_screenshot_params(
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!("browser_screenshot quality must be 0..=100; got {quality}"),
+        ));
+    }
+    if params.max_pixels == Some(0) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_screenshot max_pixels must be greater than zero",
+        ));
+    }
+    if params.max_long_edge == Some(0) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_screenshot max_long_edge must be greater than zero",
         ));
     }
     match params.scope {
@@ -17173,8 +17444,9 @@ mod tests {
     use super::{
         BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, BROWSER_INIT_SCRIPT_MAX_SOURCE_BYTES,
         BROWSER_NAV_READBACK_SOURCE_OF_TRUTH, BROWSER_NAV_SOURCE_OF_TRUTH,
-        BROWSER_TAG_MAX_CONTENT_BYTES, BROWSER_WAIT_MAX_TEXT_BYTES, BrowserTagSourceKind,
-        BrowserWaitForSelectorObservation, CdpTargetOwner,
+        BROWSER_TAG_MAX_CONTENT_BYTES, BROWSER_WAIT_MAX_TEXT_BYTES,
+        BrowserScreenshotFallbackMetadata, BrowserScreenshotParams, BrowserScreenshotScope,
+        BrowserTagSourceKind, BrowserWaitForSelectorObservation, CdpTargetOwner,
         DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS, ErrorData,
         MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
         MAX_BROWSER_WAIT_TIMEOUT_MS, MAX_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
@@ -17193,14 +17465,14 @@ mod tests {
         validate_browser_add_style_tag_params, validate_browser_downloads_params,
         validate_browser_evaluate_params, validate_browser_expose_binding_params,
         validate_browser_frame_locator, validate_browser_nav_params,
-        validate_browser_set_content_params, validate_browser_tabs_params,
-        validate_browser_wait_for_function_params, validate_browser_wait_for_load_state_params,
-        validate_browser_wait_for_params, validate_browser_wait_for_request_params,
-        validate_browser_wait_for_response_params, validate_browser_wait_for_selector_params,
-        validate_browser_wait_for_url_params, validate_screenshot_capture_facade_params,
-        validate_screenshot_gif_facade_params, validate_target_adopt_params,
-        validate_target_get_params, validate_target_set_params, validate_target_status_params,
-        validate_target_window,
+        validate_browser_screenshot_params, validate_browser_set_content_params,
+        validate_browser_tabs_params, validate_browser_wait_for_function_params,
+        validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
+        validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
+        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
+        validate_screenshot_capture_facade_params, validate_screenshot_gif_facade_params,
+        validate_target_adopt_params, validate_target_get_params, validate_target_set_params,
+        validate_target_status_params, validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
@@ -17318,6 +17590,232 @@ mod tests {
                 .and_then(|data| data.get("code"))
                 .and_then(serde_json::Value::as_str),
             Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    fn browser_screenshot_params(path: &str) -> BrowserScreenshotParams {
+        BrowserScreenshotParams {
+            path: path.to_owned(),
+            cdp_target_id: Some("chrome-tab:222".to_owned()),
+            window_hwnd: Some(0x1234),
+            scope: BrowserScreenshotScope::Viewport,
+            clip: None,
+            element_id: None,
+            masks: Vec::new(),
+            format: None,
+            quality: None,
+            omit_background: false,
+            overwrite: true,
+            wait_timeout_ms: None,
+            max_pixels: None,
+            max_long_edge: None,
+        }
+    }
+
+    #[test]
+    fn browser_screenshot_validation_rejects_zero_downscale_budgets() {
+        let mut max_pixels = browser_screenshot_params("C:\\temp\\issue1438-max-pixels.png");
+        max_pixels.max_pixels = Some(0);
+        let max_pixels_err = match validate_browser_screenshot_params(&max_pixels) {
+            Ok(_) => panic!("zero max_pixels must fail during browser screenshot preflight"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            screenshot_error_field(&max_pixels_err, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(
+            max_pixels_err
+                .message
+                .contains("browser_screenshot max_pixels must be greater than zero"),
+            "unexpected max_pixels error: {}",
+            max_pixels_err.message
+        );
+
+        let mut max_long_edge = browser_screenshot_params("C:\\temp\\issue1438-max-long-edge.png");
+        max_long_edge.max_long_edge = Some(0);
+        let max_long_edge_err = match validate_browser_screenshot_params(&max_long_edge) {
+            Ok(_) => panic!("zero max_long_edge must fail during browser screenshot preflight"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            screenshot_error_field(&max_long_edge_err, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(
+            max_long_edge_err
+                .message
+                .contains("browser_screenshot max_long_edge must be greater than zero"),
+            "unexpected max_long_edge error: {}",
+            max_long_edge_err.message
+        );
+    }
+
+    #[test]
+    fn browser_screenshot_fallback_metadata_preserves_best_readbacks() {
+        let mut metadata = BrowserScreenshotFallbackMetadata::new("chrome-tab:222");
+        let owner = CdpTargetOwner {
+            session_id: "session-1".to_owned(),
+            window_hwnd: 0x1234,
+            endpoint: "chrome-extension://synapse/chrome.tabs".to_owned(),
+            chrome_window_id: Some(10),
+            capture_window_hwnd: Some(0x1234),
+            cdp_target_id: "chrome-tab:222".to_owned(),
+            requested_url: "http://example.test/requested".to_owned(),
+            target_url: "http://example.test/owner".to_owned(),
+            created_at_unix_ms: 1,
+        };
+        metadata.apply_owner(&owner);
+        assert_eq!(metadata.url, "http://example.test/owner");
+        assert_eq!(metadata.chrome_window_id, Some(10));
+
+        metadata.apply_tab_target(
+            &crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
+                target_id: "chrome-tab:999".to_owned(),
+                tab_id: 999,
+                chrome_window_id: Some(99),
+                index: 0,
+                target_type: "page".to_owned(),
+                url: "http://example.test/wrong".to_owned(),
+                title: "Wrong Target".to_owned(),
+                ready_state: "complete".to_owned(),
+                active: false,
+                highlighted: false,
+                pinned: false,
+                target_attached: false,
+            },
+            "wrong_target",
+        );
+        assert_eq!(metadata.url, "http://example.test/owner");
+        assert_eq!(
+            metadata.source().as_deref(),
+            Some("session_cdp_target_owner")
+        );
+
+        metadata.apply_tab_target(
+            &crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
+                target_id: "chrome-tab:222".to_owned(),
+                tab_id: 222,
+                chrome_window_id: Some(20),
+                index: 1,
+                target_type: "page".to_owned(),
+                url: "http://example.test/list-tabs".to_owned(),
+                title: "List Tabs Title".to_owned(),
+                ready_state: "complete".to_owned(),
+                active: false,
+                highlighted: false,
+                pinned: false,
+                target_attached: false,
+            },
+            "chrome.tabs.query_pre_capture",
+        );
+        assert_eq!(metadata.tab_id, Some(222));
+        assert_eq!(metadata.chrome_window_id, Some(20));
+        assert_eq!(metadata.url, "http://example.test/list-tabs");
+        assert_eq!(metadata.title, "List Tabs Title");
+
+        metadata.apply_page_vitals(
+            &crate::chrome_debugger_bridge::ChromeDebuggerPageVitalsResult {
+                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+                target_id: "chrome-tab:222".to_owned(),
+                tab_id: 222,
+                chrome_window_id: Some(30),
+                url: "http://example.test/page-vitals".to_owned(),
+                title: "Page Vitals Title".to_owned(),
+                ready_state: "complete".to_owned(),
+                viewport: Some(
+                    crate::chrome_debugger_bridge::ChromeDebuggerViewportReadback {
+                        inner_width: 1200,
+                        inner_height: 800,
+                        device_pixel_ratio: 1.5,
+                        screen_width: 2560,
+                        screen_height: 1440,
+                        outer_width: 1300,
+                        outer_height: 900,
+                        scroll_width: 1210,
+                        scroll_height: 4000,
+                        visual_viewport_width: None,
+                        visual_viewport_height: None,
+                    },
+                ),
+                viewport_error_detail: None,
+                page_vitals: crate::chrome_debugger_bridge::ChromeDebuggerPageVitals::default(),
+                readback_backend: "pageVitals".to_owned(),
+                target_candidate_count: 1,
+                target_selection_reason: "target_id".to_owned(),
+            },
+        );
+        assert_eq!(metadata.chrome_window_id, Some(30));
+        assert_eq!(metadata.url, "http://example.test/page-vitals");
+        assert_eq!(metadata.title, "Page Vitals Title");
+        assert_eq!(metadata.device_pixel_ratio, Some(1.5));
+        assert_eq!(metadata.viewport_width_css, Some(1200.0));
+        assert_eq!(metadata.viewport_height_css, Some(800.0));
+        assert_eq!(metadata.scroll_width_css, Some(1210.0));
+        assert_eq!(metadata.scroll_height_css, Some(4000.0));
+
+        metadata.apply_page_vitals(
+            &crate::chrome_debugger_bridge::ChromeDebuggerPageVitalsResult {
+                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+                target_id: "chrome-tab:222".to_owned(),
+                tab_id: 222,
+                chrome_window_id: Some(31),
+                url: String::new(),
+                title: String::new(),
+                ready_state: "complete".to_owned(),
+                viewport: Some(
+                    crate::chrome_debugger_bridge::ChromeDebuggerViewportReadback {
+                        inner_width: 0,
+                        inner_height: -1,
+                        device_pixel_ratio: f64::NAN,
+                        screen_width: 2560,
+                        screen_height: 1440,
+                        outer_width: 1300,
+                        outer_height: 900,
+                        scroll_width: i64::from(u32::MAX) + 1,
+                        scroll_height: 0,
+                        visual_viewport_width: None,
+                        visual_viewport_height: None,
+                    },
+                ),
+                viewport_error_detail: Some("synthetic invalid viewport".to_owned()),
+                page_vitals: crate::chrome_debugger_bridge::ChromeDebuggerPageVitals::default(),
+                readback_backend: "pageVitals".to_owned(),
+                target_candidate_count: 1,
+                target_selection_reason: "target_id".to_owned(),
+            },
+        );
+        assert_eq!(metadata.device_pixel_ratio, Some(1.5));
+        assert_eq!(metadata.viewport_width_css, Some(1200.0));
+        assert_eq!(metadata.viewport_height_css, Some(800.0));
+        assert_eq!(metadata.scroll_width_css, Some(1210.0));
+        assert_eq!(metadata.scroll_height_css, Some(4000.0));
+
+        metadata.apply_activate_result(
+            &crate::chrome_debugger_bridge::ChromeDebuggerActivateTabResult {
+                target_id: "chrome-tab:222".to_owned(),
+                tab_id: 222,
+                chrome_window_id: Some(40),
+                before_active: Some(false),
+                active: true,
+                highlighted: Some(true),
+                url: "http://example.test/activated".to_owned(),
+                title: "Activated Title".to_owned(),
+                ready_state: "complete".to_owned(),
+                readback_backend: "activateTab".to_owned(),
+                target_candidate_count: 1,
+                target_selection_reason: "target_id".to_owned(),
+                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            },
+        );
+        assert_eq!(metadata.chrome_window_id, Some(40));
+        assert_eq!(metadata.url, "http://example.test/activated");
+        assert_eq!(metadata.title, "Activated Title");
+        assert_eq!(
+            metadata.source().as_deref(),
+            Some(
+                "session_cdp_target_owner+chrome.tabs.query_pre_capture+chrome.tabs.get_pageVitals_pre_capture+chrome.tabs.update_activateTab_fallback_readback"
+            )
         );
     }
 
