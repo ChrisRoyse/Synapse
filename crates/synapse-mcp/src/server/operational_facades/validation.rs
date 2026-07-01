@@ -5,8 +5,10 @@ use synapse_core::error_codes;
 use crate::server::ErrorData;
 
 use super::{
-    HYGIENE_TOOL, MODEL_TOOL, SETUP_TOOL, STORAGE_TOOL, TELEMETRY_TOOL,
-    types::{HygieneParams, ModelParams, SetupParams, StorageParams, TelemetryParams},
+    HYGIENE_TOOL, MODEL_TOOL, SETUP_TOOL, STORAGE_TOOL,
+    types::{
+        HygieneParams, ModelParams, SetupParams, StorageParams, TelemetryOperation, TelemetryParams,
+    },
 };
 pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), ErrorData> {
     validate_exact_spec(
@@ -62,11 +64,12 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
 }
 
 pub(super) fn validate_telemetry_params(params: &TelemetryParams) -> Result<(), ErrorData> {
-    validate_exact_spec(
-        TELEMETRY_TOOL,
-        params.operation.as_str(),
-        &[("status", params.status.is_some())],
-    )
+    match params.operation {
+        TelemetryOperation::Status => {
+            let _status_payload_present = params.status.is_some();
+            Ok(())
+        }
+    }
 }
 
 fn validate_exact_spec(
@@ -139,16 +142,17 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_operation_stays_strict() {
+    fn telemetry_status_accepts_schema_valid_empty_payload() {
+        let missing = TelemetryParams {
+            operation: TelemetryOperation::Status,
+            status: None,
+        };
+        validate_telemetry_params(&missing).expect("status payload is optional");
+
         let ok = TelemetryParams {
             operation: TelemetryOperation::Status,
             status: Some(TelemetryStatusParams::default()),
         };
         validate_telemetry_params(&ok).expect("status payload accepted");
-        let missing = TelemetryParams {
-            operation: TelemetryOperation::Status,
-            status: None,
-        };
-        validate_telemetry_params(&missing).expect_err("status payload required");
     }
 }
