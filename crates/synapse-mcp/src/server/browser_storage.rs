@@ -7,12 +7,15 @@ use super::{
 };
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 
 const COOKIES_TOOL: &str = "browser_cookies";
 const STORAGE_TOOL: &str = "browser_storage";
 const CHROME_TAB_PREFIX: &str = "chrome-tab:";
+const REDACTION_POLICY: &str = "browser_storage_secret_value_v1";
+const REDACTED_VALUE: &str = "[redacted]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +83,8 @@ pub struct BrowserCookiesResponse {
     pub source_of_truth: String,
     pub cookie_count: u32,
     pub affected_count: u32,
+    pub redaction_policy: String,
+    pub redacted_value_count: u32,
     pub readback: Value,
 }
 
@@ -152,6 +157,8 @@ pub struct BrowserStorageResponse {
     pub source_of_truth: String,
     pub item_count: u32,
     pub origin_count: u32,
+    pub redaction_policy: String,
+    pub redacted_value_count: u32,
     pub readback: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_state: Option<Value>,
@@ -305,7 +312,7 @@ impl SynapseService {
             "expiresUnixSeconds": params.expires_unix_seconds,
             "session": params.session,
         });
-        let readback = crate::chrome_debugger_bridge::cookies(
+        let mut readback = crate::chrome_debugger_bridge::cookies(
             window_hwnd,
             cdp_target_id,
             bridge_params,
@@ -320,6 +327,8 @@ impl SynapseService {
                 ),
             )
         })?;
+        let redacted_value_count = redact_browser_secret_values(&mut readback);
+        log_redaction_summary(COOKIES_TOOL, cdp_target_id, redacted_value_count);
         Ok(BrowserCookiesResponse {
             ok: readback_bool(&readback, "ok", true),
             required_foreground: false,
@@ -331,6 +340,8 @@ impl SynapseService {
                 .to_owned(),
             cookie_count: readback_u32(&readback, "cookie_count"),
             affected_count: readback_u32(&readback, "affected_count"),
+            redaction_policy: REDACTION_POLICY.to_owned(),
+            redacted_value_count,
             readback,
         })
     }
@@ -351,7 +362,7 @@ impl SynapseService {
             "clearBeforeLoad": params.clear_before_load,
             "url": params.url,
         });
-        let readback = crate::chrome_debugger_bridge::storage_state(
+        let mut readback = crate::chrome_debugger_bridge::storage_state(
             window_hwnd,
             cdp_target_id,
             bridge_params,
@@ -366,6 +377,8 @@ impl SynapseService {
                 ),
             )
         })?;
+        let redacted_value_count = redact_browser_secret_values(&mut readback);
+        log_redaction_summary(STORAGE_TOOL, cdp_target_id, redacted_value_count);
         let result = readback.get("result").cloned().unwrap_or(Value::Null);
         let storage_state = readback
             .get("storage_state")
@@ -392,6 +405,8 @@ impl SynapseService {
                 .and_then(Value::as_u64)
                 .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
                 .unwrap_or(0),
+            redaction_policy: REDACTION_POLICY.to_owned(),
+            redacted_value_count,
             readback,
             storage_state,
         })
@@ -438,4 +453,360 @@ fn readback_u32(value: &Value, key: &str) -> u32 {
         .and_then(Value::as_u64)
         .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
         .unwrap_or(0)
+}
+
+fn redact_browser_secret_values(value: &mut Value) -> u32 {
+    match value {
+        Value::Array(items) => items.iter_mut().map(redact_browser_secret_values).sum(),
+        Value::Object(fields) => redact_browser_secret_fields(fields),
+        _ => 0,
+    }
+}
+
+fn redact_browser_secret_fields(fields: &mut Map<String, Value>) -> u32 {
+    let mut redacted = 0;
+    if let Some(raw_value) = fields.get("value").cloned() {
+        let already_placeholder = raw_value.as_str() == Some(REDACTED_VALUE);
+        if !already_placeholder {
+            if fields
+                .get("value_redacted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                tracing::error!(
+                    code = "BROWSER_STORAGE_PRE_REDACTED_VALUE_INCONSISTENT",
+                    "browser storage payload claimed value_redacted=true while value still contained non-placeholder data; raw value suppressed"
+                );
+            }
+            let evidence = secret_value_evidence(&raw_value);
+            fields.insert("value".to_owned(), Value::String(REDACTED_VALUE.to_owned()));
+            fields.insert("value_redacted".to_owned(), Value::Bool(true));
+            fields.insert(
+                "value_len".to_owned(),
+                Value::Number(serde_json::Number::from(evidence.value_len)),
+            );
+            fields.insert(
+                "value_sha256".to_owned(),
+                Value::String(evidence.value_sha256),
+            );
+            fields.insert("value_kind".to_owned(), Value::String(evidence.value_kind));
+            fields.insert(
+                "redaction_policy".to_owned(),
+                Value::String(REDACTION_POLICY.to_owned()),
+            );
+            redacted += 1;
+        }
+    }
+    redacted
+        + fields
+            .values_mut()
+            .map(redact_browser_secret_values)
+            .sum::<u32>()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SecretValueEvidence {
+    value_len: u64,
+    value_sha256: String,
+    value_kind: String,
+}
+
+fn secret_value_evidence(value: &Value) -> SecretValueEvidence {
+    let (value_kind, bytes) = match value {
+        Value::String(text) => ("string".to_owned(), text.as_bytes().to_vec()),
+        Value::Null => ("null".to_owned(), b"null".to_vec()),
+        Value::Bool(flag) => ("bool".to_owned(), flag.to_string().into_bytes()),
+        Value::Number(number) => ("number".to_owned(), number.to_string().into_bytes()),
+        Value::Array(_) => (
+            "array".to_owned(),
+            serialized_value_bytes_for_redaction(value),
+        ),
+        Value::Object(_) => (
+            "object".to_owned(),
+            serialized_value_bytes_for_redaction(value),
+        ),
+    };
+    SecretValueEvidence {
+        value_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        value_sha256: format!("sha256:{}", sha256_hex(&bytes)),
+        value_kind,
+    }
+}
+
+fn serialized_value_bytes_for_redaction(value: &Value) -> Vec<u8> {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(
+                code = "BROWSER_STORAGE_REDACTION_SERIALIZE_FAILED",
+                error = %error,
+                "failed to serialize non-string browser storage value for redaction evidence; raw value suppressed"
+            );
+            b"serialization_failed".to_vec()
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn log_redaction_summary(tool: &str, cdp_target_id: &str, redacted_value_count: u32) {
+    tracing::info!(
+        code = "BROWSER_STORAGE_VALUES_REDACTED",
+        tool,
+        cdp_target_id,
+        redacted_value_count,
+        redaction_policy = REDACTION_POLICY,
+        "redacted browser cookie/storage values from MCP output"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn redacts_cookie_and_storage_values_for_save_state_payload() {
+        let raw_cookie = "auth-cookie-secret-1437";
+        let waf_cookie = "__cf-bm-secret-1437";
+        let stripe_cookie = "stripe-session-secret-1437";
+        let jwt_value = "eyJhbGciOiJIUzI1NiJ9.issue1437.payload";
+        let session_value = "session-storage-secret-1437";
+        let mut readback = json!({
+            "ok": true,
+            "storage_state": {
+                "cookies": [
+                    {
+                        "name": "auth_session",
+                        "value": raw_cookie,
+                        "domain": "example.test",
+                        "path": "/",
+                        "expires": -1,
+                        "httpOnly": true,
+                        "secure": true,
+                        "sameSite": "lax"
+                    },
+                    {
+                        "name": "__cf_bm",
+                        "value": waf_cookie,
+                        "domain": "example.test",
+                        "path": "/",
+                        "httpOnly": true,
+                        "secure": true,
+                        "sameSite": "no_restriction"
+                    },
+                    {
+                        "name": "stripe_session",
+                        "value": stripe_cookie,
+                        "domain": "example.test",
+                        "path": "/checkout",
+                        "httpOnly": false,
+                        "secure": true,
+                        "sameSite": "strict"
+                    }
+                ],
+                "origins": [
+                    {
+                        "origin": "https://example.test",
+                        "localStorage": [
+                            {"name": "jwt", "value": jwt_value}
+                        ],
+                        "sessionStorage": [
+                            {"name": "session_token", "value": session_value}
+                        ]
+                    }
+                ]
+            },
+            "result": {
+                "storage_state": {
+                    "cookies": [
+                        {
+                            "name": "auth_session",
+                            "value": raw_cookie,
+                            "domain": "example.test",
+                            "path": "/",
+                            "httpOnly": true,
+                            "secure": true,
+                            "sameSite": "lax"
+                        }
+                    ],
+                    "origins": [
+                        {
+                            "origin": "https://example.test",
+                            "localStorage": [
+                                {"name": "jwt", "value": jwt_value}
+                            ],
+                            "sessionStorage": [
+                                {"name": "session_token", "value": session_value}
+                            ]
+                        }
+                    ]
+                }
+            },
+            "frame_results": [
+                {
+                    "result": {
+                        "origin": "https://example.test",
+                        "localStorage": [
+                            {"name": "jwt", "value": jwt_value}
+                        ],
+                        "sessionStorage": [
+                            {"name": "session_token", "value": session_value}
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 10);
+        let serialized = serialize_json(&readback);
+        for raw in [
+            raw_cookie,
+            waf_cookie,
+            stripe_cookie,
+            jwt_value,
+            session_value,
+        ] {
+            assert!(
+                !serialized.contains(raw),
+                "raw browser storage secret remained in sanitized payload: {raw}"
+            );
+        }
+
+        let cookie = object_at(&readback, "/storage_state/cookies/0");
+        assert_eq!(
+            cookie.get("name").and_then(Value::as_str),
+            Some("auth_session")
+        );
+        assert_eq!(
+            cookie.get("domain").and_then(Value::as_str),
+            Some("example.test")
+        );
+        assert_eq!(cookie.get("path").and_then(Value::as_str), Some("/"));
+        assert_eq!(cookie.get("httpOnly").and_then(Value::as_bool), Some(true));
+        assert_eq!(cookie.get("secure").and_then(Value::as_bool), Some(true));
+        assert_eq!(cookie.get("sameSite").and_then(Value::as_str), Some("lax"));
+        assert_redacted_value(cookie, raw_cookie);
+
+        let local = object_at(&readback, "/storage_state/origins/0/localStorage/0");
+        assert_eq!(local.get("name").and_then(Value::as_str), Some("jwt"));
+        assert_redacted_value(local, jwt_value);
+
+        let session = object_at(&readback, "/storage_state/origins/0/sessionStorage/0");
+        assert_eq!(
+            session.get("name").and_then(Value::as_str),
+            Some("session_token")
+        );
+        assert_redacted_value(session, session_value);
+    }
+
+    #[test]
+    fn redacts_empty_string_with_hash_evidence() {
+        let mut readback = json!({
+            "items": [
+                {"name": "empty_cookie", "value": ""}
+            ]
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 1);
+        let item = object_at(&readback, "/items/0");
+        assert_redacted_value(item, "");
+    }
+
+    #[test]
+    fn redacts_non_string_value_without_serializing_raw_payload() {
+        let nested_secret = "nested-secret-1437";
+        let mut readback = json!({
+            "items": [
+                {"name": "object_value", "value": {"nested": nested_secret}}
+            ]
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 1);
+        let serialized = serialize_json(&readback);
+        assert!(!serialized.contains(nested_secret));
+        let item = object_at(&readback, "/items/0");
+        assert_eq!(
+            item.get("value_kind").and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(item.get("value_len").and_then(Value::as_u64), Some(31));
+        assert_eq!(
+            item.get("value_sha256").and_then(Value::as_str),
+            Some("sha256:7127d4b7883b88bb832613427ca9d416edc60cd9ddb20b3da407c519cb4016a9")
+        );
+    }
+
+    #[test]
+    fn redacts_inconsistent_pre_redacted_marker() {
+        let raw_cookie = "pre-redacted-marker-with-raw-secret-1437";
+        let mut readback = json!({
+            "cookies": [
+                {
+                    "name": "auth_session",
+                    "value": raw_cookie,
+                    "value_redacted": true
+                }
+            ]
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 1);
+        let serialized = serialize_json(&readback);
+        assert!(!serialized.contains(raw_cookie));
+        let cookie = object_at(&readback, "/cookies/0");
+        assert_redacted_value(cookie, raw_cookie);
+    }
+
+    fn assert_redacted_value(fields: &Map<String, Value>, raw: &str) {
+        assert_eq!(
+            fields.get("value").and_then(Value::as_str),
+            Some(REDACTED_VALUE)
+        );
+        assert_eq!(
+            fields.get("value_redacted").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            fields.get("redaction_policy").and_then(Value::as_str),
+            Some(REDACTION_POLICY)
+        );
+        assert_eq!(
+            fields.get("value_kind").and_then(Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            fields.get("value_len").and_then(Value::as_u64),
+            Some(u64::try_from(raw.len()).unwrap_or(u64::MAX))
+        );
+        assert_eq!(
+            fields.get("value_sha256").and_then(Value::as_str),
+            Some(format!("sha256:{}", sha256_hex(raw.as_bytes())).as_str())
+        );
+    }
+
+    fn object_at<'a>(value: &'a Value, pointer: &str) -> &'a Map<String, Value> {
+        match value.pointer(pointer).and_then(Value::as_object) {
+            Some(object) => object,
+            None => panic!("missing object at {pointer}: {value}"),
+        }
+    }
+
+    fn serialize_json(value: &Value) -> String {
+        match serde_json::to_string(value) {
+            Ok(serialized) => serialized,
+            Err(error) => panic!("failed to serialize test JSON: {error}"),
+        }
+    }
 }
