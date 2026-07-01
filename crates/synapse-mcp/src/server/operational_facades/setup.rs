@@ -3,7 +3,9 @@ use std::{fs, path::PathBuf};
 use rmcp::{RoleServer, service::RequestContext};
 use sha2::{Digest as _, Sha256};
 
-use crate::server::{ErrorData, Json, Parameters, SynapseService, tool_profiles::ToolProfileKind};
+use crate::server::{
+    ErrorData, Json, Parameters, SynapseService, mcp_error, tool_profiles::ToolProfileKind,
+};
 
 use super::{
     SETUP_SOT, SETUP_TOOL,
@@ -81,11 +83,8 @@ pub(super) async fn handle(
 pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusResponse, ErrorData> {
     let bind = service.m3_bind_addr()?;
     let token_file = file_readback(appdata_path(["synapse", "token.txt"]));
-    let daemon_run_file = file_readback(localappdata_path([
-        "synapse",
-        "db-daemon",
-        "daemon-run-current.json",
-    ]));
+    let daemon_run_file = active_daemon_run_file()?;
+    let shared_daemon_run_file = file_readback(shared_daemon_run_file_path());
     let codex_config_file = file_readback(userprofile_path([".codex", "config.toml"]));
     let codex_text = fs::read_to_string(codex_config_file.path.as_str()).unwrap_or_default();
     let token_env = std::env::var("SYNAPSE_BEARER_TOKEN").ok();
@@ -95,6 +94,7 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
         bind,
         token_file,
         daemon_run_file,
+        shared_daemon_run_file,
         codex_config_file,
         token_env_present: token_env.is_some(),
         token_env_len_bytes: token_env.as_ref().map(|value| value.len()),
@@ -102,6 +102,20 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
             || codex_text.contains("synapse"),
         codex_mcp_config_mentions_bearer_env: codex_text.contains("SYNAPSE_BEARER_TOKEN"),
     })
+}
+
+fn active_daemon_run_file() -> Result<FileReadback, ErrorData> {
+    let Some(paths) = crate::daemon_lifecycle::current_paths() else {
+        return Err(mcp_error(
+            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            "setup.status cannot identify the active daemon run file because the daemon lifecycle ledger is not configured",
+        ));
+    };
+    Ok(file_readback(PathBuf::from(paths.run_current_path)))
+}
+
+fn shared_daemon_run_file_path() -> PathBuf {
+    localappdata_path(["synapse", "db-daemon", "daemon-run-current.json"])
 }
 
 fn file_readback(path: PathBuf) -> FileReadback {
@@ -155,4 +169,56 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_daemon_run_file_reads_configured_lifecycle_path() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        crate::daemon_lifecycle::reset_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let paths =
+            crate::daemon_lifecycle::configure(crate::daemon_lifecycle::DaemonLifecycleConfig {
+                mode: "http",
+                bind_addr: Some("127.0.0.1:7813".to_owned()),
+                db_path: temp.path().to_path_buf(),
+            })
+            .unwrap();
+
+        let active = active_daemon_run_file().unwrap();
+        let shared = file_readback(shared_daemon_run_file_path());
+
+        assert_eq!(active.path, paths.run_current_path);
+        assert_ne!(active.path, shared.path);
+        assert!(active.exists);
+        assert_eq!(
+            active.len_bytes,
+            Some(fs::metadata(&paths.run_current_path).unwrap().len())
+        );
+
+        crate::daemon_lifecycle::reset_for_test();
+    }
+
+    #[test]
+    fn active_daemon_run_file_fails_closed_without_lifecycle_state() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        crate::daemon_lifecycle::reset_for_test();
+
+        let error = match active_daemon_run_file() {
+            Ok(readback) => panic!(
+                "expected missing lifecycle state to fail closed, got {}",
+                readback.path
+            ),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .message
+                .contains("daemon lifecycle ledger is not configured")
+        );
+    }
 }

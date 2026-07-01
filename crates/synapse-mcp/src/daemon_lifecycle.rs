@@ -417,6 +417,12 @@ pub(crate) fn diagnostic_value() -> Value {
     }
 }
 
+pub(crate) fn current_paths() -> Option<DaemonLifecyclePaths> {
+    let slot = state_slot();
+    let guard = slot.lock().ok()?;
+    guard.as_ref().map(|state| state.paths.clone())
+}
+
 pub(crate) fn current_run_id() -> Option<String> {
     let slot = state_slot();
     let guard = slot.lock().ok()?;

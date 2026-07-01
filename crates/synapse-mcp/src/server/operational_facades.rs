@@ -18,5 +18,5 @@ const TELEMETRY_TOOL: &str = "telemetry";
 const STORAGE_SOT: &str = "RocksDB CF metadata + exact row readbacks";
 const MODEL_SOT: &str = "CF_KV local_model_registry/v1 rows + probe evidence rows";
 const HYGIENE_SOT: &str = "CF_KV hygiene/flag/v1 rows + physical source rows";
-const SETUP_SOT: &str = "%APPDATA%\\synapse\\token.txt + %LOCALAPPDATA%\\synapse\\db-daemon\\daemon-run-current.json + Codex MCP config";
+const SETUP_SOT: &str = "%APPDATA%\\synapse\\token.txt + active daemon lifecycle run-current file + %LOCALAPPDATA%\\synapse\\db-daemon\\daemon-run-current.json shared installed-daemon readback + Codex MCP config";
 const TELEMETRY_SOT: &str = "CF_TELEMETRY + CF_AGENT_EVENTS + daemon profile/tool counters";

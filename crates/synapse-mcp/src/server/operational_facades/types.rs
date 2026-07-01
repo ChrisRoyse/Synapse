@@ -261,6 +261,7 @@ pub struct SetupStatusResponse {
     pub bind: String,
     pub token_file: FileReadback,
     pub daemon_run_file: FileReadback,
+    pub shared_daemon_run_file: FileReadback,
     pub codex_config_file: FileReadback,
     pub token_env_present: bool,
     pub token_env_len_bytes: Option<usize>,
