@@ -88,6 +88,11 @@
 
 .PARAMETER Purge
   With -Remove, also delete the daemon DB, deployed profiles, and token.
+
+.PARAMETER ActiveIssue
+  Optional current GitHub issue number/ref to preserve in Codex restart
+  handoffs. Defaults to SYNAPSE_ACTIVE_ISSUE when set. Accepts 1441, #1441, or
+  a ChrisRoyse/Synapse issue URL.
 #>
 [CmdletBinding()]
 param(
@@ -102,6 +107,7 @@ param(
     [string]$LogDir      = "$env:LOCALAPPDATA\synapse\logs",
     [string]$TokenPath   = "$env:APPDATA\synapse\token.txt",
     [string]$CodexToolSurfaceSnapshotPath = "$env:APPDATA\synapse\codex-tool-surface.json",
+    [string]$ActiveIssue = $env:SYNAPSE_ACTIVE_ISSUE,
     [string]$TaskName    = 'SynapseMcpDaemon',
     [string]$MaintenanceLockPath = "$env:LOCALAPPDATA\synapse\setup-maintenance.lock.json",
     [ValidateRange(1, 1440)][int]$BuildTimeoutMinutes = 90,
@@ -2292,6 +2298,36 @@ function Get-SynapseRecoveryNotesPath {
     return $null
 }
 
+function Get-SynapseNormalizedIssueRef {
+    param([AllowNull()][string]$Issue)
+
+    if ([string]::IsNullOrWhiteSpace($Issue)) {
+        return $null
+    }
+
+    $trimmed = $Issue.Trim()
+    if ($trimmed -match '^#?(?<number>[0-9]+)$') {
+        return "#$($Matches['number'])"
+    }
+    if ($trimmed -match '^https://github\.com/ChrisRoyse/Synapse/issues/(?<number>[0-9]+)(?:[/?#].*)?$') {
+        return "#$($Matches['number'])"
+    }
+
+    Die "SYNAPSE_ACTIVE_ISSUE_INVALID value=$trimmed remediation=pass an issue number like 1441, #1441, or https://github.com/ChrisRoyse/Synapse/issues/1441"
+}
+
+function Get-SynapseIssueNumberFromRef {
+    param([AllowNull()][string]$IssueRef)
+
+    if ([string]::IsNullOrWhiteSpace($IssueRef)) {
+        return $null
+    }
+    if ($IssueRef -match '^#(?<number>[0-9]+)$') {
+        return $Matches['number']
+    }
+    return $null
+}
+
 function ConvertTo-SynapseHandoffDiffObject {
     param([AllowNull()]$Diff)
 
@@ -2333,7 +2369,8 @@ function Write-SynapseCodexRestartHandoff {
         [AllowNull()][string]$CurrentSnapshotPath,
         [AllowNull()][string]$SourceDir,
         [AllowNull()][string]$Bind,
-        [AllowNull()][string]$TokenPath
+        [AllowNull()][string]$TokenPath,
+        [AllowNull()][string]$ActiveIssue
     )
 
     $root = Join-Path $env:LOCALAPPDATA 'synapse\codex-restart-handoffs'
@@ -2373,11 +2410,33 @@ function Write-SynapseCodexRestartHandoff {
     }
     $diffObject = ConvertTo-SynapseHandoffDiffObject -Diff $Diff
     $gitReadback = Get-SynapseHandoffGitReadback -SourceDir $SourceDir
+    $activeIssueRef = Get-SynapseNormalizedIssueRef -Issue $ActiveIssue
+    $activeIssueNumber = Get-SynapseIssueNumberFromRef -IssueRef $activeIssueRef
+    $activeIssueRead = if ([string]::IsNullOrWhiteSpace($activeIssueNumber)) {
+        $null
+    } else {
+        "gh issue view $activeIssueNumber --repo ChrisRoyse/Synapse --comments"
+    }
+    $resumeInstruction = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) {
+        'Resume the active GitHub issue from the caller/session context; if unknown, read the open issue queue and choose the issue that produced this setup handoff. Perform manual real-MCP FSV; do not use direct helper calls as acceptance.'
+    } else {
+        "Resume $activeIssueRef and perform manual real-MCP FSV; do not use direct helper calls as acceptance."
+    }
+    $restartCommandHint = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) {
+        "Close this Codex session completely, start a new Codex session through the patched Codex launcher, verify the active codex.exe PID is not $codexPid, then resume the active issue from the caller/session context."
+    } else {
+        "Close this Codex session completely, start a new Codex session through the patched Codex launcher, verify the active codex.exe PID is not $codexPid, then resume $activeIssueRef."
+    }
     $postRestartRequiredReads = @(
         'C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md',
         'C:\code\Synapse\docs\compressionprompt.md',
         'C:\code\Synapse\AGENTS.md',
         $recoveryNotesPath
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $githubReads = @(
+        'gh issue view 351 --repo ChrisRoyse/Synapse --comments',
+        $activeIssueRead,
+        'gh issue list --repo ChrisRoyse/Synapse --state open --limit 100'
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
 
     $record = [ordered]@{
@@ -2400,19 +2459,25 @@ function Write-SynapseCodexRestartHandoff {
         }
         diff = $diffObject
         post_restart_required_reads = $postRestartRequiredReads
-        github_reads = @(
-            'gh issue view 351 --repo ChrisRoyse/Synapse --comments',
-            'gh issue view 1398 --repo ChrisRoyse/Synapse --comments',
-            'gh issue list --repo ChrisRoyse/Synapse --state open --limit 100'
-        )
+        active_issue = [ordered]@{
+            issue_ref = $activeIssueRef
+            issue_number = $activeIssueNumber
+            source = 'ActiveIssue parameter or SYNAPSE_ACTIVE_ISSUE environment variable'
+            status = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown' } else { 'provided' }
+        }
+        stale_schema_context_issue = [ordered]@{
+            issue_ref = '#1398'
+            role = 'background context for the stale-schema bug class; not the resume target'
+        }
+        github_reads = $githubReads
         post_restart_verification = @(
             'Run git status --short --branch and confirm the working tree matches the handoff/recovery notes.',
             "Read the active Codex process parent chain and confirm the active codex.exe PID is not stale PID $codexPid from this handoff.",
             'Call real mcp__synapse.health and verify daemon pid/tool_surface_sha256 matches or intentionally supersedes this handoff.',
             'Run tool discovery for the previously missing Synapse tools. If metadata is still stale, rerun scripts\synapse-setup.ps1 and keep the issue open.',
-            'Resume #1398 and perform manual real-MCP FSV; do not use direct helper calls as acceptance.'
+            $resumeInstruction
         )
-        restart_command_hint = "Close this Codex session completely, start a new Codex session through the patched Codex launcher, verify the active codex.exe PID is not $codexPid, then resume #1398."
+        restart_command_hint = $restartCommandHint
         repo_readback = $gitReadback
         token_path = $TokenPath
         recovery_notes_path = $recoveryNotesPath
@@ -2429,6 +2494,8 @@ function Write-SynapseCodexRestartHandoff {
             "- Created UTC: $($record.created_at_utc)",
             "- Codex PID: $codexPid",
             "- Daemon: pid=$($daemon.pid) bind=$($daemon.bind) tool_count=$($daemon.tool_count) tool_surface_sha256=$($daemon.tool_surface_sha256)",
+            "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
+            "- Stale-schema context issue: #1398 (background only; not the resume target)",
             "- Current process start snapshot: status=$startSnapshotStatus hash=$ProcessHashAtStart path=$ProcessSnapshotAtStart",
             "- Current daemon snapshot: $CurrentSnapshotPath",
             "- Diff: $($diffObject.summary)",
@@ -2476,8 +2543,10 @@ function Write-SynapseCodexRestartHandoff {
                 "- Stale Codex PID: $codexPid",
                 "- Daemon bind: $Bind",
                 "- Daemon tool surface: $($daemon.tool_surface_sha256)",
+                "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
+                "- Stale-schema context issue: #1398 (background only; not the resume target)",
                 '',
-                'After restart, re-read AGENTS.md, #351, #1398, git status, and this file before resuming. Use the real mcp__synapse client for FSV; direct helper calls are diagnostics only.',
+                "After restart, re-read AGENTS.md, #351, $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'the active issue from the caller/session context' } else { $activeIssueRef }), git status, and this file before resuming. #1398 is stale-schema background context only. Use the real mcp__synapse client for FSV; direct helper calls are diagnostics only.",
                 ''
             )
             Write-SynapseUtf8NoBomFile -Path $recoveryNotesPath -Text (($notes -join "`n") + "`n")
@@ -2502,7 +2571,8 @@ function Assert-CodexCandidateHandoffPreservesCurrentProcess {
         [AllowNull()][string]$ProcessSnapshotAtStart,
         [AllowNull()][string]$SourceDir,
         [AllowNull()][string]$Bind,
-        [AllowNull()][string]$TokenPath
+        [AllowNull()][string]$TokenPath,
+        [AllowNull()][string]$ActiveIssue
     )
 
     if ($null -eq $CodexAncestor) {
@@ -2535,7 +2605,8 @@ function Assert-CodexCandidateHandoffPreservesCurrentProcess {
             -CurrentSnapshotPath $null `
             -SourceDir $SourceDir `
             -Bind $Bind `
-            -TokenPath $TokenPath
+            -TokenPath $TokenPath `
+            -ActiveIssue $ActiveIssue
         Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_PRE_HANDOFF codex_pid={0} tool_surface_at_process_start=missing candidate_tool_surface_sha256={1} candidate_tool_count={2} candidate_pid={3} start_snapshot={4} handoff={5} {6} remediation=setup will continue only to install the verified daemon; final setup must fail closed if this Codex process remains stale." -f `
             $CodexAncestor.ProcessId,
             $candidateHash,
@@ -2570,7 +2641,8 @@ function Assert-CodexCandidateHandoffPreservesCurrentProcess {
         -CurrentSnapshotPath $null `
         -SourceDir $SourceDir `
         -Bind $Bind `
-        -TokenPath $TokenPath
+        -TokenPath $TokenPath `
+        -ActiveIssue $ActiveIssue
     Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_PRE_HANDOFF codex_pid={0} start_tool_surface_sha256={1} candidate_tool_surface_sha256={2} candidate_tool_count={3} candidate_pid={4} start_snapshot={5} handoff={6} {7} remediation=setup will continue only to install the verified daemon; final setup must fail closed if this Codex process remains stale." -f `
         $CodexAncestor.ProcessId,
         $ProcessHashAtStart,
@@ -2592,7 +2664,8 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
         [Parameter(Mandatory=$true)][string]$SnapshotPath,
         [AllowNull()][string]$SourceDir,
         [AllowNull()][string]$Bind,
-        [AllowNull()][string]$TokenPath
+        [AllowNull()][string]$TokenPath,
+        [AllowNull()][string]$ActiveIssue
     )
 
     if ($null -eq $CodexAncestor) {
@@ -2615,8 +2688,9 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             -CurrentSnapshotPath $SnapshotPath `
             -SourceDir $SourceDir `
             -Bind $Bind `
-            -TokenPath $TokenPath
-        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} handoff={6} {7} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume #1398 and verify real mcp__synapse metadata." -f `
+            -TokenPath $TokenPath `
+            -ActiveIssue $ActiveIssue
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} handoff={6} {7} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume the active issue named in the handoff and verify real mcp__synapse metadata." -f `
             $CodexAncestor.ProcessId,
             $currentHash,
             $CurrentSurface.tool_count,
@@ -2651,8 +2725,9 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             -CurrentSnapshotPath $SnapshotPath `
             -SourceDir $SourceDir `
             -Bind $Bind `
-            -TokenPath $TokenPath
-        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} handoff={7} {8} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume #1398 and verify real mcp__synapse metadata." -f `
+            -TokenPath $TokenPath `
+            -ActiveIssue $ActiveIssue
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} handoff={7} {8} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume the active issue named in the handoff and verify real mcp__synapse metadata." -f `
             $CodexAncestor.ProcessId,
             $ProcessHashAtStart,
             $currentHash,
@@ -3359,7 +3434,8 @@ Assert-CodexCandidateHandoffPreservesCurrentProcess `
     -ProcessSnapshotAtStart $processToolSurfaceSnapshotAtStart `
     -SourceDir $SourceDir `
     -Bind $Bind `
-    -TokenPath $TokenPath
+    -TokenPath $TokenPath `
+    -ActiveIssue $ActiveIssue
 
 Step "Preflighting Chrome direct localhost bridge before daemon handoff"
 $chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
@@ -3647,7 +3723,8 @@ if (-not $SkipClientWiring) {
         -SnapshotPath $CodexToolSurfaceSnapshotPath `
         -SourceDir $SourceDir `
         -Bind $Bind `
-        -TokenPath $TokenPath
+        -TokenPath $TokenPath `
+        -ActiveIssue $ActiveIssue
 } else {
     Info "Skipped Codex current-process freshness check because -SkipClientWiring was set; daemon health and tools/list were still verified."
 }
