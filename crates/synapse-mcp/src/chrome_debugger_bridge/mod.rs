@@ -6895,22 +6895,21 @@ fn aria_node_is_sensitive(node: &ChromeDebuggerAriaSnapshotNode) -> bool {
             return true;
         }
     }
-    if let Some(autocomplete) = node.autocomplete.as_deref() {
-        if aria_autocomplete_is_sensitive(autocomplete) {
-            return true;
-        }
+    if let Some(autocomplete) = node.autocomplete.as_deref()
+        && aria_autocomplete_is_sensitive(autocomplete)
+    {
+        return true;
     }
     if aria_name_looks_secret(&node.name) {
         return true;
     }
     // Ambiguous/unknown metadata + a token-like value fails closed (redact).
     let metadata_known = node.input_type.is_some() || node.autocomplete.is_some();
-    if !metadata_known {
-        if let Some(value) = node.value.as_deref() {
-            if aria_value_is_high_entropy_token(value) {
-                return true;
-            }
-        }
+    if !metadata_known
+        && let Some(value) = node.value.as_deref()
+        && aria_value_is_high_entropy_token(value)
+    {
+        return true;
     }
     false
 }
@@ -6930,14 +6929,14 @@ fn redact_aria_snapshot(result: &mut ChromeDebuggerAriaSnapshotResult) -> usize 
         if !sensitive {
             continue;
         }
-        if let Some(raw) = node.value.take() {
-            if !raw.is_empty() {
-                // Re-derive evidence from the value the host can actually see so a
-                // stale/bypassed browser cannot suppress it.
-                node.value_length = Some(raw.chars().count());
-                node.value_hash = Some(aria_value_hash(&raw));
-                leaked_values.push(raw);
-            }
+        if let Some(raw) = node.value.take()
+            && !raw.is_empty()
+        {
+            // Re-derive evidence from the value the host can actually see so a
+            // stale/bypassed browser cannot suppress it.
+            node.value_length = Some(raw.chars().count());
+            node.value_hash = Some(aria_value_hash(&raw));
+            leaked_values.push(raw);
         }
         // `node.value` is now None regardless of source; browser-supplied
         // value_length/value_hash (if any) are preserved when the host saw no raw.
@@ -6946,7 +6945,7 @@ fn redact_aria_snapshot(result: &mut ChromeDebuggerAriaSnapshotResult) -> usize 
     // Scrub the pre-rendered snapshot string. Longest-first avoids partial-overlap
     // artifacts when one leaked value is a substring of another.
     if !leaked_values.is_empty() && !result.snapshot.is_empty() {
-        leaked_values.sort_by(|a, b| b.len().cmp(&a.len()));
+        leaked_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         for raw in &leaked_values {
             if !raw.is_empty() {
                 result.snapshot = result

@@ -1889,7 +1889,7 @@ fn validate_workspace_list_limit(limit: usize) -> Result<(), ErrorData> {
 }
 
 fn validate_workspace_wait_timeout_ms(timeout_ms: u64) -> Result<(), ErrorData> {
-    if timeout_ms < MIN_WORKSPACE_WAIT_TIMEOUT_MS || timeout_ms > MAX_WORKSPACE_WAIT_TIMEOUT_MS {
+    if !(MIN_WORKSPACE_WAIT_TIMEOUT_MS..=MAX_WORKSPACE_WAIT_TIMEOUT_MS).contains(&timeout_ms) {
         return Err(params_error(format!(
             "workspace wait timeout_ms must be between {MIN_WORKSPACE_WAIT_TIMEOUT_MS} and {MAX_WORKSPACE_WAIT_TIMEOUT_MS}"
         )));
@@ -1898,8 +1898,8 @@ fn validate_workspace_wait_timeout_ms(timeout_ms: u64) -> Result<(), ErrorData> 
 }
 
 fn validate_workspace_wait_poll_interval_ms(poll_interval_ms: u64) -> Result<(), ErrorData> {
-    if poll_interval_ms < MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS
-        || poll_interval_ms > MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS
+    if !(MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS..=MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS)
+        .contains(&poll_interval_ms)
     {
         return Err(params_error(format!(
             "workspace wait poll_interval_ms must be between {MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS} and {MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS}"
