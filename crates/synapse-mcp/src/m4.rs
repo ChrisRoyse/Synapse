@@ -10104,8 +10104,21 @@ async fn wait_shell_job_child(
 ) -> (Option<i32>, bool, Option<String>) {
     match timeout_ms {
         Some(timeout_ms) => {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-                Ok(Ok(status)) => (status.code(), false, None),
+            let budget = Duration::from_millis(timeout_ms);
+            let waited = Instant::now();
+            match tokio::time::timeout(budget, child.wait()).await {
+                Ok(Ok(status)) => {
+                    // Deterministic budget enforcement from the SOURCE OF TRUTH
+                    // (measured wait vs cap), not the wait-vs-timer race. Under
+                    // scheduler starvation `tokio::time::timeout` polls the inner
+                    // future first, so a child that self-exited AFTER the deadline
+                    // is still delivered as `Ok(exit)` with the fired deadline
+                    // ignored — the job silently reports "ok" despite outrunning
+                    // its cap (#1580). If the measured wait met or exceeded the
+                    // budget the job timed out, regardless of the exit code.
+                    let timed_out = waited.elapsed() >= budget;
+                    (status.code(), timed_out, None)
+                }
                 Ok(Err(error)) => (None, false, Some(format!("wait_failed:{error}"))),
                 Err(_elapsed) => {
                     if let Some(pid) = child.id() {
@@ -17360,6 +17373,53 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         }
 
         panic!("durable timeout job {job_id} did not finish within the regression readback window");
+    }
+
+    // #1580 deterministic reproduction: under CPU starvation `tokio::time::timeout`
+    // delivers a child's own exit even when the deadline already fired (it polls
+    // the inner future before the timer), so a job that outran its cap was
+    // silently reported as a clean exit instead of timed_out. We reproduce the
+    // starvation exactly — a busy-loop task hogs the single runtime worker so the
+    // deadline timer cannot fire before the real child self-exits — and assert
+    // the budget is enforced from the measured wait, not the wait-vs-timer race.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn wait_shell_job_child_enforces_budget_when_starved_timer_misses_self_exit() {
+        // Real child that self-exits well past the 80 ms cap (~200 ms sleep plus
+        // interpreter startup). No mock: a genuine process on a genuine timer.
+        let mut child = TokioCommand::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Milliseconds 200"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn starvation child: {error}"));
+
+        // Hog the single worker with a non-yielding busy loop so the 80 ms
+        // deadline timer is starved past the child's self-exit; when the wait is
+        // finally polled both the child exit and the blown deadline are ready and
+        // `tokio::time::timeout` returns the child's `Ok(exit)`.
+        let hog = tokio::spawn(async {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(800) {
+                std::hint::spin_loop();
+            }
+        });
+
+        let (exit_code, timed_out, wait_error) = wait_shell_job_child(&mut child, Some(80)).await;
+        hog.await
+            .unwrap_or_else(|error| panic!("hog task join: {error}"));
+
+        println!(
+            "readback=wait_shell_job_child edge=starved_self_exit after=exit_code:{exit_code:?} timed_out:{timed_out} wait_error:{wait_error:?}"
+        );
+        assert!(
+            wait_error.is_none(),
+            "no wait error expected: {wait_error:?}"
+        );
+        assert!(
+            timed_out,
+            "a job that ran ~200 ms under an 80 ms cap must be timed_out even when the starved timer let it self-exit (exit_code={exit_code:?})"
+        );
     }
 
     #[cfg(windows)]
