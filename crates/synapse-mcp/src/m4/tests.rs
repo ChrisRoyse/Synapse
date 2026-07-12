@@ -5192,6 +5192,71 @@ async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation
     );
 }
 
+// #1589 deterministic guard: an inline shell run that times out must terminate
+// its process tree WITHOUT blocking the async runtime. On this single-threaded
+// test runtime, a blocking termination (full-system sysinfo scan + taskkill
+// spawns + a std::thread::sleep exit-wait) executed on the async worker freezes
+// every task until it finishes — the mechanism that let concurrent scp timeouts
+// stall one another for 90 s+. A heartbeat must keep ticking on schedule while a
+// real inline timeout drives the termination path; a large gap means the
+// blocking work ran on the async worker instead of the blocking pool.
+#[cfg(windows)]
+#[tokio::test]
+async fn inline_shell_timeout_termination_keeps_async_runtime_responsive() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _root_guard = ShellJobRootGuard::new();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_task = Arc::clone(&stop);
+    let heartbeat = tokio::spawn(async move {
+        let mut max_gap = Duration::ZERO;
+        let mut ticks = 0_u32;
+        let mut last = Instant::now();
+        while !stop_for_task.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let now = Instant::now();
+            max_gap = max_gap.max(now.duration_since(last));
+            last = now;
+            ticks += 1;
+        }
+        (max_gap, ticks)
+    });
+
+    // Inline run whose child (10 s sleep) overruns its 300 ms cap, forcing the
+    // process-tree termination path.
+    let mut params = shell_params(
+        "powershell.exe",
+        vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 10"],
+        300,
+    );
+    params.execution_mode = ActRunShellExecutionMode::Inline;
+    let config = shell_config_for(&params);
+    let response = run_shell(&config, params)
+        .await
+        .unwrap_or_else(|error| panic!("inline timeout run should complete: {error}"));
+    assert!(
+        response.timed_out,
+        "the overrunning inline run must be timed_out: {response:?}"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let (max_gap, ticks) = heartbeat
+        .await
+        .unwrap_or_else(|error| panic!("heartbeat join: {error}"));
+    println!(
+        "readback=inline_timeout_responsiveness after=timed_out:{} max_heartbeat_gap_ms:{} ticks:{ticks}",
+        response.timed_out,
+        max_gap.as_millis()
+    );
+    assert!(
+        max_gap < Duration::from_millis(400),
+        "the async runtime was frozen for {}ms during the shell termination; blocking process-tree work must run off the async worker (#1589)",
+        max_gap.as_millis()
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn shell_session_cleanup_retains_live_durable_jobs() {

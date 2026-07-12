@@ -10221,7 +10221,21 @@ async fn wait_shell_job_child(
                 Ok(Err(error)) => (None, false, Some(format!("wait_failed:{error}"))),
                 Err(_elapsed) => {
                     if let Some(pid) = child.id() {
-                        let termination = terminate_shell_job_process_tree(pid);
+                        // Run the blocking process-tree termination (taskkill
+                        // spawns + a std::thread::sleep exit-wait + a full-system
+                        // sysinfo scan) off the async worker: on the async thread,
+                        // concurrent shell timeouts starve the runtime and stall
+                        // one another's timers, hanging the caller far past the
+                        // per-job budget (#1589).
+                        let termination = tokio::task::spawn_blocking(move || {
+                            terminate_shell_job_process_tree(pid)
+                        })
+                        .await
+                        .unwrap_or_else(|join_error| ShellJobTerminationReadback {
+                            attempted: false,
+                            status: format!("termination_task_join_failed:{join_error}"),
+                            remaining_process_ids: Vec::new(),
+                        });
                         tracing::warn!(
                             code = "M4_ACT_RUN_SHELL_JOB_TIMEOUT_TREE_TERMINATED",
                             pid,
@@ -11465,7 +11479,21 @@ async fn wait_shell_child(
         }
         Err(_elapsed) => {
             if let Some(pid) = child.id() {
-                let termination = terminate_shell_job_process_tree(pid);
+                // Off-load the blocking process-tree termination (taskkill spawns
+                // + a std::thread::sleep exit-wait + a full-system sysinfo scan)
+                // to the blocking pool: on the async worker, concurrent inline
+                // shell timeouts starve the runtime and stall each other's
+                // timers, hanging the caller for far longer than timeout_ms
+                // (root cause of the parallel-scp hang, #1589).
+                let termination = tokio::task::spawn_blocking(move || {
+                    terminate_shell_job_process_tree(pid)
+                })
+                .await
+                .unwrap_or_else(|join_error| ShellJobTerminationReadback {
+                    attempted: false,
+                    status: format!("termination_task_join_failed:{join_error}"),
+                    remaining_process_ids: Vec::new(),
+                });
                 tracing::warn!(
                     code = "M4_ACT_RUN_SHELL_TIMEOUT_TREE_TERMINATED",
                     pid,
