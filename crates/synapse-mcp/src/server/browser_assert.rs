@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::browser_facades::merge_top_level_target;
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
@@ -142,6 +143,16 @@ impl BrowserDomOperation {
 pub struct BrowserDomParams {
     /// DOM operation to run. Supply exactly the matching nested spec object.
     pub operation: BrowserDomOperation,
+    /// Optional top-level target alias (#1551). When set, this populates the
+    /// selected operation spec's `cdp_target_id`; a conflicting nested value
+    /// fails closed. Defaults to the nested spec / session target.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Optional top-level target-window alias (#1551). When set, this populates
+    /// the selected operation spec's `window_hwnd`; a conflicting nested value
+    /// fails closed. Defaults to the nested spec / session target window.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
     /// `operation=content`: serialized document HTML readback.
     #[serde(default)]
     pub content: Option<BrowserContentParams>,
@@ -413,15 +424,60 @@ struct AriaSnapshotBuild {
 #[tool_router(router = browser_assert_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Target addressing (cdp_target_id/window_hwnd) may be supplied at the envelope top level as an alias for the selected nested spec's target; a conflicting nested value fails closed. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_dom(
         &self,
         params: Parameters<BrowserDomParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserDomResponse>, ErrorData> {
-        let params = params.0;
+        let mut params = params.0;
         let operation = params.operation;
+        // #1551: fold top-level cdp_target_id/window_hwnd aliases into the nested
+        // operation spec before source/validation so the effective target is
+        // resolved identically to the equivalent nested-spec form.
+        let top_cdp_target_id = params.cdp_target_id.clone();
+        let top_window_hwnd = params.window_hwnd;
+        if let Some(spec) = params.content.as_mut() {
+            merge_top_level_target(
+                DOM_TOOL,
+                "content",
+                top_cdp_target_id.as_deref(),
+                top_window_hwnd,
+                &mut spec.cdp_target_id,
+                &mut spec.window_hwnd,
+            )?;
+        }
+        if let Some(spec) = params.locate.as_mut() {
+            merge_top_level_target(
+                DOM_TOOL,
+                "locate",
+                top_cdp_target_id.as_deref(),
+                top_window_hwnd,
+                &mut spec.cdp_target_id,
+                &mut spec.window_hwnd,
+            )?;
+        }
+        if let Some(spec) = params.inspect.as_mut() {
+            merge_top_level_target(
+                DOM_TOOL,
+                "inspect",
+                top_cdp_target_id.as_deref(),
+                top_window_hwnd,
+                &mut spec.cdp_target_id,
+                &mut spec.window_hwnd,
+            )?;
+        }
+        if let Some(spec) = params.aria_snapshot.as_mut() {
+            merge_top_level_target(
+                DOM_TOOL,
+                "aria_snapshot",
+                top_cdp_target_id.as_deref(),
+                top_window_hwnd,
+                &mut spec.cdp_target_id,
+                &mut spec.window_hwnd,
+            )?;
+        }
         let source_id = browser_dom_source_id(&params);
         validate_browser_dom_params(&params)?;
         tracing::info!(
@@ -2399,6 +2455,115 @@ const ASSERT_ELEMENT_FUNCTION: &str = r#"(el) => {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1551: top-level cdp_target_id/window_hwnd on the browser_dom envelope are
+    // accepted and alias the selected nested spec's target, resolving the SAME
+    // target as the equivalent nested-spec form.
+    #[test]
+    fn browser_dom_top_level_target_aliases_nested_spec_1551() {
+        let mut top_level: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "aria_snapshot": {},
+        }))
+        .expect("top-level cdp_target_id must deserialize under deny_unknown_fields");
+        let nested: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "aria_snapshot": { "cdp_target_id": "TARGET-1551-ABC" },
+        }))
+        .expect("nested cdp_target_id must deserialize");
+        let top_cdp = top_level.cdp_target_id.clone();
+        let top_hwnd = top_level.window_hwnd;
+        let spec = top_level
+            .aria_snapshot
+            .as_mut()
+            .expect("aria_snapshot spec present");
+        println!("readback=before cdp_target_id={:?}", spec.cdp_target_id);
+        merge_top_level_target(
+            DOM_TOOL,
+            "aria_snapshot",
+            top_cdp.as_deref(),
+            top_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after cdp_target_id={:?}", spec.cdp_target_id);
+        assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1551-ABC"));
+        assert_eq!(
+            spec.cdp_target_id,
+            nested.aria_snapshot.expect("nested spec").cdp_target_id
+        );
+
+        // Top-level window_hwnd (0x1234) aliases the nested spec's window_hwnd.
+        let mut top_hwnd_params: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "window_hwnd": 0x1234,
+            "aria_snapshot": {},
+        }))
+        .expect("top-level window_hwnd must deserialize");
+        let t_cdp = top_hwnd_params.cdp_target_id.clone();
+        let t_hwnd = top_hwnd_params.window_hwnd;
+        let spec = top_hwnd_params
+            .aria_snapshot
+            .as_mut()
+            .expect("aria_snapshot spec present");
+        println!("readback=before window_hwnd={:?}", spec.window_hwnd);
+        merge_top_level_target(
+            DOM_TOOL,
+            "aria_snapshot",
+            t_cdp.as_deref(),
+            t_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after window_hwnd={:?}", spec.window_hwnd);
+        assert_eq!(spec.window_hwnd, Some(0x1234));
+    }
+
+    #[test]
+    fn browser_dom_conflicting_top_level_target_fails_closed_1551() {
+        let mut params: BrowserDomParams = serde_json::from_value(json!({
+            "operation": "aria_snapshot",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "aria_snapshot": { "cdp_target_id": "OTHER-TARGET" },
+        }))
+        .expect("both target locations must deserialize");
+        let top_cdp = params.cdp_target_id.clone();
+        let top_hwnd = params.window_hwnd;
+        let spec = params
+            .aria_snapshot
+            .as_mut()
+            .expect("aria_snapshot spec present");
+        let err = merge_top_level_target(
+            DOM_TOOL,
+            "aria_snapshot",
+            top_cdp.as_deref(),
+            top_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+        let code = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        println!("readback=conflict code={code:?} message={}", err.message);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+    }
+
+    #[test]
+    fn browser_dom_still_rejects_unknown_fields_1551() {
+        let err = serde_json::from_value::<BrowserDomParams>(json!({
+            "operation": "aria_snapshot",
+            "aria_snapshot": {},
+            "bogus_1551": true,
+        }))
+        .expect_err("deny_unknown_fields must still reject a genuinely unknown field");
+        println!("readback=unknown_rejected err={err}");
+    }
     use synapse_core::{ElementId, Rect, element_id};
 
     fn node(

@@ -8,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::browser_facades::merge_top_level_target;
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
@@ -77,6 +78,16 @@ pub enum BrowserNetworkReadMode {
 pub struct BrowserNetworkParams {
     /// Which captured-network read to perform.
     pub mode: BrowserNetworkReadMode,
+    /// Optional top-level target alias (#1551). When set, this populates the
+    /// selected `mode` spec's `cdp_target_id`; a conflicting nested value fails
+    /// closed. Defaults to the nested spec / session target.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Optional top-level target-window alias (#1551). When set, this populates
+    /// the selected `mode` spec's `window_hwnd`; a conflicting nested value fails
+    /// closed. Defaults to the nested spec / session target window.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
     /// `mode=requests`: filtered request-record list.
     #[serde(default)]
     pub requests: Option<BrowserNetworkRequestsParams>,
@@ -918,7 +929,7 @@ struct NormalizedBrowserRouteParams {
 #[tool_router(router = browser_network_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Read captured network activity for the calling session's owned browser tab, selected by `mode` with the matching nested spec (#1348 — folds the former browser_network_requests/_request/_websockets read tools into one). mode=requests returns the filtered Network request-record list (spec `requests`: since_seq/limit/url_contains/url_regex/resource_type/status_min/status_max; all optional, omit the spec to list everything); mode=request inspects one captured request by CDP request_id with full request/response metadata, optional post data, and a base64-aware response body by default (spec `request`, required — carries request_id/include_body/include_post_data); mode=websockets returns WebSocket lifecycle and sent/received frame records (spec `websockets`: since_seq/limit/request_id/url_contains). All modes arm/reuse the same target-scoped raw CDP Network buffer. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed. The response field matching `mode` carries that read's full result."
+        description = "Read captured network activity for the calling session's owned browser tab, selected by `mode` with the matching nested spec (#1348 — folds the former browser_network_requests/_request/_websockets read tools into one). mode=requests returns the filtered Network request-record list (spec `requests`: since_seq/limit/url_contains/url_regex/resource_type/status_min/status_max; all optional, omit the spec to list everything); mode=request inspects one captured request by CDP request_id with full request/response metadata, optional post data, and a base64-aware response body by default (spec `request`, required — carries request_id/include_body/include_post_data); mode=websockets returns WebSocket lifecycle and sent/received frame records (spec `websockets`: since_seq/limit/request_id/url_contains). All modes arm/reuse the same target-scoped raw CDP Network buffer. Target addressing (cdp_target_id/window_hwnd) may be supplied at the envelope top level as an alias for the selected mode spec's target; a conflicting nested value fails closed. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed. The response field matching `mode` carries that read's full result."
     )]
     pub async fn browser_network(
         &self,
@@ -927,9 +938,22 @@ impl SynapseService {
     ) -> Result<Json<BrowserNetworkResponse>, ErrorData> {
         let params = params.0;
         let mode = params.mode;
+        // #1551: fold top-level cdp_target_id/window_hwnd aliases into the
+        // mode-selected spec so the effective target is resolved identically to
+        // the equivalent nested-spec form.
+        let top_cdp_target_id = params.cdp_target_id.clone();
+        let top_window_hwnd = params.window_hwnd;
         match mode {
             BrowserNetworkReadMode::Requests => {
-                let spec = params.requests.unwrap_or_default();
+                let mut spec = params.requests.unwrap_or_default();
+                merge_top_level_target(
+                    REQUESTS_TOOL,
+                    "requests",
+                    top_cdp_target_id.as_deref(),
+                    top_window_hwnd,
+                    &mut spec.cdp_target_id,
+                    &mut spec.window_hwnd,
+                )?;
                 let inner = self
                     .browser_network_requests_inner(Parameters(spec), request_context)
                     .await?;
@@ -940,12 +964,20 @@ impl SynapseService {
                 }))
             }
             BrowserNetworkReadMode::Request => {
-                let spec = params.request.ok_or_else(|| {
+                let mut spec = params.request.ok_or_else(|| {
                     mcp_error(
                         error_codes::TOOL_PARAMS_INVALID,
                         "browser_network mode=request requires the `request` spec object (with request_id)",
                     )
                 })?;
+                merge_top_level_target(
+                    REQUEST_TOOL,
+                    "request",
+                    top_cdp_target_id.as_deref(),
+                    top_window_hwnd,
+                    &mut spec.cdp_target_id,
+                    &mut spec.window_hwnd,
+                )?;
                 let inner = self
                     .browser_network_request_inner(Parameters(spec), request_context)
                     .await?;
@@ -956,7 +988,15 @@ impl SynapseService {
                 }))
             }
             BrowserNetworkReadMode::WebSockets => {
-                let spec = params.websockets.unwrap_or_default();
+                let mut spec = params.websockets.unwrap_or_default();
+                merge_top_level_target(
+                    WEBSOCKETS_TOOL,
+                    "websockets",
+                    top_cdp_target_id.as_deref(),
+                    top_window_hwnd,
+                    &mut spec.cdp_target_id,
+                    &mut spec.window_hwnd,
+                )?;
                 let inner = self
                     .browser_network_websockets_inner(Parameters(spec), request_context)
                     .await?;
@@ -4123,6 +4163,98 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #1551: top-level cdp_target_id/window_hwnd on the browser_network envelope
+    // are accepted and alias the mode-selected spec's target, resolving the SAME
+    // target as the equivalent nested-spec form.
+    #[test]
+    fn browser_network_top_level_target_aliases_nested_spec_1551() {
+        let top_level: BrowserNetworkParams = serde_json::from_value(json!({
+            "mode": "requests",
+            "cdp_target_id": "TARGET-1551-ABC",
+        }))
+        .expect("top-level cdp_target_id must deserialize under deny_unknown_fields");
+        let nested: BrowserNetworkParams = serde_json::from_value(json!({
+            "mode": "requests",
+            "requests": { "cdp_target_id": "TARGET-1551-ABC" },
+        }))
+        .expect("nested cdp_target_id must deserialize");
+        // requests spec is optional; the tool defaults it, exactly as the body does.
+        let mut spec = top_level.requests.clone().unwrap_or_default();
+        println!("readback=before cdp_target_id={:?}", spec.cdp_target_id);
+        merge_top_level_target(
+            REQUESTS_TOOL,
+            "requests",
+            top_level.cdp_target_id.as_deref(),
+            top_level.window_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after cdp_target_id={:?}", spec.cdp_target_id);
+        assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1551-ABC"));
+        assert_eq!(
+            spec.cdp_target_id,
+            nested.requests.expect("nested spec").cdp_target_id
+        );
+
+        // Top-level window_hwnd (0x1234) aliases the mode spec's window_hwnd.
+        let top_hwnd_params: BrowserNetworkParams = serde_json::from_value(json!({
+            "mode": "requests",
+            "window_hwnd": 0x1234,
+        }))
+        .expect("top-level window_hwnd must deserialize");
+        let mut spec = top_hwnd_params.requests.clone().unwrap_or_default();
+        println!("readback=before window_hwnd={:?}", spec.window_hwnd);
+        merge_top_level_target(
+            REQUESTS_TOOL,
+            "requests",
+            top_hwnd_params.cdp_target_id.as_deref(),
+            top_hwnd_params.window_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect("merge must succeed");
+        println!("readback=after window_hwnd={:?}", spec.window_hwnd);
+        assert_eq!(spec.window_hwnd, Some(0x1234));
+    }
+
+    #[test]
+    fn browser_network_conflicting_top_level_target_fails_closed_1551() {
+        let params: BrowserNetworkParams = serde_json::from_value(json!({
+            "mode": "requests",
+            "cdp_target_id": "TARGET-1551-ABC",
+            "requests": { "cdp_target_id": "OTHER-TARGET" },
+        }))
+        .expect("both target locations must deserialize");
+        let mut spec = params.requests.clone().unwrap_or_default();
+        let err = merge_top_level_target(
+            REQUESTS_TOOL,
+            "requests",
+            params.cdp_target_id.as_deref(),
+            params.window_hwnd,
+            &mut spec.cdp_target_id,
+            &mut spec.window_hwnd,
+        )
+        .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+        let code = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        println!("readback=conflict code={code:?} message={}", err.message);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+    }
+
+    #[test]
+    fn browser_network_still_rejects_unknown_fields_1551() {
+        let err = serde_json::from_value::<BrowserNetworkParams>(json!({
+            "mode": "requests",
+            "bogus_1551": true,
+        }))
+        .expect_err("deny_unknown_fields must still reject a genuinely unknown field");
+        println!("readback=unknown_rejected err={err}");
+    }
 
     fn entry(
         seq: u64,

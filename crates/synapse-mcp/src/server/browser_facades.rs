@@ -692,6 +692,84 @@ fn browser_facade_error(
     )
 }
 
+/// Unify top-level `cdp_target_id`/`window_hwnd` envelope aliases (#1551) into an
+/// operation spec's own target fields so every browser facade accepts target
+/// addressing at the envelope top level and routes it to the exact same nested
+/// resolver the spec form already triggers. An agent passing top-level
+/// `cdp_target_id` therefore resolves the SAME target as the equivalent
+/// nested-spec form.
+///
+/// Precedence (fail-closed): when BOTH the top-level alias and the same nested
+/// spec field carry a value and they CONFLICT, this returns a typed
+/// [`error_codes::TOOL_PARAMS_INVALID`] error naming both locations; when only one
+/// side is set the spec field is populated from it; when the nested spec already
+/// carries the value and the top-level alias is absent the spec is left unchanged.
+pub(super) fn merge_top_level_target(
+    tool: &'static str,
+    operation: &str,
+    top_cdp_target_id: Option<&str>,
+    top_window_hwnd: Option<i64>,
+    spec_cdp_target_id: &mut Option<String>,
+    spec_window_hwnd: &mut Option<i64>,
+) -> Result<(), ErrorData> {
+    if let Some(top) = top_cdp_target_id {
+        match spec_cdp_target_id.as_deref() {
+            Some(nested) if nested != top => {
+                return Err(target_alias_conflict_error(
+                    tool,
+                    operation,
+                    "cdp_target_id",
+                    top.to_owned(),
+                    nested.to_owned(),
+                ));
+            }
+            _ => *spec_cdp_target_id = Some(top.to_owned()),
+        }
+    }
+    if let Some(top) = top_window_hwnd {
+        match *spec_window_hwnd {
+            Some(nested) if nested != top => {
+                return Err(target_alias_conflict_error(
+                    tool,
+                    operation,
+                    "window_hwnd",
+                    format!("{top:#x}"),
+                    format!("{nested:#x}"),
+                ));
+            }
+            _ => *spec_window_hwnd = Some(top),
+        }
+    }
+    Ok(())
+}
+
+fn target_alias_conflict_error(
+    tool: &'static str,
+    operation: &str,
+    field: &'static str,
+    top_level: String,
+    nested: String,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool} operation={operation} received conflicting {field}: top-level {field}={top_level} disagrees with nested {operation}.{field}={nested}"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": tool,
+            "operation": operation,
+            "field": field,
+            "top_level_value": top_level,
+            "nested_spec_value": nested,
+            "source_of_truth": "unified browser facade target addressing (#1551): top-level cdp_target_id/window_hwnd alias the nested operation spec's target fields",
+            "remediation": format!(
+                "pass {field} at the envelope top level OR inside the operation spec, not both with different values"
+            ),
+        })),
+    )
+}
+
 fn browser_downloads_readback_source(response: &BrowserDownloadsResponse) -> String {
     match (
         &response.saved_path,
