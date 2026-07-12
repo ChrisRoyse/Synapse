@@ -37,6 +37,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use synapse_action::ActionHandle;
 use synapse_audio::{AudioConfig, AudioError, AudioRuntime, DEFAULT_RING_SECONDS};
@@ -163,6 +164,85 @@ impl M3ServiceConfig {
     }
 }
 
+/// Bounded maximum lifetime of a runtime reality-write opt-in overlay (#1559).
+/// The overlay is a break-glass escalation, so it self-expires quickly; a fresh
+/// grant is required after this window regardless of daemon uptime.
+pub const REALITY_WRITE_GRANT_MAX_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// In-memory, scoped, reversible, audited reality-write opt-in overlay (#1559).
+///
+/// After #1539 made the stock M3 grant read-only, `full_capability` no longer
+/// yields reality-write capability and there was no usable opt-in. This overlay
+/// is that opt-in: when active (non-expired) it satisfies EXACTLY the
+/// reality-write permission set (`READ_STORAGE`/`WRITE_STORAGE`/`READ_EVENTS`)
+/// and is consulted ONLY by the reality-write enforcement path — it never widens
+/// authority for any other tool or permission. Expiry is authoritative from the
+/// monotonic `Instant` (mirrors the input-lease module), immune to wall-clock
+/// changes; `granted_at`/`expires_at` are wall-clock copies for human readback.
+#[derive(Clone, Debug)]
+pub struct RealityWriteGrant {
+    granted_by: String,
+    reason: String,
+    granted_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    granted_at_instant: Instant,
+    ttl: Duration,
+}
+
+/// Serializable, `Instant`-free copy of an active [`RealityWriteGrant`] for tool
+/// responses and status readback.
+#[derive(Clone, Debug)]
+pub struct RealityWriteGrantSnapshot {
+    pub granted_by: String,
+    pub reason: String,
+    pub granted_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub remaining_ms: u64,
+}
+
+impl RealityWriteGrant {
+    #[must_use]
+    pub fn new(granted_by: String, reason: String) -> Self {
+        let ttl = REALITY_WRITE_GRANT_MAX_TTL;
+        let granted_at = Utc::now();
+        let expires_at = granted_at
+            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(900));
+        Self {
+            granted_by,
+            reason,
+            granted_at,
+            expires_at,
+            granted_at_instant: Instant::now(),
+            ttl,
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.granted_at_instant.elapsed() < self.ttl
+    }
+
+    #[must_use]
+    pub fn remaining_ms(&self) -> u64 {
+        self.ttl
+            .checked_sub(self.granted_at_instant.elapsed())
+            .map_or(0, |remaining| {
+                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> RealityWriteGrantSnapshot {
+        RealityWriteGrantSnapshot {
+            granted_by: self.granted_by.clone(),
+            reason: self.reason.clone(),
+            granted_at: self.granted_at,
+            expires_at: self.expires_at,
+            remaining_ms: self.remaining_ms(),
+        }
+    }
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -178,6 +258,15 @@ pub struct M3State {
     pub shutdown_reason: &'static str,
     pub connection_closed_cancel: Option<CancellationToken>,
     pub permission_grants: PermissionGrants,
+    /// Where the startup `permission_grants` came from (#1559): an explicit
+    /// operator config (`SYNAPSE_MCP_ALLOWED_PERMISSIONS` env / `--allowed-permissions`
+    /// CLI) or the fail-closed read-only default. Reported in status and denial
+    /// remediation so `full_capability` is never mistaken for a write grant.
+    pub permission_grants_source: &'static str,
+    /// Runtime reality-write opt-in overlay (#1559). `None` restores the
+    /// fail-closed default; `Some` (while non-expired) satisfies the reality-write
+    /// permission set for reality tools only. See [`RealityWriteGrant`].
+    pub reality_write_grant: Option<RealityWriteGrant>,
     pub enable_audio: bool,
     pub allow_unknown_profile: bool,
     pub reflex_force_degraded: bool,
@@ -298,6 +387,14 @@ impl M3State {
         let reflex_force_degraded =
             parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
+        // #1559: record the config source so status/denial remediation can state
+        // exactly how to opt into reality-write, and never imply that an absent
+        // WRITE_STORAGE is present.
+        let permission_grants_source = if allowed_permissions.is_some() {
+            "explicit operator config (SYNAPSE_MCP_ALLOWED_PERMISSIONS env / --allowed-permissions CLI)"
+        } else {
+            "fail-closed read-only default (#1539; no SYNAPSE_MCP_ALLOWED_PERMISSIONS / --allowed-permissions set)"
+        };
         Ok(Self {
             db_path,
             profile_dir,
@@ -310,6 +407,8 @@ impl M3State {
             shutdown_reason,
             connection_closed_cancel,
             permission_grants,
+            permission_grants_source,
+            reality_write_grant: None,
             enable_audio,
             allow_unknown_profile,
             reflex_force_degraded,
@@ -345,6 +444,53 @@ impl M3State {
     #[must_use]
     pub fn intent_tracker(&self) -> intent_events::SharedIntentTracker {
         Arc::clone(&self.intent_tracker)
+    }
+
+    /// True when a non-expired runtime reality-write overlay is active (#1559).
+    /// Clears the overlay in place when it has lapsed so an expired grant leaves
+    /// NO residue and the fail-closed default is restored automatically.
+    pub fn reality_write_grant_active(&mut self) -> bool {
+        match self.reality_write_grant.as_ref() {
+            Some(grant) if grant.is_active() => true,
+            Some(_expired) => {
+                self.reality_write_grant = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Installs (or replaces) the runtime reality-write overlay with a fresh
+    /// bounded TTL (#1559). Returns a serializable snapshot for audit/readback.
+    pub fn grant_reality_write(
+        &mut self,
+        granted_by: String,
+        reason: String,
+    ) -> RealityWriteGrantSnapshot {
+        let grant = RealityWriteGrant::new(granted_by, reason);
+        let snapshot = grant.snapshot();
+        self.reality_write_grant = Some(grant);
+        snapshot
+    }
+
+    /// Clears any runtime reality-write overlay (#1559), restoring the
+    /// fail-closed default with no residue. Returns the snapshot of the overlay
+    /// that was active at revoke time, or `None` when nothing active was present.
+    pub fn revoke_reality_write(&mut self) -> Option<RealityWriteGrantSnapshot> {
+        self.reality_write_grant
+            .take()
+            .filter(RealityWriteGrant::is_active)
+            .map(|grant| grant.snapshot())
+    }
+
+    /// Read-only snapshot of an active overlay for status readback (#1559).
+    /// Does not mutate; an expired overlay reports as `None`.
+    #[must_use]
+    pub fn reality_write_grant_snapshot(&self) -> Option<RealityWriteGrantSnapshot> {
+        self.reality_write_grant
+            .as_ref()
+            .filter(|grant| grant.is_active())
+            .map(RealityWriteGrant::snapshot)
     }
 
     pub fn ensure_profile_runtime(

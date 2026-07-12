@@ -21,6 +21,13 @@ const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<ses
 const TOOL_PROFILE_ROW_KIND: &str = "mcp_tool_profile";
 const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
+/// #1559: source of truth for the runtime reality-write opt-in overlay.
+const REALITY_WRITE_GRANT_SOURCE_OF_TRUTH: &str =
+    "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows";
+/// #1559: the misleading-contract fix, stated on every reality-write status and
+/// grant/revoke response so a facade profile is never mistaken for a grant.
+const PROFILE_INDEPENDENT_OF_GRANTS_NOTE: &str =
+    "the selected facade tool-visibility profile (e.g. full_capability) is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself; reality-write requires an explicit startup grant (SYNAPSE_MCP_ALLOWED_PERMISSIONS listing WRITE_STORAGE) or a runtime profile operation=grant_reality_write overlay";
 pub(crate) const PUBLIC_TOOL_LIMIT: usize = 40;
 const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
@@ -267,6 +274,24 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("CF_SESSIONS row readback + notifications/tools/list_changed attempt"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "hold the required lease/profile permission, provide reason/confirmation, then retry",
+            ),
+            op(
+                "grant_reality_write",
+                true,
+                false,
+                "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows",
+                Some("overlay status readback + CF_ACTION_LOG intent/final audit rows"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "own the foreground input lease (act operation=lease_acquire), then retry with confirm_break_glass=true and a non-empty reason",
+            ),
+            op(
+                "revoke_reality_write",
+                true,
+                false,
+                "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows",
+                Some("overlay status readback (cleared) + CF_ACTION_LOG intent/final audit rows"),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "provide an MCP session id; revoke is always permitted (de-escalation) and audited",
             ),
         ],
     ),
@@ -2540,6 +2565,37 @@ pub(crate) struct HiddenToolCapabilityRoute {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolProfileStatusResponse {
     pub snapshot: ToolProfileSnapshot,
+    /// #1559: effective M3 permission grants, their config source, and any
+    /// active runtime reality-write overlay — so the effective write posture is
+    /// coherent and `full_capability` is never mistaken for a write grant.
+    pub m3_permissions: M3PermissionStatus,
+}
+
+/// #1559: coherent effective-permission readback.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct M3PermissionStatus {
+    pub source_of_truth: &'static str,
+    /// The M3 grant names currently in effect at startup (e.g. READ_STORAGE).
+    pub effective_grant_names: Vec<String>,
+    /// Where those startup grants came from (env / CLI / fail-closed default).
+    pub config_source: &'static str,
+    /// True when a non-expired runtime reality-write overlay is active.
+    pub reality_write_overlay_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_write_overlay: Option<RealityWriteOverlayReadback>,
+    pub profile_independent_of_grants_note: &'static str,
+}
+
+/// #1559: serialized readback of the active runtime reality-write overlay.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RealityWriteOverlayReadback {
+    pub granted_by: String,
+    pub reason: String,
+    pub granted_at: String,
+    pub expires_at: String,
+    pub remaining_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -2558,6 +2614,13 @@ pub(crate) struct ToolProfileSetParams {
 pub(crate) enum ProfileOperation {
     Status,
     Set,
+    /// #1559: install the runtime reality-write opt-in overlay. Gated exactly
+    /// like an explicit break_glass escalation (confirm_break_glass + non-empty
+    /// reason + this session owns the foreground input lease).
+    GrantRealityWrite,
+    /// #1559: clear the runtime reality-write overlay, restoring the fail-closed
+    /// default. De-escalation, so it needs only an MCP session id (audited).
+    RevokeRealityWrite,
 }
 
 impl ProfileOperation {
@@ -2565,6 +2628,8 @@ impl ProfileOperation {
         match self {
             Self::Status => "status",
             Self::Set => "set",
+            Self::GrantRealityWrite => "grant_reality_write",
+            Self::RevokeRealityWrite => "revoke_reality_write",
         }
     }
 }
@@ -2597,6 +2662,38 @@ pub(crate) struct ProfileResponse {
     pub status: Option<ToolProfileStatusResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<ToolProfileSetResponse>,
+    /// #1559: grant/revoke result for the runtime reality-write overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_write: Option<RealityWriteGrantResponse>,
+}
+
+/// #1559: result of a `profile operation=grant_reality_write` /
+/// `revoke_reality_write` call. Carries the durable audit readbacks and the
+/// overlay's bounded-TTL expiry so the caller can prove the escalation happened
+/// and see exactly when it lapses.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RealityWriteGrantResponse {
+    pub operation: ProfileOperation,
+    pub source_of_truth: &'static str,
+    /// True when a runtime reality-write overlay is active after this call
+    /// (always false after revoke).
+    pub overlay_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_ms: Option<u64>,
+    pub ttl_seconds: u64,
+    pub lease_proof: ToolProfileLeaseProof,
+    pub intent_audit: ToolProfileAuditReadback,
+    pub final_audit: ToolProfileAuditReadback,
+    pub profile_independent_of_grants_note: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2625,7 +2722,7 @@ pub(crate) struct ToolProfileSetResponse {
 #[tool_router(router = tool_profile_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, and facade contract. operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease."
+        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, facade contract, and effective M3 permission grants (with config source + any active reality-write overlay). operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease. operation=grant_reality_write installs a bounded-TTL, audited, revocable reality-write opt-in overlay (gated exactly like break_glass: confirm_break_glass=true + non-empty reason + this session owns the foreground input lease); operation=revoke_reality_write clears it. The selected profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself."
     )]
     pub async fn profile(
         &self,
@@ -2645,6 +2742,7 @@ impl SynapseService {
                 source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
                 status: Some(self.tool_profile_status_response(&request_context)?),
                 set: None,
+                reality_write: None,
             })),
             ProfileOperation::Set => {
                 let profile = params.profile.ok_or_else(|| {
@@ -2671,6 +2769,49 @@ impl SynapseService {
                     source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
                     status: None,
                     set: Some(set),
+                    reality_write: None,
+                }))
+            }
+            ProfileOperation::GrantRealityWrite => {
+                let session_id = super::context::mcp_session_id_from_request_context(
+                    &request_context,
+                )?
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::HTTP_SESSION_INVALID,
+                        "profile operation=grant_reality_write requires an MCP session id so the escalation can be persisted",
+                    )
+                })?;
+                let reality_write = self.apply_reality_write_grant(
+                    &session_id,
+                    params.reason.as_deref(),
+                    params.confirm_break_glass,
+                )?;
+                Ok(Json(ProfileResponse {
+                    operation: ProfileOperation::GrantRealityWrite,
+                    source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+                    status: None,
+                    set: None,
+                    reality_write: Some(reality_write),
+                }))
+            }
+            ProfileOperation::RevokeRealityWrite => {
+                let session_id = super::context::mcp_session_id_from_request_context(
+                    &request_context,
+                )?
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::HTTP_SESSION_INVALID,
+                        "profile operation=revoke_reality_write requires an MCP session id so the revoke can be persisted",
+                    )
+                })?;
+                let reality_write = self.apply_reality_write_revoke(&session_id)?;
+                Ok(Json(ProfileResponse {
+                    operation: ProfileOperation::RevokeRealityWrite,
+                    source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+                    status: None,
+                    set: None,
+                    reality_write: Some(reality_write),
                 }))
             }
         }
@@ -2725,6 +2866,233 @@ impl SynapseService {
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         Ok(ToolProfileStatusResponse {
             snapshot: self.tool_profile_snapshot(session_id.as_deref())?,
+            m3_permissions: self.m3_permission_status()?,
+        })
+    }
+
+    /// #1559: coherent effective-permission readback drawn from live M3State —
+    /// startup grants + config source + any active runtime reality-write overlay.
+    pub(super) fn m3_permission_status(&self) -> Result<M3PermissionStatus, ErrorData> {
+        let mut state = self.m3_state.lock().map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "M3 service state lock poisoned while reading permission status",
+            )
+        })?;
+        // Consult (and lazily clear any expired) overlay so the readback matches
+        // exactly what enforcement would decide right now.
+        let overlay_active = state.reality_write_grant_active();
+        let overlay = state.reality_write_grant_snapshot().map(|snapshot| {
+            RealityWriteOverlayReadback {
+                granted_by: snapshot.granted_by,
+                reason: snapshot.reason,
+                granted_at: snapshot.granted_at.to_rfc3339(),
+                expires_at: snapshot.expires_at.to_rfc3339(),
+                remaining_ms: snapshot.remaining_ms,
+            }
+        });
+        let effective_grant_names = state
+            .permission_grants
+            .names()
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        let config_source = state.permission_grants_source;
+        drop(state);
+        Ok(M3PermissionStatus {
+            source_of_truth:
+                "M3State.permission_grants (startup) + in-memory reality_write_grant overlay",
+            effective_grant_names,
+            config_source,
+            reality_write_overlay_active: overlay_active,
+            reality_write_overlay: overlay,
+            profile_independent_of_grants_note: PROFILE_INDEPENDENT_OF_GRANTS_NOTE,
+        })
+    }
+
+    /// #1559: install the runtime reality-write opt-in overlay for a session.
+    /// Gated exactly like an explicit break_glass escalation (confirm + non-empty
+    /// reason + this session owns the foreground input lease) and audited to
+    /// CF_ACTION_LOG (intent + final). Fail-closed: any unmet gate denies and the
+    /// overlay is never installed. Takes `session_id` directly so the facade
+    /// handler and unit tests share one gated path.
+    pub(super) fn apply_reality_write_grant(
+        &self,
+        session_id: &str,
+        reason: Option<&str>,
+        confirm_break_glass: bool,
+    ) -> Result<RealityWriteGrantResponse, ErrorData> {
+        let reason = normalize_reason(reason)?;
+        let lease_proof = break_glass_lease_proof(session_id, ToolProfileKind::BreakGlass);
+        let command_payload = json!({
+            "operation": "grant_reality_write",
+            "reason": reason,
+            "confirm_break_glass": confirm_break_glass,
+        });
+        let command_before = json!({
+            "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+            "lease_proof": lease_proof,
+        });
+        let intent_audit = audit_readback(self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                "profile",
+                "grant_reality_write",
+                Some(session_id.to_owned()),
+                Some(session_id.to_owned()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            ),
+        )?);
+
+        if let Err(error) =
+            validate_reality_write_grant_gate(session_id, reason.as_deref(), confirm_break_glass, &lease_proof)
+        {
+            let final_audit = self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "profile",
+                    "grant_reality_write",
+                    Some(session_id.to_owned()),
+                    Some(session_id.to_owned()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+                        "overlay_active": false,
+                        "lease_proof": lease_proof,
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(&error)),
+            )?;
+            let _final_audit = audit_readback(final_audit);
+            return Err(error);
+        }
+
+        let snapshot = {
+            let mut state = self.m3_state.lock().map_err(|_err| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "M3 service state lock poisoned while granting reality-write overlay",
+                )
+            })?;
+            state.grant_reality_write(session_id.to_owned(), reason.clone().unwrap_or_default())
+        };
+        tracing::warn!(
+            code = "REALITY_WRITE_GRANTED",
+            session_id = %session_id,
+            reason = reason.as_deref().unwrap_or(""),
+            expires_at = %snapshot.expires_at.to_rfc3339(),
+            ttl_seconds = crate::m3::REALITY_WRITE_GRANT_MAX_TTL.as_secs(),
+            "runtime reality-write overlay granted (#1559)"
+        );
+        let final_audit = audit_readback(self.command_audit_final(
+            super::command_audit::CommandAuditInput::mcp(
+                "profile",
+                "grant_reality_write",
+                Some(session_id.to_owned()),
+                Some(session_id.to_owned()),
+                command_payload,
+                command_before,
+                json!({
+                    "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+                    "overlay_active": true,
+                    "granted_by": session_id,
+                    "expires_at": snapshot.expires_at.to_rfc3339(),
+                    "remaining_ms": snapshot.remaining_ms,
+                    "lease_proof": lease_proof,
+                }),
+                "ok",
+            ),
+        )?);
+
+        Ok(RealityWriteGrantResponse {
+            operation: ProfileOperation::GrantRealityWrite,
+            source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+            overlay_active: true,
+            granted_by: Some(session_id.to_owned()),
+            reason,
+            granted_at: Some(snapshot.granted_at.to_rfc3339()),
+            expires_at: Some(snapshot.expires_at.to_rfc3339()),
+            remaining_ms: Some(snapshot.remaining_ms),
+            ttl_seconds: crate::m3::REALITY_WRITE_GRANT_MAX_TTL.as_secs(),
+            lease_proof,
+            intent_audit,
+            final_audit,
+            profile_independent_of_grants_note: PROFILE_INDEPENDENT_OF_GRANTS_NOTE,
+        })
+    }
+
+    /// #1559: clear the runtime reality-write overlay for a session, restoring
+    /// the fail-closed default with no residue. De-escalation, so it needs only
+    /// an MCP session id; still audited to CF_ACTION_LOG.
+    pub(super) fn apply_reality_write_revoke(
+        &self,
+        session_id: &str,
+    ) -> Result<RealityWriteGrantResponse, ErrorData> {
+        let lease_proof = break_glass_lease_proof(session_id, ToolProfileKind::BreakGlass);
+        let command_payload = json!({ "operation": "revoke_reality_write" });
+        let command_before = json!({ "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH });
+        let intent_audit = audit_readback(self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                "profile",
+                "revoke_reality_write",
+                Some(session_id.to_owned()),
+                Some(session_id.to_owned()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            ),
+        )?);
+
+        let revoked = {
+            let mut state = self.m3_state.lock().map_err(|_err| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "M3 service state lock poisoned while revoking reality-write overlay",
+                )
+            })?;
+            state.revoke_reality_write()
+        };
+        tracing::warn!(
+            code = "REALITY_WRITE_REVOKED",
+            session_id = %session_id,
+            was_active = revoked.is_some(),
+            "runtime reality-write overlay revoked (#1559)"
+        );
+        let final_audit = audit_readback(self.command_audit_final(
+            super::command_audit::CommandAuditInput::mcp(
+                "profile",
+                "revoke_reality_write",
+                Some(session_id.to_owned()),
+                Some(session_id.to_owned()),
+                command_payload,
+                command_before,
+                json!({
+                    "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+                    "overlay_active": false,
+                    "was_active": revoked.is_some(),
+                }),
+                "ok",
+            ),
+        )?);
+
+        Ok(RealityWriteGrantResponse {
+            operation: ProfileOperation::RevokeRealityWrite,
+            source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
+            overlay_active: false,
+            granted_by: revoked.as_ref().map(|snapshot| snapshot.granted_by.clone()),
+            reason: revoked.as_ref().map(|snapshot| snapshot.reason.clone()),
+            granted_at: None,
+            expires_at: None,
+            remaining_ms: None,
+            ttl_seconds: 0,
+            lease_proof,
+            intent_audit,
+            final_audit,
+            profile_independent_of_grants_note: PROFILE_INDEPENDENT_OF_GRANTS_NOTE,
         })
     }
 
@@ -3297,6 +3665,47 @@ fn validate_profile_set_policy(
                 "profile": profile.as_str(),
                 "lease_proof": lease_proof,
                 "resolution": "call act operation=lease_acquire first, then retry profile operation=set or tool_profile_set with confirm_break_glass=true and a reason",
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// #1559: gate for `profile operation=grant_reality_write`. Requires the exact
+/// strictest existing escalation posture — explicit operator confirmation
+/// (`confirm_break_glass=true`), a non-empty reason, and that THIS session owns
+/// the foreground input lease (matching full_capability/break_glass). Fail-closed:
+/// any unmet gate returns an error and the caller never installs the overlay.
+fn validate_reality_write_grant_gate(
+    session_id: &str,
+    reason: Option<&str>,
+    confirm_break_glass: bool,
+    lease_proof: &ToolProfileLeaseProof,
+) -> Result<(), ErrorData> {
+    if !confirm_break_glass {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "profile operation=grant_reality_write requires confirm_break_glass=true",
+        ));
+    }
+    if reason.is_none_or(str::is_empty) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "profile operation=grant_reality_write requires a non-empty reason",
+        ));
+    }
+    if !lease_proof.caller_is_owner {
+        return Err(ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "profile operation=grant_reality_write requires this MCP session to own the foreground input lease; current owner={:?}",
+                lease_proof.owner_session_id
+            ),
+            Some(json!({
+                "code": error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
+                "session_id": session_id,
+                "lease_proof": lease_proof,
+                "resolution": "call act operation=lease_acquire first, then retry profile operation=grant_reality_write with confirm_break_glass=true and a non-empty reason",
             })),
         ));
     }
@@ -6094,6 +6503,49 @@ mod tests {
             &proof,
         )
         .expect("owned lease proof should allow break-glass");
+    }
+
+    #[test]
+    fn reality_write_grant_gate_requires_confirm_reason_and_lease() {
+        // #1559: gated exactly like break_glass — confirm + reason + owned lease.
+        let unowned = ToolProfileLeaseProof {
+            required: true,
+            held: false,
+            owner_session_id: None,
+            caller_is_owner: false,
+            expires_in_ms: None,
+        };
+        // Missing confirm.
+        assert!(
+            validate_reality_write_grant_gate("s1", Some("need reality write"), false, &unowned)
+                .is_err()
+        );
+        // Missing reason.
+        assert!(validate_reality_write_grant_gate("s1", None, true, &unowned).is_err());
+        // Missing lease ownership.
+        let lease_err =
+            validate_reality_write_grant_gate("s1", Some("need reality write"), true, &unowned)
+                .expect_err("grant without owned lease must be rejected");
+        assert_eq!(
+            lease_err
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD)
+        );
+
+        // All three satisfied → accepted.
+        let owned = ToolProfileLeaseProof {
+            required: true,
+            held: true,
+            owner_session_id: Some("s1".to_owned()),
+            caller_is_owner: true,
+            expires_in_ms: Some(10_000),
+        };
+        validate_reality_write_grant_gate("s1", Some("need reality write"), true, &owned)
+            .expect("confirm+reason+owned-lease should pass the reality-write grant gate");
+        println!("readback=gate reality_write_grant confirm+reason+lease accepted");
     }
 
     #[test]

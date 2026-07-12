@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rmcp::{ErrorData, schemars::JsonSchema};
+use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -463,7 +463,7 @@ impl SynapseService {
             force_new_epoch = params.0.force_new_epoch,
             "tool.invocation kind=reality_baseline"
         );
-        self.require_m3_permissions(REALITY_BASELINE_TOOL, &required_reality_write_permissions())?;
+        self.require_reality_write_permissions(REALITY_BASELINE_TOOL)?;
         let response = self.capture_or_read_reality_baseline(&params.0)?;
         Ok(Json(response))
     }
@@ -482,7 +482,7 @@ impl SynapseService {
             since_seq = ?params.0.since_seq,
             "tool.invocation kind=observe_delta"
         );
-        self.require_m3_permissions(OBSERVE_DELTA_TOOL, &required_reality_write_permissions())?;
+        self.require_reality_write_permissions(OBSERVE_DELTA_TOOL)?;
         let response = self.observe_reality_delta(params.0)?;
         Ok(Json(response))
     }
@@ -501,13 +501,68 @@ impl SynapseService {
             assumption_hash = ?params.0.assumption_hash,
             "tool.invocation kind=reality_audit"
         );
-        self.require_m3_permissions(REALITY_AUDIT_TOOL, &required_reality_write_permissions())?;
+        self.require_reality_write_permissions(REALITY_AUDIT_TOOL)?;
         let response = self.audit_reality(&params.0)?;
         Ok(Json(response))
     }
 }
 
 impl SynapseService {
+    /// Reality-write permission gate (#1559). Passes when EITHER the startup M3
+    /// grants already include the reality-write set OR a non-expired runtime
+    /// `reality_write_grant` overlay is active. The overlay is scoped to exactly
+    /// the reality-write permission set and is consulted ONLY here, so it never
+    /// widens authority for any other tool. The generic `require_m3_permissions`
+    /// path is unchanged for every non-reality tool. Fail-closed: any lock
+    /// failure or unmet permission denies.
+    pub(super) fn require_reality_write_permissions(
+        &self,
+        tool: &'static str,
+    ) -> Result<(), ErrorData> {
+        let required = required_reality_write_permissions();
+        let mut state = self.m3_state.lock().map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "M3 service state lock poisoned",
+            )
+        })?;
+        // Active runtime overlay satisfies the whole reality-write set. This
+        // check also clears an expired overlay so refusal is restored cleanly.
+        if state.reality_write_grant_active() {
+            let remaining_ms = state
+                .reality_write_grant_snapshot()
+                .map(|snapshot| snapshot.remaining_ms);
+            drop(state);
+            tracing::info!(
+                code = "REALITY_WRITE_OVERLAY_ALLOWED",
+                tool,
+                remaining_ms = ?remaining_ms,
+                "reality-write permitted via active runtime overlay (#1559)"
+            );
+            return Ok(());
+        }
+        let missing = state.permission_grants.first_missing(&required);
+        let config_source = state.permission_grants_source;
+        let effective_grants = state.permission_grants.names().join(", ");
+        drop(state);
+        if let Some(missing) = missing {
+            tracing::warn!(
+                code = error_codes::SAFETY_PERMISSION_DENIED,
+                tool,
+                missing_permission = missing.as_str(),
+                config_source,
+                "reality-write denied: no startup grant and no active runtime overlay (#1559)"
+            );
+            return Err(reality_write_authorization_error(
+                tool,
+                missing,
+                config_source,
+                &effective_grants,
+            ));
+        }
+        Ok(())
+    }
+
     fn capture_or_read_reality_baseline(
         &self,
         params: &RealityBaselineParams,
@@ -3359,12 +3414,42 @@ fn json_pointer_segment(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
-fn required_reality_write_permissions() -> RequiredPermissions {
+pub(super) fn required_reality_write_permissions() -> RequiredPermissions {
     required([
         Permission::ReadStorage,
         Permission::WriteStorage,
         Permission::ReadEvents,
     ])
+}
+
+/// Actionable `SAFETY_PERMISSION_DENIED` for reality-write tools (#1559). Names
+/// the EXACT supported opt-ins — the startup `SYNAPSE_MCP_ALLOWED_PERMISSIONS`
+/// config (must list `WRITE_STORAGE`) and the runtime
+/// `profile operation=grant_reality_write` overlay — plus the config source
+/// currently in effect, and states that the `full_capability` facade profile is
+/// independent of M3 grants. Fail-closed: this is only ever built on a denial.
+fn reality_write_authorization_error(
+    tool: &str,
+    missing: Permission,
+    config_source: &str,
+    effective_grants: &str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("tool {tool} requires permission {missing}"),
+        Some(json!({
+            "code": error_codes::SAFETY_PERMISSION_DENIED,
+            "tool": tool,
+            "missing_permission": missing.as_str(),
+            "effective_m3_grants": effective_grants,
+            "config_source": config_source,
+            "remediation": {
+                "startup_opt_in": "set SYNAPSE_MCP_ALLOWED_PERMISSIONS (env) or --allowed-permissions (CLI) to a list that includes WRITE_STORAGE (e.g. \"READ_STORAGE WRITE_STORAGE READ_EVENTS\") and restart the daemon",
+                "runtime_opt_in": "acquire the foreground input lease (act operation=lease_acquire), then call profile operation=grant_reality_write with confirm_break_glass=true and a non-empty reason; the grant is bounded-TTL, audited, and revocable via profile operation=revoke_reality_write",
+                "facade_profile_note": "the full_capability tool-visibility profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself",
+            },
+        })),
+    )
 }
 
 const fn default_false() -> bool {
@@ -4609,11 +4694,305 @@ mod tests {
         Ok(())
     }
 
+    // ---- #1559: runtime reality-write opt-in overlay, end-to-end ----
+
+    /// DENIED under the fail-closed read-only default: accurate missing
+    /// WRITE_STORAGE + actionable remediation naming both opt-ins.
+    #[tokio::test]
+    async fn reality_write_denied_under_default_read_only_grants() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_default_read_only_grants(temp.path())?;
+        install_synthetic_input(&service, synthetic_input("Window A"))?;
+
+        // Before: no runtime overlay, read-only startup grants.
+        let status_before = service.m3_permission_status()?;
+        println!(
+            "readback=deny before overlay_active={} grants={:?} source={}",
+            status_before.reality_write_overlay_active,
+            status_before.effective_grant_names,
+            status_before.config_source
+        );
+        assert!(!status_before.reality_write_overlay_active);
+
+        let error = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("epoch-deny".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await
+            .map(|_| ())
+            .expect_err("reality_baseline must be denied under read-only default grants");
+        let data = error.data.as_ref().expect("denial carries structured data");
+        println!(
+            "readback=deny code={:?} missing={:?} remediation_present={}",
+            data.get("code"),
+            data.get("missing_permission"),
+            data.get("remediation").is_some()
+        );
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::SAFETY_PERMISSION_DENIED)
+        );
+        assert_eq!(
+            data.get("missing_permission").and_then(Value::as_str),
+            Some("WRITE_STORAGE")
+        );
+        let remediation = data
+            .get("remediation")
+            .expect("remediation names the exact opt-ins");
+        assert!(
+            remediation
+                .get("startup_opt_in")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("WRITE_STORAGE"))
+        );
+        assert!(
+            remediation
+                .get("runtime_opt_in")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("grant_reality_write"))
+        );
+        Ok(())
+    }
+
+    /// End-to-end: with confirm+reason+lease satisfied the runtime GRANT enables
+    /// reality_baseline, which PERSISTS a physical CF_KV row (source of truth);
+    /// REVOKE then restores refusal with no residue.
+    #[tokio::test]
+    async fn reality_write_overlay_grant_enables_baseline_then_revoke_restores_refusal()
+    -> anyhow::Result<()> {
+        let _serial = crate::test_support::lease_serial("reality_write_grant_e2e");
+        let temp = TempDir::new()?;
+        let service = service_with_default_read_only_grants(temp.path())?;
+        install_synthetic_input(&service, synthetic_input("Window A"))?;
+        let session_id = "reality-write-grant-e2e-session";
+
+        // Physical source-of-truth read BEFORE: no head row persisted yet.
+        assert!(
+            service.read_reality_head("synthetic")?.is_none(),
+            "no reality head row should exist before any baseline"
+        );
+
+        // Grant gate satisfied: own the lease, confirm=true, non-empty reason.
+        let ttl = synapse_action::lease::ttl_from_ms(120_000);
+        assert!(
+            matches!(
+                synapse_action::lease::try_acquire(session_id, ttl),
+                synapse_action::lease::LeaseOutcome::Acquired(_)
+            ),
+            "serialized test must acquire the foreground lease"
+        );
+        let grant =
+            service.apply_reality_write_grant(session_id, Some("e2e reality write"), true)?;
+        println!(
+            "readback=grant overlay_active={} remaining_ms={:?} expires_at={:?}",
+            grant.overlay_active, grant.remaining_ms, grant.expires_at
+        );
+        assert!(grant.overlay_active);
+        assert_eq!(grant.granted_by.as_deref(), Some(session_id));
+
+        // With the overlay active, reality_baseline SUCCEEDS...
+        let baseline = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("epoch-grant".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await?;
+        assert!(baseline.0.created);
+
+        // ...and PERSISTS a physical CF_KV head row (source of truth, not the
+        // return value).
+        let head = service
+            .read_reality_head("synthetic")?
+            .expect("reality head row must be physically persisted after a granted baseline");
+        println!(
+            "readback=persist head_epoch={} head_seq={}",
+            head.epoch_id, head.head_seq
+        );
+        assert_eq!(head.epoch_id, "epoch-grant");
+
+        // REVOKE clears the overlay with no residue.
+        let revoke = service.apply_reality_write_revoke(session_id)?;
+        println!(
+            "readback=revoke overlay_active={} was_granted_by={:?}",
+            revoke.overlay_active, revoke.granted_by
+        );
+        assert!(!revoke.overlay_active);
+        let _ = synapse_action::lease::release(session_id);
+
+        // Refusal restored: reality_baseline denied again.
+        let error = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("epoch-after-revoke".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await
+            .map(|_| ())
+            .expect_err("reality_baseline must be denied again after revoke");
+        println!(
+            "readback=post_revoke_deny code={:?}",
+            error.data.as_ref().and_then(|data| data.get("code"))
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::SAFETY_PERMISSION_DENIED)
+        );
+        Ok(())
+    }
+
+    /// Fail-closed: the grant is rejected when confirm, reason, OR lease
+    /// ownership is missing — the overlay is never installed.
+    #[tokio::test]
+    async fn reality_write_grant_rejected_without_confirm_reason_or_lease() -> anyhow::Result<()> {
+        let _serial = crate::test_support::lease_serial("reality_write_grant_reject");
+        let temp = TempDir::new()?;
+        let service = service_with_default_read_only_grants(temp.path())?;
+        let session_id = "reality-write-grant-reject-session";
+
+        // Missing confirm (checked before lease → deterministic).
+        let no_confirm = service
+            .apply_reality_write_grant(session_id, Some("reason"), false)
+            .expect_err("grant without confirm must be rejected");
+        println!(
+            "readback=reject_no_confirm code={:?}",
+            no_confirm.data.as_ref().and_then(|data| data.get("code"))
+        );
+
+        // Missing reason (confirm=true, reason=None).
+        let no_reason = service
+            .apply_reality_write_grant(session_id, None, true)
+            .expect_err("grant without reason must be rejected");
+        println!(
+            "readback=reject_no_reason code={:?}",
+            no_reason.data.as_ref().and_then(|data| data.get("code"))
+        );
+
+        // Missing lease (confirm+reason present, but this session owns no lease).
+        let no_lease = service
+            .apply_reality_write_grant(session_id, Some("reason"), true)
+            .expect_err("grant without foreground lease must be rejected");
+        assert_eq!(
+            no_lease
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD)
+        );
+        println!(
+            "readback=reject_no_lease code={:?}",
+            no_lease.data.as_ref().and_then(|data| data.get("code"))
+        );
+
+        // No residue: overlay never became active.
+        assert!(!service.m3_permission_status()?.reality_write_overlay_active);
+        Ok(())
+    }
+
+    /// Status reports effective grants + config source + active overlay + the
+    /// explicit profile!=grant note.
+    #[tokio::test]
+    async fn reality_write_status_reports_grants_source_overlay_and_profile_note()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_default_read_only_grants(temp.path())?;
+
+        let before = service.m3_permission_status()?;
+        println!(
+            "readback=status_before grants={:?} source={} overlay_active={} note_present={}",
+            before.effective_grant_names,
+            before.config_source,
+            before.reality_write_overlay_active,
+            !before.profile_independent_of_grants_note.is_empty()
+        );
+        assert!(
+            before
+                .effective_grant_names
+                .iter()
+                .any(|name| name == "READ_STORAGE")
+        );
+        assert!(
+            !before
+                .effective_grant_names
+                .iter()
+                .any(|name| name == "WRITE_STORAGE")
+        );
+        assert!(before.config_source.contains("default"));
+        assert!(!before.reality_write_overlay_active);
+        assert!(
+            before
+                .profile_independent_of_grants_note
+                .contains("INDEPENDENT")
+        );
+
+        // Install the overlay directly (real M3State) and confirm status flips.
+        {
+            let handle = service.m3_state_handle();
+            let mut state = handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("M3 state lock poisoned"))?;
+            state.grant_reality_write("status-session".to_owned(), "status test".to_owned());
+        }
+        let after = service.m3_permission_status()?;
+        let overlay = after
+            .reality_write_overlay
+            .as_ref()
+            .expect("active overlay is reported");
+        println!(
+            "readback=status_after overlay_active={} granted_by={} remaining_ms={} expires_at={}",
+            after.reality_write_overlay_active,
+            overlay.granted_by,
+            overlay.remaining_ms,
+            overlay.expires_at
+        );
+        assert!(after.reality_write_overlay_active);
+        assert_eq!(overlay.granted_by, "status-session");
+        Ok(())
+    }
+
     fn service_with_db(path: &Path) -> anyhow::Result<SynapseService> {
         service_with_profile_dir(path, path)
     }
 
     fn service_with_profile_dir(path: &Path, profile_dir: &Path) -> anyhow::Result<SynapseService> {
+        // #1559: reality tools legitimately require the reality-write permission
+        // set. Grant it the real way (explicit startup allowed_permissions),
+        // never by weakening the enforcement check.
+        service_with_allowed_permissions(
+            path,
+            profile_dir,
+            Some("READ_STORAGE WRITE_STORAGE READ_EVENTS".to_owned()),
+        )
+    }
+
+    /// A reality service whose startup grants are the fail-closed read-only
+    /// default (no WRITE_STORAGE), used to prove the runtime opt-in end-to-end
+    /// (#1559).
+    fn service_with_default_read_only_grants(path: &Path) -> anyhow::Result<SynapseService> {
+        service_with_allowed_permissions(path, path, None)
+    }
+
+    fn service_with_allowed_permissions(
+        path: &Path,
+        profile_dir: &Path,
+        allowed_permissions: Option<String>,
+    ) -> anyhow::Result<SynapseService> {
         SynapseService::try_with_m2_shutdown_reason_and_m3_config(
             CancellationToken::new(),
             "test",
@@ -4628,7 +5007,7 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("max subscriptions must be nonzero"))?,
                 false,
                 true,
-                None,
+                allowed_permissions,
                 false,
                 None,
             ),
