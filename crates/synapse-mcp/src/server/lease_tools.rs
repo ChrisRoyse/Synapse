@@ -21,7 +21,7 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_action::{LeaseOutcome, LeaseStatus, lease};
+use synapse_action::{LeaseError, LeaseOutcome, LeaseStatus, lease};
 use synapse_core::error_codes;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -58,7 +58,9 @@ const fn default_lease_ttl_ms() -> u64 {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLeaseResponse {
-    /// One of: `acquired`, `renewed`, `released`, `status`.
+    /// One of: `acquired`, `renewed`, `released`, `not_held`, `status`.
+    /// `not_held` is an idempotent release of a lease this session did not
+    /// hold (already expired or never acquired) — a success, not a failure.
     pub outcome: String,
     /// Whether the lease is currently held by anyone.
     pub held: bool,
@@ -68,6 +70,15 @@ pub struct ControlLeaseResponse {
     pub this_session_id: String,
     /// Whether the calling session is the current holder.
     pub is_owner: bool,
+    /// Release outcomes only (#1556): whether this call actually released a
+    /// lease. `false` on an idempotent no-op release of an unheld lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<bool>,
+    /// Release outcomes only (#1556): whether a lease owned by this session was
+    /// held at release time. `false` when the lease had already expired or was
+    /// never acquired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_held: Option<bool>,
     pub acquired_at_ms_ago: Option<u64>,
     pub renewed_at_ms_ago: Option<u64>,
     pub ttl_ms: Option<u64>,
@@ -109,11 +120,31 @@ impl ControlLeaseResponse {
             owner_session_id: status.owner_session_id.clone(),
             this_session_id,
             is_owner,
+            released: None,
+            was_held: None,
             acquired_at_ms_ago: status.acquired_at_ms_ago,
             renewed_at_ms_ago: status.renewed_at_ms_ago,
             ttl_ms: status.ttl_ms,
             expires_in_ms: status.expires_in_ms,
         }
+    }
+
+    /// Readback for a release that actually freed a lease this session held.
+    fn released(this_session_id: String, status: &LeaseStatus) -> Self {
+        let mut response = Self::from_status("released", this_session_id, status);
+        response.released = Some(true);
+        response.was_held = Some(true);
+        response
+    }
+
+    /// Readback for an idempotent no-op release (#1556): the session held no
+    /// lease (already expired or never acquired), so nothing was freed. The
+    /// physical truth — lease unheld, nobody owns it — is stated explicitly.
+    fn release_noop(this_session_id: String) -> Self {
+        let mut response = Self::from_status("not_held", this_session_id, &LeaseStatus::unheld());
+        response.released = Some(false);
+        response.was_held = Some(false);
+        response
     }
 }
 
@@ -278,7 +309,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Release the input lease held by this MCP session. Errors with ACTION_FOREGROUND_LEASE_NOT_HELD if this session is not the current holder.",
+        description = "Release the input lease held by this MCP session. Idempotent: releasing a lease this session does not hold (already expired or never acquired) succeeds with outcome=not_held (released=false, was_held=false), not an error. Errors with ACTION_FOREGROUND_LEASE_NOT_HELD only when the lease is currently held by a DIFFERENT session.",
         input_schema = empty_input_schema()
     )]
     pub async fn control_lease_release(
@@ -687,13 +718,29 @@ fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, E
                 session_id = %session_id,
                 "readback=input_lease outcome=released"
             );
-            Ok(ControlLeaseResponse::from_status(
-                "released",
-                session_id.to_owned(),
-                &status,
-            ))
+            Ok(ControlLeaseResponse::released(session_id.to_owned(), &status))
         }
-        Err(error) => Err(lease_not_held_error(session_id, &error)),
+        Err(error) => match &error {
+            // #1556: releasing an unheld/expired lease is the *expected* end
+            // state of a correct short-TTL client whose happy path outlived the
+            // lease (TTL max 30s). Make it idempotent: success with a physically
+            // honest readback (released=false, was_held=false, holder=null). The
+            // caller still audits it. Erroring here trained callers to swallow
+            // release errors, which masked the one case that matters below.
+            LeaseError::NotHeld { holder: None, .. } => {
+                tracing::info!(
+                    code = "INPUT_LEASE_RELEASE_NOOP",
+                    session_id = %session_id,
+                    "readback=input_lease outcome=not_held released=false was_held=false"
+                );
+                Ok(ControlLeaseResponse::release_noop(session_id.to_owned()))
+            }
+            // Held by a DIFFERENT live session — a real caller bug (releasing
+            // someone else's lease). Keep the hard fail-closed error.
+            LeaseError::NotHeld { holder: Some(_), .. } => {
+                Err(lease_not_held_error(session_id, &error))
+            }
+        },
     }
 }
 
@@ -1452,6 +1499,67 @@ mod tests {
         );
         // Owner's lease survives the intruder's failed release.
         assert!(lease_status_for_session(owner).is_owner);
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn release_when_unheld_is_idempotent_success() -> anyhow::Result<()> {
+        // #1556: no lease is held; releasing must succeed as a no-op with a
+        // physically honest readback, not ACTION_FOREGROUND_LEASE_NOT_HELD.
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        test_support::reset_lease(TEST_RESET_REASON);
+        let session = "fsv-tool-idempotent-release";
+
+        let response = release_lease_for_session(session)
+            .map_err(|error| anyhow::anyhow!("unheld release must succeed: {error:?}"))?;
+
+        assert_eq!(response.outcome, "not_held");
+        assert_eq!(response.released, Some(false));
+        assert_eq!(response.was_held, Some(false));
+        assert!(!response.held);
+        assert_eq!(response.owner_session_id, None);
+        println!(
+            "readback=input_lease step=idempotent_release outcome={} released={:?} was_held={:?} held={}",
+            response.outcome, response.released, response.was_held, response.held
+        );
+        test_support::reset_lease(TEST_RESET_REASON);
+        Ok(())
+    }
+
+    #[test]
+    fn release_after_own_lease_expired_is_idempotent_success() -> anyhow::Result<()> {
+        // #1556: the common real case — a short-TTL client whose happy path
+        // outlived its lease. `ttl_from_ms` clamps the requested TTL up to
+        // MIN_LEASE_TTL_MS (100ms), so the sleep must exceed that floor for the
+        // lease to *genuinely* lapse; a shorter sleep leaves it live and would
+        // silently test the wrong path (release of a still-owned lease).
+        let _serial = test_support::lease_serial(TEST_RESET_REASON);
+        test_support::reset_lease(TEST_RESET_REASON);
+        let session = "fsv-tool-expired-release";
+        let _held = acquire_lease_for_session(session, 1)
+            .map_err(|error| anyhow::anyhow!("acquire failed: {error:?}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            synapse_action::MIN_LEASE_TTL_MS + 50,
+        ));
+
+        let response = release_lease_for_session(session)
+            .map_err(|error| anyhow::anyhow!("expired-lease release must succeed: {error:?}"))?;
+
+        // release() reaps the lapsed grant (expire_if_lapsed) *before* the owner
+        // check, so nothing remains to free: the honest readback is a no-op
+        // (not_held / released=false / was_held=false / no owner) — and crucially
+        // still a SUCCESS, never the ACTION_FOREGROUND_LEASE_NOT_HELD error that
+        // #1556 measured on ~45% of real release calls.
+        assert_eq!(response.outcome, "not_held");
+        assert_eq!(response.released, Some(false));
+        assert_eq!(response.was_held, Some(false));
+        assert!(!response.held);
+        assert_eq!(response.owner_session_id, None);
+        println!(
+            "readback=input_lease step=expired_owner_release outcome={} released={:?} was_held={:?} held={}",
+            response.outcome, response.released, response.was_held, response.held
+        );
         test_support::reset_lease(TEST_RESET_REASON);
         Ok(())
     }
