@@ -1052,6 +1052,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::STORAGE_WRITE_FAILED,
                 "read the row version or corrupt hash, pass the matching guard, then verify the row is absent",
             ),
+            op(
+                "wait",
+                false,
+                false,
+                "CF_KV workspace-blackboard exact row polled until present or timeout",
+                None,
+                "WORKSPACE_WAIT_TIMEOUT",
+                "increase timeout_ms or ensure a peer publishes the key with workspace put",
+            ),
         ],
     ),
     facade_contract(

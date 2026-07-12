@@ -43,7 +43,24 @@ const MAX_ARTIFACT_HANDLE_CHARS: usize = 1024;
 const MAX_ARTIFACT_TEXT_CHARS: usize = 512;
 const WORKSPACE_TOOL: &str = "workspace";
 const WORKSPACE_KEY_ABSENT: &str = "WORKSPACE_KEY_ABSENT";
+/// Detail/error code returned when a blocking `wait` reaches its deadline before
+/// the key becomes present. Mirrors the `WORKSPACE_KEY_ABSENT` convention: a
+/// workspace-local structured code string (not a `synapse_core::error_codes`
+/// entry) so callers can branch on an expected, typed timeout rather than a
+/// generic storage failure (#1552).
+const WORKSPACE_WAIT_TIMEOUT: &str = "WORKSPACE_WAIT_TIMEOUT";
 const WORKSPACE_SOURCE_OF_TRUTH: &str = "CF_KV workspace-blackboard exact row";
+/// Default blocking budget for `wait` when the caller omits `timeout_ms`.
+const DEFAULT_WORKSPACE_WAIT_TIMEOUT_MS: u64 = 5_000;
+/// Lower/upper bounds for the `wait` blocking budget. `wait` blocks a request
+/// thread with a bounded poll loop, so the ceiling is deliberately small; values
+/// outside the range fail closed (rejected, never silently clamped).
+const MIN_WORKSPACE_WAIT_TIMEOUT_MS: u64 = 1;
+const MAX_WORKSPACE_WAIT_TIMEOUT_MS: u64 = 60_000;
+/// Default and bounds for the `wait` poll cadence against CF_KV.
+const DEFAULT_WORKSPACE_WAIT_POLL_INTERVAL_MS: u64 = 50;
+const MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS: u64 = 1;
+const MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS: u64 = 5_000;
 
 static NEXT_WORKSPACE_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static WORKSPACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -57,6 +74,7 @@ pub enum WorkspaceOperation {
     Subscribe,
     Exists,
     Delete,
+    Wait,
 }
 
 impl WorkspaceOperation {
@@ -68,6 +86,7 @@ impl WorkspaceOperation {
             Self::Subscribe => "subscribe",
             Self::Exists => "exists",
             Self::Delete => "delete",
+            Self::Wait => "wait",
         }
     }
 }
@@ -88,6 +107,8 @@ pub struct WorkspaceParams {
     pub exists: Option<WorkspaceExistsParams>,
     #[serde(default)]
     pub delete: Option<WorkspaceDeleteParams>,
+    #[serde(default)]
+    pub wait: Option<WorkspaceWaitParams>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -124,6 +145,42 @@ pub struct WorkspaceGetParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub key: String,
+    /// When true, an absent (or expired) key is a SUCCESS with `found=false` and
+    /// an `absent_readback` proof from CF_KV, instead of the fail-closed
+    /// `WORKSPACE_KEY_ABSENT` error. Expected-absence polling (a peer will write
+    /// the key later) is a normal outcome, not a failure (#1552). Defaults to
+    /// false, preserving the historical fail-closed behavior exactly.
+    #[serde(default = "default_false")]
+    #[schemars(default = "default_false")]
+    pub absent_ok: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWaitParams {
+    /// Optional logical run id. Defaults to the current daemon lifecycle run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Structured key to block on until a peer publishes it via workspace put.
+    pub key: String,
+    /// Bounded blocking budget in milliseconds. CF_KV is polled until the key is
+    /// present or this deadline elapses. Out-of-range values fail closed with a
+    /// structured TOOL_PARAMS_INVALID error rather than being clamped.
+    #[serde(default = "default_workspace_wait_timeout_ms")]
+    #[schemars(
+        default = "default_workspace_wait_timeout_ms",
+        range(min = 1, max = 60_000)
+    )]
+    pub timeout_ms: u64,
+    /// Poll cadence in milliseconds between CF_KV reads. The final sleep before
+    /// the deadline is shortened so the loop never overshoots the budget by more
+    /// than one interval.
+    #[serde(default = "default_workspace_wait_poll_interval_ms")]
+    #[schemars(
+        default = "default_workspace_wait_poll_interval_ms",
+        range(min = 1, max = 5_000)
+    )]
+    pub poll_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -291,6 +348,38 @@ pub struct WorkspaceGetResponse {
     pub run_id: String,
     pub key: String,
     pub now_unix_ms: u64,
+    /// Unambiguous present/absent discriminator. True iff a live row was read;
+    /// false only on the `absent_ok=true` tolerated-absence path.
+    pub found: bool,
+    /// The live row. Present iff `found` is true; omitted on tolerated absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<WorkspaceEntry>,
+    /// Exact CF_KV row hash readback. Present iff `found` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_readback: Option<WorkspaceRowReadback>,
+    /// CF_KV proof of absence for the exact row key. Present iff `found` is
+    /// false (the `absent_ok=true` tolerated-absence path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_readback: Option<WorkspaceAbsentReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceWaitResponse {
+    pub ok: bool,
+    pub run_id: String,
+    pub key: String,
+    /// Always true on the success path: `wait` only returns Ok once the key is
+    /// present; a deadline reached first returns the `WORKSPACE_WAIT_TIMEOUT`
+    /// error instead.
+    pub found: bool,
+    pub now_unix_ms: u64,
+    /// Wall-clock milliseconds elapsed from the first poll until the key resolved.
+    pub waited_ms: u64,
+    /// Number of CF_KV poll iterations performed before the key resolved.
+    pub poll_count: u64,
+    pub timeout_ms: u64,
+    pub poll_interval_ms: u64,
     pub entry: WorkspaceEntry,
     pub storage_readback: WorkspaceRowReadback,
 }
@@ -394,6 +483,8 @@ pub struct WorkspaceResponse {
     pub exists: Option<WorkspaceExistsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete: Option<WorkspaceDeleteResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WorkspaceWaitResponse>,
 }
 
 #[derive(Clone)]
@@ -417,7 +508,7 @@ struct WorkspaceCleanupReport {
 #[tool_router(router = workspace_blackboard_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for run-scoped workspace blackboard operations in the <=40 public MCP surface. operation is one of get, put, list, subscribe, exists, or delete. Exactly one matching operation spec is accepted. Mutating operations return CF_KV or subscription readback metadata; absent keys are reported as WORKSPACE_KEY_ABSENT instead of generic storage corruption/read failures."
+        description = "Facade for run-scoped workspace blackboard operations in the <=40 public MCP surface. operation is one of get, put, list, subscribe, exists, delete, or wait. Exactly one matching operation spec is accepted. Mutating operations return CF_KV or subscription readback metadata; absent keys are reported as WORKSPACE_KEY_ABSENT instead of generic storage corruption/read failures. get.absent_ok=true (default false) turns tolerated absence into a SUCCESS with found=false and a CF_KV absent_readback proof instead of the WORKSPACE_KEY_ABSENT error, for expected-absence polling. wait blocks until the key becomes present (returning the same entry/value readback as get) or its bounded timeout_ms elapses, in which case it fails with a typed WORKSPACE_WAIT_TIMEOUT error carrying key + waited_ms + poll_count."
     )]
     pub async fn workspace(
         &self,
@@ -438,14 +529,25 @@ impl SynapseService {
                     params.0.get.ok_or_else(|| missing_workspace_spec("get"))?,
                     &session_id,
                 )?;
+                let readback = match response.storage_readback.as_ref() {
+                    Some(storage_readback) => format!(
+                        "CF_KV row={} bytes={} sha256={} found=true",
+                        storage_readback.row_key,
+                        storage_readback.value_len_bytes,
+                        storage_readback.value_sha256
+                    ),
+                    None => {
+                        let absent = response.absent_readback.as_ref();
+                        format!(
+                            "CF_KV row={} exact_match_count={} found=false",
+                            absent.map_or("", |absent| absent.row_key.as_str()),
+                            absent.map_or(0, |absent| absent.exact_match_count)
+                        )
+                    }
+                };
                 Ok(Json(workspace_response(
                     WorkspaceOperation::Get,
-                    format!(
-                        "CF_KV row={} bytes={} sha256={}",
-                        response.storage_readback.row_key,
-                        response.storage_readback.value_len_bytes,
-                        response.storage_readback.value_sha256
-                    ),
+                    readback,
                     |out| out.get = Some(response),
                 )))
             }
@@ -545,6 +647,27 @@ impl SynapseService {
                         response.post_delete_readback.exists
                     ),
                     |out| out.delete = Some(response),
+                )))
+            }
+            WorkspaceOperation::Wait => {
+                let response = self.workspace_wait_impl(
+                    params
+                        .0
+                        .wait
+                        .ok_or_else(|| missing_workspace_spec("wait"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::Wait,
+                    format!(
+                        "CF_KV row={} bytes={} sha256={} waited_ms={} poll_count={}",
+                        response.storage_readback.row_key,
+                        response.storage_readback.value_len_bytes,
+                        response.storage_readback.value_sha256,
+                        response.waited_ms,
+                        response.poll_count
+                    ),
+                    |out| out.wait = Some(response),
                 )))
             }
         }
@@ -867,6 +990,20 @@ impl SynapseService {
         let db = self.workspace_db()?;
         let row_key = workspace_row_key(&run_id, &key);
         let Some(row) = read_workspace_row_optional(&db, &row_key, now_unix_ms)? else {
+            // Truly missing exact row. Under absent_ok this is a tolerated,
+            // successful absence; otherwise it stays the historical fail-closed
+            // WORKSPACE_KEY_ABSENT error (#1552).
+            if params.absent_ok {
+                return self.workspace_get_absent_ok_response(
+                    &db,
+                    run_id,
+                    key,
+                    &row_key,
+                    now_unix_ms,
+                    session_id,
+                    "get_absent_ok_missing",
+                );
+            }
             return Err(workspace_missing_error(&run_id, &key, &row_key));
         };
         if row.entry.expires_at_unix_ms <= now_unix_ms {
@@ -875,6 +1012,20 @@ impl SynapseService {
                 vec![row.key.clone()],
                 "delete expired workspace row on get",
             )?;
+            // An expired row is semantically absent once deleted. absent_ok
+            // callers (e.g. pollers) treat it as not-yet-present rather than an
+            // error; fail-closed callers keep the typed expiry error.
+            if params.absent_ok {
+                return self.workspace_get_absent_ok_response(
+                    &db,
+                    run_id,
+                    key,
+                    &row_key,
+                    now_unix_ms,
+                    session_id,
+                    "get_absent_ok_expired",
+                );
+            }
             return Err(workspace_expired_error(
                 &run_id,
                 &key,
@@ -904,9 +1055,150 @@ impl SynapseService {
             run_id,
             key,
             now_unix_ms,
-            entry: row.entry,
-            storage_readback,
+            found: true,
+            entry: Some(row.entry),
+            storage_readback: Some(storage_readback),
+            absent_readback: None,
         })
+    }
+
+    /// Build the tolerated-absence success response for `get` with
+    /// `absent_ok=true`, attaching the CF_KV proof-of-absence readback.
+    fn workspace_get_absent_ok_response(
+        &self,
+        db: &Db,
+        run_id: String,
+        key: String,
+        row_key: &str,
+        now_unix_ms: u64,
+        session_id: &str,
+        edge: &'static str,
+    ) -> Result<WorkspaceGetResponse, ErrorData> {
+        let absent_readback = readback_absent_workspace_row(db, row_key)?;
+        tracing::info!(
+            code = "WORKSPACE_BLACKBOARD_GET_ABSENT_OK",
+            run_id,
+            key,
+            row_key,
+            reader_session_id = session_id,
+            exact_match_count = absent_readback.exact_match_count,
+            edge,
+            "readback=workspace_blackboard edge=get_absent_ok"
+        );
+        Ok(WorkspaceGetResponse {
+            ok: true,
+            run_id,
+            key,
+            now_unix_ms,
+            found: false,
+            entry: None,
+            storage_readback: None,
+            absent_readback: Some(absent_readback),
+        })
+    }
+
+    fn workspace_wait_impl(
+        &self,
+        params: WorkspaceWaitParams,
+        session_id: &str,
+    ) -> Result<WorkspaceWaitResponse, ErrorData> {
+        validate_session_id(session_id)?;
+        let run_id = resolve_workspace_run_id(params.run_id.as_deref())?;
+        let key = normalize_workspace_key(&params.key)?;
+        validate_workspace_wait_timeout_ms(params.timeout_ms)?;
+        validate_workspace_wait_poll_interval_ms(params.poll_interval_ms)?;
+        let db = self.workspace_db()?;
+        let row_key = workspace_row_key(&run_id, &key);
+        let timeout_ms = params.timeout_ms;
+        let poll_interval_ms = params.poll_interval_ms;
+        let started_at_unix_ms = unix_time_ms_now();
+        let deadline_unix_ms = started_at_unix_ms.saturating_add(timeout_ms);
+        tracing::info!(
+            code = "WORKSPACE_BLACKBOARD_WAIT_STARTED",
+            run_id,
+            key,
+            row_key,
+            waiter_session_id = session_id,
+            timeout_ms,
+            poll_interval_ms,
+            deadline_unix_ms,
+            "readback=workspace_blackboard edge=wait_started"
+        );
+        let mut poll_count: u64 = 0;
+        loop {
+            poll_count = poll_count.saturating_add(1);
+            let now_unix_ms = unix_time_ms_now();
+            if let Some(row) = read_workspace_row_optional(&db, &row_key, now_unix_ms)? {
+                if row.entry.expires_at_unix_ms > now_unix_ms {
+                    let storage_readback = workspace_row_readback(&row);
+                    let waited_ms = now_unix_ms.saturating_sub(started_at_unix_ms);
+                    tracing::info!(
+                        code = "WORKSPACE_BLACKBOARD_WAIT_RESOLVED",
+                        run_id,
+                        key,
+                        row_key,
+                        waiter_session_id = session_id,
+                        version = row.entry.version,
+                        poll_count,
+                        waited_ms,
+                        value_sha256 = %storage_readback.value_sha256,
+                        "readback=workspace_blackboard edge=wait_resolved"
+                    );
+                    return Ok(WorkspaceWaitResponse {
+                        ok: true,
+                        run_id,
+                        key,
+                        found: true,
+                        now_unix_ms,
+                        waited_ms,
+                        poll_count,
+                        timeout_ms,
+                        poll_interval_ms,
+                        entry: row.entry,
+                        storage_readback,
+                    });
+                }
+                // A physically present but expired row is not a resolution;
+                // delete it (source-of-truth cleanup) and keep polling.
+                delete_workspace_rows(
+                    &db,
+                    vec![row.key.clone()],
+                    "delete expired workspace row on wait",
+                )?;
+            }
+            let now_unix_ms = unix_time_ms_now();
+            if now_unix_ms >= deadline_unix_ms {
+                let waited_ms = now_unix_ms.saturating_sub(started_at_unix_ms);
+                let absent_readback = readback_absent_workspace_row(&db, &row_key)?;
+                tracing::warn!(
+                    code = WORKSPACE_WAIT_TIMEOUT,
+                    run_id,
+                    key,
+                    row_key,
+                    waiter_session_id = session_id,
+                    poll_count,
+                    waited_ms,
+                    timeout_ms,
+                    "readback=workspace_blackboard edge=wait_timeout"
+                );
+                return Err(workspace_wait_timeout_error(
+                    &run_id,
+                    &key,
+                    &row_key,
+                    timeout_ms,
+                    waited_ms,
+                    poll_count,
+                    &absent_readback,
+                ));
+            }
+            // Sleep for the poll interval, but never past the deadline (shorten
+            // the final nap so the effective wait stays within one interval of
+            // the requested budget). now_unix_ms < deadline here, so remaining
+            // is always >= 1.
+            let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
+            let sleep_ms = poll_interval_ms.min(remaining_ms).max(1);
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        }
     }
 
     fn workspace_list_impl(
@@ -1596,6 +1888,26 @@ fn validate_workspace_list_limit(limit: usize) -> Result<(), ErrorData> {
     Ok(())
 }
 
+fn validate_workspace_wait_timeout_ms(timeout_ms: u64) -> Result<(), ErrorData> {
+    if timeout_ms < MIN_WORKSPACE_WAIT_TIMEOUT_MS || timeout_ms > MAX_WORKSPACE_WAIT_TIMEOUT_MS {
+        return Err(params_error(format!(
+            "workspace wait timeout_ms must be between {MIN_WORKSPACE_WAIT_TIMEOUT_MS} and {MAX_WORKSPACE_WAIT_TIMEOUT_MS}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_workspace_wait_poll_interval_ms(poll_interval_ms: u64) -> Result<(), ErrorData> {
+    if poll_interval_ms < MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS
+        || poll_interval_ms > MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS
+    {
+        return Err(params_error(format!(
+            "workspace wait poll_interval_ms must be between {MIN_WORKSPACE_WAIT_POLL_INTERVAL_MS} and {MAX_WORKSPACE_WAIT_POLL_INTERVAL_MS}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_inline_value_size(value: Option<&Value>) -> Result<(), ErrorData> {
     let Some(value) = value else {
         return Ok(());
@@ -1800,6 +2112,36 @@ fn workspace_expired_error(
             "expires_at_unix_ms": expires_at_unix_ms,
             "now_unix_ms": now_unix_ms,
             "source_of_truth": "CF_KV workspace-blackboard exact row",
+        })),
+    )
+}
+
+fn workspace_wait_timeout_error(
+    run_id: &str,
+    key: &str,
+    row_key: &str,
+    timeout_ms: u64,
+    waited_ms: u64,
+    poll_count: u64,
+    absent_readback: &WorkspaceAbsentReadback,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "workspace blackboard wait for key {key:?} in run {run_id:?} timed out after {waited_ms}ms (timeout {timeout_ms}ms, {poll_count} polls) without the key becoming present"
+        ),
+        Some(json!({
+            "code": WORKSPACE_WAIT_TIMEOUT,
+            "detail_code": WORKSPACE_WAIT_TIMEOUT,
+            "run_id": run_id,
+            "key": key,
+            "row_key": row_key,
+            "timeout_ms": timeout_ms,
+            "waited_ms": waited_ms,
+            "poll_count": poll_count,
+            "absent_readback": absent_readback,
+            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
+            "remediation": "increase wait timeout_ms, poll with workspace operation=get absent_ok=true, or ensure a peer publishes the key with workspace operation=put",
         })),
     )
 }
@@ -2051,6 +2393,7 @@ fn validate_workspace_facade_params(params: &WorkspaceParams) -> Result<(), Erro
             ("subscribe", params.subscribe.is_some()),
             ("exists", params.exists.is_some()),
             ("delete", params.delete.is_some()),
+            ("wait", params.wait.is_some()),
         ],
     )
 }
@@ -2129,6 +2472,7 @@ fn workspace_response(
         subscribe: None,
         exists: None,
         delete: None,
+        wait: None,
     };
     populate(&mut response);
     response
@@ -2184,6 +2528,14 @@ const fn default_workspace_ttl_ms() -> u64 {
 
 const fn default_list_limit() -> usize {
     DEFAULT_LIST_LIMIT
+}
+
+const fn default_workspace_wait_timeout_ms() -> u64 {
+    DEFAULT_WORKSPACE_WAIT_TIMEOUT_MS
+}
+
+const fn default_workspace_wait_poll_interval_ms() -> u64 {
+    DEFAULT_WORKSPACE_WAIT_POLL_INTERVAL_MS
 }
 
 const fn default_true() -> bool {
@@ -2371,22 +2723,26 @@ mod tests {
             WorkspaceGetParams {
                 run_id: Some("run-796".to_owned()),
                 key: "findings/k1".to_owned(),
+                absent_ok: false,
             },
             "session-b",
             10_001,
         )?;
+        assert!(get.found);
+        let get_entry = get.entry.as_ref().expect("present get returns an entry");
         assert_eq!(
-            get.entry.value,
+            get_entry.value,
             Some(json!({"known": 4, "marker": "ISSUE796"}))
         );
         assert_eq!(
-            get.entry
+            get_entry
                 .artifact
                 .as_ref()
                 .map(|artifact| artifact.handle.as_str()),
             Some("artifact://issue796/screenshot")
         );
-        assert_eq!(get.storage_readback, put.storage_readback);
+        assert_eq!(get.storage_readback.as_ref(), Some(&put.storage_readback));
+        assert!(get.absent_readback.is_none());
         Ok(())
     }
 
@@ -2484,6 +2840,7 @@ mod tests {
             WorkspaceGetParams {
                 run_id: Some("run-ttl".to_owned()),
                 key: "findings/old".to_owned(),
+                absent_ok: false,
             },
             "session-b",
             40_002,
@@ -2576,12 +2933,14 @@ mod tests {
             WorkspaceGetParams {
                 run_id: Some("run-cas".to_owned()),
                 key: "findings/shared".to_owned(),
+                absent_ok: false,
             },
             "session-c",
             70_002,
         )?;
-        assert_eq!(still_first.entry.value, Some(json!({"marker": "first"})));
-        assert_eq!(still_first.entry.version, 1);
+        let still_first_entry = still_first.entry.as_ref().expect("present get entry");
+        assert_eq!(still_first_entry.value, Some(json!({"marker": "first"})));
+        assert_eq!(still_first_entry.version, 1);
 
         let second = service.workspace_put_impl_at(
             WorkspacePutParams {
@@ -2602,12 +2961,14 @@ mod tests {
             WorkspaceGetParams {
                 run_id: Some("run-cas".to_owned()),
                 key: "findings/shared".to_owned(),
+                absent_ok: false,
             },
             "session-c",
             70_004,
         )?;
-        assert_eq!(updated.entry.value, Some(json!({"marker": "second"})));
-        assert_eq!(updated.entry.version, 2);
+        let updated_entry = updated.entry.as_ref().expect("present get entry");
+        assert_eq!(updated_entry.value, Some(json!({"marker": "second"})));
+        assert_eq!(updated_entry.version, 2);
         Ok(())
     }
 
@@ -2655,6 +3016,7 @@ mod tests {
             WorkspaceGetParams {
                 run_id: Some("run-absent".to_owned()),
                 key: "missing/key".to_owned(),
+                absent_ok: false,
             },
             "session-a",
             80_000,
@@ -2668,6 +3030,274 @@ mod tests {
         assert!(
             error_remediation(&error)
                 .is_some_and(|text| text.contains("workspace operation=exists"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_ok_true_on_absent_key_is_success_found_false() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: the synthetic key has no CF_KV row.
+        let db = service.workspace_db()?;
+        let row_key = workspace_row_key("run-1552", "fsv-1552-k1");
+        assert_eq!(
+            readback_absent_workspace_row(&db, &row_key)?.exact_match_count,
+            0,
+            "precondition: key must be absent before the tolerant get"
+        );
+
+        let get = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                absent_ok: true,
+            },
+            "session-absent-ok",
+            120_000,
+        )?;
+
+        // after: tolerated absence is a SUCCESS, not the WORKSPACE_KEY_ABSENT error.
+        assert!(get.ok);
+        assert!(!get.found);
+        assert!(get.entry.is_none());
+        assert!(get.storage_readback.is_none());
+        let absent = get
+            .absent_readback
+            .as_ref()
+            .expect("absent_ok get must carry the CF_KV absent_readback proof");
+        assert!(!absent.exists);
+        assert_eq!(absent.exact_match_count, 0);
+        assert_eq!(absent.row_key, row_key);
+        println!(
+            "readback=absent_ok_get_absent found={} exists={} exact_match_count={} row_key={}",
+            get.found, absent.exists, absent.exact_match_count, absent.row_key
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_ok_true_on_present_key_returns_value_found_true() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: publish the known synthetic value "2+2=4".
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                expected_version: None,
+                value: Some(json!("2+2=4")),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-writer",
+            130_000,
+        )?;
+
+        let get = service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                absent_ok: true,
+            },
+            "session-reader",
+            130_001,
+        )?;
+
+        // after: a present key under absent_ok reads exactly like a normal get.
+        assert!(get.found);
+        let entry = get
+            .entry
+            .as_ref()
+            .expect("present absent_ok get must return the entry");
+        assert_eq!(entry.value, Some(json!("2+2=4")));
+        assert!(get.storage_readback.is_some());
+        assert!(get.absent_readback.is_none());
+        println!(
+            "readback=absent_ok_get_present found={} value={:?} sha256={:?}",
+            get.found,
+            entry.value,
+            get.storage_readback.as_ref().map(|row| &row.value_sha256)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_ok_false_on_absent_key_still_errors() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // backward-compat: default fail-closed behavior is unchanged.
+        let error = match service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-missing".to_owned(),
+                absent_ok: false,
+            },
+            "session-fail-closed",
+            140_000,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("fail-closed absent get unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        assert_eq!(error_detail_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        println!(
+            "readback=absent_ok_false_error code={:?} detail_code={:?}",
+            error_code(&error),
+            error_detail_code(&error)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_wait_resolves_when_key_present_found_true() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: publish the key against a real-clock timestamp so its TTL is in
+        // the real future (wait polls against the wall clock, unlike the
+        // synthetic-now *_impl_at helpers).
+        let put_now = unix_time_ms_now();
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                expected_version: None,
+                value: Some(json!("2+2=4")),
+                artifact: None,
+                ttl_ms: 600_000,
+            },
+            "session-writer",
+            put_now,
+        )?;
+
+        let wait = service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                timeout_ms: 1_000,
+                poll_interval_ms: 5,
+            },
+            "session-waiter",
+        )?;
+
+        // after: wait resolves immediately with the same readback as get.
+        assert!(wait.ok);
+        assert!(wait.found);
+        assert_eq!(wait.key, "fsv-1552-k1");
+        assert_eq!(wait.entry.value, Some(json!("2+2=4")));
+        assert!(wait.poll_count >= 1);
+        println!(
+            "readback=wait_resolved found={} poll_count={} waited_ms={} value={:?} sha256={}",
+            wait.found,
+            wait.poll_count,
+            wait.waited_ms,
+            wait.entry.value,
+            wait.storage_readback.value_sha256
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_wait_times_out_with_typed_error() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        // before: the key is never written.
+        let db = service.workspace_db()?;
+        let row_key = workspace_row_key("run-1552", "fsv-1552-never");
+        assert_eq!(
+            readback_absent_workspace_row(&db, &row_key)?.exact_match_count,
+            0
+        );
+
+        let error = match service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-never".to_owned(),
+                timeout_ms: 5,
+                poll_interval_ms: 1,
+            },
+            "session-waiter",
+        ) {
+            Ok(response) => {
+                anyhow::bail!("wait on a never-written key unexpectedly resolved: {response:?}")
+            }
+            Err(error) => error,
+        };
+
+        // after: a typed timeout, not a generic storage error.
+        assert_eq!(error_code(&error), Some(WORKSPACE_WAIT_TIMEOUT));
+        assert_eq!(error_detail_code(&error), Some(WORKSPACE_WAIT_TIMEOUT));
+        let waited_ms = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("waited_ms"))
+            .and_then(Value::as_u64);
+        let poll_count = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("poll_count"))
+            .and_then(Value::as_u64);
+        assert!(
+            poll_count.is_some_and(|count| count >= 1),
+            "timeout payload must report at least one poll"
+        );
+        println!(
+            "readback=wait_timeout code={:?} waited_ms={:?} poll_count={:?}",
+            error_code(&error),
+            waited_ms,
+            poll_count
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_wait_rejects_out_of_range_timeout() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let too_large = match service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                timeout_ms: MAX_WORKSPACE_WAIT_TIMEOUT_MS + 1,
+                poll_interval_ms: 5,
+            },
+            "session-waiter",
+        ) {
+            Ok(response) => {
+                anyhow::bail!("over-max wait timeout unexpectedly accepted: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&too_large),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+
+        let zero = match service.workspace_wait_impl(
+            WorkspaceWaitParams {
+                run_id: Some("run-1552".to_owned()),
+                key: "fsv-1552-k1".to_owned(),
+                timeout_ms: 0,
+                poll_interval_ms: 5,
+            },
+            "session-waiter",
+        ) {
+            Ok(response) => anyhow::bail!("zero wait timeout unexpectedly accepted: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&zero), Some(error_codes::TOOL_PARAMS_INVALID));
+        println!(
+            "readback=wait_reject over_max={:?} zero={:?}",
+            error_code(&too_large),
+            error_code(&zero)
         );
         Ok(())
     }
@@ -2974,12 +3604,14 @@ mod tests {
             get: Some(WorkspaceGetParams {
                 run_id: Some("run".to_owned()),
                 key: "k".to_owned(),
+                absent_ok: false,
             }),
             put: None,
             list: None,
             subscribe: None,
             exists: None,
             delete: None,
+            wait: None,
         })
         .expect_err("operation=put without put spec must fail");
         assert_eq!(error_code(&missing), Some(error_codes::TOOL_PARAMS_INVALID));
@@ -2989,6 +3621,7 @@ mod tests {
             get: Some(WorkspaceGetParams {
                 run_id: Some("run".to_owned()),
                 key: "k".to_owned(),
+                absent_ok: false,
             }),
             put: Some(WorkspacePutParams {
                 run_id: Some("run".to_owned()),
@@ -3002,6 +3635,7 @@ mod tests {
             subscribe: None,
             exists: None,
             delete: None,
+            wait: None,
         })
         .expect_err("multiple specs must fail");
         assert_eq!(error_code(&extra), Some(error_codes::TOOL_PARAMS_INVALID));
