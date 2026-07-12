@@ -8013,8 +8013,8 @@ fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
                 // A NOT_FOUND only counts as a transient replace window while a
                 // writer's unique staging file is still on disk; otherwise the
                 // job is genuinely absent and the error is returned as-is.
-                let mid_replace = error.kind() == io::ErrorKind::NotFound
-                    && shell_status_replace_in_flight(path);
+                let mid_replace =
+                    error.kind() == io::ErrorKind::NotFound && shell_status_replace_in_flight(path);
                 if within_window && (transient_open || mid_replace) {
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
@@ -17045,8 +17045,8 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
 
         // Exercise the real public entry point (default 7-day TTL); the aged
         // jobs are 30 days old so they exceed it, the recent one does not.
-        let readback = reap_stale_shell_jobs()
-            .unwrap_or_else(|error| panic!("reap should succeed: {error}"));
+        let readback =
+            reap_stale_shell_jobs().unwrap_or_else(|error| panic!("reap should succeed: {error}"));
         println!("readback=shell_job_reap edge=mixed_store after={readback:?}");
 
         // Full-state verification against the filesystem itself.
