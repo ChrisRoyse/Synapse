@@ -1495,12 +1495,103 @@ pub async fn cdp_page_text_target(
 /// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
 /// `A11Y_CDP_AXTREE_FAILED` if the evaluate command fails at the protocol level,
 /// the page throws an exception, or the result cannot be decoded.
+/// Default per-expression evaluation budget (milliseconds) for the raw-CDP and
+/// Chrome-bridge evaluate paths. Historically the Chrome-bridge wall was a fixed,
+/// non-configurable 5000 ms; this preserves that default while letting callers
+/// raise it through `timeout_ms` (issue #1596).
+pub const DEFAULT_EVALUATE_TIMEOUT_MS: u64 = 5_000;
+
+/// Minimum accepted `timeout_ms` for an evaluate call.
+pub const MIN_EVALUATE_TIMEOUT_MS: u64 = 50;
+
+/// Maximum accepted `timeout_ms` for an evaluate call. Bounded so a single stuck
+/// expression cannot pin a CDP connection indefinitely.
+pub const MAX_EVALUATE_TIMEOUT_MS: u64 = 120_000;
+
+/// Runs an evaluate command future under a bounded wall-clock budget, converting a
+/// deadline overrun into a structured [`A11yError::CdpEvaluateTimeout`] that is
+/// distinct from a thrown JS exception (`A11yError::CdpAxtreeFailed`). The error
+/// carries the elapsed and budget milliseconds so a caller can retry with a larger
+/// `timeout_ms` instead of guessing. The wall clock is the source of truth for the
+/// "still running at the deadline" classification; a real exception resolves the
+/// inner future to `Ok` and is surfaced separately via `exception_details`.
+async fn evaluate_within_budget<Fut, T>(
+    operation: &str,
+    scope: &str,
+    timeout_ms: Option<u64>,
+    fut: Fut,
+) -> A11yResult<T>
+where
+    Fut: std::future::Future<Output = A11yResult<T>>,
+{
+    // No caller-imposed budget: preserve the underlying transport's own timeout
+    // (chromiumoxide's request timeout) exactly as before.
+    let Some(timeout_ms) = timeout_ms else {
+        return fut.await;
+    };
+    let budget = Duration::from_millis(timeout_ms);
+    let started = Instant::now();
+    if let Ok(result) = tokio::time::timeout(budget, fut).await {
+        result
+    } else {
+        let elapsed_ms = duration_millis_u64(started.elapsed());
+        Err(A11yError::CdpEvaluateTimeout {
+            detail: format!(
+                "{operation} ({scope} scope) was still running when the {timeout_ms} ms timeout_ms budget elapsed (elapsed {elapsed_ms} ms); the expression neither resolved nor threw. Retry with a larger timeout_ms if the page work legitimately needs longer, or pass await_promise=false when evaluating a promise that never resolves."
+            ),
+        })
+    }
+}
+
 pub async fn cdp_evaluate_expression(
     endpoint: &str,
     target_id: &str,
     expression: &str,
     await_promise: bool,
     return_by_value: bool,
+) -> A11yResult<CdpEvaluateResult> {
+    cdp_evaluate_expression_inner(
+        endpoint,
+        target_id,
+        expression,
+        await_promise,
+        return_by_value,
+        None,
+    )
+    .await
+}
+
+/// Like [`cdp_evaluate_expression`] but enforces a caller-supplied wall-clock
+/// budget (`timeout_ms`). If the expression is still running when the budget
+/// elapses the call fails with [`A11yError::CdpEvaluateTimeout`] (error code
+/// `BROWSER_EVALUATE_TIMEOUT`), distinct from the exception path, so an agent can
+/// retry with a larger budget (issue #1596).
+pub async fn cdp_evaluate_expression_with_timeout(
+    endpoint: &str,
+    target_id: &str,
+    expression: &str,
+    await_promise: bool,
+    return_by_value: bool,
+    timeout_ms: u64,
+) -> A11yResult<CdpEvaluateResult> {
+    cdp_evaluate_expression_inner(
+        endpoint,
+        target_id,
+        expression,
+        await_promise,
+        return_by_value,
+        Some(timeout_ms),
+    )
+    .await
+}
+
+async fn cdp_evaluate_expression_inner(
+    endpoint: &str,
+    target_id: &str,
+    expression: &str,
+    await_promise: bool,
+    return_by_value: bool,
+    timeout_ms: Option<u64>,
 ) -> A11yResult<CdpEvaluateResult> {
     use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
     let expression = expression.to_owned();
@@ -1517,13 +1608,15 @@ pub async fn cdp_evaluate_expression(
             .map_err(|err| A11yError::CdpAxtreeFailed {
                 detail: format!("Runtime.evaluate params build: {err}"),
             })?;
-        let returns = page
-            .execute(params)
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Runtime.evaluate: {err}"),
-            })?
-            .result;
+        let returns = evaluate_within_budget("Runtime.evaluate", "page", timeout_ms, async {
+            page.execute(params)
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("Runtime.evaluate: {err}"),
+                })
+        })
+        .await?
+        .result;
         if let Some(exception) = returns.exception_details.as_ref() {
             return Err(A11yError::CdpAxtreeFailed {
                 detail: format!(
@@ -1562,6 +1655,63 @@ pub async fn cdp_evaluate_on_element(
     args: &[Value],
     await_promise: bool,
     return_by_value: bool,
+) -> A11yResult<CdpEvaluateResult> {
+    cdp_evaluate_on_element_inner(
+        endpoint,
+        target_id,
+        backend_node_id,
+        function_declaration,
+        args,
+        await_promise,
+        return_by_value,
+        None,
+    )
+    .await
+}
+
+/// Like [`cdp_evaluate_on_element`] but enforces a caller-supplied wall-clock
+/// budget (`timeout_ms`), failing with [`A11yError::CdpEvaluateTimeout`] when the
+/// element function is still running at the deadline (issue #1596).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors cdp_evaluate_on_element plus the caller-configurable evaluate budget"
+)]
+pub async fn cdp_evaluate_on_element_with_timeout(
+    endpoint: &str,
+    target_id: &str,
+    backend_node_id: i64,
+    function_declaration: &str,
+    args: &[Value],
+    await_promise: bool,
+    return_by_value: bool,
+    timeout_ms: u64,
+) -> A11yResult<CdpEvaluateResult> {
+    cdp_evaluate_on_element_inner(
+        endpoint,
+        target_id,
+        backend_node_id,
+        function_declaration,
+        args,
+        await_promise,
+        return_by_value,
+        Some(timeout_ms),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "element-scope evaluate carries node id, function, args, CDP flags, and the evaluate budget"
+)]
+async fn cdp_evaluate_on_element_inner(
+    endpoint: &str,
+    target_id: &str,
+    backend_node_id: i64,
+    function_declaration: &str,
+    args: &[Value],
+    await_promise: bool,
+    return_by_value: bool,
+    timeout_ms: Option<u64>,
 ) -> A11yResult<CdpEvaluateResult> {
     let function_declaration = function_declaration.to_owned();
     let args = args.to_vec();
@@ -1608,12 +1758,15 @@ pub async fn cdp_evaluate_on_element(
         let call = call.build().map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("build Runtime.callFunctionOn params: {err}"),
         })?;
-        let returns = page
-            .execute(call)
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Runtime.callFunctionOn: {err}"),
-            })?
+        let returns =
+            evaluate_within_budget("Runtime.callFunctionOn", "element", timeout_ms, async {
+                page.execute(call)
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("Runtime.callFunctionOn: {err}"),
+                    })
+            })
+            .await?
             .result;
         if let Some(exception) = returns.exception_details.as_ref() {
             return Err(A11yError::CdpAxtreeFailed {
@@ -4811,6 +4964,7 @@ fn rgb8_to_bgra(rgb: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synapse_core::error_codes;
 
     // Locks the FSV-discovered bug: leaving the `buttons` bit set on release
     // makes Chrome think the button is still held and never fires a `click`
@@ -5228,5 +5382,63 @@ mod tests {
             window_after.window_scroll_y
         ));
         assert!(!scroll_value_changed(10.0, 10.1));
+    }
+
+    #[test]
+    fn cdp_evaluate_timeout_error_maps_to_browser_evaluate_timeout_code() {
+        let error = A11yError::CdpEvaluateTimeout {
+            detail: "still running".to_owned(),
+        };
+        assert_eq!(error.code(), error_codes::BROWSER_EVALUATE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn evaluate_within_budget_fires_structured_timeout_when_expression_overruns() {
+        // A future that outlives the budget must convert into a structured
+        // CdpEvaluateTimeout carrying the operation, scope, and the budget ms —
+        // NOT a CdpAxtreeFailed (which is reserved for thrown JS exceptions).
+        let result: A11yResult<()> =
+            evaluate_within_budget("Runtime.evaluate", "page", Some(60), async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            })
+            .await;
+        let error = result.expect_err("an overrun must not resolve to Ok");
+        assert_eq!(error.code(), error_codes::BROWSER_EVALUATE_TIMEOUT);
+        let detail = error.to_string();
+        assert!(
+            detail.contains("Runtime.evaluate") && detail.contains("page scope"),
+            "detail must name the operation and scope: {detail}"
+        );
+        assert!(
+            detail.contains("60 ms timeout_ms budget"),
+            "detail must echo the caller budget: {detail}"
+        );
+        assert!(
+            detail.contains("await_promise=false"),
+            "detail must hint the await_promise escape hatch: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_within_budget_returns_value_when_expression_finishes_in_time() {
+        let result: A11yResult<u32> =
+            evaluate_within_budget("Runtime.evaluate", "page", Some(5_000), async { Ok(7) }).await;
+        assert_eq!(result.expect("fast expression must resolve"), 7);
+    }
+
+    #[tokio::test]
+    async fn evaluate_within_budget_none_preserves_underlying_result_without_wall() {
+        // No caller budget: the inner error (e.g. a real exception mapped to
+        // CdpAxtreeFailed) is passed through untouched, never reclassified.
+        let result: A11yResult<()> =
+            evaluate_within_budget("Runtime.evaluate", "page", None, async {
+                Err(A11yError::CdpAxtreeFailed {
+                    detail: "threw ReferenceError".to_owned(),
+                })
+            })
+            .await;
+        let error = result.expect_err("inner error must pass through");
+        assert_eq!(error.code(), error_codes::A11Y_CDP_AXTREE_FAILED);
     }
 }

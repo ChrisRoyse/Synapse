@@ -1,7 +1,13 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-09-register-token-v1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-12-evaluate-timeout-v1";
 const BRIDGE_DECLARED_BUILD_SHA256 = "25af9fe2d52245ee4d52ab89e580914ca65a0a8564c9696ff6c7b964d9cb165c";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
+// Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
+// default preserves the historical fixed 5000 ms wall; agents may raise it up to
+// EVALUATE_TIMEOUT_MAX_MS for legitimately slow expressions.
+const EVALUATE_TIMEOUT_DEFAULT_MS = 5000;
+const EVALUATE_TIMEOUT_MIN_MS = 50;
+const EVALUATE_TIMEOUT_MAX_MS = 120000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
 let captureVisibleTabQueue = Promise.resolve();
@@ -66,6 +72,7 @@ const ERROR_ATTACH_FAILED = "A11Y_CDP_ATTACH_FAILED";
 const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
 const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
+const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
@@ -1476,10 +1483,12 @@ async function handleEvaluateScript(params) {
   const args = normalizeEvaluateArgs(params.args);
   const awaitPromise = normalizeEvaluateBoolean(params.awaitPromise, true, "awaitPromise");
   const returnByValue = normalizeEvaluateBoolean(params.returnByValue, true, "returnByValue");
+  const timeoutMs = normalizeEvaluateTimeout(params.timeoutMs);
   const expressionToRun = args.length > 0 ? buildEvaluateFunctionInvocation(expression, args) : expression;
   const protocolVersion = "1.3";
   let attachment = null;
   let evaluation;
+  const startedAtMs = Date.now();
   try {
     attachment = await attachDebuggerForCommand(selected.tabId, protocolVersion);
     evaluation = await sendDebuggerCommand(attachment.debuggee, "Runtime.evaluate", {
@@ -1487,11 +1496,23 @@ async function handleEvaluateScript(params) {
       awaitPromise,
       returnByValue,
       userGesture: true
-    });
+    }, timeoutMs);
   } catch (error) {
+    const message = errorMessage(error);
+    // Distinguish "still running at the deadline" from an attach/protocol
+    // failure so the agent can retry with a larger budget (issue #1596). The
+    // wall-clock budget is the source of truth: a real JS exception surfaces via
+    // evaluation.exceptionDetails below, not here.
+    if (message.includes("timed out after")) {
+      const elapsedMs = Date.now() - startedAtMs;
+      throw bridgeError(
+        ERROR_EVALUATE_TIMEOUT,
+        `chrome.debugger Runtime.evaluate (page scope) was still running when the ${timeoutMs} ms timeout_ms budget elapsed (elapsed ${elapsedMs} ms); the expression neither resolved nor threw. Retry with a larger timeout_ms (max ${EVALUATE_TIMEOUT_MAX_MS} ms) if the page work legitimately needs longer, or pass await_promise=false when evaluating a promise that never resolves.`
+      );
+    }
     throw bridgeError(
       ERROR_ATTACH_FAILED,
-      `chrome.debugger Runtime.evaluate failed for tab ${selected.tabId}: ${errorMessage(error)}`
+      `chrome.debugger Runtime.evaluate failed for tab ${selected.tabId}: ${message}`
     );
   } finally {
     if (attachment?.shouldDetach) {
@@ -21207,6 +21228,20 @@ function normalizeWaitTimeout(value) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < 1 || number > 30000) {
     throw bridgeError(ERROR_ATTACH_FAILED, "waitTimeoutMs must be an integer from 1 through 30000");
+  }
+  return number;
+}
+
+function normalizeEvaluateTimeout(value) {
+  if (value === undefined || value === null) {
+    return EVALUATE_TIMEOUT_DEFAULT_MS;
+  }
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < EVALUATE_TIMEOUT_MIN_MS || number > EVALUATE_TIMEOUT_MAX_MS) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `timeoutMs must be an integer from ${EVALUATE_TIMEOUT_MIN_MS} through ${EVALUATE_TIMEOUT_MAX_MS}`
+    );
   }
   return number;
 }

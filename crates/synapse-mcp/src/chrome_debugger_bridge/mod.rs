@@ -40,7 +40,7 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-09-register-token-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-12-evaluate-timeout-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "25af9fe2d52245ee4d52ab89e580914ca65a0a8564c9696ff6c7b964d9cb165c";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -98,6 +98,10 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "setFieldValue",
 ];
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Extra daemon-side response headroom added on top of a caller's evaluate
+/// `timeout_ms` so the daemon waits out the in-extension evaluate budget (plus
+/// attach/round-trip overhead) before declaring a transport timeout (#1596).
+const EVALUATE_DAEMON_TIMEOUT_HEADROOM_MS: u64 = 5_000;
 const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_WS_COMMAND_WAIT: Duration = Duration::from_secs(25);
 const DEFAULT_RELOAD_WAIT_TIMEOUT_MS: u64 = 10_000;
@@ -251,6 +255,7 @@ impl ChromeDebuggerBridgeError {
             }
             Some(error_codes::ACTION_TARGET_INVALID) => error_codes::ACTION_TARGET_INVALID,
             Some(error_codes::BROWSER_WAIT_TIMEOUT) => error_codes::BROWSER_WAIT_TIMEOUT,
+            Some(error_codes::BROWSER_EVALUATE_TIMEOUT) => error_codes::BROWSER_EVALUATE_TIMEOUT,
             Some(error_codes::BROWSER_NAVIGATION_FAILED) => error_codes::BROWSER_NAVIGATION_FAILED,
             _ => error_codes::A11Y_CDP_ATTACH_FAILED,
         };
@@ -7458,6 +7463,10 @@ pub async fn activate_tab(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the MCP browser_evaluate parameters sent to the bridge, including the caller-configurable evaluate budget"
+)]
 pub async fn evaluate_script(
     hwnd: i64,
     target_id: &str,
@@ -7465,10 +7474,19 @@ pub async fn evaluate_script(
     args: &[Value],
     await_promise: bool,
     return_by_value: bool,
+    timeout_ms: u64,
 ) -> Result<ChromeDebuggerEvaluateScriptResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(hwnd, "evaluateScript")?;
+    // The daemon-side response budget must outlive the in-extension evaluate
+    // budget, otherwise the daemon kills the command first and surfaces a
+    // transport-looking A11Y_CDP_EXTENSION_TIMEOUT instead of the extension's
+    // clean structured BROWSER_EVALUATE_TIMEOUT (mirrors the downloads-wait
+    // pattern; see send_command_with_timeout). Add attach/round-trip headroom.
+    let command_timeout = COMMAND_TIMEOUT.max(Duration::from_millis(
+        timeout_ms.saturating_add(EVALUATE_DAEMON_TIMEOUT_HEADROOM_MS),
+    ));
     let result = bridge()
-        .send_command(
+        .send_command_with_timeout(
             "evaluateScript",
             json!({
                 "hwnd": hwnd,
@@ -7477,7 +7495,9 @@ pub async fn evaluate_script(
                 "args": args,
                 "awaitPromise": await_promise,
                 "returnByValue": return_by_value,
+                "timeoutMs": timeout_ms,
             }),
+            command_timeout,
         )
         .await?;
     serde_json::from_value::<ChromeDebuggerEvaluateScriptResult>(result).map_err(|error| {

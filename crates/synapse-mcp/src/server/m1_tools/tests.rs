@@ -17,9 +17,10 @@ use super::{
     capture_target_window_transient_candidate_diagnostic_from_contexts,
     cdp_activate_resolution_request_details, cdp_navigation_error_code,
     cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
-    chrome_page_vitals_info, downscale_captured_bitmap, format_chromium_window_candidates,
-    hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
-    page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
+    chrome_page_vitals_info, classify_browser_evaluate_error_parts, downscale_captured_bitmap,
+    format_chromium_window_candidates, hidden_desktop_pip_ended_response,
+    hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
+    perception_window_hwnd, resolve_browser_evaluate_timeout_ms, resolve_browser_tag_source,
     resolve_capture_target_window_context, screenshot_downscale_scale,
     select_single_active_browser_tab, sha256_hex, target_claim_param_from_set, target_wire,
     template_value, unavailable_page_vitals_info, validate_browser_add_init_script_params,
@@ -1563,6 +1564,164 @@ fn browser_evaluate_params_validation_edges() {
         .and_then(serde_json::Value::as_str);
     assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
     println!("readback=browser_evaluate validation edges all rejected with TOOL_PARAMS_INVALID");
+}
+
+#[test]
+fn browser_evaluate_timeout_ms_bounds_and_default() {
+    use synapse_a11y::{
+        DEFAULT_EVALUATE_TIMEOUT_MS, MAX_EVALUATE_TIMEOUT_MS, MIN_EVALUATE_TIMEOUT_MS,
+    };
+
+    // Unset -> resolves to the documented default (preserves historical 5000 ms).
+    assert_eq!(
+        resolve_browser_evaluate_timeout_ms(None).expect("None must resolve"),
+        DEFAULT_EVALUATE_TIMEOUT_MS
+    );
+    // Boundary: both inclusive ends are accepted verbatim.
+    for edge in [MIN_EVALUATE_TIMEOUT_MS, MAX_EVALUATE_TIMEOUT_MS] {
+        let resolved =
+            resolve_browser_evaluate_timeout_ms(Some(u32::try_from(edge).expect("edge fits u32")))
+                .expect("in-range budget must pass");
+        assert_eq!(resolved, edge);
+    }
+    // Edge: below the floor is rejected loudly, never silently clamped.
+    let below = resolve_browser_evaluate_timeout_ms(Some(
+        u32::try_from(MIN_EVALUATE_TIMEOUT_MS - 1).expect("fits"),
+    ))
+    .expect_err("below-floor budget must be rejected");
+    assert_eq!(
+        below
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::TOOL_PARAMS_INVALID)
+    );
+    // Edge: above the ceiling is rejected loudly.
+    let above = resolve_browser_evaluate_timeout_ms(Some(
+        u32::try_from(MAX_EVALUATE_TIMEOUT_MS + 1).expect("fits"),
+    ))
+    .expect_err("above-ceiling budget must be rejected");
+    assert_eq!(
+        above
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::TOOL_PARAMS_INVALID)
+    );
+    // Edge: zero is below the floor and rejected (a 0 ms CDP timeout means
+    // "terminate immediately", which must never be reachable).
+    assert!(resolve_browser_evaluate_timeout_ms(Some(0)).is_err());
+    println!(
+        "readback=browser_evaluate timeout_ms default={DEFAULT_EVALUATE_TIMEOUT_MS} range={MIN_EVALUATE_TIMEOUT_MS}..={MAX_EVALUATE_TIMEOUT_MS} bounds enforced"
+    );
+}
+
+#[test]
+fn browser_evaluate_params_accept_camel_case_aliases() {
+    // The camelCase spellings that agents previously had rejected must now
+    // deserialize onto the snake_case fields (issue #1596).
+    let params: BrowserEvaluateParams = serde_json::from_value(serde_json::json!({
+        "expression": "Promise.resolve(1)",
+        "awaitPromise": false,
+        "returnByValue": false,
+        "timeoutMs": 30000,
+    }))
+    .expect("camelCase aliases must deserialize");
+    assert_eq!(params.await_promise, Some(false));
+    assert_eq!(params.return_by_value, Some(false));
+    assert_eq!(params.timeout_ms, Some(30000));
+
+    // snake_case still works identically.
+    let snake: BrowserEvaluateParams = serde_json::from_value(serde_json::json!({
+        "expression": "1",
+        "await_promise": true,
+        "timeout_ms": 250,
+    }))
+    .expect("snake_case must deserialize");
+    assert_eq!(snake.await_promise, Some(true));
+    assert_eq!(snake.timeout_ms, Some(250));
+
+    // deny_unknown_fields is preserved: a genuinely unknown field is still an error.
+    let unknown = serde_json::from_value::<BrowserEvaluateParams>(serde_json::json!({
+        "expression": "1",
+        "awaitPromis": true,
+    }));
+    assert!(
+        unknown.is_err(),
+        "an unknown (misspelled) field must still be rejected"
+    );
+    println!(
+        "readback=browser_evaluate awaitPromise/returnByValue/timeoutMs aliases deserialize; unknown field still rejected"
+    );
+}
+
+#[test]
+fn classify_browser_evaluate_error_parts_distinguishes_timeout_from_other() {
+    // A legacy "timed out after" message (from an older loaded bridge, code
+    // A11Y_CDP_ATTACH_FAILED) is reclassified to the structured timeout code.
+    let legacy = classify_browser_evaluate_error_parts(
+        error_codes::A11Y_CDP_ATTACH_FAILED,
+        "Runtime.evaluate: Runtime.evaluate timed out after 5000ms",
+        "page",
+        5000,
+    );
+    assert_eq!(
+        legacy
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::BROWSER_EVALUATE_TIMEOUT)
+    );
+    assert!(
+        legacy.message.contains("retry with a larger timeout_ms")
+            || legacy.message.contains("Retry with a larger timeout_ms"),
+        "timeout message must carry an actionable retry hint: {}",
+        legacy.message
+    );
+
+    // The extension's structured code is likewise surfaced as the timeout code
+    // and echoes the caller's budget.
+    let structured = classify_browser_evaluate_error_parts(
+        error_codes::BROWSER_EVALUATE_TIMEOUT,
+        "still running",
+        "element",
+        45000,
+    );
+    assert_eq!(
+        structured
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::BROWSER_EVALUATE_TIMEOUT)
+    );
+    assert!(
+        structured.message.contains("45000 ms"),
+        "message must echo the caller budget: {}",
+        structured.message
+    );
+
+    // A non-timeout failure keeps its original code and is NOT masked as a timeout.
+    let other = classify_browser_evaluate_error_parts(
+        error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+        "bridge not connected",
+        "page",
+        5000,
+    );
+    assert_eq!(
+        other
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE)
+    );
+    println!(
+        "readback=classify evaluate error: timeout->BROWSER_EVALUATE_TIMEOUT, other codes preserved"
+    );
 }
 
 #[test]

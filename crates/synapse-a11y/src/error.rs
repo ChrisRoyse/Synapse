@@ -27,6 +27,8 @@ pub enum A11yError {
     CdpAxtreeFailed { detail: String },
     #[error("browser wait timed out: {detail}")]
     BrowserWaitTimeout { detail: String },
+    #[error("browser evaluate timed out: {detail}")]
+    CdpEvaluateTimeout { detail: String },
     #[error("UI Automation worker job timed out: {detail}")]
     UiaWorkerTimeout { detail: String },
     #[error("foreground activation refused: {detail}")]
@@ -55,6 +57,7 @@ impl A11yError {
             Self::CdpAttachFailed { .. } => error_codes::A11Y_CDP_ATTACH_FAILED,
             Self::CdpAxtreeFailed { .. } => error_codes::A11Y_CDP_AXTREE_FAILED,
             Self::BrowserWaitTimeout { .. } => error_codes::BROWSER_WAIT_TIMEOUT,
+            Self::CdpEvaluateTimeout { .. } => error_codes::BROWSER_EVALUATE_TIMEOUT,
             Self::UiaWorkerTimeout { .. } => error_codes::A11Y_UIA_WORKER_TIMEOUT,
             Self::ForegroundActivationRefused { .. } => error_codes::FOREGROUND_ACTIVATION_REFUSED,
             Self::InvalidElementId { .. } | Self::Internal { .. } => error_codes::OBSERVE_INTERNAL,

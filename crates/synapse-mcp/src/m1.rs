@@ -1844,14 +1844,27 @@ pub struct BrowserEvaluateParams {
     /// passed as `Runtime.callFunctionOn` arguments.
     #[serde(default)]
     pub args: Option<Vec<serde_json::Value>>,
-    /// Await a returned promise/thenable before resolving. Defaults to true.
-    #[serde(default)]
+    /// Await a returned promise/thenable before resolving. Defaults to true. The
+    /// camelCase spelling `awaitPromise` (the raw CDP field name) is accepted as
+    /// an alias so a promise-returning expression can turn awaiting off without
+    /// having the field rejected (issue #1596).
+    #[serde(default, alias = "awaitPromise")]
     pub await_promise: Option<bool>,
     /// Serialize the result by value as JSON. Defaults to true. Set false to
     /// receive only the type/description handle for non-serializable values
-    /// (DOM nodes, functions).
-    #[serde(default)]
+    /// (DOM nodes, functions). The camelCase alias `returnByValue` is accepted.
+    #[serde(default, alias = "returnByValue")]
     pub return_by_value: Option<bool>,
+    /// Bounded wall-clock budget in milliseconds for the expression to finish.
+    /// Defaults to 5000; accepted range is 50..=120000. When the expression is
+    /// still running at the deadline the call fails with a structured
+    /// `BROWSER_EVALUATE_TIMEOUT` error (carrying the elapsed and budget ms and
+    /// distinct from a thrown JS exception) so an agent can retry with a larger
+    /// budget rather than guessing (issue #1596). The camelCase alias `timeoutMs`
+    /// is accepted.
+    #[serde(default, alias = "timeoutMs")]
+    #[schemars(range(min = 50, max = 120000))]
+    pub timeout_ms: Option<u32>,
 }
 
 /// Response for `browser_evaluate`. The evaluated value plus the page context it

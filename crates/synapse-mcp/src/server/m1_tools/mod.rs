@@ -2840,6 +2840,7 @@ impl SynapseService {
         )?;
         let await_promise = params.0.await_promise.unwrap_or(true);
         let return_by_value = params.0.return_by_value.unwrap_or(true);
+        let timeout_ms = resolve_browser_evaluate_timeout_ms(params.0.timeout_ms)?;
         let backend_node_id = element.as_ref().map(|(backend, _)| *backend);
         let args = params.0.args.clone().unwrap_or_default();
         let request_details = json!({
@@ -2852,6 +2853,7 @@ impl SynapseService {
             "arg_count": args.len(),
             "await_promise": await_promise,
             "return_by_value": return_by_value,
+            "timeout_ms": timeout_ms,
             "required_foreground": false,
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
@@ -2866,6 +2868,7 @@ impl SynapseService {
                 &args,
                 await_promise,
                 return_by_value,
+                timeout_ms,
             )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
@@ -6434,6 +6437,7 @@ impl SynapseService {
         args: &[Value],
         await_promise: bool,
         return_by_value: bool,
+        timeout_ms: u64,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if backend_node_id.is_some() {
@@ -6451,17 +6455,10 @@ impl SynapseService {
                 args,
                 await_promise,
                 return_by_value,
+                timeout_ms,
             )
             .await
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "browser_evaluate normal Chrome bridge Runtime.evaluate failed: {}",
-                        error.detail()
-                    ),
-                )
-            })?;
+            .map_err(|error| classify_browser_evaluate_bridge_error(&error, "page", timeout_ms))?;
             let endpoint = evaluated
                 .extension_id
                 .as_deref()
@@ -6514,7 +6511,7 @@ impl SynapseService {
         let (evaluated, scope, readback_backend) = if let Some(backend_node_id) = backend_node_id {
             // Element scope: callFunctionOn the resolved node with args; `this`
             // and the first parameter are bound to the element.
-            let evaluated = synapse_a11y::cdp_evaluate_on_element(
+            let evaluated = synapse_a11y::cdp_evaluate_on_element_with_timeout(
                 &endpoint,
                 cdp_target_id,
                 backend_node_id,
@@ -6522,6 +6519,7 @@ impl SynapseService {
                 args,
                 await_promise,
                 return_by_value,
+                timeout_ms,
             )
             .await
             .map_err(|error| {
@@ -6533,12 +6531,13 @@ impl SynapseService {
             (evaluated, "element", "Runtime.callFunctionOn")
         } else if args.is_empty() {
             // Page scope, no args: plain Runtime.evaluate of the expression.
-            let evaluated = synapse_a11y::cdp_evaluate_expression(
+            let evaluated = synapse_a11y::cdp_evaluate_expression_with_timeout(
                 &endpoint,
                 cdp_target_id,
                 expression,
                 await_promise,
                 return_by_value,
+                timeout_ms,
             )
             .await
             .map_err(|error| {
@@ -6564,12 +6563,13 @@ impl SynapseService {
                 .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             let invocation = format!("({expression})({arg_list})");
-            let evaluated = synapse_a11y::cdp_evaluate_expression(
+            let evaluated = synapse_a11y::cdp_evaluate_expression_with_timeout(
                 &endpoint,
                 cdp_target_id,
                 &invocation,
                 await_promise,
                 return_by_value,
+                timeout_ms,
             )
             .await
             .map_err(|error| {
@@ -6635,6 +6635,7 @@ impl SynapseService {
         _args: &[Value],
         _await_promise: bool,
         _return_by_value: bool,
+        _timeout_ms: u64,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
         Err(mcp_error(
             error_codes::A11Y_NOT_AVAILABLE,
@@ -7091,6 +7092,7 @@ impl SynapseService {
                     &[],
                     true,
                     true,
+                    synapse_a11y::DEFAULT_EVALUATE_TIMEOUT_MS,
                 )
                 .await
                 .map_err(|error| {
@@ -11074,7 +11076,74 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
             ),
         ));
     }
+    resolve_browser_evaluate_timeout_ms(params.timeout_ms)?;
     Ok(())
+}
+
+/// Maps a Chrome-bridge evaluate error into an `ErrorData`, reclassifying a
+/// command timeout (either the extension's structured `BROWSER_EVALUATE_TIMEOUT`
+/// or a legacy `"timed out after"` message from an older loaded bridge) into a
+/// single, structured `BROWSER_EVALUATE_TIMEOUT` result that names the budget and
+/// tells the agent to retry with a larger `timeout_ms` — distinct from a thrown
+/// JS exception (issue #1596). All other errors keep the bridge's own code.
+fn classify_browser_evaluate_bridge_error(
+    error: &crate::chrome_debugger_bridge::ChromeDebuggerBridgeError,
+    scope: &str,
+    timeout_ms: u64,
+) -> ErrorData {
+    classify_browser_evaluate_error_parts(error.code(), error.detail(), scope, timeout_ms)
+}
+
+/// Pure classification of a Chrome-bridge evaluate failure by its `(code, detail)`
+/// pair. Factored out of [`classify_browser_evaluate_bridge_error`] so the timeout
+/// reclassification can be unit-tested without constructing a private bridge error
+/// type (issue #1596).
+fn classify_browser_evaluate_error_parts(
+    code: &'static str,
+    detail: &str,
+    scope: &str,
+    timeout_ms: u64,
+) -> ErrorData {
+    let is_timeout =
+        code == error_codes::BROWSER_EVALUATE_TIMEOUT || detail.contains("timed out after");
+    if is_timeout {
+        return mcp_error(
+            error_codes::BROWSER_EVALUATE_TIMEOUT,
+            format!(
+                "browser_evaluate ({scope} scope) Chrome bridge Runtime.evaluate was still running when the {timeout_ms} ms timeout_ms budget elapsed; the expression neither resolved nor threw. Retry with a larger timeout_ms (max {} ms) if the page work legitimately needs longer, or pass await_promise=false when evaluating a promise that never resolves. bridge_detail={detail}",
+                synapse_a11y::MAX_EVALUATE_TIMEOUT_MS
+            ),
+        );
+    }
+    mcp_error(
+        code,
+        format!("browser_evaluate normal Chrome bridge Runtime.evaluate failed: {detail}"),
+    )
+}
+
+/// Resolves the effective evaluate budget in milliseconds, applying the default
+/// when unset and enforcing the bounded `50..=120000` range. Returns a structured
+/// `TOOL_PARAMS_INVALID` error naming the offending value and the accepted range
+/// so an out-of-range request fails loudly instead of being silently clamped
+/// (issue #1596).
+fn resolve_browser_evaluate_timeout_ms(timeout_ms: Option<u32>) -> Result<u64, ErrorData> {
+    let Some(requested) = timeout_ms else {
+        return Ok(synapse_a11y::DEFAULT_EVALUATE_TIMEOUT_MS);
+    };
+    let requested = u64::from(requested);
+    if !(synapse_a11y::MIN_EVALUATE_TIMEOUT_MS..=synapse_a11y::MAX_EVALUATE_TIMEOUT_MS)
+        .contains(&requested)
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_evaluate timeout_ms must be in {}..={} ms; got {requested}",
+                synapse_a11y::MIN_EVALUATE_TIMEOUT_MS,
+                synapse_a11y::MAX_EVALUATE_TIMEOUT_MS
+            ),
+        ));
+    }
+    Ok(requested)
 }
 
 fn validate_browser_wait_facade_params(

@@ -26,6 +26,12 @@ pub const CHROME_DOM_ELEMENT_NOT_ACTIONABLE: &str = "CHROME_DOM_ELEMENT_NOT_ACTI
 pub const CHROME_DOM_ACTION_UNSUPPORTED: &str = "CHROME_DOM_ACTION_UNSUPPORTED";
 pub const CHROME_DOM_ACTION_POSTCONDITION_FAILED: &str = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
 pub const BROWSER_WAIT_TIMEOUT: &str = "BROWSER_WAIT_TIMEOUT";
+/// Emitted when an evaluate expression outlives its `timeout_ms` budget.
+///
+/// Distinct from `A11Y_CDP_AXTREE_FAILED`, which signals a thrown JS exception.
+/// The message carries the elapsed and budget milliseconds so an agent can retry
+/// with a larger `timeout_ms` rather than guessing.
+pub const BROWSER_EVALUATE_TIMEOUT: &str = "BROWSER_EVALUATE_TIMEOUT";
 pub const BROWSER_NAVIGATION_FAILED: &str = "BROWSER_NAVIGATION_FAILED";
 pub const A11Y_UIA_WORKER_TIMEOUT: &str = "A11Y_UIA_WORKER_TIMEOUT";
 pub const A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE: &str =
