@@ -15653,16 +15653,34 @@ function runAriaSnapshotInPage(request) {
     }
     const path = domPath(element);
     const children = Array.from(element.children || []);
+    const role = inferRole(element);
+    const name = accessibleName(element).replace(/\s+/g, " ").trim();
+    const rawValue = elementValue(element);
+    // #1558: classify + redact credential/secret control values AT SOURCE (this
+    // page-context builder has full DOM access). Sensitive values never leave the
+    // page: we emit only role/name plus non-secret evidence (length + a
+    // non-reversible hash). Metadata (input_type/autocomplete) is forwarded so the
+    // Rust host can re-apply the same policy as defense-in-depth.
+    const inputType = controlInputType(element);
+    const autocomplete = stringOrNull(element.getAttribute("autocomplete"));
+    const controlId = stringOrNull(element.id);
+    const sensitive = controlValueIsSensitive(inputType, autocomplete, name, controlId, rawValue);
+    const hasRawValue = rawValue != null && String(rawValue).length > 0;
     nodes.push({
       element_id: path,
       parent_element_id: parentPath,
       depth,
-      role: inferRole(element),
-      name: accessibleName(element).replace(/\s+/g, " ").trim(),
-      value: elementValue(element),
+      role,
+      name,
+      value: sensitive ? null : rawValue,
       enabled: isElementEnabled(element),
       focused: document.activeElement === element,
-      children_count: children.length
+      children_count: children.length,
+      input_type: inputType,
+      autocomplete,
+      redacted: sensitive,
+      value_length: sensitive && hasRawValue ? String(rawValue).length : null,
+      value_hash: sensitive && hasRawValue ? nonReversibleValueHash(String(rawValue)) : null
     });
     for (const child of children) {
       walk(child, path, depth + 1);
@@ -15753,6 +15771,96 @@ function runAriaSnapshotInPage(request) {
       return false;
     }
     return String(element.getAttribute("aria-disabled") || "").toLowerCase() !== "true";
+  }
+
+  // #1558 helpers (page-context; must be defined inside the injected builder).
+  function stringOrNull(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    const text = String(value).trim();
+    return text ? text : null;
+  }
+
+  function controlInputType(element) {
+    // Prefer the normalized DOM property (an <input> with no type reports "text",
+    // a hidden input reports "hidden"), falling back to the raw attribute.
+    if ("type" in element && typeof element.type === "string" && element.type) {
+      return String(element.type).toLowerCase();
+    }
+    return stringOrNull(element.getAttribute("type"))?.toLowerCase() ?? null;
+  }
+
+  function autocompleteIsSensitive(autocomplete) {
+    if (!autocomplete) {
+      return false;
+    }
+    // autocomplete may be a space-separated token list; treat every cc-* token and
+    // the password/one-time-code tokens as sensitive.
+    return String(autocomplete)
+      .toLowerCase()
+      .split(/\s+/)
+      .some((token) =>
+        token === "current-password" ||
+        token === "new-password" ||
+        token === "one-time-code" ||
+        token.startsWith("cc-")
+      );
+  }
+
+  function nameLooksSecret(text) {
+    if (!text) {
+      return false;
+    }
+    // Case-insensitive; optional separators so api_key/api-key/apiKey/apikey match.
+    // Substring (not word-bounded): over-redaction is acceptable, under-redaction is not.
+    return /password|passwd|pwd|secret|token|api[-_ ]?key|apikey|auth|bearer|credential|private[-_ ]?key|cvv|cvc|card[-_ ]?number|ccnumber|otp|one[-_ ]?time|passcode|pin|session[-_ ]?id|csrf/i.test(
+      String(text)
+    );
+  }
+
+  function valueIsHighEntropyToken(value) {
+    const text = String(value ?? "").trim();
+    if (text.length < 16 || /\s/.test(text)) {
+      return false;
+    }
+    return /[A-Za-z]/.test(text) && /[0-9]/.test(text);
+  }
+
+  function controlValueIsSensitive(inputType, autocomplete, name, controlId, rawValue) {
+    const type = String(inputType || "").toLowerCase();
+    if (type === "password" || type === "hidden") {
+      return true;
+    }
+    if (autocompleteIsSensitive(autocomplete)) {
+      return true;
+    }
+    if (nameLooksSecret(name) || nameLooksSecret(controlId)) {
+      return true;
+    }
+    // Ambiguous/unknown metadata + a token-like value fails closed (redact).
+    const metadataKnown = Boolean(inputType) || Boolean(autocomplete);
+    if (!metadataKnown && rawValue != null && valueIsHighEntropyToken(rawValue)) {
+      return true;
+    }
+    return false;
+  }
+
+  function nonReversibleValueHash(value) {
+    // Deterministic, non-cryptographic, NON-REVERSIBLE 32-bit FNV-1a digest. Used
+    // only as an equality tag for redacted values; the original cannot be recovered
+    // from the 8-hex-digit output. (crypto.subtle is async and awkward in this sync
+    // injected context, so a simple deterministic hash is used per #1558 guidance.)
+    const text = String(value);
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      hash ^= code & 0xff;
+      hash = Math.imul(hash, 0x01000193);
+      hash ^= (code >> 8) & 0xff;
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
   }
 
   function elementByPath(path) {
@@ -17389,9 +17497,18 @@ function prefixAriaSnapshotNode(node, tabId, frameId) {
     value: node?.value == null ? null : String(node.value),
     enabled: node?.enabled !== false,
     focused: Boolean(node?.focused),
-    children_count: Number.isSafeInteger(node?.children_count) ? node.children_count : 0
+    children_count: Number.isSafeInteger(node?.children_count) ? node.children_count : 0,
+    // #1558: carry credential-redaction metadata through so the host can re-apply
+    // the policy as defense-in-depth. `redacted` nodes already have value === null.
+    input_type: node?.input_type == null ? null : String(node.input_type),
+    autocomplete: node?.autocomplete == null ? null : String(node.autocomplete),
+    redacted: Boolean(node?.redacted),
+    value_length: Number.isSafeInteger(node?.value_length) ? node.value_length : null,
+    value_hash: node?.value_hash == null ? null : String(node.value_hash)
   };
 }
+
+const ARIA_SNAPSHOT_REDACTED_MARKER = "[redacted]";
 
 function renderPrefixedAriaSnapshot(nodes) {
   return nodes.map((node) => {
@@ -17399,7 +17516,10 @@ function renderPrefixedAriaSnapshot(nodes) {
     if (node.name) {
       line += ` "${escapeSnapshotScalar(node.name)}"`;
     }
-    if (node.value) {
+    if (node.redacted) {
+      // #1558: never emit the raw value; show the redaction marker instead.
+      line += `: "${ARIA_SNAPSHOT_REDACTED_MARKER}"`;
+    } else if (node.value) {
       line += `: "${escapeSnapshotScalar(node.value)}"`;
     }
     if (!node.enabled) {

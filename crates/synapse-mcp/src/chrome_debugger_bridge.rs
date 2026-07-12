@@ -2047,6 +2047,21 @@ pub struct ChromeDebuggerAriaSnapshotNode {
     pub focused: bool,
     #[serde(default)]
     pub children_count: u32,
+    // #1558 credential-redaction metadata. The browser-side AX builder classifies
+    // and redacts sensitive form-control values at source; these fields let the host
+    // re-apply the same classification as defense-in-depth before the snapshot reaches
+    // MCP output, daemon logs, transcripts, or persisted audit rows. Wire format is
+    // snake_case (this struct does not use `rename_all`), matching the extension.
+    #[serde(default)]
+    pub input_type: Option<String>,
+    #[serde(default)]
+    pub autocomplete: Option<String>,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub value_length: Option<usize>,
+    #[serde(default)]
+    pub value_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6780,6 +6795,169 @@ pub async fn set_content(
     })
 }
 
+/// #1558: marker substituted for any redacted control value, in both the node
+/// `value` field and the pre-rendered `snapshot` string.
+const ARIA_SNAPSHOT_REDACTED_MARKER: &str = "[redacted]";
+
+/// #1558: non-reversible short hash of a redacted control value, for equality
+/// proofs without exposing the secret. Truncated SHA-256 hex is one-way: the
+/// original value cannot be recovered from it. Prefixed to document the algorithm.
+fn aria_value_hash(value: &str) -> String {
+    let full = sha256_hex_lower(value.as_bytes());
+    format!("sha256:{}", &full[..16.min(full.len())])
+}
+
+/// #1558: `true` when an `autocomplete` attribute marks a credential/secret value.
+/// Handles space-separated token lists (e.g. "section-blue shipping cc-number")
+/// and treats every `cc-*` token as sensitive per the research-backed policy.
+fn aria_autocomplete_is_sensitive(autocomplete: &str) -> bool {
+    autocomplete.split_whitespace().any(|token| {
+        let token = token.trim().to_ascii_lowercase();
+        matches!(
+            token.as_str(),
+            "current-password" | "new-password" | "one-time-code"
+        ) || token.starts_with("cc-")
+    })
+}
+
+/// #1558: case-insensitive secret-name predicate matching the same alternation
+/// used by the browser-side builder. Separators are optional so `api_key`,
+/// `api-key`, `apiKey`, and `apikey` all match. Substring (not word-bounded)
+/// matching is intentional: over-redaction is acceptable, under-redaction is not.
+fn aria_name_looks_secret(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let hay = name.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "apikey",
+        "api key",
+        "api-key",
+        "api_key",
+        "auth",
+        "bearer",
+        "credential",
+        "privatekey",
+        "private key",
+        "private-key",
+        "private_key",
+        "cvv",
+        "cvc",
+        "cardnumber",
+        "card number",
+        "card-number",
+        "card_number",
+        "ccnumber",
+        "otp",
+        "onetime",
+        "one time",
+        "one-time",
+        "one_time",
+        "passcode",
+        "pin",
+        "sessionid",
+        "session id",
+        "session-id",
+        "session_id",
+        "csrf",
+    ];
+    PATTERNS.iter().any(|needle| hay.contains(needle))
+}
+
+/// #1558: heuristic for a high-entropy / token-like value. Used only to fail
+/// closed when field metadata is ambiguous/unknown: a long, whitespace-free run
+/// mixing letters and digits is treated as a probable secret and redacted.
+fn aria_value_is_high_entropy_token(value: &str) -> bool {
+    let value = value.trim();
+    let len = value.chars().count();
+    if len < 16 {
+        return false;
+    }
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let has_alpha = value.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = value.chars().any(|c| c.is_ascii_digit());
+    has_alpha && has_digit
+}
+
+/// #1558: re-apply the redaction policy to a single node. Returns `true` when the
+/// control's value must not be exposed. Ambiguous metadata fails closed.
+fn aria_node_is_sensitive(node: &ChromeDebuggerAriaSnapshotNode) -> bool {
+    if let Some(input_type) = node.input_type.as_deref() {
+        let input_type = input_type.trim().to_ascii_lowercase();
+        if input_type == "password" || input_type == "hidden" {
+            return true;
+        }
+    }
+    if let Some(autocomplete) = node.autocomplete.as_deref() {
+        if aria_autocomplete_is_sensitive(autocomplete) {
+            return true;
+        }
+    }
+    if aria_name_looks_secret(&node.name) {
+        return true;
+    }
+    // Ambiguous/unknown metadata + a token-like value fails closed (redact).
+    let metadata_known = node.input_type.is_some() || node.autocomplete.is_some();
+    if !metadata_known {
+        if let Some(value) = node.value.as_deref() {
+            if aria_value_is_high_entropy_token(value) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// #1558: host-side, last-choke-point redaction pass over a deserialized aria
+/// snapshot. Runs before the result is returned to MCP output/logs/audit and does
+/// not trust the browser to have redacted. For every sensitive node it strips the
+/// raw `value`, records `value_length` + a non-reversible `value_hash`, and sets
+/// `redacted = true`; it then scrubs any surviving raw value substring out of the
+/// pre-rendered `snapshot` string. Returns the total number of redacted nodes.
+/// Never logs or returns any secret value.
+fn redact_aria_snapshot(result: &mut ChromeDebuggerAriaSnapshotResult) -> usize {
+    // Capture raw values we strip so we can scrub them from `snapshot` afterwards.
+    let mut leaked_values: Vec<String> = Vec::new();
+    for node in &mut result.nodes {
+        let sensitive = node.redacted || aria_node_is_sensitive(node);
+        if !sensitive {
+            continue;
+        }
+        if let Some(raw) = node.value.take() {
+            if !raw.is_empty() {
+                // Re-derive evidence from the value the host can actually see so a
+                // stale/bypassed browser cannot suppress it.
+                node.value_length = Some(raw.chars().count());
+                node.value_hash = Some(aria_value_hash(&raw));
+                leaked_values.push(raw);
+            }
+        }
+        // `node.value` is now None regardless of source; browser-supplied
+        // value_length/value_hash (if any) are preserved when the host saw no raw.
+        node.redacted = true;
+    }
+    // Scrub the pre-rendered snapshot string. Longest-first avoids partial-overlap
+    // artifacts when one leaked value is a substring of another.
+    if !leaked_values.is_empty() && !result.snapshot.is_empty() {
+        leaked_values.sort_by(|a, b| b.len().cmp(&a.len()));
+        for raw in &leaked_values {
+            if !raw.is_empty() {
+                result.snapshot = result
+                    .snapshot
+                    .replace(raw.as_str(), ARIA_SNAPSHOT_REDACTED_MARKER);
+            }
+        }
+    }
+    result.nodes.iter().filter(|node| node.redacted).count()
+}
+
 pub async fn aria_snapshot(
     hwnd: i64,
     target_id: &str,
@@ -6800,11 +6978,27 @@ pub async fn aria_snapshot(
             }),
         )
         .await?;
-    serde_json::from_value::<ChromeDebuggerAriaSnapshotResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger ariaSnapshot response: {error}"
-        ))
-    })
+    let mut snapshot =
+        serde_json::from_value::<ChromeDebuggerAriaSnapshotResult>(result).map_err(|error| {
+            ChromeDebuggerBridgeError::protocol(format!(
+                "decode Chrome debugger ariaSnapshot response: {error}"
+            ))
+        })?;
+    // #1558: defense-in-depth. Redact sensitive form-control values on the host
+    // before the snapshot can reach MCP output, logs, transcripts, or audit rows.
+    let redacted_nodes = redact_aria_snapshot(&mut snapshot);
+    if redacted_nodes > 0 {
+        // Fail-loud, count only. Never log any value.
+        tracing::warn!(
+            code = "ARIA_SNAPSHOT_REDACTED",
+            hwnd,
+            target_id,
+            redacted_nodes,
+            node_count = snapshot.nodes.len(),
+            "redacted sensitive form-control values from aria snapshot before return"
+        );
+    }
+    Ok(snapshot)
 }
 
 pub async fn assert_poll(
@@ -10296,5 +10490,252 @@ mod tests {
         assert!(formatted.contains("risk-7"));
         assert!(!formatted.contains("risk-8 |"));
         assert!(formatted.ends_with("+2 more"));
+    }
+
+    // ---- #1558 aria_snapshot credential redaction (host defense-in-depth) ----
+
+    fn aria_test_node(
+        name: &str,
+        value: Option<&str>,
+        input_type: Option<&str>,
+        autocomplete: Option<&str>,
+    ) -> ChromeDebuggerAriaSnapshotNode {
+        ChromeDebuggerAriaSnapshotNode {
+            element_id: "chrome-tab:1:frame:0:path:0.1".to_owned(),
+            parent_element_id: None,
+            depth: 1,
+            role: "textbox".to_owned(),
+            name: name.to_owned(),
+            value: value.map(str::to_owned),
+            enabled: true,
+            focused: false,
+            children_count: 0,
+            input_type: input_type.map(str::to_owned),
+            autocomplete: autocomplete.map(str::to_owned),
+            redacted: false,
+            value_length: None,
+            value_hash: None,
+        }
+    }
+
+    fn aria_test_result(
+        nodes: Vec<ChromeDebuggerAriaSnapshotNode>,
+    ) -> ChromeDebuggerAriaSnapshotResult {
+        // Render a snapshot string that embeds each node's raw value the same way
+        // the browser-side renderer does, so we can prove the scrub removes secrets.
+        let snapshot = nodes
+            .iter()
+            .map(|node| {
+                let mut line = format!("- {} \"{}\"", node.role, node.name);
+                if let Some(value) = node.value.as_deref() {
+                    line.push_str(&format!(": \"{value}\""));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ChromeDebuggerAriaSnapshotResult {
+            target_id: "target-1".to_owned(),
+            tab_id: 1,
+            chrome_window_id: None,
+            url: "https://example.test/login".to_owned(),
+            title: "Login".to_owned(),
+            ready_state: "complete".to_owned(),
+            root_element_id: None,
+            snapshot,
+            node_count: nodes.len(),
+            total_ax_nodes: nodes.len() as u32,
+            nodes,
+            max_nodes: 500,
+            max_depth: 32,
+            truncated_by_max_nodes: false,
+            truncated_by_depth: false,
+            frame_tree_frame_count: 1,
+            attached_frame_target_count: 0,
+            blocked_frame_targets: Vec::new(),
+            frame_snapshot_errors: Vec::new(),
+            readback_backend: "test".to_owned(),
+            backend_tier_used: "test".to_owned(),
+            required_foreground: false,
+            target_candidate_count: 1,
+            target_selection_reason: "test".to_owned(),
+            extension_id: None,
+        }
+    }
+
+    #[test]
+    fn aria_redaction_strips_password_field_value_and_snapshot() {
+        const SENTINEL: &str = "S3cr3t-SENTINEL-A";
+        let mut result = aria_test_result(vec![aria_test_node(
+            "Password",
+            Some(SENTINEL),
+            Some("password"),
+            None,
+        )]);
+        let before = result.nodes[0].value.clone();
+        let redacted_count = redact_aria_snapshot(&mut result);
+        let node = &result.nodes[0];
+        println!(
+            "readback=password before={before:?} after={:?} redacted_count={redacted_count}",
+            node.value
+        );
+        assert_eq!(redacted_count, 1);
+        assert!(node.redacted);
+        assert!(node.value.is_none());
+        assert_eq!(node.value_length, Some(SENTINEL.chars().count()));
+        assert!(node.value_hash.is_some());
+        // role/name preserved as safe evidence.
+        assert_eq!(node.role, "textbox");
+        assert_eq!(node.name, "Password");
+        // Sentinel absent from node debug rendering AND from the snapshot string.
+        assert!(!format!("{node:?}").contains(SENTINEL));
+        assert!(!result.snapshot.contains(SENTINEL));
+        assert!(result.snapshot.contains(ARIA_SNAPSHOT_REDACTED_MARKER));
+    }
+
+    #[test]
+    fn aria_redaction_strips_one_time_code_autocomplete() {
+        const SENTINEL: &str = "123456-SENTINEL";
+        let mut result = aria_test_result(vec![aria_test_node(
+            "Verification code",
+            Some(SENTINEL),
+            Some("text"),
+            Some("one-time-code"),
+        )]);
+        let redacted_count = redact_aria_snapshot(&mut result);
+        let node = &result.nodes[0];
+        println!(
+            "readback=one-time-code after={:?} redacted_count={redacted_count}",
+            node.value
+        );
+        assert_eq!(redacted_count, 1);
+        assert!(node.redacted);
+        assert!(node.value.is_none());
+        assert_eq!(node.value_length, Some(SENTINEL.chars().count()));
+        assert!(node.value_hash.is_some());
+        assert!(!result.snapshot.contains(SENTINEL));
+    }
+
+    #[test]
+    fn aria_redaction_strips_hidden_input_token() {
+        const SENTINEL: &str = "hidden-token-SENTINEL-xyz";
+        let mut result = aria_test_result(vec![aria_test_node(
+            "csrf_field",
+            Some(SENTINEL),
+            Some("hidden"),
+            None,
+        )]);
+        let redacted_count = redact_aria_snapshot(&mut result);
+        let node = &result.nodes[0];
+        println!(
+            "readback=hidden after={:?} redacted_count={redacted_count}",
+            node.value
+        );
+        assert_eq!(redacted_count, 1);
+        assert!(node.redacted);
+        assert!(node.value.is_none());
+        assert!(!result.snapshot.contains(SENTINEL));
+    }
+
+    #[test]
+    fn aria_redaction_preserves_ordinary_textbox() {
+        const VISIBLE: &str = "hello world";
+        let mut result = aria_test_result(vec![aria_test_node(
+            "Search",
+            Some(VISIBLE),
+            Some("text"),
+            Some("off"),
+        )]);
+        let redacted_count = redact_aria_snapshot(&mut result);
+        let node = &result.nodes[0];
+        println!(
+            "readback=search after={:?} redacted_count={redacted_count}",
+            node.value
+        );
+        assert_eq!(redacted_count, 0);
+        assert!(!node.redacted);
+        assert_eq!(node.value.as_deref(), Some(VISIBLE));
+        assert!(node.value_hash.is_none());
+        assert!(result.snapshot.contains(VISIBLE));
+    }
+
+    #[test]
+    fn aria_redaction_fails_closed_on_ambiguous_high_entropy_value() {
+        const SENTINEL: &str = "sk_live_SENTINEL_0xDEADBEEFCAFE";
+        // No input_type, no autocomplete, benign-looking name: metadata is unknown,
+        // so a token-like value must fail closed and be redacted.
+        let mut result = aria_test_result(vec![aria_test_node(
+            "field",
+            Some(SENTINEL),
+            None,
+            None,
+        )]);
+        let redacted_count = redact_aria_snapshot(&mut result);
+        let node = &result.nodes[0];
+        println!(
+            "readback=ambiguous after={:?} redacted_count={redacted_count}",
+            node.value
+        );
+        assert_eq!(redacted_count, 1);
+        assert!(node.redacted);
+        assert!(node.value.is_none());
+        assert_eq!(node.value_length, Some(SENTINEL.chars().count()));
+        assert!(node.value_hash.is_some());
+        assert!(!result.snapshot.contains(SENTINEL));
+    }
+
+    #[test]
+    fn aria_redaction_scrubs_all_sentinels_from_snapshot_string() {
+        const PW: &str = "S3cr3t-SENTINEL-A";
+        const OTP: &str = "123456-SENTINEL";
+        const HIDDEN: &str = "hidden-token-SENTINEL-xyz";
+        const AMBIG: &str = "sk_live_SENTINEL_0xDEADBEEFCAFE";
+        const VISIBLE: &str = "hello world";
+        let mut result = aria_test_result(vec![
+            aria_test_node("Password", Some(PW), Some("password"), None),
+            aria_test_node("Code", Some(OTP), Some("text"), Some("one-time-code")),
+            aria_test_node("csrf", Some(HIDDEN), Some("hidden"), None),
+            aria_test_node("field", Some(AMBIG), None, None),
+            aria_test_node("Search", Some(VISIBLE), Some("text"), Some("off")),
+        ]);
+        let redacted_count = redact_aria_snapshot(&mut result);
+        println!(
+            "readback=snapshot-scrub redacted_count={redacted_count} snapshot={:?}",
+            result.snapshot
+        );
+        assert_eq!(redacted_count, 4);
+        for sentinel in [PW, OTP, HIDDEN, AMBIG] {
+            assert!(
+                !result.snapshot.contains(sentinel),
+                "sentinel {sentinel} survived in snapshot"
+            );
+            for node in &result.nodes {
+                assert_ne!(node.value.as_deref(), Some(sentinel));
+            }
+        }
+        // The ordinary visible value is preserved.
+        assert!(result.snapshot.contains(VISIBLE));
+    }
+
+    #[test]
+    fn aria_redaction_honors_browser_supplied_redacted_flag() {
+        // A stale/older browser may already have redacted (value stripped) but the
+        // host must still count it and keep the evidence fields intact.
+        let mut node = aria_test_node("Password", None, Some("password"), None);
+        node.redacted = true;
+        node.value_length = Some(12);
+        node.value_hash = Some("sha256:deadbeefdeadbeef".to_owned());
+        let mut result = aria_test_result(vec![node]);
+        let redacted_count = redact_aria_snapshot(&mut result);
+        let node = &result.nodes[0];
+        println!(
+            "readback=browser-redacted after={:?} redacted_count={redacted_count}",
+            node.value
+        );
+        assert_eq!(redacted_count, 1);
+        assert!(node.redacted);
+        assert!(node.value.is_none());
+        assert_eq!(node.value_length, Some(12));
+        assert_eq!(node.value_hash.as_deref(), Some("sha256:deadbeefdeadbeef"));
     }
 }
