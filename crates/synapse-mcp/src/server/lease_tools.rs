@@ -718,7 +718,10 @@ fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, E
                 session_id = %session_id,
                 "readback=input_lease outcome=released"
             );
-            Ok(ControlLeaseResponse::released(session_id.to_owned(), &status))
+            Ok(ControlLeaseResponse::released(
+                session_id.to_owned(),
+                &status,
+            ))
         }
         Err(error) => match &error {
             // #1556: releasing an unheld/expired lease is the *expected* end
@@ -737,9 +740,9 @@ fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, E
             }
             // Held by a DIFFERENT live session — a real caller bug (releasing
             // someone else's lease). Keep the hard fail-closed error.
-            LeaseError::NotHeld { holder: Some(_), .. } => {
-                Err(lease_not_held_error(session_id, &error))
-            }
+            LeaseError::NotHeld {
+                holder: Some(_), ..
+            } => Err(lease_not_held_error(session_id, &error)),
         },
     }
 }

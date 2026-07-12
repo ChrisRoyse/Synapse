@@ -3078,7 +3078,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_get_absent_ok_true_on_present_key_returns_value_found_true() -> anyhow::Result<()> {
+    fn workspace_get_absent_ok_true_on_present_key_returns_value_found_true() -> anyhow::Result<()>
+    {
         let temp = TempDir::new()?;
         let service = service_with_db(temp.path())?;
 

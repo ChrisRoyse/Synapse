@@ -4821,7 +4821,9 @@ fn bridge_build_id_stale_reason(
             "build_id_skew=daemon_expected_build_mismatch loaded_build_id={actual_build_id} expected_build_id={expected_build_id} service_worker_sha256_matches_expected=true repair=restart_or_reinstall_repo_built_daemon"
         ));
     }
-    Some(format!("build_id={actual_build_id} expected={expected_build_id}"))
+    Some(format!(
+        "build_id={actual_build_id} expected={expected_build_id}"
+    ))
 }
 
 fn setup_repair_guidance() -> String {

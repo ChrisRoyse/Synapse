@@ -1,9 +1,9 @@
 // Split-out sibling of the m4_tools module; the globs mirror the pre-split
 // single-module layout and keep the shared symbol set in one place.
 #[allow(clippy::wildcard_imports)]
-use super::*;
-#[allow(clippy::wildcard_imports)]
 use super::types::*;
+#[allow(clippy::wildcard_imports)]
+use super::*;
 
 pub(super) fn shell_facade_error(
     operation: ShellOperation,
@@ -274,7 +274,9 @@ pub(super) fn shell_start_params(params: ShellParams) -> Result<ActRunShellStart
     })
 }
 
-pub(super) fn shell_status_params(params: ShellParams) -> Result<ActRunShellStatusParams, ErrorData> {
+pub(super) fn shell_status_params(
+    params: ShellParams,
+) -> Result<ActRunShellStatusParams, ErrorData> {
     let mut unexpected = Vec::new();
     if params.command.is_some() {
         unexpected.push("command");
@@ -315,7 +317,9 @@ pub(super) fn shell_status_params(params: ShellParams) -> Result<ActRunShellStat
     })
 }
 
-pub(super) fn shell_cancel_params(params: ShellParams) -> Result<ActRunShellJobIdParams, ErrorData> {
+pub(super) fn shell_cancel_params(
+    params: ShellParams,
+) -> Result<ActRunShellJobIdParams, ErrorData> {
     let mut unexpected = Vec::new();
     if params.command.is_some() {
         unexpected.push("command");
@@ -514,7 +518,10 @@ pub(super) fn process_row_matches(filters: &ProcessFilters, row: &ProcessRow) ->
     true
 }
 
-pub(super) fn process_history_row_matches(filters: &ProcessFilters, row: &ProcessHistoryRow) -> bool {
+pub(super) fn process_history_row_matches(
+    filters: &ProcessFilters,
+    row: &ProcessHistoryRow,
+) -> bool {
     if filters.pid.is_some_and(|pid| row.pid != Some(pid)) {
         return false;
     }
@@ -537,7 +544,9 @@ pub(super) fn process_history_row_matches(filters: &ProcessFilters, row: &Proces
     true
 }
 
-pub(super) fn process_list_response(params: &ProcessParams) -> Result<ProcessListResponse, ErrorData> {
+pub(super) fn process_list_response(
+    params: &ProcessParams,
+) -> Result<ProcessListResponse, ErrorData> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let limit = validate_process_query_params(ProcessOperation::List, params)?;

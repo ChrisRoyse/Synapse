@@ -1,0 +1,6 @@
+[toolchain]
+# Pin the toolchain channel so `cargo fmt`/`cargo clippy` are reproducible across
+# contributors (this repo has no CI to enforce a version). `rustfmt` + `clippy`
+# are declared so a fresh checkout has the components the workspace lints require.
+channel = "stable"
+components = ["rustfmt", "clippy"]

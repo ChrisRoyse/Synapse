@@ -2770,13 +2770,12 @@ mod tests {
         );
 
         // The isolated service must NOT fold the foreign global owner in.
-        let page =
-            service.session_list_impl_with_options(SessionListOptions::from_tool_params(
-                SessionListParams {
-                    limit: Some(10),
-                    ..SessionListParams::default()
-                },
-            )?)?;
+        let page = service.session_list_impl_with_options(SessionListOptions::from_tool_params(
+            SessionListParams {
+                limit: Some(10),
+                ..SessionListParams::default()
+            },
+        )?)?;
         assert_eq!(
             page.total_count, 3,
             "foreign global lease owner leaked into session_list (issue #1574 regression)"

@@ -165,7 +165,8 @@ mod tests {
         // The continuation cursor IS surfaced so the partial page is pageable (#1515);
         // it is a resume key, not a success/row-count proof.
         assert_eq!(
-            data.get("next_start_key_hex").and_then(|value| value.as_str()),
+            data.get("next_start_key_hex")
+                .and_then(|value| value.as_str()),
             Some("18be7a763bd0462c0000005500")
         );
     }

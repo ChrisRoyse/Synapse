@@ -26,8 +26,7 @@ const REALITY_WRITE_GRANT_SOURCE_OF_TRUTH: &str =
     "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows";
 /// #1559: the misleading-contract fix, stated on every reality-write status and
 /// grant/revoke response so a facade profile is never mistaken for a grant.
-const PROFILE_INDEPENDENT_OF_GRANTS_NOTE: &str =
-    "the selected facade tool-visibility profile (e.g. full_capability) is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself; reality-write requires an explicit startup grant (SYNAPSE_MCP_ALLOWED_PERMISSIONS listing WRITE_STORAGE) or a runtime profile operation=grant_reality_write overlay";
+const PROFILE_INDEPENDENT_OF_GRANTS_NOTE: &str = "the selected facade tool-visibility profile (e.g. full_capability) is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself; reality-write requires an explicit startup grant (SYNAPSE_MCP_ALLOWED_PERMISSIONS listing WRITE_STORAGE) or a runtime profile operation=grant_reality_write overlay";
 pub(crate) const PUBLIC_TOOL_LIMIT: usize = 40;
 const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
@@ -2882,15 +2881,16 @@ impl SynapseService {
         // Consult (and lazily clear any expired) overlay so the readback matches
         // exactly what enforcement would decide right now.
         let overlay_active = state.reality_write_grant_active();
-        let overlay = state.reality_write_grant_snapshot().map(|snapshot| {
-            RealityWriteOverlayReadback {
-                granted_by: snapshot.granted_by,
-                reason: snapshot.reason,
-                granted_at: snapshot.granted_at.to_rfc3339(),
-                expires_at: snapshot.expires_at.to_rfc3339(),
-                remaining_ms: snapshot.remaining_ms,
-            }
-        });
+        let overlay =
+            state
+                .reality_write_grant_snapshot()
+                .map(|snapshot| RealityWriteOverlayReadback {
+                    granted_by: snapshot.granted_by,
+                    reason: snapshot.reason,
+                    granted_at: snapshot.granted_at.to_rfc3339(),
+                    expires_at: snapshot.expires_at.to_rfc3339(),
+                    remaining_ms: snapshot.remaining_ms,
+                });
         let effective_grant_names = state
             .permission_grants
             .names()
@@ -2900,8 +2900,7 @@ impl SynapseService {
         let config_source = state.permission_grants_source;
         drop(state);
         Ok(M3PermissionStatus {
-            source_of_truth:
-                "M3State.permission_grants (startup) + in-memory reality_write_grant overlay",
+            source_of_truth: "M3State.permission_grants (startup) + in-memory reality_write_grant overlay",
             effective_grant_names,
             config_source,
             reality_write_overlay_active: overlay_active,
@@ -2946,9 +2945,12 @@ impl SynapseService {
             ),
         )?);
 
-        if let Err(error) =
-            validate_reality_write_grant_gate(session_id, reason.as_deref(), confirm_break_glass, &lease_proof)
-        {
+        if let Err(error) = validate_reality_write_grant_gate(
+            session_id,
+            reason.as_deref(),
+            confirm_break_glass,
+            &lease_proof,
+        ) {
             let final_audit = self.command_audit_final(
                 super::command_audit::CommandAuditInput::mcp(
                     "profile",
@@ -2964,7 +2966,9 @@ impl SynapseService {
                     }),
                     "error",
                 )
-                .with_error(super::command_audit::command_audit_error_from_error_data(&error)),
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
             )?;
             let _final_audit = audit_readback(final_audit);
             return Err(error);

@@ -64,16 +64,16 @@ const PROCESS_HISTORY_MAX_LIMIT: usize = 200;
 
 mod agent_spawn;
 mod facade;
-mod types;
 #[cfg(test)]
 mod tests;
+mod types;
 
-pub use self::types::*;
-pub(super) use self::types::shell_input_schema;
+pub(crate) use self::agent_spawn::agent_spawn_root_dir;
+pub(super) use self::agent_spawn::*;
 #[allow(clippy::wildcard_imports)]
 use self::facade::*;
-pub(super) use self::agent_spawn::*;
-pub(crate) use self::agent_spawn::agent_spawn_root_dir;
+pub(super) use self::types::shell_input_schema;
+pub use self::types::*;
 /// Builds the per-spawn manifest JSON. Records the CLI, resolved working
 /// directory, and, when the operator pinned one, the model. This is the
 /// authoritative run identity the transcript ingester and respawn path read.

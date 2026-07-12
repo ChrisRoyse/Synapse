@@ -16,9 +16,7 @@ use synapse_core::{Backend, ChromeBridgeDetail};
 /// `detail` blobs, so callers still learn the health conclusion at a fraction
 /// of the wire size. `Full` preserves the complete legacy output for
 /// debugging.
-#[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthDetail {
     /// Drop verbose per-subsystem `detail` prose; keep structured verdicts.
@@ -743,7 +741,11 @@ fn parse_chrome_bridge_detail(detail: &str) -> ChromeBridgeDetail {
             _ => None,
         })
     };
-    let u64_field = |key: &str| fields.get(key).and_then(|value| (*value).parse::<u64>().ok());
+    let u64_field = |key: &str| {
+        fields
+            .get(key)
+            .and_then(|value| (*value).parse::<u64>().ok())
+    };
     let string_field = |key: &str| fields.get(key).map(|value| (*value).to_owned());
     ChromeBridgeDetail {
         tab_control_available: bool_field("tab_control_available"),
@@ -960,7 +962,10 @@ mod tests {
                 compact_sub.status, full_sub.status,
                 "subsystem {name} status must match between compact and full"
             );
-            println!("evidence=verdict subsystem={name} status={}", full_sub.status);
+            println!(
+                "evidence=verdict subsystem={name} status={}",
+                full_sub.status
+            );
         }
         // Full keeps the detail prose; compact drops it.
         let full_bridge = &full.subsystems["chrome_bridge"];
@@ -1012,7 +1017,10 @@ mod tests {
         );
         // An independent parse of the raw blob reproduces the surfaced struct.
         let reparsed = parse_chrome_bridge_detail(raw_detail);
-        assert_eq!(&reparsed, structured, "parser is deterministic and lossless");
+        assert_eq!(
+            &reparsed, structured,
+            "parser is deterministic and lossless"
+        );
         println!(
             "evidence=chrome_bridge_struct tab_control_available={tab_control_available} host_count={host_count} expected_extension_id={expected_extension_id}"
         );

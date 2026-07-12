@@ -1363,7 +1363,10 @@ mod tests {
         .expect("nested cdp_target_id must deserialize");
         let top_cdp = top_level.cdp_target_id.clone();
         let top_hwnd = top_level.window_hwnd;
-        let spec = top_level.set_value.as_mut().expect("set_value spec present");
+        let spec = top_level
+            .set_value
+            .as_mut()
+            .expect("set_value spec present");
         println!("readback=before cdp_target_id={:?}", spec.cdp_target_id);
         merge_top_level_target(
             FORM_TOOL,

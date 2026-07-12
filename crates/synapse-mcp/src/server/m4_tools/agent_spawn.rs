@@ -37,7 +37,10 @@ pub(super) fn validate_spawn_local_model_static_requirements(
     Ok(())
 }
 
-pub(super) fn local_model_unhealthy_refusal(model_ref: &str, row: &LocalModelRegistryRow) -> ErrorData {
+pub(super) fn local_model_unhealthy_refusal(
+    model_ref: &str,
+    row: &LocalModelRegistryRow,
+) -> ErrorData {
     let code = match row
         .last_probe
         .as_ref()
@@ -165,7 +168,8 @@ pub(super) fn trim_configured_agent_spawn_shell(value: &str) -> &str {
 }
 
 #[cfg(windows)]
-pub(super) fn resolve_default_agent_spawn_powershell_host() -> Result<AgentSpawnLaunchHost, ErrorData> {
+pub(super) fn resolve_default_agent_spawn_powershell_host()
+-> Result<AgentSpawnLaunchHost, ErrorData> {
     let mut attempted = Vec::new();
     for (source, candidate) in AGENT_SPAWN_WINDOWS_SHELL_CANDIDATES {
         ensure_supported_agent_spawn_shell(candidate)?;
@@ -191,7 +195,8 @@ pub(super) fn resolve_default_agent_spawn_powershell_host() -> Result<AgentSpawn
 }
 
 #[cfg(not(windows))]
-pub(super) fn resolve_default_agent_spawn_powershell_host() -> Result<AgentSpawnLaunchHost, ErrorData> {
+pub(super) fn resolve_default_agent_spawn_powershell_host()
+-> Result<AgentSpawnLaunchHost, ErrorData> {
     let mut attempted = Vec::new();
     let candidate = "pwsh";
     if let Some(target) = resolve_agent_spawn_shell_candidate(candidate, &mut attempted) {
@@ -1605,7 +1610,10 @@ pub(super) fn validate_agent_spawn_id_path_segment(spawn_id: &str) -> Result<(),
     Ok(())
 }
 
-pub(super) fn read_agent_spawn_manifest(log_dir: &Path, spawn_id: &str) -> Result<Value, ErrorData> {
+pub(super) fn read_agent_spawn_manifest(
+    log_dir: &Path,
+    spawn_id: &str,
+) -> Result<Value, ErrorData> {
     let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
     let bytes = fs::read(&manifest_path).map_err(|error| {
         mcp_error(
@@ -1637,7 +1645,9 @@ pub(super) fn read_agent_spawn_manifest(log_dir: &Path, spawn_id: &str) -> Resul
     Ok(manifest)
 }
 
-pub(super) fn agent_kind_from_spawn_manifest(manifest: &Value) -> Result<ActSpawnAgentCli, ErrorData> {
+pub(super) fn agent_kind_from_spawn_manifest(
+    manifest: &Value,
+) -> Result<ActSpawnAgentCli, ErrorData> {
     let cli = manifest
         .get("cli")
         .or_else(|| manifest.get("kind"))
@@ -1772,7 +1782,10 @@ pub(super) fn ensure_existing_task_started_claim(
     Ok(())
 }
 
-pub(super) fn write_task_started_artifact_atomically(path: &Path, artifact: &Value) -> Result<(), ErrorData> {
+pub(super) fn write_task_started_artifact_atomically(
+    path: &Path,
+    artifact: &Value,
+) -> Result<(), ErrorData> {
     let bytes = serde_json::to_vec_pretty(artifact).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
@@ -2774,7 +2787,10 @@ pub(super) fn spawn_session_candidate_readiness_from_read(
     }
 }
 
-pub(super) fn task_start_session_id_for_spawn(files: &AgentSpawnFiles, spawn_id: &str) -> Option<String> {
+pub(super) fn task_start_session_id_for_spawn(
+    files: &AgentSpawnFiles,
+    spawn_id: &str,
+) -> Option<String> {
     let value = read_json_file_lossy(&files.task_started_path)?;
     let object_spawn_id = value.get("spawn_id").and_then(Value::as_str)?;
     if object_spawn_id != spawn_id {
@@ -2825,7 +2841,10 @@ pub(super) fn registry_matches_cli(registry: &SessionRegistryRead, cli: ActSpawn
         .is_some_and(|name| name.to_ascii_lowercase().contains(cli))
 }
 
-pub(super) fn matches_target_wire(wire: Option<&crate::server::TargetWire>, expected: &ActSpawnAgentTarget) -> bool {
+pub(super) fn matches_target_wire(
+    wire: Option<&crate::server::TargetWire>,
+    expected: &ActSpawnAgentTarget,
+) -> bool {
     match (wire, expected) {
         (
             Some(crate::server::TargetWire::Window {
@@ -2919,11 +2938,13 @@ pub(super) fn agent_spawn_tool_error(
     ErrorData::new(ErrorCode(-32099), message, Some(data))
 }
 
-pub(super) fn launch_lifecycle_tool_error(message: &'static str, data: serde_json::Value) -> ErrorData {
+pub(super) fn launch_lifecycle_tool_error(
+    message: &'static str,
+    data: serde_json::Value,
+) -> ErrorData {
     tracing::warn!(
         code = error_codes::TOOL_INTERNAL_ERROR,
         "M4 launch lifecycle tool error: {message}"
     );
     ErrorData::new(ErrorCode(-32099), message, Some(data))
 }
-

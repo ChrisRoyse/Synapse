@@ -247,9 +247,8 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!("stat daemon tool events {}", paths.tool_events_path)
-            });
+            return Err(error)
+                .with_context(|| format!("stat daemon tool events {}", paths.tool_events_path));
         }
     };
     let state = DaemonLifecycleState {
@@ -668,7 +667,10 @@ fn write_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyh
     }
 }
 
-fn write_tool_event_inner(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
+fn write_tool_event_inner(
+    state: &mut DaemonLifecycleState,
+    event: &ToolEvent,
+) -> anyhow::Result<()> {
     append_tool_event(state, event)?;
     let tool_last_path = state.paths.tool_last_path.clone();
     write_json_atomic(Path::new(&tool_last_path), event)
@@ -689,16 +691,13 @@ fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> any
     let events_path = state.paths.tool_events_path.clone();
     let path = Path::new(&events_path);
 
-    let mut line = serde_json::to_vec(event)
-        .with_context(|| format!("encode JSON line {events_path}"))?;
+    let mut line =
+        serde_json::to_vec(event).with_context(|| format!("encode JSON line {events_path}"))?;
     line.push(b'\n');
     let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
 
     if state.tool_events_bytes > 0
-        && state
-            .tool_events_bytes
-            .saturating_add(line_len)
-            > state.max_segment_bytes
+        && state.tool_events_bytes.saturating_add(line_len) > state.max_segment_bytes
     {
         if let Err(error) = rotate_tool_events(path) {
             let detail = format!("{error:#}");
@@ -1169,9 +1168,15 @@ mod tests {
 
         // After: a rotated `.1` segment exists and the active file was reset to
         // a fresh single-record segment (not the pre-rotation contents).
-        assert!(seg1.exists(), "rotated segment .1 must exist after the cap is exceeded");
+        assert!(
+            seg1.exists(),
+            "rotated segment .1 must exist after the cap is exceeded"
+        );
         let active_lines = segment_line_count(&active);
-        assert_eq!(active_lines, 1, "active file must be reset to a fresh segment");
+        assert_eq!(
+            active_lines, 1,
+            "active file must be reset to a fresh segment"
+        );
         let total = total_records(&active);
         assert_eq!(total, 3, "every record must survive rotation");
         println!(
@@ -1232,10 +1237,19 @@ mod tests {
         write_synthetic_events(5);
 
         let total = total_records(&active);
-        assert_eq!(total, 5, "no records lost when rotations stay within the cap");
+        assert_eq!(
+            total, 5,
+            "no records lost when rotations stay within the cap"
+        );
         let all = read_all_segments_concat(&active);
-        assert!(all.contains("\"idx\":0"), "oldest record retained within the cap");
-        assert!(all.contains("\"idx\":4"), "newest record retained within the cap");
+        assert!(
+            all.contains("\"idx\":0"),
+            "oldest record retained within the cap"
+        );
+        assert!(
+            all.contains("\"idx\":4"),
+            "newest record retained within the cap"
+        );
         println!("readback=noloss total_records={total}");
     }
 }
