@@ -23,7 +23,13 @@ async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::R
         .find(|tool| tool.get("name") == Some(&Value::String("health".to_owned())))
         .context("health tool missing")?;
 
-    assert_eq!(health_tool["description"], "Return server health");
+    assert!(
+        health_tool["description"]
+            .as_str()
+            .is_some_and(|description| description.starts_with("Return server health")),
+        "health description should start with the stable prefix: {:?}",
+        health_tool["description"]
+    );
     assert_eq!(health_tool["inputSchema"]["type"], "object");
     let set_value_tool = tools
         .iter()
@@ -146,7 +152,11 @@ async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::R
             .iter()
             .any(|line| line.contains("\"tools\"") && line.contains("\"act_focus_window\""))
     );
-    let health_response = client.tools_call("health", serde_json::json!({})).await?;
+    // #1554: health now defaults to compact (detail prose omitted). Request
+    // detail=full to assert the verbose chrome_bridge detail blob below.
+    let health_response = client
+        .tools_call("health", serde_json::json!({ "detail": "full" }))
+        .await?;
     let health = health_response
         .get("structuredContent")
         .context("health structuredContent missing")?;

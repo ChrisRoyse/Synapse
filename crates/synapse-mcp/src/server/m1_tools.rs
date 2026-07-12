@@ -26,7 +26,8 @@ use super::{
     CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
     CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
     CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
-    ElementInspection, ErrorData, FindParams, FindResponse, Health, HiddenDesktopPipFrameParams,
+    ElementInspection, ErrorData, FindParams, FindResponse, Health, HealthParams,
+    HiddenDesktopPipFrameParams,
     HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
     ReadTextParams, ScreenshotOperation, ScreenshotParams, ScreenshotResponse, SessionTarget,
     SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
@@ -213,9 +214,12 @@ struct TargetFacadeResponse {
 
 #[tool_router(router = m1_tool_router, vis = "pub(super)")]
 impl SynapseService {
-    #[tool(description = "Return server health", input_schema = empty_input_schema())]
+    #[tool(
+        description = "Return server health. `detail` controls verbosity: \"compact\" (the default) returns each subsystem's structured status/verdict fields but omits the verbose human-readable `detail` prose to minimize token cost; \"full\" returns the complete legacy diagnostic detail for every subsystem. The chrome_bridge subsystem exposes its verdict as a structured `chrome_bridge` object in both modes."
+    )]
     pub async fn health(
         &self,
+        params: Parameters<HealthParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<Health>, ErrorData> {
         tracing::info!(
@@ -224,7 +228,9 @@ impl SynapseService {
             "tool.invocation kind=health"
         );
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
-        Ok(Json(self.health_payload_for_session(session_id.as_deref())))
+        Ok(Json(
+            self.health_payload_for_session(session_id.as_deref(), params.0.detail),
+        ))
     }
 
     #[tool(

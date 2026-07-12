@@ -1,10 +1,42 @@
 use super::{BTreeMap, ErrorData, Health, SubsystemHealth, SynapseService};
 use rmcp::model::Tool;
+use rmcp::schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use synapse_action::BackendResolutionPolicy;
-use synapse_core::Backend;
+use synapse_core::{Backend, ChromeBridgeDetail};
+
+/// Verbosity control for the `health` tool response.
+///
+/// `health` is called frequently and its verbose per-subsystem `detail` prose
+/// dominates the payload token cost (issue #1554). `Compact` (the default)
+/// keeps every structured verdict field but drops the long human-readable
+/// `detail` blobs, so callers still learn the health conclusion at a fraction
+/// of the wire size. `Full` preserves the complete legacy output for
+/// debugging.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthDetail {
+    /// Drop verbose per-subsystem `detail` prose; keep structured verdicts.
+    #[default]
+    Compact,
+    /// Preserve every `detail` string (the legacy behavior).
+    Full,
+}
+
+/// Request parameters for the `health` tool.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct HealthParams {
+    /// `compact` (default) trims verbose per-subsystem detail prose while
+    /// keeping every structured status field; `full` returns the complete
+    /// diagnostic detail for every subsystem.
+    pub detail: HealthDetail,
+}
 
 fn state_lock_health() -> SubsystemHealth {
     SubsystemHealth {
@@ -31,8 +63,12 @@ impl SynapseService {
         self.health_payload_with_http_sessions(None)
     }
 
-    pub(crate) fn health_payload_for_session(&self, session_id: Option<&str>) -> Health {
-        self.health_payload_with_http_sessions_and_session(None, session_id)
+    pub(crate) fn health_payload_for_session(
+        &self,
+        session_id: Option<&str>,
+        detail: HealthDetail,
+    ) -> Health {
+        self.health_payload_with_http_sessions_and_session_detail(None, session_id, detail)
     }
 
     pub(crate) fn health_payload_with_http_sessions(
@@ -42,10 +78,26 @@ impl SynapseService {
         self.health_payload_with_http_sessions_and_session(active_sessions, None)
     }
 
+    /// Non-MCP callers (HTTP `/health`, dashboard, tests) keep the full detail
+    /// so their existing readback is unchanged; only the frequently-called MCP
+    /// `health` tool defaults to compact.
     pub(crate) fn health_payload_with_http_sessions_and_session(
         &self,
         active_sessions: Option<usize>,
         session_id: Option<&str>,
+    ) -> Health {
+        self.health_payload_with_http_sessions_and_session_detail(
+            active_sessions,
+            session_id,
+            HealthDetail::Full,
+        )
+    }
+
+    pub(crate) fn health_payload_with_http_sessions_and_session_detail(
+        &self,
+        active_sessions: Option<usize>,
+        session_id: Option<&str>,
+        detail: HealthDetail,
     ) -> Health {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
@@ -81,6 +133,7 @@ impl SynapseService {
             );
         }
         let ok = subsystems.values().all(|health| health.status != "error");
+        apply_health_detail(&mut subsystems, detail);
         Health {
             ok,
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -629,6 +682,105 @@ struct ToolSurfaceFingerprint {
     error: Option<String>,
 }
 
+/// Apply the requested detail verbosity to the assembled subsystem map.
+///
+/// `Compact` (the default) drops every verbose per-subsystem `detail` string
+/// but leaves the structured verdict fields (status, counts, schema versions,
+/// timeouts, ...) untouched, so the health conclusion is unchanged — only the
+/// human-readable prose is trimmed. `Full` preserves the `detail` strings.
+///
+/// The `chrome_bridge` subsystem's only structured information historically
+/// lived inside its concatenated `detail` blob, so in both modes we parse that
+/// blob into the typed `ChromeBridgeDetail`. `Full` keeps the original blob and
+/// the fully-parsed struct; `Compact` keeps only the verdict-critical fields
+/// and drops the blob.
+fn apply_health_detail(subsystems: &mut BTreeMap<String, SubsystemHealth>, detail: HealthDetail) {
+    for (name, subsystem) in subsystems.iter_mut() {
+        if name == "chrome_bridge" {
+            let parsed = subsystem.detail.as_deref().map(parse_chrome_bridge_detail);
+            match detail {
+                HealthDetail::Full => {
+                    subsystem.chrome_bridge = parsed;
+                }
+                HealthDetail::Compact => {
+                    subsystem.chrome_bridge = parsed.map(compact_chrome_bridge_detail);
+                    subsystem.detail = None;
+                }
+            }
+        } else if detail == HealthDetail::Compact {
+            subsystem.detail = None;
+        }
+    }
+}
+
+/// Parse the `chrome_bridge` `detail` blob (`key=value` tokens joined by
+/// spaces, with trailing free-text guidance) into the typed
+/// `ChromeBridgeDetail`.
+///
+/// Only whitespace-free `key=value` tokens are consumed, so the trailing
+/// human-readable guidance strings (which contain spaces) are ignored rather
+/// than corrupting fields. Full-mode responses retain the original `detail`
+/// string, so no information is lost even for fields this parser does not
+/// surface.
+fn parse_chrome_bridge_detail(detail: &str) -> ChromeBridgeDetail {
+    let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
+    for token in detail.split_whitespace() {
+        if let Some((key, value)) = token.split_once('=') {
+            if !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                // First occurrence wins; blob keys are unique.
+                fields.entry(key).or_insert(value);
+            }
+        }
+    }
+    let bool_field = |key: &str| {
+        fields.get(key).and_then(|value| match *value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+    };
+    let u64_field = |key: &str| fields.get(key).and_then(|value| (*value).parse::<u64>().ok());
+    let string_field = |key: &str| fields.get(key).map(|value| (*value).to_owned());
+    ChromeBridgeDetail {
+        tab_control_available: bool_field("tab_control_available"),
+        extension_stale: bool_field("extension_stale"),
+        extension_stale_reasons: string_field("extension_stale_reasons"),
+        reason: string_field("reason"),
+        host_count: u64_field("host_count"),
+        queued_count: u64_field("queued_count"),
+        pending_count: u64_field("pending_count"),
+        extension_id: string_field("extension_id"),
+        expected_extension_id: string_field("expected_extension_id"),
+        extension_version: string_field("extension_version"),
+        transport: string_field("transport"),
+        endpoint: string_field("endpoint"),
+    }
+}
+
+/// Reduce a fully-parsed `ChromeBridgeDetail` to the verdict-critical fields
+/// retained in compact health responses. The verbose identity/version/endpoint
+/// fields are dropped (they remain available via `detail=full`).
+fn compact_chrome_bridge_detail(detail: ChromeBridgeDetail) -> ChromeBridgeDetail {
+    ChromeBridgeDetail {
+        tab_control_available: detail.tab_control_available,
+        extension_stale: detail.extension_stale,
+        extension_stale_reasons: detail.extension_stale_reasons,
+        reason: detail.reason,
+        host_count: detail.host_count,
+        queued_count: detail.queued_count,
+        pending_count: detail.pending_count,
+        extension_id: None,
+        expected_extension_id: None,
+        extension_version: None,
+        transport: None,
+        endpoint: None,
+    }
+}
+
 fn canonical_json_bytes(value: Value) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(&canonical_json_value(value))
 }
@@ -710,7 +862,10 @@ const fn backend_config_name(backend: Backend) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_json_bytes;
+    use super::{
+        HealthDetail, HealthParams, SynapseService, canonical_json_bytes,
+        parse_chrome_bridge_detail,
+    };
 
     #[test]
     fn canonical_json_bytes_sorts_object_keys_recursively() {
@@ -736,6 +891,151 @@ mod tests {
         assert_eq!(
             String::from_utf8(left).expect("utf8"),
             r#"{"mcp_surface":"tools/list","tools":[{"inputSchema":{"a":1,"z":2},"name":"b"},{"inputSchema":{"a":false,"b":true},"name":"a"}]}"#
+        );
+    }
+
+    #[test]
+    fn compact_health_is_materially_smaller_than_full() {
+        // #1554: the verbose per-subsystem detail prose is the payload's bulk.
+        // Compact drops it while keeping every structured verdict field, so the
+        // serialized JSON must be materially smaller than full.
+        let service = SynapseService::new();
+        let compact = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Compact,
+        );
+        let full = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Full,
+        );
+        let compact_json = serde_json::to_string(&compact).expect("serialize compact health");
+        let full_json = serde_json::to_string(&full).expect("serialize full health");
+        let saved = full_json.len().saturating_sub(compact_json.len());
+        println!(
+            "evidence=health_detail_size compact_bytes={} full_bytes={} saved_bytes={}",
+            compact_json.len(),
+            full_json.len(),
+            saved
+        );
+        assert!(
+            compact_json.len() < full_json.len(),
+            "compact ({}) must be smaller than full ({})",
+            compact_json.len(),
+            full_json.len()
+        );
+        assert!(
+            saved >= 300,
+            "compact should drop at least a few hundred bytes of detail prose; saved={saved}"
+        );
+    }
+
+    #[test]
+    fn compact_and_full_report_identical_subsystem_verdicts() {
+        // Compact must change only the prose, never the health conclusion.
+        let service = SynapseService::new();
+        let compact = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Compact,
+        );
+        let full = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Full,
+        );
+        assert_eq!(compact.ok, full.ok, "overall verdict must match");
+        assert_eq!(
+            compact.subsystems.keys().collect::<Vec<_>>(),
+            full.subsystems.keys().collect::<Vec<_>>(),
+            "same subsystems must be present in both modes"
+        );
+        for (name, full_sub) in &full.subsystems {
+            let compact_sub = compact
+                .subsystems
+                .get(name)
+                .expect("subsystem present in compact");
+            assert_eq!(
+                compact_sub.status, full_sub.status,
+                "subsystem {name} status must match between compact and full"
+            );
+            println!("evidence=verdict subsystem={name} status={}", full_sub.status);
+        }
+        // Full keeps the detail prose; compact drops it.
+        let full_bridge = &full.subsystems["chrome_bridge"];
+        let compact_bridge = &compact.subsystems["chrome_bridge"];
+        assert!(
+            full_bridge.detail.is_some(),
+            "full chrome_bridge keeps its detail string"
+        );
+        assert!(
+            compact_bridge.detail.is_none(),
+            "compact chrome_bridge drops its detail string"
+        );
+    }
+
+    #[test]
+    fn full_chrome_bridge_detail_is_structured() {
+        // The chrome_bridge blob is surfaced as a typed struct whose fields
+        // agree with the raw detail string they were parsed from.
+        let service = SynapseService::new();
+        let full = service.health_payload_with_http_sessions_and_session_detail(
+            None,
+            None,
+            HealthDetail::Full,
+        );
+        let bridge = &full.subsystems["chrome_bridge"];
+        let raw_detail = bridge
+            .detail
+            .as_deref()
+            .expect("full chrome_bridge detail string");
+        let structured = bridge
+            .chrome_bridge
+            .as_ref()
+            .expect("full chrome_bridge structured detail");
+        let tab_control_available = structured
+            .tab_control_available
+            .expect("tab_control_available populated");
+        let host_count = structured.host_count.expect("host_count populated");
+        let expected_extension_id = structured
+            .expected_extension_id
+            .as_deref()
+            .expect("expected_extension_id populated");
+        assert!(
+            raw_detail.contains(&format!("tab_control_available={tab_control_available}")),
+            "structured tab_control_available must match the raw blob"
+        );
+        assert!(
+            raw_detail.contains(&format!("expected_extension_id={expected_extension_id}")),
+            "structured expected_extension_id must match the raw blob"
+        );
+        // An independent parse of the raw blob reproduces the surfaced struct.
+        let reparsed = parse_chrome_bridge_detail(raw_detail);
+        assert_eq!(&reparsed, structured, "parser is deterministic and lossless");
+        println!(
+            "evidence=chrome_bridge_struct tab_control_available={tab_control_available} host_count={host_count} expected_extension_id={expected_extension_id}"
+        );
+    }
+
+    #[test]
+    fn default_detail_is_compact() {
+        // No `detail` param (the common `health {}` call) must resolve to
+        // compact — the new default that fixes the verbose-by-default bug.
+        assert_eq!(HealthDetail::default(), HealthDetail::Compact);
+        assert_eq!(HealthParams::default().detail, HealthDetail::Compact);
+        let empty: HealthParams =
+            serde_json::from_str("{}").expect("deserialize empty health params");
+        assert_eq!(empty.detail, HealthDetail::Compact);
+        let full: HealthParams =
+            serde_json::from_str(r#"{"detail":"full"}"#).expect("deserialize full detail");
+        assert_eq!(full.detail, HealthDetail::Full);
+        let compact: HealthParams =
+            serde_json::from_str(r#"{"detail":"compact"}"#).expect("deserialize compact detail");
+        assert_eq!(compact.detail, HealthDetail::Compact);
+        println!(
+            "evidence=default_detail value={:?}",
+            HealthParams::default().detail
         );
     }
 }

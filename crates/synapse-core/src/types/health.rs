@@ -90,4 +90,58 @@ pub struct SubsystemHealth {
     pub capture_config: Option<ObservationCaptureConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_runtime: Option<CaptureRuntimeReadback>,
+    /// Structured `chrome_bridge` verdict. `None` for every subsystem except
+    /// `chrome_bridge`; the MCP health builder populates it so the bridge
+    /// readiness is machine-readable instead of a single concatenated
+    /// `detail` string. In compact health responses only the verdict-critical
+    /// fields are retained; full responses populate every parsed field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_bridge: Option<ChromeBridgeDetail>,
+}
+
+/// Structured replacement for the `chrome_bridge` subsystem's concatenated
+/// `detail` blob. Each field names one piece the blob previously encoded as
+/// `key=value` text. Every field is optional so partially-observed hosts and
+/// the no-host/unavailable branch omit what they cannot report, and so compact
+/// health responses can drop the verbose identity fields while keeping the
+/// readiness verdict.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChromeBridgeDetail {
+    /// Whether tab-control debugger commands can currently be issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_control_available: Option<bool>,
+    /// Whether the connected extension identity is stale versus expectations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_stale: Option<bool>,
+    /// Pipe-joined stale reasons, or `none` when the identity is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_stale_reasons: Option<String>,
+    /// Reason code emitted when no active bridge host is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Number of registered bridge hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_count: Option<u64>,
+    /// Number of commands queued for the active host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_count: Option<u64>,
+    /// Number of commands pending acknowledgement from the active host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_count: Option<u64>,
+    /// Extension id reported by the active host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
+    /// Extension id the bridge expects (identity anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_extension_id: Option<String>,
+    /// Extension version reported by the active host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_version: Option<String>,
+    /// Transport carrying bridge traffic (e.g. `native_messaging`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Chrome extension health endpoint URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }

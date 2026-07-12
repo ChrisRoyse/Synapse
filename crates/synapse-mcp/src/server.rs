@@ -241,6 +241,7 @@ pub(crate) mod drain;
 pub(crate) mod escalation;
 mod handler;
 mod health;
+pub(crate) use health::HealthParams;
 mod hygiene_report;
 mod intent_tools;
 mod lease_tools;
