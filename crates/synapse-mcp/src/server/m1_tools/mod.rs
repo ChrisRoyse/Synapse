@@ -2501,35 +2501,35 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let params = validate_browser_tabs_params(params.0)?;
-        let allow_human_foreground_discovery = matches!(
+        // Using the human's *foreground* Chromium window as an implicit target is
+        // only permitted for read-style ops (list/select). Mutating ops
+        // (new/close/activate) must never hijack whatever browser window the
+        // human currently has focused.
+        let allow_human_foreground_target = matches!(
             params.operation,
             BrowserTabsOperation::List | BrowserTabsOperation::Select
         );
-        if !allow_human_foreground_discovery
-            && params.window_hwnd.is_none()
-            && self.session_target(Some(&session_id))?.is_none()
-        {
-            return Err(mcp_error(
-                error_codes::TARGET_NOT_SET,
-                format!(
-                    "{TOOL} operation={:?} requires window_hwnd or an active session target; refusing to use the human foreground browser as an implicit mutation target",
-                    params.operation
-                ),
-            ));
-        }
+        // Passive discovery of an already-open, NON-foreground Chromium window is
+        // now permitted for every operation, including mutating ops (#1592). An
+        // agent whose OS foreground is a non-Chromium app (e.g. VS Code) can still
+        // act on the Chrome window it is driving instead of hard-failing target
+        // resolution. Passive discovery never selects the foreground window, so it
+        // cannot hijack the human's focused browser; the foreground-target guard
+        // below still refuses the foreground-Chromium case for mutating ops.
+        let allow_passive_chromium_discovery = true;
         let window_resolution = self.resolve_browser_tabs_window_context(
             TOOL,
             &session_id,
             params.window_hwnd,
-            allow_human_foreground_discovery,
+            allow_passive_chromium_discovery,
         )?;
         let window_context = window_resolution.context.clone();
-        if !allow_human_foreground_discovery && window_resolution.used_human_os_foreground_window {
+        if !allow_human_foreground_target && window_resolution.used_human_os_foreground_window {
             return Err(mcp_error(
                 error_codes::TARGET_NOT_SET,
                 format!(
-                    "{TOOL} operation={:?} refused human foreground fallback; pass window_hwnd or set a session target first",
-                    params.operation
+                    "{TOOL} operation={:?} refused to mutate the human OS foreground browser window (hwnd={:#x} process_name={:?}); pass window_hwnd, set a session target, or adopt an existing background Chrome window first",
+                    params.operation, window_context.hwnd, window_context.process_name
                 ),
             ));
         }
@@ -5793,36 +5793,10 @@ impl SynapseService {
                     (context, true, "human_os_foreground_chromium", 1)
                 } else if allow_passive_chromium_discovery {
                     let candidates = passive_chromium_window_candidates(tool, Some(&context))?;
-                    match candidates.as_slice() {
-                        [candidate] => (
-                            candidate.clone(),
-                            false,
-                            "passive_single_chromium_window",
-                            1,
-                        ),
-                        [] => {
-                            return Err(mcp_error(
-                                error_codes::ACTION_TARGET_INVALID,
-                                format!(
-                                    "{tool} resolved non-Chromium human foreground hwnd={:#x} process_name={:?} title={:?}; passive discovery found no visible Chromium windows. remediation=use target operation=list to inspect windows, open or reuse an existing Chrome/Chromium/Edge/Brave/Vivaldi/Opera window, or pass window_hwnd explicitly.",
-                                    context.hwnd, context.process_name, context.window_title
-                                ),
-                            ));
-                        }
-                        _ => {
-                            return Err(mcp_error(
-                                error_codes::ACTION_TARGET_INVALID,
-                                format!(
-                                    "{tool} resolved non-Chromium human foreground hwnd={:#x} process_name={:?} title={:?}; passive discovery found {} Chromium windows and refused to guess. candidates=[{}] remediation=pass window_hwnd from target operation=list or bind a session target first.",
-                                    context.hwnd,
-                                    context.process_name,
-                                    context.window_title,
-                                    candidates.len(),
-                                    format_chromium_window_candidates(&candidates)
-                                ),
-                            ));
-                        }
-                    }
+                    let session_owned = self.session_owned_chromium_windows(session_id)?;
+                    let (selected, discovery_source, candidate_count) =
+                        decide_passive_chromium_window(tool, &context, candidates, &session_owned)?;
+                    (selected, false, discovery_source, candidate_count)
                 } else {
                     (context, true, "human_os_foreground_non_chromium", 0)
                 }
@@ -5856,6 +5830,61 @@ impl SynapseService {
             error_codes::A11Y_NOT_AVAILABLE,
             format!("{tool} is only available on Windows in this build"),
         ))
+    }
+
+    /// Windows this MCP session already owns a CDP tab in, drawn from the live
+    /// CDP target-owner registry. Used to disambiguate passive Chromium window
+    /// discovery when 2+ Chrome windows are visible (#1592): the session's own
+    /// window is preferred over guessing or hard-failing.
+    #[cfg(windows)]
+    fn session_owned_chromium_windows(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionOwnedChromiumWindow>, ErrorData> {
+        let guard = self.lock_cdp_target_owners()?;
+        let windows = guard
+            .values()
+            .filter(|owner| owner.session_id == session_id)
+            .map(|owner| SessionOwnedChromiumWindow {
+                hwnd: owner.window_hwnd,
+                created_at_unix_ms: owner.created_at_unix_ms,
+            })
+            .collect::<Vec<_>>();
+        drop(guard);
+        Ok(windows)
+    }
+
+    /// Drops a stale cached `chrome_window_id` from a CDP target owner (both the
+    /// in-memory registry and the persisted row) after the Chrome extension
+    /// refused to map it, so the next readback falls back to passive
+    /// bounds/title discovery. Returns whether an entry was actually cleared.
+    #[cfg(windows)]
+    fn clear_owner_cached_chrome_window_id(
+        &self,
+        owner: &CdpTargetOwner,
+    ) -> Result<bool, ErrorData> {
+        if owner.chrome_window_id.is_none() {
+            return Ok(false);
+        }
+        let owner_key =
+            cdp_target_owner_key(owner.window_hwnd, &owner.endpoint, &owner.cdp_target_id);
+        let updated = {
+            let mut guard = self.lock_cdp_target_owners()?;
+            match guard.get_mut(&owner_key) {
+                Some(entry) if entry.chrome_window_id.is_some() => {
+                    entry.chrome_window_id = None;
+                    Some(entry.clone())
+                }
+                _ => None,
+            }
+        };
+        match updated {
+            Some(entry) => {
+                self.persist_cdp_target_owner(&owner_key, &entry)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     #[cfg(windows)]
@@ -6257,25 +6286,77 @@ impl SynapseService {
                 ),
             ));
         }
-        let expected_chrome_window_id = self
-            .active_cdp_target_owner_for_window("browser_tabs", session_id, window_context.hwnd)?
+        let active_owner = self.active_cdp_target_owner_for_window(
+            "browser_tabs",
+            session_id,
+            window_context.hwnd,
+        )?;
+        let expected_chrome_window_id = active_owner
+            .as_ref()
             .and_then(|owner| owner.chrome_window_id);
-        let listed = crate::chrome_debugger_bridge::list_tabs(
+        let listed = match crate::chrome_debugger_bridge::list_tabs(
             window_context.hwnd,
             expected_chrome_window_id,
             Some(window_context.window_bounds),
             Some(&window_context.window_title),
         )
         .await
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "browser_tabs Chrome bridge chrome.tabs.query/readback failed: {}",
-                    error.detail()
-                ),
-            )
-        })?;
+        {
+            Ok(listed) => listed,
+            Err(error)
+                if expected_chrome_window_id.is_some()
+                    && is_stale_chrome_window_id_mapping_refusal(error.detail()) =>
+            {
+                // #1592 self-heal: the cached chrome_window_id from a prior
+                // adoption is stale (the Chrome window was closed and re-created),
+                // so the extension refused to map the OS HWND onto it. Blindly
+                // retrying with the same stale id always fails the same way, so
+                // drop the stale cache entry and retry once with passive
+                // bounds/title discovery (expected_chrome_window_id=None). If the
+                // retry also fails, surface a rich structured error rather than a
+                // silent fallback.
+                let cache_entry_cleared = active_owner
+                    .as_ref()
+                    .map(|owner| self.clear_owner_cached_chrome_window_id(owner))
+                    .transpose()?
+                    .unwrap_or(false);
+                tracing::warn!(
+                    code = "BROWSER_TABS_STALE_CHROME_WINDOW_ID_SELF_HEAL",
+                    session_id = %session_id,
+                    hwnd = window_context.hwnd,
+                    stale_chrome_window_id = expected_chrome_window_id.unwrap_or_default(),
+                    cache_entry_cleared,
+                    refusal = %error.detail(),
+                    "readback=chrome.tabs.query outcome=retry_passive_discovery_after_stale_window_id"
+                );
+                crate::chrome_debugger_bridge::list_tabs(
+                    window_context.hwnd,
+                    None,
+                    Some(window_context.window_bounds),
+                    Some(&window_context.window_title),
+                )
+                .await
+                .map_err(|retry_error| {
+                    mcp_error(
+                        retry_error.code(),
+                        format!(
+                            "browser_tabs Chrome bridge chrome.tabs.query/readback failed after self-healing a stale chrome_window_id {} (cache_entry_cleared={cache_entry_cleared}): {}",
+                            expected_chrome_window_id.unwrap_or_default(),
+                            retry_error.detail()
+                        ),
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(mcp_error(
+                    error.code(),
+                    format!(
+                        "browser_tabs Chrome bridge chrome.tabs.query/readback failed: {}",
+                        error.detail()
+                    ),
+                ));
+            }
+        };
         let endpoint = listed
             .extension_id
             .as_deref()
@@ -13718,6 +13799,117 @@ fn background_tab_activation_foregrounded_requested_window(
     before_hwnd != Some(requested_window_hwnd)
         && after_hwnd == Some(requested_window_hwnd)
         && after_hwnd != before_hwnd
+}
+
+/// A Chromium window this MCP session already owns a CDP tab in, used to
+/// disambiguate passive discovery when several Chrome windows are visible.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct SessionOwnedChromiumWindow {
+    hwnd: i64,
+    created_at_unix_ms: u64,
+}
+
+/// Chooses a single Chromium window from passive discovery for a request whose
+/// human OS foreground is a non-Chromium app (e.g. VS Code) and that has no
+/// explicit `window_hwnd` / session target (#1592).
+///
+/// Selection order:
+/// 1. exactly one visible Chromium window -> adopt it;
+/// 2. 2+ windows where this session owns a tab in exactly one -> adopt the owned
+///    one;
+/// 3. 2+ windows where this session owns tabs in several -> adopt the most
+///    recently adopted owned window (created_at desc, then hwnd asc);
+/// 4. otherwise refuse with the full candidate list so the agent can pass
+///    `window_hwnd` — never a silent guess.
+///
+/// Returns `(selected_window, discovery_source_label, candidate_count)`.
+#[cfg(windows)]
+fn decide_passive_chromium_window(
+    tool: &str,
+    foreground: &ForegroundContext,
+    candidates: Vec<ForegroundContext>,
+    session_owned: &[SessionOwnedChromiumWindow],
+) -> Result<(ForegroundContext, &'static str, u32), ErrorData> {
+    let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+    if candidates.is_empty() {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "{tool} resolved non-Chromium human foreground hwnd={:#x} process_name={:?} title={:?}; passive discovery found no visible Chromium windows. remediation=use target operation=list to inspect windows, open or reuse an existing Chrome/Chromium/Edge/Brave/Vivaldi/Opera window, or pass window_hwnd explicitly.",
+                foreground.hwnd, foreground.process_name, foreground.window_title
+            ),
+        ));
+    }
+    if candidates.len() == 1 {
+        let selected = candidates
+            .into_iter()
+            .next()
+            .expect("candidates length checked == 1");
+        return Ok((selected, "passive_single_chromium_window", 1));
+    }
+    // 2+ visible Chromium windows: disambiguate by this session's ownership
+    // (set-difference style, not positional guessing) before refusing.
+    let mut owned = candidates
+        .iter()
+        .filter_map(|candidate| {
+            session_owned
+                .iter()
+                .filter(|owned| owned.hwnd == candidate.hwnd)
+                .map(|owned| owned.created_at_unix_ms)
+                .max()
+                .map(|created_at_unix_ms| (candidate.clone(), created_at_unix_ms))
+        })
+        .collect::<Vec<_>>();
+    match owned.len() {
+        0 => Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "{tool} resolved non-Chromium human foreground hwnd={:#x} process_name={:?} title={:?}; passive discovery found {} Chromium windows and this session owns a tab in none of them, so it refused to guess. candidates=[{}] remediation=pass window_hwnd from target operation=list or bind a session target first.",
+                foreground.hwnd,
+                foreground.process_name,
+                foreground.window_title,
+                candidates.len(),
+                format_chromium_window_candidates(&candidates)
+            ),
+        )),
+        1 => {
+            let (selected, _created_at) =
+                owned.into_iter().next().expect("owned length checked == 1");
+            Ok((
+                selected,
+                "passive_session_owned_chromium_window",
+                candidate_count,
+            ))
+        }
+        _ => {
+            owned.sort_by(|left, right| {
+                right
+                    .1
+                    .cmp(&left.1)
+                    .then_with(|| left.0.hwnd.cmp(&right.0.hwnd))
+            });
+            let (selected, _created_at) =
+                owned.into_iter().next().expect("owned length checked > 1");
+            Ok((
+                selected,
+                "passive_most_recent_session_chromium_window",
+                candidate_count,
+            ))
+        }
+    }
+}
+
+/// True when a Chrome bridge failure detail is the extension's "mapping refused"
+/// specifically because a passed `expectedChromeWindowId` was not among the live
+/// Chrome windows — i.e. a stale cached `chrome_window_id`. Distinguished from
+/// the other (genuinely ambiguous) mapping-refused variants so only the
+/// self-healable case triggers a cache drop + retry (#1592).
+#[cfg(windows)]
+fn is_stale_chrome_window_id_mapping_refusal(detail: &str) -> bool {
+    detail.contains("mapping refused")
+        && detail.contains("expectedChromeWindowId")
+        && detail.contains("was not present")
 }
 
 #[cfg(windows)]
