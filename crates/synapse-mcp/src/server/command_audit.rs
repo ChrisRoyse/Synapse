@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn command_audit_query_exact_limit_is_complete_but_extra_match_is_partial() {
+    fn command_audit_query_unwindowed_newest_first_exact_complete_extra_reports_has_older() {
         let dir = TempDir::new().expect("tmp");
         let service = service_with_db(dir.path());
         let tool = "issue1487_browser_tabs";
@@ -1146,13 +1146,21 @@ mod tests {
             .expect("limit-plus-one page should query");
         assert_eq!(extra_match.returned_count, 2);
         assert_eq!(extra_match.matched_rows, 2);
-        assert!(extra_match.partial);
+        // #1550: an unwindowed default query now scans newest-first and returns the
+        // most-recent rows as a COMPLETE success page. `partial` is the fail-closed
+        // signal reserved for explicit start_key_hex paging, so it stays false here;
+        // "more matching rows exist" is reported via `has_older`, and the caller pages
+        // further back by windowing with end_ts_ns = oldest_returned_ts_ns.
+        assert!(!extra_match.partial);
+        assert!(extra_match.has_older);
         assert!(!extra_match.exhausted);
-        assert!(extra_match.next_start_key_hex.is_some());
+        assert_eq!(extra_match.scan_order, "newest_first");
+        assert!(extra_match.oldest_returned_ts_ns.is_some());
+        assert!(extra_match.next_start_key_hex.is_none());
     }
 
     #[test]
-    fn command_audit_query_scan_limit_partial_keeps_resume_key_without_matches() {
+    fn command_audit_query_unwindowed_newest_first_scan_capped_no_match_reports_has_older() {
         let dir = TempDir::new().expect("tmp");
         let service = service_with_db(dir.path());
         seed_command_rows(&service, "issue1487_other_tool", 3);
@@ -1169,8 +1177,14 @@ mod tests {
         assert_eq!(response.returned_count, 0);
         assert_eq!(response.matched_rows, 0);
         assert_eq!(response.scanned_rows, 2);
-        assert!(response.partial);
+        // #1550: the unwindowed default scans newest-first. A scan_limit-capped page
+        // that matched nothing reports `has_older` (rows remain beyond the scanned
+        // tail) as a SUCCESS, not a fail-closed partial. To search older history for
+        // a specific tool, window with start_ts_ns/end_ts_ns — the newest-first
+        // default intentionally surfaces recent activity first.
+        assert!(!response.partial);
+        assert!(response.has_older);
         assert!(!response.exhausted);
-        assert!(response.next_start_key_hex.is_some());
+        assert_eq!(response.scan_order, "newest_first");
     }
 }
