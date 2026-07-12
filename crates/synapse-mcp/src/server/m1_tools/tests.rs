@@ -4041,3 +4041,88 @@ fn ocr_cache_key_separates_auto_from_explicit_winrt_requests() {
     assert_ne!(explicit_key, auto_key);
     assert!(auto_key.contains("/auto/winrt/"));
 }
+
+/// #1551/#1593: a top-level `cdp_target_id` on `browser_wait` (the exact
+/// telemetry payload that used to fail closed as `unknown field`) is now folded
+/// into the selected condition spec, so envelope addressing resolves the SAME
+/// target as the nested-spec form.
+#[test]
+fn browser_wait_top_level_cdp_target_id_folds_into_condition_spec_1593() {
+    use crate::m1::{BrowserWaitConditionKind, BrowserWaitParams};
+
+    let mut wait = BrowserWaitParams {
+        condition: BrowserWaitConditionKind::Text,
+        text: Some(BrowserWaitForParams {
+            text: Some("ready".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    println!(
+        "readback=before cdp_target_id={:?}",
+        wait.text
+            .as_ref()
+            .and_then(|spec| spec.cdp_target_id.clone())
+    );
+    super::merge_browser_wait_top_level_target(&mut wait, Some("TARGET-1593-WAIT"), Some(0x1234))
+        .expect("top-level target folds into the text condition spec");
+    let spec = wait.text.expect("text spec present");
+    println!(
+        "readback=after cdp_target_id={:?} window_hwnd={:?}",
+        spec.cdp_target_id, spec.window_hwnd
+    );
+    assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1593-WAIT"));
+    assert_eq!(spec.window_hwnd, Some(0x1234));
+}
+
+/// #1551/#1593: a top-level target that conflicts with a value already present
+/// in the nested condition spec must fail closed rather than silently pick one.
+#[test]
+fn browser_wait_top_level_cdp_target_id_conflict_fails_closed_1593() {
+    use crate::m1::{BrowserWaitConditionKind, BrowserWaitParams};
+
+    let mut wait = BrowserWaitParams {
+        condition: BrowserWaitConditionKind::Selector,
+        selector: Some(BrowserWaitForSelectorParams {
+            query: "#q".to_owned(),
+            cdp_target_id: Some("OTHER-TARGET".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err = super::merge_browser_wait_top_level_target(&mut wait, Some("TARGET-1593-WAIT"), None)
+        .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+    let code = err
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
+    println!("readback=conflict code={code:?} message={}", err.message);
+    assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+}
+
+/// #1551/#1593: with no envelope target supplied the wait spec is untouched
+/// (the merge is a no-op), so the happy path stays byte-for-byte identical.
+#[test]
+fn browser_wait_without_top_level_target_is_noop_1593() {
+    use crate::m1::{BrowserWaitConditionKind, BrowserWaitParams};
+
+    let mut wait = BrowserWaitParams {
+        condition: BrowserWaitConditionKind::Text,
+        text: Some(BrowserWaitForParams {
+            text: Some("ready".to_owned()),
+            cdp_target_id: Some("NESTED-ONLY".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    super::merge_browser_wait_top_level_target(&mut wait, None, None)
+        .expect("no envelope target is a no-op");
+    assert_eq!(
+        wait.text
+            .expect("text spec present")
+            .cdp_target_id
+            .as_deref(),
+        Some("NESTED-ONLY")
+    );
+}

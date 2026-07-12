@@ -251,6 +251,7 @@ mod m3_tools;
 pub(crate) mod m4_tools;
 mod notify_tools;
 mod operational_facades;
+mod param_hints;
 mod permission_gate;
 pub(crate) mod permission_policy;
 mod plan_tools;

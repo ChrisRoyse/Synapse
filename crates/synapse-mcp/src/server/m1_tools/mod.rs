@@ -163,6 +163,16 @@ struct BrowserWaitFacadeParams {
     /// `operation=for_condition`: unified wait condition spec.
     #[serde(default)]
     wait: Option<BrowserWaitParams>,
+    /// Envelope-level target alias (#1551/#1593). When set it is folded into the
+    /// selected `wait.<condition>` spec's `cdp_target_id` before polling, so
+    /// top-level addressing resolves the same target as the nested-spec form.
+    /// Fails closed on a conflicting nested value.
+    #[serde(default)]
+    cdp_target_id: Option<String>,
+    /// Envelope-level target alias (#1551/#1593). Browser HWND that owns the
+    /// target; folded into the selected `wait.<condition>` spec's `window_hwnd`.
+    #[serde(default)]
+    window_hwnd: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -3152,8 +3162,18 @@ impl SynapseService {
     ) -> Result<Json<BrowserWaitFacadeResponse>, ErrorData> {
         let params = params.0;
         let operation = params.operation;
-        let source_id = browser_wait_facade_source_id(&params);
-        let wait = validate_browser_wait_facade_params(params)?;
+        let top_cdp_target_id = params.cdp_target_id.clone();
+        let top_window_hwnd = params.window_hwnd;
+        let mut wait = validate_browser_wait_facade_params(params)?;
+        // #1551/#1593: fold the envelope-level cdp_target_id/window_hwnd aliases
+        // into the selected condition spec so top-level addressing resolves the
+        // same target as the nested-spec form (fail-closed on conflict).
+        merge_browser_wait_top_level_target(
+            &mut wait,
+            top_cdp_target_id.as_deref(),
+            top_window_hwnd,
+        )?;
+        let source_id = browser_wait_condition_source_id(&wait);
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "browser_wait",
@@ -11096,6 +11116,56 @@ fn validate_browser_wait_facade_params(
     }
 }
 
+/// Fold `browser_wait`'s envelope-level `cdp_target_id`/`window_hwnd` aliases
+/// (#1551/#1593) into whichever condition spec is present, reusing the shared
+/// [`crate::server::browser_facades::merge_top_level_target`] resolver so a
+/// top-level target resolves the SAME tab as the nested-spec form and a
+/// conflicting nested value fails closed.
+fn merge_browser_wait_top_level_target(
+    wait: &mut BrowserWaitParams,
+    top_cdp_target_id: Option<&str>,
+    top_window_hwnd: Option<i64>,
+) -> Result<(), ErrorData> {
+    if top_cdp_target_id.is_none() && top_window_hwnd.is_none() {
+        return Ok(());
+    }
+    let condition = browser_wait_condition_name(wait.condition);
+    macro_rules! fold {
+        ($spec:expr) => {
+            if let Some(spec) = $spec.as_mut() {
+                crate::server::browser_facades::merge_top_level_target(
+                    "browser_wait",
+                    condition,
+                    top_cdp_target_id,
+                    top_window_hwnd,
+                    &mut spec.cdp_target_id,
+                    &mut spec.window_hwnd,
+                )?;
+            }
+        };
+    }
+    fold!(wait.text);
+    fold!(wait.load_state);
+    fold!(wait.url);
+    fold!(wait.selector);
+    fold!(wait.function);
+    fold!(wait.request);
+    fold!(wait.response);
+    Ok(())
+}
+
+const fn browser_wait_condition_name(condition: BrowserWaitConditionKind) -> &'static str {
+    match condition {
+        BrowserWaitConditionKind::Text => "text",
+        BrowserWaitConditionKind::LoadState => "load_state",
+        BrowserWaitConditionKind::Url => "url",
+        BrowserWaitConditionKind::Selector => "selector",
+        BrowserWaitConditionKind::Function => "function",
+        BrowserWaitConditionKind::Request => "request",
+        BrowserWaitConditionKind::Response => "response",
+    }
+}
+
 fn validate_browser_wait_condition_shape(params: &BrowserWaitParams) -> Result<(), ErrorData> {
     let fields = [
         ("text", params.text.is_some()),
@@ -11131,16 +11201,6 @@ fn validate_browser_wait_condition_shape(params: &BrowserWaitParams) -> Result<(
         ));
     }
     Ok(())
-}
-
-fn browser_wait_facade_source_id(params: &BrowserWaitFacadeParams) -> String {
-    match params.operation {
-        BrowserWaitOperation::ForCondition => params
-            .wait
-            .as_ref()
-            .map(browser_wait_condition_source_id)
-            .unwrap_or_else(|| "missing_wait_spec".to_owned()),
-    }
 }
 
 fn browser_wait_condition_source_id(params: &BrowserWaitParams) -> String {
