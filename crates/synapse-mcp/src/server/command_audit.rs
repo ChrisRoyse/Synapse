@@ -1155,8 +1155,38 @@ mod tests {
         assert!(extra_match.has_older);
         assert!(!extra_match.exhausted);
         assert_eq!(extra_match.scan_order, "newest_first");
-        assert!(extra_match.oldest_returned_ts_ns.is_some());
         assert!(extra_match.next_start_key_hex.is_none());
+        let oldest_returned_ts_ns = extra_match
+            .oldest_returned_ts_ns
+            .expect("a newest-first page with returned rows must expose its oldest-ts anchor");
+
+        // Full State Verification of the documented resume: `has_older` promises the
+        // caller can page further back by windowing with `end_ts_ns`. Prove that is
+        // actionable (not a dead end) by actually retrieving the one remaining older
+        // match straight from the real on-disk CF_ACTION_LOG.
+        let older_page = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(20),
+                scan_limit: Some(16),
+                tool: Some(tool.to_owned()),
+                end_ts_ns: Some(oldest_returned_ts_ns - 1),
+                ..Default::default()
+            })
+            .expect("window-back page should query");
+        assert_eq!(
+            older_page.returned_count, 1,
+            "the one older match must be retrievable by windowing end_ts_ns"
+        );
+        assert_eq!(older_page.matched_rows, 1);
+        assert_eq!(older_page.scan_order, "newest_first");
+        assert!(
+            older_page
+                .oldest_returned_ts_ns
+                .is_some_and(|ts| ts < oldest_returned_ts_ns),
+            "window-back must reach a strictly older row than the first page"
+        );
+        assert!(!older_page.has_older);
+        assert!(older_page.exhausted);
     }
 
     #[test]
