@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
@@ -7771,9 +7771,33 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
             }),
         )
     })?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, bytes).map_err(|error| {
-        shell_tool_error(
+    // Stage to a PER-WRITE UNIQUE sibling temp file, never a shared fixed name.
+    // Multiple threads (the background monitor, `act_run_shell_status`
+    // reconciliation, and terminal-status persistence) rewrite the same
+    // `status.json` concurrently. A shared `status.json.tmp` let two `write_all`
+    // calls interleave into the same staging blob — a shorter payload's tail
+    // left the previous longer payload's bytes behind, producing the
+    // `trailing characters at line N` corruption that was then renamed into
+    // place (#1568). A unique name means each writer stages, fsyncs, and renames
+    // its OWN complete blob; the rename is atomic, so readers observe either the
+    // old or the new whole file — never a half-merged one. (Canonical
+    // write→fsync→rename atomic-replace pattern.)
+    //
+    // Serialize concurrent writers to the SAME destination for the whole
+    // stage+commit. Every writer of a given `status.json` lives in this one
+    // daemon process, so an in-process per-path lock guarantees only one
+    // `MoveFileExW(REPLACE_EXISTING)` targets a destination at a time. Without
+    // it, many writers racing the same rename can starve one another past the
+    // bounded retry window and fail a status write outright under load (#1568).
+    let write_lock = shell_status_write_lock(path);
+    let _write_guard = write_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp_path = shell_status_temp_path(path);
+    if let Err(error) = write_shell_job_status_staging(&tmp_path, &bytes) {
+        // Never leak the partial staging file on the write/fsync failure path.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(shell_tool_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!("act_run_shell failed to write shell job status temp file: {error}"),
             json!({
@@ -7782,10 +7806,12 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
                 "path": tmp_path,
                 "reason": "job_status_temp_write_failed",
             }),
-        )
-    })?;
-    commit_shell_job_status_file(&tmp_path, path, &safe_status.job_id).map_err(|error| {
-        shell_tool_error(
+        ));
+    }
+    if let Err(error) = commit_shell_job_status_file(&tmp_path, path, &safe_status.job_id) {
+        // The rename never happened, so the staging file is orphaned — remove it.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(shell_tool_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!("act_run_shell failed to commit shell job status file: {error}"),
             json!({
@@ -7795,8 +7821,60 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
                 "tmp_path": tmp_path,
                 "reason": "job_status_rename_failed",
             }),
-        )
-    })
+        ));
+    }
+    Ok(())
+}
+
+/// Write the fully-serialized status blob to `tmp_path` and flush it to stable
+/// storage before the caller renames it over the live status file. The
+/// `sync_all` (fsync) is what makes the subsequent atomic rename crash-safe: a
+/// power loss after the rename can only expose the fully-durable new blob or the
+/// prior one, never a zero-length or partially-flushed file.
+fn write_shell_job_status_staging(tmp_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = fs::File::create(tmp_path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Deterministic-prefix, per-(process, write) UNIQUE staging path for a status
+/// file. The `<name>.tmp.` prefix is what [`shell_status_replace_in_flight`]
+/// scans for to tell an in-flight atomic replace apart from a genuinely-missing
+/// job; the `<pid>.<seq>` suffix guarantees two concurrent writers — even across
+/// daemon processes — never collide on the same staging file.
+fn shell_status_temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "status.json".to_owned());
+    path.with_file_name(format!("{base}.tmp.{}.{seq}", std::process::id()))
+}
+
+/// In-process serialization lock for status writes to a given destination.
+///
+/// Uses a fixed pool of stripes hashed by path, so memory is bounded no matter
+/// how many distinct jobs a long-running daemon creates (a per-path registry
+/// would grow without bound). Writes to the same `status.json` always hash to
+/// the same stripe and are therefore serialized; two unrelated paths only share
+/// a stripe ~1/N of the time, and the resulting brief extra serialization is
+/// harmless because a stage+commit is sub-millisecond.
+fn shell_status_write_lock(path: &Path) -> &'static Mutex<()> {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        sync::OnceLock,
+    };
+    const STRIPES: usize = 64;
+    static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| (0..STRIPES).map(|_| Mutex::new(())).collect());
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let index = (hasher.finish() as usize) % STRIPES;
+    &locks[index]
 }
 
 #[cfg(windows)]
@@ -7867,28 +7945,53 @@ fn commit_shell_job_status_file(tmp_path: &Path, path: &Path, _job_id: &str) -> 
 ///
 /// `NOT_FOUND` is overloaded: it is also the legitimate signal that a job never
 /// existed. We disambiguate without penalising the genuine-missing path by
-/// checking for the writer's staging `*.json.tmp` sibling: if it is present a
-/// replace is in flight and we retry; if neither the target nor the staging
-/// file exists the job is truly absent and we return immediately.
+/// checking for any of the writer's `<name>.tmp.*` staging siblings: if one is
+/// present a replace is in flight and we retry; if neither the target nor any
+/// staging file exists the job is truly absent and we return immediately.
+///
+/// Open the status file for reading with **`FILE_SHARE_DELETE`** in addition to
+/// share-read/write. This is the load-bearing half of the atomic-replace
+/// contract on Windows: `std::fs::read` omits `FILE_SHARE_DELETE`, so a reader
+/// holding the file open blocks the monitor's `MoveFileExW(REPLACE_EXISTING)`
+/// with `ERROR_SHARING_VIOLATION`/`ERROR_ACCESS_DENIED`. Under sustained polling
+/// the destination is almost never idle, so the writer's bounded rename retry
+/// eventually exhausts and a status rewrite fails outright (#1568, the
+/// "surfaced under heavy load" failure). With share-delete the replace proceeds
+/// while the reader keeps reading the complete old inode, which Windows keeps
+/// alive until the handle closes — so the reader still observes a whole file,
+/// never a partial one.
+#[cfg(windows)]
+fn read_status_file_share_delete(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ (0x1) | FILE_SHARE_WRITE (0x2) | FILE_SHARE_DELETE (0x4).
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 #[cfg(windows)]
 fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
     // ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32.
     const TRANSIENT_OPEN_CODES: [i32; 2] = [5, 32];
-    let staging_path = shell_status_staging_path(path);
     let started = Instant::now();
     loop {
-        match fs::read(path) {
+        match read_status_file_share_delete(path) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 let within_window = started.elapsed() < Duration::from_millis(500);
                 let transient_open = error
                     .raw_os_error()
                     .is_some_and(|code| TRANSIENT_OPEN_CODES.contains(&code));
-                // A NOT_FOUND only counts as a transient replace window while the
-                // writer's staging file is still on disk; otherwise the job is
-                // genuinely absent and the error is returned as-is.
-                let mid_replace =
-                    error.kind() == io::ErrorKind::NotFound && staging_path.exists();
+                // A NOT_FOUND only counts as a transient replace window while a
+                // writer's unique staging file is still on disk; otherwise the
+                // job is genuinely absent and the error is returned as-is.
+                let mid_replace = error.kind() == io::ErrorKind::NotFound
+                    && shell_status_replace_in_flight(path);
                 if within_window && (transient_open || mid_replace) {
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
@@ -7907,12 +8010,27 @@ fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path)
 }
 
-/// Deterministic path of the staging file `write_shell_job_status` renames into
-/// place; must stay in lockstep with the `with_extension("json.tmp")` call
-/// there so [`read_shell_status_bytes`] can detect an in-flight replace.
+/// Whether any writer currently has a `<name>.tmp.*` staging sibling for `path`
+/// on disk — i.e. an atomic replace is mid-flight. Scans the status file's own
+/// job directory (which holds only a handful of sidecar files) for the
+/// [`shell_status_temp_path`] prefix. Used by [`read_shell_status_bytes`] to
+/// keep the NOT_FOUND retry window from ever firing for a genuinely-absent job.
 #[cfg(windows)]
-fn shell_status_staging_path(path: &Path) -> PathBuf {
-    path.with_extension("json.tmp")
+fn shell_status_replace_in_flight(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let base = match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => return false,
+    };
+    let prefix = format!("{base}.tmp.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
 }
 
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
@@ -10239,7 +10357,9 @@ fn read_file_prefix_lossy(path: &Path, limit_bytes: usize) -> Result<String, Err
         )
     })?;
     let mut bytes = Vec::new();
-    file.by_ref()
+    // Disambiguate `by_ref`: both `io::Read` and `io::Write` are in scope for
+    // `File`, so name the Read impl explicitly for this bounded output read.
+    io::Read::by_ref(&mut file)
         .take(u64::try_from(limit_bytes).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|error| {
@@ -13436,25 +13556,27 @@ mod tests {
         assert_eq!(final_readback.job_id, "issue1012-status-race");
     }
 
-    // #1509: the status reader tolerates the Windows atomic-replace window
-    // (destination transiently reports NOT_FOUND while the writer's staging file
-    // is renamed in) WITHOUT slowing down the genuinely-missing path. Both arms
-    // are asserted against real filesystem state so a future change that either
-    // drops the mid-replace tolerance or blanket-retries every NOT_FOUND is
-    // caught.
+    // #1509/#1568: the status reader tolerates the Windows atomic-replace window
+    // (destination transiently reports NOT_FOUND while a writer's unique staging
+    // sibling is renamed in) WITHOUT slowing down the genuinely-missing path.
+    // Both arms are asserted against real filesystem state so a future change
+    // that either drops the mid-replace tolerance or blanket-retries every
+    // NOT_FOUND is caught. The mid-replace arm lands the file via the REAL
+    // atomic write path (unique temp -> fsync -> rename), so the reader can only
+    // ever observe a whole file — never the empty/partial slice a truncate-in-
+    // place writer used to expose (the flaky failure surfaced in #1568).
     #[cfg(windows)]
     #[test]
     fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
         let temp = tempfile::TempDir::new()
             .unwrap_or_else(|error| panic!("create temp status dir: {error}"));
         let status_path = temp.path().join("status.json");
-        let staging_path = shell_status_staging_path(&status_path);
 
-        // Arm 1 — genuinely missing: neither the target nor the staging file
+        // Arm 1 — genuinely missing: neither the target nor any staging sibling
         // exists, so the read must fail immediately rather than burning the
         // 500 ms replace-tolerance window.
         assert!(!status_path.exists());
-        assert!(!staging_path.exists());
+        assert!(!shell_status_replace_in_flight(&status_path));
         let started = Instant::now();
         let missing = read_shell_status_bytes(&status_path);
         let missing_elapsed = started.elapsed();
@@ -13474,38 +13596,207 @@ mod tests {
             "genuine missing read must return promptly, took {missing_elapsed:?}"
         );
 
-        // Arm 2 — mid-replace window: target absent but the writer's staging file
-        // is present, so the reader retries. A concurrent thread lands the real
-        // file partway through the tolerance window; the read must then succeed
-        // with the delivered bytes instead of erroring.
-        std::fs::write(&staging_path, b"pending-replace")
-            .unwrap_or_else(|error| panic!("seed staging file: {error}"));
+        // Arm 2 — mid-replace window: target absent but a writer's unique staging
+        // sibling is present, so the reader retries. A concurrent thread
+        // atomically lands the real file (unique temp -> fsync -> rename, exactly
+        // as `write_shell_job_status` does); the read must then succeed with the
+        // delivered WHOLE-file bytes, never an empty/partial slice. No timing
+        // lower bound is asserted — correctness must not depend on the reader
+        // happening to catch the window mid-flight.
+        let delivered = br#"{"delivered":true}"#.to_vec();
+        let seed_staging = shell_status_temp_path(&status_path);
+        std::fs::write(&seed_staging, b"pending-replace")
+            .unwrap_or_else(|error| panic!("seed staging sibling: {error}"));
+        assert!(
+            shell_status_replace_in_flight(&status_path),
+            "seeded staging sibling must register as an in-flight replace"
+        );
         let writer_status_path = status_path.clone();
+        let writer_bytes = delivered.clone();
+        let seed_for_writer = seed_staging.clone();
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(60));
-            std::fs::write(&writer_status_path, b"{\"delivered\":true}")
-                .unwrap_or_else(|error| panic!("land replacement status: {error}"));
+            let landing = shell_status_temp_path(&writer_status_path);
+            write_shell_job_status_staging(&landing, &writer_bytes)
+                .unwrap_or_else(|error| panic!("stage replacement status: {error}"));
+            commit_shell_job_status_file(&landing, &writer_status_path, "issue1568-mid-replace")
+                .unwrap_or_else(|error| panic!("commit replacement status: {error}"));
+            let _ = std::fs::remove_file(&seed_for_writer);
         });
-        let started = Instant::now();
         let recovered = read_shell_status_bytes(&status_path);
-        let recovered_elapsed = started.elapsed();
         writer
             .join()
             .unwrap_or_else(|error| panic!("writer thread should join: {error:?}"));
         println!(
-            "readback=read_shell_status_bytes edge=mid_replace after=ok:{} elapsed_ms:{}",
-            recovered.is_ok(),
-            recovered_elapsed.as_millis()
+            "readback=read_shell_status_bytes edge=mid_replace after=ok:{}",
+            recovered.is_ok()
         );
         assert_eq!(
             recovered.expect("mid-replace read must recover once the file lands"),
-            b"{\"delivered\":true}".to_vec(),
-            "reader must return the freshly delivered bytes"
+            delivered,
+            "reader must return the freshly delivered whole-file bytes, never empty/partial"
         );
-        assert!(
-            recovered_elapsed >= Duration::from_millis(40),
-            "reader must have waited through the replace window, waited {recovered_elapsed:?}"
+    }
+
+    // #1568 root-cause reproduction: many threads rewriting the SAME durable
+    // status file concurrently must never let a reader observe a corrupt,
+    // partial, empty, or trailing-garbage state, and must not leak staging temp
+    // files. Writers alternate between a SHORT and a LONG payload (via a large
+    // `error_message`) so that the pre-fix shared `status.json.tmp` staging file
+    // would interleave two `write_all`s — a shorter blob's tail left the longer
+    // blob's bytes behind, exactly the `trailing characters at line N` corruption
+    // the daemon logged. With per-write unique staging names this is impossible:
+    // each writer renames its own complete, fsynced blob into place. The source
+    // of truth checked here is the ACTUAL on-disk bytes (parsed back), not any
+    // return value.
+    #[test]
+    fn shell_status_concurrent_multiwriter_never_corrupts() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            thread,
+        };
+
+        const WRITERS: usize = 6;
+        const WRITES_PER_WRITER: usize = 300;
+        const READERS: usize = 4;
+
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+        };
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "Write-Output issue1568-mw".to_owned(),
+            ],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue1568-mw".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line_from_parts(&params.command, &params.args),
+            matched_pattern: "__any_permitted__".to_owned(),
+        };
+        let request_sha = run_shell_start_request_sha256(&params)
+            .unwrap_or_else(|error| panic!("start request should hash: {error}"));
+        let base = shell_job_status_record(
+            "issue1568-mw",
+            "running",
+            &params,
+            &paths,
+            &request_sha,
+            &authorization,
+            "2026-07-12T00:00:00Z".to_owned(),
+            Some(4242),
+            None,
         );
+        // Seed the initial complete status so readers always have a whole file.
+        write_shell_job_status(&paths.status_path, &base)
+            .unwrap_or_else(|error| panic!("initial status should write: {error}"));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let read_errors = Arc::new(AtomicUsize::new(0));
+        let reads_ok = Arc::new(AtomicUsize::new(0));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let status_path = paths.status_path.clone();
+                let stop = Arc::clone(&stop);
+                let read_errors = Arc::clone(&read_errors);
+                let reads_ok = Arc::clone(&reads_ok);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match read_shell_job_status(&status_path, "issue1568-mw") {
+                            Ok(status) => {
+                                assert_eq!(status.job_id, "issue1568-mw");
+                                reads_ok.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                read_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer_index| {
+                let paths = paths.clone();
+                let mut status = base.clone();
+                thread::spawn(move || {
+                    for iteration in 0..WRITES_PER_WRITER {
+                        // Alternate a large vs empty `error_message` so successive
+                        // serialized blobs differ sharply in length — the exact
+                        // condition that turned a shared staging file into
+                        // trailing-garbage before the fix.
+                        if (writer_index + iteration) % 2 == 0 {
+                            status.status = "running".to_owned();
+                            status.error_message = Some("y".repeat(8192));
+                        } else {
+                            status.status = "finalizing".to_owned();
+                            status.error_message = None;
+                        }
+                        status.duration_ms = Some(iteration as u64);
+                        write_shell_job_status(&paths.status_path, &status)
+                            .unwrap_or_else(|error| panic!("status rewrite should commit: {error}"));
+                    }
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer
+                .join()
+                .unwrap_or_else(|error| panic!("writer thread should join: {error:?}"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader
+                .join()
+                .unwrap_or_else(|error| panic!("reader thread should join: {error:?}"));
+        }
+
+        // Source of truth #1: the final on-disk bytes parse as a whole status.
+        let final_status = read_shell_job_status(&paths.status_path, "issue1568-mw")
+            .unwrap_or_else(|error| panic!("final status must parse: {error}"));
+        // Source of truth #2: not a single reader observed a corrupt/partial read
+        // across the whole concurrent run.
+        let observed_errors = read_errors.load(Ordering::Relaxed);
+        let observed_ok = reads_ok.load(Ordering::Relaxed);
+        // Source of truth #3: no staging temp file leaked in the job dir.
+        let leaked: Vec<String> = fs::read_dir(temp.path())
+            .unwrap_or_else(|error| panic!("scan job dir: {error}"))
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+
+        println!(
+            "readback=act_run_shell_status edge=concurrent_multiwriter before={WRITERS}x{WRITES_PER_WRITER}_rewrites after=read_errors:{observed_errors} reads_ok:{observed_ok} final_status:{} leaked_temps:{}",
+            final_status.status,
+            leaked.len()
+        );
+        assert_eq!(
+            observed_errors, 0,
+            "no reader may observe a corrupt/partial/empty status ({observed_errors} did)"
+        );
+        assert!(observed_ok > 0, "readers must have completed real reads");
+        assert_eq!(final_status.job_id, "issue1568-mw");
+        assert!(leaked.is_empty(), "no staging temp file may leak: {leaked:?}");
     }
 
     #[test]
