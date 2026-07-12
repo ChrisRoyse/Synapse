@@ -617,6 +617,19 @@ impl SynapseService {
     }
 
     fn tool_router() -> ToolRouter<Self> {
+        Self::build_tool_router(debug_tools_enabled())
+    }
+
+    /// Builds the full tool router, then removes the synthetic debug-only
+    /// fault-injector / synthetic-write routes unless `debug_enabled`.
+    ///
+    /// Split out from [`Self::tool_router`] so the gating decision is a pure
+    /// function of an explicit bool and can be unit-tested deterministically
+    /// via [`rmcp::handler::server::router::tool::ToolRouter::has_route`],
+    /// without mutating the process-global `SYNAPSE_DEBUG_TOOLS` env var (which
+    /// would race with other tests). See [`DEBUG_ONLY_TOOL_ROUTES`] for the
+    /// gated set and its rationale (#1348, #1595).
+    fn build_tool_router(debug_enabled: bool) -> ToolRouter<Self> {
         let mut router = Self::m1_tool_router()
             + Self::m2_tool_router()
             + Self::lease_tool_router()
@@ -668,25 +681,44 @@ impl SynapseService {
             + Self::browser_network_tool_router()
             + Self::browser_storage_tool_router()
             + Self::tool_profile_tool_router();
-        // Gate the synthetic fault-injectors off the default agent surface;
-        // they remain available only when SYNAPSE_DEBUG_TOOLS is set.
-        // `storage_pressure_sample` simulates disk pressure, and the two
-        // `action_diagnostic_*` tools force ACTION_RATE_LIMITED / ACTION_QUEUE_FULL
-        // to exercise the action emitter's backpressure paths (#1348). They have
-        // no production callers and every test that drives them sets
+        // Gate the synthetic test/FSV-scaffolding tools off the default agent
+        // surface; they remain reachable only when SYNAPSE_DEBUG_TOOLS is set.
+        // `remove_route` drops the route from the router entirely, so the tool
+        // is unreachable even by an unbound call (the tool-profile visibility
+        // filter only runs once a session is bound — see
+        // `tools_for_session_profile`), matching the least-privilege /
+        // exclude-by-default posture: a gated tool cannot be called even when
+        // explicitly named. Every test that drives these sets
         // SYNAPSE_DEBUG_TOOLS=1.
-        //
-        // NOTE: `storage_put_probe_rows` is intentionally NOT gated here — it is a
-        // default-granted real diagnostic write tool (normal_agent surface, see
-        // tool_profiles tests) used by storage-GC FSV to seed bounded probe rows.
-        if !debug_tools_enabled() {
-            router.remove_route("storage_pressure_sample");
-            router.remove_route("action_diagnostic_rate_limit_override");
-            router.remove_route("action_diagnostic_queue_full_setup");
+        if !debug_enabled {
+            for route in DEBUG_ONLY_TOOL_ROUTES {
+                router.remove_route(route);
+            }
         }
         router
     }
 }
+
+/// Synthetic test/FSV-scaffolding tool routes that must NOT ship on the normal,
+/// default agent surface; they are only registered when `SYNAPSE_DEBUG_TOOLS` is
+/// set (see [`SynapseService::build_tool_router`]).
+///
+/// - `storage_put_probe_rows` — writes bounded synthetic probe rows into a real
+///   RocksDB column family; a synthetic-write diagnostic used by storage/GC and
+///   timeline FSV to seed rows, never a production capability (#1595).
+/// - `storage_pressure_sample` — simulates disk pressure to exercise the storage
+///   pressure signal.
+/// - `action_diagnostic_rate_limit_override` / `action_diagnostic_queue_full_setup`
+///   — force `ACTION_RATE_LIMITED` / `ACTION_QUEUE_FULL` to exercise the action
+///   emitter's backpressure paths.
+///
+/// All four have no production callers (#1348, #1595).
+pub(crate) const DEBUG_ONLY_TOOL_ROUTES: &[&str] = &[
+    "storage_put_probe_rows",
+    "storage_pressure_sample",
+    "action_diagnostic_rate_limit_override",
+    "action_diagnostic_queue_full_setup",
+];
 
 /// Pure decision for [`SynapseService::action_session_target_override`] (#984):
 /// maps explicit per-call routing params to a [`SessionTarget`], or `Ok(None)`
