@@ -72,7 +72,7 @@ use crate::{
         ActStrokeResponse, ActTypeParams, ActTypeResponse, M2ServiceConfig, ReleaseAllParams,
         ReleaseAllResponse, SharedM2State, SharedSessionClipboardBuffers,
         act_click_with_handle_and_lease, act_clipboard_session_buffer, act_focus_window,
-        act_focus_window_request_details, act_focus_window_target_hwnd, act_keymap_with_handle,
+        act_focus_window_request_details, act_focus_window_target_hwnd,
         act_pad_with_handle, act_press_with_handle, act_scroll_with_handle, act_set_value,
         act_set_value_request_details, act_stroke_validation_failure_details,
         act_stroke_with_handle, act_type_with_handle, new_session_clipboards,

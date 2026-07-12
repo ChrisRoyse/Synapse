@@ -1356,7 +1356,7 @@ fn foreground_context_for_test(
         hwnd,
         pid,
         process_name: process_name.to_owned(),
-        process_path: format!(r"C:\Program Files\{}\{}.exe", process_name, process_name),
+        process_path: format!(r"C:\Program Files\{process_name}\{process_name}.exe"),
         window_title: window_title.to_owned(),
         window_bounds,
         monitor_index: 0,

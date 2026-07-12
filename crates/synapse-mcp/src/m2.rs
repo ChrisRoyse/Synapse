@@ -63,7 +63,7 @@ pub use postcondition::default_verify_timeout_ms;
 pub use press::action_from_press_params;
 pub use press::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
-    act_keymap_with_handle, act_press_with_handle,
+    act_press_with_handle,
 };
 pub(crate) use press::{
     HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,

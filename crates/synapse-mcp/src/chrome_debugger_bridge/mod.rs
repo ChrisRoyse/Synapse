@@ -3775,6 +3775,10 @@ pub struct ChromeDebuggerPageVitals {
     pub error_detail: Option<String>,
 }
 
+// Bridge page-vitals readback type. Currently exercised via the parallel
+// m1_tools raw-CDP path (`raw_cdp_page_vitals_info`); retained as the typed
+// bridge-level surface, so unused in the compiled bins.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChromeDebuggerPageVitalsResult {
     pub extension_id: Option<String>,
@@ -4814,14 +4818,10 @@ fn bridge_build_id_stale_reason(
         && actual_service_worker_status.unwrap_or("not_seen_yet") == "ok";
     if worker_sha256_matches {
         return Some(format!(
-            "build_id_skew=daemon_expected_build_mismatch loaded_build_id={} expected_build_id={} service_worker_sha256_matches_expected=true repair=restart_or_reinstall_repo_built_daemon",
-            actual_build_id, expected_build_id
+            "build_id_skew=daemon_expected_build_mismatch loaded_build_id={actual_build_id} expected_build_id={expected_build_id} service_worker_sha256_matches_expected=true repair=restart_or_reinstall_repo_built_daemon"
         ));
     }
-    Some(format!(
-        "build_id={} expected={}",
-        actual_build_id, expected_build_id
-    ))
+    Some(format!("build_id={actual_build_id} expected={expected_build_id}"))
 }
 
 fn setup_repair_guidance() -> String {
@@ -6472,6 +6472,10 @@ pub async fn media_emulation(
     })
 }
 
+// See `ChromeDebuggerPageVitalsResult`: the live page-vitals readback runs
+// through m1_tools' raw-CDP path, so this bridge-level entry point is unused in
+// the compiled bins.
+#[allow(dead_code)]
 pub async fn page_vitals(
     hwnd: i64,
     target_id: &str,
@@ -6825,10 +6829,6 @@ fn aria_autocomplete_is_sensitive(autocomplete: &str) -> bool {
 /// `api-key`, `apiKey`, and `apikey` all match. Substring (not word-bounded)
 /// matching is intentional: over-redaction is acceptable, under-redaction is not.
 fn aria_name_looks_secret(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let hay = name.to_ascii_lowercase();
     const PATTERNS: &[&str] = &[
         "password",
         "passwd",
@@ -6866,6 +6866,10 @@ fn aria_name_looks_secret(name: &str) -> bool {
         "session_id",
         "csrf",
     ];
+    if name.is_empty() {
+        return false;
+    }
+    let hay = name.to_ascii_lowercase();
     PATTERNS.iter().any(|needle| hay.contains(needle))
 }
 

@@ -100,7 +100,9 @@ pub struct SubsystemHealth {
 }
 
 /// Structured replacement for the `chrome_bridge` subsystem's concatenated
-/// `detail` blob. Each field names one piece the blob previously encoded as
+/// `detail` blob.
+///
+/// Each field names one piece the blob previously encoded as
 /// `key=value` text. Every field is optional so partially-observed hosts and
 /// the no-host/unavailable branch omit what they cannot report, and so compact
 /// health responses can drop the verbose identity fields while keeping the

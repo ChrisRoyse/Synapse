@@ -4853,7 +4853,7 @@ fn reap_stale_shell_jobs_honors_ttl_boundary() {
         &two_hours_ago,
         Some(&two_hours_ago),
     );
-    let short = reap_stale_shell_jobs_with_ttl(Duration::from_secs(60 * 60))
+    let short = reap_stale_shell_jobs_with_ttl(Duration::from_hours(1))
         .unwrap_or_else(|error| panic!("short-ttl reap should succeed: {error}"));
     assert!(
         !under_short_ttl.job_dir.exists(),
@@ -4868,7 +4868,7 @@ fn reap_stale_shell_jobs_honors_ttl_boundary() {
         &two_hours_ago,
         Some(&two_hours_ago),
     );
-    let long = reap_stale_shell_jobs_with_ttl(Duration::from_secs(24 * 60 * 60))
+    let long = reap_stale_shell_jobs_with_ttl(Duration::from_hours(24))
         .unwrap_or_else(|error| panic!("long-ttl reap should succeed: {error}"));
     assert!(
         under_long_ttl.job_dir.exists(),

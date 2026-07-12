@@ -70,6 +70,7 @@ mod tests;
 
 pub use self::types::*;
 pub(super) use self::types::shell_input_schema;
+#[allow(clippy::wildcard_imports)]
 use self::facade::*;
 pub(super) use self::agent_spawn::*;
 pub(crate) use self::agent_spawn::agent_spawn_root_dir;

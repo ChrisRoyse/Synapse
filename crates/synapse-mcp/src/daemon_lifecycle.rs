@@ -672,7 +672,7 @@ fn write_tool_event_inner(state: &mut DaemonLifecycleState, event: &ToolEvent) -
     append_tool_event(state, event)?;
     let tool_last_path = state.paths.tool_last_path.clone();
     write_json_atomic(Path::new(&tool_last_path), event)
-        .with_context(|| format!("write daemon last tool {}", tool_last_path))
+        .with_context(|| format!("write daemon last tool {tool_last_path}"))
 }
 
 /// Append one JSON line to the active `daemon-tool-events.jsonl`, rotating the

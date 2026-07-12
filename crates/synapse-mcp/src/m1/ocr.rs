@@ -31,7 +31,10 @@ pub struct ResolvedReadTextRequest {
     pub synthetic: bool,
     /// When true, a clean OCR pass that finds zero glyphs stays a hard
     /// `OCR_NO_TEXT` error instead of the #1557 empty-observation success — for
-    /// callers that want to pin fail-closed absence.
+    /// callers that want to pin fail-closed absence. Carried on the resolved
+    /// request for completeness; the fail-closed gate is enforced separately by
+    /// [`enforce_require_text`] from the tool params.
+    #[allow(dead_code)]
     pub require_text: bool,
 }
 

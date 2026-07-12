@@ -167,7 +167,7 @@ impl M3ServiceConfig {
 /// Bounded maximum lifetime of a runtime reality-write opt-in overlay (#1559).
 /// The overlay is a break-glass escalation, so it self-expires quickly; a fresh
 /// grant is required after this window regardless of daemon uptime.
-pub const REALITY_WRITE_GRANT_MAX_TTL: Duration = Duration::from_secs(15 * 60);
+pub const REALITY_WRITE_GRANT_MAX_TTL: Duration = Duration::from_mins(15);
 
 /// In-memory, scoped, reversible, audited reality-write opt-in overlay (#1559).
 ///

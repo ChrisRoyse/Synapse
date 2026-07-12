@@ -1,4 +1,4 @@
-//! Unit tests for chrome_debugger_bridge (split out of the module body per #1555).
+//! Unit tests for `chrome_debugger_bridge` (split out of the module body per #1555).
 
 use axum::http::{HeaderMap, HeaderValue, Uri, header};
 
@@ -1215,7 +1215,7 @@ fn aria_test_result(
         root_element_id: None,
         snapshot,
         node_count: nodes.len(),
-        total_ax_nodes: nodes.len() as u32,
+        total_ax_nodes: u32::try_from(nodes.len()).unwrap_or(u32::MAX),
         nodes,
         max_nodes: 500,
         max_depth: 32,

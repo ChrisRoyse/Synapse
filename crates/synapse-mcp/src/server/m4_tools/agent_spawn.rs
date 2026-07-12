@@ -1,3 +1,6 @@
+// Split-out sibling of the m4_tools module; the glob mirrors the pre-split
+// single-module layout and keeps the shared symbol set in one place.
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub(super) fn validate_spawn_local_model_static_requirements(

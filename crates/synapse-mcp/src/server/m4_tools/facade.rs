@@ -1,4 +1,8 @@
+// Split-out sibling of the m4_tools module; the globs mirror the pre-split
+// single-module layout and keep the shared symbol set in one place.
+#[allow(clippy::wildcard_imports)]
 use super::*;
+#[allow(clippy::wildcard_imports)]
 use super::types::*;
 
 pub(super) fn shell_facade_error(

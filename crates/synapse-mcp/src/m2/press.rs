@@ -75,6 +75,9 @@ pub async fn act_press_with_handle(
     })
 }
 
+// Test-exercised keymap helper (see m2::press::tests); production keymap
+// routing no longer calls it directly, so it is unused in the compiled bins.
+#[allow(dead_code)]
 pub async fn act_keymap_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
