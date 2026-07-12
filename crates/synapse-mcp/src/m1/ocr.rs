@@ -29,6 +29,10 @@ pub struct ResolvedReadTextRequest {
     pub effective_backend: OcrBackend,
     pub lang_hint: Option<String>,
     pub synthetic: bool,
+    /// When true, a clean OCR pass that finds zero glyphs stays a hard
+    /// `OCR_NO_TEXT` error instead of the #1557 empty-observation success — for
+    /// callers that want to pin fail-closed absence.
+    pub require_text: bool,
 }
 
 impl ResolvedReadTextRequest {
@@ -59,6 +63,7 @@ pub fn resolve_read_text_request(
         effective_backend: effective_ocr_backend(params.backend)?,
         lang_hint: params.lang_hint.clone(),
         synthetic: state.synthetic.is_some(),
+        require_text: params.require_text,
     })
 }
 
@@ -69,15 +74,14 @@ pub fn read_text_request_uncached(
         let provider = SyntheticOcrProvider {
             region: request.region,
         };
-        let words = read_text_with_provider(&provider, request.region)
-            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-        return Ok(ocr_result_from_text_regions(words, request));
+        return ocr_result_or_empty(
+            read_text_with_provider(&provider, request.region),
+            request,
+        );
     }
     match request.effective_backend {
         OcrBackend::Winrt => {
-            let words = platform_read_text(request.region)
-                .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-            Ok(ocr_result_from_text_regions(words, request))
+            ocr_result_or_empty(platform_read_text(request.region), request)
         }
         OcrBackend::Crnn => Err(crnn_unavailable_error()),
         OcrBackend::Auto => Err(mcp_error(
@@ -98,14 +102,15 @@ pub fn read_text_request_from_bgra(
     let request = read_text_request_for_captured_bitmap(request.clone(), captured)?;
     match request.effective_backend {
         OcrBackend::Winrt => {
-            let words = synapse_perception::read_text_from_bgra_bitmap(
-                request.region,
-                captured.width,
-                captured.height,
-                &captured.bytes,
+            ocr_result_or_empty(
+                synapse_perception::read_text_from_bgra_bitmap(
+                    request.region,
+                    captured.width,
+                    captured.height,
+                    &captured.bytes,
+                ),
+                &request,
             )
-            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-            Ok(ocr_result_from_text_regions(words, &request))
         }
         OcrBackend::Crnn => Err(crnn_unavailable_error()),
         OcrBackend::Auto => Err(mcp_error(
@@ -160,8 +165,9 @@ pub fn read_text_request_for_captured_bitmap(
 ///
 /// # Errors
 ///
-/// `OCR_NO_TEXT` if the bitmap dimensions exceed `i32` or OCR finds no text;
-/// any `WinRT` OCR backend error from `read_text_from_bgra_bitmap`.
+/// `OCR_NO_TEXT` if the bitmap dimensions exceed `i32`; any `WinRT` OCR backend
+/// error from `read_text_from_bgra_bitmap`. A clean pass that finds no glyphs is
+/// a success with `no_text: true` (empty observation), not an error (#1557).
 #[cfg(windows)]
 pub fn ocr_result_from_web_bitmap(
     width: u32,
@@ -182,8 +188,6 @@ pub fn ocr_result_from_web_bitmap(
         )
     })?;
     let region = Rect { x: 0, y: 0, w, h };
-    let words = synapse_perception::read_text_from_bgra_bitmap(region, width, height, bgra)
-        .map_err(|err| mcp_error(err.code(), err.to_string()))?;
     let request = ResolvedReadTextRequest {
         region,
         capture_source: ReadTextCaptureSource::Screen,
@@ -191,8 +195,12 @@ pub fn ocr_result_from_web_bitmap(
         effective_backend: OcrBackend::Winrt,
         lang_hint: lang_hint.map(str::to_owned),
         synthetic: false,
+        require_text: false,
     };
-    Ok(ocr_result_from_text_regions(words, &request))
+    ocr_result_or_empty(
+        synapse_perception::read_text_from_bgra_bitmap(region, width, height, bgra),
+        &request,
+    )
 }
 
 fn text_region(
@@ -361,6 +369,7 @@ fn ocr_result_from_text_regions(
         .map(|word| word.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    let no_text = regions.is_empty();
     let confidence = aggregate_confidence(&regions);
     let confidence_source = aggregate_confidence_source(&regions);
     OcrResult {
@@ -382,8 +391,72 @@ fn ocr_result_from_text_regions(
         confidence_source,
         region: request.region,
         lang: request.lang(),
+        no_text,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
+    }
+}
+
+/// The empty-region success readback for #1557: a clean OCR pass that found no
+/// glyphs is a valid observation (`no_text: true`), not a failure.
+fn empty_ocr_result(request: &ResolvedReadTextRequest) -> OcrResult {
+    OcrResult {
+        full_text: String::new(),
+        words: Vec::new(),
+        confidence: 0.0,
+        confidence_source: OcrConfidenceSource::Unsupported,
+        region: request.region,
+        lang: request.lang(),
+        no_text: true,
+        perceived_text_notice: None,
+        suspected_injection: Vec::new(),
+    }
+}
+
+/// The #1557 `require_text` fail-closed gate, applied to a FINAL `OcrResult`.
+///
+/// Kept OUT of [`ocr_result_or_empty`] on purpose: `read_text` caches the raw
+/// empty observation in `CF_OCR_CACHE` (keyed on pixels+backend), so a gate
+/// buried in the OCR pass is silently bypassed on a cache hit — the exact defect
+/// FSV caught, where `require_text:true` returned a cached `no_text:true`
+/// success. Enforcing absence here, on the final post-cache result, makes it
+/// fire identically on cache hits and misses, independent of how the perception
+/// layer represented "no glyphs" (`Err(OcrNoText)` vs `Ok(vec![])`). It also
+/// avoids masking a legitimate blank as a hard error mid-pass, which would wrong-
+/// foot the window-capture fallback in `read_text_with_target_hwnd`.
+pub fn enforce_require_text(result: &OcrResult, require_text: bool) -> Result<(), ErrorData> {
+    if require_text && result.no_text {
+        return Err(mcp_error(
+            error_codes::OCR_NO_TEXT,
+            format!(
+                "read_text found no glyphs in OCR region ({}, {}, {}, {}) and require_text was set, so absence is a hard OCR_NO_TEXT failure",
+                result.region.x, result.region.y, result.region.w, result.region.h
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Turns a raw OCR word result into an `OcrResult`, treating the perception
+/// layer's "no glyphs" outcome as a valid empty observation (#1557) instead of a
+/// hard error.
+///
+/// "No glyphs" has two equivalent representations at the perception boundary:
+/// `Err(OcrNoText)` (some backends raise it) and `Ok(vec![])` (WinRT returns an
+/// empty region vector for a clean blank capture). Both collapse to the same
+/// empty observation, which is what gets cached. The `require_text` fail-closed
+/// policy is applied separately by [`enforce_require_text`] on the final
+/// post-cache result, so it is representation- and cache-agnostic. Every other
+/// perception failure (backend unavailable, capture failed, …) stays a typed
+/// hard error exactly as before.
+fn ocr_result_or_empty(
+    words: synapse_perception::PerceptionResult<Vec<TextRegion>>,
+    request: &ResolvedReadTextRequest,
+) -> Result<OcrResult, ErrorData> {
+    match words {
+        Ok(regions) => Ok(ocr_result_from_text_regions(regions, request)),
+        Err(synapse_perception::PerceptionError::OcrNoText { .. }) => Ok(empty_ocr_result(request)),
+        Err(err) => Err(mcp_error(err.code(), err.to_string())),
     }
 }
 
@@ -559,9 +632,10 @@ impl synapse_perception::OcrProvider for SyntheticOcrProvider {
 mod tests {
     use super::{
         AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP, ReadTextCaptureSource, ResolvedReadTextRequest,
-        identifier_aware_confidence, is_ambiguous_identifier_token, ocr_result_from_text_regions,
+        enforce_require_text, identifier_aware_confidence, is_ambiguous_identifier_token,
+        ocr_result_from_text_regions, ocr_result_or_empty,
     };
-    use synapse_core::{OcrBackend, OcrConfidenceSource, Rect};
+    use synapse_core::{OcrBackend, OcrConfidenceSource, Rect, error_codes};
     use synapse_perception::TextRegionConfidenceSource;
 
     #[test]
@@ -598,6 +672,7 @@ mod tests {
             effective_backend: OcrBackend::Winrt,
             lang_hint: None,
             synthetic: false,
+            require_text: false,
         };
         let result = ocr_result_from_text_regions(
             vec![synapse_perception::TextRegion {
@@ -618,6 +693,114 @@ mod tests {
         );
     }
 
+    fn empty_ocr_test_request(require_text: bool) -> ResolvedReadTextRequest {
+        ResolvedReadTextRequest {
+            region: Rect {
+                x: 410,
+                y: 74,
+                w: 1178,
+                h: 746,
+            },
+            capture_source: ReadTextCaptureSource::Screen,
+            requested_backend: OcrBackend::Winrt,
+            effective_backend: OcrBackend::Winrt,
+            lang_hint: None,
+            synthetic: false,
+            require_text,
+        }
+    }
+
+    #[test]
+    fn ocr_no_text_is_empty_observation_by_default() {
+        // #1557: a clean OCR pass over a valid region that finds zero glyphs is a
+        // valid empty observation (no_text:true), not an OCR_NO_TEXT failure.
+        let request = empty_ocr_test_request(false);
+        let result = ocr_result_or_empty(
+            Err(synapse_perception::PerceptionError::OcrNoText {
+                region: request.region,
+            }),
+            &request,
+        )
+        .expect("empty region must be a success observation, not a failure");
+        assert!(result.no_text);
+        assert!(result.full_text.is_empty());
+        assert!(result.words.is_empty());
+        assert_eq!(result.region, request.region);
+        println!(
+            "readback=read_text no_text={} full_text={:?} words={} region={:?}",
+            result.no_text,
+            result.full_text,
+            result.words.len(),
+            result.region
+        );
+    }
+
+    #[test]
+    fn ocr_no_text_stays_error_when_require_text_pinned() {
+        // The opt-in fail-closed path is preserved for callers that pin absence.
+        // The empty observation is Ok (and cacheable); the require_text gate is
+        // applied separately on the final result via enforce_require_text.
+        let request = empty_ocr_test_request(true);
+        let result = ocr_result_or_empty(
+            Err(synapse_perception::PerceptionError::OcrNoText {
+                region: request.region,
+            }),
+            &request,
+        )
+        .expect("an empty observation is Ok; the fail-closed gate runs post-cache");
+        assert!(result.no_text);
+        let error = enforce_require_text(&result, true)
+            .expect_err("require_text must keep fail-closed OCR_NO_TEXT");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::OCR_NO_TEXT))
+        );
+    }
+
+    #[test]
+    fn ocr_backend_failure_is_never_masked_as_empty() {
+        // Backend/capture failures stay hard errors; only "no glyphs" is empty.
+        let request = empty_ocr_test_request(false);
+        let error = ocr_result_or_empty(
+            Err(synapse_perception::PerceptionError::OcrBackendUnavailable {
+                detail: "winrt engine missing".to_owned(),
+            }),
+            &request,
+        )
+        .expect_err("backend failures must not be masked as an empty observation");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::OCR_BACKEND_UNAVAILABLE))
+        );
+    }
+
+    #[test]
+    fn ocr_empty_regions_vec_respects_require_text() {
+        // FSV #1557 regression: WinRT signals "no glyphs" as Ok(vec![]) rather
+        // than Err(OcrNoText), and read_text caches that empty observation. The
+        // require_text gate runs on the final (post-cache) result, so it fires on
+        // this representation AND on a cache hit — the exact bug FSV caught where
+        // require_text:true returned a cached no_text:true success.
+        let result = ocr_result_or_empty(Ok(Vec::new()), &empty_ocr_test_request(false))
+            .expect("an empty Ok vec is a valid empty observation");
+        assert!(result.no_text, "empty Ok vec must set no_text");
+        assert!(result.words.is_empty());
+        assert!(result.full_text.is_empty());
+
+        enforce_require_text(&result, false)
+            .expect("default require_text=false keeps the empty observation as success");
+        let error = enforce_require_text(&result, true)
+            .expect_err("require_text=true must fail-closed on an empty observation");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::OCR_NO_TEXT))
+        );
+        println!(
+            "readback=read_text empty_observation no_text={} gate(false)=ok gate(true)=OCR_NO_TEXT",
+            result.no_text
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn whole_window_request_uses_captured_bitmap_extent() {
@@ -633,6 +816,7 @@ mod tests {
             effective_backend: OcrBackend::Winrt,
             lang_hint: None,
             synthetic: false,
+            require_text: false,
         };
         let captured = synapse_capture::CapturedBgraBitmap {
             region: Rect {

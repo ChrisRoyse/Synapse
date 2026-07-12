@@ -2452,6 +2452,7 @@ mod scope_gate_tests {
                 window_hwnd: None,
                 backend: synapse_core::OcrBackend::Winrt,
                 lang_hint: None,
+                require_text: false,
             }))?;
         assert_eq!(ocr.0.full_text, "Synapse");
 

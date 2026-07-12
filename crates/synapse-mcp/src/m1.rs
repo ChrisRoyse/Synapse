@@ -24,7 +24,7 @@ use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_conf
 #[cfg(windows)]
 pub use ocr::ocr_result_from_web_bitmap;
 pub use ocr::{
-    ReadTextCaptureSource, ResolvedReadTextRequest, effective_ocr_backend,
+    ReadTextCaptureSource, ResolvedReadTextRequest, effective_ocr_backend, enforce_require_text,
     read_text_request_uncached, resolve_read_text_request,
 };
 #[cfg(windows)]
@@ -292,6 +292,12 @@ pub struct ReadTextParams {
     pub backend: OcrBackend,
     #[serde(default)]
     pub lang_hint: Option<String>,
+    /// When true, a clean OCR pass that finds no glyphs returns the typed
+    /// `OCR_NO_TEXT` error (fail-closed absence) instead of the default #1557
+    /// empty-observation success (`no_text: true`, empty text). Default false:
+    /// an empty region is a valid observation, not a failure.
+    #[serde(default)]
+    pub require_text: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

@@ -477,6 +477,11 @@ pub struct OcrResult {
     pub confidence_source: OcrConfidenceSource,
     pub region: Rect,
     pub lang: String,
+    /// True when a clean OCR pass over a valid region produced zero glyphs — an
+    /// empty region is a valid observation, not a failure (#1557). Omitted
+    /// (defaults false) for populated results so existing readers are unchanged.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub no_text: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

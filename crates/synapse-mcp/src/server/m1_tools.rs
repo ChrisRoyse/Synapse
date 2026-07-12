@@ -508,7 +508,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
+        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words (not an OCR_NO_TEXT error); pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
     )]
     pub async fn read_text(
         &self,
@@ -531,6 +531,7 @@ impl SynapseService {
             let mut result = self
                 .read_text_web_element(element_id, backend_node_id, &params.0)
                 .await?;
+            crate::m1::enforce_require_text(&result, params.0.require_text)?;
             attach_ocr_hygiene_annotations(&mut result);
             return Ok(Json(result));
         }
@@ -561,6 +562,9 @@ impl SynapseService {
         .and_then(|request| self.read_text_request_with_cache(request));
         match normal_result {
             Ok(mut result) => {
+                // #1557 fail-closed gate, applied to the final (post-cache)
+                // result so require_text is honoured on a CF_OCR_CACHE hit too.
+                crate::m1::enforce_require_text(&result, params.0.require_text)?;
                 attach_ocr_hygiene_annotations(&mut result);
                 Ok(Json(result))
             }
@@ -573,6 +577,7 @@ impl SynapseService {
                 };
                 let mut result =
                     self.read_text_hidden_desktop(&params.0, session_id, hwnd, error)?;
+                crate::m1::enforce_require_text(&result, params.0.require_text)?;
                 attach_ocr_hygiene_annotations(&mut result);
                 Ok(Json(result))
             }
@@ -2263,6 +2268,7 @@ impl SynapseService {
             effective_backend,
             lang_hint: params.lang_hint.clone(),
             synthetic: false,
+            require_text: false,
         };
         self.read_text_request_with_captured_bitmap(
             request,
@@ -21123,6 +21129,7 @@ mod tests {
                 h: 80,
             },
             lang: "en".to_owned(),
+            no_text: false,
             perceived_text_notice: None,
             suspected_injection: Vec::new(),
         };
@@ -21154,6 +21161,7 @@ mod tests {
                 h: 80,
             },
             lang: "en".to_owned(),
+            no_text: false,
             perceived_text_notice: None,
             suspected_injection: Vec::new(),
         };
@@ -22199,6 +22207,7 @@ mod tests {
             effective_backend: OcrBackend::Winrt,
             lang_hint: Some("en-US".to_owned()),
             synthetic: false,
+            require_text: false,
         };
 
         let first_hash = sha256_hex(&[1, 2, 3, 4]);
@@ -22226,6 +22235,7 @@ mod tests {
             effective_backend: OcrBackend::Winrt,
             lang_hint: None,
             synthetic: false,
+            require_text: false,
         };
         let hash = sha256_hex(&[9, 9, 9, 9]);
         let explicit_key = ocr_cache_key(&explicit, 200, 80, &hash, "gdi_screen_region_bgra");
