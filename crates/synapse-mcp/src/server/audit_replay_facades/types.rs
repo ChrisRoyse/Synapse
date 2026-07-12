@@ -288,6 +288,16 @@ pub struct AuditCommandQueryResponse {
     pub returned_count: usize,
     pub corrupt_row_count: usize,
     pub complete: bool,
+    /// Iteration direction applied: `"newest_first"` (unwindowed default) or
+    /// `"oldest_first"` (explicit forward paging). #1550.
+    pub scan_order: String,
+    /// True when matches older than this page exist. For newest-first this is an
+    /// honest "more history available", not a failure; page older with
+    /// `end_ts_ns = oldest_returned_ts_ns`.
+    pub has_older: bool,
+    /// Timestamp of the oldest returned row (newest-first only), for paging older.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_returned_ts_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_key_hex: Option<String>,
     pub rows: Vec<AuditCommandQueryRowSummary>,

@@ -123,8 +123,24 @@ pub(crate) struct CommandAuditQueryResponse {
     pub exhausted: bool,
     pub start_key_hex: Option<String>,
     pub next_start_key_hex: Option<String>,
+    /// Iteration direction actually applied. `"newest_first"` is the unwindowed
+    /// default (no `start_key_hex`/`start_ts_ns`): it returns the most recent
+    /// matches as a complete page. `"oldest_first"` is explicit forward paging
+    /// (a `start_key_hex` or `start_ts_ns` was supplied) and keeps the
+    /// fail-closed partial-page contract. #1550.
+    pub scan_order: &'static str,
+    /// True when matches older than the returned window exist. For newest-first
+    /// this is an honest "there is more history", NOT a failure — page older by
+    /// passing `end_ts_ns = oldest_returned_ts_ns`.
+    pub has_older: bool,
+    /// Timestamp of the oldest row returned this page (newest-first only), so a
+    /// caller can continue older without guessing a `start_ts_ns` a priori.
+    pub oldest_returned_ts_ns: Option<u64>,
     pub rows: Vec<CommandAuditQueryRow>,
 }
+
+pub(crate) const AUDIT_SCAN_ORDER_NEWEST_FIRST: &str = "newest_first";
+pub(crate) const AUDIT_SCAN_ORDER_OLDEST_FIRST: &str = "oldest_first";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CommandAuditQueryFilters {
@@ -283,7 +299,17 @@ impl SynapseService {
             }
         }
 
-        let start_key = match normalized_filter(params.start_key_hex) {
+        // #1550: the natural unwindowed "what did X just do?" call supplies
+        // neither a cursor nor a start timestamp. Oldest-first from an empty key
+        // exhausts scan_limit deep in weeks-old history and hard-errors, so
+        // default to a newest-first scan that returns the most recent matches as
+        // a complete page. Any explicit cursor or start window keeps the forward
+        // paging contract below unchanged.
+        let start_key_hex_param = normalized_filter(params.start_key_hex);
+        if start_key_hex_param.is_none() && filters.start_ts_ns.is_none() {
+            return self.command_audit_query_newest_first(limit, scan_limit, filters);
+        }
+        let start_key = match start_key_hex_param {
             Some(start_key_hex) => {
                 decode_hex(&start_key_hex).map_err(command_audit_params_error)?
             }
@@ -386,6 +412,100 @@ impl SynapseService {
             exhausted: !partial,
             start_key_hex,
             next_start_key_hex,
+            scan_order: AUDIT_SCAN_ORDER_OLDEST_FIRST,
+            has_older: partial,
+            oldest_returned_ts_ns: None,
+            rows: returned,
+        })
+    }
+
+    /// Newest-first bounded tail scan of `CF_ACTION_LOG` for the unwindowed
+    /// default (#1550). Reuses the reverse-tail primitive already backing
+    /// `command_audit_snapshot`, walks the most recent `scan_limit` rows from
+    /// newest to oldest, and returns up to `limit` matches as a **complete
+    /// page** — filling `limit` (or capping `scan_limit`) reports `has_older`
+    /// honestly instead of hard-erroring the way forward paging must.
+    fn command_audit_query_newest_first(
+        &self,
+        limit: usize,
+        scan_limit: usize,
+        filters: CommandAuditQueryFilters,
+    ) -> Result<CommandAuditQueryResponse, ErrorData> {
+        let runtime = self.reflex_runtime()?;
+        let runtime = runtime.lock().map_err(|_error| {
+            command_audit_internal_error(
+                "reflex runtime lock poisoned while querying action audit (newest-first)",
+            )
+        })?;
+        // Ascending (oldest->newest) tail of at most scan_limit rows; iterate it
+        // in reverse to emit newest-first. `tail_capped` means older rows exist
+        // beyond this window.
+        let tail = runtime
+            .storage_cf_tail_rows(cf::CF_ACTION_LOG, scan_limit)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let tail_capped = tail.len() >= scan_limit;
+
+        let mut scanned_rows = 0_usize;
+        let mut matched_rows = 0_usize;
+        let mut corrupt_row_count = 0_usize;
+        let mut returned = Vec::new();
+        let mut has_older = false;
+        let mut newest_start_key_hex = None;
+        let mut oldest_returned_ts_ns = None;
+
+        for (key, value) in tail.into_iter().rev() {
+            scanned_rows = scanned_rows.saturating_add(1);
+            let row = match synapse_storage::decode_json::<Value>(&value) {
+                Ok(row) => row,
+                Err(_error) => {
+                    corrupt_row_count = corrupt_row_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let ts_ns = audit_row_ts_ns(&row);
+            // In newest-first mode end_ts_ns is an upper bound: skip rows newer
+            // than it (they are outside the requested window), keep scanning down.
+            if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
+                continue;
+            }
+            if !audit_row_matches(&row, &filters) {
+                continue;
+            }
+            if returned.len() >= limit {
+                has_older = true;
+                break;
+            }
+            if newest_start_key_hex.is_none() {
+                newest_start_key_hex = Some(hex_encode(&key));
+            }
+            matched_rows = matched_rows.saturating_add(1);
+            oldest_returned_ts_ns = Some(ts_ns);
+            returned.push(command_audit_query_row(&key, &value, row));
+        }
+
+        // If we consumed the whole scan window without filling `limit` but the
+        // window itself was capped, older matches may still exist beyond it.
+        if !has_older && tail_capped {
+            has_older = true;
+        }
+        let returned_count = returned.len();
+        Ok(CommandAuditQueryResponse {
+            source_of_truth: "CF_ACTION_LOG newest-first bounded tail scan",
+            cf_name: cf::CF_ACTION_LOG,
+            filters,
+            limit,
+            scan_limit,
+            scanned_rows,
+            matched_rows,
+            returned_count,
+            corrupt_row_count,
+            partial: false,
+            exhausted: !has_older,
+            start_key_hex: newest_start_key_hex,
+            next_start_key_hex: None,
+            scan_order: AUDIT_SCAN_ORDER_NEWEST_FIRST,
+            has_older,
+            oldest_returned_ts_ns,
             rows: returned,
         })
     }

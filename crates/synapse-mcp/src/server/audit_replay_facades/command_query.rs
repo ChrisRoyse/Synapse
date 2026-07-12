@@ -80,6 +80,9 @@ pub(super) fn summarize_command_query(
         returned_count: response.returned_count,
         corrupt_row_count: response.corrupt_row_count,
         complete: response.exhausted,
+        scan_order: response.scan_order.to_owned(),
+        has_older: response.has_older,
+        oldest_returned_ts_ns: response.oldest_returned_ts_ns,
         start_key_hex: response.start_key_hex,
         rows: response
             .rows
@@ -133,6 +136,9 @@ mod tests {
             exhausted: !partial,
             start_key_hex: Some("18be7a58134fc24000000000".to_owned()),
             next_start_key_hex: next_start_key_hex.map(str::to_owned),
+            scan_order: crate::server::command_audit::AUDIT_SCAN_ORDER_OLDEST_FIRST,
+            has_older: partial,
+            oldest_returned_ts_ns: None,
             rows: Vec::new(),
         }
     }
@@ -172,5 +178,29 @@ mod tests {
         let error = summarize_command_query(response).expect_err("corrupt rows are not trusted");
 
         assert!(error.message.contains("corrupt CF_ACTION_LOG rows"));
+    }
+
+    #[test]
+    fn command_query_newest_first_has_older_is_success_not_error() {
+        // #1550: the unwindowed default scans newest-first and returns the most
+        // recent matches as a COMPLETE page. A full page with older history
+        // remaining must be a success with has_older=true, never the forward
+        // partial-page hard error.
+        let mut response = response(false, None);
+        response.scan_order = crate::server::command_audit::AUDIT_SCAN_ORDER_NEWEST_FIRST;
+        response.exhausted = false;
+        response.has_older = true;
+        response.oldest_returned_ts_ns = Some(1_783_000_000_000_000_000);
+
+        let summary = summarize_command_query(response)
+            .expect("newest-first has_older page is a complete answer, not a failure");
+
+        assert_eq!(summary.scan_order, "newest_first");
+        assert!(summary.has_older);
+        assert!(!summary.complete);
+        assert_eq!(
+            summary.oldest_returned_ts_ns,
+            Some(1_783_000_000_000_000_000)
+        );
     }
 }
