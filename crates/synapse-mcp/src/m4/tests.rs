@@ -5096,6 +5096,9 @@ async fn shell_durable_timeout_persists_budget_expired_code() {
 async fn wait_shell_job_child_enforces_budget_when_starved_timer_misses_self_exit() {
     // Real child that self-exits well past the 80 ms cap (~200 ms sleep plus
     // interpreter startup). No mock: a genuine process on a genuine timer.
+    // `started` is taken at spawn so the cap is measured from the process origin,
+    // exactly as the production monitor does.
+    let started = Instant::now();
     let mut child = TokioCommand::new("powershell.exe")
         .args(["-NoProfile", "-Command", "Start-Sleep -Milliseconds 200"])
         .stdout(Stdio::null())
@@ -5114,7 +5117,8 @@ async fn wait_shell_job_child_enforces_budget_when_starved_timer_misses_self_exi
         }
     });
 
-    let (exit_code, timed_out, wait_error) = wait_shell_job_child(&mut child, Some(80)).await;
+    let (exit_code, timed_out, wait_error) =
+        wait_shell_job_child(&mut child, Some(80), started).await;
     hog.await
         .unwrap_or_else(|error| panic!("hog task join: {error}"));
 
@@ -5128,6 +5132,63 @@ async fn wait_shell_job_child_enforces_budget_when_starved_timer_misses_self_exi
     assert!(
         timed_out,
         "a job that ran ~200 ms under an 80 ms cap must be timed_out even when the starved timer let it self-exit (exit_code={exit_code:?})"
+    );
+}
+
+// #1588 deterministic reproduction of the starvation shape the timer-miss test
+// above does NOT cover: under heavy oversubscription the monitor task itself is
+// dispatched only AFTER the child has already exited, so `child.wait()` resolves
+// instantly and every wall clock the monitor samples is corrupted — reading ~0
+// since wait-entry (false negative) or the whole starvation delay since spawn
+// (false positive). Both directions must be resolved from the OS process runtime
+// (exit - creation), which is independent of when this task ran. We drive both
+// failure modes deterministically by letting the child fully exit, then waiting.
+#[cfg(windows)]
+#[tokio::test]
+async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation() {
+    // Case A (false-negative guard, #1588): the child genuinely outran its 40 ms
+    // cap (~150 ms), but the monitor only reaches the wait ~400 ms after spawn,
+    // so `child.wait()` resolves instantly. It must still be timed_out.
+    let started = Instant::now();
+    let mut over_budget = TokioCommand::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Milliseconds 150"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn over-budget child: {error}"));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (over_exit, over_timed_out, over_err) =
+        wait_shell_job_child(&mut over_budget, Some(40), started).await;
+    println!(
+        "readback=wait_shell_job_child edge=over_budget_late_monitor after=exit_code:{over_exit:?} timed_out:{over_timed_out} wait_error:{over_err:?}"
+    );
+    assert!(over_err.is_none(), "no wait error expected: {over_err:?}");
+    assert!(
+        over_timed_out,
+        "a child that ran ~150 ms under a 40 ms cap must be timed_out even when observed late (exit_code={over_exit:?})"
+    );
+
+    // Case B (false-positive guard, the regression a spawn-relative wall clock
+    // introduces): a fast child (~tens of ms) finishes well within its 1000 ms
+    // cap, yet the monitor is starved *past* the cap (1500 ms) before it observes
+    // the exit. Only the OS runtime keeps this correctly "ok".
+    let started = Instant::now();
+    let mut within_budget = TokioCommand::new("cmd.exe")
+        .args(["/c", "exit 0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn within-budget child: {error}"));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (within_exit, within_timed_out, within_err) =
+        wait_shell_job_child(&mut within_budget, Some(1000), started).await;
+    println!(
+        "readback=wait_shell_job_child edge=within_budget_starved_monitor after=exit_code:{within_exit:?} timed_out:{within_timed_out} wait_error:{within_err:?}"
+    );
+    assert!(within_err.is_none(), "no wait error expected: {within_err:?}");
+    assert!(
+        !within_timed_out,
+        "a child that finished within its 1000 ms cap must not be flagged timed_out even when the monitor was starved 1500 ms (exit_code={within_exit:?})"
     );
 }
 

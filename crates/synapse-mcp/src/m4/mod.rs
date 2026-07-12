@@ -9979,7 +9979,7 @@ async fn monitor_shell_job(
     original_args: Vec<String>,
 ) {
     let (exit_code, timed_out, wait_error) =
-        wait_shell_job_child(&mut child, status.timeout_ms).await;
+        wait_shell_job_child(&mut child, status.timeout_ms, started).await;
     if let Ok(latest) = read_shell_job_status(&paths.status_path, &status.job_id) {
         status.cancel_requested |= latest.cancel_requested;
         if latest.status == "cancel_requested" {
@@ -10098,25 +10098,124 @@ fn persist_shell_job_local_terminal_status(paths: &ShellJobPaths, status: &ActRu
     }
 }
 
+/// Independent OS handle to a shell job's child process, opened before the child
+/// is reaped so its kernel-recorded creation/exit timing stays readable even
+/// after tokio closes its own handle.
+///
+/// The measured runtime (`exit - creation`) is the source of truth for durable
+/// timeout enforcement: unlike any wall clock the monitor task samples, it is
+/// immune to how late scheduler starvation dispatches that task (#1580/#1588).
+// The raw `HANDLE` value, not a `windows::HANDLE` (which is `!Send`): the probe
+// is held across `child.wait().await`, and the monitor future must stay `Send`
+// for `tokio::spawn`. A Windows process handle is process-wide, so using it from
+// whichever worker polls the future is sound.
+#[cfg(windows)]
+struct ChildRuntimeProbe(isize);
+
+#[cfg(windows)]
+impl ChildRuntimeProbe {
+    fn capture(child: &tokio::process::Child) -> Option<Self> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // `id()` is Some until tokio reaps the child; our own handle then keeps
+        // the (possibly already-exited) process object alive for the query.
+        let pid = child.id()?;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        Some(Self(handle.0 as isize))
+    }
+
+    fn handle(&self) -> windows::Win32::Foundation::HANDLE {
+        windows::Win32::Foundation::HANDLE(self.0 as *mut core::ffi::c_void)
+    }
+
+    /// Wall-clock process runtime (`exit - creation`), or `None` while the
+    /// process is still running or if the timing query fails.
+    fn runtime(&self) -> Option<Duration> {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::GetProcessTimes;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetProcessTimes(
+                self.handle(),
+                std::ptr::addr_of_mut!(creation),
+                std::ptr::addr_of_mut!(exit),
+                std::ptr::addr_of_mut!(kernel),
+                std::ptr::addr_of_mut!(user),
+            )
+        }
+        .ok()?;
+        let creation = filetime_ticks_100ns(creation);
+        let exit = filetime_ticks_100ns(exit);
+        // `exit` reads zero until the process has actually exited.
+        (exit != 0 && exit >= creation)
+            .then(|| Duration::from_nanos((exit - creation).saturating_mul(100)))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildRuntimeProbe {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle()) };
+    }
+}
+
+#[cfg(windows)]
+fn filetime_ticks_100ns(value: windows::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+}
+
+/// Non-Windows stub: the OS runtime probe is unavailable, so callers fall back
+/// to the elapsed-since-spawn wall clock.
+#[cfg(not(windows))]
+struct ChildRuntimeProbe;
+
+#[cfg(not(windows))]
+impl ChildRuntimeProbe {
+    fn capture(_child: &tokio::process::Child) -> Option<Self> {
+        None
+    }
+
+    fn runtime(&self) -> Option<Duration> {
+        None
+    }
+}
+
 async fn wait_shell_job_child(
     child: &mut tokio::process::Child,
     timeout_ms: Option<u64>,
+    started: Instant,
 ) -> (Option<i32>, bool, Option<String>) {
     match timeout_ms {
         Some(timeout_ms) => {
             let budget = Duration::from_millis(timeout_ms);
-            let waited = Instant::now();
-            match tokio::time::timeout(budget, child.wait()).await {
+            // Open an independent OS handle to the child BEFORE waiting so its
+            // kernel-recorded creation/exit timing stays readable even after
+            // tokio reaps the child; that runtime is the budget source of truth.
+            let runtime_probe = ChildRuntimeProbe::capture(child);
+            // Arm the deadline against the SPAWN instant (`started`), not
+            // wait-entry: under scheduler starvation this monitor task can be
+            // dispatched only after the child already exited, and a
+            // wait-entry-relative timer would grant a fresh full budget. Zero
+            // once the cap has already elapsed, so the timeout fires promptly.
+            let budget_remaining = budget.saturating_sub(started.elapsed());
+            match tokio::time::timeout(budget_remaining, child.wait()).await {
                 Ok(Ok(status)) => {
-                    // Deterministic budget enforcement from the SOURCE OF TRUTH
-                    // (measured wait vs cap), not the wait-vs-timer race. Under
-                    // scheduler starvation `tokio::time::timeout` polls the inner
-                    // future first, so a child that self-exited AFTER the deadline
-                    // is still delivered as `Ok(exit)` with the fired deadline
-                    // ignored — the job silently reports "ok" despite outrunning
-                    // its cap (#1580). If the measured wait met or exceeded the
-                    // budget the job timed out, regardless of the exit code.
-                    let timed_out = waited.elapsed() >= budget;
+                    // SOURCE OF TRUTH: the OS-recorded process runtime
+                    // (exit - creation) vs the cap. `tokio::time::timeout` polls
+                    // the inner future first, so a child that self-exited after
+                    // the deadline is still delivered here as `Ok(exit)`; and a
+                    // starved monitor may observe the exit long after it happened
+                    // (a wall clock this task samples then over- or under-counts
+                    // in either direction). Only the kernel runtime reveals
+                    // whether the child truly outran its cap (#1580/#1588). Fall
+                    // back to elapsed-since-spawn only if the OS probe is
+                    // unavailable.
+                    let timed_out = runtime_probe
+                        .as_ref()
+                        .and_then(ChildRuntimeProbe::runtime)
+                        .map_or(started.elapsed() >= budget, |runtime| runtime >= budget);
                     (status.code(), timed_out, None)
                 }
                 Ok(Err(error)) => (None, false, Some(format!("wait_failed:{error}"))),
