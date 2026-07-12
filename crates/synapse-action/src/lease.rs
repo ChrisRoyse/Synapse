@@ -22,8 +22,9 @@
 //! emit — so [`status`] never blocks a health probe.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
-    sync::{Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -147,24 +148,75 @@ impl LeaseError {
     }
 }
 
-fn slot() -> &'static Mutex<Option<InputLease>> {
-    static LEASE: OnceLock<Mutex<Option<InputLease>>> = OnceLock::new();
-    LEASE.get_or_init(|| Mutex::new(None))
+/// Process-global daemon state for the input lease: the current holder slot and
+/// the pending expired-cleanup ledger, bundled so a test can swap both together
+/// behind a single thread-local override.
+struct LeaseCell {
+    slot: Mutex<Option<InputLease>>,
+    expired_cleanup: Mutex<BTreeMap<String, LeaseStatus>>,
 }
 
-fn expired_cleanup_slot() -> &'static Mutex<BTreeMap<String, LeaseStatus>> {
-    static EXPIRED_CLEANUP: OnceLock<Mutex<BTreeMap<String, LeaseStatus>>> = OnceLock::new();
-    EXPIRED_CLEANUP.get_or_init(|| Mutex::new(BTreeMap::new()))
+impl LeaseCell {
+    const fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            expired_cleanup: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+/// The real process-global lease state. In production every caller resolves to
+/// this single cell, so the lease behaves as one shared singleton exactly as
+/// before this indirection was introduced.
+static GLOBAL_CELL: LeaseCell = LeaseCell::new();
+
+thread_local! {
+    /// Per-thread override of [`GLOBAL_CELL`], installed only by
+    /// [`isolate_for_test`]. Production never sets it, so [`current_cell`]
+    /// always returns `&GLOBAL_CELL` and behavior is byte-for-byte unchanged.
+    static CELL_OVERRIDE: Cell<Option<&'static LeaseCell>> = const { Cell::new(None) };
+}
+
+/// Resolves the lease cell for the current thread: the test override if one is
+/// installed, otherwise the process-global cell.
+fn current_cell() -> &'static LeaseCell {
+    CELL_OVERRIDE.with(Cell::get).unwrap_or(&GLOBAL_CELL)
+}
+
+/// Installs a fresh, thread-local input-lease cell so a test's lease reads and
+/// writes are hermetic.
+///
+/// A parallel test acquiring the process-global lease can then no longer inject
+/// a phantom holder into this thread's [`status`] reads — the confirmed root
+/// cause of the flaky `session_list` projection (issue #1574).
+///
+/// Idempotent per thread: the first call installs the isolated cell and later
+/// calls reuse it, so multiple services built on one test thread still share a
+/// single lease exactly as production does. The cell is intentionally leaked to
+/// obtain a `'static` reference; the count is bounded by the number of tests
+/// that opt in, and libtest gives each test a fresh thread (so no override
+/// bleeds between tests).
+#[cfg(feature = "test-support")]
+pub fn isolate_for_test() {
+    CELL_OVERRIDE.with(|override_cell| {
+        if override_cell.get().is_none() {
+            override_cell.set(Some(Box::leak(Box::new(LeaseCell::new()))));
+        }
+    });
 }
 
 /// Locks the lease slot, recovering from a poisoned mutex rather than panicking:
 /// a foreground lease that panicked mid-action must still be reclaimable.
 fn lock() -> MutexGuard<'static, Option<InputLease>> {
-    slot().lock().unwrap_or_else(PoisonError::into_inner)
+    current_cell()
+        .slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 fn lock_expired_cleanup() -> MutexGuard<'static, BTreeMap<String, LeaseStatus>> {
-    expired_cleanup_slot()
+    current_cell()
+        .expired_cleanup
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }

@@ -6,6 +6,12 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes `lease::isolate_for_test`, which installs a thread-local override of
+# the process-global input lease so downstream crates' parallel tests can run
+# hermetically (see issue #1574). Off in production; enabled via dev-dependency.
+test-support = []
+
 [dependencies]
 bit-set = "0.10.0"
 serde.workspace = true

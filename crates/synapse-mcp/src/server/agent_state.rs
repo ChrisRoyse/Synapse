@@ -48,6 +48,7 @@
 //!   silently.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fs,
     path::Path,
@@ -1111,9 +1112,48 @@ pub(crate) fn is_state_machine_row(record: &AgentEventRecord) -> bool {
         && record.payload.get("origin").and_then(Value::as_str) == Some(STATE_MACHINE_ORIGIN)
 }
 
-fn tracker() -> &'static Mutex<AgentStateTracker> {
+/// The real process-global agent-state tracker. Production always resolves
+/// here, so the tracker is one shared singleton exactly as before.
+fn global_tracker() -> &'static Mutex<AgentStateTracker> {
     static TRACKER: OnceLock<Mutex<AgentStateTracker>> = OnceLock::new();
     TRACKER.get_or_init(|| Mutex::new(AgentStateTracker::default()))
+}
+
+thread_local! {
+    /// Per-thread override of [`global_tracker`], installed only by
+    /// [`isolate_for_test`]. Production never sets it, so [`tracker`] always
+    /// returns the process-global tracker and behavior is unchanged.
+    static TRACKER_OVERRIDE: Cell<Option<&'static Mutex<AgentStateTracker>>> =
+        const { Cell::new(None) };
+}
+
+/// Resolves the agent-state tracker for the current thread: the test override
+/// if one is installed, otherwise the process-global tracker.
+fn tracker() -> &'static Mutex<AgentStateTracker> {
+    TRACKER_OVERRIDE
+        .with(Cell::get)
+        .unwrap_or_else(global_tracker)
+}
+
+/// Installs a fresh, thread-local agent-state tracker so a test's
+/// `read_for_session` reads are hermetic.
+///
+/// A parallel test recording agent events into the process-global tracker can
+/// then no longer contaminate this thread's `session_list`
+/// `attached_agent_registry` projection — the agent-state analogue of the
+/// input-lease leak in issue #1574.
+///
+/// Idempotent per thread; the leaked cell count is bounded by the number of
+/// tests that opt in, and libtest gives each test a fresh thread.
+#[cfg(test)]
+pub(crate) fn isolate_for_test() {
+    TRACKER_OVERRIDE.with(|override_cell| {
+        if override_cell.get().is_none() {
+            override_cell.set(Some(Box::leak(Box::new(Mutex::new(
+                AgentStateTracker::default(),
+            )))));
+        }
+    });
 }
 
 static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();

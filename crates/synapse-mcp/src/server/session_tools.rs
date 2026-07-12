@@ -2725,6 +2725,80 @@ mod tests {
         Ok(())
     }
 
+    /// Deterministic regression guard for issue #1574: a foreign holder of the
+    /// process-global input lease (exactly what a parallel lease-mutating test
+    /// does) must not leak into this service's `session_list` as a phantom
+    /// session. Before per-test lease isolation this folded the foreign owner in
+    /// and `total_count` intermittently became 4. Here we reproduce the leak
+    /// mechanism deterministically — hold the real global lease with a foreign
+    /// owner on an unisolated thread — and prove the isolated service ignores it.
+    #[test]
+    fn session_list_ignores_foreign_global_input_lease_owner() -> anyhow::Result<()> {
+        use synapse_action::lease;
+
+        let profiles = TempDir::new()?;
+        // The constructor installs this thread's hermetic lease override.
+        let service = test_service_with_profiles(profiles.path())?;
+        register_initialized_session(&service, "session-a", "codex-mcp-client", 1_000)?;
+        register_initialized_session(&service, "session-b", "codex-mcp-client", 1_100)?;
+        register_initialized_session(&service, "session-c", "codex-mcp-client", 1_200)?;
+
+        // A thread with no isolation override acquires the *process-global*
+        // lease — the precise contention that used to contaminate this test.
+        let phantom = "phantom-zzz-foreign-owner";
+        let global_status = std::thread::spawn(move || {
+            let outcome = lease::try_acquire(phantom, lease::ttl_from_ms(60_000));
+            assert!(
+                matches!(outcome, lease::LeaseOutcome::Acquired(_)),
+                "expected to acquire the process-global lease, got {outcome:?}"
+            );
+            lease::status()
+        })
+        .join()
+        .map_err(|_error| anyhow::anyhow!("global-lease acquisition thread panicked"))?;
+
+        // Source-of-truth check: the process-global lease really is held by the
+        // foreign owner at the moment we read the list below.
+        assert!(
+            global_status.held,
+            "the process-global lease should be held by the phantom owner"
+        );
+        assert_eq!(
+            global_status.owner_session_id.as_deref(),
+            Some(phantom),
+            "the process-global lease owner should be the phantom session"
+        );
+
+        // The isolated service must NOT fold the foreign global owner in.
+        let page =
+            service.session_list_impl_with_options(SessionListOptions::from_tool_params(
+                SessionListParams {
+                    limit: Some(10),
+                    ..SessionListParams::default()
+                },
+            )?)?;
+        assert_eq!(
+            page.total_count, 3,
+            "foreign global lease owner leaked into session_list (issue #1574 regression)"
+        );
+        assert!(
+            page.compact_sessions
+                .iter()
+                .all(|row| row.session_id != phantom),
+            "the phantom lease owner must not appear as a session row"
+        );
+
+        // Good-citizen cleanup: release the process-global lease from an
+        // unisolated thread so no residue reaches other tests in this process.
+        std::thread::spawn(move || {
+            let _released = lease::release_if_owner(phantom);
+        })
+        .join()
+        .map_err(|_error| anyhow::anyhow!("global-lease cleanup thread panicked"))?;
+
+        Ok(())
+    }
+
     #[test]
     fn session_list_full_view_and_live_only_filter_are_explicit() -> anyhow::Result<()> {
         let profiles = TempDir::new()?;

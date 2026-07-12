@@ -80,6 +80,9 @@ synapse-test-utils = { version = "0.1.0", path = "../synapse-test-utils" }
 # Integration tests open the daemon's RocksDB directly to verify physical rows.
 synapse-storage = { version = "0.1.0", path = "../synapse-storage" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
+# Enables `lease::isolate_for_test` so parallel unit tests get a hermetic,
+# per-test input lease (issue #1574). Dev-only: excluded from release builds.
+synapse-action = { version = "0.1.0", path = "../synapse-action", features = ["test-support"] }
 
 [lints.rust]
 unsafe_code = "allow"
