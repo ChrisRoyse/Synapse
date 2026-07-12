@@ -7,7 +7,7 @@ use synapse_telemetry::{TelemetryConfig, TelemetryGuard, init_tracing};
 use tracing_subscriber::filter::LevelFilter;
 
 #[allow(dead_code)]
-#[path = "../chrome_debugger_bridge.rs"]
+#[path = "../chrome_debugger_bridge/mod.rs"]
 mod chrome_debugger_bridge;
 
 #[tokio::main]
