@@ -19,6 +19,21 @@ const TOOL_LAST_FILE: &str = "daemon-tool-last.json";
 const TOOL_EVENTS_FILE: &str = "daemon-tool-events.jsonl";
 const EXIT_EVENTS_FILE: &str = "daemon-exit.jsonl";
 
+/// Maximum size in bytes the active daemon tool-event ledger
+/// (`daemon-tool-events.jsonl`) may reach before it is rotated to a numbered
+/// segment. Set to 8 MiB: small enough that a single segment opens and scans
+/// quickly, large enough that rotation stays rare on the hot append path.
+///
+/// Before this cap existed the ledger grew unbounded (~141 MiB in five weeks);
+/// segmented rotation plus [`MAX_LEDGER_SEGMENTS`] now bounds total disk usage.
+const MAX_LEDGER_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Maximum number of rotated tool-event segments retained on disk
+/// (`daemon-tool-events.jsonl.1` .. `.5`, newest suffix `.1`). Older segments
+/// are pruned during rotation, so total retained ledger bytes are bounded by
+/// roughly `MAX_LEDGER_SEGMENT_BYTES * (MAX_LEDGER_SEGMENTS + 1)`.
+const MAX_LEDGER_SEGMENTS: usize = 5;
+
 static STATE: OnceLock<Mutex<Option<DaemonLifecycleState>>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
@@ -124,6 +139,15 @@ struct DaemonLifecycleState {
     in_flight: BTreeMap<u64, ToolEvent>,
     seq: u64,
     last_error: Option<String>,
+    /// Current byte size of the active `daemon-tool-events.jsonl` segment,
+    /// tracked in memory so the append hot path never stats the file. Seeded
+    /// from the existing file size at [`configure`] and updated after each
+    /// append and reset to zero on rotation.
+    tool_events_bytes: u64,
+    /// Size cap the active tool-event segment may reach before rotation. Seeded
+    /// from [`MAX_LEDGER_SEGMENT_BYTES`]; overridable only in tests via
+    /// [`set_max_segment_bytes_for_test`] to force rotation without writing MiB.
+    max_segment_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -216,12 +240,26 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
 
     write_json_atomic(Path::new(&paths.run_current_path), &run)
         .with_context(|| format!("write daemon current run {}", paths.run_current_path))?;
+    // Seed the in-memory ledger size from the file that survives across daemon
+    // restarts, so the very first append after startup rotates when the active
+    // segment was already at the cap. A missing file simply starts at zero.
+    let tool_events_bytes = match fs::metadata(&paths.tool_events_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("stat daemon tool events {}", paths.tool_events_path)
+            });
+        }
+    };
     let state = DaemonLifecycleState {
         run,
         paths: paths.clone(),
         in_flight: BTreeMap::new(),
         seq: 0,
         last_error: None,
+        tool_events_bytes,
+        max_segment_bytes: MAX_LEDGER_SEGMENT_BYTES,
     };
     let slot = state_slot();
     let mut guard = slot
@@ -601,7 +639,7 @@ fn record_exit(event_kind: &'static str, cause: &'static str, detail: Value) -> 
 }
 
 fn write_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
-    match write_tool_event_inner(&state.paths, event) {
+    match write_tool_event_inner(state, event) {
         Ok(()) => {
             state.last_error = None;
             tracing::info!(
@@ -630,11 +668,152 @@ fn write_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyh
     }
 }
 
-fn write_tool_event_inner(paths: &DaemonLifecyclePaths, event: &ToolEvent) -> anyhow::Result<()> {
-    append_json_line(Path::new(&paths.tool_events_path), event)
-        .with_context(|| format!("append daemon tool event {}", paths.tool_events_path))?;
-    write_json_atomic(Path::new(&paths.tool_last_path), event)
-        .with_context(|| format!("write daemon last tool {}", paths.tool_last_path))
+fn write_tool_event_inner(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
+    append_tool_event(state, event)?;
+    let tool_last_path = state.paths.tool_last_path.clone();
+    write_json_atomic(Path::new(&tool_last_path), event)
+        .with_context(|| format!("write daemon last tool {}", tool_last_path))
+}
+
+/// Append one JSON line to the active `daemon-tool-events.jsonl`, rotating the
+/// segment first when this record would push it past the size cap.
+///
+/// Size is tracked with the in-memory [`DaemonLifecycleState::tool_events_bytes`]
+/// counter, so the hot path performs no per-write stat. The rotation runs before
+/// any handle to the active file is opened; because appends reopen and close the
+/// handle per call, the active file is guaranteed to have no open write handle at
+/// rename time, which Windows requires. An empty active file is never rotated, so
+/// a single record larger than the cap is still written (to an empty segment)
+/// rather than lost.
+fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
+    let events_path = state.paths.tool_events_path.clone();
+    let path = Path::new(&events_path);
+
+    let mut line = serde_json::to_vec(event)
+        .with_context(|| format!("encode JSON line {events_path}"))?;
+    line.push(b'\n');
+    let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
+
+    if state.tool_events_bytes > 0
+        && state
+            .tool_events_bytes
+            .saturating_add(line_len)
+            > state.max_segment_bytes
+    {
+        if let Err(error) = rotate_tool_events(path) {
+            let detail = format!("{error:#}");
+            tracing::error!(
+                code = "DAEMON_LEDGER_ROTATE_FAILED",
+                tool_events_path = %events_path,
+                active_bytes = state.tool_events_bytes,
+                next_record_bytes = line_len,
+                max_segment_bytes = state.max_segment_bytes,
+                detail = %detail,
+                "daemon lifecycle tool-event ledger rotation failed"
+            );
+            return Err(error);
+        }
+        state.tool_events_bytes = 0;
+        tracing::info!(
+            code = "MCP_DAEMON_LIFECYCLE_LEDGER_ROTATED",
+            tool_events_path = %events_path,
+            max_segment_bytes = state.max_segment_bytes,
+            max_segments = MAX_LEDGER_SEGMENTS,
+            "daemon lifecycle tool-event ledger rotated"
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open append {events_path}"))?;
+    file.write_all(&line)
+        .with_context(|| format!("write daemon tool event {events_path}"))?;
+    file.flush()
+        .with_context(|| format!("flush {events_path}"))?;
+    file.sync_data()
+        .with_context(|| format!("sync {events_path}"))?;
+    state.tool_events_bytes = state.tool_events_bytes.saturating_add(line_len);
+    Ok(())
+}
+
+/// Rotate the active daemon tool-event ledger using a fixed shift scheme.
+///
+/// `daemon-tool-events.jsonl.1` is always the most recently rotated segment and
+/// `daemon-tool-events.jsonl.{MAX_LEDGER_SEGMENTS}` the oldest. On each rotation
+/// the oldest slot is pruned first, remaining segments shift up by one
+/// (`.1`->`.2`, ...), and the active file is renamed into `.1`. That bounds the
+/// number of rotated files at [`MAX_LEDGER_SEGMENTS`]. Every step runs with no
+/// open handle on the files involved (required on Windows). All failures are
+/// propagated so the caller never keeps appending to an oversized ledger.
+fn rotate_tool_events(active: &Path) -> anyhow::Result<()> {
+    // Prune the oldest retained segment so the shift below cannot exceed the cap.
+    let oldest = segment_path(active, MAX_LEDGER_SEGMENTS);
+    match fs::remove_file(&oldest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "prune oldest daemon tool-event segment {}",
+                    oldest.display()
+                )
+            });
+        }
+    }
+    // Shift existing segments up: .(MAX-1)->.MAX, ..., .1->.2.
+    for index in (1..MAX_LEDGER_SEGMENTS).rev() {
+        let from = segment_path(active, index);
+        let to = segment_path(active, index + 1);
+        match fs::rename(&from, &to) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "shift daemon tool-event segment {} to {}",
+                        from.display(),
+                        to.display()
+                    )
+                });
+            }
+        }
+    }
+    // Move the (closed) active file into the newest rotated slot.
+    let newest = segment_path(active, 1);
+    fs::rename(active, &newest).with_context(|| {
+        format!(
+            "rotate active daemon tool-event ledger {} to {}",
+            active.display(),
+            newest.display()
+        )
+    })
+}
+
+/// Build the path of rotated segment `index` for `active` by appending
+/// `.{index}` to the active file name (e.g. `daemon-tool-events.jsonl.1`).
+fn segment_path(active: &Path, index: usize) -> PathBuf {
+    let mut name = active
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(format!(".{index}"));
+    active.with_file_name(name)
+}
+
+#[cfg(test)]
+pub(crate) fn set_max_segment_bytes_for_test(bytes: u64) {
+    let slot = state_slot();
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = guard.as_mut() {
+        state.max_segment_bytes = bytes;
+    }
 }
 
 fn state_slot() -> &'static Mutex<Option<DaemonLifecycleState>> {
@@ -914,5 +1093,149 @@ mod tests {
         assert!(exits.contains("\"cause\":\"process_missing_on_startup\""));
         assert!(exits.contains("\"tool\":\"observe\""));
         assert!(exits.contains("\"status\":\"started\""));
+    }
+
+    fn configure_temp(temp: &tempfile::TempDir) -> DaemonLifecyclePaths {
+        configure(DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some("127.0.0.1:7700".to_owned()),
+            db_path: temp.path().to_path_buf(),
+        })
+        .unwrap()
+    }
+
+    /// Write `count` synthetic single-line tool events, each carrying a unique
+    /// `idx` in its detail so records can be counted and located exactly on disk.
+    fn write_synthetic_events(count: usize) {
+        for idx in 0..count {
+            record_context_event(ContextEvent {
+                event_kind: "synthetic_rotation_probe",
+                tool: "rotation_test",
+                status: "recorded",
+                mcp_session_id: Some(format!("session-{idx}")),
+                foreground: None,
+                foreground_read_error: None,
+                detail: json!({ "idx": idx, "code": "SYNTHETIC_ROTATION_PROBE" }),
+            })
+            .unwrap();
+        }
+    }
+
+    fn segment_line_count(path: &Path) -> usize {
+        match fs::read_to_string(path) {
+            Ok(contents) => contents.lines().count(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read {}: {error}", path.display()),
+        }
+    }
+
+    /// Total records across the active file plus every contiguous rotated
+    /// segment (`.1`, `.2`, ...). The shift scheme keeps segments gap-free.
+    fn total_records(active: &Path) -> usize {
+        let mut total = segment_line_count(active);
+        let mut index = 1;
+        while segment_path(active, index).exists() {
+            total += segment_line_count(&segment_path(active, index));
+            index += 1;
+        }
+        total
+    }
+
+    fn read_all_segments_concat(active: &Path) -> String {
+        let mut all = fs::read_to_string(active).unwrap_or_default();
+        let mut index = 1;
+        while segment_path(active, index).exists() {
+            all.push_str(&fs::read_to_string(segment_path(active, index)).unwrap());
+            index += 1;
+        }
+        all
+    }
+
+    #[test]
+    fn rotates_active_ledger_when_size_cap_exceeded() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure_temp(&temp);
+        // 1-byte cap forces a rotation on every append after the first, so a
+        // few synthetic records exercise the whole rotate-before-write path.
+        set_max_segment_bytes_for_test(1);
+        let active = PathBuf::from(&paths.tool_events_path);
+        let seg1 = segment_path(&active, 1);
+
+        // Before: no rotated segment exists yet.
+        assert!(!seg1.exists());
+
+        write_synthetic_events(3);
+
+        // After: a rotated `.1` segment exists and the active file was reset to
+        // a fresh single-record segment (not the pre-rotation contents).
+        assert!(seg1.exists(), "rotated segment .1 must exist after the cap is exceeded");
+        let active_lines = segment_line_count(&active);
+        assert_eq!(active_lines, 1, "active file must be reset to a fresh segment");
+        let total = total_records(&active);
+        assert_eq!(total, 3, "every record must survive rotation");
+        println!(
+            "readback=rotate seg1_exists={} active_lines={active_lines} total_records={total}",
+            seg1.exists()
+        );
+    }
+
+    #[test]
+    fn retains_at_most_max_segments_and_prunes_oldest() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure_temp(&temp);
+        set_max_segment_bytes_for_test(1);
+        let active = PathBuf::from(&paths.tool_events_path);
+
+        // 9 records => 8 rotations, more than the retention cap of 5.
+        write_synthetic_events(9);
+
+        let mut rotated = 0;
+        for index in 1..=(MAX_LEDGER_SEGMENTS + 3) {
+            if segment_path(&active, index).exists() {
+                rotated += 1;
+            }
+        }
+        assert_eq!(
+            rotated, MAX_LEDGER_SEGMENTS,
+            "retention cap must bound rotated segments"
+        );
+        assert!(
+            !segment_path(&active, MAX_LEDGER_SEGMENTS + 1).exists(),
+            "segments beyond the cap must be pruned"
+        );
+
+        let total = total_records(&active);
+        assert_eq!(
+            total,
+            MAX_LEDGER_SEGMENTS + 1,
+            "only the active file plus retained segments remain"
+        );
+
+        let all = read_all_segments_concat(&active);
+        assert!(!all.contains("\"idx\":0"), "oldest record must be pruned");
+        assert!(!all.contains("\"idx\":2"), "oldest records must be pruned");
+        assert!(all.contains("\"idx\":8"), "newest record must be retained");
+        println!("readback=retention rotated={rotated} total_records={total}");
+    }
+
+    #[test]
+    fn preserves_all_records_across_rotation_within_cap() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure_temp(&temp);
+        set_max_segment_bytes_for_test(1);
+        let active = PathBuf::from(&paths.tool_events_path);
+
+        // 5 records => 4 rotations, within the retention cap of 5: nothing pruned.
+        write_synthetic_events(5);
+
+        let total = total_records(&active);
+        assert_eq!(total, 5, "no records lost when rotations stay within the cap");
+        let all = read_all_segments_concat(&active);
+        assert!(all.contains("\"idx\":0"), "oldest record retained within the cap");
+        assert!(all.contains("\"idx\":4"), "newest record retained within the cap");
+        println!("readback=noloss total_records={total}");
     }
 }
