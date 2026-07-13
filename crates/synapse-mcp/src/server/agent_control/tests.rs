@@ -140,7 +140,19 @@ async fn wait_for_tree_exit_reports_survivors_after_grace() {
 
 #[tokio::test]
 async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyhow::Result<()> {
-    let _serial = crate::test_support::lease_serial("operator_panic_test_reset");
+    // Build the service FIRST: every `SynapseService` constructor installs the
+    // per-thread process-global isolation override (input lease + agent-state
+    // tracker) under `#[cfg(test)]` — the established pattern from #1574/#1585.
+    // With that override installed before the first lease touch below, every
+    // `try_acquire`/`status`/`force_preempt` in this test operates on this
+    // thread's hermetic lease cell, so a parallel test mutating the real
+    // process-global lease can no longer clear/overwrite this test's seeded
+    // owner between `try_acquire` and `force_preempt_input_lease` (issue #1600).
+    //
+    // This replaces the pre-#1585 `lease_serial` band-aid, which serialized only
+    // against other `lease_serial` callers and, worse, force-cleared the GLOBAL
+    // cell before the override was installed — guarding a cell this test never
+    // reads once the service is built.
     let temp = TempDir::new()?;
     let service = regression_service(temp.path());
     let owner = "session-operator-panic-prior";
