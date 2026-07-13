@@ -101,7 +101,11 @@ rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "zs
 clap = { version = "4.6.1", features = ["derive", "env"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
-schemars = { version = "1.2.1", features = ["chrono04", "derive"] }
+# Pinned to an exact version: schemars output IS the published MCP tool-schema
+# contract surface (see tests/snapshots/*.snap). A transparent minor/patch bump
+# can silently change schema emission (e.g. `items: true` -> `items: {}`) and
+# drift the contract without review. Any bump must be deliberate and re-blessed.
+schemars = { version = "=1.2.1", features = ["chrono04", "derive"] }
 regex = "1.12.3"
 ed25519-dalek = "2.2.0"
 sha2 = "0.11.0"

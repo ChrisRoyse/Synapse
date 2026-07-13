@@ -1,6 +1,5 @@
 ---
 source: crates/synapse-mcp/tests/m3_subscribe_tool.rs
-assertion_line: 211
 expression: shape
 ---
 {
@@ -170,7 +169,16 @@ expression: shape
                   "type": "string"
                 },
                 "values": {
-                  "items": true,
+                  "items": {
+                    "type": [
+                      "object",
+                      "array",
+                      "string",
+                      "number",
+                      "boolean",
+                      "null"
+                    ]
+                  },
                   "type": "array"
                 }
               },

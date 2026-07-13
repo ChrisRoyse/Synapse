@@ -181,7 +181,16 @@ expression: shape
                 "type": "string"
               },
               "values": {
-                "items": true,
+                "items": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                },
                 "type": "array"
               }
             },
