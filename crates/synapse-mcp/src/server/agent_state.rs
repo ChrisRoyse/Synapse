@@ -103,6 +103,44 @@ const DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 /// Kestra's DISCONNECTED→TERMINATED. Env-overridable; default 30 min.
 pub(crate) const DEFAULT_UNPROBEABLE_DEAD_AFTER_MS: u64 = 30 * 60 * 1000;
 
+/// While an unprobeable agent's most recent journal event is an in-flight
+/// `ToolCallStarted` with no matching finish, it is *executing a tool* — a long
+/// shell job, a browser wait, or a web fetch legitimately emits nothing until
+/// the tool returns. Silence there is work in progress, not death, so the
+/// end-of-life verdict is deferred to this multiple of
+/// `unprobeable_dead_after_ms` (a work-aware deadline, mirroring Conductor's
+/// long-task `timeoutSeconds` vs heartbeat `responseTimeoutSeconds` split and
+/// comis's activity-resetting stall budget with an outer makespan ceiling). The
+/// resurrection guard still recovers the agent if this outer bound is exceeded
+/// and real activity later resumes, so the multiplier only trades a longer
+/// dormant-but-visible window for far fewer false reaps of working agents (#1594).
+pub(crate) const UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT: u64 = 4;
+
+/// The `reason_code` the unprobeable-silence reaper stamps on an *inferred*
+/// death. Unlike a confirmed terminal event (`Killed`/`Exited`/process-gone),
+/// this death is a heuristic guess from silence alone; a subsequent real
+/// agent-loop event overturns it (see [`AgentStateTracker::apply_event`]).
+const UNPROBEABLE_SILENT_ENDED_REASON: &str = "unprobeable_silent_ended";
+
+/// Audit `reason_code` for a resurrection: a dead agent transitioned back to a
+/// live state because real agent-loop activity proved the inferred death wrong.
+const RESURRECTED_REASON: &str = "resurrected_by_live_evidence";
+
+/// Process-wide count of journal events discarded because they arrived for an
+/// agent in a *confirmed*-dead state (`AGENT_STATE_EVENT_AFTER_DEATH`). Surfaced
+/// as a running total on every drop so a pile-up (#1594: 198 events for one
+/// agent) is a visible signal rather than 198 disconnected INFO lines. Never
+/// reset in production; readable in tests via [`events_dropped_after_death_count`].
+static EVENTS_DROPPED_AFTER_DEATH: AtomicU64 = AtomicU64::new(0);
+
+/// Test accessor for the process-wide after-death drop counter. Production
+/// visibility comes from the `events_dropped_after_death_total` field the
+/// `AGENT_STATE_EVENT_AFTER_DEATH` warn carries on every drop.
+#[cfg(test)]
+pub(crate) fn events_dropped_after_death_count() -> u64 {
+    EVENTS_DROPPED_AFTER_DEATH.load(Ordering::Relaxed)
+}
+
 /// Rebuild lookback window over `CF_AGENT_EVENTS`.
 const REBUILD_LOOKBACK_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
@@ -353,6 +391,30 @@ fn late_exit_reconciles_process_probe_death(entry: &AgentEntry, record: &AgentEv
         && entry.reason_code.as_deref() == Some("process_gone_without_exit_event")
 }
 
+/// True when the entry's dead state is an *inferred* liveness-sweep death (the
+/// unprobeable-silence reaper's guess from silence alone), as opposed to a
+/// confirmed terminal event. Only inferred deaths may be overturned by later
+/// live evidence; a `Killed`/`Exited`/process-gone death is authoritative and a
+/// straggler never resurrects it.
+fn is_liveness_inferred_death(entry: &AgentEntry) -> bool {
+    entry.state == AgentLifecycleState::Dead
+        && entry.reason_code.as_deref() == Some(UNPROBEABLE_SILENT_ENDED_REASON)
+}
+
+/// True for journal events that are direct proof the agent loop is running:
+/// turn boundaries and tool-call activity. Mailbox/lease/state-changed traffic
+/// is deliberately excluded — it can originate from arbitrary sessions and is a
+/// weaker liveness signal than the agent's own turn/tool events.
+fn is_proof_of_life(kind: AgentEventKind) -> bool {
+    matches!(
+        kind,
+        AgentEventKind::TurnStarted
+            | AgentEventKind::ToolCallStarted
+            | AgentEventKind::ToolCallFinished
+            | AgentEventKind::TurnFinished
+    )
+}
+
 fn newest_spawn_artifact_activity(entry: &AgentEntry) -> Option<AgentArtifactActivity> {
     let log_dir = Path::new(entry.log_dir.as_deref()?);
     [
@@ -499,21 +561,42 @@ impl AgentStateTracker {
         // (rather than leaving it dead or forking a duplicate) is the explicit
         // resurrection guard the dormancy reap requires — it falls through to
         // `reduce`, which maps `SpawnRequested` → `Spawning`.
+        // Live evidence overturns an INFERRED liveness-sweep death. The
+        // unprobeable-silence reaper only *guesses* an ambient agent ended
+        // because it went quiet with no pid to probe (#1594); a subsequent real
+        // agent-loop event (turn/tool) is direct proof the guess was wrong.
+        // Rather than discard the agent's real activity, resurrect it with an
+        // audited RESURRECTED transition. A CONFIRMED death
+        // (killed/exited/process-gone) is authoritative and is never overturned
+        // by a straggler — see `hook_after_kill_never_resurrects_a_dead_agent`.
+        let resurrecting_on_evidence =
+            is_liveness_inferred_death(entry) && is_proof_of_life(record.kind);
         if entry.state == AgentLifecycleState::Dead
             && !matches!(record.kind, AgentEventKind::SpawnRequested)
             && !late_exit_reconciles_process_probe_death(entry, record)
+            && !resurrecting_on_evidence
         {
             if !matches!(record.kind, AgentEventKind::Exited | AgentEventKind::Killed) {
+                let dropped = EVENTS_DROPPED_AFTER_DEATH.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::warn!(
                     code = "AGENT_STATE_EVENT_AFTER_DEATH",
                     anchor = %entry.anchor,
                     kind = ?record.kind,
+                    reason_code = ?entry.reason_code,
                     ts_ns = record.ts_ns,
-                    "journal event arrived for a dead agent; state stays dead"
+                    events_dropped_after_death_total = dropped,
+                    "journal event arrived for a confirmed-dead agent; event discarded (state stays dead)"
                 );
             }
             return None;
         }
+        // Captured before bookkeeping so the RESURRECTED audit can name the
+        // death reason the live evidence just overturned.
+        let death_reason_before_resurrection = if resurrecting_on_evidence {
+            entry.reason_code.clone()
+        } else {
+            None
+        };
 
         // Bookkeeping that never changes state by itself.
         if entry.session_id.is_none() && record.session_id.is_some() {
@@ -540,7 +623,29 @@ impl AgentStateTracker {
             return None;
         }
         entry.state = decision.state;
-        entry.reason_code = Some(decision.reason_code.clone());
+        let (reason_code, evidence) = if resurrecting_on_evidence {
+            tracing::warn!(
+                code = "AGENT_STATE_RESURRECTED",
+                anchor = %entry.anchor,
+                kind = ?record.kind,
+                prior_death_reason = ?death_reason_before_resurrection,
+                state_to = decision.state.as_str(),
+                ts_ns = record.ts_ns,
+                "inferred-dead agent produced live agent-loop activity; resurrected"
+            );
+            (
+                RESURRECTED_REASON.to_owned(),
+                json!({
+                    "resurrected": true,
+                    "prior_death_reason": death_reason_before_resurrection,
+                    "trigger_event_kind": record.kind,
+                    "reduced_reason": decision.reason_code,
+                }),
+            )
+        } else {
+            (decision.reason_code, decision.evidence)
+        };
+        entry.reason_code = Some(reason_code.clone());
         entry.waiting_for = decision.waiting_for.clone();
         entry.since_unix_ms = event_unix_ms;
         Some(StateTransition {
@@ -549,10 +654,10 @@ impl AgentStateTracker {
             session_id: entry.session_id.clone(),
             state_from,
             state_to: decision.state,
-            reason_code: decision.reason_code,
+            reason_code,
             waiting_for: decision.waiting_for,
             runaway: entry.runaway,
-            evidence: decision.evidence,
+            evidence,
         })
     }
 
@@ -684,15 +789,28 @@ impl AgentStateTracker {
             // surely as a working one. A resume re-registers and revives.
             if entry.probe_pid().is_none() {
                 let silent_ms = now_unix_ms.saturating_sub(entry.last_event_unix_ms);
-                if silent_ms >= unprobeable_dead_after_ms {
+                // Work-aware deadline: an in-flight `ToolCallStarted` with no
+                // matching finish means the agent is executing a tool (a long
+                // shell job / browser wait / web fetch is legitimately silent),
+                // so defer the end-of-life verdict with an extended grace rather
+                // than reap a working agent mid-call (#1594). Idle-between-turns
+                // ambient agents keep the sane base deadline.
+                let in_flight_tool_call = entry.last_event_kind == AgentEventKind::ToolCallStarted;
+                let dead_after_ms = if in_flight_tool_call {
+                    unprobeable_dead_after_ms.saturating_mul(UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT)
+                } else {
+                    unprobeable_dead_after_ms
+                };
+                if silent_ms >= dead_after_ms {
                     transitions.push(force_transition(
                         entry,
                         AgentLifecycleState::Dead,
-                        "unprobeable_silent_ended",
+                        UNPROBEABLE_SILENT_ENDED_REASON,
                         None,
                         json!({
                             "silent_ms": silent_ms,
-                            "unprobeable_dead_after_ms": unprobeable_dead_after_ms,
+                            "unprobeable_dead_after_ms": dead_after_ms,
+                            "in_flight_tool_call": in_flight_tool_call,
                             "last_event_kind": entry.last_event_kind,
                         }),
                         now_unix_ms,
@@ -1949,9 +2067,30 @@ mod tests {
         assert_eq!(transitions[0].state_to, AgentLifecycleState::Stuck);
         assert_eq!(transitions[0].reason_code, "silent_timeout_unprobeable");
 
-        // Past the ended threshold it transitions straight to Dead so it leaves
-        // the attention queue and is pruned after retention.
-        let ended = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        // Work-aware deadline: the last event is an in-flight `ToolCallStarted`,
+        // so at the *base* unprobeable deadline the mid-tool agent is NOT reaped
+        // — a long tool call is legitimately silent (#1594).
+        let base_deadline = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let deferred = tracker.sweep(
+            base_deadline,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert!(
+            deferred.is_empty(),
+            "in-flight tool call must defer the death verdict: {deferred:?}"
+        );
+        assert_eq!(
+            tracker.unbound_reads(base_deadline)[0].state,
+            AgentLifecycleState::Stuck,
+            "deferred agent stays visibly stuck, not dead"
+        );
+
+        // Past the *extended* in-flight deadline it finally transitions straight
+        // to Dead so it leaves the attention queue and is pruned after retention.
+        let ended =
+            base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS * UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT + 1;
         let transitions = tracker.sweep(
             ended,
             DEFAULT_STUCK_AFTER_MS,
@@ -1961,9 +2100,10 @@ mod tests {
         assert_eq!(transitions.len(), 1, "{transitions:?}");
         assert_eq!(transitions[0].state_to, AgentLifecycleState::Dead);
         assert_eq!(transitions[0].reason_code, "unprobeable_silent_ended");
+        assert_eq!(transitions[0].evidence["in_flight_tool_call"], true);
         assert!(
             transitions[0].evidence["silent_ms"].as_u64().unwrap()
-                >= DEFAULT_UNPROBEABLE_DEAD_AFTER_MS
+                >= DEFAULT_UNPROBEABLE_DEAD_AFTER_MS * UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT
         );
 
         // Resurrection guard: the session resumes (appends again) and the
@@ -1974,6 +2114,317 @@ mod tests {
             .expect("re-registration must revive a dormancy-reaped agent");
         assert_eq!(revived.state_from, AgentLifecycleState::Dead);
         assert_eq!(revived.state_to, AgentLifecycleState::Spawning);
+    }
+
+    /// #1594 core: a liveness-sweep death is an *inference*, and a subsequent
+    /// real agent-loop event proves it wrong. The agent must resurrect (not have
+    /// its 176 real events silently discarded). Source of truth = the tracker's
+    /// own read after the event is applied.
+    #[test]
+    fn live_evidence_resurrects_inferred_dead_ambient_agent() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-claude-ut-resurrect";
+        // An unprobeable ambient agent that idled between turns: last real event
+        // is a `TurnFinished` (Idle), no pid to probe.
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        tracker.apply_event(&tool_call(spawn, "act_run_shell", "sha256:work"));
+        tracker.apply_event(&event(AgentEventKind::TurnFinished, Some(spawn), None));
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Idle,
+            "idle-between-turns before the sweep"
+        );
+
+        // The sweep reaps it as inferred-dead after the idle deadline.
+        let base = unix_time_ns_now() / 1_000_000;
+        let ended = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let transitions = tracker.sweep(
+            ended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(transitions[0].reason_code, "unprobeable_silent_ended");
+        assert_eq!(
+            tracker.unbound_reads(ended)[0].state,
+            AgentLifecycleState::Dead,
+            "reaped by inference before resurrection"
+        );
+
+        // A post-death `ToolCallStarted` is proof the agent loop is running:
+        // resurrect to Working with an audited RESURRECTED transition instead of
+        // dropping it as a straggler.
+        let resurrect = tracker
+            .apply_event(&tool_call(spawn, "browser_nav", "sha256:alive-again"))
+            .expect("live evidence must resurrect an inferred-dead agent");
+        assert_eq!(resurrect.state_from, AgentLifecycleState::Dead);
+        assert_eq!(resurrect.state_to, AgentLifecycleState::Working);
+        assert_eq!(resurrect.reason_code, RESURRECTED_REASON);
+        assert_eq!(resurrect.evidence["resurrected"], true);
+        assert_eq!(
+            resurrect.evidence["prior_death_reason"],
+            "unprobeable_silent_ended"
+        );
+        assert_eq!(
+            resurrect.evidence["trigger_event_kind"],
+            "tool_call_started"
+        );
+
+        // Source-of-truth read: the agent is alive again, not dead.
+        let read = tracker.unbound_reads(ended)[0].clone();
+        assert_eq!(read.state, AgentLifecycleState::Working);
+        assert_eq!(read.reason_code.as_deref(), Some(RESURRECTED_REASON));
+        assert_eq!(read.attention_class, AgentAttentionClass::None);
+
+        // And it keeps making progress afterwards (a following turn goes idle).
+        let after = tracker
+            .apply_event(&event(AgentEventKind::TurnFinished, Some(spawn), None))
+            .expect("resurrected agent keeps transitioning");
+        assert_eq!(after.state_from, AgentLifecycleState::Working);
+        assert_eq!(after.state_to, AgentLifecycleState::Idle);
+    }
+
+    /// A CONFIRMED death (an explicit kill/exit) must never be resurrected by a
+    /// straggler event — and each discarded event must bump the visible
+    /// after-death drop counter (#1594 part 3).
+    #[test]
+    fn confirmed_dead_drops_straggler_events_and_counts_them() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ut-confirmed-dead";
+        tracker.apply_event(&event(AgentEventKind::SpawnRequested, Some(spawn), None));
+        let killed = tracker
+            .apply_event(&event(AgentEventKind::Killed, Some(spawn), None))
+            .expect("spawning→dead");
+        assert_eq!(killed.state_to, AgentLifecycleState::Dead);
+
+        let before = events_dropped_after_death_count();
+        // Even proof-of-life events are discarded for a confirmed-dead agent.
+        for digest in ["sha256:a", "sha256:b", "sha256:c"] {
+            assert!(
+                tracker
+                    .apply_event(&tool_call(spawn, "Bash", digest))
+                    .is_none(),
+                "straggler must not resurrect a confirmed-dead agent"
+            );
+        }
+        assert!(
+            tracker
+                .apply_event(&event(AgentEventKind::TurnStarted, Some(spawn), None))
+                .is_none(),
+            "TurnStarted straggler must not resurrect a confirmed-dead agent"
+        );
+        assert_eq!(
+            tracker.unbound_reads(0)[0].state,
+            AgentLifecycleState::Dead,
+            "confirmed-dead agent stays dead"
+        );
+        // Four proof-of-life stragglers were dropped; the counter reflects it.
+        assert!(
+            events_dropped_after_death_count() >= before + 4,
+            "after-death drop counter must advance by the dropped-event count"
+        );
+    }
+
+    /// Boundary/edge coverage for the work-aware in-flight deadline: at exactly
+    /// the base deadline an in-flight tool call is deferred, and an agent whose
+    /// last event is NOT an in-flight tool call is reaped at the base deadline.
+    #[test]
+    fn work_aware_deadline_defers_only_in_flight_tool_calls() {
+        let mut tracker = AgentStateTracker::default();
+        let in_flight = "agent-spawn-ut-inflight";
+        let idle = "agent-spawn-ut-idle";
+        let base = unix_time_ns_now() / 1_000_000;
+
+        // in-flight: last event is a ToolCallStarted (Working).
+        let mut req_a = event(AgentEventKind::SpawnRequested, Some(in_flight), None);
+        set_event_time_ms(&mut req_a, base);
+        tracker.apply_event(&req_a);
+        let mut call = tool_call(in_flight, "act_run_shell", "sha256:long");
+        set_event_time_ms(&mut call, base);
+        tracker.apply_event(&call);
+
+        // idle: last event is a TurnFinished (Idle), not in-flight.
+        let mut req_b = event(AgentEventKind::SpawnRequested, Some(idle), None);
+        set_event_time_ms(&mut req_b, base);
+        tracker.apply_event(&req_b);
+        let mut finished = event(AgentEventKind::TurnFinished, Some(idle), None);
+        set_event_time_ms(&mut finished, base);
+        tracker.apply_event(&finished);
+
+        // At the base deadline: the idle agent is reaped Dead, but the in-flight
+        // agent's death is deferred — it only becomes visibly Stuck
+        // (silent_timeout_unprobeable), never Dead.
+        let at_base = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS;
+        let transitions = tracker.sweep(
+            at_base,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        let idle_transition = transitions
+            .iter()
+            .find(|transition| transition.anchor == idle)
+            .expect("idle agent transition");
+        assert_eq!(idle_transition.state_to, AgentLifecycleState::Dead);
+        assert_eq!(idle_transition.reason_code, "unprobeable_silent_ended");
+        assert_eq!(idle_transition.evidence["in_flight_tool_call"], false);
+
+        // No transition may reap the in-flight agent to Dead at the base deadline.
+        assert!(
+            !transitions
+                .iter()
+                .any(|transition| transition.anchor == in_flight
+                    && transition.state_to == AgentLifecycleState::Dead),
+            "in-flight tool call must not be reaped at the base deadline: {transitions:?}"
+        );
+        let in_flight_read = tracker
+            .unbound_reads(at_base)
+            .into_iter()
+            .find(|read| read.anchor == in_flight)
+            .expect("in-flight agent tracked");
+        assert_ne!(
+            in_flight_read.state,
+            AgentLifecycleState::Dead,
+            "deferred in-flight agent stays alive/visible, not dead"
+        );
+
+        // Past the extended in-flight deadline it is finally reaped Dead.
+        let past_extended =
+            base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS * UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT + 1;
+        let extended = tracker.sweep(
+            past_extended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        let in_flight_death = extended
+            .iter()
+            .find(|transition| transition.anchor == in_flight)
+            .expect("in-flight agent reaped past extended deadline");
+        assert_eq!(in_flight_death.state_to, AgentLifecycleState::Dead);
+        assert_eq!(in_flight_death.evidence["in_flight_tool_call"], true);
+    }
+
+    /// Edge (#1594): resurrection is not tool-call-specific. A `TurnFinished`
+    /// (not just `ToolCallStarted`) is also proof of life and must overturn an
+    /// inferred death — landing in `Idle`, since a finished turn maps to `Idle`.
+    #[test]
+    fn turn_finished_only_resurrects_inferred_dead_to_idle() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-ut-turnfinished-revive";
+        let base = 1_000_000u64;
+
+        let mut req = event(AgentEventKind::SpawnRequested, Some(spawn), None);
+        set_event_time_ms(&mut req, base);
+        tracker.apply_event(&req);
+        // Last event is a `TurnStarted` (Working) — NOT an in-flight tool call,
+        // so it reaps at the base deadline, not the extended one.
+        let mut started = event(AgentEventKind::TurnStarted, Some(spawn), None);
+        set_event_time_ms(&mut started, base);
+        tracker.apply_event(&started);
+
+        let ended = base + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let reaped = tracker.sweep(
+            ended,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(reaped[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(reaped[0].reason_code, "unprobeable_silent_ended");
+        assert_eq!(reaped[0].evidence["in_flight_tool_call"], false);
+
+        // A bare `TurnFinished` overturns the inferred death → Idle.
+        let mut finished = event(AgentEventKind::TurnFinished, Some(spawn), None);
+        set_event_time_ms(&mut finished, ended);
+        let resurrect = tracker
+            .apply_event(&finished)
+            .expect("TurnFinished must resurrect an inferred-dead agent");
+        assert_eq!(resurrect.state_from, AgentLifecycleState::Dead);
+        assert_eq!(resurrect.state_to, AgentLifecycleState::Idle);
+        assert_eq!(resurrect.reason_code, RESURRECTED_REASON);
+        assert_eq!(resurrect.evidence["resurrected"], true);
+        assert_eq!(resurrect.evidence["trigger_event_kind"], "turn_finished");
+        assert_eq!(
+            tracker.unbound_reads(ended)[0].state,
+            AgentLifecycleState::Idle,
+            "source-of-truth read: alive (idle) again, not dead"
+        );
+    }
+
+    /// Edge (#1594): resurrection is repeatable, not a one-shot. An ambient
+    /// agent that is reaped, resurrected, idles, is reaped AGAIN by a later
+    /// sweep, and produces fresh evidence must resurrect a second time.
+    #[test]
+    fn resurrection_survives_repeated_sweep_death_cycles() {
+        let mut tracker = AgentStateTracker::default();
+        let spawn = "agent-spawn-ambient-ut-multi-sweep";
+        let t0 = 1_000_000u64;
+
+        let mut req = event(AgentEventKind::SpawnRequested, Some(spawn), None);
+        set_event_time_ms(&mut req, t0);
+        tracker.apply_event(&req);
+        let mut fin0 = event(AgentEventKind::TurnFinished, Some(spawn), None);
+        set_event_time_ms(&mut fin0, t0);
+        tracker.apply_event(&fin0);
+
+        // Sweep #1 → inferred-dead.
+        let sweep1 = t0 + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let dead1 = tracker.sweep(
+            sweep1,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        assert_eq!(dead1[0].state_to, AgentLifecycleState::Dead);
+        assert_eq!(dead1[0].reason_code, "unprobeable_silent_ended");
+
+        // Resurrection #1 via ToolCallStarted → Working.
+        let mut call = tool_call(spawn, "act_run_shell", "sha256:cycle-1");
+        set_event_time_ms(&mut call, sweep1);
+        let r1 = tracker
+            .apply_event(&call)
+            .expect("first resurrection on live evidence");
+        assert_eq!(r1.state_from, AgentLifecycleState::Dead);
+        assert_eq!(r1.state_to, AgentLifecycleState::Working);
+        assert_eq!(r1.reason_code, RESURRECTED_REASON);
+
+        // It idles again.
+        let mut fin1 = event(AgentEventKind::TurnFinished, Some(spawn), None);
+        set_event_time_ms(&mut fin1, sweep1);
+        tracker.apply_event(&fin1);
+
+        // Sweep #2 (later) reaps it inferred-dead a SECOND time.
+        let sweep2 = sweep1 + DEFAULT_UNPROBEABLE_DEAD_AFTER_MS + 1;
+        let dead2 = tracker.sweep(
+            sweep2,
+            DEFAULT_STUCK_AFTER_MS,
+            DEFAULT_UNPROBEABLE_DEAD_AFTER_MS,
+            &|_pid| panic!("unprobeable: probe must not run"),
+        );
+        let dead2_t = dead2
+            .iter()
+            .find(|transition| transition.anchor == spawn)
+            .expect("second inferred death");
+        assert_eq!(dead2_t.state_to, AgentLifecycleState::Dead);
+        assert_eq!(dead2_t.reason_code, "unprobeable_silent_ended");
+
+        // Resurrection #2 via TurnStarted → Working: not a one-shot.
+        let mut started = event(AgentEventKind::TurnStarted, Some(spawn), None);
+        set_event_time_ms(&mut started, sweep2);
+        let r2 = tracker
+            .apply_event(&started)
+            .expect("second resurrection after a second sweep");
+        assert_eq!(r2.state_from, AgentLifecycleState::Dead);
+        assert_eq!(r2.state_to, AgentLifecycleState::Working);
+        assert_eq!(r2.reason_code, RESURRECTED_REASON);
+        assert_eq!(
+            tracker.unbound_reads(sweep2)[0].state,
+            AgentLifecycleState::Working,
+            "alive again after the second resurrection"
+        );
     }
 
     /// Physical-row integration: events written through the journal choke

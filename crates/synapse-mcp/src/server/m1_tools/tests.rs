@@ -8,18 +8,20 @@ use super::{
     CdpTargetOwner, DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
     ErrorData, MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
     MAX_BROWSER_WAIT_TIMEOUT_MS, MAX_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
-    MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionTarget, SetTargetParam, SynapseService,
-    TargetClaimTargetParam, TargetOperation, TargetParams, TargetWire,
-    attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
+    MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionOwnedChromiumWindow, SessionTarget,
+    SetTargetParam, SynapseService, TargetClaimTargetParam, TargetOperation, TargetParams,
+    TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
     background_tab_activation_foregrounded_requested_window, browser_nav_delegate_error,
     browser_screenshot_bridge_disconnected, browser_tab_entry,
     browser_tab_window_title_matches_target, browser_wait_for_selector_condition,
     capture_target_window_transient_candidate_diagnostic_from_contexts,
     cdp_activate_resolution_request_details, cdp_navigation_error_code,
-    cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
-    chrome_page_vitals_info, classify_browser_evaluate_error_parts, downscale_captured_bitmap,
-    format_chromium_window_candidates, hidden_desktop_pip_ended_response,
-    hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
+    cdp_target_info_resolution_request_details, cdp_target_owner_key,
+    chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
+    classify_browser_evaluate_error_parts, decide_passive_chromium_window,
+    downscale_captured_bitmap, format_chromium_window_candidates,
+    hidden_desktop_pip_ended_response, hidden_worker_target_miss,
+    is_stale_chrome_window_id_mapping_refusal, mcp_error, ocr_cache_key, page_text_info_from_parts,
     perception_window_hwnd, resolve_browser_evaluate_timeout_ms, resolve_browser_tag_source,
     resolve_capture_target_window_context, screenshot_downscale_scale,
     select_single_active_browser_tab, sha256_hex, target_claim_param_from_set, target_wire,
@@ -1454,6 +1456,265 @@ fn format_chromium_window_candidates_includes_human_actionable_context() {
         "{summary}"
     );
     assert!(summary.contains("bounds=1280x720+10,20"), "{summary}");
+}
+
+// #1592 — a chrome.exe window candidate at a known hwnd, for passive-discovery
+// disambiguation tests.
+fn chromium_candidate(hwnd: i64, title: &str) -> ForegroundContext {
+    foreground_context_for_test(
+        hwnd,
+        4200 + (hwnd as u32 & 0xff),
+        "chrome.exe",
+        title,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 720,
+        },
+    )
+}
+
+// #1592 — the human OS foreground is a non-Chromium app (VS Code), which is what
+// pushes resolution into passive Chromium discovery.
+fn vscode_foreground() -> ForegroundContext {
+    foreground_context_for_test(
+        0xC0DE,
+        9001,
+        "Code.exe",
+        "issue-1592 — mod.rs — Visual Studio Code",
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        },
+    )
+}
+
+// #1592 no-Chromium-anywhere: passive discovery with zero visible Chromium
+// windows must hard-fail with an actionable, structured error that names the
+// non-Chromium foreground — never a silent fallback.
+#[test]
+fn decide_passive_chromium_window_errors_when_no_chromium_visible() {
+    let foreground = vscode_foreground();
+
+    let error = decide_passive_chromium_window("browser_tabs", &foreground, vec![], &[])
+        .expect_err("no visible Chromium windows must fail resolution");
+
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&json!(error_codes::ACTION_TARGET_INVALID))
+    );
+    assert!(
+        error.message.contains("no visible Chromium windows"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("Code.exe"),
+        "must name the non-Chromium foreground: {}",
+        error.message
+    );
+}
+
+// #1592 exactly-one-Chrome: a single visible Chromium window is adopted for any
+// operation (including mutating New), tagged passive_single_chromium_window and
+// never flagged as the human foreground window.
+#[test]
+fn decide_passive_chromium_window_adopts_the_sole_chromium_window() {
+    let foreground = vscode_foreground();
+    let candidate = chromium_candidate(0x1111, "Sole Chrome Window");
+
+    let (selected, source, count) =
+        decide_passive_chromium_window("browser_tabs", &foreground, vec![candidate], &[])
+            .expect("the sole Chromium window must be adopted");
+
+    assert_eq!(selected.hwnd, 0x1111);
+    assert_eq!(source, "passive_single_chromium_window");
+    assert_eq!(count, 1);
+}
+
+// #1592 two-Chrome-windows with a session owner: disambiguation must pick the
+// window this session already owns a tab in, not refuse and not guess.
+#[test]
+fn decide_passive_chromium_window_prefers_session_owned_window() {
+    let foreground = vscode_foreground();
+    let owned = chromium_candidate(0x2222, "Session-Owned Chrome");
+    let other = chromium_candidate(0x3333, "Unrelated Chrome");
+    let session_owned = [SessionOwnedChromiumWindow {
+        hwnd: 0x2222,
+        created_at_unix_ms: 10,
+    }];
+
+    let (selected, source, count) = decide_passive_chromium_window(
+        "browser_tabs",
+        &foreground,
+        vec![other, owned],
+        &session_owned,
+    )
+    .expect("the session-owned window must be adopted");
+
+    assert_eq!(selected.hwnd, 0x2222);
+    assert_eq!(source, "passive_session_owned_chromium_window");
+    assert_eq!(count, 2);
+}
+
+// #1592 genuine ambiguity: 2+ Chromium windows and this session owns none of
+// them -> refuse, but the error must enumerate the candidate windows so the
+// agent can pass window_hwnd.
+#[test]
+fn decide_passive_chromium_window_refuses_and_lists_candidates_when_ambiguous() {
+    let foreground = vscode_foreground();
+    let first = chromium_candidate(0x4444, "Chrome A");
+    let second = chromium_candidate(0x5555, "Chrome B");
+
+    let error =
+        decide_passive_chromium_window("browser_tabs", &foreground, vec![first, second], &[])
+            .expect_err("ambiguous discovery with no session ownership must refuse");
+
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&json!(error_codes::ACTION_TARGET_INVALID))
+    );
+    assert!(
+        error.message.contains("owns a tab in none of them"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("hwnd=0x4444"), "{}", error.message);
+    assert!(error.message.contains("hwnd=0x5555"), "{}", error.message);
+}
+
+// #1592 recency tie-break: when the session owns tabs in several visible Chrome
+// windows, the most recently adopted one wins.
+#[test]
+fn decide_passive_chromium_window_breaks_owner_ties_by_recency() {
+    let foreground = vscode_foreground();
+    let older = chromium_candidate(0x6666, "Older Chrome");
+    let newer = chromium_candidate(0x7777, "Newer Chrome");
+    let session_owned = [
+        SessionOwnedChromiumWindow {
+            hwnd: 0x6666,
+            created_at_unix_ms: 100,
+        },
+        SessionOwnedChromiumWindow {
+            hwnd: 0x7777,
+            created_at_unix_ms: 200,
+        },
+    ];
+
+    let (selected, source, count) = decide_passive_chromium_window(
+        "browser_tabs",
+        &foreground,
+        vec![older, newer],
+        &session_owned,
+    )
+    .expect("most recently adopted owned window must win");
+
+    assert_eq!(selected.hwnd, 0x7777);
+    assert_eq!(source, "passive_most_recent_session_chromium_window");
+    assert_eq!(count, 2);
+}
+
+// #1592 — session_owned_chromium_windows derives its view from the live CDP
+// target-owner registry. Full-state verification: register owners for two
+// sessions, then read back the derived per-session window list.
+#[test]
+fn session_owned_chromium_windows_reads_live_owner_registry() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let service = service_with_temp_db(dir.path())?;
+    let session_id = "issue1592-owner-session";
+    service.register_cdp_target_owner(CdpTargetOwner {
+        session_id: session_id.to_owned(),
+        window_hwnd: 0x2222,
+        endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+        chrome_window_id: Some(42),
+        capture_window_hwnd: None,
+        cdp_target_id: "chrome-tab:owned-1592".to_owned(),
+        requested_url: "about:blank".to_owned(),
+        target_url: "about:blank".to_owned(),
+        created_at_unix_ms: 55,
+    })?;
+    service.register_cdp_target_owner(CdpTargetOwner {
+        session_id: "other-session".to_owned(),
+        window_hwnd: 0x9999,
+        endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+        chrome_window_id: Some(7),
+        capture_window_hwnd: None,
+        cdp_target_id: "chrome-tab:other-1592".to_owned(),
+        requested_url: "about:blank".to_owned(),
+        target_url: "about:blank".to_owned(),
+        created_at_unix_ms: 12,
+    })?;
+
+    let windows = service.session_owned_chromium_windows(session_id)?;
+
+    assert_eq!(windows.len(), 1, "only this session's window is returned");
+    assert_eq!(windows[0].hwnd, 0x2222);
+    assert_eq!(windows[0].created_at_unix_ms, 55);
+    Ok(())
+}
+
+// #1592 self-heal — clearing a stale cached chrome_window_id must mutate the
+// live owner registry. Full-state verification: register an owner carrying a
+// chrome_window_id, clear it, then read the registry back and confirm it is now
+// None while every other field is untouched. A second clear is a no-op.
+#[test]
+fn clear_owner_cached_chrome_window_id_drops_only_the_window_id() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let service = service_with_temp_db(dir.path())?;
+    let owner = CdpTargetOwner {
+        session_id: "issue1592-stale-session".to_owned(),
+        window_hwnd: 0x2222,
+        endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+        chrome_window_id: Some(1592),
+        capture_window_hwnd: None,
+        cdp_target_id: "chrome-tab:stale-1592".to_owned(),
+        requested_url: "about:blank".to_owned(),
+        target_url: "https://example.test/".to_owned(),
+        created_at_unix_ms: 77,
+    };
+    let owner_key = cdp_target_owner_key(owner.window_hwnd, &owner.endpoint, &owner.cdp_target_id);
+    service.register_cdp_target_owner(owner.clone())?;
+
+    let cleared = service.clear_owner_cached_chrome_window_id(&owner)?;
+    assert!(cleared, "a cached chrome_window_id must be cleared");
+
+    // Read the source of truth: the in-memory owner registry.
+    let stored = {
+        let guard = service
+            .cdp_target_owners_ref()
+            .lock()
+            .expect("owner registry lock");
+        guard.get(&owner_key).cloned().expect("owner still present")
+    };
+    assert_eq!(stored.chrome_window_id, None, "stale window id was dropped");
+    assert_eq!(stored.cdp_target_id, "chrome-tab:stale-1592");
+    assert_eq!(stored.window_hwnd, 0x2222);
+    assert_eq!(stored.target_url, "https://example.test/");
+    assert_eq!(stored.created_at_unix_ms, 77);
+
+    // Clearing again is idempotent (no cached id left to drop).
+    let cleared_again = service.clear_owner_cached_chrome_window_id(&stored)?;
+    assert!(!cleared_again, "second clear is a no-op");
+    Ok(())
+}
+
+// #1592 — the stale-window-id detector must fire only for the extension's
+// "expectedChromeWindowId ... was not present" refusal, not for the genuinely
+// ambiguous mapping-refused variants (which are not self-healable by dropping a
+// cached id).
+#[test]
+fn is_stale_chrome_window_id_mapping_refusal_matches_only_the_stale_variant() {
+    let stale = "browser_tabs Chrome bridge chrome.tabs.query/readback failed: Chrome window mapping refused hwnd hint 8675309: expectedChromeWindowId 42 was not present; candidate_count=2 candidates=[...]";
+    assert!(is_stale_chrome_window_id_mapping_refusal(stale));
+
+    let ambiguous_bounds = "Chrome window mapping refused hwnd hint 8675309: expected_window_bounds matched 2 Chrome windows within 8px and expected_window_title did not disambiguate";
+    assert!(!is_stale_chrome_window_id_mapping_refusal(ambiguous_bounds));
+
+    let no_mapping = "browser_tabs Chrome bridge chrome.tabs.query/readback failed: Chrome debugger extension bridge is not connected";
+    assert!(!is_stale_chrome_window_id_mapping_refusal(no_mapping));
 }
 
 #[test]
@@ -4199,4 +4460,89 @@ fn ocr_cache_key_separates_auto_from_explicit_winrt_requests() {
 
     assert_ne!(explicit_key, auto_key);
     assert!(auto_key.contains("/auto/winrt/"));
+}
+
+/// #1551/#1593: a top-level `cdp_target_id` on `browser_wait` (the exact
+/// telemetry payload that used to fail closed as `unknown field`) is now folded
+/// into the selected condition spec, so envelope addressing resolves the SAME
+/// target as the nested-spec form.
+#[test]
+fn browser_wait_top_level_cdp_target_id_folds_into_condition_spec_1593() {
+    use crate::m1::{BrowserWaitConditionKind, BrowserWaitParams};
+
+    let mut wait = BrowserWaitParams {
+        condition: BrowserWaitConditionKind::Text,
+        text: Some(BrowserWaitForParams {
+            text: Some("ready".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    println!(
+        "readback=before cdp_target_id={:?}",
+        wait.text
+            .as_ref()
+            .and_then(|spec| spec.cdp_target_id.clone())
+    );
+    super::merge_browser_wait_top_level_target(&mut wait, Some("TARGET-1593-WAIT"), Some(0x1234))
+        .expect("top-level target folds into the text condition spec");
+    let spec = wait.text.expect("text spec present");
+    println!(
+        "readback=after cdp_target_id={:?} window_hwnd={:?}",
+        spec.cdp_target_id, spec.window_hwnd
+    );
+    assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1593-WAIT"));
+    assert_eq!(spec.window_hwnd, Some(0x1234));
+}
+
+/// #1551/#1593: a top-level target that conflicts with a value already present
+/// in the nested condition spec must fail closed rather than silently pick one.
+#[test]
+fn browser_wait_top_level_cdp_target_id_conflict_fails_closed_1593() {
+    use crate::m1::{BrowserWaitConditionKind, BrowserWaitParams};
+
+    let mut wait = BrowserWaitParams {
+        condition: BrowserWaitConditionKind::Selector,
+        selector: Some(BrowserWaitForSelectorParams {
+            query: "#q".to_owned(),
+            cdp_target_id: Some("OTHER-TARGET".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err = super::merge_browser_wait_top_level_target(&mut wait, Some("TARGET-1593-WAIT"), None)
+        .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+    let code = err
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
+    println!("readback=conflict code={code:?} message={}", err.message);
+    assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+}
+
+/// #1551/#1593: with no envelope target supplied the wait spec is untouched
+/// (the merge is a no-op), so the happy path stays byte-for-byte identical.
+#[test]
+fn browser_wait_without_top_level_target_is_noop_1593() {
+    use crate::m1::{BrowserWaitConditionKind, BrowserWaitParams};
+
+    let mut wait = BrowserWaitParams {
+        condition: BrowserWaitConditionKind::Text,
+        text: Some(BrowserWaitForParams {
+            text: Some("ready".to_owned()),
+            cdp_target_id: Some("NESTED-ONLY".to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    super::merge_browser_wait_top_level_target(&mut wait, None, None)
+        .expect("no envelope target is a no-op");
+    assert_eq!(
+        wait.text
+            .expect("text spec present")
+            .cdp_target_id
+            .as_deref(),
+        Some("NESTED-ONLY")
+    );
 }

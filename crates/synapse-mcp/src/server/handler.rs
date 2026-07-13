@@ -249,6 +249,15 @@ fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
         );
     }
     if error.data.is_none() && error.code == rmcp::model::ErrorCode::INVALID_PARAMS {
+        // #1593: turn opaque `deny_unknown_fields` deserialize dead-ends into
+        // actionable "did you mean" errors that name the correct field/location.
+        // Falls through to the plain code rewrite when the message is not an
+        // enrichable unknown-field failure.
+        if let Some(enriched) =
+            super::param_hints::enrich_param_deserialize_error(tool_name, &error.message)
+        {
+            return enriched;
+        }
         return mcp_error(
             synapse_core::error_codes::TOOL_PARAMS_INVALID,
             error.message.to_string(),

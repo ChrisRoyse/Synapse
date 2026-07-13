@@ -1,4 +1,62 @@
-use super::{SessionTarget, SynapseService, explicit_action_target};
+use super::{DEBUG_ONLY_TOOL_ROUTES, SessionTarget, SynapseService, explicit_action_target};
+
+/// #1595: `storage_put_probe_rows` is a synthetic-write test/FSV tool and must
+/// be gated off the default agent surface exactly like its fault-injector
+/// siblings — absent from the router unless `SYNAPSE_DEBUG_TOOLS` is set, and
+/// present when it is. FSV drives the actual router (`ToolRouter::has_route`),
+/// the source of truth for what a client can call, not a return value.
+#[test]
+fn debug_only_tool_routes_are_gated_off_the_default_surface() {
+    // Sanity: the gated set is exactly the four synthetic diagnostics, with
+    // the synthetic-write probe (#1595) included.
+    println!("readback=DEBUG_ONLY_TOOL_ROUTES before=expected value=synthetic diagnostics");
+    assert_eq!(
+        DEBUG_ONLY_TOOL_ROUTES,
+        &[
+            "storage_put_probe_rows",
+            "storage_pressure_sample",
+            "action_diagnostic_rate_limit_override",
+            "action_diagnostic_queue_full_setup",
+        ],
+    );
+
+    // Default surface (debug disabled): every gated route is removed, so an
+    // unbound client cannot call it even by exact name.
+    let default_router = SynapseService::build_tool_router(false);
+    for route in DEBUG_ONLY_TOOL_ROUTES {
+        let present = default_router.has_route(route);
+        println!("readback=has_route debug=false route={route} after=present:{present}");
+        assert!(
+            !present,
+            "gated debug tool {route} must be absent from the default (non-debug) router surface",
+        );
+    }
+    // The non-synthetic storage tools that share the `storage` facade stay on
+    // the default surface — gating is scoped to the synthetic diagnostics only.
+    assert!(
+        default_router.has_route("storage_gc_once"),
+        "real storage_gc_once must remain on the default surface",
+    );
+    assert!(
+        default_router.has_route("storage_inspect"),
+        "real storage_inspect must remain on the default surface",
+    );
+
+    // Debug surface (SYNAPSE_DEBUG_TOOLS set): every gated route is registered
+    // so FSV/tests can drive it.
+    let debug_router = SynapseService::build_tool_router(true);
+    for route in DEBUG_ONLY_TOOL_ROUTES {
+        let present = debug_router.has_route(route);
+        println!("readback=has_route debug=true route={route} after=present:{present}");
+        assert!(
+            present,
+            "gated debug tool {route} must be present when SYNAPSE_DEBUG_TOOLS is enabled",
+        );
+    }
+    // The real storage tools are unaffected by the debug flag.
+    assert!(debug_router.has_route("storage_gc_once"));
+    assert!(debug_router.has_route("storage_inspect"));
+}
 
 #[test]
 fn explicit_action_target_prefers_window_then_cdp_and_rejects_orphan_cdp() {

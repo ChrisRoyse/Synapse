@@ -117,6 +117,17 @@ impl BrowserDebuggerOperation {
 #[serde(deny_unknown_fields)]
 pub struct BrowserDebuggerParams {
     pub operation: BrowserDebuggerOperation,
+    /// Envelope-level target alias (#1551/#1593). When set, it is folded into the
+    /// selected operation spec's `cdp_target_id` before dispatch, so top-level
+    /// addressing resolves the SAME target as the nested-spec form. Fails closed
+    /// on a conflicting nested value. `reload_bridge` takes no target and rejects
+    /// this alias.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Envelope-level target alias (#1551/#1593). Browser HWND that owns the
+    /// target; folded into the selected operation spec's `window_hwnd`.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub evaluate: Option<BrowserEvaluateParams>,
     #[serde(default)]
@@ -270,7 +281,7 @@ impl SynapseService {
     )]
     pub async fn browser_debugger(
         &self,
-        params: Parameters<BrowserDebuggerParams>,
+        mut params: Parameters<BrowserDebuggerParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserDebuggerResponse>, ErrorData> {
         tracing::info!(
@@ -281,6 +292,10 @@ impl SynapseService {
         );
         validate_browser_debugger_params(&params.0)?;
         self.require_browser_debugger_facade_profile(&request_context, params.0.operation)?;
+        // #1551/#1593: fold the envelope-level cdp_target_id/window_hwnd aliases
+        // into the selected operation spec so top-level addressing resolves the
+        // same target as the nested-spec form (fail-closed on conflict).
+        merge_browser_debugger_top_level_target(&mut params.0)?;
         match params.0.operation {
             BrowserDebuggerOperation::Evaluate => {
                 let delegate = params
@@ -595,6 +610,62 @@ impl SynapseService {
     }
 }
 
+/// Fold `browser_debugger`'s envelope-level `cdp_target_id`/`window_hwnd`
+/// aliases (#1551/#1593) into whichever operation spec is present, reusing the
+/// same [`merge_top_level_target`] resolver every other browser facade uses.
+/// `reload_bridge` reloads the whole CDP bridge rather than a single target, so
+/// it fails closed when a top-level target is supplied.
+fn merge_browser_debugger_top_level_target(
+    params: &mut BrowserDebuggerParams,
+) -> Result<(), ErrorData> {
+    let top_cdp = params.cdp_target_id.clone();
+    let top_hwnd = params.window_hwnd;
+    if top_cdp.is_none() && top_hwnd.is_none() {
+        return Ok(());
+    }
+    let operation = params.operation.as_str();
+    if matches!(params.operation, BrowserDebuggerOperation::ReloadBridge) {
+        return Err(browser_facade_error(
+            BROWSER_DEBUGGER_TOOL,
+            error_codes::TOOL_PARAMS_INVALID,
+            operation,
+            "browser_debugger operation=reload_bridge does not address a single target; reload_bridge reloads the whole CDP bridge",
+            "drop the top-level cdp_target_id/window_hwnd for reload_bridge",
+        ));
+    }
+    macro_rules! fold {
+        ($spec:expr) => {
+            if let Some(spec) = $spec.as_mut() {
+                merge_top_level_target(
+                    BROWSER_DEBUGGER_TOOL,
+                    operation,
+                    top_cdp.as_deref(),
+                    top_hwnd,
+                    &mut spec.cdp_target_id,
+                    &mut spec.window_hwnd,
+                )?;
+            }
+        };
+    }
+    fold!(params.evaluate);
+    fold!(params.console_messages);
+    fold!(params.pdf);
+    fold!(params.file_upload);
+    fold!(params.dialog);
+    fold!(params.add_init_script);
+    fold!(params.add_script_tag);
+    fold!(params.add_style_tag);
+    fold!(params.network);
+    fold!(params.network_har);
+    fold!(params.network_overrides);
+    fold!(params.route);
+    fold!(params.emulate);
+    fold!(params.expose_binding);
+    fold!(params.drag);
+    fold!(params.drop);
+    Ok(())
+}
+
 fn validate_browser_capture_params(params: &BrowserCaptureParams) -> Result<(), ErrorData> {
     validate_exact_operation_spec(
         BROWSER_CAPTURE_TOOL,
@@ -905,5 +976,104 @@ impl SynapseService {
             )),
         )?;
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod merge_top_level_target_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// #1551/#1593: a top-level `cdp_target_id`/`window_hwnd` on
+    /// `browser_debugger` (the telemetry payload that used to fail closed as
+    /// `unknown field`) now deserializes AND is folded into the selected
+    /// operation spec, so envelope addressing resolves the SAME target as the
+    /// nested-spec form. This exercises the real deserialize path end to end.
+    #[test]
+    fn browser_debugger_top_level_target_folds_into_operation_spec_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "evaluate",
+            "cdp_target_id": "TARGET-1593-DBG",
+            "window_hwnd": 0x1234,
+            "evaluate": { "expression": "1 + 1" },
+        }))
+        .expect("top-level target now deserializes on browser_debugger");
+        println!(
+            "readback=before cdp_target_id={:?}",
+            params
+                .evaluate
+                .as_ref()
+                .and_then(|spec| spec.cdp_target_id.clone())
+        );
+        merge_browser_debugger_top_level_target(&mut params)
+            .expect("top-level target folds into the evaluate spec");
+        let spec = params.evaluate.expect("evaluate spec present");
+        println!(
+            "readback=after cdp_target_id={:?} window_hwnd={:?}",
+            spec.cdp_target_id, spec.window_hwnd
+        );
+        assert_eq!(spec.cdp_target_id.as_deref(), Some("TARGET-1593-DBG"));
+        assert_eq!(spec.window_hwnd, Some(0x1234));
+    }
+
+    /// #1551/#1593: a top-level target that conflicts with the value already in
+    /// the operation spec must fail closed rather than silently pick one.
+    #[test]
+    fn browser_debugger_top_level_target_conflict_fails_closed_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "evaluate",
+            "cdp_target_id": "TARGET-1593-DBG",
+            "evaluate": { "expression": "1 + 1", "cdp_target_id": "OTHER-TARGET" },
+        }))
+        .expect("both target locations deserialize");
+        let err = merge_browser_debugger_top_level_target(&mut params)
+            .expect_err("conflicting top-level and nested cdp_target_id must fail closed");
+        let code = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str);
+        println!("readback=conflict code={code:?} message={}", err.message);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+    }
+
+    /// #1593: `reload_bridge` reloads the whole CDP bridge, not a single target,
+    /// so a top-level target alias must fail closed.
+    #[test]
+    fn browser_debugger_reload_bridge_rejects_top_level_target_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "reload_bridge",
+            "cdp_target_id": "TARGET-1593-DBG",
+        }))
+        .expect("reload_bridge with top-level target deserializes");
+        let err = merge_browser_debugger_top_level_target(&mut params)
+            .expect_err("reload_bridge must reject a top-level target");
+        println!("readback=reload_bridge rejection message={}", err.message);
+        assert!(
+            err.message.contains("reload_bridge"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1593: no envelope target supplied is a no-op; the nested spec is
+    /// untouched so the happy path stays identical.
+    #[test]
+    fn browser_debugger_without_top_level_target_is_noop_1593() {
+        let mut params: BrowserDebuggerParams = serde_json::from_value(json!({
+            "operation": "evaluate",
+            "evaluate": { "expression": "1 + 1", "cdp_target_id": "NESTED-ONLY" },
+        }))
+        .expect("nested-only target deserializes");
+        merge_browser_debugger_top_level_target(&mut params)
+            .expect("no envelope target is a no-op");
+        assert_eq!(
+            params
+                .evaluate
+                .expect("evaluate spec present")
+                .cdp_target_id
+                .as_deref(),
+            Some("NESTED-ONLY")
+        );
     }
 }
