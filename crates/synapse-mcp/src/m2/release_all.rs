@@ -423,9 +423,17 @@ mod tests {
             "readback=action_emitter_state tool=release_all edge=in_flight_hold_interrupt elapsed_ms={} response={response:?} after={after:?}",
             elapsed.as_millis()
         );
+        // The contract is that release_all interrupts the in-flight 1_000 ms hold
+        // (see hold_ms above) rather than serializing behind it. The bound is
+        // derived from that signature: a non-interrupting regression waits the
+        // full ~1_000 ms, so any threshold well below 1_000 ms detects it. We use
+        // half the hold (500 ms) instead of 250 ms so a transient async-scheduler
+        // wakeup delay under full-suite parallel load (the #1616 flake class)
+        // cannot fail a correct interrupt, while still unambiguously proving the
+        // hold was not waited out.
         assert!(
-            elapsed < Duration::from_millis(250),
-            "release_all waited behind the in-flight hold instead of interrupting it: {elapsed:?}"
+            elapsed < Duration::from_millis(500),
+            "release_all waited behind the in-flight 1s hold instead of interrupting it: {elapsed:?}"
         );
         assert!(backend.release_observed.load(Ordering::Acquire));
         assert!(after.held_keys.is_empty());

@@ -1353,11 +1353,22 @@ fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
     // 500 ms replace-tolerance window.
     assert!(!status_path.exists());
     assert!(!shell_status_replace_in_flight(&status_path));
-    let started = Instant::now();
-    let missing = read_shell_status_bytes(&status_path);
-    let missing_elapsed = started.elapsed();
+    // The contract is that a genuinely-missing read returns promptly instead of
+    // burning the 500 ms replace-tolerance window. The read is a pure, repeatable
+    // stat, so we take the fastest of three samples and keep the strict 200 ms
+    // bound: a regression that waits the full ~500 ms window fails on ALL three
+    // samples, while a single filesystem/scheduler hiccup under full-suite load
+    // (the #1616 flake class) is filtered out. The error assertions below still
+    // run against the last read.
+    let mut missing = read_shell_status_bytes(&status_path);
+    let mut missing_elapsed = Duration::MAX;
+    for _ in 0..3 {
+        let started = Instant::now();
+        missing = read_shell_status_bytes(&status_path);
+        missing_elapsed = missing_elapsed.min(started.elapsed());
+    }
     println!(
-        "readback=read_shell_status_bytes edge=genuine_missing after=err:{} elapsed_ms:{}",
+        "readback=read_shell_status_bytes edge=genuine_missing after=err:{} best_elapsed_ms:{}",
         missing.is_err(),
         missing_elapsed.as_millis()
     );
@@ -1369,7 +1380,7 @@ fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
     );
     assert!(
         missing_elapsed < Duration::from_millis(200),
-        "genuine missing read must return promptly, took {missing_elapsed:?}"
+        "genuine missing read must return promptly, best of three took {missing_elapsed:?}"
     );
 
     // Arm 2 — mid-replace window: target absent but a writer's unique staging
@@ -3130,13 +3141,28 @@ async fn issue1604_inline_fast_command_reports_exit_promptly() {
 #[cfg(windows)]
 #[tokio::test]
 async fn issue1604_inline_timeout_bounds_elapsed_time() {
-    let started = Instant::now();
     let mut child = TokioCommand::new("powershell.exe")
         .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|error| panic!("spawn sleeper child: {error}"));
+    // Assert on the code's OWN kernel-derived verdicts rather than a test-side
+    // stopwatch. The #1616 flake came from bounding total elapsed time: even
+    // measured after spawn, `wait_shell_child`'s elapsed is dominated by the
+    // process-tree TERMINATION it performs after the cap fires (taskkill spawns
+    // plus an up-to-5 s exit-wait poll), which balloons to multiple seconds under
+    // full-suite CPU saturation (observed 4411 ms) yet says nothing about whether
+    // the 200 ms cap worked. The real proof the cap bounded execution is that the
+    // child was killed rather than allowed to reach its 5 s natural exit:
+    //   - `timed_out == true`  — the cap fired.
+    //   - `exit_code == None`  — the child was terminated by the cap, not run to
+    //     completion (a broken cap lets `Start-Sleep -Seconds 5` finish and
+    //     returns `Some(0)` with `timed_out == false`, as the sibling exit-code
+    //     tests pin).
+    // These are load-independent. The wall bound is kept only as a generous
+    // deadlock backstop (a hung wait would exceed any child-exit-driven time).
+    let started = Instant::now();
     let (exit_code, timed_out) = wait_shell_child(&mut child, 200)
         .await
         .unwrap_or_else(|error| panic!("wait sleeper: {error:?}"));
@@ -3149,9 +3175,13 @@ async fn issue1604_inline_timeout_bounds_elapsed_time() {
         timed_out,
         "a 5 s process under a 200 ms cap must be timed_out"
     );
+    assert_eq!(
+        exit_code, None,
+        "a cap-terminated child must have no natural exit code; Some(_) means the 200 ms cap failed to bound the process"
+    );
     assert!(
-        elapsed < Duration::from_secs(4),
-        "timeout_ms must bound elapsed time; the 5 s process ran {} ms",
+        elapsed < Duration::from_secs(20),
+        "wait_shell_child must return in bounded time (deadlock backstop); took {} ms",
         elapsed.as_millis()
     );
 }
