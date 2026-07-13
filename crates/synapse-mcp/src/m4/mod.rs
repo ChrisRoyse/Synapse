@@ -8885,12 +8885,19 @@ fn reconcile_shell_job_remote_exit_marker(
     running: bool,
     trigger: &'static str,
 ) -> Result<bool, ErrorData> {
-    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
-        || job.cancel_requested
-        || job.timed_out
-    {
+    // Exit-evidence wins: a captured SYNAPSE_REMOTE_EXIT_V1 marker overrides a
+    // *local* budget timeout. The scenario (#1604): the remote process exits and
+    // emits its exit marker in a fraction of a second, but the local ssh.exe
+    // wrapper keeps its control connection / pipe open past durable_timeout_ms
+    // and is force-terminated by `wait_shell_job_child`. That local timeout must
+    // not be allowed to shadow the captured remote exit — the job's verdict is
+    // the remote exit; the local budget overrun is downgraded to a warning
+    // (`downgrade_local_timeout_after_remote_exit`). A deliberate `cancel` is
+    // still honored as an explicit operator verdict and is not overridden here.
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH || job.cancel_requested {
         return Ok(false);
     }
+    let overriding_local_timeout = job.timed_out;
     let stderr_prefix =
         read_file_prefix_lossy(&paths.stderr_path, SHELL_REMOTE_METADATA_PREFIX_BYTES)?;
     let stderr_tail = tail_file_lossy(&paths.stderr_path, SHELL_JOB_TAIL_DEFAULT_BYTES as usize)?;
@@ -8923,7 +8930,15 @@ fn reconcile_shell_job_remote_exit_marker(
         );
         return Ok(false);
     }
-    if metadata.exit_code != 0 {
+    // A clean remote exit (code 0) with a live/mismatched local verdict is the
+    // ordinary "already gone, local stale" reconciliation. A *non-zero* remote
+    // exit is only reconciled when it is correcting a stale LOCAL timeout: in
+    // that case exit-evidence (the real remote failure code) is strictly more
+    // truthful than "timed_out", so it wins. Outside a local timeout a non-zero
+    // local verdict already reflects the failure honestly and is left untouched
+    // so we never manufacture an "already gone" success out of a remote failure
+    // (regression guard for issue1274_remote_exit_marker_nonzero_*).
+    if metadata.exit_code != 0 && !overriding_local_timeout {
         return Ok(false);
     }
     if !running && job.status == "ok" && job.exit_code == Some(0) {
@@ -8949,7 +8964,39 @@ fn reconcile_shell_job_remote_exit_marker(
         &remaining_process_ids,
         Some(metadata.exit_code),
     );
+    if overriding_local_timeout {
+        downgrade_local_timeout_after_remote_exit(job, trigger, metadata.exit_code);
+    }
     Ok(true)
+}
+
+/// Downgrade a local `timed_out` verdict to a structured warning once a matching
+/// remote exit marker has proven the remote process actually finished (#1604).
+///
+/// Exit-evidence is the verdict: `timed_out` is cleared and the caller-facing
+/// `ACTION_BUDGET_EXPIRED` error code is dropped (the local budget overrun is no
+/// longer the outcome). The overrun is preserved verbatim as detection evidence
+/// so the loud, rich context — that the local ssh wrapper outran its budget
+/// after the remote had already exited — is never silently swallowed.
+fn downgrade_local_timeout_after_remote_exit(
+    job: &mut ActRunShellJobStatus,
+    trigger: &'static str,
+    remote_exit_code: i32,
+) {
+    if !job.timed_out {
+        return;
+    }
+    let budget_ms = job.timeout_ms.unwrap_or_default();
+    job.timed_out = false;
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!(
+            "local_timeout_overridden_by_remote_exit_marker:trigger={trigger}:budget_ms={budget_ms}:remote_exit_code={remote_exit_code}"
+        ),
+    );
+    if job.error_code.as_deref() == Some(error_codes::ACTION_BUDGET_EXPIRED) {
+        job.error_code = None;
+    }
 }
 
 fn wait_for_shell_job_remote_metadata(
@@ -10231,10 +10278,12 @@ async fn wait_shell_job_child(
                             terminate_shell_job_process_tree(pid)
                         })
                         .await
-                        .unwrap_or_else(|join_error| ShellJobTerminationReadback {
-                            attempted: false,
-                            status: format!("termination_task_join_failed:{join_error}"),
-                            remaining_process_ids: Vec::new(),
+                        .unwrap_or_else(|join_error| {
+                            ShellJobTerminationReadback {
+                                attempted: false,
+                                status: format!("termination_task_join_failed:{join_error}"),
+                                remaining_process_ids: Vec::new(),
+                            }
                         });
                         tracing::warn!(
                             code = "M4_ACT_RUN_SHELL_JOB_TIMEOUT_TREE_TERMINATED",
@@ -11464,9 +11513,29 @@ async fn wait_shell_child(
     child: &mut tokio::process::Child,
     timeout_ms: u64,
 ) -> Result<(Option<i32>, bool), ErrorData> {
-    let wait_result = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
+    let budget = Duration::from_millis(timeout_ms);
+    // Source of truth for `timed_out`, at parity with the durable path (#1588):
+    // the kernel-recorded process runtime, captured BEFORE the wait so it stays
+    // readable after tokio reaps the child. `tokio::time::timeout` polls the
+    // inner future first and delivers a past-deadline self-exit as `Ok(exit)`,
+    // and under runtime starvation this task may be dispatched long after both
+    // the deadline and the child's exit — so neither the timer branch nor any
+    // wall clock this task samples can classify correctly on its own. Only the
+    // OS runtime reveals whether the child truly outran `timeout_ms`.
+    let runtime_probe = ChildRuntimeProbe::capture(child);
+    let started = Instant::now();
+    let child_outran_budget = || {
+        runtime_probe
+            .as_ref()
+            .and_then(ChildRuntimeProbe::runtime)
+            .map_or(started.elapsed() >= budget, |runtime| runtime >= budget)
+    };
+    let wait_result = tokio::time::timeout(budget, child.wait()).await;
     let result = match wait_result {
-        Ok(Ok(status)) => (status.code(), false),
+        // The child exited (possibly just after a late-delivered deadline).
+        // Exit-evidence wins: return its real code, and flag `timed_out` only if
+        // the OS runtime confirms it actually ran past the cap.
+        Ok(Ok(status)) => (status.code(), child_outran_budget()),
         Ok(Err(error)) => {
             return Err(shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -11478,6 +11547,13 @@ async fn wait_shell_child(
             ));
         }
         Err(_elapsed) => {
+            // Deadline fired with the child still pending at poll time. It may
+            // have self-exited in the gap before we terminate — grab that exit
+            // evidence with a non-blocking `try_wait` so a genuine exit code is
+            // never discarded in favor of a manufactured timeout verdict.
+            if let Ok(Some(status)) = child.try_wait() {
+                return Ok((status.code(), child_outran_budget()));
+            }
             if let Some(pid) = child.id() {
                 // Off-load the blocking process-tree termination (taskkill spawns
                 // + a std::thread::sleep exit-wait + a full-system sysinfo scan)
@@ -11485,15 +11561,14 @@ async fn wait_shell_child(
                 // shell timeouts starve the runtime and stall each other's
                 // timers, hanging the caller for far longer than timeout_ms
                 // (root cause of the parallel-scp hang, #1589).
-                let termination = tokio::task::spawn_blocking(move || {
-                    terminate_shell_job_process_tree(pid)
-                })
-                .await
-                .unwrap_or_else(|join_error| ShellJobTerminationReadback {
-                    attempted: false,
-                    status: format!("termination_task_join_failed:{join_error}"),
-                    remaining_process_ids: Vec::new(),
-                });
+                let termination =
+                    tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(pid))
+                        .await
+                        .unwrap_or_else(|join_error| ShellJobTerminationReadback {
+                            attempted: false,
+                            status: format!("termination_task_join_failed:{join_error}"),
+                            remaining_process_ids: Vec::new(),
+                        });
                 tracing::warn!(
                     code = "M4_ACT_RUN_SHELL_TIMEOUT_TREE_TERMINATED",
                     pid,

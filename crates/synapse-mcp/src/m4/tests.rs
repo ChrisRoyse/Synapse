@@ -2816,6 +2816,238 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
     );
 }
 
+// #1604: a durable SSH job whose remote process exited 0 in a fraction of a
+// second (SYNAPSE_REMOTE_EXIT_V1 emitted) but whose LOCAL ssh.exe wrapper outran
+// durable_timeout_ms and was force-terminated must NOT be reported as timed_out.
+// Exit-evidence wins: the captured remote exit is the verdict, the local budget
+// overrun is downgraded to a warning, and the ACTION_BUDGET_EXPIRED error clears.
+#[test]
+fn issue1604_local_timeout_does_not_shadow_remote_exit_zero() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+    let paths = temp_shell_job_paths(&temp);
+    let mut status = issue1277_ssh_status("issue1604-exit-zero", "timed_out", &paths);
+    // Simulate the durable timeout verdict produced by `wait_shell_job_child`
+    // when the local ssh wrapper blew its budget while the remote was already gone.
+    status.timeout_ms = Some(60_000);
+    status.timed_out = true;
+    status.exit_code = None;
+    status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
+    status.error_message = Some("durable job timeout_ms cap expired".to_owned());
+    let stderr = "\
+SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1604-exit-zero pid=1005689 pgid=1005689 sid=1005689
+SYNAPSE_REMOTE_EXIT_V1 job_id=issue1604-exit-zero pid=1005689 pgid=1005689 exit_code=0
+";
+    std::fs::write(&paths.stderr_path, stderr)
+        .unwrap_or_else(|error| panic!("write remote exit stderr: {error}"));
+    refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths)
+        .unwrap_or_else(|error| panic!("remote process marker should read: {error}"));
+
+    println!(
+        "readback=act_run_shell_status issue=1604 edge=timeout_over_exit_zero BEFORE status:{} exit_code:{:?} timed_out:{} error_code:{:?} cleanup:{}",
+        status.status,
+        status.exit_code,
+        status.timed_out,
+        status.error_code,
+        status.remote_process_scope.remote_cleanup_status
+    );
+
+    let reconciled =
+        reconcile_shell_job_remote_exit_marker(&mut status, &paths, false, "regression_issue1604")
+            .unwrap_or_else(|error| panic!("remote exit marker should read: {error}"));
+
+    println!(
+        "readback=act_run_shell_status issue=1604 edge=timeout_over_exit_zero AFTER status:{} exit_code:{:?} timed_out:{} error_code:{:?} cleanup:{} reconciled:{reconciled}",
+        status.status,
+        status.exit_code,
+        status.timed_out,
+        status.error_code,
+        status.remote_process_scope.remote_cleanup_status
+    );
+
+    assert!(
+        reconciled,
+        "the exit marker must override the local timeout"
+    );
+    assert_eq!(status.status, SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE);
+    assert_eq!(status.exit_code, Some(0));
+    assert!(
+        !status.timed_out,
+        "a captured remote exit must clear the stale local timeout verdict"
+    );
+    assert_ne!(
+        status.error_code.as_deref(),
+        Some(error_codes::ACTION_BUDGET_EXPIRED),
+        "ACTION_BUDGET_EXPIRED must not survive a captured remote exit"
+    );
+    assert!(status.remote_process_scope.remote_cleanup_verified);
+    assert_eq!(
+        status.remote_process_scope.remote_cleanup_status,
+        SHELL_REMOTE_CLEANUP_ALREADY_GONE
+    );
+    assert!(
+        status
+            .remote_process_scope
+            .detection_evidence
+            .iter()
+            .any(|evidence| evidence.starts_with("local_timeout_overridden_by_remote_exit_marker:")),
+        "the downgraded local budget overrun must be preserved as structured warning evidence: {:?}",
+        status.remote_process_scope.detection_evidence
+    );
+}
+
+// #1604 edge: exit code nonzero + a stale local timeout. Exit-evidence is still
+// more truthful than "timed_out" — the verdict becomes the real remote failure
+// code, never a budget timeout, and the failure is not hidden.
+#[test]
+fn issue1604_local_timeout_does_not_shadow_remote_exit_nonzero() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+    let paths = temp_shell_job_paths(&temp);
+    let mut status = issue1277_ssh_status("issue1604-exit-nonzero", "timed_out", &paths);
+    status.timeout_ms = Some(60_000);
+    status.timed_out = true;
+    status.exit_code = None;
+    status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
+    let stderr = "\
+SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1604-exit-nonzero pid=1005689 pgid=1005689 sid=1005689
+SYNAPSE_REMOTE_EXIT_V1 job_id=issue1604-exit-nonzero pid=1005689 pgid=1005689 exit_code=7
+";
+    std::fs::write(&paths.stderr_path, stderr)
+        .unwrap_or_else(|error| panic!("write remote exit stderr: {error}"));
+    refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths)
+        .unwrap_or_else(|error| panic!("remote process marker should read: {error}"));
+
+    let reconciled =
+        reconcile_shell_job_remote_exit_marker(&mut status, &paths, false, "regression_issue1604")
+            .unwrap_or_else(|error| panic!("remote exit marker should read: {error}"));
+
+    println!(
+        "readback=act_run_shell_status issue=1604 edge=timeout_over_exit_nonzero AFTER status:{} exit_code:{:?} timed_out:{} error_code:{:?} reconciled:{reconciled}",
+        status.status, status.exit_code, status.timed_out, status.error_code
+    );
+
+    assert!(reconciled);
+    assert_eq!(status.exit_code, Some(7));
+    assert!(!status.timed_out);
+    assert_ne!(
+        status.error_code.as_deref(),
+        Some(error_codes::ACTION_BUDGET_EXPIRED)
+    );
+}
+
+// #1604 edge: the local wrapper timed out but the connection dropped before any
+// SYNAPSE_REMOTE_EXIT_V1 marker was captured. With no exit-evidence, the loud
+// timed_out verdict MUST stand — we never invent a success from an absent marker.
+#[test]
+fn issue1604_absent_remote_exit_marker_keeps_timeout_verdict() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+    let paths = temp_shell_job_paths(&temp);
+    let mut status = issue1277_ssh_status("issue1604-no-marker", "timed_out", &paths);
+    status.timeout_ms = Some(60_000);
+    status.timed_out = true;
+    status.exit_code = None;
+    status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
+    // Process marker present (tracked) but NO exit marker: transport dropped
+    // before the remote could report its exit.
+    let stderr = "\
+SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1604-no-marker pid=1005689 pgid=1005689 sid=1005689
+client_loop: send disconnect: Broken pipe
+";
+    std::fs::write(&paths.stderr_path, stderr)
+        .unwrap_or_else(|error| panic!("write stderr: {error}"));
+    refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths)
+        .unwrap_or_else(|error| panic!("remote process marker should read: {error}"));
+
+    let reconciled =
+        reconcile_shell_job_remote_exit_marker(&mut status, &paths, false, "regression_issue1604")
+            .unwrap_or_else(|error| panic!("reconcile should not error: {error}"));
+
+    println!(
+        "readback=act_run_shell_status issue=1604 edge=no_marker AFTER status:{} timed_out:{} reconciled:{reconciled}",
+        status.status, status.timed_out
+    );
+
+    assert!(!reconciled, "no exit marker => no override");
+    assert!(
+        status.timed_out,
+        "the timeout verdict must stand without exit-evidence"
+    );
+    assert_eq!(
+        status.error_code.as_deref(),
+        Some(error_codes::ACTION_BUDGET_EXPIRED)
+    );
+}
+
+// #1604 inline parity (#1588): a fast local command must report its real exit
+// code promptly and never be flagged timed_out, even under a large timeout_ms.
+#[cfg(windows)]
+#[tokio::test]
+async fn issue1604_inline_fast_command_reports_exit_promptly() {
+    let mut zero = TokioCommand::new("cmd.exe")
+        .args(["/c", "exit 0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn zero-exit child: {error}"));
+    let (zero_exit, zero_timed_out) = wait_shell_child(&mut zero, 60_000)
+        .await
+        .unwrap_or_else(|error| panic!("wait zero-exit: {error:?}"));
+    println!(
+        "readback=wait_shell_child issue=1604 edge=fast_exit_zero after=exit_code:{zero_exit:?} timed_out:{zero_timed_out}"
+    );
+    assert_eq!(zero_exit, Some(0));
+    assert!(!zero_timed_out, "a fast clean exit is never timed_out");
+
+    // Zero-duration nonzero exit: exit-evidence (code 3) preserved, not timed_out.
+    let mut nonzero = TokioCommand::new("cmd.exe")
+        .args(["/c", "exit 3"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn nonzero-exit child: {error}"));
+    let (nonzero_exit, nonzero_timed_out) = wait_shell_child(&mut nonzero, 60_000)
+        .await
+        .unwrap_or_else(|error| panic!("wait nonzero-exit: {error:?}"));
+    println!(
+        "readback=wait_shell_child issue=1604 edge=fast_exit_nonzero after=exit_code:{nonzero_exit:?} timed_out:{nonzero_timed_out}"
+    );
+    assert_eq!(nonzero_exit, Some(3));
+    assert!(!nonzero_timed_out);
+}
+
+// #1604 inline: timeout_ms must bound elapsed time. A real 5 s process under a
+// 200 ms cap must return timed_out well before its natural exit.
+#[cfg(windows)]
+#[tokio::test]
+async fn issue1604_inline_timeout_bounds_elapsed_time() {
+    let started = Instant::now();
+    let mut child = TokioCommand::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn sleeper child: {error}"));
+    let (exit_code, timed_out) = wait_shell_child(&mut child, 200)
+        .await
+        .unwrap_or_else(|error| panic!("wait sleeper: {error:?}"));
+    let elapsed = started.elapsed();
+    println!(
+        "readback=wait_shell_child issue=1604 edge=timeout_bounds after=exit_code:{exit_code:?} timed_out:{timed_out} elapsed_ms:{}",
+        elapsed.as_millis()
+    );
+    assert!(
+        timed_out,
+        "a 5 s process under a 200 ms cap must be timed_out"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "timeout_ms must bound elapsed time; the 5 s process ran {} ms",
+        elapsed.as_millis()
+    );
+}
+
 #[test]
 fn issue1283_bash_login_errexit_exit_one_surfaces_specific_hint() {
     let temp = tempfile::TempDir::new()
@@ -5185,7 +5417,10 @@ async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation
     println!(
         "readback=wait_shell_job_child edge=within_budget_starved_monitor after=exit_code:{within_exit:?} timed_out:{within_timed_out} wait_error:{within_err:?}"
     );
-    assert!(within_err.is_none(), "no wait error expected: {within_err:?}");
+    assert!(
+        within_err.is_none(),
+        "no wait error expected: {within_err:?}"
+    );
     assert!(
         !within_timed_out,
         "a child that finished within its 1000 ms cap must not be flagged timed_out even when the monitor was starved 1500 ms (exit_code={within_exit:?})"
