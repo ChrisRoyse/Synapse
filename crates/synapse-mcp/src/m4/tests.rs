@@ -5185,7 +5185,10 @@ async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation
     println!(
         "readback=wait_shell_job_child edge=within_budget_starved_monitor after=exit_code:{within_exit:?} timed_out:{within_timed_out} wait_error:{within_err:?}"
     );
-    assert!(within_err.is_none(), "no wait error expected: {within_err:?}");
+    assert!(
+        within_err.is_none(),
+        "no wait error expected: {within_err:?}"
+    );
     assert!(
         !within_timed_out,
         "a child that finished within its 1000 ms cap must not be flagged timed_out even when the monitor was starved 1500 ms (exit_code={within_exit:?})"

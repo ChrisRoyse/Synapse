@@ -10231,10 +10231,12 @@ async fn wait_shell_job_child(
                             terminate_shell_job_process_tree(pid)
                         })
                         .await
-                        .unwrap_or_else(|join_error| ShellJobTerminationReadback {
-                            attempted: false,
-                            status: format!("termination_task_join_failed:{join_error}"),
-                            remaining_process_ids: Vec::new(),
+                        .unwrap_or_else(|join_error| {
+                            ShellJobTerminationReadback {
+                                attempted: false,
+                                status: format!("termination_task_join_failed:{join_error}"),
+                                remaining_process_ids: Vec::new(),
+                            }
                         });
                         tracing::warn!(
                             code = "M4_ACT_RUN_SHELL_JOB_TIMEOUT_TREE_TERMINATED",
@@ -11485,15 +11487,14 @@ async fn wait_shell_child(
                 // shell timeouts starve the runtime and stall each other's
                 // timers, hanging the caller for far longer than timeout_ms
                 // (root cause of the parallel-scp hang, #1589).
-                let termination = tokio::task::spawn_blocking(move || {
-                    terminate_shell_job_process_tree(pid)
-                })
-                .await
-                .unwrap_or_else(|join_error| ShellJobTerminationReadback {
-                    attempted: false,
-                    status: format!("termination_task_join_failed:{join_error}"),
-                    remaining_process_ids: Vec::new(),
-                });
+                let termination =
+                    tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(pid))
+                        .await
+                        .unwrap_or_else(|join_error| ShellJobTerminationReadback {
+                            attempted: false,
+                            status: format!("termination_task_join_failed:{join_error}"),
+                            remaining_process_ids: Vec::new(),
+                        });
                 tracing::warn!(
                     code = "M4_ACT_RUN_SHELL_TIMEOUT_TREE_TERMINATED",
                     pid,

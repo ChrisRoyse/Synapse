@@ -43,9 +43,26 @@ if [ "$needs_gate" -eq 0 ]; then
   exit 0
 fi
 
-echo "pre-push: running local clippy gate (cargo clippy --workspace --all-targets) ..."
 log_dir=$(git rev-parse --git-path synapse-pre-push-logs 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")
 mkdir -p "$log_dir"
+
+# Formatting gate: the toolchain version is pinned in rust-toolchain.toml, and
+# `cargo fmt` invoked here respects that pin, so this catches fmt drift (#1603)
+# before it can be swept into an unrelated PR. --check makes no edits.
+echo "pre-push: running local rustfmt gate (cargo fmt --all --check) ..."
+fmt_log="$log_dir/fmt-$(date +%Y%m%dT%H%M%S)-$$.log"
+if ! cargo fmt --all --check >"$fmt_log" 2>&1; then
+  echo ""
+  echo "pre-push: BLOCKED — rustfmt gate failed (workspace is not fmt-clean under"
+  echo "          the pinned toolchain). Run 'cargo fmt --all' and re-push."
+  echo "pre-push: diff follows (full log: $fmt_log):"
+  sed -n '1,120p' "$fmt_log" || true
+  exit 1
+fi
+rm -f "$fmt_log"
+echo "pre-push: rustfmt gate green."
+
+echo "pre-push: running local clippy gate (cargo clippy --workspace --all-targets) ..."
 log_path="$log_dir/clippy-$(date +%Y%m%dT%H%M%S)-$$.log"
 
 if cargo clippy --workspace --all-targets >"$log_path" 2>&1; then

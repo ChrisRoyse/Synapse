@@ -1,6 +1,10 @@
 [toolchain]
-# Pin the toolchain channel so `cargo fmt`/`cargo clippy` are reproducible across
-# contributors (this repo has no CI to enforce a version). `rustfmt` + `clippy`
-# are declared so a fresh checkout has the components the workspace lints require.
-channel = "stable"
+# Pin an EXACT toolchain version so `cargo fmt`/`cargo clippy` are reproducible
+# across contributors (this repo has no CI to enforce a version). An unversioned
+# `stable` does not achieve this: each stable release formats slightly differently,
+# so `cargo fmt` on a newer stable produces spurious diffs on already-clean code
+# (see #1603). Bump this deliberately and re-run `cargo fmt --all` in the same PR.
+# rustup auto-installs this version on a fresh checkout; `rustfmt` + `clippy` are
+# declared so it also has the components the workspace lints require.
+channel = "1.96.1"
 components = ["rustfmt", "clippy"]
