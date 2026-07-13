@@ -8001,28 +8001,54 @@ fn read_status_file_share_delete(path: &Path) -> io::Result<Vec<u8>> {
 fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
     // ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32.
     const TRANSIENT_OPEN_CODES: [i32; 2] = [5, 32];
-    let started = Instant::now();
-    loop {
+    // Retry by ATTEMPT COUNT, not wall-clock — the same lesson the writer's
+    // `commit_shell_job_status_file` already learned (#1568) and the reader had
+    // not: under heavy CPU contention (a full parallel test suite, an AV sweep)
+    // a wall-clock budget is spent while this thread is descheduled, so a 500 ms
+    // window can yield only one or two real open attempts before "expiring" and
+    // surfacing a spurious transient error to a status poll, cleanup scan, or
+    // dashboard read (the confirmed class behind the #1608 multiwriter flake). A
+    // fixed attempt count guarantees that many real retries regardless of
+    // scheduling, with exponential backoff so a transient AV/indexer lock or an
+    // in-flight atomic replace has escalating time to clear. Bounds mirror the
+    // writer's move-retry: ~1s worst case, dominated by short early retries.
+    const MAX_ATTEMPTS: u32 = 24;
+    const BACKOFF_START_MS: u64 = 1;
+    const BACKOFF_CAP_MS: u64 = 50;
+    let mut backoff_ms = BACKOFF_START_MS;
+    for attempt in 1..=MAX_ATTEMPTS {
         match read_status_file_share_delete(path) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
-                let within_window = started.elapsed() < Duration::from_millis(500);
                 let transient_open = error
                     .raw_os_error()
                     .is_some_and(|code| TRANSIENT_OPEN_CODES.contains(&code));
-                // A NOT_FOUND only counts as a transient replace window while a
-                // writer's unique staging file is still on disk; otherwise the
-                // job is genuinely absent and the error is returned as-is.
-                let mid_replace =
-                    error.kind() == io::ErrorKind::NotFound && shell_status_replace_in_flight(path);
-                if within_window && (transient_open || mid_replace) {
-                    std::thread::sleep(Duration::from_millis(2));
+                // NOT_FOUND is overloaded: it is the legitimate "no such job"
+                // signal, but it also fires transiently mid-replace when
+                // `MoveFileExW(REPLACE_EXISTING)` has momentarily unlinked the
+                // destination. It is retryable while a replace is plausibly in
+                // flight, detected two ways so the check cannot race false at the
+                // exact instant the replace lands (#1608): a writer's unique
+                // `<name>.tmp.*` staging sibling is still on disk, OR the
+                // destination itself now exists again — the tell that a
+                // `MoveFileExW` completed between our failed open and this check
+                // (its staging file already renamed away), so the very next open
+                // will succeed. A genuinely-absent job matches neither predicate
+                // and returns immediately with no added latency.
+                let mid_replace = error.kind() == io::ErrorKind::NotFound
+                    && (shell_status_replace_in_flight(path) || path.try_exists().unwrap_or(false));
+                if attempt < MAX_ATTEMPTS && (transient_open || mid_replace) {
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = backoff_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
                     continue;
                 }
                 return Err(error);
             }
         }
     }
+    // Unreachable: the final iteration returns `Err(error)` because
+    // `attempt < MAX_ATTEMPTS` is false. Kept so the function has a total return.
+    read_status_file_share_delete(path)
 }
 
 #[cfg(not(windows))]

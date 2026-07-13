@@ -1617,6 +1617,114 @@ fn shell_status_concurrent_multiwriter_never_corrupts() {
     );
 }
 
+/// Deterministic regression guard for #1608: the durable status reader must ride
+/// out a *sustained* transient open failure — an AV/indexer sweep or a peer
+/// handle briefly holding `status.json` without share-read — instead of
+/// surfacing a spurious error to a status poll, cleanup scan, or dashboard read.
+///
+/// Before this fix `read_shell_status_bytes` retried on a WALL-CLOCK 500 ms
+/// budget; under scheduler starvation (a full parallel test suite) that window
+/// could expire after only one or two real open attempts, exactly the class
+/// behind the flaky `shell_status_concurrent_multiwriter_never_corrupts` failure
+/// (a reader observing a transient error). The reader now retries by ATTEMPT
+/// COUNT like the writer's move-retry.
+///
+/// This reproduces the transient condition deterministically: a peer thread
+/// holds the status file open with a NO-SHARING handle, so every concurrent open
+/// fails with `ERROR_SHARING_VIOLATION` (32). The lock is held for **650 ms** —
+/// deliberately longer than the old 500 ms wall-clock budget — then released.
+/// The old reader would give up at 500 ms and fail the read; the attempt-count
+/// reader rides it out and returns the whole status. (Windows-only: the POSIX
+/// reader path uses atomic `rename(2)` and never sees a transient open error.)
+#[cfg(windows)]
+#[test]
+fn shell_status_reader_rides_out_sustained_transient_lock() {
+    use std::{
+        os::windows::fs::OpenOptionsExt,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
+
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    let params = ActRunShellStartParams {
+        command: "powershell.exe".to_owned(),
+        args: vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "Write-Output issue1608-reader".to_owned(),
+        ],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some("issue1608-reader".to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&params.command, &params.args),
+        matched_pattern: "__any_permitted__".to_owned(),
+    };
+    let request_sha = run_shell_start_request_sha256(&params)
+        .unwrap_or_else(|error| panic!("start request should hash: {error}"));
+    // Seed a complete status through the production writer so the reader has a
+    // whole file to recover once the transient lock clears.
+    let base = shell_job_status_record(
+        "issue1608-reader",
+        "running",
+        &params,
+        &paths,
+        &request_sha,
+        &authorization,
+        "2026-07-12T00:00:00Z".to_owned(),
+        Some(4242),
+        None,
+    );
+    write_shell_job_status(&paths.status_path, &base)
+        .unwrap_or_else(|error| panic!("seed status should write: {error}"));
+
+    // Deny FILE_SHARE_READ | WRITE | DELETE: while this handle is open, every
+    // concurrent open of `status.json` fails with ERROR_SHARING_VIOLATION.
+    let barrier = Arc::new(Barrier::new(2));
+    let holder_barrier = Arc::clone(&barrier);
+    let holder_path = paths.status_path.clone();
+    let holder = thread::spawn(move || {
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&holder_path)
+            .unwrap_or_else(|error| panic!("peer should exclusively open status: {error}"));
+        holder_barrier.wait();
+        // Longer than the old 500 ms wall-clock budget so the pre-fix reader
+        // would give up; well within the attempt-count budget so the fixed
+        // reader recovers.
+        thread::sleep(Duration::from_millis(650));
+        drop(locked);
+    });
+
+    barrier.wait();
+    let status =
+        read_shell_job_status(&paths.status_path, "issue1608-reader").unwrap_or_else(|error| {
+            panic!("reader must ride out a sustained transient lock, not fail: {error}")
+        });
+    holder
+        .join()
+        .unwrap_or_else(|error| panic!("holder thread should join: {error:?}"));
+
+    println!(
+        "readback=act_run_shell_status edge=sustained_transient_lock after=recovered_status:{status:?}"
+    );
+    assert_eq!(status.job_id, "issue1608-reader");
+    assert_eq!(status.status, "running");
+}
+
 #[test]
 fn shell_job_reconciliation_preserves_monitor_terminal_status() {
     let temp = tempfile::TempDir::new()
@@ -4651,6 +4759,12 @@ fn act_run_shell_zero_timeout_still_fails_validation() {
 #[cfg(windows)]
 #[tokio::test]
 async fn shell_long_timeout_returns_durable_job_handle() {
+    // Hermetic durable-job root (#1610): this test backgrounds a durable job
+    // and polls its status, so without an isolated root a sibling shell test's
+    // session cleanup / reap / enumeration of the shared process-global root
+    // (`%LOCALAPPDATA%\Synapse\shell-jobs`) can reconcile or race this job dir
+    // under parallel `m4` runs. The `ShellJobRootGuard` gives it a private root.
+    let _root_guard = ShellJobRootGuard::new();
     let inline_await_limit_ms = 1;
     let timeout_ms = DEFAULT_SHELL_TIMEOUT_MS;
     let params = shell_params(
@@ -4796,6 +4910,10 @@ async fn shell_inline_mode_waits_past_inline_await_limit() {
 #[cfg(windows)]
 #[tokio::test]
 async fn shell_inline_timeout_above_client_budget_returns_durable_job_handle() {
+    // Hermetic durable-job root (#1610): backgrounds a durable job and awaits
+    // its completion, so isolate it from sibling shell tests sharing the
+    // process-global root under parallel `m4` runs.
+    let _root_guard = ShellJobRootGuard::new();
     let mut params = shell_params(
         "cmd.exe",
         vec!["/c", "echo inline-client-budget-handoff-ok"],
@@ -5116,6 +5234,12 @@ fn reap_stale_shell_jobs_honors_ttl_boundary() {
 #[cfg(windows)]
 #[tokio::test]
 async fn shell_auto_background_uses_explicit_durable_timeout() {
+    // Hermetic durable-job root (#1610): this test backgrounds a durable job
+    // and awaits its completion on the process-global shell-jobs root. Under a
+    // parallel `m4` run a sibling shell test's session cleanup / reaper /
+    // enumeration of that shared root could reconcile or race this job dir,
+    // flipping its observed status — the confirmed root cause of the flake.
+    let _root_guard = ShellJobRootGuard::new();
     let inline_await_limit_ms = 1;
     let mut params = shell_params(
         "cmd.exe",
@@ -5147,6 +5271,10 @@ async fn shell_auto_background_uses_explicit_durable_timeout() {
 #[cfg(windows)]
 #[tokio::test]
 async fn shell_durable_mode_returns_job_without_inline_limit() {
+    // Hermetic durable-job root (#1610): same isolation as its sibling durable
+    // tests so a parallel shell test cannot reconcile or race this job dir on
+    // the shared process-global root.
+    let _root_guard = ShellJobRootGuard::new();
     let inline_await_limit_ms = DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS;
     let mut params = shell_params(
         "cmd.exe",
