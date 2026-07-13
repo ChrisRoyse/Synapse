@@ -166,6 +166,34 @@ async fn health_and_action_tools_appear_in_tools_list_with_schema() -> anyhow::R
             .as_array()
             .is_some_and(|tools| tools.contains(&Value::String("act_run_shell_status".to_owned())))
     );
+    // #1612: health's reported tool surface must be *identical* to the surface
+    // actually served by tools/list for the same session. Both are derived from
+    // the single `tools_for_session_profile` source of truth, so any future
+    // divergence (e.g. a reintroduced hand-maintained parallel list) fails here.
+    let served_names = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    let health_names = health["tool_names"]
+        .as_array()
+        .context("health tool_names array missing")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        served_names,
+        health_names,
+        "health tool_names must equal the served tools/list surface; served-only={:?} health-only={:?}",
+        served_names.difference(&health_names).collect::<Vec<_>>(),
+        health_names.difference(&served_names).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        health["tool_count"].as_u64(),
+        Some(served_names.len() as u64),
+        "health tool_count must equal the served tool surface size"
+    );
     assert_eq!(
         health["subsystems"]["action"]["run_shell_inline_await_limit_ms"],
         Value::from(90_000)

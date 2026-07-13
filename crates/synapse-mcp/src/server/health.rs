@@ -4,7 +4,6 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{Backend, ChromeBridgeDetail};
 
@@ -290,18 +289,21 @@ impl SynapseService {
         }
     }
 
+    /// Report the *exact* tool surface the client is served.
+    ///
+    /// Health's `tool_names`/`tool_count`/`tool_surface_sha256` must mirror what
+    /// `tools/list` actually returns for the same session, or health lies about
+    /// the surface. The served surface (see `ServerHandler::list_tools`) is
+    /// `tools_for_session_profile(session_id)` for every session — including the
+    /// unscoped stdio/admin case where `session_id` is `None` and the full
+    /// break-glass surface (raw `act_*` primitives such as `act_run_shell_status`
+    /// included) is served. Deriving health from that single source of truth
+    /// makes the two surfaces identical by construction, closing the drift class
+    /// where a hand-maintained parallel list (previously a `public_tool_names`
+    /// filter for the `None` case) silently diverged from what was served
+    /// (issue #1612).
     fn health_tool_surface(&self, session_id: Option<&str>) -> Result<Vec<Tool>, ErrorData> {
-        if session_id.is_some() {
-            return self.tools_for_session_profile(session_id);
-        }
-        let public_snapshot = self.public_tool_registry_snapshot()?;
-        let public_names = public_snapshot
-            .public_tool_names
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut tools = self.full_sanitized_tools();
-        tools.retain(|tool| public_names.contains(tool.name.as_ref()));
-        Ok(tools)
+        self.tools_for_session_profile(session_id)
     }
 
     fn storage_health(&self) -> SubsystemHealth {
@@ -868,6 +870,49 @@ mod tests {
         HealthDetail, HealthParams, SynapseService, canonical_json_bytes,
         parse_chrome_bridge_detail,
     };
+
+    #[test]
+    fn health_tool_surface_matches_served_tools_list_source_of_truth() {
+        // #1612: health's reported tool surface is the exact surface served by
+        // `tools/list` (`tools_for_session_profile`) for the same session. The
+        // unscoped stdio/admin case (`session_id == None`) is the one the
+        // regression bit: it serves the full break-glass surface including raw
+        // primitives like `act_run_shell_status`, and health previously dropped
+        // them via a divergent `public_tool_names` filter.
+        let service = SynapseService::new();
+        let served = service
+            .tools_for_session_profile(None)
+            .expect("served tools_for_session_profile(None)");
+        let served_names = served
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let fingerprint = service.tool_surface_fingerprint(None);
+        assert!(
+            fingerprint.error.is_none(),
+            "health tool surface must resolve: {:?}",
+            fingerprint.error
+        );
+        let health_names = fingerprint
+            .names
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            served_names, health_names,
+            "health tool_names must equal the served tools/list surface"
+        );
+        assert!(
+            health_names.contains("act_run_shell_status"),
+            "unscoped surface must expose the raw act_run_shell_status primitive"
+        );
+        println!(
+            "evidence=tool_surface_source_of_truth served_count={} health_count={} act_run_shell_status_present={}",
+            served_names.len(),
+            health_names.len(),
+            health_names.contains("act_run_shell_status")
+        );
+    }
 
     #[test]
     fn canonical_json_bytes_sorts_object_keys_recursively() {
