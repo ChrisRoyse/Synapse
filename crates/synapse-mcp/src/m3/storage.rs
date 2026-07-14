@@ -6,12 +6,12 @@ use std::{
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{DiskPressureLevel, GcReport, PressureReport, cf};
 
 use crate::m1::mcp_error;
-use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 use super::{
     M3ToolStub,
@@ -27,8 +27,9 @@ const MAX_PROBE_VALUE_BYTES: u32 = 65_536;
 const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
-const MAX_INSPECT_SAMPLE_VALUE_CHARS: usize = 4096;
 const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len()] = cf::ALL_COLUMN_FAMILIES;
+const STORAGE_INSPECT_REDACTION_POLICY: &str =
+    "metadata_only_no_raw_keys_or_values_hashes_for_correlation";
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -111,10 +112,14 @@ pub struct StorageSummaryResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageRowSample {
-    pub key_hex: String,
+    pub key_len_bytes: u64,
+    pub key_sha256: String,
+    pub key_material_omitted: bool,
     pub value_len_bytes: u64,
-    pub value_utf8_prefix: String,
-    pub value_truncated: bool,
+    pub value_sha256: String,
+    pub value_encoding: String,
+    pub value_content_omitted: bool,
+    pub redaction_policy: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -425,17 +430,37 @@ fn cf_row_samples(
         samples.insert(
             cf_name.to_owned(),
             rows.into_iter()
-                .map(|(key, value)| StorageRowSample {
-                    key_hex: hex_encode(&key),
-                    value_len_bytes: value.len() as u64,
-                    value_utf8_prefix: redacted_utf8_prefix(&value, MAX_INSPECT_SAMPLE_VALUE_CHARS),
-                    value_truncated: String::from_utf8_lossy(&value).chars().count()
-                        > MAX_INSPECT_SAMPLE_VALUE_CHARS,
-                })
+                .map(|(key, value)| storage_row_sample(&key, &value))
                 .collect(),
         );
     }
     Ok(samples)
+}
+
+fn storage_row_sample(key: &[u8], value: &[u8]) -> StorageRowSample {
+    StorageRowSample {
+        key_len_bytes: key.len() as u64,
+        key_sha256: sha256_hex(key),
+        key_material_omitted: true,
+        value_len_bytes: value.len() as u64,
+        value_sha256: sha256_hex(value),
+        value_encoding: classify_value_encoding(value),
+        value_content_omitted: true,
+        redaction_policy: STORAGE_INSPECT_REDACTION_POLICY.to_owned(),
+    }
+}
+
+fn classify_value_encoding(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "empty".to_owned();
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        return "binary_or_invalid_utf8".to_owned();
+    }
+    if serde_json::from_slice::<Value>(bytes).is_ok() {
+        return "json".to_owned();
+    }
+    "utf8_non_json".to_owned()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -448,21 +473,9 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
-fn utf8_prefix(bytes: &[u8], max_chars: usize) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .take(max_chars)
-        .collect()
-}
-
-fn redacted_utf8_prefix(bytes: &[u8], max_chars: usize) -> String {
-    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
-        redact_url_fields_for_public_readback(&mut value);
-        if let Ok(encoded) = serde_json::to_string(&value) {
-            return encoded.chars().take(max_chars).collect();
-        }
-    }
-    utf8_prefix(bytes, max_chars)
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{}", hex_encode(digest.as_ref()))
 }
 
 fn validate_probe_params(params: &StoragePutProbeRowsParams) -> Result<(), ErrorData> {
@@ -794,19 +807,44 @@ fn lock_runtime(
 
 #[cfg(test)]
 mod tests {
-    use super::redacted_utf8_prefix;
+    use super::{classify_value_encoding, hex_encode, storage_row_sample};
 
     #[test]
-    fn storage_inspect_prefix_redacts_url_fields() {
-        let value = br#"{"payload":{"url":"https://example.test/account/SYN1485?token=secret#frag","before_url":"data:text/html,<title>SYN1485</title>"},"note":"kept"}"#;
+    fn storage_inspect_sample_omits_raw_key_and_value_material() {
+        let key = b"zzzz-ISSUE1639-SECRET-KEY";
+        let value = br#"{"token":"ISSUE1639_SECRET_TOKEN","nested":{"password":"do-not-emit"}}"#;
 
-        let prefix = redacted_utf8_prefix(value, 4096);
+        let sample = storage_row_sample(key, value);
+        let encoded = serde_json::to_string(&sample).expect("encode sample");
 
-        assert!(prefix.contains("\"url\":\"https://example.test/redacted?redacted#redacted\""));
-        assert!(prefix.contains("\"before_url\":\"data:redacted\""));
-        assert!(prefix.contains("\"note\":\"kept\""));
-        assert!(!prefix.contains("account/SYN1485"));
-        assert!(!prefix.contains("token=secret"));
-        assert!(!prefix.contains("<title>SYN1485</title>"));
+        assert_eq!(sample.key_len_bytes, key.len() as u64);
+        assert_eq!(sample.value_len_bytes, value.len() as u64);
+        assert!(sample.key_material_omitted);
+        assert!(sample.value_content_omitted);
+        assert_eq!(sample.value_encoding, "json");
+        assert!(sample.key_sha256.starts_with("sha256:"));
+        assert!(sample.value_sha256.starts_with("sha256:"));
+        assert!(!encoded.contains("key_hex"));
+        assert!(!encoded.contains("value_utf8_prefix"));
+        assert!(!encoded.contains("value_truncated"));
+        assert!(!encoded.contains("ISSUE1639"));
+        assert!(!encoded.contains("SECRET"));
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains(&hex_encode(key)));
+    }
+
+    #[test]
+    fn storage_inspect_sample_classifies_non_displayable_values() {
+        assert_eq!(classify_value_encoding(b""), "empty");
+        assert_eq!(
+            classify_value_encoding(b"plain ISSUE1639 text"),
+            "utf8_non_json"
+        );
+        assert_eq!(classify_value_encoding(br#"{"ok":true}"#), "json");
+        assert_eq!(
+            classify_value_encoding(&[0xff, 0xfe, 0xfd]),
+            "binary_or_invalid_utf8"
+        );
     }
 }
