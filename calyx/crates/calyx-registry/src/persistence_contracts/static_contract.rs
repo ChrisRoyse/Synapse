@@ -15,7 +15,10 @@ use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::runtime::candle::{self, CandlePoolingPolicy, CandlePrecision};
 use crate::runtime::common::DEFAULT_MAX_TOKENS;
 use crate::runtime::onnx::{custom_contract_corpus_hash, custom_pooling_from_config};
-use crate::{AlgorithmicEncoder, LensRuntime, LensSpec, MultimodalAdapterLens, Qwen3ModelFiles};
+use crate::{
+    AlgorithmicEncoder, AlgorithmicLens, LensRuntime, LensSpec, MultimodalAdapterLens,
+    Qwen3ModelFiles,
+};
 
 const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
 const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
@@ -79,90 +82,169 @@ fn algorithmic_contract(spec: &LensSpec, kind: &str) -> Result<FrozenLensContrac
             spec.name
         ))
     })?;
-    if encoder == AlgorithmicEncoder::ByteFeatures {
-        return Ok(FrozenLensContract::algorithmic_byte_features(
-            &spec.name,
-            spec.modality,
-        ));
-    }
-    let encoder_text = format!("{encoder:?}:{}", encoder.dim());
-    Ok(FrozenLensContract::new(
-        spec.name.clone(),
-        sha256_digest(&[b"algorithmic-runtime-v2", encoder_text.as_bytes()]),
-        sha256_digest(&[b"algorithmic-data-oblivious"]),
-        encoder.shape(),
-        spec.modality,
-        LensDType::F32,
-        NormPolicy::None,
-    ))
+    Ok(AlgorithmicLens::new(&spec.name, spec.modality, encoder)
+        .contract()
+        .clone())
 }
 
 fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncoder> {
-    match kind {
-        "byte_features" | "byte-features" | "byte" => Some(AlgorithmicEncoder::ByteFeatures),
-        "scalar" => Some(AlgorithmicEncoder::Scalar),
-        "ast_style" | "ast-style" => Some(AlgorithmicEncoder::AstStyle),
-        "gdelt_cameo" | "gdelt-cameo" => Some(AlgorithmicEncoder::GdeltCameo),
-        "gdelt_actor_geo" | "gdelt-actor-geo" => Some(AlgorithmicEncoder::GdeltActorGeo {
+    let normalized = kind.replace('-', "_");
+    let parts = normalized.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["byte_features"] | ["byte"] => Some(AlgorithmicEncoder::ByteFeatures),
+        ["scalar"] => Some(AlgorithmicEncoder::Scalar),
+        ["ast_style"] => Some(AlgorithmicEncoder::AstStyle),
+        ["gdelt_cameo"] => Some(AlgorithmicEncoder::GdeltCameo),
+        ["gdelt_actor_geo"] => Some(AlgorithmicEncoder::GdeltActorGeo {
             dim: sparse_dim(shape)?,
         }),
-        "gdelt_source_domain" | "gdelt-source-domain" => {
-            Some(AlgorithmicEncoder::GdeltSourceDomain {
-                dim: sparse_dim(shape)?,
-            })
-        }
-        "gdelt_event_geo" | "gdelt-event-geo" => Some(AlgorithmicEncoder::GdeltEventGeo {
+        ["gdelt_source_domain"] => Some(AlgorithmicEncoder::GdeltSourceDomain {
             dim: sparse_dim(shape)?,
         }),
-        "gdelt_actor_pair" | "gdelt-actor-pair" => Some(AlgorithmicEncoder::GdeltActorPair {
+        ["gdelt_event_geo"] => Some(AlgorithmicEncoder::GdeltEventGeo {
             dim: sparse_dim(shape)?,
         }),
-        "gdelt_event_actor" | "gdelt-event-actor" => Some(AlgorithmicEncoder::GdeltEventActor {
+        ["gdelt_actor_pair"] => Some(AlgorithmicEncoder::GdeltActorPair {
             dim: sparse_dim(shape)?,
         }),
-        "gdelt_tone_signal" | "gdelt-tone-signal" => Some(AlgorithmicEncoder::GdeltToneSignal {
+        ["gdelt_event_actor"] => Some(AlgorithmicEncoder::GdeltEventActor {
             dim: sparse_dim(shape)?,
         }),
-        "gdelt_source_event" | "gdelt-source-event" => Some(AlgorithmicEncoder::GdeltSourceEvent {
+        ["gdelt_tone_signal"] => Some(AlgorithmicEncoder::GdeltToneSignal {
             dim: sparse_dim(shape)?,
         }),
-        "sparse" | "sparse_keywords" | "sparse-keywords" => {
-            Some(AlgorithmicEncoder::SparseKeywords {
-                dim: sparse_dim(shape)?,
-            })
-        }
-        "token_hash" | "token-hash" | "multi_hash" | "multi-hash" => {
+        ["gdelt_source_event"] => Some(AlgorithmicEncoder::GdeltSourceEvent {
+            dim: sparse_dim(shape)?,
+        }),
+        ["sparse"] | ["sparse_keywords"] => Some(AlgorithmicEncoder::SparseKeywords {
+            dim: sparse_dim(shape)?,
+        }),
+        ["sparse_keywords", dim] => Some(AlgorithmicEncoder::SparseKeywords {
+            dim: parse_u32(dim)?,
+        }),
+        ["token_hash"] | ["multi_hash"] => Some(AlgorithmicEncoder::TokenHash {
+            token_dim: token_dim(shape)?,
+        }),
+        ["token_hash", token_dim] | ["multi_hash", token_dim] => {
             Some(AlgorithmicEncoder::TokenHash {
-                token_dim: token_dim(shape)?,
+                token_dim: parse_u32(token_dim)?,
             })
         }
-        "one_hot" | "one-hot" => Some(AlgorithmicEncoder::OneHot {
+        ["one_hot"] => Some(AlgorithmicEncoder::OneHot {
             buckets: dense_dim(shape)?,
         }),
-        value => {
-            if let Some(dim) = value
-                .strip_prefix("sparse_keywords:")
-                .or_else(|| value.strip_prefix("sparse-keywords:"))
-                .and_then(|dim| dim.parse().ok())
-            {
-                return Some(AlgorithmicEncoder::SparseKeywords { dim });
-            }
-            if let Some(token_dim) = value
-                .strip_prefix("token_hash:")
-                .or_else(|| value.strip_prefix("token-hash:"))
-                .or_else(|| value.strip_prefix("multi_hash:"))
-                .or_else(|| value.strip_prefix("multi-hash:"))
-                .and_then(|dim| dim.parse().ok())
-            {
-                return Some(AlgorithmicEncoder::TokenHash { token_dim });
-            }
-            value
-                .strip_prefix("one_hot:")
-                .or_else(|| value.strip_prefix("one-hot:"))
-                .and_then(|buckets| buckets.parse().ok())
-                .map(|buckets| AlgorithmicEncoder::OneHot { buckets })
+        ["one_hot", buckets] => Some(AlgorithmicEncoder::OneHot {
+            buckets: parse_u32(buckets)?,
+        }),
+        ["syn_cyclic_time", period] | ["syn_cyclical_time", period] => {
+            Some(AlgorithmicEncoder::SynCyclicTime {
+                period: parse_u32(period)?,
+            })
         }
+        ["syn_scalar_raw"] => Some(AlgorithmicEncoder::SynScalarRaw),
+        ["syn_scalar_log1p"] => Some(AlgorithmicEncoder::SynScalarLog1p),
+        ["syn_scalar_zscore", mean_micros, std_micros] => {
+            Some(AlgorithmicEncoder::SynScalarZScore {
+                mean_micros: parse_i64(mean_micros)?,
+                std_micros: parse_u64(std_micros)?,
+            })
+        }
+        ["syn_scalar_rank", min_micros, max_micros] => Some(AlgorithmicEncoder::SynScalarRank {
+            min_micros: parse_i64(min_micros)?,
+            max_micros: parse_i64(max_micros)?,
+        }),
+        ["syn_one_hot"] | ["syn_onehot"] => Some(AlgorithmicEncoder::SynOneHot {
+            buckets: dense_dim(shape)?,
+        }),
+        ["syn_one_hot", buckets] | ["syn_onehot", buckets] => Some(AlgorithmicEncoder::SynOneHot {
+            buckets: parse_u32(buckets)?,
+        }),
+        ["syn_hash"] => Some(AlgorithmicEncoder::SynHash {
+            dim: sparse_dim(shape)?,
+        }),
+        ["syn_hash", dim] => Some(AlgorithmicEncoder::SynHash {
+            dim: parse_u32(dim)?,
+        }),
+        ["syn_sparse_text"] => Some(AlgorithmicEncoder::SynSparseText {
+            dim: sparse_dim(shape)?,
+        }),
+        ["syn_sparse_text", dim] => Some(AlgorithmicEncoder::SynSparseText {
+            dim: parse_u32(dim)?,
+        }),
+        ["syn_token_slots"] => Some(AlgorithmicEncoder::SynTokenSlots {
+            token_dim: token_dim(shape)?,
+        }),
+        ["syn_token_slots", token_dim] => Some(AlgorithmicEncoder::SynTokenSlots {
+            token_dim: parse_u32(token_dim)?,
+        }),
+        ["syn_multi_hot"] | ["syn_multihot"] => Some(AlgorithmicEncoder::SynMultiHot {
+            dim: sparse_dim(shape)?,
+        }),
+        ["syn_multi_hot", dim] | ["syn_multihot", dim] => Some(AlgorithmicEncoder::SynMultiHot {
+            dim: parse_u32(dim)?,
+        }),
+        ["syn_record_vector"] => Some(AlgorithmicEncoder::SynRecordVector {
+            dim: dense_dim(shape)?,
+        }),
+        ["syn_record_vector", dim] => Some(AlgorithmicEncoder::SynRecordVector {
+            dim: parse_u32(dim)?,
+        }),
+        ["syn_bin", buckets, min_micros, max_micros] => Some(AlgorithmicEncoder::SynBin {
+            buckets: parse_u32(buckets)?,
+            min_micros: parse_i64(min_micros)?,
+            max_micros: parse_i64(max_micros)?,
+        }),
+        ["syn_bin", min_micros, max_micros] => Some(AlgorithmicEncoder::SynBin {
+            buckets: dense_dim(shape)?,
+            min_micros: parse_i64(min_micros)?,
+            max_micros: parse_i64(max_micros)?,
+        }),
+        ["syn_ordinal", levels] => Some(AlgorithmicEncoder::SynOrdinal {
+            levels: parse_u32(levels)?,
+        }),
+        ["syn_frequency", count, total] => Some(AlgorithmicEncoder::SynFrequency {
+            count: parse_u64(count)?,
+            total: parse_u64(total)?,
+        }),
+        ["syn_target_mean", mean_micros, fold_count, outcome_hash] => {
+            Some(AlgorithmicEncoder::SynTargetMean {
+                mean_micros: parse_i64(mean_micros)?,
+                fold_count: parse_u32(fold_count)?,
+                outcome_hash: parse_u32(outcome_hash)?,
+            })
+        }
+        ["syn_delta", scale_micros] => Some(AlgorithmicEncoder::SynDelta {
+            scale_micros: parse_u64(scale_micros)?,
+        }),
+        ["syn_rate", scale_micros] => Some(AlgorithmicEncoder::SynRate {
+            scale_micros: parse_u64(scale_micros)?,
+        }),
+        ["syn_cross"] => Some(AlgorithmicEncoder::SynCross {
+            dim: sparse_dim(shape)?,
+        }),
+        ["syn_cross", dim] => Some(AlgorithmicEncoder::SynCross {
+            dim: parse_u32(dim)?,
+        }),
+        ["syn_aggregation"] => Some(AlgorithmicEncoder::SynAggregation {
+            dim: dense_dim(shape)?,
+        }),
+        ["syn_aggregation", dim] => Some(AlgorithmicEncoder::SynAggregation {
+            dim: parse_u32(dim)?,
+        }),
+        _ => None,
     }
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value.parse().ok()
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse().ok()
+}
+
+fn parse_i64(value: &str) -> Option<i64> {
+    value.parse().ok()
 }
 
 fn tei_contract(spec: &LensSpec, endpoint: &str) -> Result<FrozenLensContract> {

@@ -21,6 +21,9 @@ pub(super) fn output_shape(runtime: &str, dim: u32) -> Result<SlotShape> {
     let Some(kind) = algorithmic_kind(runtime) else {
         return learned_output_shape(runtime, dim);
     };
+    if let Some(shape) = syn_output_shape(kind, dim)? {
+        return Ok(shape);
+    }
     let shape = match kind {
         "byte" | "byte-features" => checked_dense(kind, dim, 16)?,
         "ast-style" | "ast_style" => checked_dense(kind, dim, 8)?,
@@ -91,6 +94,9 @@ pub(super) fn frozen_contract(
 }
 
 fn encoder_from_kind(kind: &str, shape: SlotShape) -> Result<AlgorithmicEncoder> {
+    if let Some(encoder) = syn_encoder_from_kind(kind, shape)? {
+        return Ok(encoder);
+    }
     let encoder = match kind {
         "byte" | "byte-features" | "byte_features" => AlgorithmicEncoder::ByteFeatures,
         "ast-style" | "ast_style" => AlgorithmicEncoder::AstStyle,
@@ -152,6 +158,175 @@ fn encoder_from_kind(kind: &str, shape: SlotShape) -> Result<AlgorithmicEncoder>
         }
     };
     Ok(encoder)
+}
+
+fn syn_output_shape(kind: &str, dim: u32) -> Result<Option<SlotShape>> {
+    let normalized = kind.replace('-', "_");
+    let parts = normalized.split(':').collect::<Vec<_>>();
+    let shape = match parts.as_slice() {
+        ["syn_cyclic_time", _] | ["syn_cyclical_time", _] => checked_dense(kind, dim, 2)?,
+        ["syn_scalar_raw"]
+        | ["syn_scalar_log1p"]
+        | ["syn_scalar_zscore", _, _]
+        | ["syn_scalar_rank", _, _]
+        | ["syn_ordinal", _]
+        | ["syn_frequency", _, _]
+        | ["syn_target_mean", _, _, _]
+        | ["syn_delta", _]
+        | ["syn_rate", _] => checked_dense(kind, dim, 1)?,
+        ["syn_one_hot"] | ["syn_onehot"] => SlotShape::Dense(checked_positive(kind, dim)?),
+        ["syn_one_hot", buckets] | ["syn_onehot", buckets] => {
+            let buckets = parse_u32_value(kind, buckets)?;
+            checked_dense(kind, dim, buckets)?
+        }
+        ["syn_hash"]
+        | ["syn_sparse_text"]
+        | ["syn_multi_hot"]
+        | ["syn_multihot"]
+        | ["syn_cross"] => SlotShape::Sparse(checked_power_of_two(kind, dim)?),
+        ["syn_hash", parsed]
+        | ["syn_sparse_text", parsed]
+        | ["syn_multi_hot", parsed]
+        | ["syn_multihot", parsed]
+        | ["syn_cross", parsed] => {
+            let parsed = parse_u32_value(kind, parsed)?;
+            checked_match(kind, dim, parsed)?;
+            SlotShape::Sparse(checked_power_of_two(kind, parsed)?)
+        }
+        ["syn_token_slots"] => SlotShape::Multi {
+            token_dim: checked_power_of_two(kind, dim)?,
+        },
+        ["syn_token_slots", parsed] => {
+            let parsed = parse_u32_value(kind, parsed)?;
+            checked_match(kind, dim, parsed)?;
+            SlotShape::Multi {
+                token_dim: checked_power_of_two(kind, parsed)?,
+            }
+        }
+        ["syn_record_vector"] | ["syn_aggregation"] => {
+            SlotShape::Dense(checked_positive(kind, dim)?)
+        }
+        ["syn_record_vector", parsed] | ["syn_aggregation", parsed] => {
+            let parsed = parse_u32_value(kind, parsed)?;
+            checked_match(kind, dim, parsed)?;
+            SlotShape::Dense(checked_positive(kind, parsed)?)
+        }
+        ["syn_bin", min_micros, max_micros] => {
+            parse_i64_value(kind, min_micros)?;
+            parse_i64_value(kind, max_micros)?;
+            SlotShape::Dense(checked_positive(kind, dim)?)
+        }
+        ["syn_bin", buckets, min_micros, max_micros] => {
+            parse_i64_value(kind, min_micros)?;
+            parse_i64_value(kind, max_micros)?;
+            let buckets = parse_u32_value(kind, buckets)?;
+            checked_dense(kind, dim, buckets)?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(shape))
+}
+
+fn syn_encoder_from_kind(kind: &str, shape: SlotShape) -> Result<Option<AlgorithmicEncoder>> {
+    let normalized = kind.replace('-', "_");
+    let parts = normalized.split(':').collect::<Vec<_>>();
+    let encoder = match parts.as_slice() {
+        ["syn_cyclic_time", period] | ["syn_cyclical_time", period] => {
+            AlgorithmicEncoder::SynCyclicTime {
+                period: parse_u32_value(kind, period)?,
+            }
+        }
+        ["syn_scalar_raw"] => AlgorithmicEncoder::SynScalarRaw,
+        ["syn_scalar_log1p"] => AlgorithmicEncoder::SynScalarLog1p,
+        ["syn_scalar_zscore", mean_micros, std_micros] => AlgorithmicEncoder::SynScalarZScore {
+            mean_micros: parse_i64_value(kind, mean_micros)?,
+            std_micros: parse_u64_value(kind, std_micros)?,
+        },
+        ["syn_scalar_rank", min_micros, max_micros] => AlgorithmicEncoder::SynScalarRank {
+            min_micros: parse_i64_value(kind, min_micros)?,
+            max_micros: parse_i64_value(kind, max_micros)?,
+        },
+        ["syn_one_hot"] | ["syn_onehot"] => AlgorithmicEncoder::SynOneHot {
+            buckets: dense_shape_dim(kind, shape)?,
+        },
+        ["syn_one_hot", buckets] | ["syn_onehot", buckets] => AlgorithmicEncoder::SynOneHot {
+            buckets: parse_u32_value(kind, buckets)?,
+        },
+        ["syn_hash"] => AlgorithmicEncoder::SynHash {
+            dim: sparse_shape_dim(kind, shape)?,
+        },
+        ["syn_hash", dim] => AlgorithmicEncoder::SynHash {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_sparse_text"] => AlgorithmicEncoder::SynSparseText {
+            dim: sparse_shape_dim(kind, shape)?,
+        },
+        ["syn_sparse_text", dim] => AlgorithmicEncoder::SynSparseText {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_token_slots"] => AlgorithmicEncoder::SynTokenSlots {
+            token_dim: multi_shape_dim(kind, shape)?,
+        },
+        ["syn_token_slots", token_dim] => AlgorithmicEncoder::SynTokenSlots {
+            token_dim: parse_u32_value(kind, token_dim)?,
+        },
+        ["syn_multi_hot"] | ["syn_multihot"] => AlgorithmicEncoder::SynMultiHot {
+            dim: sparse_shape_dim(kind, shape)?,
+        },
+        ["syn_multi_hot", dim] | ["syn_multihot", dim] => AlgorithmicEncoder::SynMultiHot {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_record_vector"] => AlgorithmicEncoder::SynRecordVector {
+            dim: dense_shape_dim(kind, shape)?,
+        },
+        ["syn_record_vector", dim] => AlgorithmicEncoder::SynRecordVector {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_bin", min_micros, max_micros] => AlgorithmicEncoder::SynBin {
+            buckets: dense_shape_dim(kind, shape)?,
+            min_micros: parse_i64_value(kind, min_micros)?,
+            max_micros: parse_i64_value(kind, max_micros)?,
+        },
+        ["syn_bin", buckets, min_micros, max_micros] => AlgorithmicEncoder::SynBin {
+            buckets: parse_u32_value(kind, buckets)?,
+            min_micros: parse_i64_value(kind, min_micros)?,
+            max_micros: parse_i64_value(kind, max_micros)?,
+        },
+        ["syn_ordinal", levels] => AlgorithmicEncoder::SynOrdinal {
+            levels: parse_u32_value(kind, levels)?,
+        },
+        ["syn_frequency", count, total] => AlgorithmicEncoder::SynFrequency {
+            count: parse_u64_value(kind, count)?,
+            total: parse_u64_value(kind, total)?,
+        },
+        ["syn_target_mean", mean_micros, fold_count, outcome_hash] => {
+            AlgorithmicEncoder::SynTargetMean {
+                mean_micros: parse_i64_value(kind, mean_micros)?,
+                fold_count: parse_u32_value(kind, fold_count)?,
+                outcome_hash: parse_u32_value(kind, outcome_hash)?,
+            }
+        }
+        ["syn_delta", scale_micros] => AlgorithmicEncoder::SynDelta {
+            scale_micros: parse_u64_value(kind, scale_micros)?,
+        },
+        ["syn_rate", scale_micros] => AlgorithmicEncoder::SynRate {
+            scale_micros: parse_u64_value(kind, scale_micros)?,
+        },
+        ["syn_cross"] => AlgorithmicEncoder::SynCross {
+            dim: sparse_shape_dim(kind, shape)?,
+        },
+        ["syn_cross", dim] => AlgorithmicEncoder::SynCross {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_aggregation"] => AlgorithmicEncoder::SynAggregation {
+            dim: dense_shape_dim(kind, shape)?,
+        },
+        ["syn_aggregation", dim] => AlgorithmicEncoder::SynAggregation {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(encoder))
 }
 
 fn dense_shape_dim(kind: &str, shape: SlotShape) -> Result<u32> {
@@ -216,11 +391,39 @@ fn checked_positive(kind: &str, dim: u32) -> Result<u32> {
     )))
 }
 
+fn checked_power_of_two(kind: &str, dim: u32) -> Result<u32> {
+    let dim = checked_positive(kind, dim)?;
+    if dim.is_power_of_two() {
+        return Ok(dim);
+    }
+    Err(config_invalid(format!(
+        "algorithmic lens {kind} dim must be a power of two"
+    )))
+}
+
 fn parse_dim(kind: &str) -> Result<u32> {
     kind.split_once(':')
         .and_then(|(_, dim)| dim.parse::<u32>().ok())
         .filter(|dim| *dim > 0)
         .ok_or_else(|| config_invalid(format!("invalid algorithmic dim in {kind}")))
+}
+
+fn parse_u32_value(kind: &str, value: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .map_err(|_| config_invalid(format!("invalid u32 parameter {value} in {kind}")))
+}
+
+fn parse_u64_value(kind: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| config_invalid(format!("invalid u64 parameter {value} in {kind}")))
+}
+
+fn parse_i64_value(kind: &str, value: &str) -> Result<i64> {
+    value
+        .parse::<i64>()
+        .map_err(|_| config_invalid(format!("invalid i64 parameter {value} in {kind}")))
 }
 
 fn config_invalid(message: impl Into<String>) -> CalyxError {
