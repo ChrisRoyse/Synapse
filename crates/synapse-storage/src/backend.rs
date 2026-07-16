@@ -161,6 +161,11 @@ pub trait StorageBackend: Send + Sync {
     fn kind(&self) -> StorageBackendKind;
     fn put_batch(&self, cf_name: &str, rows: Vec<RawRow>) -> StorageResult<()>;
     fn put_batch_pressure_bypass(&self, cf_name: &str, rows: Vec<RawRow>) -> StorageResult<()>;
+    fn put_calyx_migration_batch_pressure_bypass(
+        &self,
+        cf_name: &str,
+        rows: Vec<CalyxMigrationRow>,
+    ) -> StorageResult<()>;
     fn put_cf_batches_pressure_bypass(&self, batches: Vec<OwnedCfWriteBatch>) -> StorageResult<()>;
     fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
     fn mutate_batch_pressure_bypass(
@@ -214,6 +219,14 @@ pub trait StorageBackend: Send + Sync {
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>>;
     fn compact_cf(&self, cf_name: &str) -> StorageResult<()>;
     fn compact_cf_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> StorageResult<()>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalyxMigrationRow {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub written_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 pub struct RocksDbBackend {
@@ -376,6 +389,17 @@ impl StorageBackend for RocksDbBackend {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
             })
+    }
+
+    fn put_calyx_migration_batch_pressure_bypass(
+        &self,
+        _cf_name: &str,
+        _rows: Vec<CalyxMigrationRow>,
+    ) -> StorageResult<()> {
+        Err(StorageError::BackendUnavailable {
+            backend: self.kind().as_str().to_owned(),
+            detail: "Calyx migration envelope writes require storage_backend=\"calyx\"".to_owned(),
+        })
     }
 
     fn put_cf_batches_pressure_bypass(&self, batches: Vec<OwnedCfWriteBatch>) -> StorageResult<()> {
@@ -947,6 +971,32 @@ impl StorageBackend for CalyxBackend {
         })
     }
 
+    fn put_calyx_migration_batch_pressure_bypass(
+        &self,
+        cf_name: &str,
+        rows: Vec<CalyxMigrationRow>,
+    ) -> StorageResult<()> {
+        let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.with_vault(cf_name, "write Calyx migration KV batch", true, |vault| {
+            let writes = rows
+                .into_iter()
+                .map(|row| {
+                    encode_calyx_key_for_write(cf_name, collection_id, &row.key).map(|key| {
+                        SynapseCalyxCfWrite::new(
+                            ColumnFamily::Kv,
+                            key,
+                            encode_calyx_value(row.expires_at_ms, row.written_at_ms, &row.value),
+                        )
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            commit_calyx_rows_to_vault(vault, cf_name, writes)
+        })
+    }
+
     fn put_cf_batches_pressure_bypass(&self, batches: Vec<OwnedCfWriteBatch>) -> StorageResult<()> {
         if batches.iter().all(|(_cf_name, rows)| rows.is_empty()) {
             return Ok(());
@@ -1346,6 +1396,19 @@ fn scan_calyx_cf_read_only(
         .map_err(|source| calyx_open_failed(path, &source))?;
     verify_calyx_schema_version_existing(&vault, path, schema_version)?;
     read_all_rows_from_vault(&vault, cf_name)
+}
+
+pub fn scan_calyx_cf_read_only_including_expired(
+    path: &Path,
+    schema_version: u32,
+    cf_name: &str,
+) -> StorageResult<Vec<RawRow>> {
+    require_known_cf_for_read(cf_name)?;
+    let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
+    let vault = SynapseCalyxReadOnlyVault::open_existing(config)
+        .map_err(|source| calyx_open_failed(path, &source))?;
+    verify_calyx_schema_version_existing(&vault, path, schema_version)?;
+    read_all_rows_from_vault_including_expired(&vault, cf_name)
 }
 
 fn require_known_cf_for_read(cf_name: &str) -> StorageResult<&'static str> {
@@ -1795,6 +1858,21 @@ fn read_all_rows_from_vault(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
 ) -> StorageResult<Vec<RawRow>> {
+    read_all_rows_from_vault_filtered(vault, cf_name, false)
+}
+
+fn read_all_rows_from_vault_including_expired(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+) -> StorageResult<Vec<RawRow>> {
+    read_all_rows_from_vault_filtered(vault, cf_name, true)
+}
+
+fn read_all_rows_from_vault_filtered(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    include_expired: bool,
+) -> StorageResult<Vec<RawRow>> {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let snapshot = vault.latest_seq_value();
@@ -1807,8 +1885,20 @@ fn read_all_rows_from_vault(
         .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
     for (key, value) in rows {
         let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &key)?;
-        if let Some(payload) = decode_calyx_value_for_read(cf_name, &value, now_ms)? {
-            decoded.push((user_key, payload));
+        let envelope = decode_calyx_value_raw(&value).map_err(|detail| {
+            tracing::error!(
+                code = error_codes::STORAGE_READ_FAILED,
+                cf = cf_name,
+                detail,
+                "Calyx storage backend rejected malformed KV retention envelope"
+            );
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail,
+            }
+        })?;
+        if include_expired || !calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+            decoded.push((user_key, envelope.payload.to_vec()));
         }
     }
     decoded.sort_by(|left, right| left.0.cmp(&right.0));

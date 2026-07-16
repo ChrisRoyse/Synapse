@@ -8,6 +8,7 @@ pub mod compaction;
 pub mod episodes;
 pub mod error;
 mod gc;
+mod migration;
 mod pressure;
 pub mod routines;
 pub mod timeline;
@@ -23,6 +24,10 @@ pub use backend::{
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
+pub use migration::{
+    DEFAULT_MIGRATION_BATCH_ROWS, StorageMigrationCfReport, StorageMigrationConfig,
+    StorageMigrationManifest, migrate_rocksdb_to_calyx,
+};
 pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
 
 /// One raw storage row: key bytes and value bytes.
@@ -150,6 +155,15 @@ impl Db {
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
         )
+    }
+
+    pub(crate) fn put_calyx_migration_batch_pressure_bypass(
+        &self,
+        cf_name: &str,
+        rows: Vec<backend::CalyxMigrationRow>,
+    ) -> StorageResult<()> {
+        self.backend
+            .put_calyx_migration_batch_pressure_bypass(cf_name, rows)
     }
 
     /// Writes key/value batches across multiple column families atomically

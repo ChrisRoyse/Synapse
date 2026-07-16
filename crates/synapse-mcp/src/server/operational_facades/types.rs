@@ -19,7 +19,7 @@ use crate::m3::{
     },
     storage::{
         StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-        StorageSummaryResponse,
+        StorageMigrateParams, StorageMigrateResponse, StorageSummaryResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -28,6 +28,7 @@ pub enum StorageOperation {
     Inspect,
     Summary,
     GcOnce,
+    Migrate,
 }
 
 impl StorageOperation {
@@ -36,6 +37,7 @@ impl StorageOperation {
             Self::Inspect => "inspect",
             Self::Summary => "summary",
             Self::GcOnce => "gc_once",
+            Self::Migrate => "migrate",
         }
     }
 }
@@ -50,6 +52,8 @@ pub struct StorageParams {
     pub summary: Option<StorageInspectParams>,
     #[serde(default)]
     pub gc_once: Option<StorageGcOnceParams>,
+    #[serde(default)]
+    pub migrate: Option<StorageMigrateParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -64,6 +68,8 @@ pub struct StorageResponse {
     pub summary: Option<StorageSummaryResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_once: Option<StorageGcOnceResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrate: Option<StorageMigrateResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

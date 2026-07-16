@@ -17,6 +17,7 @@ pub(super) fn storage_response(
         inspect: None,
         summary: None,
         gc_once: None,
+        migrate: None,
     };
     fill(&mut response);
     response
