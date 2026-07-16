@@ -26,7 +26,10 @@ pub(crate) const RECORD_HEADER_BYTES: u64 = record::HEADER_LEN as u64;
 /// Default group-commit window for PH05.
 pub const DEFAULT_GROUP_COMMIT_WINDOW: Duration = Duration::from_millis(2);
 /// Maximum encoded payload accepted by one WAL record.
-pub(crate) const MAX_RECORD_BYTES: usize = record::MAX_RECORD_BYTES as usize;
+///
+/// Public so embedding runtimes can preflight and chunk durable write batches
+/// before they reach the fail-closed WAL encoder.
+pub const MAX_RECORD_BYTES: usize = record::MAX_RECORD_BYTES as usize;
 
 /// WAL writer configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

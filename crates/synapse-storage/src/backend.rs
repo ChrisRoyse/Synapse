@@ -9,6 +9,7 @@ use std::{
 use calyx_aster::{
     cf::{ColumnFamily, prefix_range},
     mvcc::tombstone_value,
+    wal,
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
@@ -53,6 +54,14 @@ const CALYX_GC_CF: &str = "storage_gc";
 const CALYX_GC_PROTECTED_CF_POLICY_SKIPPED: &str = "protected_cf_policy_skipped";
 const CALYX_GC_CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
 const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
+const CALYX_WRITE_BATCH_ROW_COUNT_BYTES: usize = 4;
+const CALYX_WRITE_BATCH_CF_TAG_BYTES: usize = 1;
+const CALYX_WRITE_BATCH_LEN_PREFIX_BYTES: usize = 4;
+const CALYX_WRITE_BATCH_ROW_OVERHEAD_BYTES: usize =
+    CALYX_WRITE_BATCH_CF_TAG_BYTES + (2 * CALYX_WRITE_BATCH_LEN_PREFIX_BYTES);
+const CALYX_WRITE_BATCH_WAL_HEADROOM_BYTES: usize = MIB;
+const CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES: usize =
+    wal::MAX_RECORD_BYTES - CALYX_WRITE_BATCH_WAL_HEADROOM_BYTES;
 const MILLIS_PER_HOUR: u64 = 60 * 60 * 1_000;
 const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
 const MIB_U64: u64 = 1024 * 1024;
@@ -1957,12 +1966,203 @@ fn commit_calyx_rows_to_vault(
     if rows.is_empty() {
         return Ok(());
     }
-    vault
-        .write_cf_batch(rows)
-        .map_err(|source| calyx_write_failed(cf_name, "write Calyx CF batch", &source))?;
+    let plan = plan_calyx_write_batches(cf_name, rows)?;
+    let chunk_count = plan.chunks.len();
+    let total_rows = plan.total_rows;
+    let total_payload_bytes = plan.total_payload_bytes;
+    let largest_row_payload_bytes = plan.largest_row_payload_bytes;
+    for (chunk_index, chunk) in plan.chunks.into_iter().enumerate() {
+        let chunk_rows = chunk.rows.len();
+        let chunk_payload_bytes = chunk.payload_bytes;
+        vault.write_cf_batch(chunk.rows).map_err(|source| {
+            calyx_write_failed(
+                cf_name,
+                &format!(
+                    "write Calyx CF batch chunk {}/{} rows={} estimated_payload_bytes={} max_payload_bytes={} wal_max_record_bytes={}",
+                    chunk_index + 1,
+                    chunk_count,
+                    chunk_rows,
+                    chunk_payload_bytes,
+                    CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES,
+                    wal::MAX_RECORD_BYTES
+                ),
+                &source,
+            )
+        })?;
+        if chunk_count > 1 {
+            tracing::info!(
+                code = "STORAGE_CALYX_WRITE_BATCH_CHUNK_COMMITTED",
+                cf = cf_name,
+                chunk_index = chunk_index + 1,
+                chunk_count,
+                chunk_rows,
+                chunk_payload_bytes,
+                max_payload_bytes = CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES,
+                wal_max_record_bytes = wal::MAX_RECORD_BYTES,
+                "committed bounded Calyx CF write-batch chunk"
+            );
+        }
+    }
+    if chunk_count > 1 {
+        tracing::info!(
+            code = "STORAGE_CALYX_WRITE_BATCH_CHUNKED",
+            cf = cf_name,
+            chunk_count,
+            total_rows,
+            total_payload_bytes,
+            largest_row_payload_bytes,
+            max_payload_bytes = CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES,
+            wal_max_record_bytes = wal::MAX_RECORD_BYTES,
+            "Calyx CF write batch was split below the WAL record ceiling"
+        );
+    }
     vault
         .flush()
         .map_err(|source| calyx_write_failed(cf_name, "flush Calyx CF batch", &source))
+}
+
+#[derive(Debug)]
+struct CalyxWriteBatchChunk {
+    rows: Vec<SynapseCalyxCfWrite>,
+    payload_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CalyxWriteBatchPlan {
+    chunks: Vec<CalyxWriteBatchChunk>,
+    total_rows: usize,
+    total_payload_bytes: usize,
+    largest_row_payload_bytes: usize,
+}
+
+fn plan_calyx_write_batches(
+    cf_name: &str,
+    rows: Vec<SynapseCalyxCfWrite>,
+) -> StorageResult<CalyxWriteBatchPlan> {
+    let total_rows = rows.len();
+    if total_rows > u32::MAX as usize {
+        return Err(calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "Calyx write batch row count exceeds u32 payload header: rows={total_rows} max_rows={}",
+                u32::MAX
+            ),
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_rows = Vec::new();
+    let mut current_payload_bytes = CALYX_WRITE_BATCH_ROW_COUNT_BYTES;
+    let mut total_payload_bytes = CALYX_WRITE_BATCH_ROW_COUNT_BYTES;
+    let mut largest_row_payload_bytes = 0_usize;
+
+    for row in rows {
+        let row_payload_bytes = calyx_write_row_payload_bytes(cf_name, &row)?;
+        largest_row_payload_bytes = largest_row_payload_bytes.max(row_payload_bytes);
+        total_payload_bytes =
+            checked_calyx_payload_add(cf_name, total_payload_bytes, row_payload_bytes)?;
+
+        if CALYX_WRITE_BATCH_ROW_COUNT_BYTES
+            .checked_add(row_payload_bytes)
+            .is_none_or(|payload| payload > CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES)
+        {
+            tracing::error!(
+                code = "STORAGE_CALYX_WRITE_BATCH_ROW_TOO_LARGE",
+                cf = cf_name,
+                row_payload_bytes,
+                max_payload_bytes = CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES,
+                wal_max_record_bytes = wal::MAX_RECORD_BYTES,
+                headroom_bytes = CALYX_WRITE_BATCH_WAL_HEADROOM_BYTES,
+                key_len_bytes = row.key.len(),
+                value_len_bytes = row.value.len(),
+                "Calyx CF write row cannot fit in one WAL-safe batch"
+            );
+            return Err(calyx_write_failed_detail(
+                cf_name,
+                format!(
+                    "Calyx CF write row cannot fit in one WAL-safe batch: row_payload_bytes={row_payload_bytes} max_payload_bytes={} wal_max_record_bytes={} headroom_bytes={} key_len_bytes={} value_len_bytes={}",
+                    CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES,
+                    wal::MAX_RECORD_BYTES,
+                    CALYX_WRITE_BATCH_WAL_HEADROOM_BYTES,
+                    row.key.len(),
+                    row.value.len()
+                ),
+            ));
+        }
+
+        if !current_rows.is_empty()
+            && current_payload_bytes
+                .checked_add(row_payload_bytes)
+                .is_none_or(|payload| payload > CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES)
+        {
+            chunks.push(CalyxWriteBatchChunk {
+                rows: std::mem::take(&mut current_rows),
+                payload_bytes: current_payload_bytes,
+            });
+            current_payload_bytes = CALYX_WRITE_BATCH_ROW_COUNT_BYTES;
+        }
+
+        current_payload_bytes =
+            checked_calyx_payload_add(cf_name, current_payload_bytes, row_payload_bytes)?;
+        current_rows.push(row);
+    }
+
+    if !current_rows.is_empty() {
+        chunks.push(CalyxWriteBatchChunk {
+            rows: current_rows,
+            payload_bytes: current_payload_bytes,
+        });
+    }
+
+    Ok(CalyxWriteBatchPlan {
+        chunks,
+        total_rows,
+        total_payload_bytes,
+        largest_row_payload_bytes,
+    })
+}
+
+fn calyx_write_row_payload_bytes(cf_name: &str, row: &SynapseCalyxCfWrite) -> StorageResult<usize> {
+    u32::try_from(row.key.len()).map_err(|_error| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "Calyx CF write key exceeds u32 length prefix: key_len_bytes={}",
+                row.key.len()
+            ),
+        )
+    })?;
+    u32::try_from(row.value.len()).map_err(|_error| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!(
+                "Calyx CF write value exceeds u32 length prefix: value_len_bytes={}",
+                row.value.len()
+            ),
+        )
+    })?;
+    CALYX_WRITE_BATCH_ROW_OVERHEAD_BYTES
+        .checked_add(row.key.len())
+        .and_then(|payload| payload.checked_add(row.value.len()))
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                cf_name,
+                format!(
+                    "Calyx CF write row payload size overflow: key_len_bytes={} value_len_bytes={}",
+                    row.key.len(),
+                    row.value.len()
+                ),
+            )
+        })
+}
+
+fn checked_calyx_payload_add(cf_name: &str, left: usize, right: usize) -> StorageResult<usize> {
+    left.checked_add(right).ok_or_else(|| {
+        calyx_write_failed_detail(
+            cf_name,
+            format!("Calyx CF write batch payload size overflow: left={left} right={right}"),
+        )
+    })
 }
 
 fn preflight_calyx_retention_for_cf(
@@ -2957,11 +3157,7 @@ fn calyx_read_failed(
     }
 }
 
-fn calyx_write_failed(
-    cf_name: &str,
-    action: &'static str,
-    source: &SynapseCalyxError,
-) -> StorageError {
+fn calyx_write_failed(cf_name: &str, action: &str, source: &SynapseCalyxError) -> StorageError {
     tracing::error!(
         code = source.code,
         source_code = source.source_code.unwrap_or("none"),
