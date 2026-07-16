@@ -280,6 +280,8 @@ All derivations assume Windows (the supported platform). Non-Windows fallbacks u
 | Bearer token file | `%APPDATA%\synapse\token.txt` | `http/auth.rs::token_file_path` | HTTP bearer token (preferred over env). | sacred (secret) |
 | Codex tool-surface snapshot | `%APPDATA%\synapse\codex-tool-surface.json` | `synapse-setup.ps1` | tools/list fingerprint for Codex start-guard. | regenerable |
 | Codex start snapshots | `%LOCALAPPDATA%\synapse\codex-start-snapshots` | `synapse-setup.ps1` | Per-start tool-surface snapshots. | ephemeral |
+| Codex no-facade doctor reports | `%LOCALAPPDATA%\synapse\codex-no-facade-doctor` | `synapse-codex-doctor.ps1` | Per-run JSON reports and fresh Codex probe event logs for sessions that cannot call the Synapse MCP namespace. | ephemeral |
+| Codex restart handoffs | `%LOCALAPPDATA%\synapse\codex-restart-handoffs` | `synapse-setup.ps1`, `synapse-codex-doctor.ps1` | Same-agent restart handoffs for stale schema/socket/no-facade Codex sessions. | ephemeral |
 | Action recovery ledger | `SYNAPSE_ACTION_RECOVERY_FILE` → daemon DB dir → `SYNAPSE_DB` → `%LOCALAPPDATA%\synapse\action_recovery.jsonl` | `synapse-action/recovery.rs` | JSONL of currently-held inputs for crash recovery (`action_recovery.jsonl`). | ephemeral |
 | Shell job logs | `%LOCALAPPDATA%\Synapse\shell-jobs` (and `\jobs`) | `m4.rs::shell_job_root_dir` | Durable `act_run_shell` job stdout/stderr/status. | ephemeral |
 | Shell sessions | `%LOCALAPPDATA%\Synapse\shell-sessions` | `m4.rs::shell_session_root_dir` | Per-session shell working dirs. | ephemeral |

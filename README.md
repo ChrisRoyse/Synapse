@@ -471,7 +471,12 @@ Install Synapse for me and wire it into my AI tools.
    real MCP client and confirm it returns { "ok": true, ... }. If an
    already-running Codex session still says `Transport closed`, restart Codex
    through the patched launcher; Windows cannot update that process environment
-   after it has started.
+   after it has started. If Codex has no Synapse MCP namespace at all but can
+   still run shell commands, run
+   `pwsh -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir <repo> -ObservedSynapseFacadeAbsent`.
+   The doctor fails closed on broken config/token/daemon state; when a fresh
+   production Codex probe can call real Synapse `health`, it writes a restart
+   handoff under `%LOCALAPPDATA%\synapse\codex-restart-handoffs`.
 
 I'm on Windows. Use the real absolute Cargo bin path, don't invent one, and tell
 me anything that needs my approval (e.g. installing the Rust toolchain).
