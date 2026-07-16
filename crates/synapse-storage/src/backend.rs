@@ -1295,8 +1295,29 @@ pub fn scan_cf_read_only(
     backend: StorageBackendKind,
     cf_name: &str,
 ) -> StorageResult<Vec<RawRow>> {
+    scan_cf_read_only_with_expired(path, schema_version, backend, cf_name, false)
+}
+
+/// Scans one storage column family without opening the backend for writes,
+/// optionally including expired Calyx rows retained in the physical vault.
+///
+/// # Errors
+///
+/// Returns a storage error when the backend cannot be opened read-only, the
+/// requested column family is not part of the Synapse schema, the schema
+/// sentinel is missing or mismatched, or the rows cannot be read.
+pub fn scan_cf_read_only_with_expired(
+    path: &Path,
+    schema_version: u32,
+    backend: StorageBackendKind,
+    cf_name: &str,
+    include_expired: bool,
+) -> StorageResult<Vec<RawRow>> {
     match backend {
         StorageBackendKind::RocksDb => scan_rocksdb_cf_read_only(path, schema_version, cf_name),
+        StorageBackendKind::Calyx if include_expired => {
+            scan_calyx_cf_read_only_including_expired(path, schema_version, cf_name)
+        }
         StorageBackendKind::Calyx => scan_calyx_cf_read_only(path, schema_version, cf_name),
     }
 }
@@ -1314,7 +1335,26 @@ pub fn dump_cf_read_only(
     backend: StorageBackendKind,
     cf_name: &str,
 ) -> StorageResult<StorageCfDump> {
-    let rows = scan_cf_read_only(path, schema_version, backend, cf_name)?;
+    dump_cf_read_only_with_expired(path, schema_version, backend, cf_name, false)
+}
+
+/// Builds a metadata-only dump of one storage column family without opening it
+/// for writes, optionally including expired Calyx rows retained in the physical vault.
+///
+/// # Errors
+///
+/// Returns a storage error when the backend cannot be opened read-only, the
+/// requested column family is not part of the Synapse schema, the schema
+/// sentinel is missing or mismatched, or the rows cannot be read.
+pub fn dump_cf_read_only_with_expired(
+    path: &Path,
+    schema_version: u32,
+    backend: StorageBackendKind,
+    cf_name: &str,
+    include_expired: bool,
+) -> StorageResult<StorageCfDump> {
+    let rows =
+        scan_cf_read_only_with_expired(path, schema_version, backend, cf_name, include_expired)?;
     let row_count = u64::try_from(rows.len()).map_err(|_error| StorageError::ReadFailed {
         cf_name: cf_name.to_owned(),
         detail: format!("storage dump row count does not fit in u64: {}", rows.len()),

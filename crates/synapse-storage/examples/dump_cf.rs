@@ -9,7 +9,7 @@
 //! surface.
 //!
 //! Usage:
-//! `cargo run -p synapse-storage --example dump_cf -- --backend <rocksdb|calyx> <db_path> <cf_name>`
+//! `cargo run -p synapse-storage --example dump_cf -- [--include-expired] --backend <rocksdb|calyx> <db_path> <cf_name>`
 
 use std::{
     error::Error,
@@ -18,12 +18,20 @@ use std::{
     path::Path,
 };
 
-use synapse_storage::{StorageBackendKind, dump_cf_read_only};
+use synapse_storage::{StorageBackendKind, dump_cf_read_only_with_expired};
 
-const USAGE: &str = "usage: dump_cf --backend <rocksdb|calyx> <db_path> <cf_name>";
+const USAGE: &str =
+    "usage: dump_cf [--include-expired] --backend <rocksdb|calyx> <db_path> <cf_name>";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    let include_expired = if args.first().is_some_and(|arg| arg == "--include-expired") {
+        args.remove(0);
+        true
+    } else {
+        false
+    };
+    let mut args = args.into_iter();
     let backend_flag = args.next().ok_or(USAGE)?;
     if backend_flag != "--backend" {
         return Err(format!("{USAGE}; got first argument {backend_flag:?}").into());
@@ -36,20 +44,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
     }
 
-    let dump = dump_cf_read_only(
+    let dump = dump_cf_read_only_with_expired(
         Path::new(&db_path),
         synapse_core::SCHEMA_VERSION,
         backend,
         &cf_name,
+        include_expired,
     )?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     if !write_stdout_line(
         &mut stdout,
         format_args!(
-            "dump_cf db_path={db_path} cf={} backend={} mode=read_only row_count={}",
+            "dump_cf db_path={db_path} cf={} backend={} mode=read_only include_expired={} row_count={}",
             dump.cf_name,
             dump.backend.as_str(),
+            include_expired,
             dump.row_count
         ),
     )? {

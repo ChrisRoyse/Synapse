@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 pub use backend::{
     CalyxVaultCollectionInspect, CalyxVaultInspect, STORAGE_METADATA_ONLY_REDACTION_POLICY,
     StorageBackendKind, StorageCfDump, StorageDumpRow, dump_cf_read_only,
-    inspect_calyx_vault_read_only, scan_cf_read_only,
+    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
+    scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
