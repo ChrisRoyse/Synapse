@@ -205,7 +205,9 @@ pub fn spawn_runner(runner: Arc<dyn GcRunner>, interval: Duration) -> StorageRes
     let state = Arc::new(GcTaskState::default());
     let task_state = Arc::clone(&state);
     let task = handle.spawn(async move {
-        let mut interval = tokio::time::interval(interval);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = interval.tick() => {

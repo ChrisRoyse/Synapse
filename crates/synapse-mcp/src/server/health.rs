@@ -56,13 +56,14 @@ fn storage_pressure_status(level: synapse_storage::DiskPressureLevel) -> String 
 
 fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -> Option<String> {
     let mut reasons = Vec::new();
+    let pressure_probe_active = storage_pressure_probe_active(readback);
     if readback.maintenance_supported && !readback.gc_task_running {
         reasons.push("storage GC task is not running".to_owned());
     }
     if !readback.pressure_task_running {
         reasons.push("storage pressure task is not running".to_owned());
     }
-    if !readback.pressure_probe.observed {
+    if !readback.pressure_probe.observed && !pressure_probe_active {
         reasons.push("storage pressure probe has not completed successfully".to_owned());
     }
     if readback.maintenance_supported
@@ -76,6 +77,32 @@ fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -
     (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
+fn storage_tick_active(started: Option<u64>, completed: Option<u64>) -> bool {
+    started.is_some_and(|started| completed.is_none_or(|completed| started > completed))
+}
+
+fn storage_gc_tick_active(readback: &crate::m3::StorageMaintenanceReadback) -> bool {
+    storage_tick_active(
+        readback.gc_task.last_started_unix_ms,
+        readback.gc_task.last_completed_unix_ms,
+    )
+}
+
+fn storage_pressure_probe_active(readback: &crate::m3::StorageMaintenanceReadback) -> bool {
+    storage_tick_active(
+        readback.pressure_probe.last_started_unix_ms,
+        readback.pressure_probe.last_completed_unix_ms,
+    )
+}
+
+fn storage_maintenance_active(readback: &crate::m3::StorageMaintenanceReadback) -> bool {
+    storage_gc_tick_active(readback) || storage_pressure_probe_active(readback)
+}
+
+fn calyx_health_cf_sizes_skipped_reason() -> String {
+    "calyx backend health skips scan-bound CF size estimates; use storage summary/inspect for explicit storage readback".to_owned()
+}
+
 fn apply_storage_maintenance_fields(
     health: &mut SubsystemHealth,
     readback: &crate::m3::StorageMaintenanceReadback,
@@ -83,7 +110,9 @@ fn apply_storage_maintenance_fields(
     health.storage_maintenance_supported = Some(readback.maintenance_supported);
     health.storage_maintenance_unsupported_reason = readback.unsupported_reason.clone();
     health.storage_gc_task_running = Some(readback.gc_task_running);
+    health.storage_gc_tick_active = Some(storage_gc_tick_active(readback));
     health.storage_pressure_task_running = Some(readback.pressure_task_running);
+    health.storage_pressure_probe_active = Some(storage_pressure_probe_active(readback));
     health.storage_pressure_probe_observed = Some(readback.pressure_probe.observed);
     health.storage_pressure_last_free_bytes = readback.pressure_probe.last_free_bytes;
     health.storage_pressure_last_level = readback
@@ -500,32 +529,47 @@ impl SynapseService {
                     if state.db.is_some() {
                         let maintenance_error = storage_maintenance_error(&maintenance);
                         let maintenance_unsupported = maintenance.unsupported_reason.clone();
-                        let cf_sizes = state.db.as_ref().and_then(|db| {
-                            db.cf_live_data_size_estimates()
-                                .ok()
-                                .map(|(sizes, _)| sizes)
-                        });
+                        let maintenance_active = storage_maintenance_active(&maintenance);
+                        let cf_sizes_skipped_reason =
+                            (storage_backend == "calyx").then(calyx_health_cf_sizes_skipped_reason);
+                        let cf_sizes = if cf_sizes_skipped_reason.is_some() {
+                            None
+                        } else {
+                            state.db.as_ref().and_then(|db| {
+                                db.cf_live_data_size_estimates()
+                                    .ok()
+                                    .map(|(sizes, _)| sizes)
+                            })
+                        };
                         let mut health = SubsystemHealth {
                             status: if maintenance_error.is_some() {
                                 "error".to_owned()
                             } else if maintenance_unsupported.is_some() {
                                 "maintenance_unsupported".to_owned()
+                            } else if maintenance_active {
+                                "maintenance".to_owned()
                             } else {
                                 "ok".to_owned()
                             },
-                            detail: Some(match (maintenance_error, maintenance_unsupported) {
-                                (Some(error), _) => format!(
+                            detail: Some(match (
+                                maintenance_error,
+                                maintenance_unsupported,
+                                maintenance_active,
+                            ) {
+                                (Some(error), _, _) => format!(
                                     "storage opened at daemon startup (reflex runtime idle); maintenance unhealthy: {error}"
                                 ),
-                                (None, Some(reason)) => format!(
+                                (None, Some(reason), _) => format!(
                                     "storage opened at daemon startup (reflex runtime idle); maintenance unsupported for this backend: {reason}"
                                 ),
-                                (None, None) => "storage opened at daemon startup (reflex runtime idle); maintenance tasks running and pressure probe observed".to_owned(),
+                                (None, None, true) => "storage opened at daemon startup (reflex runtime idle); maintenance tick active; health skipped scan-bound CF size readback".to_owned(),
+                                (None, None, false) => "storage opened at daemon startup (reflex runtime idle); maintenance tasks running and pressure probe observed".to_owned(),
                             }),
                             db_path,
                             storage_backend: Some(storage_backend),
                             schema_version: Some(synapse_core::SCHEMA_VERSION),
                             cf_sizes,
+                            storage_cf_sizes_skipped_reason: cf_sizes_skipped_reason,
                             ..SubsystemHealth::default()
                         };
                         apply_storage_maintenance_fields(&mut health, &maintenance);
@@ -542,49 +586,68 @@ impl SynapseService {
                     return health;
                 };
                 match runtime.lock() {
-                    Ok(runtime) => match runtime.storage_cf_live_data_size_estimates() {
-                        Ok(cf_sizes) => {
-                            let maintenance_error = storage_maintenance_error(&maintenance);
-                            let maintenance_unsupported = maintenance.unsupported_reason.clone();
-                            let mut health = SubsystemHealth {
-                                status: if maintenance_error.is_some() {
-                                    "error".to_owned()
-                                } else if maintenance_unsupported.is_some() {
-                                    "maintenance_unsupported".to_owned()
-                                } else {
-                                    storage_pressure_status(runtime.storage_pressure_level())
-                                },
-                                detail: Some(match (maintenance_error, maintenance_unsupported) {
-                                    (Some(error), _) => format!(
-                                    "storage runtime initialized; cf_sizes use backend metrics; maintenance unhealthy: {error}"
-                                    ),
-                                    (None, Some(reason)) => format!(
-                                        "storage runtime initialized; maintenance unsupported for this backend: {reason}"
-                                    ),
-                                    (None, None) => "storage runtime initialized; cf_sizes use backend metrics; maintenance tasks running and pressure probe observed".to_owned(),
-                                }),
-                                db_path: Some(runtime.storage_path().display().to_string()),
-                                storage_backend: Some(runtime.storage_backend_name().to_owned()),
-                                schema_version: Some(runtime.schema_version()),
-                                cf_sizes: Some(cf_sizes.0),
-                                ..SubsystemHealth::default()
-                            };
-                            apply_storage_maintenance_fields(&mut health, &maintenance);
-                            health
-                        }
-                        Err(error) => {
-                            let mut health = SubsystemHealth {
-                                status: "error".to_owned(),
-                                detail: Some(error.to_string()),
-                                db_path: Some(runtime.storage_path().display().to_string()),
-                                storage_backend: Some(runtime.storage_backend_name().to_owned()),
-                                schema_version: Some(runtime.schema_version()),
-                                ..SubsystemHealth::default()
-                            };
-                            apply_storage_maintenance_fields(&mut health, &maintenance);
-                            health
-                        }
-                    },
+                    Ok(runtime) => {
+                        let runtime_backend = runtime.storage_backend_name().to_owned();
+                        let runtime_db_path = runtime.storage_path().display().to_string();
+                        let runtime_schema_version = runtime.schema_version();
+                        let maintenance_error = storage_maintenance_error(&maintenance);
+                        let maintenance_unsupported = maintenance.unsupported_reason.clone();
+                        let maintenance_active = storage_maintenance_active(&maintenance);
+                        let cf_sizes_skipped_reason =
+                            (runtime_backend == "calyx").then(calyx_health_cf_sizes_skipped_reason);
+                        let cf_sizes = if cf_sizes_skipped_reason.is_some() {
+                            None
+                        } else {
+                            match runtime.storage_cf_live_data_size_estimates() {
+                                Ok((sizes, _warnings)) => Some(sizes),
+                                Err(error) => {
+                                    let mut health = SubsystemHealth {
+                                        status: "error".to_owned(),
+                                        detail: Some(error.to_string()),
+                                        db_path: Some(runtime_db_path),
+                                        storage_backend: Some(runtime_backend),
+                                        schema_version: Some(runtime_schema_version),
+                                        ..SubsystemHealth::default()
+                                    };
+                                    apply_storage_maintenance_fields(&mut health, &maintenance);
+                                    return health;
+                                }
+                            }
+                        };
+                        let mut health = SubsystemHealth {
+                            status: if maintenance_error.is_some() {
+                                "error".to_owned()
+                            } else if maintenance_unsupported.is_some() {
+                                "maintenance_unsupported".to_owned()
+                            } else if maintenance_active {
+                                "maintenance".to_owned()
+                            } else {
+                                storage_pressure_status(runtime.storage_pressure_level())
+                            },
+                            detail: Some(match (
+                                maintenance_error,
+                                maintenance_unsupported,
+                                maintenance_active,
+                            ) {
+                                (Some(error), _, _) => format!(
+                                    "storage runtime initialized; maintenance unhealthy: {error}"
+                                ),
+                                (None, Some(reason), _) => format!(
+                                    "storage runtime initialized; maintenance unsupported for this backend: {reason}"
+                                ),
+                                (None, None, true) => "storage runtime initialized; maintenance tick active; health skipped scan-bound CF size readback".to_owned(),
+                                (None, None, false) => "storage runtime initialized; cf_sizes use backend metrics; maintenance tasks running and pressure probe observed".to_owned(),
+                            }),
+                            db_path: Some(runtime_db_path),
+                            storage_backend: Some(runtime_backend),
+                            schema_version: Some(runtime_schema_version),
+                            cf_sizes,
+                            storage_cf_sizes_skipped_reason: cf_sizes_skipped_reason,
+                            ..SubsystemHealth::default()
+                        };
+                        apply_storage_maintenance_fields(&mut health, &maintenance);
+                        health
+                    }
                     Err(_err) => {
                         let mut health = SubsystemHealth {
                             status: "error".to_owned(),

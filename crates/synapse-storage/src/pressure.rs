@@ -267,7 +267,11 @@ fn spawn_with_probe(
         })?;
     let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = handle.spawn(async move {
-        let mut interval = tokio::time::interval(config.interval);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + config.interval,
+            config.interval,
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = interval.tick() => {

@@ -47,9 +47,15 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cf_sizes: Option<BTreeMap<String, u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_cf_sizes_skipped_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_task_running: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_tick_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_task_running: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_probe_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_probe_observed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

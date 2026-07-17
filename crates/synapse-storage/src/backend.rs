@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -974,9 +974,10 @@ impl StorageBackend for CalyxBackend {
                 .into_iter()
                 .map(|(key, value)| calyx_put_row(cf_name, collection_id, &key, &value, now_ms))
                 .collect::<StorageResult<Vec<_>>>()?;
-            preflight_calyx_retention_for_cf(vault, cf_name, collection_id, now_ms)?;
-            commit_calyx_rows_to_vault(vault, cf_name, rows)?;
-            enforce_calyx_retention_for_cf(vault, cf_name, now_ms)
+            // Retention scans and cap eviction are GC work. Keeping foreground
+            // writes bounded prevents MCP handshakes from inheriting large-CF
+            // maintenance latency.
+            commit_calyx_rows_to_vault(vault, cf_name, rows)
         })
     }
 
@@ -1017,12 +1018,8 @@ impl StorageBackend for CalyxBackend {
             |vault| {
                 let now_ms = calyx_clock_now_for_write(vault, "<multi-cf>")?;
                 let mut writes = Vec::new();
-                let mut affected_cfs = BTreeSet::new();
                 for (cf_name, rows) in batches {
                     let collection_id = calyx_collection_id_for_cf_write(&cf_name)?;
-                    if !rows.is_empty() {
-                        affected_cfs.insert(cf_name.clone());
-                    }
                     for (key, value) in rows {
                         writes.push(calyx_put_row(
                             &cf_name,
@@ -1033,19 +1030,7 @@ impl StorageBackend for CalyxBackend {
                         )?);
                     }
                 }
-                for cf_name in &affected_cfs {
-                    preflight_calyx_retention_for_cf(
-                        vault,
-                        cf_name,
-                        calyx_collection_id_for_cf_write(cf_name)?,
-                        now_ms,
-                    )?;
-                }
-                commit_calyx_rows_to_vault(vault, "<multi-cf>", writes)?;
-                for cf_name in affected_cfs {
-                    enforce_calyx_retention_for_cf(vault, &cf_name, now_ms)?;
-                }
-                Ok(())
+                commit_calyx_rows_to_vault(vault, "<multi-cf>", writes)
             },
         )
     }
@@ -1082,14 +1067,7 @@ impl StorageBackend for CalyxBackend {
             for (key, value) in puts {
                 rows.push(calyx_put_row(cf_name, collection_id, &key, &value, now_ms)?);
             }
-            if put_count > 0 {
-                preflight_calyx_retention_for_cf(vault, cf_name, collection_id, now_ms)?;
-            }
-            commit_calyx_rows_to_vault(vault, cf_name, rows)?;
-            if put_count == 0 {
-                return Ok(());
-            }
-            enforce_calyx_retention_for_cf(vault, cf_name, now_ms)
+            commit_calyx_rows_to_vault(vault, cf_name, rows)
         })
     }
 
@@ -2165,16 +2143,6 @@ fn checked_calyx_payload_add(cf_name: &str, left: usize, right: usize) -> Storag
     })
 }
 
-fn preflight_calyx_retention_for_cf(
-    vault: &SynapseCalyxVault,
-    cf_name: &str,
-    collection_id: u64,
-    now_ms: u64,
-) -> StorageResult<()> {
-    let protected = calyx_cf_protected_from_auto_delete(cf_name);
-    collect_calyx_retention_state(vault, cf_name, collection_id, now_ms, protected).map(|_| ())
-}
-
 fn calyx_clock_now_for_read(vault: &SynapseCalyxVault, cf_name: &str) -> StorageResult<u64> {
     vault
         .clock_now_ms()
@@ -2224,20 +2192,6 @@ struct CalyxRetentionState {
     tombstones: Vec<SynapseCalyxCfWrite>,
     before_live_bytes: u64,
     expired_rows: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CalyxRetentionCaps {
-    soft_cap_bytes: u64,
-    hard_cap_bytes: u64,
-    protected: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CalyxRetentionOutcome {
-    after_live_bytes: u64,
-    cap_evicted_rows: u64,
-    hard_cap_reached: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2584,49 +2538,6 @@ fn emit_calyx_gc_eviction_metric(
     );
 }
 
-fn enforce_calyx_retention_for_cf(
-    vault: &SynapseCalyxVault,
-    cf_name: &str,
-    now_ms: u64,
-) -> StorageResult<()> {
-    let retention = calyx_retention_default_for_write(cf_name)?;
-    let (soft_cap_bytes, hard_cap_bytes) = calyx_retention_cap_bytes_for_write(retention)?;
-    let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
-    let caps = CalyxRetentionCaps {
-        soft_cap_bytes,
-        hard_cap_bytes,
-        protected: calyx_cf_protected_from_auto_delete(cf_name),
-    };
-    let mut state =
-        collect_calyx_retention_state(vault, cf_name, collection_id, now_ms, caps.protected)?;
-    let hard_cap_reached = log_calyx_hard_cap_if_reached(
-        cf_name,
-        state.before_live_bytes,
-        caps.soft_cap_bytes,
-        caps.hard_cap_bytes,
-        caps.protected,
-    );
-    let (after_live_bytes, cap_evicted_rows) = apply_calyx_cap_eviction(
-        cf_name,
-        &mut state,
-        caps.soft_cap_bytes,
-        caps.hard_cap_bytes,
-        caps.protected,
-    )?;
-    let outcome = CalyxRetentionOutcome {
-        after_live_bytes,
-        cap_evicted_rows,
-        hard_cap_reached,
-    };
-
-    if !state.tombstones.is_empty() {
-        let tombstones = std::mem::take(&mut state.tombstones);
-        commit_calyx_rows_to_vault(vault, cf_name, tombstones)?;
-    }
-    emit_calyx_retention_enforced(cf_name, &state, caps, outcome);
-    Ok(())
-}
-
 fn collect_calyx_retention_state(
     vault: &SynapseCalyxVault,
     cf_name: &str,
@@ -2699,122 +2610,6 @@ fn collect_calyx_retention_state(
         });
     }
     Ok(state)
-}
-
-fn log_calyx_hard_cap_if_reached(
-    cf_name: &str,
-    before_live_bytes: u64,
-    soft_cap_bytes: u64,
-    hard_cap_bytes: u64,
-    protected: bool,
-) -> bool {
-    let hard_cap_reached = before_live_bytes >= hard_cap_bytes;
-    if hard_cap_reached {
-        tracing::warn!(
-            code = error_codes::STORAGE_CF_HARD_CAP_REACHED,
-            cf = cf_name,
-            before_live_bytes,
-            soft_cap_bytes,
-            hard_cap_bytes,
-            protected,
-            "Calyx retention hard cap reached"
-        );
-    }
-    hard_cap_reached
-}
-
-fn apply_calyx_cap_eviction(
-    cf_name: &str,
-    state: &mut CalyxRetentionState,
-    soft_cap_bytes: u64,
-    hard_cap_bytes: u64,
-    protected: bool,
-) -> StorageResult<(u64, u64)> {
-    let before_live_bytes = state.before_live_bytes;
-    let mut after_live_bytes = state.before_live_bytes;
-    let mut cap_evicted_rows = 0_u64;
-    if protected && before_live_bytes > soft_cap_bytes {
-        tracing::warn!(
-            code = "STORAGE_CALYX_RETENTION_PROTECTED_CAP_SKIPPED",
-            cf = cf_name,
-            before_live_bytes,
-            soft_cap_bytes,
-            hard_cap_bytes,
-            "Calyx retention skipped cap eviction for protected operator-owned column family"
-        );
-    } else if before_live_bytes > soft_cap_bytes {
-        state.live_entries.sort_by(|left, right| {
-            left.written_at_ms
-                .cmp(&right.written_at_ms)
-                .then_with(|| left.user_key.cmp(&right.user_key))
-        });
-        for entry in state.live_entries.drain(..) {
-            if after_live_bytes <= soft_cap_bytes {
-                break;
-            }
-            after_live_bytes = after_live_bytes.checked_sub(entry.live_bytes).ok_or_else(|| {
-                calyx_write_failed_detail(
-                    cf_name,
-                    format!(
-                        "Calyx retention byte accounting underflow while evicting {} bytes from {cf_name}",
-                        entry.live_bytes
-                    ),
-                )
-            })?;
-            state.tombstones.push(SynapseCalyxCfWrite::new(
-                ColumnFamily::Kv,
-                entry.full_key,
-                tombstone_value(),
-            ));
-            cap_evicted_rows = cap_evicted_rows.saturating_add(1);
-        }
-        if before_live_bytes > hard_cap_bytes && after_live_bytes > hard_cap_bytes {
-            let detail = format!(
-                "Calyx retention could not reduce {cf_name} below hard cap: before_live_bytes={before_live_bytes} after_live_bytes={after_live_bytes} hard_cap_bytes={hard_cap_bytes}"
-            );
-            tracing::error!(
-                code = error_codes::STORAGE_WRITE_FAILED,
-                cf = cf_name,
-                before_live_bytes,
-                after_live_bytes,
-                hard_cap_bytes,
-                detail,
-                "Calyx retention hard cap enforcement failed"
-            );
-            return Err(calyx_write_failed_detail(cf_name, detail));
-        }
-    }
-    Ok((after_live_bytes, cap_evicted_rows))
-}
-
-fn emit_calyx_retention_enforced(
-    cf_name: &str,
-    state: &CalyxRetentionState,
-    caps: CalyxRetentionCaps,
-    outcome: CalyxRetentionOutcome,
-) {
-    if state.expired_rows > 0 || outcome.cap_evicted_rows > 0 || outcome.hard_cap_reached {
-        tracing::info!(
-            code = "STORAGE_CALYX_RETENTION_ENFORCED",
-            cf = cf_name,
-            expired_rows = state.expired_rows,
-            cap_evicted_rows = outcome.cap_evicted_rows,
-            before_live_bytes = state.before_live_bytes,
-            after_live_bytes = outcome.after_live_bytes,
-            soft_cap_bytes = caps.soft_cap_bytes,
-            hard_cap_bytes = caps.hard_cap_bytes,
-            protected = caps.protected,
-            "Calyx retention enforcement completed"
-        );
-    }
-    if outcome.cap_evicted_rows > 0 {
-        synapse_telemetry::metrics::counter!(
-            "cache_evictions_total",
-            "cf" => cf_name.to_owned(),
-            "reason" => "soft_cap"
-        )
-        .increment(outcome.cap_evicted_rows);
-    }
 }
 
 fn calyx_retention_default_for_write(cf_name: &str) -> StorageResult<RetentionDefault> {

@@ -1872,42 +1872,32 @@ pub(super) async fn serve(
     let m3_state_for_recorder = service.m3_state_handle();
     let m2_emitter_owner = take_m2_emitter_owner(&service);
 
-    // Eager storage open + maintenance startup: validate RocksDB and retain the
-    // periodic GC/pressure task handles before serving any MCP request, so a
-    // lock/schema/task/probe fault fails fast instead of reporting healthy
-    // storage while retention is inert. The handle is cached and reused by the
-    // reflex runtime, so there is no open-then-reopen race. The Calyx vault is
-    // opened in the same transaction so health never serves a silent no-vault
-    // daemon when the configured durable vault is unavailable.
+    // Eager storage and Calyx vault open: validate lock/schema/vault state
+    // before any MCP request can be served. Periodic maintenance is started
+    // after the recorder/router startup preflights below, otherwise its first
+    // Calyx GC tick can hold the vault and block those preflights before the
+    // HTTP server becomes reachable.
     {
-        let open_or_maintenance_result = match m3_state_for_recorder.lock() {
-            Ok(mut state) => Some(
-                state
-                    .ensure_storage()
-                    .map_err(anyhow::Error::new)
-                    .and_then(|_| {
-                        state
-                            .ensure_storage_maintenance_tasks()
-                            .map_err(anyhow::Error::new)
-                    })
-                    .and_then(|_| {
-                        let status = state.ensure_calyx_vault().map_err(anyhow::Error::new)?;
-                        crate::m3::record_calyx_vault_status_event(&status, "opened")?;
-                        Ok(())
-                    }),
-            ),
+        let open_result = match m3_state_for_recorder.lock() {
+            Ok(mut state) => Some(state.ensure_storage().map_err(anyhow::Error::new).and_then(
+                |_| {
+                    let status = state.ensure_calyx_vault().map_err(anyhow::Error::new)?;
+                    crate::m3::record_calyx_vault_status_event(&status, "opened")?;
+                    Ok(())
+                },
+            )),
             Err(poisoned) => {
                 drop(poisoned);
                 None
             }
         };
-        let Some(open_or_maintenance_result) = open_or_maintenance_result else {
+        let Some(open_result) = open_result else {
             drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_state_lock",
                     anyhow::anyhow!(
-                        "m3 service state lock poisoned during startup storage/Calyx open/maintenance"
+                        "m3 service state lock poisoned during startup storage/Calyx open"
                     ),
                     Vec::new(),
                     None,
@@ -1924,7 +1914,7 @@ pub(super) async fn serve(
             )
             .await;
         };
-        if let Err(error) = open_or_maintenance_result {
+        if let Err(error) = open_result {
             let detail = format!("{error:#}");
             if detail.to_lowercase().contains("lock") {
                 tracing::error!(
@@ -1935,16 +1925,16 @@ pub(super) async fn serve(
                 );
             } else {
                 tracing::error!(
-                    code = "STORAGE_OR_CALYX_OPEN_OR_MAINTENANCE_START_FAILED",
+                    code = "STORAGE_OR_CALYX_OPEN_START_FAILED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: storage open/maintenance or Calyx vault startup failed at daemon startup"
+                    "refusing to start: storage open or Calyx vault startup failed at daemon startup"
                 );
             }
             drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
-                    "storage_or_calyx_open_or_maintenance_start",
+                    "storage_or_calyx_open_start",
                     anyhow::anyhow!(detail),
                     Vec::new(),
                     None,
@@ -1964,7 +1954,7 @@ pub(super) async fn serve(
         tracing::info!(
             code = "MCP_DAEMON_STORAGE_AND_CALYX_OPENED",
             db_path = %db_path.display(),
-            "daemon storage opened eagerly, storage maintenance started, and Calyx vault opened at startup"
+            "daemon storage and Calyx vault opened eagerly at startup"
         );
     }
 
@@ -2067,6 +2057,76 @@ pub(super) async fn serve(
             .await;
         }
     };
+
+    {
+        let maintenance_result = match m3_state_for_recorder.lock() {
+            Ok(mut state) => Some(
+                state
+                    .ensure_storage_maintenance_tasks()
+                    .map_err(anyhow::Error::new),
+            ),
+            Err(poisoned) => {
+                drop(poisoned);
+                None
+            }
+        };
+        let Some(maintenance_result) = maintenance_result else {
+            drop(listener);
+            return fail_http_startup_after_service(
+                HttpRuntimeStartupFailure::new(
+                    "storage_maintenance_state_lock",
+                    anyhow::anyhow!(
+                        "m3 service state lock poisoned during startup storage maintenance start"
+                    ),
+                    background_tasks,
+                    operator_hotkey_guard,
+                ),
+                service,
+                m3_state_for_recorder,
+                m2_emitter_owner,
+                true,
+                true,
+                shutdown_cancel,
+                connection_closed_cancel,
+                shell_job_store_lock_guard,
+                single_instance_guard,
+            )
+            .await;
+        };
+        if let Err(error) = maintenance_result {
+            let detail = format!("{error:#}");
+            tracing::error!(
+                code = "STORAGE_MAINTENANCE_START_FAILED_AFTER_HTTP_READY_PREREQS",
+                db_path = %db_path.display(),
+                detail = %detail,
+                "refusing to start: storage maintenance failed after HTTP readiness prerequisites completed"
+            );
+            drop(listener);
+            return fail_http_startup_after_service(
+                HttpRuntimeStartupFailure::new(
+                    "storage_maintenance_start_after_http_ready_prereqs",
+                    anyhow::anyhow!(detail),
+                    background_tasks,
+                    operator_hotkey_guard,
+                ),
+                service,
+                m3_state_for_recorder,
+                m2_emitter_owner,
+                true,
+                true,
+                shutdown_cancel,
+                connection_closed_cancel,
+                shell_job_store_lock_guard,
+                single_instance_guard,
+            )
+            .await;
+        }
+        tracing::info!(
+            code = "MCP_DAEMON_STORAGE_MAINTENANCE_STARTED_AFTER_HTTP_READY_PREREQS",
+            db_path = %db_path.display(),
+            "daemon storage maintenance started after HTTP readiness prerequisites completed"
+        );
+    }
     let m2_emitter_done = m2_emitter_owner.done_receiver();
 
     tracing::info!(
