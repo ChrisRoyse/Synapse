@@ -2019,6 +2019,11 @@ pub(super) async fn serve(
     // preflights below, otherwise its first Calyx GC tick can hold the vault and
     // block those preflights before the HTTP server becomes reachable.
     {
+        tracing::info!(
+            code = "MCP_DAEMON_STORAGE_AND_CALYX_OPEN_START",
+            db_path = %db_path.display(),
+            "daemon storage and Calyx vault eager startup open starting"
+        );
         let open_result = match m3_state_for_recorder.lock() {
             Ok(mut state) => Some(state.ensure_storage().map_err(anyhow::Error::new).and_then(
                 |_| {

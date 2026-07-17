@@ -127,6 +127,13 @@
   ACK. "force_unacknowledged" returns an explicit unacknowledged-pause
   diagnostic after reading /health so the rollback branch can be physically
   exercised without waiting for a random bridge outage.
+
+.PARAMETER InstallHealthTimeoutSeconds
+  Seconds to wait for the installed daemon to answer /health after the scheduled
+  task starts it. Defaults to 600 because the live Calyx-backed database can
+  spend several minutes in startup preflights before the HTTP listener is bound.
+  Setup still fails closed after the deadline and prints process/socket/startup
+  log readbacks before rollback.
 #>
 [CmdletBinding()]
 param(
@@ -150,6 +157,8 @@ param(
     [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
     [string]$AllowedPermissions = $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS,
+    [ValidateRange(60, 3600)]
+    [int]$InstallHealthTimeoutSeconds = 600,
     [switch]$ManualInstallHealthRollbackProbe,
     [ValidateSet('normal','require_active_ack','force_unacknowledged')]
     [string]$ManualInstallHealthRollbackPauseMode = 'normal',
@@ -1934,6 +1943,29 @@ function Get-SynapseRustToolchainReadback {
     }
 }
 
+function Set-SynapseReleaseBuildCompilerEnvironment {
+    $minimumRustStack = 8 * 1024 * 1024
+    $existing = $env:RUST_MIN_STACK
+    $effective = $minimumRustStack
+    $source = 'synapse_setup_default'
+    if (-not [string]::IsNullOrWhiteSpace($existing)) {
+        $parsed = 0L
+        if ([Int64]::TryParse($existing, [ref]$parsed) -and $parsed -ge $minimumRustStack) {
+            $effective = $parsed
+            $source = 'preexisting_env'
+        } else {
+            $source = 'raised_by_synapse_setup'
+        }
+    }
+    $env:RUST_MIN_STACK = [string]$effective
+    return [pscustomobject]@{
+        schema = 'synapse_setup_release_build_compiler_environment/v1'
+        rust_min_stack = $env:RUST_MIN_STACK
+        rust_min_stack_source = $source
+        rust_min_stack_minimum = $minimumRustStack
+    }
+}
+
 function Get-SynapseReleaseBuildFailureKind {
     param(
         [Parameter(Mandatory=$true)]$Diagnostics,
@@ -2649,6 +2681,73 @@ function Format-SynapseTcpBindListenerSnapshot {
     }
     return (($Snapshot | ForEach-Object {
         "state=$($_.State) local=$($_.LocalAddress):$($_.LocalPort) owner_pid=$($_.OwningProcess) owner_exists=$($_.OwnerExists) owner=$($_.OwnerName) created=$($_.CreationTime) owner_cmd=$($_.OwnerCommandLine)"
+    }) -join "`n")
+}
+
+function Get-SynapseDaemonStartupLogSignal {
+    param(
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [int]$TailLines = 1600,
+        [int]$MaxMatches = 24
+    )
+
+    $patterns = @(
+        'MCP_CLI_PARSED',
+        'MCP_DAEMON_SINGLE_INSTANCE_ACQUIRED',
+        'MCP_DAEMON_SHELL_JOB_STORE_LOCK_ACQUIRED',
+        'MCP_DAEMON_LIFECYCLE_READY',
+        'M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY',
+        'M4_SHELL_JOB_REAP_STARTUP',
+        'MCP_DAEMON_STORAGE_AND_CALYX_OPEN_START',
+        'SYNAPSE_CALYX_MATH_BACKEND_SELECTED',
+        'SYNAPSE_CALYX_VAULT_OPENED',
+        'STORAGE_BACKEND_OPENED',
+        'MCP_DAEMON_STORAGE_AND_CALYX_OPENED',
+        'TIMELINE_RECORDER_STARTED',
+        'MCP_DAEMON_ACTIVITY_RECORDER_STARTED',
+        'MCP_HTTP_BIND_NORMAL',
+        'MCP_HTTP_BIND_FAILED',
+        'refusing to start'
+    )
+    $pattern = ($patterns | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $paths = @(Get-ChildItem -LiteralPath $LogDir -Filter 'synapse.log*' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 2)
+    $matches = @()
+    foreach ($path in $paths) {
+        $lines = @(Get-Content -LiteralPath $path.FullName -Tail $TailLines -ErrorAction SilentlyContinue |
+            Select-String -Pattern $pattern -ErrorAction SilentlyContinue |
+            Select-Object -Last $MaxMatches)
+        foreach ($line in $lines) {
+            $text = [string]$line.Line
+            if ($text.Length -gt 900) {
+                $text = $text.Substring(0, 900) + '...<truncated>'
+            }
+            $matches += [pscustomobject]@{
+                path = $path.FullName
+                line = $text
+            }
+        }
+    }
+    if ($matches.Count -gt $MaxMatches) {
+        $matches = @($matches | Select-Object -Last $MaxMatches)
+    }
+    return [pscustomobject]@{
+        schema = 'synapse_daemon_startup_log_signal/v1'
+        log_dir = $LogDir
+        files_scanned = @($paths | Select-Object -ExpandProperty FullName)
+        matches = @($matches)
+    }
+}
+
+function Format-SynapseDaemonStartupLogSignal {
+    param([AllowNull()]$Signal)
+
+    if (-not $Signal -or -not $Signal.matches -or @($Signal.matches).Count -eq 0) {
+        return '<none>'
+    }
+    return ((@($Signal.matches) | ForEach-Object {
+        "path=$($_.path) line=$($_.line)"
     }) -join "`n")
 }
 
@@ -7161,6 +7260,10 @@ Set-SynapseCudaBuildEnvironment
 
 if (-not $SkipBuild) {
     Step "Building synapse-mcp (release) from $SourceDir"
+    $releaseBuildCompilerEnvironment = Set-SynapseReleaseBuildCompilerEnvironment
+    Info ("Release build compiler environment: RUST_MIN_STACK={0} source={1}" -f `
+        $releaseBuildCompilerEnvironment.rust_min_stack,
+        $releaseBuildCompilerEnvironment.rust_min_stack_source)
     if (-not $PSBoundParameters.ContainsKey('CargoTarget')) {
         # Key the persistent target by the source checkout so two checkouts
         # can never share (and poison) one fingerprint database. Cargo
@@ -7249,6 +7352,7 @@ if (-not $SkipBuild) {
             build_exit = $buildExit
             remediation = $failureKind.remediation
             diagnostics_archive = $buildDiagnosticsArchivePath
+            compiler_environment = $releaseBuildCompilerEnvironment
             invocation = $buildInvocationDiagnostics
             log_signal = $buildLogSignal
             artifact_readback = $artifactReadback
@@ -7617,9 +7721,11 @@ $ok = $false
 $healthPid = $null
 $lastHealthError = $null
 $lastHealthSubsystemStatuses = '<none>'
-$installHealthTimeoutSeconds = 180
+$installHealthTimeoutSeconds = $InstallHealthTimeoutSeconds
 if ($ManualInstallHealthRollbackProbe) {
     Info "Manual install-health rollback probe using production candidate health timeout seconds=$installHealthTimeoutSeconds"
+} else {
+    Info "Installed daemon health timeout seconds=$installHealthTimeoutSeconds"
 }
 $installHealthDeadline = (Get-Date).AddSeconds($installHealthTimeoutSeconds)
 $installHealthAttempt = 0
@@ -7669,21 +7775,36 @@ while ((Get-Date) -lt $installHealthDeadline) {
         $lastHealthError = $_.Exception.Message
         Info "WARN: daemon /health not ready yet attempt=$installHealthAttempt timeout_s=$healthTimeoutSec remaining_s=$remainingSeconds error=$lastHealthError"
     }
+    if (-not $ok -and ($installHealthAttempt -eq 1 -or ($installHealthAttempt % 15) -eq 0)) {
+        $progressListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $progressProcesses = @(Get-SynapseMcpProcessSnapshot)
+        $progressStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir
+        Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS attempt={0} remaining_s={1} last_health_error={2}`nlisteners:`n{3}`nprocesses:`n{4}`nstartup_log:`n{5}" -f `
+            $installHealthAttempt,
+            $remainingSeconds,
+            ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $progressListeners),
+            (Format-SynapseMcpProcessSnapshot -Snapshot $progressProcesses),
+            (Format-SynapseDaemonStartupLogSignal -Signal $progressStartupLog))
+    }
 }
 if (-not $ok) {
     $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} last_health_error={4} last_subsystem_statuses={5} manual_probe={6} manual_probe_pause_mode={7}`nlisteners:`n{8}`nprocesses:`n{9}`nremediation=inspect {10} and synapse.log.* under {11} for launch / STORAGE_* / bind errors" -f `
+    $failureStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} last_health_error={5} last_subsystem_statuses={6} manual_probe={7} manual_probe_pause_mode={8}`nlisteners:`n{9}`nprocesses:`n{10}`nstartup_log:`n{11}`nremediation=inspect {12} and synapse.log.* under {13} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
         ($(if ($backupPath) { $backupPath } else { '<none>' })),
+        $installHealthTimeoutSeconds,
         ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
         $lastHealthSubsystemStatuses,
         $ManualInstallHealthRollbackProbe,
         $ManualInstallHealthRollbackPauseMode,
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
+        (Format-SynapseDaemonStartupLogSignal -Signal $failureStartupLog),
         $launcherLog,
         $LogDir)
 
@@ -7730,7 +7851,7 @@ if (-not $ok) {
         $rollbackHealth = $null
         $rollbackLastHealthError = $null
         $rollbackLastSubsystemStatuses = '<none>'
-        $rollbackHealthDeadline = (Get-Date).AddSeconds(180)
+        $rollbackHealthDeadline = (Get-Date).AddSeconds($installHealthTimeoutSeconds)
         $rollbackHealthAttempt = 0
         while ((Get-Date) -lt $rollbackHealthDeadline) {
             $rollbackHealthAttempt++
