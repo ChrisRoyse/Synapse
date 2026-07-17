@@ -5,8 +5,8 @@ use calyx_core::{
     AbsentReason, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens, Modality, SlotId,
     SlotVector, VaultId,
 };
-use calyx_registry::measure::{absent, input_hash};
-use calyx_registry::runtime::algorithmic::AlgorithmicLens;
+use calyx_lenses::AlgorithmicLens;
+use calyx_lenses::measure::{absent, input_hash};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};

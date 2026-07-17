@@ -444,6 +444,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "calyx-lenses"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-core",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "calyx-lodestar"
 version = "0.1.0"
 dependencies = [
