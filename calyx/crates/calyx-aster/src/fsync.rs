@@ -33,6 +33,15 @@ pub(crate) fn write_atomic(
         .parent()
         .ok_or_else(|| durable_error(label, "resolve parent", path, None, 0))?;
     create_dir_all(parent, label)?;
+    if mode == PublishMode::CreateNew
+        && matches!(
+            create_new_target_state(path, bytes, label, "preflight")?,
+            CreateNewTargetState::Identical
+        )
+    {
+        sync_parent(path, label)?;
+        return Ok(());
+    }
     let temp = temp_path(path)?;
     let result = (|| {
         let mut file = open_create_new(&temp, label, "create atomic temp")?;
@@ -41,20 +50,32 @@ pub(crate) fn write_atomic(
         file.sync_all()
             .map_err(|error| durable_error(label, "fsync atomic temp", &temp, Some(error), 0))?;
         drop(file);
-        publish_path(&temp, path, label, mode)?;
+        match publish_path(&temp, path, label, mode) {
+            Ok(()) => {}
+            Err(error) if mode == PublishMode::CreateNew => {
+                match create_new_target_state(path, bytes, label, "post-publish")? {
+                    CreateNewTargetState::Identical => {
+                        tracing::warn!(
+                            label,
+                            path = %path.display(),
+                            temp_path = %temp.display(),
+                            original_error_code = error.code,
+                            original_error = %error.message,
+                            "create-new durable target already contains identical bytes after publish failure; accepting idempotent recovered publish"
+                        );
+                        cleanup_unpublished_temp(&temp, label);
+                        sync_parent(path, label)?;
+                        return Ok(());
+                    }
+                    CreateNewTargetState::Missing => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
         sync_parent(path, label)
     })();
-    if result.is_err()
-        && let Err(cleanup) = fs::remove_file(&temp)
-        && cleanup.kind() != io::ErrorKind::NotFound
-    {
-        tracing::error!(
-            label,
-            path = %temp.display(),
-            kind = ?cleanup.kind(),
-            os_error = cleanup.raw_os_error(),
-            "failed to remove unpublished durable temp file"
-        );
+    if result.is_err() {
+        cleanup_unpublished_temp(&temp, label);
     }
     result
 }
@@ -147,12 +168,10 @@ fn publish_path_portable(
     mode: PublishMode,
 ) -> Result<()> {
     if mode == PublishMode::CreateNew && target.exists() {
-        return Err(durable_error(
+        return Err(create_new_publish_collision_error(
             label,
             "publish create-new target already exists",
             target,
-            None,
-            0,
         ));
     }
     retry_sharing(label, "publish durable path", target, || {
@@ -177,7 +196,7 @@ fn publish_path_windows(
     if mode == PublishMode::ReplaceExisting {
         flags |= MOVEFILE_REPLACE_EXISTING;
     }
-    retry_sharing(label, "publish durable path", target, || {
+    let result = retry_sharing(label, "publish durable path", target, || {
         // SAFETY: both buffers are NUL-terminated and remain alive for the call.
         let ok = unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) };
         if ok == 0 {
@@ -185,7 +204,15 @@ fn publish_path_windows(
         } else {
             Ok(())
         }
-    })
+    });
+    if result.is_err() && mode == PublishMode::CreateNew && target.exists() {
+        return Err(create_new_publish_collision_error(
+            label,
+            "publish create-new target already exists",
+            target,
+        ));
+    }
+    result
 }
 
 fn retry_sharing<T>(
@@ -265,6 +292,90 @@ fn durable_error(
         "{operation} for {label} path={} attempts={attempts}: {detail}",
         path.display()
     ))
+}
+
+fn create_new_publish_collision_error(label: &str, operation: &str, path: &Path) -> CalyxError {
+    CalyxError::aster_corrupt_shard(format!(
+        "{operation} for {label} path={}: target already exists; create-new durable publish refuses to overwrite immutable artifacts",
+        path.display()
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateNewTargetState {
+    Missing,
+    Identical,
+}
+
+fn create_new_target_state(
+    path: &Path,
+    expected: &[u8],
+    label: &str,
+    phase: &'static str,
+) -> Result<CreateNewTargetState> {
+    match fs::read(path) {
+        Ok(existing) if existing == expected => {
+            tracing::warn!(
+                label,
+                phase,
+                path = %path.display(),
+                bytes = existing.len(),
+                blake3 = %blake3_hex(expected),
+                "create-new durable target already exists with identical bytes; treating as idempotent recovered publish"
+            );
+            Ok(CreateNewTargetState::Identical)
+        }
+        Ok(existing) => {
+            let error = CalyxError::aster_corrupt_shard(format!(
+                "create-new durable target collision for {label} path={} phase={phase}: \
+                 existing_len={} expected_len={} existing_blake3={} expected_blake3={}; \
+                 refusing to overwrite existing immutable artifact",
+                path.display(),
+                existing.len(),
+                expected.len(),
+                blake3_hex(&existing),
+                blake3_hex(expected)
+            ));
+            tracing::error!(
+                label,
+                phase,
+                path = %path.display(),
+                existing_len = existing.len(),
+                expected_len = expected.len(),
+                existing_blake3 = %blake3_hex(&existing),
+                expected_blake3 = %blake3_hex(expected),
+                error_code = error.code,
+                "create-new durable target collision; refusing to overwrite"
+            );
+            Err(error)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CreateNewTargetState::Missing),
+        Err(error) => Err(durable_error(
+            label,
+            "read create-new target",
+            path,
+            Some(error),
+            0,
+        )),
+    }
+}
+
+fn cleanup_unpublished_temp(path: &Path, label: &str) {
+    if let Err(cleanup) = fs::remove_file(path)
+        && cleanup.kind() != io::ErrorKind::NotFound
+    {
+        tracing::error!(
+            label,
+            path = %path.display(),
+            kind = ?cleanup.kind(),
+            os_error = cleanup.raw_os_error(),
+            "failed to remove unpublished durable temp file"
+        );
+    }
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 fn temp_path(path: &Path) -> Result<PathBuf> {

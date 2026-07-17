@@ -157,25 +157,13 @@ enum PageAdvice {
 }
 
 fn not_found(message: impl Into<String>) -> CalyxError {
-    CalyxError {
-        code: CALYX_NOT_FOUND,
-        message: message.into(),
-        remediation: "create a non-empty cold column file before opening it",
-    }
+    CalyxError::aster_corrupt_shard(message)
 }
 
 fn io_error(message: impl Into<String>) -> CalyxError {
-    CalyxError {
-        code: CALYX_IO_ERROR,
-        message: message.into(),
-        remediation: "inspect the OS file error and storage path",
-    }
+    CalyxError::disk_pressure(message)
 }
 
 fn bounds_exceeded(message: impl Into<String>) -> CalyxError {
-    CalyxError {
-        code: CALYX_BOUNDS_EXCEEDED,
-        message: message.into(),
-        remediation: "read within the mapped column length and alignment",
-    }
+    CalyxError::aster_corrupt_shard(message)
 }
