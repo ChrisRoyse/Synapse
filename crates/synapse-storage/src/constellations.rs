@@ -138,6 +138,12 @@ pub struct NativeConstellationContext {
     pub next_ledger_seq: u64,
 }
 
+/// Build the Calyx constellation for a timeline record.
+///
+/// # Errors
+///
+/// Returns an error when enum serialization, lens measurement, JSON encoding,
+/// or exact integer scalar conversion fails.
 pub fn build_timeline_constellation(
     context: NativeConstellationContext,
     source_key: &[u8],
@@ -230,6 +236,16 @@ pub fn build_timeline_constellation(
     ))
 }
 
+/// Build the Calyx constellation for an episode record.
+///
+/// # Errors
+///
+/// Returns an error when enum serialization, lens measurement, JSON encoding,
+/// or exact integer scalar conversion fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "episode constellation construction is a one-to-one field-to-slot map; splitting would obscure the stable slot contract"
+)]
 pub fn build_episode_constellation(
     context: NativeConstellationContext,
     source_key: &[u8],
@@ -427,6 +443,16 @@ pub fn build_episode_constellation(
     ))
 }
 
+/// Build the Calyx constellation for an agent event record.
+///
+/// # Errors
+///
+/// Returns an error when enum serialization, lens measurement, JSON encoding,
+/// or exact integer scalar conversion fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "agent event constellation construction is a one-to-one field-to-slot map; splitting would obscure the stable slot contract"
+)]
 pub fn build_agent_event_constellation(
     context: NativeConstellationContext,
     source_key: &[u8],
@@ -434,6 +460,8 @@ pub fn build_agent_event_constellation(
     record: &AgentEventRecord,
 ) -> StorageResult<Constellation> {
     let mut slots = BTreeMap::new();
+    let operation_name = optional_gen_ai_operation_name(record.attributes.operation_name)?;
+    let end_state_name = optional_agent_end_state_name(record.end_state)?;
     slots.insert(
         AE_SLOT_KIND_ONEHOT,
         measure_text(
@@ -451,7 +479,7 @@ pub fn build_agent_event_constellation(
         optional_onehot_slot(
             SYN_AGENT_EVENT_PANEL_NAME,
             "syn.agent_event.operation_onehot.v1",
-            optional_gen_ai_operation_name(record.attributes.operation_name)?,
+            operation_name.as_deref(),
             16,
         )?,
     );
@@ -496,7 +524,7 @@ pub fn build_agent_event_constellation(
         optional_onehot_slot(
             SYN_AGENT_EVENT_PANEL_NAME,
             "syn.agent_event.error_onehot.v1",
-            record.attributes.error_type.clone(),
+            record.attributes.error_type.as_deref(),
             64,
         )?,
     );
@@ -505,7 +533,7 @@ pub fn build_agent_event_constellation(
         optional_onehot_slot(
             SYN_AGENT_EVENT_PANEL_NAME,
             "syn.agent_event.end_state_onehot.v1",
-            optional_agent_end_state_name(record.end_state)?,
+            end_state_name.as_deref(),
             8,
         )?,
     );
@@ -568,6 +596,16 @@ pub fn build_agent_event_constellation(
     ))
 }
 
+/// Build the Calyx constellation for an agent transcript record.
+///
+/// # Errors
+///
+/// Returns an error when enum serialization, lens measurement, JSON encoding,
+/// or exact integer scalar conversion fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "agent transcript constellation construction is a one-to-one field-to-slot map; splitting would obscure the stable slot contract"
+)]
 pub fn build_agent_transcript_constellation(
     context: NativeConstellationContext,
     source_key: &[u8],
@@ -575,12 +613,13 @@ pub fn build_agent_transcript_constellation(
     record: &AgentTranscriptRecord,
 ) -> StorageResult<Constellation> {
     let mut slots = BTreeMap::new();
+    let role_name = optional_transcript_role_name(record.role)?;
     slots.insert(
         AT_SLOT_ROLE_ONEHOT,
         optional_onehot_slot(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
             "syn.agent_transcript.role_onehot.v1",
-            optional_transcript_role_name(record.role)?,
+            role_name.as_deref(),
             8,
         )?,
     );
@@ -738,7 +777,7 @@ pub fn emit_success_metric(report: &ConstellationPutReport) {
         "panel" => report.panel_name,
         "source_cf" => report.source_cf,
     )
-    .record(report.duration_us as f64);
+    .record(metric_u64_as_f64(report.duration_us));
 }
 
 pub fn emit_error_metric(
@@ -759,13 +798,15 @@ pub fn emit_error_metric(
         "panel" => panel_name,
         "source_cf" => source_cf,
     )
-    .record(duration_us(duration) as f64);
+    .record(metric_u64_as_f64(duration_us(duration)));
 }
 
+#[must_use]
 pub fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+#[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len().saturating_mul(2));
@@ -776,9 +817,37 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+#[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(digest.as_ref())
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metrics histograms accept f64 values; duration precision loss is acceptable for observability buckets"
+)]
+const fn metric_u64_as_f64(value: u64) -> f64 {
+    value as f64
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "callers check the value is within the IEEE-754 exact integer range before converting"
+)]
+const fn exact_u64_as_f64(value: u64) -> f64 {
+    value as f64
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "ratios are intentionally represented as f64 lens inputs"
+)]
+const fn ratio_u64(numerator: u64, denominator: u64) -> f64 {
+    numerator as f64 / denominator as f64
 }
 
 fn constellation(
@@ -925,6 +994,10 @@ fn agent_event_scalars(
     Ok(scalars)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "agent transcript scalar extraction is a one-to-one record field map kept together to preserve auditability"
+)]
 fn agent_transcript_scalars(
     record: &AgentTranscriptRecord,
     raw_bytes: &[u8],
@@ -1060,7 +1133,7 @@ fn insert_u64_scalar(
             format!("{name}={value}"),
         ));
     }
-    scalars.insert(name.to_owned(), value as f64);
+    scalars.insert(name.to_owned(), exact_u64_as_f64(value));
     Ok(())
 }
 
@@ -1098,10 +1171,7 @@ fn timeline_metadata(
         actor_kind(&record.actor).to_owned(),
     );
     if let TimelineActor::Agent { session_id } = &record.actor {
-        metadata.insert(
-            "timeline_agent_session_id".to_owned(),
-            session_id.to_string(),
-        );
+        metadata.insert("timeline_agent_session_id".to_owned(), session_id.clone());
     }
     if let Some(app) = record.app.as_deref().and_then(non_empty) {
         metadata.insert("timeline_app".to_owned(), truncate_metadata(app));
@@ -1144,10 +1214,7 @@ fn episode_metadata(
         actor_kind(&record.actor).to_owned(),
     );
     if let TimelineActor::Agent { session_id } = &record.actor {
-        metadata.insert(
-            "episode_agent_session_id".to_owned(),
-            session_id.to_string(),
-        );
+        metadata.insert("episode_agent_session_id".to_owned(), session_id.clone());
     }
     metadata.insert(
         "episode_started_because".to_owned(),
@@ -1184,6 +1251,10 @@ fn episode_metadata(
     Ok(metadata)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "agent event metadata extraction is a one-to-one record field map kept together to preserve auditability"
+)]
 fn agent_event_metadata(
     source_key: &[u8],
     raw_bytes: &[u8],
@@ -1415,6 +1486,10 @@ fn measure_text(
     )
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "all current call sites pass Copy numeric primitives and by-value keeps slot construction readable"
+)]
 fn measure_number<T>(
     panel_name: &'static str,
     lens: AlgorithmicLens,
@@ -1458,30 +1533,34 @@ fn optional_hash_slot(
     value: Option<&str>,
     dim: u32,
 ) -> StorageResult<SlotVector> {
-    match value.and_then(non_empty) {
-        Some(text) => measure_text(
-            panel_name,
-            AlgorithmicLens::syn_hash(lens_name, Modality::Structured, dim),
-            text,
-        ),
-        None => Ok(absent(AbsentReason::NotApplicable)),
-    }
+    value.and_then(non_empty).map_or_else(
+        || Ok(absent(AbsentReason::NotApplicable)),
+        |text| {
+            measure_text(
+                panel_name,
+                AlgorithmicLens::syn_hash(lens_name, Modality::Structured, dim),
+                text,
+            )
+        },
+    )
 }
 
 fn optional_onehot_slot(
     panel_name: &'static str,
     lens_name: &'static str,
-    value: Option<String>,
+    value: Option<&str>,
     dim: u32,
 ) -> StorageResult<SlotVector> {
-    match value.as_deref().and_then(non_empty) {
-        Some(text) => measure_text(
-            panel_name,
-            AlgorithmicLens::syn_one_hot(lens_name, Modality::Structured, dim),
-            text,
-        ),
-        None => Ok(absent(AbsentReason::NotApplicable)),
-    }
+    value.and_then(non_empty).map_or_else(
+        || Ok(absent(AbsentReason::NotApplicable)),
+        |text| {
+            measure_text(
+                panel_name,
+                AlgorithmicLens::syn_one_hot(lens_name, Modality::Structured, dim),
+                text,
+            )
+        },
+    )
 }
 
 fn optional_log1p_slot(
@@ -1489,16 +1568,22 @@ fn optional_log1p_slot(
     lens_name: &'static str,
     value: Option<u64>,
 ) -> StorageResult<SlotVector> {
-    match value {
-        Some(value) => measure_number(
-            panel_name,
-            AlgorithmicLens::syn_scalar_log1p(lens_name, Modality::Structured),
-            value,
-        ),
-        None => Ok(absent(AbsentReason::NotApplicable)),
-    }
+    value.map_or_else(
+        || Ok(absent(AbsentReason::NotApplicable)),
+        |value| {
+            measure_number(
+                panel_name,
+                AlgorithmicLens::syn_scalar_log1p(lens_name, Modality::Structured),
+                value,
+            )
+        },
+    )
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the helper owns freshly constructed lens/input values at every call site and immediately measures them"
+)]
 fn measure_input(
     panel_name: &'static str,
     lens: AlgorithmicLens,
@@ -1512,6 +1597,10 @@ fn measure_input(
     })
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "call sites pass lightweight display values or owned error strings; taking by value avoids temporary lifetime plumbing in error construction"
+)]
 fn measurement_error(action: &'static str, detail: impl ToString) -> StorageError {
     StorageError::WriteFailed {
         cf_name: "calyx_constellation".to_owned(),
@@ -1581,7 +1670,7 @@ where
         .ok_or_else(|| measurement_error("enum did not serialize to a snake-case string", label))
 }
 
-fn actor_kind(actor: &TimelineActor) -> &'static str {
+const fn actor_kind(actor: &TimelineActor) -> &'static str {
     match actor {
         TimelineActor::Human => "human",
         TimelineActor::Agent { .. } => "agent",
@@ -1623,7 +1712,7 @@ fn non_empty(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn utc_hour_and_dow(ts_ns: u64) -> (u64, u64) {
+const fn utc_hour_and_dow(ts_ns: u64) -> (u64, u64) {
     let secs = ts_ns / NS_PER_SEC;
     let hour = (secs / SECS_PER_HOUR) % 24;
     let days = secs / SECS_PER_DAY;
@@ -1631,12 +1720,12 @@ fn utc_hour_and_dow(ts_ns: u64) -> (u64, u64) {
     (hour, dow_monday_zero)
 }
 
-fn interruption_ratio(record: &EpisodeRecord) -> f64 {
+const fn interruption_ratio(record: &EpisodeRecord) -> f64 {
     let duration = record.duration_ms();
     if duration == 0 {
         0.0
     } else {
-        record.interrupted_ms as f64 / duration as f64
+        ratio_u64(record.interrupted_ms, duration)
     }
 }
 
@@ -1730,8 +1819,8 @@ fn present_u64(value: Option<&str>) -> u64 {
     bool_u64(value.and_then(non_empty).is_some())
 }
 
-fn bool_u64(value: bool) -> u64 {
-    if value { 1 } else { 0 }
+const fn bool_u64(value: bool) -> u64 {
+    value as u64
 }
 
 fn agent_event_usage_total(record: &AgentEventRecord) -> Option<u64> {
@@ -1827,16 +1916,19 @@ fn url_host(url: &str) -> Option<String> {
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_user, host)| host);
-    let host = if let Some(stripped) = host_port.strip_prefix('[') {
-        stripped
-            .split_once(']')
-            .map_or(host_port, |(ipv6, _rest)| ipv6)
-    } else {
-        host_port
-            .split_once(':')
-            .map_or(host_port, |(host, _port)| host)
-    };
-    non_empty(host).map(|value| value.to_ascii_lowercase())
+    let host = host_port.strip_prefix('[').map_or_else(
+        || {
+            host_port
+                .split_once(':')
+                .map_or(host_port, |(host, _port)| host)
+        },
+        |stripped| {
+            stripped
+                .split_once(']')
+                .map_or(host_port, |(ipv6, _rest)| ipv6)
+        },
+    );
+    non_empty(host).map(str::to_ascii_lowercase)
 }
 
 fn source_pointer(source_cf: &'static str, source_key: &[u8]) -> String {

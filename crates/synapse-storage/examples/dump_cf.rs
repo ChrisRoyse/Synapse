@@ -45,6 +45,10 @@ use synapse_storage::{
 const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path>";
 const MAX_DURABLE_SLOT_ID: u16 = 47;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "example CLI dispatch keeps each mode visible in one small executable entry point"
+)]
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "--native-cx") {
@@ -152,6 +156,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "repair mode owns its path for repeated vault opens and prints the full before/write/readback flow inline"
+)]
 fn repair_bad_episode_slots(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
     let vault = SynapseCalyxVault::open(SynapseCalyxConfig::from_vault_dir(db_path.clone()))?;
     let before_seq = vault.latest_seq();
@@ -184,9 +193,9 @@ fn repair_bad_episode_slots(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
     let mut targets = Vec::new();
     let mut duplicate_targets = 0_u64;
     for candidate in &candidates {
-        let mut candidate_targets =
+        let candidate_targets =
             collect_repair_targets(&vault, before_seq, candidate.cx_id, &candidate.slot_ids)?;
-        for target in candidate_targets.drain(..) {
+        for target in candidate_targets {
             if targets.iter().any(|existing: &RepairTarget| {
                 existing.cf == target.cf && existing.key == target.key
             }) {
@@ -388,6 +397,10 @@ struct RepairTarget {
     key: Vec<u8>,
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "source dump owns the path while chaining into per-constellation readbacks"
+)]
 fn dump_native_source(
     db_path: PathBuf,
     source_cf: &str,
@@ -477,6 +490,11 @@ fn dump_native_source(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "native constellation dump prints a complete physical readback in deterministic order"
+)]
 fn dump_native_cx(
     db_path: PathBuf,
     cx_id: &str,
@@ -562,7 +580,7 @@ fn dump_native_cx(
         };
         if !write_stdout_line(
             &mut stdout,
-            format_args!("metadata key={} value={}", key, rendered),
+            format_args!("metadata key={key} value={rendered}"),
         )? {
             return Ok(());
         }
