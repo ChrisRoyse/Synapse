@@ -3,6 +3,7 @@ pub mod agent_transcripts;
 mod backend;
 pub mod cf;
 pub mod codecs;
+pub mod constellations;
 pub mod episodes;
 pub mod error;
 mod gc;
@@ -20,6 +21,10 @@ pub use backend::{
     scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
+pub use constellations::{
+    ConstellationPutReport, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+};
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
 pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
@@ -351,6 +356,44 @@ impl Db {
     #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
     pub fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
         self.backend.calyx_vault_inspect()
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_TIMELINE` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_timeline_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::types::TimelineRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_timeline_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_EPISODES` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_episode_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::types::EpisodeRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_episode_constellation(source_key, raw_bytes, record)
     }
 
     /// Runs one disk-pressure check immediately.

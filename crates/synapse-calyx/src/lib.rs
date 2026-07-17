@@ -15,8 +15,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use calyx_aster::cf::{ColumnFamily, KeyRange};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::mvcc::{Freshness, Snapshot};
-use calyx_aster::vault::{AsterVault, VaultOptions};
-use calyx_core::{CalyxError, Clock, Seq, SystemClock, Ts, VaultId};
+use calyx_aster::vault::{AsterVault, PutDisposition, VaultOptions};
+use calyx_core::{CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -31,6 +31,59 @@ pub use math::{
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxPutDisposition {
+    Inserted,
+    ExistingIdentical,
+    ExistingAnchorsMerged { added: usize },
+    InBatchDuplicate { anchors_added: usize },
+}
+
+impl SynapseCalyxPutDisposition {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::ExistingIdentical => "existing_identical",
+            Self::ExistingAnchorsMerged { .. } => "existing_anchors_merged",
+            Self::InBatchDuplicate { .. } => "in_batch_duplicate",
+        }
+    }
+
+    #[must_use]
+    pub const fn inserted(self) -> bool {
+        matches!(self, Self::Inserted)
+    }
+
+    #[must_use]
+    pub const fn deduped(self) -> bool {
+        !self.inserted()
+    }
+}
+
+impl From<PutDisposition> for SynapseCalyxPutDisposition {
+    fn from(disposition: PutDisposition) -> Self {
+        match disposition {
+            PutDisposition::Inserted => Self::Inserted,
+            PutDisposition::ExistingIdentical => Self::ExistingIdentical,
+            PutDisposition::ExistingAnchorsMerged { added } => {
+                Self::ExistingAnchorsMerged { added }
+            }
+            PutDisposition::InBatchDuplicate { anchors_added } => {
+                Self::InBatchDuplicate { anchors_added }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxObservationPutReadback {
+    pub cx_id: String,
+    pub disposition: SynapseCalyxPutDisposition,
+    pub latest_seq: Seq,
+}
 
 const SYNAPSE_DIR_NAME: &str = "synapse";
 const VAULT_DIR_NAME: &str = "vault";
@@ -620,6 +673,22 @@ impl SynapseCalyxReadOnlyVault {
     /// Returns a structured error when the vault directory, identity, machine
     /// salt, or read-only Aster recovery cannot be read.
     pub fn open_existing(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
+        Self::open_existing_with_cfs(config, Some(vec![ColumnFamily::Kv]))
+    }
+
+    /// Opens an existing Calyx vault for physical inspection of selected
+    /// native Aster column families.
+    ///
+    /// This path is read-only and does not acquire the Synapse writer lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the vault directory, identity, machine
+    /// salt, or read-only Aster recovery cannot be read.
+    pub fn open_existing_with_cfs(
+        config: SynapseCalyxConfig,
+        selected_cfs: Option<Vec<ColumnFamily>>,
+    ) -> Result<Self, SynapseCalyxError> {
         error_bridge::validate_calyx_error_bridge()?;
         let clock = SynapseCalyxClock::from_tuning(&config.tuning)?;
         if !config.vault_dir.is_dir() {
@@ -649,7 +718,7 @@ impl SynapseCalyxReadOnlyVault {
             read_only: true,
             restore_mvcc_rows: false,
             restore_ledger_hook: false,
-            selected_cfs: Some(vec![ColumnFamily::Kv]),
+            selected_cfs,
             ..VaultOptions::default()
         };
         let vault =
@@ -675,6 +744,11 @@ impl SynapseCalyxReadOnlyVault {
     #[must_use]
     pub fn vault_id(&self) -> String {
         self.vault.vault_id().to_string()
+    }
+
+    #[must_use]
+    pub fn vault_id_value(&self) -> VaultId {
+        self.vault.vault_id()
     }
 
     #[must_use]
@@ -721,6 +795,22 @@ impl SynapseCalyxReadOnlyVault {
         self.vault
             .read_cf_at(snapshot, cf, key)
             .map_err(|error| SynapseCalyxError::from_calyx("read Calyx CF row", &error))
+    }
+
+    /// Scans visible raw CF rows at a numeric snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the read-only handle cannot
+    /// serve the requested snapshot/CF.
+    pub fn scan_cf_at(
+        &self,
+        snapshot: Seq,
+        cf: ColumnFamily,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.vault
+            .scan_cf_at(snapshot, cf)
+            .map_err(|error| SynapseCalyxError::from_calyx("scan Calyx CF", &error))
     }
 
     /// Scans visible raw CF rows in a key range at a numeric snapshot.
@@ -840,6 +930,11 @@ impl SynapseCalyxVault {
     }
 
     #[must_use]
+    pub fn vault_id_value(&self) -> VaultId {
+        self.vault.vault_id()
+    }
+
+    #[must_use]
     pub fn latest_seq(&self) -> Seq {
         self.vault.latest_seq()
     }
@@ -871,6 +966,36 @@ impl SynapseCalyxVault {
                     })
             }
         }
+    }
+
+    #[must_use]
+    pub fn cx_id_for_input(&self, input_bytes: &[u8], panel_version: u32) -> CxId {
+        self.vault.cx_id_for_input(input_bytes, panel_version)
+    }
+
+    /// Writes one content-addressed observation through Aster's native
+    /// constellation ingestion path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if schema validation,
+    /// duplicate compatibility checks, ledger append, WAL commit, or any
+    /// native Base/Slot/Scalars row write fails.
+    pub fn put_observation_constellation(
+        &self,
+        constellation: Constellation,
+    ) -> Result<SynapseCalyxObservationPutReadback, SynapseCalyxError> {
+        let outcome = self
+            .vault
+            .put_observation_with_outcome(constellation)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("put native Calyx observation constellation", &error)
+            })?;
+        Ok(SynapseCalyxObservationPutReadback {
+            cx_id: outcome.cx_id.to_string(),
+            disposition: outcome.disposition.into(),
+            latest_seq: self.vault.latest_seq(),
+        })
     }
 
     /// Runs one physical Aster compaction attempt for the Synapse KV storage CF.

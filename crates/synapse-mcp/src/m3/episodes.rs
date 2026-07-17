@@ -14,9 +14,10 @@
 //! day is a closed replacement unit: re-segmenting any day range converges
 //! to the same physical rows, byte for byte.
 //!
-//! Failure policy: disk pressure refusal, undecodable rows, and engine
-//! errors are loud and structured. The tool never deletes rows it could not
-//! re-derive (a failed day leaves storage untouched for that day).
+//! Failure policy: disk pressure refusal, undecodable rows, engine errors, and
+//! constellation measurement failures are loud and structured. The tool never
+//! deletes rows it could not re-derive (a failed day leaves storage untouched
+//! for that day).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -75,6 +76,9 @@ pub struct EpisodeSegmentDay {
     pub timeline_rows: u64,
     pub episodes_written: u64,
     pub episodes_deleted: u64,
+    pub constellations_inserted: u64,
+    pub constellations_deduped: u64,
+    pub constellation_failures: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -96,6 +100,9 @@ pub struct EpisodeSegmentResponse {
     pub payload_anomalies: u64,
     pub episodes_written: u64,
     pub episodes_deleted: u64,
+    pub constellations_inserted: u64,
+    pub constellations_deduped: u64,
+    pub constellation_failures: u64,
     pub dry_run: bool,
     /// Per-day breakdown for days that had rows or stale episodes.
     pub days: Vec<EpisodeSegmentDay>,
@@ -421,6 +428,9 @@ pub fn segment_episodes(
                     payload_anomalies: 0,
                     episodes_written: 0,
                     episodes_deleted: 0,
+                    constellations_inserted: 0,
+                    constellations_deduped: 0,
+                    constellation_failures: 0,
                     dry_run: params.dry_run,
                     days: Vec::new(),
                     next_start_ts_ns: None,
@@ -448,6 +458,9 @@ pub fn segment_episodes(
         payload_anomalies: 0,
         episodes_written: 0,
         episodes_deleted: 0,
+        constellations_inserted: 0,
+        constellations_deduped: 0,
+        constellation_failures: 0,
         dry_run: params.dry_run,
         days: Vec::new(),
         next_start_ts_ns: None,
@@ -506,6 +519,7 @@ pub fn segment_episodes(
         }
         let deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
+        let measurement_rows = new_rows.clone();
         if !params.dry_run && (deleted > 0 || written > 0) {
             runtime
                 .storage_replace_rows(cf::CF_EPISODES, stale_keys, new_rows)
@@ -519,8 +533,55 @@ pub fn segment_episodes(
                     )
                 })?;
         }
+        let mut constellations_inserted = 0_u64;
+        let mut constellations_deduped = 0_u64;
+        let mut constellation_failures = 0_u64;
+        if !params.dry_run {
+            for ((key, value), episode) in measurement_rows.iter().zip(segmentation.episodes.iter())
+            {
+                match runtime.storage_put_episode_constellation(key, value, episode) {
+                    Ok(report) if report.inserted() => {
+                        constellations_inserted = constellations_inserted.saturating_add(1);
+                    }
+                    Ok(report) if report.deduped() => {
+                        constellations_deduped = constellations_deduped.saturating_add(1);
+                    }
+                    Ok(_report) => {}
+                    Err(error) => {
+                        constellation_failures = constellation_failures.saturating_add(1);
+                        tracing::error!(
+                            code = "CALYX_EPISODE_CONSTELLATION_MEASUREMENT_FAILED",
+                            day_start_ns = day_start,
+                            day_end_ns = day_end,
+                            key_hex = %hex_encode(key),
+                            detail = %error,
+                            "episode row was written but native Calyx constellation measurement failed"
+                        );
+                    }
+                }
+            }
+            if constellation_failures > 0 {
+                return Err(mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "episode_segment wrote {written} CF_EPISODES rows for day {day_start}..{day_end}, \
+                         but {constellation_failures} native Calyx constellation measurements failed; \
+                         inspect CALYX_EPISODE_CONSTELLATION_MEASUREMENT_FAILED logs and rerun the same range after fixing storage"
+                    ),
+                ));
+            }
+        }
         response.episodes_deleted += deleted;
         response.episodes_written += written;
+        response.constellations_inserted = response
+            .constellations_inserted
+            .saturating_add(constellations_inserted);
+        response.constellations_deduped = response
+            .constellations_deduped
+            .saturating_add(constellations_deduped);
+        response.constellation_failures = response
+            .constellation_failures
+            .saturating_add(constellation_failures);
         response.days_processed += 1;
         if timeline_rows > 0 || deleted > 0 || written > 0 {
             response.days.push(EpisodeSegmentDay {
@@ -529,6 +590,9 @@ pub fn segment_episodes(
                 timeline_rows,
                 episodes_written: written,
                 episodes_deleted: deleted,
+                constellations_inserted,
+                constellations_deduped,
+                constellation_failures,
             });
         }
         tracing::info!(
@@ -538,6 +602,9 @@ pub fn segment_episodes(
             timeline_rows,
             episodes_written = written,
             episodes_deleted = deleted,
+            constellations_inserted,
+            constellations_deduped,
+            constellation_failures,
             dry_run = params.dry_run,
             "episode_segment replaced one local day"
         );

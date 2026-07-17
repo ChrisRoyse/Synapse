@@ -239,8 +239,21 @@ impl DemoRecordControl {
         let key = timeline_key(ts_ns, seq);
         let value = serde_json::to_vec(&record).context("encode demo marker timeline row")?;
         self.db
-            .put_batch(cf::CF_TIMELINE, [(key, value)])
+            .put_batch(cf::CF_TIMELINE, [(key.clone(), value.clone())])
             .context("write demo marker timeline row")?;
+        self.db
+            .put_timeline_constellation(&key, &value, &record)
+            .context("measure native Calyx constellation for demo marker timeline row")
+            .inspect_err(|error| {
+            tracing::error!(
+                code = "CALYX_TIMELINE_CONSTELLATION_MEASUREMENT_FAILED",
+                kind = ?TimelineKind::DemoMarker,
+                ts_ns,
+                seq,
+                detail = %format!("{error:#}"),
+                "demo marker timeline row was written but native Calyx constellation measurement failed"
+            );
+            })?;
         if flush {
             self.db.flush().context("flush demo marker timeline row")?;
         }

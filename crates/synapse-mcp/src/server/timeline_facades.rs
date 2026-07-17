@@ -3,7 +3,10 @@ use super::{
 };
 
 use crate::m3::{
-    episodes::{EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse},
+    episodes::{
+        EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse,
+        EpisodeSegmentParams, EpisodeSegmentResponse,
+    },
     hygiene::{HygieneRedactParams, HygieneRedactResponse},
     timeline::{
         TimelineGetParams, TimelineGetResponse, TimelinePurgeParams, TimelinePurgeResponse,
@@ -92,6 +95,7 @@ pub struct TimelineResponse {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpisodeOperation {
+    Segment,
     List,
     Get,
 }
@@ -99,6 +103,7 @@ pub enum EpisodeOperation {
 impl EpisodeOperation {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Segment => "segment",
             Self::List => "list",
             Self::Get => "get",
         }
@@ -109,6 +114,8 @@ impl EpisodeOperation {
 #[serde(deny_unknown_fields)]
 pub struct EpisodeParams {
     pub operation: EpisodeOperation,
+    #[serde(default)]
+    pub segment: Option<EpisodeSegmentParams>,
     #[serde(default)]
     pub list: Option<EpisodeListParams>,
     #[serde(default)]
@@ -121,6 +128,8 @@ pub struct EpisodeResponse {
     pub operation: EpisodeOperation,
     pub source_of_truth: String,
     pub readback_source_of_truth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<EpisodeSegmentResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list: Option<EpisodeListResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,7 +321,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for episode reads in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to the real episode_list/episode_get paths and returns CF_EPISODES plus CF_TIMELINE evidence readback metadata."
+        description = "Facade for episode segmentation and reads in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to the real episode_segment/episode_list/episode_get paths and returns CF_EPISODES plus CF_TIMELINE evidence readback metadata."
     )]
     pub async fn episode(
         &self,
@@ -327,6 +336,42 @@ impl SynapseService {
             "tool.invocation kind=episode"
         );
         match operation {
+            EpisodeOperation::Segment => {
+                let spec = params
+                    .0
+                    .segment
+                    .ok_or_else(|| missing_episode_spec("segment"))?;
+                let source_id = timeline_range_source_id(spec.start_ts_ns, spec.end_ts_ns);
+                let response = self
+                    .episode_segment(Parameters(spec))
+                    .await
+                    .map_err(|error| {
+                        episode_delegate_error(
+                            operation,
+                            source_id,
+                            error,
+                            "fix episode segmentation bounds/disk pressure and inspect CF_TIMELINE plus CF_EPISODES rows",
+                        )
+                    })?
+                    .0;
+                Ok(Json(episode_response(
+                    operation,
+                    format!(
+                        "CF_EPISODES segment days={} written={} deleted={} constellations_inserted={} constellations_deduped={} constellation_failures={} next_start_ts_ns={}",
+                        response.days_processed,
+                        response.episodes_written,
+                        response.episodes_deleted,
+                        response.constellations_inserted,
+                        response.constellations_deduped,
+                        response.constellation_failures,
+                        response
+                            .next_start_ts_ns
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".to_owned())
+                    ),
+                    |out| out.segment = Some(response),
+                )))
+            }
             EpisodeOperation::List => {
                 let spec = params.0.list.ok_or_else(|| missing_episode_spec("list"))?;
                 let source_id = timeline_range_source_id(spec.start_ts_ns, spec.end_ts_ns);
@@ -627,6 +672,7 @@ fn validate_episode_facade_params(params: &EpisodeParams) -> Result<(), ErrorDat
         EPISODE_TOOL,
         params.operation.as_str(),
         &[
+            ("segment", params.segment.is_some()),
             ("list", params.list.is_some()),
             ("get", params.get.is_some()),
         ],
@@ -832,6 +878,7 @@ fn episode_response(
             operation.as_str()
         ),
         readback_source_of_truth,
+        segment: None,
         list: None,
         get: None,
     };

@@ -18,6 +18,11 @@ pub const CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
 pub const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
 pub const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
 pub const STORAGE_WRITE_BATCH_FLUSHES_TOTAL: &str = "storage_write_batch_flushes_total";
+pub const CALYX_CONSTELLATION_MEASUREMENTS_TOTAL: &str = "calyx_constellation_measurements_total";
+pub const CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL: &str =
+    "calyx_constellation_measurement_errors_total";
+pub const CALYX_CONSTELLATION_MEASUREMENT_DURATION_US: &str =
+    "calyx_constellation_measurement_duration_us";
 pub const PROFILES_ACTIVE: &str = "profiles_active";
 pub const PROFILE_RELOADS_TOTAL: &str = "profile_reloads_total";
 pub const AUDIO_LOOPBACK_UNDERRUNS_TOTAL: &str = "audio_loopback_underruns_total";
@@ -159,6 +164,33 @@ pub const M3_METRICS: &[MetricSpec] = &[
         max_label_combinations: 8,
         label_policy: "flush trigger closed set.",
         description: "Storage write batch flushes by trigger.",
+    },
+    MetricSpec {
+        name: CALYX_CONSTELLATION_MEASUREMENTS_TOTAL,
+        kind: MetricKind::Counter,
+        unit: Some(Unit::Count),
+        labels: &["panel", "source_cf", "outcome"],
+        max_label_combinations: 48,
+        label_policy: "panel and source_cf are closed sets; outcome is the Calyx put disposition.",
+        description: "Native Calyx constellations measured and submitted from Synapse rows.",
+    },
+    MetricSpec {
+        name: CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL,
+        kind: MetricKind::Counter,
+        unit: Some(Unit::Count),
+        labels: &["panel", "source_cf", "error_type"],
+        max_label_combinations: 64,
+        label_policy: "panel/source_cf are closed sets; error_type is a stable Synapse/Calyx code.",
+        description: "Native Calyx constellation measurement or persistence failures.",
+    },
+    MetricSpec {
+        name: CALYX_CONSTELLATION_MEASUREMENT_DURATION_US,
+        kind: MetricKind::Histogram,
+        unit: Some(Unit::Microseconds),
+        labels: &["panel", "source_cf"],
+        max_label_combinations: 8,
+        label_policy: "panel/source_cf are closed sets.",
+        description: "Wall-clock duration for row-to-constellation measurement and native put.",
     },
     MetricSpec {
         name: PROFILES_ACTIVE,

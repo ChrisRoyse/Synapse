@@ -459,7 +459,7 @@ pub fn encode_write_batch(rows: &[WriteRow]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
     for row in rows {
-        out.push(cf_tag(row.cf));
+        out.push(cf_tag(row.cf)?);
         put_bytes(&mut out, &row.key)?;
         put_bytes(&mut out, &row.value)?;
     }

@@ -52,6 +52,12 @@
   flag also permits an exact-PID forced stop only after the graceful path fails
   for a verified legacy or unresponsive synapse-mcp.exe process.
 
+.PARAMETER AllowedPermissions
+  Explicit M3 permission grant list passed to the daemon as
+  --allowed-permissions. Omit for the fail-closed read-only default. Use a
+  whitespace/comma-separated list such as
+  "READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE".
+
 .PARAMETER Bind
   Loopback address the daemon binds. Default 127.0.0.1:7700.
 
@@ -125,6 +131,7 @@ param(
     [string]$PostExitContinuationReason = '',
     [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
+    [string]$AllowedPermissions = $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS,
     [switch]$SkipClientWiring,
     [switch]$Remove,
     [switch]$Purge
@@ -807,6 +814,20 @@ function Quote-PowerShellSingleQuotedString {
     return "'" + ($Value -replace "'", "''") + "'"
 }
 
+function Normalize-SynapseAllowedPermissionsArgument {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    $tokens = @($Value -split '[,;\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($tokens.Count -eq 0) {
+        return ''
+    }
+
+    return ($tokens -join ',')
+}
+
 function Vbs-Literal {
     param([Parameter(Mandatory=$true)][string]$Value)
     return '"' + ($Value -replace '"', '""') + '"'
@@ -821,7 +842,8 @@ function New-HiddenDaemonLauncher {
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
-        [Parameter(Mandatory=$true)][string]$MaintenanceLockPath
+        [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [AllowNull()][string]$AllowedPermissions
     )
 
     $daemonLogDir = $LogDir
@@ -829,13 +851,18 @@ function New-HiddenDaemonLauncher {
     $supervisorPath = Join-Path (Split-Path -Parent $OutputPath) 'synapse-daemon-supervisor.ps1'
     $supervisorState = Join-Path $LogDir 'daemon-supervisor-current.json'
     $supervisorEvents = Join-Path $LogDir 'daemon-supervisor-events.jsonl'
-    $daemonArgumentText = @(
+    $daemonArguments = @(
         '--mode', 'http',
         '--bind', (Quote-WindowsCommandArgument $Bind),
         '--db', (Quote-WindowsCommandArgument $DbPath),
         '--profile-dir', (Quote-WindowsCommandArgument $ProfilesDir),
         '--log-level', 'info'
-    ) -join ' '
+    )
+    $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
+        $daemonArguments += @('--allowed-permissions', (Quote-WindowsCommandArgument $allowedPermissionsArgument))
+    }
+    $daemonArgumentText = $daemonArguments -join ' '
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
         Die "SYNAPSE_HIDDEN_SUPERVISOR_POWERSHELL_MISSING path=$powerShellExe remediation=repair Windows PowerShell before registering the daemon supervisor"
@@ -4399,7 +4426,8 @@ function Test-SynapseCandidateDaemon {
         [Parameter(Mandatory=$true)][string]$CandidateExePath,
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
-        [Parameter(Mandatory=$true)][string]$LogDir
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [AllowNull()][string]$AllowedPermissions
     )
 
     if (-not (Test-Path -LiteralPath $CandidateExePath)) {
@@ -4431,9 +4459,14 @@ function Test-SynapseCandidateDaemon {
         $previousShellJobRoot = Get-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
         try {
             $env:SYNAPSE_SHELL_JOB_ROOT = $candidateShellJobRoot
+            $candidateArgs = @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info')
+            $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+            if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
+                $candidateArgs += @('--allowed-permissions', $allowedPermissionsArgument)
+            }
             $candidate = Start-Process `
                 -FilePath $CandidateExePath `
-                -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info') `
+                -ArgumentList $candidateArgs `
                 -WindowStyle Hidden `
                 -PassThru
         } finally {
@@ -6985,7 +7018,7 @@ if ($SkipBuild) {
     $installSourcePath = $stagedBinary.Path
     $installSourceHash = $stagedBinary.Sha256
 }
-$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir
+$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
 }
@@ -7203,7 +7236,7 @@ $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
 if (-not (Test-Path $wscriptExe)) {
     Die "SYNAPSE_HIDDEN_LAUNCHER_MISSING path=$wscriptExe remediation=repair Windows Script Host or run the daemon manually with a hidden process supervisor"
 }
-New-HiddenDaemonLauncher -OutputPath $hiddenLauncher -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -TokenPath $TokenPath -MaintenanceLockPath $MaintenanceLockPath
+New-HiddenDaemonLauncher -OutputPath $hiddenLauncher -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -TokenPath $TokenPath -MaintenanceLockPath $MaintenanceLockPath -AllowedPermissions $AllowedPermissions
 
 $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"

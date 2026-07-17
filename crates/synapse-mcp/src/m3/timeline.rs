@@ -968,7 +968,7 @@ pub(crate) fn write_cleaning_audit_row(
         )
     })?;
     runtime
-        .storage_put_rows_pressure_bypass(cf::CF_TIMELINE, vec![(key.clone(), value)])
+        .storage_put_rows_pressure_bypass(cf::CF_TIMELINE, vec![(key.clone(), value.clone())])
         .map_err(|error| {
             mcp_error(
                 error.code(),
@@ -990,6 +990,22 @@ pub(crate) fn write_cleaning_audit_row(
         return Err(mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             "rows were purged but the purge audit row is absent on readback",
+        ));
+    }
+    if let Err(error) = runtime.storage_put_timeline_constellation(&key, &value, &record) {
+        tracing::error!(
+            code = "CALYX_TIMELINE_CONSTELLATION_MEASUREMENT_FAILED",
+            kind = ?TimelineKind::Purge,
+            ts_ns,
+            seq,
+            detail = %error,
+            "cleaning audit timeline row was written but native Calyx constellation measurement failed"
+        );
+        return Err(mcp_error(
+            error.code(),
+            format!(
+                "purge audit row was written but native Calyx constellation measurement failed: {error}"
+            ),
         ));
     }
     Ok(hex_encode(&key))

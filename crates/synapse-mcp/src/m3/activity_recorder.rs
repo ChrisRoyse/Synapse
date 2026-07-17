@@ -626,8 +626,25 @@ impl TimelineWriter {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let key = timeline_key(ts_ns, seq);
         self.db
-            .put_batch(cf::CF_TIMELINE, [(key, value)])
+            .put_batch(cf::CF_TIMELINE, [(key.clone(), value.clone())])
             .with_context(|| format!("write CF_TIMELINE {kind:?} row ts_ns={ts_ns} seq={seq}"))?;
+        self.db
+            .put_timeline_constellation(&key, &value, &record)
+            .with_context(|| {
+                format!(
+                    "measure native Calyx constellation for CF_TIMELINE {kind:?} row ts_ns={ts_ns} seq={seq}"
+                )
+            })
+            .inspect_err(|error| {
+            tracing::error!(
+                code = "CALYX_TIMELINE_CONSTELLATION_MEASUREMENT_FAILED",
+                kind = ?kind,
+                ts_ns,
+                seq,
+                detail = %format!("{error:#}"),
+                "timeline row was written but native Calyx constellation measurement failed"
+            );
+            })?;
         self.rows_written.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             code = "TIMELINE_ROW_WRITTEN",

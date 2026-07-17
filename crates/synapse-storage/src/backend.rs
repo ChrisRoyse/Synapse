@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use calyx_aster::{
@@ -14,16 +15,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
     SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxError,
-    SynapseCalyxReadOnlyVault, SynapseCalyxVault,
+    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault, SynapseCalyxVault,
 };
 use synapse_core::{
     error_codes,
     retention::{DEFAULTS, RetentionDefault, RetentionTtl},
+    types::{EpisodeRecord, TimelineRecord},
 };
 
+use crate::constellations::{
+    ConstellationPutReport, NativeConstellationContext, SYN_EPISODE_PANEL_NAME,
+    SYN_EPISODE_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+};
 use crate::{
-    CfEstimateMap, OwnedCfWriteBatch, RawRow, ScanWindow, StorageError, StorageResult, cf, gc,
-    pressure,
+    CfEstimateMap, OwnedCfWriteBatch, RawRow, ScanWindow, StorageError, StorageResult, cf,
+    constellations, gc, pressure,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -181,6 +187,18 @@ pub trait StorageBackend: Send + Sync {
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>>;
+    fn put_timeline_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &TimelineRecord,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_episode_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &EpisodeRecord,
+    ) -> StorageResult<ConstellationPutReport>;
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -609,6 +627,158 @@ impl StorageBackend for CalyxBackend {
             false,
             |vault| inspect_calyx_vault(vault, &self.path).map(Some),
         )
+    }
+
+    fn put_timeline_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &TimelineRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put timeline Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_TIMELINE_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_TIMELINE)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_timeline_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put timeline observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_TIMELINE_PANEL_NAME,
+                    panel_version: SYN_TIMELINE_PANEL_VERSION,
+                    source_cf: cf::CF_TIMELINE,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_TIMELINE_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "timeline row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_TIMELINE_PANEL_NAME,
+                    cf::CF_TIMELINE,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_episode_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &EpisodeRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put episode Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_EPISODE_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_EPISODES)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_episode_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put episode observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_EPISODE_PANEL_NAME,
+                    panel_version: SYN_EPISODE_PANEL_VERSION,
+                    source_cf: cf::CF_EPISODES,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_EPISODE_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "episode row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_EPISODE_PANEL_NAME,
+                    cf::CF_EPISODES,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
     }
 
     fn run_pressure_check_once(
@@ -1176,6 +1346,34 @@ fn cf_name_for_calyx_collection_id(collection_id: u64) -> Option<&'static str> {
         }
     }
     None
+}
+
+struct ConstellationReportInput<'a> {
+    panel_name: &'static str,
+    panel_version: u32,
+    source_cf: &'static str,
+    source_key: &'a [u8],
+    raw_bytes: &'a [u8],
+    readback: SynapseCalyxObservationPutReadback,
+    slot_count: u64,
+    scalar_count: u64,
+    duration_us: u64,
+}
+
+fn constellation_report(input: ConstellationReportInput<'_>) -> ConstellationPutReport {
+    ConstellationPutReport {
+        panel_name: input.panel_name,
+        panel_version: input.panel_version,
+        source_cf: input.source_cf,
+        source_key_hex: constellations::hex_encode(input.source_key),
+        raw_sha256: constellations::sha256_hex(input.raw_bytes),
+        cx_id: input.readback.cx_id,
+        disposition: input.readback.disposition,
+        latest_seq: input.readback.latest_seq,
+        slot_count: input.slot_count,
+        scalar_count: input.scalar_count,
+        duration_us: input.duration_us,
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]

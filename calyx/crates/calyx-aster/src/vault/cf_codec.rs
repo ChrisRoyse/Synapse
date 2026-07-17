@@ -1,48 +1,62 @@
 use crate::cf::{ColumnFamily, SlotFamilyKind};
 use calyx_core::{CalyxError, Result, SlotId};
 
-pub(crate) fn cf_tag(cf: ColumnFamily) -> u8 {
+/// Highest slot id encodable by the legacy durable one-byte WAL CF tag.
+///
+/// Tags `16..=63` are quantized slots and `64..=111` are raw slot sidecars.
+/// Static CFs occupy higher tags, so out-of-range slots must fail before
+/// durable write; otherwise slot ids alias unrelated static CF tags.
+pub(crate) const MAX_DURABLE_SLOT_ID: u16 = 47;
+
+pub(crate) fn cf_tag(cf: ColumnFamily) -> Result<u8> {
     match cf {
-        ColumnFamily::Base => 0,
-        ColumnFamily::Collections => 117,
-        ColumnFamily::Relational => 118,
-        ColumnFamily::Document => 119,
-        ColumnFamily::Kv => 120,
-        ColumnFamily::TimeSeries => 121,
-        ColumnFamily::Blob => 122,
-        ColumnFamily::Anchors => 1,
-        ColumnFamily::Ledger => 2,
-        ColumnFamily::XTerm => 3,
-        ColumnFamily::Scalars => 4,
-        ColumnFamily::Online => 5,
-        ColumnFamily::Assay => 6,
-        ColumnFamily::Recurrence => 7,
-        ColumnFamily::Reactive => 126,
-        ColumnFamily::TemporalXTerm => 8,
-        ColumnFamily::AnnealRollback => 9,
-        ColumnFamily::AnnealHealth => 10,
-        ColumnFamily::AnnealChecksums => 11,
-        ColumnFamily::Graph => 12,
-        ColumnFamily::AnnealMistakes => 13,
-        ColumnFamily::AnnealReplay => 14,
-        ColumnFamily::AnnealHeads => 15,
-        ColumnFamily::AnnealBandit => 112,
-        ColumnFamily::AnnealSoak => 113,
-        ColumnFamily::AnnealReport => 114,
-        ColumnFamily::AnnealGrowth => 115,
-        ColumnFamily::TimeIndex => 116,
-        ColumnFamily::IndexBtree => 123,
-        ColumnFamily::IndexInverted => 124,
-        ColumnFamily::AnnealOperators => 125,
-        ColumnFamily::Kernel => 127,
-        ColumnFamily::Guard => 128,
-        ColumnFamily::Leapable => 129,
+        ColumnFamily::Base => Ok(0),
+        ColumnFamily::Collections => Ok(117),
+        ColumnFamily::Relational => Ok(118),
+        ColumnFamily::Document => Ok(119),
+        ColumnFamily::Kv => Ok(120),
+        ColumnFamily::TimeSeries => Ok(121),
+        ColumnFamily::Blob => Ok(122),
+        ColumnFamily::Anchors => Ok(1),
+        ColumnFamily::Ledger => Ok(2),
+        ColumnFamily::XTerm => Ok(3),
+        ColumnFamily::Scalars => Ok(4),
+        ColumnFamily::Online => Ok(5),
+        ColumnFamily::Assay => Ok(6),
+        ColumnFamily::Recurrence => Ok(7),
+        ColumnFamily::Reactive => Ok(126),
+        ColumnFamily::TemporalXTerm => Ok(8),
+        ColumnFamily::AnnealRollback => Ok(9),
+        ColumnFamily::AnnealHealth => Ok(10),
+        ColumnFamily::AnnealChecksums => Ok(11),
+        ColumnFamily::Graph => Ok(12),
+        ColumnFamily::AnnealMistakes => Ok(13),
+        ColumnFamily::AnnealReplay => Ok(14),
+        ColumnFamily::AnnealHeads => Ok(15),
+        ColumnFamily::AnnealBandit => Ok(112),
+        ColumnFamily::AnnealSoak => Ok(113),
+        ColumnFamily::AnnealReport => Ok(114),
+        ColumnFamily::AnnealGrowth => Ok(115),
+        ColumnFamily::TimeIndex => Ok(116),
+        ColumnFamily::IndexBtree => Ok(123),
+        ColumnFamily::IndexInverted => Ok(124),
+        ColumnFamily::AnnealOperators => Ok(125),
+        ColumnFamily::Kernel => Ok(127),
+        ColumnFamily::Guard => Ok(128),
+        ColumnFamily::Leapable => Ok(129),
         ColumnFamily::Slot { slot, kind } => {
+            let slot_id = slot.get();
+            if slot_id > MAX_DURABLE_SLOT_ID {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "slot id {slot_id} exceeds durable CF tag maximum {MAX_DURABLE_SLOT_ID}; \
+                     allocate panel slots within 0..={MAX_DURABLE_SLOT_ID} or extend the WAL CF tag codec before writing"
+                )));
+            }
             let base = match kind {
                 SlotFamilyKind::Quantized => 16,
                 SlotFamilyKind::Raw => 64,
             };
-            base + slot.get() as u8
+            Ok(base + slot_id as u8)
         }
     }
 }

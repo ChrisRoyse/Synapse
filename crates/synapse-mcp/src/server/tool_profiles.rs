@@ -1489,6 +1489,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
         "CF_EPISODES rows + CF_TIMELINE evidence refs",
         &[
             op(
+                "segment",
+                true,
+                false,
+                "CF_TIMELINE input rows + CF_EPISODES per-day atomic replacement rows",
+                Some("episodes_written/deleted and constellation write/readback counters"),
+                error_codes::STORAGE_READ_FAILED,
+                "fix segmentation bounds/disk pressure and inspect CF_TIMELINE plus CF_EPISODES rows",
+            ),
+            op(
                 "list",
                 false,
                 false,

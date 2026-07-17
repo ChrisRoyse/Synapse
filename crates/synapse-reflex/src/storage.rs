@@ -1,8 +1,10 @@
 use std::{collections::BTreeMap, path::Path};
 
+use synapse_core::types::{EpisodeRecord, TimelineRecord};
 use synapse_core::{StoredReflexAudit, error_codes};
 use synapse_storage::{
-    CalyxVaultInspect, DiskPressureLevel, GcReport, PressureReport, StorageResult, cf, decode_json,
+    CalyxVaultInspect, ConstellationPutReport, DiskPressureLevel, GcReport, PressureReport,
+    StorageResult, cf, decode_json,
 };
 
 use crate::{ReflexError, ReflexResult, ReflexRuntime};
@@ -246,6 +248,42 @@ impl ReflexRuntime {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> StorageResult<()> {
         self.db.mutate_batch_pressure_bypass(cf_name, deletes, puts)
+    }
+
+    /// Measures and stores the native Calyx constellation for one already
+    /// persisted timeline row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when row measurement or native Calyx
+    /// constellation persistence fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", source_key_len = source_key.len()))]
+    pub fn storage_put_timeline_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &TimelineRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.db
+            .put_timeline_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one already
+    /// persisted episode row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when row measurement or native Calyx
+    /// constellation persistence fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", source_key_len = source_key.len()))]
+    pub fn storage_put_episode_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &EpisodeRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.db
+            .put_episode_constellation(source_key, raw_bytes, record)
     }
 
     /// Compacts one key range of a column family (tombstone reclamation after
