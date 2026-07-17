@@ -109,6 +109,24 @@
   Optional current GitHub issue number/ref to preserve in Codex restart
   handoffs. Defaults to SYNAPSE_ACTIVE_ISSUE when set. Accepts 1441, #1441, or
   a ChrisRoyse/Synapse issue URL.
+
+.PARAMETER ManualInstallHealthRollbackProbe
+  Operator-run rollback drill for manual FSV. Setup still builds and preflights
+  a real candidate, installs it, and starts it through the real scheduled-task
+  supervisor. After the installed daemon answers /health, setup rejects that
+  health gate with an explicit manual-probe diagnostic so rollback must stop a
+  real running candidate daemon, restore the previous binary, and re-read the
+  daemon/Chrome bridge SoT. Requires -ForceRestart and a previous installed
+  daemon binary; setup exits fail-loud after rollback.
+
+.PARAMETER ManualInstallHealthRollbackPauseMode
+  With -ManualInstallHealthRollbackProbe, controls the rollback maintenance
+  pause edge. "normal" uses the real bridge pause result. "require_active_ack"
+  waits for the candidate daemon to report a real active Chrome bridge host
+  before rejecting install health, so rollback must receive a real bridge pause
+  ACK. "force_unacknowledged" returns an explicit unacknowledged-pause
+  diagnostic after reading /health so the rollback branch can be physically
+  exercised without waiting for a random bridge outage.
 #>
 [CmdletBinding()]
 param(
@@ -132,6 +150,9 @@ param(
     [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
     [string]$AllowedPermissions = $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS,
+    [switch]$ManualInstallHealthRollbackProbe,
+    [ValidateSet('normal','require_active_ack','force_unacknowledged')]
+    [string]$ManualInstallHealthRollbackPauseMode = 'normal',
     [switch]$SkipClientWiring,
     [switch]$Remove,
     [switch]$Purge
@@ -152,6 +173,8 @@ $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
 $script:SynapseBindPostExitContinuationRequired = $false
 $script:SynapseBindPostExitContinuationDetail = $null
 $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitContinuationReason -eq 'dead_owner_bind_after_install')
+$script:SynapseManualInstallHealthRollbackProbe = [bool]$ManualInstallHealthRollbackProbe
+$script:SynapseManualInstallHealthRollbackPauseMode = $ManualInstallHealthRollbackPauseMode
 $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
 $script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
 $script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
@@ -6055,6 +6078,26 @@ function Request-SynapseChromeBridgeMaintenancePause {
                 Detail = $detail
             }
         }
+        if ($Reason -eq 'install_health_failed_rollback' -and
+            $script:SynapseManualInstallHealthRollbackProbe -and
+            $script:SynapseManualInstallHealthRollbackPauseMode -eq 'force_unacknowledged') {
+            return [pscustomobject]@{
+                Ok = $false
+                Skipped = $false
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_MANUAL_UNACKNOWLEDGED_PROBE'
+                Response = [pscustomobject]@{
+                    manual_probe = 'install_health_failed_rollback'
+                    pause_mode = $script:SynapseManualInstallHealthRollbackPauseMode
+                    health = $health
+                    health_attempts = $healthAttempts
+                    bridge_status = $status
+                    bridge_detail = $detail
+                }
+                Error = 'manual rollback probe forced the maintenance pause to remain unacknowledged after /health readback'
+                Detail = $detail
+                Attempts = @()
+            }
+        }
     } else {
         $detail = "health_preflight_unreadable attempts=$($healthAttempts.Count); proceeding_to_maintenance_pause_post because the POST endpoint is the authoritative bridge pause acknowledgement gate"
         Info ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_PREFLIGHT_UNREADABLE_PROCEEDING reason={0} bind={1} attempts={2} last_error={3}" -f `
@@ -6062,6 +6105,26 @@ function Request-SynapseChromeBridgeMaintenancePause {
             $Bind,
             $healthAttempts.Count,
             $healthAttempts[-1].error)
+        if ($Reason -eq 'install_health_failed_rollback' -and
+            $script:SynapseManualInstallHealthRollbackProbe -and
+            $script:SynapseManualInstallHealthRollbackPauseMode -eq 'force_unacknowledged') {
+            return [pscustomobject]@{
+                Ok = $false
+                Skipped = $false
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_MANUAL_UNACKNOWLEDGED_PROBE'
+                Response = [pscustomobject]@{
+                    manual_probe = 'install_health_failed_rollback'
+                    pause_mode = $script:SynapseManualInstallHealthRollbackPauseMode
+                    health = $null
+                    health_attempts = $healthAttempts
+                    bridge_status = '<unreadable>'
+                    bridge_detail = $detail
+                }
+                Error = 'manual rollback probe forced the maintenance pause to remain unacknowledged after /health readback failed'
+                Detail = $detail
+                Attempts = @()
+            }
+        }
     }
 
     $body = [ordered]@{
@@ -6991,6 +7054,21 @@ if ($Remove) {
 # 1. Preflight
 # ---------------------------------------------------------------------------
 Step "Preflight"
+if ($ManualInstallHealthRollbackPauseMode -ne 'normal' -and -not $ManualInstallHealthRollbackProbe) {
+    Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PAUSE_MODE_WITHOUT_PROBE mode=$ManualInstallHealthRollbackPauseMode remediation=-ManualInstallHealthRollbackPauseMode is only valid with -ManualInstallHealthRollbackProbe because it intentionally changes rollback maintenance-pause behavior"
+}
+if ($ManualInstallHealthRollbackProbe) {
+    if (-not $ForceRestart) {
+        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_REQUIRES_FORCE_RESTART remediation=the rollback drill intentionally drains and restarts the live daemon, so rerun with -ForceRestart during a maintenance window"
+    }
+    if ($SkipBuild) {
+        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_REQUIRES_BUILD remediation=the rollback drill needs a real candidate that differs from the installed daemon; -SkipBuild cannot produce a backup/candidate handoff"
+    }
+    if ($script:SynapsePostExitStartOnly) {
+        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_POST_EXIT_UNSUPPORTED remediation=post-exit continuation only starts the already-installed daemon; run the rollback drill from the primary setup process"
+    }
+    Info "Manual install-health rollback probe armed pause_mode=$ManualInstallHealthRollbackPauseMode; setup will reject the first installed daemon health readback and exit fail-loud after rollback readback"
+}
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 if (-not $SkipBuild) {
     if (-not (Test-Path $cargo)) {
@@ -7299,6 +7377,9 @@ if ($SkipBuild) {
         Info "SkipBuild candidate is already installed; setup will keep the live daemon and let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash"
     }
 }
+if ($ManualInstallHealthRollbackProbe -and $installedBinaryAlreadyVerified) {
+    Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_CANDIDATE_ALREADY_INSTALLED path=$ExePath sha256=$installSourceHash remediation=the rollback drill requires candidate bytes that differ from the installed daemon so setup can back up and restore the previous artifact"
+}
 
 $codexAncestorBeforeHandoff = Get-SynapseCurrentCodexAncestor
 if ($codexAncestorBeforeHandoff -and $processTokenAtStart -ne $token) {
@@ -7363,6 +7444,9 @@ if ($installedBinaryAlreadyVerified) {
         Die "SYNAPSE_BINARY_BACKUP_HASH_MISMATCH installed=$ExePath backup=$backupPath installed_hash=$oldInstalledHash backup_hash=$backupHash remediation=backup bytes changed during copy; refusing to install candidate"
     }
     Info "Backed up old binary -> $backupPath sha256=$backupHash"
+}
+if ($ManualInstallHealthRollbackProbe -and (-not $backupPath -or -not $oldInstalledHash)) {
+    Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_BACKUP_MISSING installed=$ExePath remediation=the rollback drill requires an existing installed daemon binary so setup can prove backup hash, restore the prior artifact, and re-read daemon health after rollback"
 }
 if ($installedBinaryAlreadyVerified) {
     Info "SkipBuild candidate already resides at install path=$ExePath"
@@ -7499,7 +7583,16 @@ $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
 if (-not (Test-Path $wscriptExe)) {
     Die "SYNAPSE_HIDDEN_LAUNCHER_MISSING path=$wscriptExe remediation=repair Windows Script Host or run the daemon manually with a hidden process supervisor"
 }
-New-HiddenDaemonLauncher -OutputPath $hiddenLauncher -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -TokenPath $TokenPath -MaintenanceLockPath $MaintenanceLockPath -AllowedPermissions $AllowedPermissions
+New-HiddenDaemonLauncher `
+    -OutputPath $hiddenLauncher `
+    -ExePath $ExePath `
+    -Bind $Bind `
+    -DbPath $DbPath `
+    -ProfilesDir $ProfilesDir `
+    -LogDir $LogDir `
+    -TokenPath $TokenPath `
+    -MaintenanceLockPath $MaintenanceLockPath `
+    -AllowedPermissions $AllowedPermissions
 
 $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
@@ -7524,7 +7617,11 @@ $ok = $false
 $healthPid = $null
 $lastHealthError = $null
 $lastHealthSubsystemStatuses = '<none>'
-$installHealthDeadline = (Get-Date).AddSeconds(180)
+$installHealthTimeoutSeconds = 180
+if ($ManualInstallHealthRollbackProbe) {
+    Info "Manual install-health rollback probe using production candidate health timeout seconds=$installHealthTimeoutSeconds"
+}
+$installHealthDeadline = (Get-Date).AddSeconds($installHealthTimeoutSeconds)
 $installHealthAttempt = 0
 while ((Get-Date) -lt $installHealthDeadline) {
     $installHealthAttempt++
@@ -7537,6 +7634,28 @@ while ((Get-Date) -lt $installHealthDeadline) {
         $criticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $h
         if ($criticalReady.Ok) {
             Info ("Daemon OK: pid={0} version={1} db={2}" -f $h.pid, $h.version, $h.subsystems.storage.db_path)
+            if ($ManualInstallHealthRollbackProbe) {
+                if ($ManualInstallHealthRollbackPauseMode -eq 'require_active_ack') {
+                    $candidateChromeBridge = $h.subsystems.chrome_bridge
+                    $candidateChromeBridgeStatus = "$($candidateChromeBridge.status)"
+                    $candidateChromeBridgeDetail = "$($candidateChromeBridge.detail)"
+                    $candidateChromeBridgeActive = (
+                        $candidateChromeBridgeStatus -eq 'ok' -and
+                        $candidateChromeBridgeDetail -match 'tab_control_available=true' -and
+                        $candidateChromeBridgeDetail -match 'host_count=1' -and
+                        $candidateChromeBridgeDetail -notmatch 'no_active_chrome_bridge_host')
+                    if (-not $candidateChromeBridgeActive) {
+                        $lastHealthError = "manual install-health rollback probe waiting for active Chrome bridge before ACK edge; pid=$($h.pid) chrome_bridge_status=$candidateChromeBridgeStatus"
+                        Info "WARN: $lastHealthError subsystem_statuses=$lastHealthSubsystemStatuses chrome_bridge_detail=$candidateChromeBridgeDetail"
+                        Start-Sleep -Seconds 2
+                        continue
+                    }
+                    Info "Manual install-health rollback probe observed active Chrome bridge host before ACK edge pid=$($h.pid)"
+                }
+                $lastHealthError = "manual install-health rollback probe rejected critical-ready daemon pid=$($h.pid)"
+                Info "WARN: $lastHealthError subsystem_statuses=$lastHealthSubsystemStatuses"
+                break
+            }
             if ($h.ok -ne $true) {
                 Info "WARN: daemon /health returned ok=false after install, but critical non-Chrome subsystems are ready; continuing to Chrome bridge repair/readback. subsystem_statuses=$lastHealthSubsystemStatuses"
             }
@@ -7554,13 +7673,15 @@ while ((Get-Date) -lt $installHealthDeadline) {
 if (-not $ok) {
     $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} last_health_error={4} last_subsystem_statuses={5}`nlisteners:`n{6}`nprocesses:`n{7}`nremediation=inspect {8} and synapse.log.* under {9} for launch / STORAGE_* / bind errors" -f `
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} last_health_error={4} last_subsystem_statuses={5} manual_probe={6} manual_probe_pause_mode={7}`nlisteners:`n{8}`nprocesses:`n{9}`nremediation=inspect {10} and synapse.log.* under {11} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
         ($(if ($backupPath) { $backupPath } else { '<none>' })),
         ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
         $lastHealthSubsystemStatuses,
+        $ManualInstallHealthRollbackProbe,
+        $ManualInstallHealthRollbackPauseMode,
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
         $launcherLog,
@@ -7569,6 +7690,19 @@ if (-not $ok) {
     if ($backupPath -and (Test-Path -LiteralPath $backupPath) -and $oldInstalledHash) {
         Info "WARN: $failureDetail"
         Info "Attempting rollback to previous daemon binary backup=$backupPath sha256=$oldInstalledHash"
+        if ($ManualInstallHealthRollbackProbe) {
+            New-HiddenDaemonLauncher `
+                -OutputPath $hiddenLauncher `
+                -ExePath $ExePath `
+                -Bind $Bind `
+                -DbPath $DbPath `
+                -ProfilesDir $ProfilesDir `
+                -LogDir $LogDir `
+                -TokenPath $TokenPath `
+                -MaintenanceLockPath $MaintenanceLockPath `
+                -AllowedPermissions $AllowedPermissions
+            Info "Manual install-health rollback probe restored normal daemon launcher before rollback stop path=$hiddenLauncher"
+        }
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
             Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         }
@@ -7577,6 +7711,19 @@ if (-not $ok) {
         $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
         if ($rollbackHash -ne $oldInstalledHash) {
             Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_HASH_MISMATCH expected_sha256=$oldInstalledHash actual_sha256=$rollbackHash backup=$backupPath install_path=$ExePath original_failure=[$failureDetail]"
+        }
+        if ($ManualInstallHealthRollbackProbe) {
+            New-HiddenDaemonLauncher `
+                -OutputPath $hiddenLauncher `
+                -ExePath $ExePath `
+                -Bind $Bind `
+                -DbPath $DbPath `
+                -ProfilesDir $ProfilesDir `
+                -LogDir $LogDir `
+                -TokenPath $TokenPath `
+                -MaintenanceLockPath $MaintenanceLockPath `
+                -AllowedPermissions $AllowedPermissions
+            Info "Manual install-health rollback probe restored normal daemon launcher before rollback start path=$hiddenLauncher"
         }
         Start-ScheduledTask -TaskName $TaskName
         $rollbackOk = $false

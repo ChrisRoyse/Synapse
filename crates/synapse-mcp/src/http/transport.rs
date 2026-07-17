@@ -1995,17 +1995,6 @@ pub(super) async fn serve(
         return Ok(ExitCode::from(4));
     }
 
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
-            bind = %addr,
-            "non-loopback HTTP bind allowed by explicit operator flag"
-        );
-    }
-    let listener = bind_http_listener(addr).await?;
-    let local_addr = listener
-        .local_addr()
-        .context("read HTTP listener address")?;
     let shutdown_cancel = CancellationToken::new();
     let connection_closed_cancel = CancellationToken::new();
     let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
@@ -2022,10 +2011,13 @@ pub(super) async fn serve(
     let m2_emitter_owner = take_m2_emitter_owner(&service);
 
     // Eager storage and Calyx vault open: validate lock/schema/vault state
-    // before any MCP request can be served. Periodic maintenance is started
-    // after the recorder/router startup preflights below, otherwise its first
-    // Calyx GC tick can hold the vault and block those preflights before the
-    // HTTP server becomes reachable.
+    // before the production TCP listener is bound. A bound listener before
+    // request-serving state exists makes setup health probes hang against a
+    // process that is not yet able to answer `/health`.
+    //
+    // Periodic maintenance is started after the recorder/router startup
+    // preflights below, otherwise its first Calyx GC tick can hold the vault and
+    // block those preflights before the HTTP server becomes reachable.
     {
         let open_result = match m3_state_for_recorder.lock() {
             Ok(mut state) => Some(state.ensure_storage().map_err(anyhow::Error::new).and_then(
@@ -2041,7 +2033,6 @@ pub(super) async fn serve(
             }
         };
         let Some(open_result) = open_result else {
-            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_state_lock",
@@ -2080,7 +2071,6 @@ pub(super) async fn serve(
                     "refusing to start: storage open or Calyx vault startup failed at daemon startup"
                 );
             }
-            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_or_calyx_open_start",
@@ -2120,7 +2110,6 @@ pub(super) async fn serve(
             }
         };
         let Some(recorder_result) = recorder_result else {
-            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "activity_recorder_state_lock",
@@ -2150,7 +2139,6 @@ pub(super) async fn serve(
                 detail = %detail,
                 "refusing to start: activity recorder failed at daemon startup"
             );
-            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "activity_recorder_start",
@@ -2175,6 +2163,18 @@ pub(super) async fn serve(
             "activity recorder started eagerly at startup"
         );
     }
+
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
+            bind = %addr,
+            "non-loopback HTTP bind allowed by explicit operator flag"
+        );
+    }
+    let listener = bind_http_listener(addr).await?;
+    let local_addr = listener
+        .local_addr()
+        .context("read HTTP listener address")?;
 
     let active_http_sockets = ActiveHttpSockets::default();
     let HttpRuntimeStartup {
