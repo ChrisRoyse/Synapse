@@ -48,6 +48,7 @@ use std::{
     },
 };
 
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -81,6 +82,10 @@ pub(crate) const CURSOR_KV_PREFIX: &str = "agent-transcripts/cursor/";
 
 /// Envelope version for [`TranscriptCursor`] rows.
 const TRANSCRIPT_CURSOR_VERSION: u32 = 1;
+const NS_PER_MS: u64 = 1_000_000;
+const TIMESTAMP_LINE_OFFSET_NS: u64 = NS_PER_MS;
+const STABLE_TS_BASE_MS: u64 = 1_600_000_000_000;
+const STABLE_TS_SPAN_MS: u64 = 20 * 365 * 24 * 60 * 60 * 1_000;
 
 /// Hard cap on one encoded transcript row. The per-field bounds keep real
 /// rows far below this; exceeding it means an ingester bug, surfaced as a
@@ -130,6 +135,11 @@ pub(crate) struct TranscriptCursor {
     pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Stable source-time seed in Unix milliseconds, normally from
+    /// spawn-manifest.json. Used only when a transcript line lacks its own
+    /// timestamp/UUIDv7 time anchor so retries encode the same row bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch_unix_ms: Option<u64>,
     /// True once the source reached its terminal state and the tail was
     /// fully consumed; complete spawns are skipped by later cycles.
     pub source_complete: bool,
@@ -267,21 +277,39 @@ fn detect_source(log_dir: &Path) -> Result<TranscriptSource, String> {
     }
 }
 
-/// Reads the model id recorded in the spawn manifest, if present. This is the
-/// authoritative model source for Codex spawns, whose `exec --json` stream
-/// carries no model id (#949); for Claude it merely seeds the cursor until the
-/// stream's own (more specific) model id supersedes it. A missing or malformed
-/// manifest is not an error here — the spawn simply has no pinned model, and a
-/// model-less spawn is honestly reported as `unknown`/unpriced downstream.
-fn read_spawn_manifest_model(log_dir: &Path) -> Option<String> {
+#[derive(Clone, Debug, Default)]
+struct SpawnManifestSeed {
+    model: Option<String>,
+    created_unix_ms: Option<u64>,
+}
+
+/// Reads stable spawn metadata recorded at launch.
+///
+/// `model` is the authoritative model seed for Codex spawns, whose stream may
+/// omit the model id (#949). `created_unix_ms` is the stable timestamp seed used
+/// only when an individual transcript line has no timestamp/UUIDv7 time anchor.
+/// A missing/malformed manifest is not fatal: the parser still derives time
+/// from source events where possible and falls back to a deterministic source
+/// key seed rather than the wall clock.
+fn read_spawn_manifest_seed(log_dir: &Path) -> SpawnManifestSeed {
     let path = log_dir.join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
-    let bytes = std::fs::read(&path).ok()?;
-    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
-    let model = manifest.get("model")?.as_str()?.trim();
-    if model.is_empty() {
-        return None;
+    let Some(manifest) = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return SpawnManifestSeed::default();
+    };
+    let model = manifest
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned);
+    let created_unix_ms = manifest.get("created_unix_ms").and_then(Value::as_u64);
+    SpawnManifestSeed {
+        model,
+        created_unix_ms,
     }
-    Some(model.to_owned())
 }
 
 fn load_cursor(db: &Db, spawn_id: &str) -> Result<Option<TranscriptCursor>, String> {
@@ -372,6 +400,7 @@ pub(crate) fn ingest_spawn_dir_once(
     let mut cursor = match load_cursor(db, spawn_id)? {
         Some(cursor) => cursor,
         None => {
+            let manifest_seed = read_spawn_manifest_seed(log_dir);
             let source = match detect_source(log_dir) {
                 Ok(source) => source,
                 Err(detail) => {
@@ -390,6 +419,7 @@ pub(crate) fn ingest_spawn_dir_once(
                         last_assistant_message_id: None,
                         conversation_id: None,
                         model: None,
+                        source_epoch_unix_ms: manifest_seed.created_unix_ms,
                         source_complete: false,
                         completed_reason: None,
                         error: None,
@@ -412,7 +442,8 @@ pub(crate) fn ingest_spawn_dir_once(
                 conversation_id: None,
                 // Seed from the spawn manifest. For Codex this is the only model
                 // source; for Claude the stream supersedes it (#949).
-                model: read_spawn_manifest_model(log_dir),
+                model: manifest_seed.model,
+                source_epoch_unix_ms: manifest_seed.created_unix_ms,
                 source_complete: false,
                 completed_reason: None,
                 error: None,
@@ -530,6 +561,8 @@ pub(crate) fn ingest_spawn_dir_once(
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
     let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
+    let mut constellation_rows: Vec<(Vec<u8>, Vec<u8>, AgentTranscriptRecord)> =
+        Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     for raw_line in &lines {
@@ -570,6 +603,7 @@ pub(crate) fn ingest_spawn_dir_once(
             agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
             transcript_key.clone(),
         ));
+        constellation_rows.push((transcript_key.clone(), encoded.clone(), record.clone()));
         rows.push((transcript_key, encoded));
         cursor.lines_ingested = line_no;
     }
@@ -584,6 +618,22 @@ pub(crate) fn ingest_spawn_dir_once(
                 "TRANSCRIPT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines will re-ingest)"
             )
         })?;
+        for (source_key, raw_bytes, record) in &constellation_rows {
+            db.put_agent_transcript_constellation(source_key, raw_bytes, record)
+                .map_err(|error| {
+                    tracing::error!(
+                        code = "CALYX_AGENT_TRANSCRIPT_CONSTELLATION_MEASUREMENT_FAILED",
+                        spawn_id,
+                        line_no = record.line_no,
+                        source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
+                        detail = %error,
+                        "transcript row was written but native Calyx constellation measurement failed; cursor not advanced"
+                    );
+                    format!(
+                        "TRANSCRIPT_CONSTELLATION_MEASUREMENT_FAILED: {error} (cursor not advanced; lines will re-ingest)"
+                    )
+                })?;
+        }
     }
 
     cursor.offset_bytes += consumed_bytes as u64;
@@ -926,7 +976,7 @@ fn parse_line(
     cursor: &mut TranscriptCursor,
 ) -> AgentTranscriptRecord {
     let mut record = AgentTranscriptRecord::new(
-        unix_time_ns_now(),
+        transcript_source_ts_ns(None, &cursor.spawn_id, line_no, cursor.source_epoch_unix_ms),
         cursor.spawn_id.clone(),
         line_no,
         cursor.source,
@@ -954,6 +1004,12 @@ fn parse_line(
         record.parse_error = Some("LINE_NOT_JSON_OBJECT".to_owned());
         return record;
     };
+    record.ts_ns = transcript_source_ts_ns(
+        Some(object),
+        &cursor.spawn_id,
+        line_no,
+        cursor.source_epoch_unix_ms,
+    );
     let result = match cursor.source {
         TranscriptSource::ClaudeStreamJson => parse_claude_object(object, &mut record, cursor),
         TranscriptSource::CodexExecJson => parse_codex_object(object, &mut record, cursor),
@@ -1014,6 +1070,206 @@ fn bounded_json_string(value: &Value, cap: usize) -> (String, u64, bool) {
     let full_bytes = serialized.len() as u64;
     let (bounded, truncated) = bounded_chars(&serialized, cap);
     (bounded, full_bytes, truncated)
+}
+
+pub(crate) fn transcript_source_ts_ns(
+    object: Option<&Map<String, Value>>,
+    source_id: &str,
+    line_no: u64,
+    source_epoch_unix_ms: Option<u64>,
+) -> u64 {
+    let Some(object) = object else {
+        return stable_transcript_ts_ns(source_id, line_no, source_epoch_unix_ms);
+    };
+    let value = Value::Object(object.clone());
+    if let Some(ts_ns) = find_named_u64(&value, TIMESTAMP_NS_FIELDS) {
+        return ts_ns;
+    }
+    if let Some(ts_ms) = find_named_u64(&value, TIMESTAMP_MS_FIELDS) {
+        return timestamp_ms_with_line_offset(ts_ms, line_no);
+    }
+    if let Some(ts_ms) = find_named_rfc3339_ms(&value) {
+        return timestamp_ms_with_line_offset(ts_ms, line_no);
+    }
+    if let Some(ts_ms) = find_named_uuid_v7_ms(&value) {
+        return timestamp_ms_with_line_offset(ts_ms, line_no);
+    }
+    stable_transcript_ts_ns(source_id, line_no, source_epoch_unix_ms)
+}
+
+const TIMESTAMP_NS_FIELDS: &[&str] = &[
+    "ts_ns",
+    "timestamp_ns",
+    "timestampUnixNs",
+    "timestamp_unix_ns",
+    "created_unix_ns",
+    "createdAtNs",
+    "startedAtNs",
+    "completedAtNs",
+    "updatedAtNs",
+];
+const TIMESTAMP_MS_FIELDS: &[&str] = &[
+    "ts_unix_ms",
+    "timestamp_ms",
+    "timestampUnixMs",
+    "timestamp_unix_ms",
+    "created_unix_ms",
+    "createdAtMs",
+    "startedAtMs",
+    "completedAtMs",
+    "updatedAtMs",
+];
+const TIMESTAMP_RFC3339_FIELDS: &[&str] = &[
+    "timestamp",
+    "created_at",
+    "createdAt",
+    "startedAt",
+    "completedAt",
+    "updatedAt",
+    "time",
+];
+const UUID_V7_TIME_FIELDS: &[&str] = &[
+    "id",
+    "threadId",
+    "thread_id",
+    "turnId",
+    "turn_id",
+    "itemId",
+    "item_id",
+    "message_id",
+    "sessionId",
+    "session_id",
+    "spawn_id",
+    "spawnId",
+];
+
+fn timestamp_ms_with_line_offset(ts_ms: u64, line_no: u64) -> u64 {
+    ts_ms
+        .saturating_mul(NS_PER_MS)
+        .saturating_add(line_no % TIMESTAMP_LINE_OFFSET_NS)
+}
+
+fn stable_transcript_ts_ns(
+    source_id: &str,
+    line_no: u64,
+    source_epoch_unix_ms: Option<u64>,
+) -> u64 {
+    let ts_ms = source_epoch_unix_ms
+        .or_else(|| uuid_v7_unix_ms(source_id))
+        .unwrap_or_else(|| stable_source_epoch_ms(source_id));
+    timestamp_ms_with_line_offset(ts_ms, line_no)
+}
+
+fn stable_source_epoch_ms(source_id: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(source_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    STABLE_TS_BASE_MS + (u64::from_be_bytes(bytes) % STABLE_TS_SPAN_MS)
+}
+
+fn find_named_u64(value: &Value, names: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if field_matches(name, names)
+                    && let Some(number) = value_as_u64(value)
+                {
+                    return Some(number);
+                }
+                if let Some(found) = find_named_u64(value, names) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(|value| find_named_u64(value, names)),
+        _ => None,
+    }
+}
+
+fn find_named_rfc3339_ms(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if field_matches(name, TIMESTAMP_RFC3339_FIELDS)
+                    && let Some(text) = value.as_str()
+                    && let Some(ms) = parse_rfc3339_unix_ms(text)
+                {
+                    return Some(ms);
+                }
+                if let Some(found) = find_named_rfc3339_ms(value) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(find_named_rfc3339_ms),
+        _ => None,
+    }
+}
+
+fn find_named_uuid_v7_ms(value: &Value) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if field_matches(name, UUID_V7_TIME_FIELDS)
+                    && let Some(text) = value.as_str()
+                    && let Some(ms) = uuid_v7_unix_ms(text)
+                {
+                    return Some(ms);
+                }
+                if let Some(found) = find_named_uuid_v7_ms(value) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(find_named_uuid_v7_ms),
+        _ => None,
+    }
+}
+
+fn field_matches(name: &str, candidates: &[&str]) -> bool {
+    candidates.contains(&name)
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+}
+
+fn parse_rfc3339_unix_ms(text: &str) -> Option<u64> {
+    let millis = DateTime::parse_from_rfc3339(text).ok()?.timestamp_millis();
+    u64::try_from(millis).ok()
+}
+
+fn uuid_v7_unix_ms(value: &str) -> Option<u64> {
+    let mut candidate = value.trim();
+    for prefix in ["agent-spawn-", "ambient-claude-", "msg_"] {
+        if let Some(stripped) = candidate.strip_prefix(prefix) {
+            candidate = stripped;
+        }
+    }
+    let hex = candidate
+        .chars()
+        .filter(|ch| *ch != '-')
+        .take(32)
+        .collect::<String>();
+    if hex.len() < 13 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !hex
+        .as_bytes()
+        .get(12)
+        .is_some_and(|version| *version == b'7')
+    {
+        return None;
+    }
+    u64::from_str_radix(&hex[..12], 16).ok()
 }
 
 /// Claude Code `--output-format stream-json` vocabulary, pinned to the

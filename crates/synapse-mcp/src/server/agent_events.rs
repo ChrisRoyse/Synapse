@@ -226,6 +226,7 @@ pub(crate) fn record_agent_events_unobserved(
     records: &[AgentEventRecord],
 ) -> StorageResult<Vec<AgentEventWriteReadback>> {
     let mut rows = Vec::with_capacity(records.len());
+    let mut constellation_rows = Vec::with_capacity(records.len());
     let mut readbacks = Vec::with_capacity(records.len());
     for record in records {
         let encoded = validate_and_encode(record).inspect_err(|error| {
@@ -245,7 +246,9 @@ pub(crate) fn record_agent_events_unobserved(
             seq,
             value_len_bytes: encoded.len(),
         });
-        rows.push((agent_event_key(record.ts_ns, seq), encoded));
+        let key = agent_event_key(record.ts_ns, seq);
+        constellation_rows.push((key.clone(), encoded.clone()));
+        rows.push((key, encoded));
     }
     if rows.is_empty() {
         return Ok(readbacks);
@@ -260,7 +263,22 @@ pub(crate) fn record_agent_events_unobserved(
                 "agent event batch enqueue failed"
             );
         })?;
-    for (record, readback) in records.iter().zip(&readbacks) {
+    for ((record, readback), (source_key, raw_bytes)) in
+        records.iter().zip(&readbacks).zip(&constellation_rows)
+    {
+        let constellation = db
+            .put_agent_event_constellation(source_key, raw_bytes, record)
+            .inspect_err(|error| {
+                tracing::error!(
+                    code = "CALYX_AGENT_EVENT_CONSTELLATION_MEASUREMENT_FAILED",
+                    kind = ?record.kind,
+                    ts_ns = readback.ts_ns,
+                    seq = readback.seq,
+                    source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
+                    detail = %error,
+                    "agent event row was written but native Calyx constellation measurement failed"
+                );
+            })?;
         tracing::debug!(
             code = "AGENT_EVENT_RECORDED",
             kind = ?record.kind,
@@ -269,6 +287,9 @@ pub(crate) fn record_agent_events_unobserved(
             session_id = ?record.session_id,
             spawn_id = ?record.spawn_id,
             value_len_bytes = readback.value_len_bytes,
+            constellation_panel = constellation.panel_name,
+            constellation_disposition = constellation.disposition.as_str(),
+            constellation_cx_id = %constellation.cx_id,
             "readback=CF_AGENT_EVENTS edge=enqueued"
         );
     }

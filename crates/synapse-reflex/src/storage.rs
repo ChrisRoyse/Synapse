@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
-use synapse_core::types::{EpisodeRecord, TimelineRecord};
+use synapse_core::types::{AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, TimelineRecord};
 use synapse_core::{StoredReflexAudit, error_codes};
 use synapse_storage::{
     CalyxVaultInspect, ConstellationPutReport, DiskPressureLevel, GcReport, PressureReport,
@@ -284,6 +284,42 @@ impl ReflexRuntime {
     ) -> StorageResult<ConstellationPutReport> {
         self.db
             .put_episode_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one already
+    /// persisted agent-event row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when row measurement or native Calyx
+    /// constellation persistence fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", source_key_len = source_key.len()))]
+    pub fn storage_put_agent_event_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &AgentEventRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.db
+            .put_agent_event_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one already
+    /// persisted agent-transcript row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when row measurement or native Calyx
+    /// constellation persistence fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", source_key_len = source_key.len()))]
+    pub fn storage_put_agent_transcript_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &AgentTranscriptRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.db
+            .put_agent_transcript_constellation(source_key, raw_bytes, record)
     }
 
     /// Compacts one key range of a column family (tombstone reclamation after

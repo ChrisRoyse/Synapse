@@ -77,7 +77,10 @@ use synapse_storage::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::agent_events::{provider_for_agent_kind, record_agent_events, unix_time_ns_now};
+use super::{
+    agent_events::{provider_for_agent_kind, record_agent_events, unix_time_ns_now},
+    agent_transcripts::transcript_source_ts_ns,
+};
 use crate::m3::{M3State, default_daemon_db_path, default_db_path};
 
 /// Seconds between ambient ingest cycles.
@@ -190,6 +193,10 @@ struct AmbientCursor {
     cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     git_branch: Option<String>,
+    /// Stable source-time seed for rows whose session-file JSON lacks a
+    /// timestamp/UUIDv7 time anchor. This keeps reingest idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_epoch_unix_ms: Option<u64>,
     /// True once the `SpawnRequested`/`SpawnReady` registration rows are
     /// journaled. Restart-safe: the journal rebuild restores the agent, so a
     /// registered cursor never re-emits registration.
@@ -615,6 +622,8 @@ fn ingest_session_file(
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
     let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
+    let mut constellation_rows: Vec<(Vec<u8>, Vec<u8>, AgentTranscriptRecord)> =
+        Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     let mut last_lifecycle: Option<Lifecycle> = None;
@@ -654,6 +663,7 @@ fn ingest_session_file(
             agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
             transcript_key.clone(),
         ));
+        constellation_rows.push((transcript_key.clone(), encoded.clone(), record.clone()));
         rows.push((transcript_key, encoded));
         cursor.lines_ingested = line_no;
         if let Some(signal) = lifecycle {
@@ -669,6 +679,22 @@ fn ingest_session_file(
         .map_err(|error| {
             format!("AMBIENT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines re-ingest)")
         })?;
+        for (source_key, raw_bytes, record) in &constellation_rows {
+            db.put_agent_transcript_constellation(source_key, raw_bytes, record)
+                .map_err(|error| {
+                    tracing::error!(
+                        code = "CALYX_AGENT_TRANSCRIPT_CONSTELLATION_MEASUREMENT_FAILED",
+                        spawn_id = %spawn_id,
+                        line_no = record.line_no,
+                        source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
+                        detail = %error,
+                        "ambient transcript row was written but native Calyx constellation measurement failed; cursor not advanced"
+                    );
+                    format!(
+                        "AMBIENT_CONSTELLATION_MEASUREMENT_FAILED: {error} (cursor not advanced; lines re-ingest)"
+                    )
+                })?;
+        }
     }
 
     cursor.offset_bytes += consumed_bytes as u64;
@@ -712,6 +738,7 @@ fn seed_cursor(spawn_id: &str, session_id: &str, source_path: &Path) -> AmbientC
         model: None,
         cwd: None,
         git_branch: None,
+        source_epoch_unix_ms: None,
         registered: false,
         last_emitted_state: None,
         error: None,
@@ -981,7 +1008,7 @@ fn parse_session_line(
     cursor: &mut AmbientCursor,
 ) -> (AgentTranscriptRecord, Option<Lifecycle>) {
     let mut record = AgentTranscriptRecord::new(
-        unix_time_ns_now(),
+        transcript_source_ts_ns(None, &cursor.spawn_id, line_no, cursor.source_epoch_unix_ms),
         cursor.spawn_id.clone(),
         line_no,
         TranscriptSource::ClaudeSessionJsonl,
@@ -1012,6 +1039,12 @@ fn parse_session_line(
         record.parse_error = Some("LINE_NOT_JSON_OBJECT".to_owned());
         return (record, None);
     };
+    record.ts_ns = transcript_source_ts_ns(
+        Some(object),
+        &cursor.spawn_id,
+        line_no,
+        cursor.source_epoch_unix_ms,
+    );
 
     match classify_session_object(object, &mut record, cursor) {
         Ok(lifecycle) => {

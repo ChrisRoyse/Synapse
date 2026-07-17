@@ -5822,57 +5822,96 @@ function Request-SynapseChromeBridgeMaintenancePause {
         [int]$ResumeProbeAfterMs = $SynapseChromeBridgeMaintenanceResumeProbeAfterMs
     )
 
-    try {
-        $health = Invoke-RestMethod `
-            -Method Get `
-            -Uri "http://$Bind/health" `
-            -Headers @{ Authorization = "Bearer $Token" } `
-            -UserAgent "synapse-setup/$Reason" `
-            -TimeoutSec 4
-    } catch {
-        return [pscustomobject]@{
-            Ok = $false
-            Skipped = $false
-            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_FAILED'
-            Response = $null
-            Error = $_.Exception.Message
-            Detail = $null
+    $health = $null
+    $healthAttempts = @()
+    $healthTimeouts = @(4, 8, 12)
+    for ($healthAttempt = 1; $healthAttempt -le $healthTimeouts.Count; $healthAttempt++) {
+        $timeoutSec = [int]$healthTimeouts[$healthAttempt - 1]
+        try {
+            $health = Invoke-RestMethod `
+                -Method Get `
+                -Uri "http://$Bind/health" `
+                -Headers @{ Authorization = "Bearer $Token" } `
+                -UserAgent "synapse-setup/$Reason" `
+                -TimeoutSec $timeoutSec
+            $healthAttempts += [pscustomobject]@{
+                attempt = $healthAttempt
+                ok = $true
+                timeout_sec = $timeoutSec
+                error = $null
+            }
+            if ($healthAttempt -gt 1) {
+                Info ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_RETRY_OK reason={0} bind={1} attempt={2} timeout_sec={3}" -f `
+                    $Reason,
+                    $Bind,
+                    $healthAttempt,
+                    $timeoutSec)
+            }
+            break
+        } catch {
+            $healthAttempts += [pscustomobject]@{
+                attempt = $healthAttempt
+                ok = $false
+                timeout_sec = $timeoutSec
+                error = $_.Exception.Message
+            }
+            if ($healthAttempt -lt $healthTimeouts.Count) {
+                Start-Sleep -Seconds 1
+            }
         }
     }
 
-    $chromeBridge = $health.subsystems.chrome_bridge
-    if ($null -eq $chromeBridge) {
-        return [pscustomobject]@{
-            Ok = $false
-            Skipped = $false
-            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_MISSING'
-            Response = $health
-            Error = 'health.subsystems.chrome_bridge missing'
-            Detail = $null
+    if ($null -ne $health) {
+        $chromeBridge = $health.subsystems.chrome_bridge
+        if ($null -eq $chromeBridge) {
+            return [pscustomobject]@{
+                Ok = $false
+                Skipped = $false
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_MISSING'
+                Response = [pscustomobject]@{
+                    health = $health
+                    health_attempts = $healthAttempts
+                }
+                Error = 'health.subsystems.chrome_bridge missing'
+                Detail = $null
+            }
         }
-    }
 
-    $status = "$($chromeBridge.status)"
-    $detail = "$($chromeBridge.detail)"
-    if ($detail -match 'no_active_chrome_bridge_host') {
-        return [pscustomobject]@{
-            Ok = $true
-            Skipped = $true
-            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_NO_ACTIVE_HOST'
-            Response = $health
-            Error = $null
-            Detail = $detail
+        $status = "$($chromeBridge.status)"
+        $detail = "$($chromeBridge.detail)"
+        if ($detail -match 'no_active_chrome_bridge_host') {
+            return [pscustomobject]@{
+                Ok = $true
+                Skipped = $true
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_NO_ACTIVE_HOST'
+                Response = [pscustomobject]@{
+                    health = $health
+                    health_attempts = $healthAttempts
+                }
+                Error = $null
+                Detail = $detail
+            }
         }
-    }
-    if ([string]::IsNullOrWhiteSpace($status)) {
-        return [pscustomobject]@{
-            Ok = $false
-            Skipped = $false
-            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_STATUS_UNREADABLE'
-            Response = $health
-            Error = 'health.subsystems.chrome_bridge.status missing'
-            Detail = $detail
+        if ([string]::IsNullOrWhiteSpace($status)) {
+            return [pscustomobject]@{
+                Ok = $false
+                Skipped = $false
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_STATUS_UNREADABLE'
+                Response = [pscustomobject]@{
+                    health = $health
+                    health_attempts = $healthAttempts
+                }
+                Error = 'health.subsystems.chrome_bridge.status missing'
+                Detail = $detail
+            }
         }
+    } else {
+        $detail = "health_preflight_unreadable attempts=$($healthAttempts.Count); proceeding_to_maintenance_pause_post because the POST endpoint is the authoritative bridge pause acknowledgement gate"
+        Info ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_PREFLIGHT_UNREADABLE_PROCEEDING reason={0} bind={1} attempts={2} last_error={3}" -f `
+            $Reason,
+            $Bind,
+            $healthAttempts.Count,
+            $healthAttempts[-1].error)
     }
 
     $body = [ordered]@{
@@ -5896,6 +5935,34 @@ function Request-SynapseChromeBridgeMaintenancePause {
         } catch {
             $responseBody = Read-SynapseHttpErrorResponseBody -ErrorRecord $_
             $statusCode = Read-SynapseHttpErrorStatus -ErrorRecord $_
+            $responseDetail = $responseBody
+            $parsedResponseBody = $null
+            if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                try {
+                    $parsedResponseBody = $responseBody | ConvertFrom-Json -ErrorAction Stop
+                    if ($null -ne $parsedResponseBody.detail) {
+                        $responseDetail = "$($parsedResponseBody.detail)"
+                    }
+                } catch {
+                    $parsedResponseBody = $null
+                }
+            }
+            if ($statusCode -eq 503 -and $responseDetail -match 'no_active_chrome_bridge_host') {
+                return [pscustomobject]@{
+                    Ok = $true
+                    Skipped = $true
+                    Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_NO_ACTIVE_HOST'
+                    Response = [pscustomobject]@{
+                        health_attempts = $healthAttempts
+                        maintenance_pause_attempt = $attempt
+                        post_response = $parsedResponseBody
+                        post_response_body = $responseBody
+                    }
+                    Error = $null
+                    Detail = $responseDetail
+                    Attempts = $attempts
+                }
+            }
             $attempts += [pscustomobject]@{
                 attempt = $attempt
                 code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_REQUEST_FAILED'

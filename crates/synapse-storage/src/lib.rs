@@ -22,8 +22,9 @@ pub use backend::{
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
-    ConstellationPutReport, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    ConstellationPutReport, SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION,
+    SYN_AGENT_TRANSCRIPT_PANEL_NAME, SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME,
+    SYN_EPISODE_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
@@ -394,6 +395,44 @@ impl Db {
     ) -> StorageResult<ConstellationPutReport> {
         self.backend
             .put_episode_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_AGENT_EVENTS` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_agent_event_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::types::AgentEventRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_agent_event_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_AGENT_TRANSCRIPTS` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_agent_transcript_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::types::AgentTranscriptRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_agent_transcript_constellation(source_key, raw_bytes, record)
     }
 
     /// Runs one disk-pressure check immediately.

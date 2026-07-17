@@ -20,12 +20,14 @@ use synapse_calyx::{
 use synapse_core::{
     error_codes,
     retention::{DEFAULTS, RetentionDefault, RetentionTtl},
-    types::{EpisodeRecord, TimelineRecord},
+    types::{AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, TimelineRecord},
 };
 
 use crate::constellations::{
-    ConstellationPutReport, NativeConstellationContext, SYN_EPISODE_PANEL_NAME,
-    SYN_EPISODE_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    ConstellationPutReport, NativeConstellationContext, SYN_AGENT_EVENT_PANEL_NAME,
+    SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+    SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 use crate::{
     CfEstimateMap, OwnedCfWriteBatch, RawRow, ScanWindow, StorageError, StorageResult, cf,
@@ -198,6 +200,18 @@ pub trait StorageBackend: Send + Sync {
         source_key: &[u8],
         raw_bytes: &[u8],
         record: &EpisodeRecord,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_agent_event_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &AgentEventRecord,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_agent_transcript_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &AgentTranscriptRecord,
     ) -> StorageResult<ConstellationPutReport>;
     fn run_pressure_check_once(
         &self,
@@ -773,6 +787,158 @@ impl StorageBackend for CalyxBackend {
                 constellations::emit_error_metric(
                     SYN_EPISODE_PANEL_NAME,
                     cf::CF_EPISODES,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_agent_event_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &AgentEventRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put agent event Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_AGENT_EVENT_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_AGENT_EVENTS)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_agent_event_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put agent event observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_AGENT_EVENT_PANEL_NAME,
+                    panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
+                    source_cf: cf::CF_AGENT_EVENTS,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_AGENT_EVENT_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "agent event row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_AGENT_EVENT_PANEL_NAME,
+                    cf::CF_AGENT_EVENTS,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_agent_transcript_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &AgentTranscriptRecord,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put agent transcript Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_AGENT_TRANSCRIPT_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_AGENT_TRANSCRIPTS)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_agent_transcript_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put agent transcript observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+                    panel_version: SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+                    source_cf: cf::CF_AGENT_TRANSCRIPTS,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_AGENT_TRANSCRIPT_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "agent transcript row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+                    cf::CF_AGENT_TRANSCRIPTS,
                     error.code(),
                     started.elapsed(),
                 );
