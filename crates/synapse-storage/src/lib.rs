@@ -1,14 +1,11 @@
 pub mod agent_events;
 pub mod agent_transcripts;
 mod backend;
-mod batch;
 pub mod cf;
 pub mod codecs;
-pub mod compaction;
 pub mod episodes;
 pub mod error;
 mod gc;
-mod migration;
 mod pressure;
 pub mod routines;
 pub mod timeline;
@@ -25,10 +22,6 @@ pub use backend::{
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
-pub use migration::{
-    DEFAULT_MIGRATION_BATCH_ROWS, StorageMigrationCfReport, StorageMigrationConfig,
-    StorageMigrationManifest, migrate_rocksdb_to_calyx,
-};
 pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
 
 /// One raw storage row: key bytes and value bytes.
@@ -60,7 +53,7 @@ impl fmt::Debug for Db {
 }
 
 impl Db {
-    /// Opens storage with the default backend (`rocksdb`).
+    /// Opens storage with the default Calyx backend.
     ///
     /// # Errors
     ///
@@ -85,9 +78,6 @@ impl Db {
         backend_kind: StorageBackendKind,
     ) -> StorageResult<Self> {
         let backend: Box<dyn backend::StorageBackend> = match backend_kind {
-            StorageBackendKind::RocksDb => {
-                Box::new(backend::RocksDbBackend::open(path, schema_version)?)
-            }
             StorageBackendKind::Calyx => {
                 Box::new(backend::CalyxBackend::open(path, schema_version)?)
             }
@@ -156,15 +146,6 @@ impl Db {
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
         )
-    }
-
-    pub(crate) fn put_calyx_migration_batch_pressure_bypass(
-        &self,
-        cf_name: &str,
-        rows: Vec<backend::CalyxMigrationRow>,
-    ) -> StorageResult<()> {
-        self.backend
-            .put_calyx_migration_batch_pressure_bypass(cf_name, rows)
     }
 
     /// Writes key/value batches across multiple column families atomically
@@ -362,13 +343,11 @@ impl Db {
         self.backend.cf_estimated_row_counts()
     }
 
-    /// Returns physical Calyx vault collection statistics when this DB is
-    /// backed by Calyx.
+    /// Returns physical Calyx vault collection statistics.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the Calyx vault cannot be inspected. `RocksDB`
-    /// backends return `Ok(None)` because there is no Calyx vault.
+    /// Returns a storage error when the Calyx vault cannot be inspected.
     #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
     pub fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
         self.backend.calyx_vault_inspect()

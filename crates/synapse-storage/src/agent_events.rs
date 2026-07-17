@@ -10,7 +10,7 @@
 //! error, never a silent skip.
 //!
 //! Durability contract (#897 acceptance): journal rows use `Db::put_batch`,
-//! which returns only after the row reaches `RocksDB` with a synced WAL.
+//! which returns only after the row reaches the Calyx vault and its WAL.
 //! Writers of terminal lifecycle events (exited/killed/spawn failure) also
 //! call `Db::flush()` at the lifecycle boundary.
 

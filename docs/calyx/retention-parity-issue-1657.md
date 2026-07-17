@@ -66,9 +66,8 @@ Byte-cap behavior:
 - Redis documents the production pattern of passive expiry on access plus active
   cleanup for keys that may never be touched again:
   https://redis.io/docs/latest/commands/expire/
-- RocksDB's TTL documentation says expired TTL values are deleted only during
-  compaction and that `Get`/iterators may return expired entries first:
-  https://github.com/facebook/rocksdb/wiki/Time-to-Live
+- LSM-style TTL implementations delete expired values during compaction and can
+  return stale physical entries before maintenance runs.
 - Caffeine separates size-based eviction from time-based expiration and performs
   expiration maintenance during writes and occasional reads:
   https://github.com/ben-manes/caffeine/wiki/Eviction

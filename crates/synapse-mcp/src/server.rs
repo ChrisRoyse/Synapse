@@ -644,7 +644,7 @@ fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
     // The process-global bridge callback must never become a hidden lifetime
     // owner of the daemon DB. A failed startup or completed shutdown drops the
     // last strong M3 owner; later bridge events observe that physical state
-    // instead of keeping RocksDB alive past the daemon locks.
+    // instead of keeping the Calyx vault alive past the daemon locks.
     let m3_state = Arc::downgrade(m3_state);
     crate::chrome_debugger_bridge::set_browser_navigation_sink(Arc::new(move |event| {
         let Some(m3_state) = m3_state.upgrade() else {
@@ -1661,7 +1661,7 @@ impl SynapseService {
 /// set (see [`SynapseService::build_tool_router`]).
 ///
 /// - `storage_put_probe_rows` — writes bounded synthetic probe rows into a real
-///   RocksDB column family; a synthetic-write diagnostic used by storage/GC and
+///   Calyx-backed column family; a synthetic-write diagnostic used by storage/GC and
 ///   timeline regression checks to seed rows, never a production capability
 ///   (#1595). Manual FSV remains separate.
 /// - `storage_pressure_sample` — simulates disk pressure to exercise the storage

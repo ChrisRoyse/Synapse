@@ -70,8 +70,8 @@ use synapse_storage::{
     Db,
     agent_transcripts::{
         AGENT_TRANSCRIPT_TS_INDEX_PREFIX, agent_transcript_spawn_prefix,
-        agent_transcript_ts_index_key, agent_transcript_ts_index_lower_bound,
-        decode_agent_transcript_key, decode_agent_transcript_ts_index_key_ts,
+        agent_transcript_ts_index_lower_bound, decode_agent_transcript_key,
+        decode_agent_transcript_ts_index_key_ts,
     },
     cf,
 };
@@ -594,7 +594,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Roll up token usage and cost from durable agent transcripts: per-spawn, per-model, and fleet totals. Counters are derived by a budget-guarded scan of CF_AGENT_TRANSCRIPTS so they reconcile exactly with physical rows (scanned_rows is returned). Unpriced models surface as `unpriced`; Claude's own total_cost is surfaced for cross-check."
+        description = "Roll up token usage and cost for one spawn_id from durable agent transcripts. Fleet cost rollups are fail-closed until #1688 TimeSeries/OLAP rollups replace scan-bound transcript analytics. Unpriced models surface as `unpriced`; Claude's own total_cost is surfaced for cross-check."
     )]
     pub async fn agent_cost(
         &self,
@@ -612,7 +612,7 @@ impl SynapseService {
 #[tool_router(router = cost_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public cost facade for the <=40 MCP surface. operation=summarize rolls up token/cost from CF_AGENT_TRANSCRIPTS; price_list reads CF_KV price rows; price_put/price_delete are maintenance-gated mutations with exact CF_KV readback."
+        description = "Public cost facade for the <=40 MCP surface. operation=summarize is bounded to one spawn_id until #1688 rollups replace scan-bound fleet analytics; price_list reads CF_KV price rows; price_put/price_delete are maintenance-gated mutations with exact CF_KV readback."
     )]
     pub async fn cost(
         &self,
@@ -972,6 +972,16 @@ impl SynapseService {
     }
 
     fn agent_cost_impl(&self, params: AgentCostParams) -> Result<AgentCostResponse, ErrorData> {
+        if params.spawn_id.is_none() {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "AGENT_COST_FLEET_ROLLUP_UNAVAILABLE: fleet cost summarize is disabled until \
+                 #1688 lands TimeSeries/OLAP rollups. The retained transcript corpus is too \
+                 large for a raw or timestamp-index scan to complete inside the MCP tools/call \
+                 budget, and a timed-out partial scan would hide an incomplete answer. Pass \
+                 spawn_id for a bounded exact spawn-prefix cost read.",
+            ));
+        }
         let plan = AgentCostQueryPlan::from_params(params)?;
         self.agent_cost_impl_scoped(plan, None)
     }
@@ -2066,7 +2076,7 @@ struct IndexedTranscriptRead {
     transcript_rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-fn ensure_transcript_ts_index(db: &Db) -> Result<CostTranscriptIndexMeta, ErrorData> {
+fn load_transcript_ts_index_meta(db: &Db) -> Result<CostTranscriptIndexMeta, ErrorData> {
     if let Some(value) = db
         .get_cf(cf::CF_KV, COST_TS_INDEX_META_KEY.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
@@ -2089,75 +2099,17 @@ fn ensure_transcript_ts_index(db: &Db) -> Result<CostTranscriptIndexMeta, ErrorD
         return Ok(meta);
     }
 
-    let mut indexed_rows = 0_u64;
-    let mut start = Vec::new();
-    loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_AGENT_TRANSCRIPTS, &start, SCAN_CHUNK_ROWS)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut index_rows = Vec::with_capacity(rows.len());
-        for (key, value) in &rows {
-            let (spawn_id, _line_no) = decode_agent_transcript_key(key)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            let record: AgentTranscriptRecord = serde_json::from_slice(value).map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "AGENT_COST_INDEX_BUILD_TRANSCRIPT_CORRUPT: spawn {spawn_id} row failed to decode: {error}"
-                    ),
-                )
-            })?;
-            index_rows.push((
-                agent_transcript_ts_index_key(record.ts_ns, key),
-                key.clone(),
-            ));
-        }
-        if !index_rows.is_empty() {
-            db.put_batch_pressure_bypass(cf::CF_KV, index_rows)
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("AGENT_COST_INDEX_BUILD_WRITE_FAILED: {error}"),
-                    )
-                })?;
-            indexed_rows = indexed_rows.saturating_add(rows.len() as u64);
-        }
-        if !more {
-            break;
-        }
-        let Some((last, _value)) = rows.last() else {
-            break;
-        };
-        start = key_after(last);
-    }
-
-    let meta = CostTranscriptIndexMeta {
-        schema_version: COST_TS_INDEX_VERSION,
-        indexed_rows,
-        built_at_ns: unix_time_ns_now(),
-        source_cf: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
-        index_prefix: String::from_utf8_lossy(AGENT_TRANSCRIPT_TS_INDEX_PREFIX).to_string(),
-    };
-    let encoded = serde_json::to_vec(&meta).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("AGENT_COST_INDEX_META_ENCODE_FAILED: {error}"),
-        )
-    })?;
-    db.put_batch_pressure_bypass(
-        cf::CF_KV,
-        [(COST_TS_INDEX_META_KEY.as_bytes().to_vec(), encoded)],
-    )
-    .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!("AGENT_COST_INDEX_META_WRITE_FAILED: {error}"),
-        )
-    })?;
-    Ok(meta)
+    Err(mcp_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!(
+            "AGENT_COST_INDEX_MISSING: {COST_TS_INDEX_META_KEY} is absent from CF_KV; \
+             default fleet cost summarize cannot prove a bounded timestamp-index read. \
+             Use spawn_id for an exact spawn-prefix cost read, or complete #1688 \
+             TimeSeries/OLAP rollups before fleet cost analytics. The read path \
+             refuses to rebuild the index inline because that hides setup work \
+             behind a long-running tools/call."
+        ),
+    ))
 }
 
 fn scan_transcripts_by_timestamp_index(
@@ -2165,7 +2117,7 @@ fn scan_transcripts_by_timestamp_index(
     since_ns: u64,
     until_ns: Option<u64>,
 ) -> Result<IndexedTranscriptRead, ErrorData> {
-    let _meta = ensure_transcript_ts_index(db)?;
+    let _meta = load_transcript_ts_index_meta(db)?;
     let upper = until_ns.map(agent_transcript_ts_index_lower_bound);
     let mut start = agent_transcript_ts_index_lower_bound(since_ns);
     let mut scanned_index_rows = 0_u64;

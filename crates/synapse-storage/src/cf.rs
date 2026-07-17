@@ -49,7 +49,7 @@ pub const CF_AGENT_EVENTS: &str = "CF_AGENT_EVENTS";
 /// re-ingestable: the same line always maps to the same key.
 pub const CF_AGENT_TRANSCRIPTS: &str = "CF_AGENT_TRANSCRIPTS";
 
-/// PRD §4 column family names, excluding `RocksDB`'s implicit `default` CF.
+/// PRD §4 logical column family names persisted as Calyx vault collections.
 pub const ALL_COLUMN_FAMILIES: [&str; 17] = [
     CF_EVENTS,
     CF_OBSERVATIONS,

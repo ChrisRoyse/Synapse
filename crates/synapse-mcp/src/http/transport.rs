@@ -1677,10 +1677,10 @@ pub(super) async fn serve(
         return Ok(ExitCode::from(2));
     }
 
-    // Single-instance guard: at most one daemon may own a given RocksDB path.
+    // Single-instance guard: at most one daemon may own a given vault path.
     // Acquired before binding the port or opening storage so a duplicate launch
-    // fails fast with a clear, holder-naming error instead of a cryptic RocksDB
-    // LOCK failure surfacing later inside a tool call.
+    // fails fast with a clear, holder-naming error instead of a storage lock
+    // failure surfacing later inside a tool call.
     let db_path = m3_config
         .db_path
         .clone()
@@ -2480,9 +2480,9 @@ pub(super) async fn serve(
             .context("flush and close Calyx vault before releasing lifetime locks"),
     );
 
-    // The custom daemon lock must outlive every RocksDB/service owner. Dropping
+    // The custom daemon lock must outlive every storage/service owner. Dropping
     // these Arcs and callbacks before unlock prevents a successor from winning
-    // daemon.lock only to collide with this process's still-live RocksDB LOCK.
+    // daemon.lock only to collide with this process's still-live vault lock.
     drop(runtime);
     drop(service);
     drop(shutdown_cancel);

@@ -11,7 +11,7 @@
 //! # Durability contract (#897 acceptance)
 //!
 //! [`record_agent_event`] uses `Db::put_batch`, which returns only after
-//! the row reaches RocksDB with a synced WAL. [`record_agent_event_durable`]
+//! the row reaches the Calyx vault and its WAL. [`record_agent_event_durable`]
 //! additionally calls `Db::flush()` at terminal lifecycle boundaries
 //! (exited, spawn failure, session deleted).
 //!

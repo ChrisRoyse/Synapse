@@ -1,7 +1,7 @@
 //! At-rest secret protection via Windows DPAPI (CurrentUser scope).
 //!
 //! Cloud-model API keys are encrypted with `CryptProtectData` before they ever
-//! touch RocksDB and decrypted with `CryptUnprotectData` only in-process, only
+//! touch the Calyx vault and decrypted with `CryptUnprotectData` only in-process, only
 //! when a spawn or probe needs to authenticate. CurrentUser scope binds the
 //! ciphertext to the Windows account the daemon runs as: another local user, or
 //! the same database directory copied to a different machine, cannot decrypt

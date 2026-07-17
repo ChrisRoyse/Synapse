@@ -130,44 +130,5 @@ pub(super) async fn handle(
                 |out| out.gc_once = Some(response),
             )))
         }
-        StorageOperation::Migrate => {
-            let spec = params
-                .0
-                .migrate
-                .ok_or_else(|| missing_spec(STORAGE_TOOL, "migrate"))?;
-            require_maintenance_profile(
-                service,
-                &request_context,
-                STORAGE_TOOL,
-                operation.as_str(),
-                &spec.source_rocksdb_path,
-                STORAGE_SOT,
-            )?;
-            service.require_m3_permissions(
-                STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_migrate(&spec),
-            )?;
-            let response = crate::m3::storage::migrate_storage(&spec).map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    &spec.source_rocksdb_path,
-                    STORAGE_SOT,
-                    error,
-                    "inspect source/target storage paths, migration manifest, and CF row hashes before retrying",
-                )
-            })?;
-            Ok(Json(storage_response(
-                operation,
-                format!(
-                    "{}->{} rows={} manifest={}",
-                    response.manifest.source_backend,
-                    response.manifest.target_backend,
-                    response.manifest.total_rows,
-                    response.manifest.manifest_path
-                ),
-                |out| out.migrate = Some(response),
-            )))
-        }
     }
 }

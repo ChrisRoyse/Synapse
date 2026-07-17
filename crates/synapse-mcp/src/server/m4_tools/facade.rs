@@ -621,7 +621,7 @@ pub(super) fn process_history_response(
                     ProcessOperation::History,
                     cf::CF_PROCESS_HISTORY,
                     format!("CF_PROCESS_HISTORY tail read failed: {error}"),
-                    "inspect the RocksDB column family and daemon storage logs",
+                    "inspect the Calyx-backed column family and daemon storage logs",
                 )
             })?
     };

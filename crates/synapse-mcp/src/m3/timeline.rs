@@ -10,7 +10,7 @@
 //!
 //! Purge shares the same filter machinery (what you can find is exactly what
 //! you can delete), hard-deletes via `delete_batch`, compacts the purged key
-//! range (tombstone reclamation per the ADR §6 / RocksDB guidance), and
+//! range (tombstone reclamation per the Calyx vault retention model), and
 //! writes a `kind = purge` audit row carrying counts and the filters — never
 //! deleted content. Blanket purges skip `purge` audit rows so a purge can
 //! never consume its own audit trail; deleting audit rows requires naming
@@ -379,9 +379,7 @@ pub struct TimelineStatsResponse {
     /// Exact count of decoded rows in the aggregation window (== the sum of
     /// `rows_by_kind`). Authoritative only when `scan_complete` is true.
     pub total_rows: u64,
-    /// CF_TIMELINE on-disk footprint in bytes, when storage exposes it. This is
-    /// RocksDB's SST size estimate; freshly-written rows still in the memtable
-    /// may not be reflected until a flush/compaction.
+    /// CF_TIMELINE logical on-disk footprint in bytes, when storage exposes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_bytes: Option<u64>,
     /// Exact row counts by timeline kind over the scanned window.

@@ -31,7 +31,7 @@ Normal agents use facade tools only. Old implementation names are not default pu
 
 Every facade call uses a strict `operation` enum. Unknown operations fail closed with structured errors. There is no alias fallback from an old tool name to a new facade operation.
 
-Mutating operations must name the physical readback source of truth: file path, RocksDB CF/key, process id, tab id, target id, event cursor, or profile row.
+Mutating operations must name the physical readback source of truth: file path, Calyx vault row, process id, tab id, target id, event cursor, or profile row.
 
 Raw browser debugger capability is explicit: switch to `browser_debugger` before using raw CDP/chrome.debugger operations.
 

@@ -3,7 +3,7 @@
 //! Toast buttons in an unpackaged desktop app can use protocol activation. The
 //! child process launched by Windows never decides approvals directly; it only
 //! forwards the one-time activation token to the already-running loopback daemon
-//! endpoint, where the durable RocksDB row is validated and updated.
+//! endpoint, where the durable Calyx vault row is validated and updated.
 
 use std::{collections::BTreeMap, net::SocketAddr, process::ExitCode, time::Duration};
 

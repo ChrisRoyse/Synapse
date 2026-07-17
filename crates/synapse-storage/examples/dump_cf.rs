@@ -9,7 +9,7 @@
 //! surface.
 //!
 //! Usage:
-//! `cargo run -p synapse-storage --example dump_cf -- [--include-expired] --backend <rocksdb|calyx> <db_path> <cf_name>`
+//! `cargo run -p synapse-storage --example dump_cf -- [--include-expired] <db_path> <cf_name>`
 
 use std::{
     error::Error,
@@ -20,8 +20,7 @@ use std::{
 
 use synapse_storage::{StorageBackendKind, dump_cf_read_only_with_expired};
 
-const USAGE: &str =
-    "usage: dump_cf [--include-expired] --backend <rocksdb|calyx> <db_path> <cf_name>";
+const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name>";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -32,12 +31,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         false
     };
     let mut args = args.into_iter();
-    let backend_flag = args.next().ok_or(USAGE)?;
-    if backend_flag != "--backend" {
-        return Err(format!("{USAGE}; got first argument {backend_flag:?}").into());
-    }
-    let backend_raw = args.next().ok_or(USAGE)?;
-    let backend = StorageBackendKind::parse_config(&backend_raw)?;
     let db_path = args.next().ok_or(USAGE)?;
     let cf_name = args.next().ok_or(USAGE)?;
     if let Some(extra) = args.next() {
@@ -47,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dump = dump_cf_read_only_with_expired(
         Path::new(&db_path),
         synapse_core::SCHEMA_VERSION,
-        backend,
+        StorageBackendKind::Calyx,
         &cf_name,
         include_expired,
     )?;

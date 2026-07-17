@@ -103,7 +103,6 @@ wasapi = "0.23.0"
 enigo = { version = "0.6.1", default-features = false }
 vigem-client = "0.1.4"
 ort = { version = "2.0.0-rc.12", default-features = false }
-rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "zstd", "multi-threaded-cf"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
@@ -166,7 +165,7 @@ debug = false
 # rebuilds (the iteration loop is build-the-daemon -> reinstall -> verify), while
 # staying a fully optimized binary:
 #   lto = "thin"       parallel, near-fat runtime (<~3% on this IO/perception
-#                      daemon; RocksDB is C++ and unaffected by Rust LTO) but a
+#                      daemon; storage-native code is unaffected by Rust LTO) but a
 #                      fraction of fat-LTO's serial link time.
 #   codegen-units = 16 parallel codegen across all cores. fat + cgu=1 forced the
 #                      whole synapse-mcp crate through ONE thread at the end,

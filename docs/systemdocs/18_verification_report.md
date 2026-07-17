@@ -20,7 +20,7 @@
 | Lines of Rust (approx, `crates/**/*.rs`) | ~47,805 | `wc -l` total |
 | MCP tool macros (`#[tool(` occurrences) | 238 | grep over `crates/synapse-mcp/src` |
 | Distinct client-exposed MCP tools | 206 | enumerated in [16_api_tools_reference.md](16_api_tools_reference.md) (after gating/dedup) |
-| RocksDB column families (named) | 17 (+ implicit `default`) | [04_storage_and_persistence.md](04_storage_and_persistence.md) |
+| Calyx-backed logical column-family collections | 17 | [04_storage_and_persistence.md](04_storage_and_persistence.md) |
 | Storage `SCHEMA_VERSION` | 1 | `crates/synapse-core/src/defaults.rs` |
 | Error codes (catalog) | ~120 across 9 groups | `crates/synapse-core/src/error_codes.rs` |
 | Telemetry metrics | 19 (12 counter / 5 gauge / 2 histogram) | [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) |

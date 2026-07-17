@@ -1373,7 +1373,7 @@ impl ActForegroundAuthorityGuard {
 
     /// Recover a foreground transaction panic while the tracked transaction
     /// still owns the session authority gate. This is the only path allowed to
-    /// perform the exact RocksDB/profile rollback after an unwind; `Drop`
+    /// perform the exact storage/profile rollback after an unwind; `Drop`
     /// remains storage-free.
     fn cleanup_with_bounded_retries(
         &mut self,
@@ -1429,7 +1429,7 @@ impl Drop for ActForegroundAuthorityGuard {
             return;
         }
         // An armed Drop means the tracked transaction failed to catch its own
-        // unwind. Do only bounded in-memory revocation here: no RocksDB, schema,
+        // unwind. Do only bounded in-memory revocation here: no storage, schema,
         // audit, runtime lookup, or task spawn is legal from this destructor.
         let lease_at_drop = synapse_action::lease::status();
         let newly_owned_during_call = self.lease_owner_before.as_deref()

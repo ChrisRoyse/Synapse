@@ -1,10 +1,10 @@
 //! Single-instance guard for the Synapse daemon (`--mode http`).
 //!
-//! Guarantees that at most one daemon process owns a given RocksDB directory at
-//! a time. The guard is acquired at startup **before** RocksDB is opened, so a
+//! Guarantees that at most one daemon process owns a given Calyx vault directory
+//! at a time. The guard is acquired at startup **before** storage is opened, so a
 //! duplicate launch fails fast with a clear, actionable error that names the
-//! current holder PID — instead of surfacing later as a cryptic RocksDB `LOCK`
-//! failure deep inside a tool call (the exact symptom that motivated this work).
+//! current holder PID instead of surfacing later as a storage lock failure deep
+//! inside a tool call.
 //!
 //! Mechanism: an OS advisory exclusive file lock (`fs2`) on `<db>/daemon.lock`.
 //! Chosen over a bare Win32 named mutex because the lock is released
@@ -28,7 +28,7 @@ use std::{
 
 use fs2::FileExt;
 
-/// Empty file created inside the RocksDB directory used purely as the daemon
+/// Empty file created inside the Calyx vault directory used purely as the daemon
 /// single-instance advisory lock token.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
 
@@ -36,7 +36,7 @@ pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
 pub const DAEMON_PID_FILE: &str = "daemon.pid";
 
 /// Empty file inside the durable shell-job store used to exclude every other
-/// daemon, even when those daemons use different RocksDB directories.
+/// daemon, even when those daemons use different vault directories.
 pub const SHELL_JOB_STORE_LOCK_FILE: &str = "shell-job-store.lock";
 
 /// Unlocked sidecar identifying the process that owns the shell-job store.
@@ -139,7 +139,7 @@ pub struct SingleInstanceGuard {
 }
 
 /// Holds exclusive ownership of one canonical durable shell-job store for the
-/// daemon lifetime. This is deliberately independent from the RocksDB guard:
+/// daemon lifetime. This is deliberately independent from the storage guard:
 /// two daemons with different DB paths must still not recover or mutate the
 /// same durable shell jobs concurrently.
 #[must_use = "dropping the guard immediately releases the shell-job store lock"]
@@ -432,14 +432,14 @@ impl SingleInstanceGuard {
             &self.file,
             &self.lock_path,
             &self.pid_path,
-            "rocksdb_single_instance",
+            "storage_single_instance",
         );
         self.cleanup_attempted = true;
         result
     }
 }
 
-/// Close the independent shell-job lock first and the RocksDB single-instance
+/// Close the independent shell-job lock first and the storage single-instance
 /// lock second. Both attempts always run, and either failure rejects a graceful
 /// daemon verdict while retaining both physical readbacks.
 pub fn close_daemon_lifetime_locks(
@@ -675,7 +675,7 @@ impl Drop for SingleInstanceGuard {
                 &self.file,
                 &self.lock_path,
                 &self.pid_path,
-                "rocksdb_single_instance",
+                "storage_single_instance",
             );
         }
     }

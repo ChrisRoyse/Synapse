@@ -366,7 +366,7 @@ request:
 Synapse ships **29 application profiles** that encode how to operate Notepad, Chrome, Excel,
 Word, Outlook, Teams, Slack, Explorer, Terminal, and more — and it gets *better with use*:
 
-- Every action is logged to a local **RocksDB** audit trail.
+- Every action is logged to the local **Calyx vault** audit trail.
 - **`profile`** activates and manages the right profile per app; **`audit`
   operation=profile_intelligence** turns real outcomes into quality signal per profile.
 - **`audit`** also exposes command history, lifecycle events, and a consented export bundle;
@@ -404,7 +404,7 @@ flowchart LR
         ACT["🖱️ Action + verification<br/>UIA patterns · CDP · SendInput"]
         FAB["🤖 Agent fabric<br/>spawn · mailboxes · tasks · approvals"]
         LRN["🧭 Learning<br/>routines · assist · timeline · profiles"]
-        ST["💾 Storage<br/>RocksDB audit · workspace"]
+        ST["💾 Storage<br/>Calyx vault · audit · workspace"]
     end
     B <-->|sees & controls| W["🖥️ Your Windows desktop,<br/>apps, browsers, WSL"]
     SES --- P
@@ -425,7 +425,7 @@ needed) explicit foreground.
 
 ```mermaid
 flowchart LR
-    U["Profile used"] --> O["Outcome audited<br/>(RocksDB)"]
+    U["Profile used"] --> O["Outcome audited<br/>(Calyx vault)"]
     O --> Q["Quality &amp; compatibility<br/>learned"]
     Q --> I["Profile improved"]
     I --> D["Better profile<br/>distributed"]
@@ -509,7 +509,7 @@ the WSL side):
 
 Both are idempotent and fail loud — each prerequisite is checked and a failure stops with
 the exact cause and fix (no silent fallbacks). They build the daemon from a **local** source
-path into a persistent target (re-installs are incremental, not a fresh RocksDB build),
+path into a persistent target (re-installs are incremental, not a fresh native rebuild),
 deploy the bundled profiles next to the binary, generate a loopback bearer token, register
 the auto-start daemon (interactive desktop session, single-writer DB) with `--profile-dir`,
 verify `health`, and wire detected MCP clients. Claude Code and Codex use Streamable HTTP;
@@ -718,8 +718,8 @@ glance:
 | `setup` | `status` · `doctor` · `repair` |
 | `telemetry` | `status` |
 
-Every mutating operation names the physical readback source of truth — a file path, RocksDB
-CF/key, process id, tab id, target id, event cursor, or profile row — so "it worked" is
+Every mutating operation names the physical readback source of truth — a file path, Calyx
+vault row, process id, tab id, target id, event cursor, or profile row — so "it worked" is
 always backed by evidence. Full mapping and migration notes:
 [Synapse 40-Tool Surface](docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
 
@@ -734,10 +734,10 @@ always backed by evidence. Full mapping and migration notes:
 | Perception | Windows UI Automation, Windows Graphics Capture / DXGI duplication, WinRT OCR |
 | Browser | **Chrome DevTools Protocol** — DOM/AX-tree perception, background tabs, page input; bundled extension bridge for normal profiles |
 | Action | Win32 `SendInput` (`enigo`), UIA control patterns, CDP input, verified readback |
-| Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, RocksDB mailboxes + workspace blackboard, approvals & escalation |
+| Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, Calyx-backed mailboxes + workspace blackboard, approvals & escalation |
 | Learning | Routine mining, intent/assist, activity timeline & episodes, profile quality from audit |
 | Audio | Debug-gated WASAPI loopback; Whisper STT requires `--enable-audio` plus a side-loaded verified model |
-| Storage | **RocksDB** (LZ4 + ZSTD), durable audit trail |
+| Storage | **Calyx vault**, durable audit trail |
 | Models | ONNX Runtime (`ort`) for optional detection |
 
 The active documented input backend is **`software`**: keyboard and mouse via `SendInput`,

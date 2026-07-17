@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rocksdb::DB;
 use synapse_core::error_codes;
 
 use crate::{StorageError, StorageResult, cf};
@@ -124,24 +123,6 @@ impl Default for PressureConfig {
 
 pub trait PressureMaintenance: Send + Sync {
     fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>>;
-}
-
-#[derive(Debug)]
-pub struct RocksDbPressureMaintenance {
-    db: Arc<DB>,
-}
-
-impl RocksDbPressureMaintenance {
-    #[must_use]
-    pub const fn new(db: Arc<DB>) -> Self {
-        Self { db }
-    }
-}
-
-impl PressureMaintenance for RocksDbPressureMaintenance {
-    fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>> {
-        compact_all(&self.db)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -340,18 +321,6 @@ fn apply_free_bytes(
         compacted_cfs,
         gc_advised,
     })
-}
-
-fn compact_all(db: &DB) -> StorageResult<Vec<&'static str>> {
-    let mut compacted = Vec::with_capacity(cf::ALL_COLUMN_FAMILIES.len());
-    for cf_name in cf::ALL_COLUMN_FAMILIES {
-        let handle = db
-            .cf_handle(cf_name)
-            .ok_or_else(|| read_failed(format!("column family handle missing: {cf_name}")))?;
-        db.compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
-        compacted.push(cf_name);
-    }
-    Ok(compacted)
 }
 
 fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {

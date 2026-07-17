@@ -2,7 +2,7 @@
 //!
 //! Lets a stdio-only MCP client (Claude Desktop, Codex) reach the single shared
 //! HTTP daemon instead of spawning its own embedded server (which would contend
-//! for the one RocksDB lock). The bridge is a transport-level pump: it forwards
+//! for the one storage lock). The bridge is a transport-level pump: it forwards
 //! raw JSON-RPC between the client's stdio transport and an rmcp
 //! Streamable-HTTP client transport pointed at the daemon, so the initialize
 //! handshake, `Mcp-Session-Id` sessions, and SSE server->client notifications

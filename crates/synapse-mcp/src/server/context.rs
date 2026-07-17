@@ -381,7 +381,7 @@ impl SynapseService {
             })
     }
 
-    /// Opened M3 storage handle (the daemon-wide `RocksDB` instance).
+    /// Opened M3 storage handle (the daemon-wide Calyx vault).
     pub(super) fn m3_storage(&self) -> Result<Arc<synapse_storage::Db>, ErrorData> {
         let mut state = self.m3_state.lock().map_err(|_err| {
             mcp_error(

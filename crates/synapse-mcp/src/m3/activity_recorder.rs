@@ -640,7 +640,7 @@ impl TimelineWriter {
     }
 
     /// Syncs the storage WAL. `put_batch` already returns only after the
-    /// row reaches RocksDB with a synced WAL; shutdown still performs an
+    /// row reaches the Calyx vault and its WAL; shutdown still performs an
     /// explicit sync at session boundaries.
     fn flush_checked(&self) -> Result<()> {
         self.db.flush().context("flush batched timeline writes")

@@ -3,7 +3,7 @@
 //! A crash-safe work queue agents are dispatched from — the board the fleet
 //! kanban renders. Tasks live in `CF_KV` (same durable handle as templates #909
 //! and the mailbox #908); each `task_*` mutation flushes so a row is on disk and
-//! visible to the RocksDB read path before the tool returns (config/operational
+//! visible to the Calyx vault read path before the tool returns (config/operational
 //! state must be read-after-write consistent, never left in the batcher's
 //! pending queue — see [[storage-batcher-and-winevent-truth]]).
 //!

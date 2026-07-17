@@ -1829,10 +1829,10 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "summarize",
                 false,
                 false,
-                "CF_AGENT_TRANSCRIPTS bounded transcript scan + CF_KV price rows",
+                "CF_AGENT_TRANSCRIPTS spawn-prefix scan + CF_KV price rows",
                 None,
-                error_codes::STORAGE_READ_FAILED,
-                "pass a spawn_id or bounded window, add missing price rows, or repair corrupt transcript/price rows",
+                error_codes::TOOL_INTERNAL_ERROR,
+                "pass spawn_id for exact bounded cost read; fleet rollups require #1688 TimeSeries/OLAP aggregates",
             ),
             op(
                 "price_list",

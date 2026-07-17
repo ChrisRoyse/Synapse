@@ -6,7 +6,7 @@
 //! what the live tools reported.
 //!
 //! ```text
-//! cargo run -p synapse-mcp --example dump_action_log -- --backend <rocksdb|calyx> <db-path>
+//! cargo run -p synapse-mcp --example dump_action_log -- <db-path>
 //! ```
 //!
 //! Errors out (non-zero exit) when the DB cannot be opened or a row fails to
@@ -16,16 +16,10 @@ use std::path::Path;
 
 use synapse_storage::{StorageBackendKind, cf, scan_cf_read_only};
 
-const USAGE: &str = "usage: dump_action_log --backend <rocksdb|calyx> <db-path>";
+const USAGE: &str = "usage: dump_action_log <db-path>";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let backend_flag = args.next().ok_or(USAGE)?;
-    if backend_flag != "--backend" {
-        return Err(format!("{USAGE}; got first argument {backend_flag:?}").into());
-    }
-    let backend_raw = args.next().ok_or(USAGE)?;
-    let backend = StorageBackendKind::parse_config(&backend_raw)?;
     let db_path = args.next().ok_or(USAGE)?;
     if let Some(extra) = args.next() {
         return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
@@ -33,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rows = scan_cf_read_only(
         Path::new(&db_path),
         synapse_core::SCHEMA_VERSION,
-        backend,
+        StorageBackendKind::Calyx,
         cf::CF_ACTION_LOG,
     )?;
     let mut invalid = 0usize;

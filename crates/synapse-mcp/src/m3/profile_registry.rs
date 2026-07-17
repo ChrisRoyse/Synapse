@@ -2970,7 +2970,7 @@ fn report_base_pointers(storage_path: &str) -> Vec<ProfileRegistryReportPointer>
             "storage_path",
             None,
             None,
-            "RocksDB root path backing this report",
+            "Calyx vault path backing this report",
         ),
         (
             "registry_rows_prefix",

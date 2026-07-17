@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -13,8 +12,7 @@ use synapse_reflex::ReflexRuntime;
 use synapse_storage::{
     CalyxVaultCollectionInspect as BackendCalyxVaultCollectionInspect,
     CalyxVaultInspect as BackendCalyxVaultInspect, DiskPressureLevel, GcReport, PressureReport,
-    STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageMigrationConfig,
-    StorageMigrationManifest as BackendStorageMigrationManifest, cf, migrate_rocksdb_to_calyx,
+    STORAGE_METADATA_ONLY_REDACTION_POLICY, cf,
 };
 
 use crate::m1::mcp_error;
@@ -78,21 +76,6 @@ pub struct StorageGcOnceParams {
     pub dedupe_window_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct StorageMigrateParams {
-    pub source_rocksdb_path: String,
-    pub target_calyx_path: String,
-    pub manifest_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 1_000_000))]
-    pub batch_rows: Option<u64>,
-    #[serde(default)]
-    pub rename_source_on_success: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retired_rocksdb_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -228,60 +211,6 @@ pub struct StorageGcCfReport {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct StorageMigrateResponse {
-    pub manifest: StorageMigrateManifest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct StorageMigrateManifest {
-    pub manifest_schema_version: u32,
-    pub storage_schema_version: u32,
-    pub source_backend: String,
-    pub target_backend: String,
-    pub source_rocksdb_path: String,
-    pub target_calyx_path: String,
-    pub manifest_path: String,
-    pub started_at_unix_ms: u64,
-    pub completed_at_unix_ms: u64,
-    pub batch_rows: u64,
-    pub total_rows: u64,
-    pub total_key_bytes: u64,
-    pub total_value_bytes: u64,
-    pub source_digest_sha256: String,
-    pub target_digest_sha256: String,
-    pub cf_reports: Vec<StorageMigrateCfReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retired_rocksdb_path: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct StorageMigrateCfReport {
-    pub cf_name: String,
-    pub source_rows: u64,
-    pub target_rows: u64,
-    pub rows_written: u64,
-    pub source_key_bytes: u64,
-    pub source_value_bytes: u64,
-    pub target_key_bytes: u64,
-    pub target_value_bytes: u64,
-    pub source_digest_sha256: String,
-    pub target_digest_sha256: String,
-    pub verified_byte_exact: bool,
-    pub ttl_policy: String,
-    pub source_timestamped_rows: u64,
-    pub source_timestamp_missing_rows: u64,
-    pub expires_at_zero_rows: u64,
-    pub expired_at_migration_rows: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_key_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_key_sha256: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct StoragePressureSampleResponse {
     pub report: StoragePressureReport,
     pub pressure_transition_codes: Vec<String>,
@@ -342,11 +271,6 @@ pub fn required_permissions_gc(_params: &StorageGcOnceParams) -> RequiredPermiss
 }
 
 #[must_use]
-pub fn required_permissions_migrate(_params: &StorageMigrateParams) -> RequiredPermissions {
-    required([Permission::WriteStorage])
-}
-
-#[must_use]
 pub fn required_permissions_pressure(_params: &StoragePressureSampleParams) -> RequiredPermissions {
     required([Permission::WriteStorage])
 }
@@ -380,7 +304,7 @@ pub fn inspect_storage_summary(
             .map(str::to_owned)
             .collect(),
         audit_retention_policy_count: audit_retention_policies().len(),
-        metrics_mode: storage_metrics_mode(runtime.storage_backend_name()),
+        metrics_mode: storage_metrics_mode(),
         cf_sizes,
         cf_row_counts,
         missing_cf_size_estimates,
@@ -388,12 +312,8 @@ pub fn inspect_storage_summary(
     })
 }
 
-fn storage_metrics_mode(storage_backend: &str) -> String {
-    if storage_backend == "calyx" {
-        "calyx_exact_scan_sizes_counts".to_owned()
-    } else {
-        format!("{storage_backend}_live_data_size_estimates_estimated_row_counts")
-    }
+fn storage_metrics_mode() -> String {
+    "calyx_exact_scan_sizes_counts".to_owned()
 }
 
 pub fn put_probe_rows(
@@ -493,15 +413,6 @@ pub fn run_storage_gc_once(
         .unwrap_or((0, 0));
     drop(runtime);
     Ok(gc_response(cf_name, before, after, report))
-}
-
-pub fn migrate_storage(params: &StorageMigrateParams) -> Result<StorageMigrateResponse, ErrorData> {
-    let config = migration_config(params)?;
-    let manifest = migrate_rocksdb_to_calyx(&config)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    Ok(StorageMigrateResponse {
-        manifest: storage_migrate_manifest(manifest),
-    })
 }
 
 pub fn apply_storage_pressure_sample(
@@ -624,109 +535,6 @@ fn storage_calyx_vault_collection(
         stored_value_bytes: collection.stored_value_bytes,
         total_logical_bytes: collection.total_logical_bytes,
         expires_at_ms_histogram: collection.expires_at_ms_histogram,
-    }
-}
-
-fn migration_config(params: &StorageMigrateParams) -> Result<StorageMigrationConfig, ErrorData> {
-    let source_rocksdb_path = required_path(&params.source_rocksdb_path, "source_rocksdb_path")?;
-    let target_calyx_path = required_path(&params.target_calyx_path, "target_calyx_path")?;
-    let manifest_path = required_path(&params.manifest_path, "manifest_path")?;
-    if source_rocksdb_path == target_calyx_path {
-        return Err(mcp_error(
-            error_codes::STORAGE_BACKEND_INVALID_CONFIG,
-            "source_rocksdb_path and target_calyx_path must be different",
-        ));
-    }
-    let batch_rows = match params.batch_rows {
-        Some(0) => {
-            return Err(mcp_error(
-                error_codes::STORAGE_BACKEND_INVALID_CONFIG,
-                "batch_rows must be at least 1",
-            ));
-        }
-        Some(rows) if rows > 1_000_000 => {
-            return Err(mcp_error(
-                error_codes::STORAGE_BACKEND_INVALID_CONFIG,
-                format!("batch_rows must be <= 1000000; got {rows}"),
-            ));
-        }
-        Some(rows) => usize::try_from(rows).map_err(|_error| {
-            mcp_error(
-                error_codes::STORAGE_BACKEND_INVALID_CONFIG,
-                format!("batch_rows does not fit usize: {rows}"),
-            )
-        })?,
-        None => synapse_storage::DEFAULT_MIGRATION_BATCH_ROWS,
-    };
-    let retired_rocksdb_path = params
-        .retired_rocksdb_path
-        .as_deref()
-        .map(|path| required_path(path, "retired_rocksdb_path"))
-        .transpose()?;
-    Ok(StorageMigrationConfig {
-        source_rocksdb_path,
-        target_calyx_path,
-        manifest_path,
-        schema_version: synapse_core::SCHEMA_VERSION,
-        batch_rows,
-        rename_source_on_success: params.rename_source_on_success,
-        retired_rocksdb_path,
-    })
-}
-
-fn required_path(value: &str, field: &'static str) -> Result<PathBuf, ErrorData> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(mcp_error(
-            error_codes::STORAGE_BACKEND_INVALID_CONFIG,
-            format!("{field} must not be empty"),
-        ));
-    }
-    Ok(PathBuf::from(trimmed))
-}
-
-fn storage_migrate_manifest(manifest: BackendStorageMigrationManifest) -> StorageMigrateManifest {
-    StorageMigrateManifest {
-        manifest_schema_version: manifest.manifest_schema_version,
-        storage_schema_version: manifest.storage_schema_version,
-        source_backend: manifest.source_backend,
-        target_backend: manifest.target_backend,
-        source_rocksdb_path: manifest.source_rocksdb_path,
-        target_calyx_path: manifest.target_calyx_path,
-        manifest_path: manifest.manifest_path,
-        started_at_unix_ms: manifest.started_at_unix_ms,
-        completed_at_unix_ms: manifest.completed_at_unix_ms,
-        batch_rows: manifest.batch_rows,
-        total_rows: manifest.total_rows,
-        total_key_bytes: manifest.total_key_bytes,
-        total_value_bytes: manifest.total_value_bytes,
-        source_digest_sha256: manifest.source_digest_sha256,
-        target_digest_sha256: manifest.target_digest_sha256,
-        cf_reports: manifest
-            .cf_reports
-            .into_iter()
-            .map(|report| StorageMigrateCfReport {
-                cf_name: report.cf_name,
-                source_rows: report.source_rows,
-                target_rows: report.target_rows,
-                rows_written: report.rows_written,
-                source_key_bytes: report.source_key_bytes,
-                source_value_bytes: report.source_value_bytes,
-                target_key_bytes: report.target_key_bytes,
-                target_value_bytes: report.target_value_bytes,
-                source_digest_sha256: report.source_digest_sha256,
-                target_digest_sha256: report.target_digest_sha256,
-                verified_byte_exact: report.verified_byte_exact,
-                ttl_policy: report.ttl_policy,
-                source_timestamped_rows: report.source_timestamped_rows,
-                source_timestamp_missing_rows: report.source_timestamp_missing_rows,
-                expires_at_zero_rows: report.expires_at_zero_rows,
-                expired_at_migration_rows: report.expired_at_migration_rows,
-                first_key_sha256: report.first_key_sha256,
-                last_key_sha256: report.last_key_sha256,
-            })
-            .collect(),
-        retired_rocksdb_path: manifest.retired_rocksdb_path,
     }
 }
 

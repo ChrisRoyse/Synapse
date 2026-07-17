@@ -22,7 +22,7 @@ Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `ru
 | Async runtime | `tokio` (full), `tokio-util`, `tokio-tungstenite`, `futures-util` |
 | MCP / HTTP | `rmcp` 1.7 (server, stdio, streamable-http, macros, schemars), `axum` 0.8 (ws), `hyper`, `tower`, `reqwest` |
 | Serialization | `serde`, `serde_json`, `toml`, `schemars`, `base64` |
-| Storage | `rocksdb` 0.24 (lz4, zstd, multi-threaded-cf), `fs2` |
+| Storage | Calyx vault, `calyx-aster`, `fs2` |
 | Windows platform | `windows` 0.62 (Win32 Foundation/UI/Graphics/Media OCR/etc.), `windows-capture`, `uiautomation` 0.25 |
 | Browser/CDP | `chromiumoxide` 0.9 |
 | Input/HID | `enigo`, `vigem-client`, `arboard` (clipboard), `x11rb` (non-Windows) |
@@ -73,7 +73,7 @@ crates/synapse-core/src/types/web_perception.rs  # WebPerceptionPath / CDP perce
 Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-storage
-RocksDB persistence: column families, batched writes, GC, disk-pressure shedding. Depends on `synapse-core`, `synapse-telemetry`.
+Calyx vault persistence: logical column-family collections, direct writes, GC, disk-pressure shedding. Depends on `synapse-core`, `synapse-telemetry`, `synapse-calyx`, and vendored Calyx crates.
 
 ```
 crates/synapse-storage/src/lib.rs            # Db handle: open, put/delete batch, scan/compact, GC + pressure spawn
@@ -90,7 +90,7 @@ crates/synapse-storage/src/agent_events.rs   # agent-event CF read/write helpers
 crates/synapse-storage/src/agent_transcripts.rs # agent-transcript CF read/write helpers
 crates/synapse-storage/src/error.rs          # StorageError / StorageResult
 crates/synapse-storage/src/{batch,compaction,gc,open,pressure}_tests.rs # in-crate unit tests
-crates/synapse-storage/build.rs              # build script (rocksdb link config)
+crates/synapse-storage/build.rs              # build script (storage codec guard)
 ```
 `examples/dump_cf.rs` dumps a column family; `benches/batch_throughput.rs` write-throughput bench.
 
@@ -551,7 +551,7 @@ synapse-core       -> (none — root)
 |---|---|---|
 | synapse-core | — | shared types/IDs/error codes (root) |
 | synapse-telemetry | core | tracing/log init, metrics |
-| synapse-storage | core, telemetry | RocksDB persistence |
+| synapse-storage | core, telemetry, calyx | Calyx vault persistence |
 | synapse-a11y | core | UIA + CDP accessibility |
 | synapse-capture | core, telemetry | screen/window capture |
 | synapse-action | core | input emission, leases, safety |

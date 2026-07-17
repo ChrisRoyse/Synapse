@@ -55,7 +55,7 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--bind` | `SYNAPSE_BIND` | string | `127.0.0.1:7700` | HTTP server bind address (host:port). Also the single-daemon port. |
 | `--allow-non-loopback` | `SYNAPSE_ALLOW_NON_LOOPBACK` | bool | `false` | Permit binding/serving on a non-loopback address. |
 | `--db` | `SYNAPSE_DB` | path | (derived, see §4) | Storage directory path. |
-| `--storage-backend` | `SYNAPSE_STORAGE_BACKEND` | `rocksdb` or `calyx` | `rocksdb` | Selects the `synapse_storage::Db` backend. `rocksdb` is the implemented default. `calyx` is reserved for #1656 and fails closed with `STORAGE_BACKEND_UNIMPLEMENTED` until that backend lands. Unknown values fail startup with `STORAGE_BACKEND_INVALID_CONFIG`. |
+| `--storage-backend` | `SYNAPSE_STORAGE_BACKEND` | `calyx` | `calyx` | Selects the `synapse_storage::Db` backend. `calyx` is the only accepted value; unknown values fail startup with `STORAGE_BACKEND_INVALID_CONFIG`. |
 | `--profile-dir` | `SYNAPSE_PROFILE_DIR` | path | bundled dir (see [11]) | Profile package directory. See profiles doc (11) for layout. |
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | string | `info` | Tracing level (`off`/`error`/`warn`/`info`/`debug`/`trace`). Parsed as `LevelFilter`. |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | bool | `false` | Disable the reflex runtime. |
@@ -114,7 +114,7 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 |------|---------|------|---------|-------------|
 | `LOCALAPPDATA` | many (telemetry, m3, m4, models, etc.) | path | (Windows-provided) | Root for db/logs/models/runs/shell dirs (see §4). |
 | `SYNAPSE_DB` | `m3.rs` (`DB_ENV`), `synapse-action/recovery.rs` | path | derived (§4) | Storage directory path (also CLI `--db`). |
-| `SYNAPSE_STORAGE_BACKEND` | `m3.rs` (`STORAGE_BACKEND_ENV`) and `main.rs` (`--storage-backend`) | enum | `rocksdb` | Selects `rocksdb` or `calyx`; invalid strings fail closed before serving. |
+| `SYNAPSE_STORAGE_BACKEND` | `m3.rs` (`STORAGE_BACKEND_ENV`) and `main.rs` (`--storage-backend`) | enum | `calyx` | Selects the Calyx backend; invalid strings fail closed before serving. |
 | `SYNAPSE_ACTION_RECOVERY_FILE` | `synapse-action/recovery.rs` (`RECOVERY_FILE_ENV`) | path | derived (§4) | Held-input crash-recovery JSONL ledger path. |
 | `SYNAPSE_SHELL_SESSION_DIR` | `m4.rs` (`SHELL_SESSION_DIR_ENV`) | path | derived (§4) | Per-session shell working/session dir override. |
 | `SYNAPSE_SHELL_WORKING_DIR` | `m4.rs` (`SHELL_WORKING_DIR_ENV`) | path | none | Working dir for shell jobs. |

@@ -1,6 +1,6 @@
 //! `--mode doctor`: enumerate, classify, and optionally clean up synapse-mcp
 //! processes. Operationalizes the manual triage used to recover from leaked /
-//! duplicate instances: it names the legitimate daemon (the RocksDB lock
+//! duplicate instances: it names the legitimate daemon (the storage lock
 //! holder recorded by the single-instance guard), classifies every other
 //! synapse-mcp process, and with `--kill-stray` removes everything except the
 //! one legitimate daemon (and itself).

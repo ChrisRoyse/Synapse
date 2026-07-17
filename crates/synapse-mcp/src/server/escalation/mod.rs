@@ -665,7 +665,7 @@ fn prune_terminal_items(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
     prune_terminal_item_rows(db, now_unix_ms, &rows)
 }
 
-/// All escalation items. Large queues are scanned in bounded RocksDB windows;
+/// All escalation items. Large queues are scanned in bounded storage windows;
 /// terminal item rows are compacted by the sweep/list paths instead of making
 /// the queue fail closed at the historical row limit.
 fn scan_items(db: &Db) -> Result<Vec<EscalationItem>, ErrorData> {

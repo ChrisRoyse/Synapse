@@ -26,7 +26,7 @@
   Daemon bind address. Default 127.0.0.1:7700 (the shared daemon).
 
 .PARAMETER DbPath
-  RocksDB path. Default: the daemon's standard %LOCALAPPDATA% location.
+  Calyx vault path. Default: the daemon's standard %LOCALAPPDATA% location.
 
 .PARAMETER ProfileDir
   Profile directory passed to synapse-mcp. Defaults to the installed binary's

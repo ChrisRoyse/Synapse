@@ -2,8 +2,8 @@
 
 ## Root Cause
 
-`synapse-storage::gc` was still RocksDB-shaped. The report/task API was
-backend-neutral, but the scheduler captured `Arc<rocksdb::DB>` directly and
+`synapse-storage::gc` was still legacy-backend-shaped. The report/task API was
+backend-neutral, but the scheduler captured the concrete database handle directly and
 the Calyx backend returned unsupported for:
 
 - `run_gc_once`
@@ -15,21 +15,19 @@ every Synapse row stored in Aster `ColumnFamily::Kv` carries a retention
 envelope with `expires_at_ms`, `written_at_ms`, and the payload. Calyx pressure
 parity (#1658) had already added physical KV compaction. The missing piece was
 using those two existing primitives to produce the same public `GcReport` and
-`GcTaskReadback` surfaces that RocksDB callers expect.
+`GcTaskReadback` surfaces that existing callers expect.
 
 ## Research Inputs
 
-- RocksDB TTL documents the important invariant for LSM stores: TTL metadata
-  can mark data expired, but physical removal happens during compaction, and
-  stale reads can see expired records until compaction has run:
-  https://github.com/facebook/rocksdb/wiki/Time-to-Live
+- LSM-style TTL has the important invariant that TTL metadata can mark data
+  expired, but physical removal happens during compaction, and stale reads can
+  see expired records until compaction has run.
 - Cassandra tombstone documentation reinforces the same split: deletion and
   TTL write tombstones first, then compaction later removes tombstones when it
   is safe:
   https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/tombstones.html
-- RocksDB tuning guidance calls out periodic/TTL compaction and tombstone-heavy
-  ranges as operational maintenance concerns, not return-value-only concerns:
-  https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide
+- Tombstone-heavy ranges are operational maintenance concerns, not
+  return-value-only concerns.
 - Redis `EXPIRE` is a useful contrast for the public semantic contract: after
   expiration the key should not behave as live data. Calyx already honored this
   on reads; #1659 makes GC physically remove the expired rows too:
@@ -37,9 +35,8 @@ using those two existing primitives to produce the same public `GcReport` and
 
 ## Design
 
-The scheduler now accepts a `GcRunner` trait. RocksDB still uses the same
-`run_once(&DB, &GcConfig)` code, but task spawning no longer needs to know which
-backend owns the physical maintenance operation.
+The scheduler now accepts a `GcRunner` trait. Task spawning no longer needs to
+know which backend owns the physical maintenance operation.
 
 Calyx GC now:
 
@@ -53,8 +50,12 @@ Calyx GC now:
   and counts them in `evicted_rows`.
 - Applies oldest-first cap eviction using `(written_at_ms, user_key)` so
   same-timestamp batches have deterministic ordering.
-- Preserves protected CFs such as `CF_ROUTINE_STATE`; over-cap protected CFs
-  return `eviction_skipped_reason=protected_cf_policy_skipped`.
+- Preserves protected CFs such as `CF_KV` and `CF_ROUTINE_STATE`; over-cap
+  protected CFs return `eviction_skipped_reason=protected_cf_policy_skipped`.
+  `CF_KV` is protected because it now carries daemon control-plane state
+  (workspace rows, cost price/index metadata, setup/session policy rows, and
+  other extension prefixes) where generic storage GC cannot infer
+  rebuildability.
 - Plans every CF report before committing tombstones, so a malformed later CF
   cannot partially mutate an earlier CF during a default pass.
 - Commits tombstones through the real Calyx write path and then calls
@@ -62,7 +63,7 @@ Calyx GC now:
   tombstone-aware compaction for physical reclamation.
 
 `M3State::ensure_storage_maintenance_tasks` no longer skips Calyx GC. Calyx now
-starts the same pressure task and GC task surfaces as RocksDB.
+starts the same pressure task and GC task surfaces as the previous backend.
 
 ## Failure Contract
 

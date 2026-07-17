@@ -112,8 +112,6 @@ enum Mode {
     Doctor,
     /// Run a registry-backed local model as a Synapse MCP client/agent.
     LocalAgent,
-    /// Offline storage migration from a RocksDB directory into a Calyx vault.
-    StorageMigrate,
 }
 
 #[derive(Debug, Parser)]
@@ -134,8 +132,8 @@ struct Cli {
     #[arg(
         long,
         env = "SYNAPSE_STORAGE_BACKEND",
-        default_value = "rocksdb",
-        value_name = "rocksdb|calyx"
+        default_value = "calyx",
+        value_name = "calyx"
     )]
     storage_backend: String,
     #[arg(long, env = "SYNAPSE_PROFILE_DIR")]
@@ -166,23 +164,6 @@ struct Cli {
         value_name = "BYTES"
     )]
     storage_pressure_free_bytes_sample: Option<u64>,
-    #[arg(long, env = "SYNAPSE_MIGRATE_SOURCE_ROCKSDB", value_name = "PATH")]
-    migrate_source_rocksdb: Option<PathBuf>,
-    #[arg(long, env = "SYNAPSE_MIGRATE_TARGET_CALYX", value_name = "PATH")]
-    migrate_target_calyx: Option<PathBuf>,
-    #[arg(long, env = "SYNAPSE_MIGRATE_MANIFEST", value_name = "PATH")]
-    migrate_manifest: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "SYNAPSE_MIGRATE_BATCH_ROWS",
-        default_value_t = synapse_storage::DEFAULT_MIGRATION_BATCH_ROWS,
-        value_name = "ROWS"
-    )]
-    migrate_batch_rows: usize,
-    #[arg(long, env = "SYNAPSE_MIGRATE_RENAME_SOURCE_ON_SUCCESS")]
-    migrate_rename_source_on_success: bool,
-    #[arg(long, env = "SYNAPSE_MIGRATE_RETIRED_ROCKSDB", value_name = "PATH")]
-    migrate_retired_rocksdb: Option<PathBuf>,
     #[arg(
         long,
         env = "SYNAPSE_CALYX_VAULT",
@@ -346,34 +327,6 @@ impl Cli {
     }
 }
 
-fn run_storage_migrate(cli: &Cli) -> anyhow::Result<ExitCode> {
-    let source_rocksdb_path = cli
-        .migrate_source_rocksdb
-        .clone()
-        .context("--migrate-source-rocksdb is required for --mode storage-migrate")?;
-    let target_calyx_path = cli
-        .migrate_target_calyx
-        .clone()
-        .context("--migrate-target-calyx is required for --mode storage-migrate")?;
-    let manifest_path = cli
-        .migrate_manifest
-        .clone()
-        .context("--migrate-manifest is required for --mode storage-migrate")?;
-    let config = synapse_storage::StorageMigrationConfig {
-        source_rocksdb_path,
-        target_calyx_path,
-        manifest_path,
-        schema_version: synapse_core::SCHEMA_VERSION,
-        batch_rows: cli.migrate_batch_rows,
-        rename_source_on_success: cli.migrate_rename_source_on_success,
-        retired_rocksdb_path: cli.migrate_retired_rocksdb.clone(),
-    };
-    let manifest = synapse_storage::migrate_rocksdb_to_calyx(&config)
-        .context("migrate RocksDB storage into Calyx vault")?;
-    println!("{}", serde_json::to_string_pretty(&manifest)?);
-    Ok(ExitCode::SUCCESS)
-}
-
 fn parse_env_list(name: &str) -> Vec<String> {
     std::env::var(name)
         .map(|raw| raw.split(',').map(ToOwned::to_owned).collect())
@@ -432,11 +385,6 @@ async fn run() -> anyhow::Result<ExitCode> {
     }
     if matches!(cli.mode, Mode::Doctor) {
         let code = doctor::run_doctor(cli.kill_stray, cli.db.as_deref());
-        drop(telemetry_guard);
-        return Ok(code);
-    }
-    if matches!(cli.mode, Mode::StorageMigrate) {
-        let code = run_storage_migrate(&cli)?;
         drop(telemetry_guard);
         return Ok(code);
     }
@@ -505,19 +453,6 @@ async fn run() -> anyhow::Result<ExitCode> {
         code = "CAPTURE_DPI_AWARENESS_INITIALIZED",
         "capture dpi awareness initialized"
     );
-    let recovery_file = synapse_action::configure_crash_recovery_file(cli.db.as_deref())
-        .context("configure action crash recovery ledger")?;
-    let recovery_report = synapse_action::recover_stale_inputs_from_configured_path()
-        .context("recover stale action inputs from previous daemon")?;
-    tracing::info!(
-        code = "ACTION_CRASH_RECOVERY_CONFIGURED",
-        recovery_file = %recovery_file.display(),
-        recovered_keys = recovery_report.recovered_keys,
-        recovered_buttons = recovery_report.recovered_buttons,
-        recovered_pads = recovery_report.recovered_pads,
-        ignored_trailing_bytes = recovery_report.ignored_trailing_bytes,
-        "action crash recovery ledger configured"
-    );
 
     let m2_config = Cli::m2_config();
     let m3_config = match cli.m3_config() {
@@ -557,6 +492,19 @@ async fn run() -> anyhow::Result<ExitCode> {
             return Err(error);
         }
     };
+    let recovery_file = synapse_action::configure_crash_recovery_file(cli.db.as_deref())
+        .context("configure action crash recovery ledger")?;
+    let recovery_report = synapse_action::recover_stale_inputs_from_configured_path()
+        .context("recover stale action inputs from previous daemon")?;
+    tracing::info!(
+        code = "ACTION_CRASH_RECOVERY_CONFIGURED",
+        recovery_file = %recovery_file.display(),
+        recovered_keys = recovery_report.recovered_keys,
+        recovered_buttons = recovery_report.recovered_buttons,
+        recovered_pads = recovery_report.recovered_pads,
+        ignored_trailing_bytes = recovery_report.ignored_trailing_bytes,
+        "action crash recovery ledger configured"
+    );
 
     match cli.mode {
         Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,
@@ -577,10 +525,9 @@ async fn run() -> anyhow::Result<ExitCode> {
         | Mode::ApprovalProtocol
         | Mode::DesktopWorker
         | Mode::Doctor
-        | Mode::LocalAgent
-        | Mode::StorageMigrate => {
+        | Mode::LocalAgent => {
             unreachable!(
-                "connect, chrome-native-host, approval-protocol, desktop-worker, doctor, local-agent, and storage-migrate modes are handled before daemon setup"
+                "connect, chrome-native-host, approval-protocol, desktop-worker, doctor, and local-agent modes are handled before daemon setup"
             )
         }
     }

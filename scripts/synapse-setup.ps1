@@ -26,7 +26,7 @@
       --profile-dir explicitly. A compile-time CARGO_MANIFEST_DIR profile path
       never exists on an installed host.
     * Use a persistent CARGO_TARGET_DIR so re-installs are incremental, not a
-      ~25-minute RocksDB rebuild every time.
+      repeated native dependency rebuild every time.
 
   Nothing here silently falls back: every prerequisite is checked and throws a
   clear error naming exactly what failed and how to fix it.
@@ -574,7 +574,9 @@ $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
 $processToolSurfaceSnapshotAtStart = $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
 $script:SynapseMcpProtocolVersion = '2025-06-18'
-$script:SynapseMcpSessionDeleteTimeoutSec = 20
+# DELETE waits for the daemon's real lifecycle cleanup/readbacks. On the
+# operator Calyx vault, cold post-start cleanup can exceed the old 20s budget.
+$script:SynapseMcpSessionDeleteTimeoutSec = 120
 $script:SynapseSetupMaintenanceLockStream = $null
 $script:SynapseSetupMaintenanceLockPath = $null
 $script:SynapseSetupMaintenanceLockReason = $null
@@ -818,7 +820,8 @@ function New-HiddenDaemonLauncher {
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$LogDir,
-        [Parameter(Mandatory=$true)][string]$TokenPath
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$MaintenanceLockPath
     )
 
     $daemonLogDir = $LogDir
@@ -851,6 +854,7 @@ $TokenPath = __TOKEN_PATH__
 $LauncherLog = __LAUNCHER_LOG__
 $SupervisorState = __SUPERVISOR_STATE__
 $SupervisorEvents = __SUPERVISOR_EVENTS__
+$MaintenanceLockPath = __MAINTENANCE_LOCK_PATH__
 $DaemonArgumentText = __DAEMON_ARGUMENT_TEXT__
 
 $restartFloorSeconds = 2
@@ -948,6 +952,53 @@ function Test-ExpectedDaemonProcess {
         ($commandLine.IndexOf($DbPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
 }
 
+function Test-SetupMaintenanceLockActive {
+    if ([string]::IsNullOrWhiteSpace($MaintenanceLockPath) -or -not (Test-Path -LiteralPath $MaintenanceLockPath -PathType Leaf)) {
+        return [pscustomobject]@{ Active = $false; Reason = 'missing' }
+    }
+    try {
+        $text = (Get-Content -Raw -LiteralPath $MaintenanceLockPath).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return [pscustomobject]@{ Active = $false; Reason = 'empty' }
+        }
+        $lock = $text | ConvertFrom-Json
+        if ([string]$lock.schema -ne 'synapse_setup_maintenance_lock/v1') {
+            return [pscustomobject]@{ Active = $false; Reason = 'schema_mismatch' }
+        }
+        if ([string]$lock.bind -ne $Bind) {
+            return [pscustomobject]@{ Active = $false; Reason = 'bind_mismatch' }
+        }
+        if ([string]$lock.state -ne 'held') {
+            return [pscustomobject]@{ Active = $false; Reason = "state_$($lock.state)" }
+        }
+        $lockPid = [int]$lock.pid
+        $owner = Get-ProcessInfoForPid -ProcessId $lockPid
+        if ($null -eq $owner) {
+            return [pscustomobject]@{ Active = $false; Reason = "owner_missing_$lockPid" }
+        }
+        return [pscustomobject]@{ Active = $true; Reason = [string]$lock.reason; Pid = $lockPid }
+    } catch {
+        return [pscustomobject]@{ Active = $false; Reason = "read_failed:$($_.Exception.Message)" }
+    }
+}
+
+function Stop-IfSetupMaintenanceActive {
+    param(
+        [Parameter(Mandatory=$true)][string]$Phase,
+        [int]$Generation,
+        [AllowNull()][object]$ChildPid,
+        [AllowNull()][object]$ExitCode
+    )
+    $maintenance = Test-SetupMaintenanceLockActive
+    if ($maintenance.Active -ne $true) {
+        return
+    }
+    Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_STOP generation=$Generation reason=setup_maintenance phase=$Phase lock_reason=$($maintenance.Reason) lock_pid=$($maintenance.Pid)"
+    Write-SupervisorEvent 'supervisor_stop' @{ generation = $Generation; reason = 'setup_maintenance'; phase = $Phase; lock_reason = $maintenance.Reason; lock_pid = $maintenance.Pid }
+    Write-SupervisorState -State 'stopped' -Generation $Generation -ChildPid $ChildPid -ExitCode $ExitCode -Message "Setup maintenance lock is held by pid $($maintenance.Pid); supervisor stopped instead of launching/restarting during $Phase."
+    exit 0
+}
+
 function Wait-AdoptedDaemon {
     param(
         [Parameter(Mandatory=$true)][int]$OwnerPid,
@@ -1037,6 +1088,8 @@ while ($true) {
     Write-SupervisorEvent 'child_exit' @{ generation = $generation; child_pid = $process.Id; exit_code = $exitCode; runtime_ms = $runtimeMs }
     Write-SupervisorState -State 'child_exited' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message "Daemon child exited after ${runtimeMs}ms."
 
+    Stop-IfSetupMaintenanceActive -Phase 'post_child_exit' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode
+
     if ($exitCode -eq 0) {
         Write-LogLine "SYNAPSE_DAEMON_SUPERVISOR_STOP generation=$generation reason=daemon_exit_zero"
         Write-SupervisorEvent 'supervisor_stop' @{ generation = $generation; reason = 'daemon_exit_zero' }
@@ -1062,6 +1115,7 @@ while ($true) {
         Replace('__LAUNCHER_LOG__', (Quote-PowerShellSingleQuotedString $launcherLog)).
         Replace('__SUPERVISOR_STATE__', (Quote-PowerShellSingleQuotedString $supervisorState)).
         Replace('__SUPERVISOR_EVENTS__', (Quote-PowerShellSingleQuotedString $supervisorEvents)).
+        Replace('__MAINTENANCE_LOCK_PATH__', (Quote-PowerShellSingleQuotedString $MaintenanceLockPath)).
         Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText))
 
     $supervisorScript | Set-Content -Path $supervisorPath -Encoding ascii
@@ -6337,12 +6391,103 @@ function Stop-SynapseMcpProcesses {
         $Reason, $TimeoutSeconds, $remaining.Count, (Format-SynapseMcpProcessSnapshot -Snapshot $remaining))
 }
 
+function Get-SynapseDaemonSupervisorProcessSnapshot {
+    param([Parameter(Mandatory=$true)][string]$SupervisorPath)
+
+    $resolvedSupervisorPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($SupervisorPath)
+    @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = [string]$_.Name
+            $commandLine = [string]$_.CommandLine
+            ($name -ieq 'powershell.exe' -or $name -ieq 'pwsh.exe') -and
+                ($commandLine.IndexOf('-File', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+                ($commandLine.IndexOf($resolvedSupervisorPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+        } |
+        Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine)
+}
+
+function Format-SynapseDaemonSupervisorProcessSnapshot {
+    param([AllowNull()][object[]]$Snapshot)
+
+    if (-not $Snapshot -or $Snapshot.Count -eq 0) {
+        return '<none>'
+    }
+    return (($Snapshot | ForEach-Object {
+        "pid=$($_.ProcessId) ppid=$($_.ParentProcessId) name=$($_.Name) path=$($_.ExecutablePath) cmd=$($_.CommandLine)"
+    }) -join "`n")
+}
+
+function Stop-SynapseDaemonSupervisorProcessesForInstallHandoff {
+    param(
+        [Parameter(Mandatory=$true)][string]$SupervisorPath,
+        [int]$TimeoutSeconds = 20
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $before = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
+    if ($before.Count -eq 0) {
+        Info "Synapse daemon supervisor stop not needed before binary handoff: supervisor_path=$SupervisorPath"
+        return
+    }
+
+    Info ("Synapse daemon supervisor exact-path stop requested before binary handoff count={0}`nsupervisors:`n{1}" -f `
+        $before.Count,
+        (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $before))
+
+    foreach ($proc in $before) {
+        $pidValue = [int]$proc.ProcessId
+        if ($pidValue -eq $PID) {
+            Die "SYNAPSE_SUPERVISOR_STOP_REFUSED_SELF pid=$pidValue supervisor_path=$SupervisorPath remediation=setup refused to stop its own process while preparing daemon handoff"
+        }
+        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+        if (-not $current) {
+            continue
+        }
+        $currentCommand = [string]$current.CommandLine
+        if ($currentCommand.IndexOf('-File', [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+            $currentCommand.IndexOf($SupervisorPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            Die ("SYNAPSE_SUPERVISOR_STOP_TARGET_MISMATCH pid={0} supervisor_path={1} actual_name={2} actual_path={3} actual_command={4} remediation=PID was reused or is not the setup-owned hidden Synapse daemon supervisor; refusing protected-shell stop" -f `
+                $pidValue,
+                $SupervisorPath,
+                $current.Name,
+                $current.ExecutablePath,
+                $current.CommandLine)
+        }
+        try {
+            Stop-Process -Id $pidValue -Force -ErrorAction Stop
+            Info "Synapse daemon supervisor exact-PID stop issued pid=$pidValue supervisor_path=$SupervisorPath"
+        } catch {
+            Die "SYNAPSE_SUPERVISOR_STOP_FAILED pid=$pidValue supervisor_path=$SupervisorPath error=$($_.Exception.Message) remediation=setup only stops the exact hidden daemon supervisor launched from synapse-daemon-supervisor.ps1; inspect the task/process SoT before retrying"
+        }
+    }
+
+    do {
+        Start-Sleep -Milliseconds 250
+        $after = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
+        if ($after.Count -eq 0) {
+            Info "Synapse daemon supervisor stop verified before binary handoff supervisor_path=$SupervisorPath"
+            return
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    $remaining = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
+    Die ("SYNAPSE_SUPERVISOR_STOP_TIMEOUT supervisor_path={0} timeout_s={1} remaining_count={2}`nremaining:`n{3}`nremediation=the scheduled-task hidden supervisor is still running and can relaunch the installed daemon during binary replacement; inspect Task Scheduler and process ownership before retrying" -f `
+        $SupervisorPath,
+        $TimeoutSeconds,
+        $remaining.Count,
+        (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $remaining))
+}
+
 function Suspend-SynapseDaemonTaskForInstallHandoff {
-    param([Parameter(Mandatory=$true)][string]$TaskName)
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$SupervisorPath
+    )
 
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
         Info "Synapse daemon scheduled task absent before install handoff: task=$TaskName"
+        Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $SupervisorPath
         return
     }
 
@@ -6365,6 +6510,7 @@ function Suspend-SynapseDaemonTaskForInstallHandoff {
         return
     }
     Info "Synapse daemon scheduled task suspended for handoff: task=$TaskName state=$($readback.State)"
+    Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $SupervisorPath
 }
 
 function Stop-SynapseMcpProcessesForInstallHandoff {
@@ -6699,7 +6845,7 @@ if (-not $SkipBuild) {
         # synapse-update.ps1). The env var outranks any `[build] jobs = N` cap
         # in a user/repo cargo config.toml that would otherwise silently
         # serialize the build; cargo forwards it to build scripts as NUM_JOBS,
-        # which parallelizes the RocksDB C++ compile. RAM-guarded (~1.5 GB per
+        # which parallelizes native dependency compilation. RAM-guarded (~1.5 GB per
         # heavy rustc/cl.exe job) so low-memory machines don't swap.
         $logicalCpus = [Environment]::ProcessorCount
         $ramGb = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
@@ -6901,7 +7047,8 @@ if ($installedBinaryAlreadyVerified) {
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
     Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
-    Suspend-SynapseDaemonTaskForInstallHandoff -TaskName $TaskName
+    $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+    Suspend-SynapseDaemonTaskForInstallHandoff -TaskName $TaskName -SupervisorPath $daemonSupervisorPath
     Stop-SynapseMcpProcessesForInstallHandoff -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
     Assert-SynapseInstallPathUnlocked -Path $ExePath -Bind $Bind -DbPath $DbPath -TimeoutSeconds 30
 }
@@ -7056,7 +7203,7 @@ $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
 if (-not (Test-Path $wscriptExe)) {
     Die "SYNAPSE_HIDDEN_LAUNCHER_MISSING path=$wscriptExe remediation=repair Windows Script Host or run the daemon manually with a hidden process supervisor"
 }
-New-HiddenDaemonLauncher -OutputPath $hiddenLauncher -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -TokenPath $TokenPath
+New-HiddenDaemonLauncher -OutputPath $hiddenLauncher -ExePath $ExePath -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -LogDir $LogDir -TokenPath $TokenPath -MaintenanceLockPath $MaintenanceLockPath
 
 $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"

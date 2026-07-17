@@ -1,16 +1,16 @@
 # Calyx Integration Plan — Synapse on an Association-Native Database
 
 **Status:** Proposed · 2026-07-15
-**Scope:** Replace RocksDB completely with Calyx as Synapse's storage layer, then unlock every Calyx capability (associations, bits, kernel, guard, oracle, provenance, self-optimization) over everything Synapse captures.
+**Scope:** Run Synapse on Calyx as its storage layer, then unlock every Calyx capability (associations, bits, kernel, guard, oracle, provenance, self-optimization) over everything Synapse captures.
 **Doctrine:** `BUILDING_ON_CALYX.md` is the build handbook. Encoders only — **no learned embedders**. GPU preferred, CPU fallback. Manual FSV (AGENTS.md D1) gates every step.
 
 ---
 
 ## 1. What exists today
 
-### 1.1 Synapse persists 17 RocksDB column families through one facade
+### 1.1 Synapse persists 17 logical column families through one facade
 
-All storage flows through `synapse_storage::Db` (`crates/synapse-storage/src/lib.rs`) — `put_batch`, `put_batch_pressure_bypass`, `put_cf_batches_pressure_bypass`, `mutate_batch_pressure_bypass`, `get_cf`, `scan_cf`, `scan_cf_prefix[_from]`, `scan_cf_from`, `scan_cf_tail`, `delete_batch`, `flush`, GC, disk-pressure, sizes/counts. ~155 files consume this facade; none touch RocksDB directly. **This facade is the swap seam.**
+All storage flows through `synapse_storage::Db` (`crates/synapse-storage/src/lib.rs`) — `put_batch`, `put_batch_pressure_bypass`, `put_cf_batches_pressure_bypass`, `mutate_batch_pressure_bypass`, `get_cf`, `scan_cf`, `scan_cf_prefix[_from]`, `scan_cf_from`, `scan_cf_tail`, `delete_batch`, `flush`, GC, disk-pressure, sizes/counts. ~155 files consume this facade; none touch the concrete vault directly. **This facade is the storage seam.**
 
 | CF | Contents | Key | TTL / caps |
 |---|---|---|---|
@@ -63,7 +63,7 @@ Rust 2024 workspace, **compiles clean on Windows** (verified 2026-07-15: `cargo 
 
 1. **In-process embedding, one durable vault.** New crate `synapse-calyx` owns an `AsterVault` at `%APPDATA%\synapse\vault\`. No daemon-to-daemon hop; Calyx runs inside `synapse-mcp.exe`.
 2. **Fork-and-own — Calyx is a blueprint, absorbed as Synapse's code.** The dependency-closed 17-crate set is absorbed into this repo at `calyx/` (nested workspace, `exclude = ["calyx"]`; apps/servers pruned at absorption — see `calyx/README.md`). It is Synapse-owned from that point: fully customizable, expected to diverge, no upstream tracking. `C:\code\calyx-dev` / upstream is reference-only; this repo never builds against it. Calyx-side work (new encoders, pipelines, hardening) is written in `calyx/crates/` as normal Synapse commits.
-3. **Keep the `Db` facade, replace its guts.** `synapse-storage` keeps its exact public API; internally a backend enum selects RocksDB or Calyx during migration, then RocksDB is deleted. All 17 CFs become **Kv-family collections** in the vault — keys byte-identical to today (existing key codecs unchanged), values stay JSON (ADR-0001 inspectability preserved). TTL maps to Kv `expires_at`; caps map to aster retention/GC; pressure levels map to aster pressure.
+3. **Keep the `Db` facade, replace its guts.** `synapse-storage` keeps its exact public API. All 17 CFs are **Kv-family collections** in the vault — keys byte-identical to the original codecs, values stay JSON (ADR-0001 inspectability preserved). TTL maps to Kv `expires_at`; caps map to aster retention/GC; pressure levels map to aster pressure.
 4. **Raw row + constellation, dual representation.** The verbatim JSON row remains the replay/audit source of truth. Alongside it, each intelligence-bearing record is *measured* into a constellation (slots + exact `scalars` + verbatim `metadata` + anchors + provenance) with content-addressed ids (idempotent re-ingest). This is the handbook's Phase 2 "no side store" satisfied in one engine: both live in the same vault.
 5. **Encoders only — never embed the explicit.** Every lens is a frozen deterministic `AlgorithmicEncoder`-style instrument (the `Gdelt*` family in `calyx-registry` is the template for adding a `Syn*` family). No candle/onnx/tei lens is ever registered. Structured meaning is measured in **bits**, not cosine-over-embeddings.
 6. **GPU preferred, CPU fallback, measured parity.** Build `calyx-forge` with the `cuda` feature (dynamic-linking — no hard CUDA install dependency). At startup: try `CudaBackend::new()`, on error fall back to `CpuBackend::new()`; log the choice, surface it in the `health` tool, enforce CPU↔GPU bit-parity via the forge parity checks.
@@ -167,11 +167,11 @@ Beyond storing and analyzing, Calyx **controls** what it can do so with groundin
 
 ## 5. Migration & cutover
 
-1. Backend seam lands behind `storage_backend = "rocksdb" | "calyx"` config (default rocksdb).
-2. `synapse-mcp storage migrate` — streams every CF row into the vault (pressure-bypass path, ledger-recorded), then verifies **byte-exact**: per-CF row counts equal + exhaustive key/value comparison; writes a migration manifest.
+1. Backend seam landed and now accepts only `storage_backend = "calyx"`.
+2. Cutover verification reads every storage-touching tool at the Calyx vault SoT.
 3. Shadow phase: daemon runs on calyx backend; FSV compares live behavior (timeline queries, episode segmentation, cost queries, replay) against expectations at the SoT.
-4. Cutover: default flips to calyx; RocksDB directory renamed `db.rocksdb-retired` (kept until FSV sweep passes).
-5. Decommission: `rocksdb` dependency and backend enum removed; retired directory deleted after operator confirmation.
+4. Cutover: default is Calyx and the retired source directory is kept until operator confirmation.
+5. Decommission: the legacy dependency and backend enum are removed; retired source data is deleted only after operator confirmation.
 
 ## 6. Verification doctrine
 
@@ -181,7 +181,7 @@ Every issue ends with manual FSV (never automated, AGENTS.md D1): daemon PID/bin
 
 - **Phase 0 — Foundation & absorption:** #1652 absorb Calyx fork-and-own (landed in tree) → #1653 `synapse-calyx` vault crate → #1654 GPU-preferred/CPU-fallback math runtime.
 - **Phase 0.5 — Calyx adaptation (new code — §2.5):** #1692 async vault facade + WAL-synced batcher → #1693 Windows durability hardening + crash soak → #1694 structured-record measurement pipeline → #1695 deferred forge GPU ops (profile-driven) → #1696 error/config/clock bridges.
-- **Phase 1 — Parity swap:** #1655 backend seam → #1656 Kv backend (byte-identical Db API; needs #1692) → #1657 retention/TTL, #1658 disk pressure, #1659 GC, #1660 inspect/dump → #1661 migration (byte-exact verified) → #1662 cutover + rocksdb removal (needs #1693).
+- **Phase 1 — Parity swap:** #1655 backend seam → #1656 Kv backend (byte-identical Db API; needs #1692) → #1657 retention/TTL, #1658 disk pressure, #1659 GC, #1660 inspect/dump → #1661 migration (byte-exact verified) → #1662 Calyx-only cutover.
 - **Phase 2 — Measure:** #1663 `Syn*` encoder family (new calyx-registry code; needs #1694) → #1664 timeline/episode panels, #1665 agent panels, #1666 action/reflex/process/observation panels → #1667 temporal lenses + recurrence → #1668 panel lifecycle/backfill/admission gate → #1685 graph-structural + hierarchy lenses.
 - **Phase 3 — Ground:** #1669 anchor writers → #1670 grounding-gap report.
 - **Phase 4 — Count/Differentiate:** #1671 loom weave/abundance → #1672 assay bits/sufficiency/synergy → #1673 transfer entropy/periodicity/CUSUM/hazard → #1674 blind spots + drift.

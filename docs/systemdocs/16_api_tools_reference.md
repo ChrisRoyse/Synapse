@@ -35,7 +35,7 @@ The full surface is assembled in `SynapseService::tool_router()` (`server.rs:603
 Conventions seen throughout:
 - Browser/CDP tools accept `cdp_target_id` + `window_hwnd` to address a session-owned tab, defaulting to the active session target; they are background-safe (no tab activation, no OS foreground, no human-foreground fallback).
 - Action tools take `verify_delta` / `verify_timeout_ms` and a `backend` (auto/software/hardware) selector.
-- Many tools persist to RocksDB column families (`CF_KV`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS`, etc.) and return an exact row readback.
+- Many tools persist to Calyx-backed column-family collections (`CF_KV`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS`, etc.) and return an exact row readback.
 
 > Detail note: where a param table below says "(summarized)" the field list is abbreviated to key/required params; full field sets exist in the named struct.
 

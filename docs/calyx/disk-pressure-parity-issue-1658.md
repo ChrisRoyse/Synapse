@@ -3,10 +3,10 @@
 ## Root Cause
 
 `synapse-storage::pressure` already had the pressure levels, transition-code
-history, probe readbacks, and per-CF write shedding that RocksDB callers rely
+history, probe readbacks, and per-CF write shedding that storage callers rely
 on. The missing structural invariant was backend independence: the pressure
-responder accepted a `rocksdb::DB` directly so Level2 and above could run
-`compact_range_cf` across RocksDB column families.
+responder accepted the concrete database handle directly so Level2 and above
+could run compaction across column families.
 
 The Calyx backend therefore exposed only an in-process `PressureState` for
 `pressure_level` and `pressure_permits_write`. The actual maintenance entry
@@ -24,9 +24,9 @@ and shedding could not become real until #1658 and #1659 both landed.
 The storage crate now keeps a single Synapse pressure state machine and injects
 backend-specific physical maintenance through `PressureMaintenance`.
 
-RocksDB behavior remains the same:
+Legacy behavior remains the same:
 
-- Level2 and above call RocksDB compaction across all Synapse column families.
+- Level2 and above call compaction across all Synapse column families.
 - The same `PressureReport` shape, transition codes, and `WriteShed` behavior
   remain visible to existing callers.
 
@@ -38,7 +38,7 @@ Calyx behavior is now explicit:
   physical `ColumnFamily::Kv`, so one successful KV compaction attempt covers
   the complete Synapse storage surface.
 - Calyx pressure checks use the same thresholds and write-shed policy as
-  RocksDB.
+  the storage backend.
 - Pressure errors fail closed through structured `StorageError` values; there
   is no fallback to pretending maintenance succeeded.
 - `M3State::ensure_storage_maintenance` now starts pressure maintenance on
@@ -60,11 +60,10 @@ The parity surface exercised for #1658:
 
 ## Research Inputs
 
-- RocksDB write stalls slow or stop writes when flush or compaction cannot keep
+- Storage write stalls slow or stop writes when flush or compaction cannot keep
   up, because otherwise space/read amplification can exhaust disk or degrade
-  reads. RocksDB also records stall conditions and supports immediate
-  non-blocking failures for callers that should not block indefinitely:
-  https://github.com/facebook/rocksdb/wiki/Write-Stalls
+  reads. Stateful storage should record stall conditions and support immediate
+  non-blocking failures for callers that should not block indefinitely.
 - CockroachDB admission control queues CPU and storage IO by priority to keep
   important work moving when individual stateful nodes hit hotspots. That
   supports Synapse's existing per-CF priority shedding rather than a single

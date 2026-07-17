@@ -3,15 +3,15 @@
 **Status:** Target state · 2026-07-15 · realized when the `[CALYX]` issue graph is closed
 **Companion:** `docs/calyx/INTEGRATION_PLAN.md` (how) · this document (what it makes possible)
 
-Synapse today is a Windows-native perception/action/autonomy daemon that *captures* everything — operator activity timeline, derived episodes, mined routines, agent journals and transcripts, emitted actions, reflex audits, observations, process history — and stores it as inert JSON rows in RocksDB. After the Calyx integration, the same daemon stores that corpus in an **association-native database** where the relationships between everything it captures are first-class, measured, grounded, and queryable. No learned embedders anywhere: every measurement is a deterministic encoder, every insight is information-theoretic (bits), every claim is anchored to a real outcome or explicitly tagged provisional. All math runs GPU-first with automatic CPU fallback.
+Synapse is a Windows-native perception/action/autonomy daemon that *captures* everything — operator activity timeline, derived episodes, mined routines, agent journals and transcripts, emitted actions, reflex audits, observations, process history — and stores it in a Calyx **association-native database** where the relationships between everything it captures are first-class, measured, grounded, and queryable. No learned embedders anywhere: every measurement is a deterministic encoder, every insight is information-theoretic (bits), every claim is anchored to a real outcome or explicitly tagged provisional. All math runs GPU-first with automatic CPU fallback.
 
 ---
 
-## 1. A single universal store (RocksDB fully retired)
+## 1. A single universal store
 
 - **One vault, one engine.** All 17 data classes live in one Calyx vault (`%APPDATA%\synapse\vault\`): LSM core, WAL + group commit, MVCC snapshots, crash-safe manifest — embedded in-process in `synapse-mcp.exe`.
 - **Everything Synapse's storage did before, preserved exactly**: byte-identical keys, JSON values you can inspect, per-class TTLs (24 h events → 90 d timeline → never-expiring operator decisions), soft/hard byte caps, oldest-first GC, 4-level disk-pressure shedding, schema versioning, dump/inspect tooling with redaction.
-- **Plus what RocksDB never had:**
+- **Calyx adds:**
   - **Time-travel reads** — MVCC snapshots let `replay` and debugging read the store *as it was*, consistently.
   - **Tamper-evident history** — every mutation is an entry in an append-only hash chain with Merkle checkpoints; `audit` can `verify_chain` over the entire history and detect a single flipped byte.
   - **Provable erasure** — `privacy` erase uses redaction tombstones: the content is unrecoverable, yet the provenance chain still verifies. Deletion you can audit.
