@@ -86,6 +86,8 @@ const HTTP_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_BACKGROUND_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_SECS";
+const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const DASHBOARD_CONTEXT_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -283,6 +285,26 @@ struct HttpRouterRuntime {
     session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
     drain_state: crate::server::drain::DaemonDrainState,
     background_tasks: Vec<HttpBackgroundTaskOwner>,
+}
+
+struct HttpShutdownWatchdog {
+    disarmed: Arc<AtomicBool>,
+    source: &'static str,
+    timeout: Duration,
+}
+
+impl HttpShutdownWatchdog {
+    fn disarm(&self, outcome: &'static str) {
+        self.disarmed.store(true, Ordering::Release);
+        tracing::info!(
+            code = "MCP_HTTP_SHUTDOWN_WATCHDOG_DISARMED",
+            source = self.source,
+            timeout_ms = self.timeout.as_millis(),
+            outcome,
+            pid = std::process::id(),
+            "HTTP shutdown watchdog disarmed after terminal process decision"
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -993,6 +1015,132 @@ fn own_http_background_task(name: &'static str, task: JoinHandle<()>) -> HttpBac
     (name, ShutdownTaskOwner::new(name, task))
 }
 
+fn configured_http_shutdown_watchdog_timeout() -> anyhow::Result<Duration> {
+    match std::env::var(HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV) {
+        Ok(raw) => {
+            let secs = raw.trim().parse::<u64>().with_context(|| {
+                format!("{HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV} must be a positive integer seconds value, got {raw:?}")
+            })?;
+            if secs == 0 {
+                anyhow::bail!("{HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV} must be at least 1 second");
+            }
+            Ok(Duration::from_secs(secs))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT),
+        Err(error) => Err(anyhow::anyhow!(
+            "{HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV} is not valid unicode: {error}"
+        )),
+    }
+}
+
+fn spawn_http_shutdown_watchdog(
+    bind: SocketAddr,
+    db_path: PathBuf,
+    source: &'static str,
+    timeout: Duration,
+) -> HttpShutdownWatchdog {
+    let disarmed = Arc::new(AtomicBool::new(false));
+    let disarmed_for_thread = Arc::clone(&disarmed);
+    let pid = std::process::id();
+    tracing::warn!(
+        code = "MCP_HTTP_SHUTDOWN_WATCHDOG_ARMED",
+        source,
+        bind = %bind,
+        db_path = %db_path.display(),
+        timeout_ms = timeout.as_millis(),
+        pid,
+        "HTTP shutdown watchdog armed; process must reach a terminal exit decision before the listener-less deadline"
+    );
+    let db_path_for_thread = db_path.clone();
+    match std::thread::Builder::new()
+        .name("synapse-http-shutdown-watchdog".to_owned())
+        .spawn(move || {
+            std::thread::sleep(timeout);
+            if disarmed_for_thread.load(Ordering::Acquire) {
+                return;
+            }
+            let detail = serde_json::json!({
+                "code": "MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED",
+                "source": source,
+                "bind": bind.to_string(),
+                "db_path": db_path_for_thread.display().to_string(),
+                "pid": pid,
+                "timeout_ms": timeout.as_millis(),
+                "reason": "HTTP shutdown accepted and listener teardown started, but the daemon did not reach a terminal process decision before the listener-less deadline",
+            });
+            tracing::error!(
+                code = "MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED",
+                source,
+                bind = %bind,
+                db_path = %db_path_for_thread.display(),
+                timeout_ms = timeout.as_millis(),
+                pid,
+                detail = ?detail,
+                "HTTP shutdown watchdog forcing nonzero process exit because the daemon is unreachable and still alive"
+            );
+            if let Err(error) = crate::daemon_lifecycle::record_forced_exit_nonblocking(
+                "http_shutdown_watchdog_expired",
+                detail.clone(),
+            ) {
+                eprintln!(
+                    "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXIT_LEDGER_FAILED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} error={error:#}",
+                    db_path_for_thread.display(),
+                    timeout.as_millis()
+                );
+            }
+            eprintln!(
+                "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} detail={detail}",
+                db_path_for_thread.display(),
+                timeout.as_millis()
+            );
+            std::process::exit(1);
+        }) {
+        Ok(_handle) => {}
+        Err(error) => {
+            let detail = serde_json::json!({
+                "code": "MCP_HTTP_SHUTDOWN_WATCHDOG_SPAWN_FAILED",
+                "source": source,
+                "bind": bind.to_string(),
+                "db_path": db_path.display().to_string(),
+                "pid": pid,
+                "timeout_ms": timeout.as_millis(),
+                "error": error.to_string(),
+            });
+            tracing::error!(
+                code = "MCP_HTTP_SHUTDOWN_WATCHDOG_SPAWN_FAILED",
+                source,
+                bind = %bind,
+                db_path = %db_path.display(),
+                timeout_ms = timeout.as_millis(),
+                pid,
+                error = %error,
+                "failed to arm HTTP shutdown watchdog; forcing nonzero exit because listener-less shutdown cannot be supervised"
+            );
+            if let Err(record_error) = crate::daemon_lifecycle::record_forced_exit_nonblocking(
+                "http_shutdown_watchdog_spawn_failed",
+                detail.clone(),
+            ) {
+                eprintln!(
+                    "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXIT_LEDGER_FAILED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} error={record_error:#}",
+                    db_path.display(),
+                    timeout.as_millis()
+                );
+            }
+            eprintln!(
+                "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_SPAWN_FAILED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} detail={detail}",
+                db_path.display(),
+                timeout.as_millis()
+            );
+            std::process::exit(1);
+        }
+    }
+    HttpShutdownWatchdog {
+        disarmed,
+        source,
+        timeout,
+    }
+}
+
 fn start_http_runtime(
     service: &SynapseService,
     shutdown_cancel: &CancellationToken,
@@ -1685,6 +1833,7 @@ pub(super) async fn serve(
         .db_path
         .clone()
         .unwrap_or_else(crate::m3::default_db_path);
+    let shutdown_watchdog_timeout = configured_http_shutdown_watchdog_timeout()?;
     let single_instance_guard = match crate::single_instance::SingleInstanceGuard::acquire(&db_path)
     {
         Ok(guard) => {
@@ -2155,6 +2304,7 @@ pub(super) async fn serve(
         authority_finalizers_quiescent,
         session_input_owners_quiescent,
         operator_owner_drain,
+        shutdown_watchdog,
     ) = tokio::select! {
         result = &mut server_task => {
             let mut failures = HttpShutdownFailures::default();
@@ -2167,6 +2317,12 @@ pub(super) async fn serve(
             } else {
                 "server_task_unexpected_stop"
             };
+            let shutdown_watchdog = spawn_http_shutdown_watchdog(
+                local_addr,
+                db_path.clone(),
+                source,
+                shutdown_watchdog_timeout,
+            );
             if shutdown_was_requested {
                 tracing::info!(
                     code = "MCP_HTTP_SERVER_STOPPED",
@@ -2236,17 +2392,29 @@ pub(super) async fn serve(
                     "HTTP MCP transport stopped without a shutdown request",
                 );
             }
+            let exit_code = if shutdown_was_requested {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            };
             (
-                ExitCode::SUCCESS,
+                exit_code,
                 source,
                 failures,
                 authority_finalizers_quiescent,
                 session_input_owners_quiescent,
                 operator_owner_drain,
+                shutdown_watchdog,
             )
         }
         signal = wait_for_shutdown_signal("http") => {
             let mut failures = HttpShutdownFailures::default();
+            let shutdown_watchdog = spawn_http_shutdown_watchdog(
+                local_addr,
+                db_path.clone(),
+                "signal",
+                shutdown_watchdog_timeout,
+            );
             if let Err(error) = &signal {
                 tracing::error!(
                     code = "MCP_HTTP_SHUTDOWN_SIGNAL_WAIT_FAILED",
@@ -2323,10 +2491,17 @@ pub(super) async fn serve(
                 authority_finalizers_quiescent,
                 session_input_owners_quiescent,
                 operator_owner_drain,
+                shutdown_watchdog,
             )
         }
         _ = shutdown_cancel_for_http_endpoint.cancelled() => {
             let mut failures = HttpShutdownFailures::default();
+            let shutdown_watchdog = spawn_http_shutdown_watchdog(
+                local_addr,
+                db_path.clone(),
+                "http_endpoint",
+                shutdown_watchdog_timeout,
+            );
             // The `/shutdown` handler marks drain state, returns its ACCEPTED
             // response, and only cancels this token after
             // DRAIN_RESPONSE_GRACE_TIMEOUT. Reaching this branch therefore
@@ -2396,12 +2571,13 @@ pub(super) async fn serve(
                 emitter_drain.context("drain M2 emitter after HTTP endpoint shutdown"),
             );
             (
-                ExitCode::SUCCESS,
+                ExitCode::from(1),
                 "http_endpoint",
                 failures,
                 authority_finalizers_quiescent,
                 session_input_owners_quiescent,
                 operator_owner_drain,
+                shutdown_watchdog,
             )
         }
     };
@@ -2597,13 +2773,16 @@ pub(super) async fn serve(
         pid = std::process::id(),
         "daemon lifecycle graceful HTTP service completion written"
     );
+    let exit_code_for_log = u8::from(shutdown_source == "http_endpoint");
     tracing::info!(
         code = "MCP_HTTP_PROCESS_EXIT_DECISION",
         source = "http_service_completed",
         pid = std::process::id(),
-        exit_code = 0,
-        "HTTP daemon process returning success after graceful shutdown"
+        exit_code = exit_code_for_log,
+        restart_requested = shutdown_source == "http_endpoint",
+        "HTTP daemon process returning after graceful shutdown"
     );
+    shutdown_watchdog.disarm("http_service_completed");
     Ok(code)
 }
 

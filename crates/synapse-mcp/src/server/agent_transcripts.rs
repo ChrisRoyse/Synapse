@@ -162,6 +162,7 @@ pub(crate) struct SpawnIngestOutcome {
     pub source_complete: bool,
     pub deferred_for_pressure: bool,
     pub skipped: bool,
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -394,6 +395,16 @@ pub(crate) fn ingest_spawn_dir_once(
     log_dir: &Path,
     finalize: bool,
 ) -> Result<SpawnIngestOutcome, String> {
+    ingest_spawn_dir_once_with_cancel(db, spawn_id, log_dir, finalize, None)
+}
+
+fn ingest_spawn_dir_once_with_cancel(
+    db: &Db,
+    spawn_id: &str,
+    log_dir: &Path,
+    finalize: bool,
+    cancel: Option<&CancellationToken>,
+) -> Result<SpawnIngestOutcome, String> {
     validate_spawn_id_shape(spawn_id)?;
     let stdout_path = log_dir.join("stdout.jsonl");
 
@@ -520,19 +531,16 @@ pub(crate) fn ingest_spawn_dir_once(
     fn trim_line_terminator(line: &[u8]) -> &[u8] {
         line.strip_suffix(b"\r").unwrap_or(line)
     }
-    let mut lines: Vec<&[u8]> = Vec::new();
-    let mut consumed_bytes = 0_usize;
+    let mut lines: Vec<(&[u8], usize)> = Vec::new();
     let mut start = 0_usize;
     for (index, byte) in new_bytes.iter().enumerate() {
         if *byte == b'\n' {
-            lines.push(trim_line_terminator(&new_bytes[start..index]));
+            lines.push((trim_line_terminator(&new_bytes[start..index]), index + 1));
             start = index + 1;
-            consumed_bytes = start;
         }
     }
     if finalize && start < new_bytes.len() {
-        lines.push(trim_line_terminator(&new_bytes[start..]));
-        consumed_bytes = new_bytes.len();
+        lines.push((trim_line_terminator(&new_bytes[start..]), new_bytes.len()));
     }
 
     if lines.is_empty() && !finalize {
@@ -565,7 +573,20 @@ pub(crate) fn ingest_spawn_dir_once(
         Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
-    for raw_line in &lines {
+    let mut processed_consumed_bytes = 0_usize;
+    let mut cancelled = false;
+    for (raw_line, line_consumed_bytes) in &lines {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            tracing::info!(
+                code = "TRANSCRIPT_INGEST_CYCLE_CANCELLED",
+                spawn_id,
+                processed_lines = rows.len(),
+                pending_lines = lines.len().saturating_sub(rows.len()),
+                "daemon shutdown cancelled transcript ingestion between source lines"
+            );
+            break;
+        }
         let line_no = cursor.lines_ingested + 1;
         let record = parse_line(raw_line, line_no, &mut cursor);
         match record.status {
@@ -606,6 +627,7 @@ pub(crate) fn ingest_spawn_dir_once(
         constellation_rows.push((transcript_key.clone(), encoded.clone(), record.clone()));
         rows.push((transcript_key, encoded));
         cursor.lines_ingested = line_no;
+        processed_consumed_bytes = *line_consumed_bytes;
     }
 
     if !rows.is_empty() {
@@ -636,14 +658,14 @@ pub(crate) fn ingest_spawn_dir_once(
         }
     }
 
-    cursor.offset_bytes += consumed_bytes as u64;
+    cursor.offset_bytes += processed_consumed_bytes as u64;
     cursor.parsed_rows += new_parsed;
     cursor.invalid_rows += new_invalid;
     cursor.updated_ts_ns = unix_time_ns_now();
     LINES_PARSED_TOTAL.fetch_add(new_parsed, Ordering::Relaxed);
     LINES_INVALID_TOTAL.fetch_add(new_invalid, Ordering::Relaxed);
 
-    if finalize {
+    if finalize && !cancelled {
         cursor.source_complete = true;
         cursor.completed_reason = Some(if completion_is_terminal(log_dir) {
             "completion_status_terminal".to_owned()
@@ -689,6 +711,7 @@ pub(crate) fn ingest_spawn_dir_once(
         new_invalid_rows: new_invalid,
         lines_ingested_total: cursor.lines_ingested,
         source_complete: cursor.source_complete,
+        cancelled,
         ..SpawnIngestOutcome::default()
     })
 }
@@ -696,13 +719,18 @@ pub(crate) fn ingest_spawn_dir_once(
 /// One pass over every spawn dir under `root`. Per-spawn errors are sticky
 /// and already logged; the cycle continues so one corrupt spawn can never
 /// stall the fleet's transcripts.
-pub(crate) fn ingest_all_spawn_dirs_once(db: &Db, root: &Path) -> Value {
+fn ingest_all_spawn_dirs_once_with_cancel(
+    db: &Db,
+    root: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Value {
     CYCLES_TOTAL.fetch_add(1, Ordering::Relaxed);
     let mut dirs_seen = 0_u64;
     let mut new_rows = 0_u64;
     let mut completed = 0_u64;
     let mut errors = 0_u64;
     let mut deferred = 0_u64;
+    let mut cancelled = false;
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) => {
@@ -719,6 +747,10 @@ pub(crate) fn ingest_all_spawn_dirs_once(db: &Db, root: &Path) -> Value {
         }
     };
     for entry in entries.flatten() {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break;
+        }
         let name = entry.file_name();
         let Some(spawn_id) = name.to_str() else {
             continue;
@@ -731,7 +763,7 @@ pub(crate) fn ingest_all_spawn_dirs_once(db: &Db, root: &Path) -> Value {
             continue;
         }
         dirs_seen += 1;
-        match ingest_spawn_dir_once(db, spawn_id, &log_dir, false) {
+        match ingest_spawn_dir_once_with_cancel(db, spawn_id, &log_dir, false, cancel) {
             Ok(outcome) => {
                 new_rows += outcome.new_parsed_rows + outcome.new_invalid_rows;
                 if outcome.source_complete && !outcome.skipped {
@@ -739,6 +771,10 @@ pub(crate) fn ingest_all_spawn_dirs_once(db: &Db, root: &Path) -> Value {
                 }
                 if outcome.deferred_for_pressure {
                     deferred += 1;
+                }
+                if outcome.cancelled {
+                    cancelled = true;
+                    break;
                 }
             }
             Err(_detail) => {
@@ -753,7 +789,20 @@ pub(crate) fn ingest_all_spawn_dirs_once(db: &Db, root: &Path) -> Value {
         "sources_completed": completed,
         "errors": errors,
         "pressure_deferred": deferred,
+        "cancelled": cancelled,
     });
+    if cancelled {
+        tracing::info!(
+            code = "TRANSCRIPT_INGEST_CYCLE_CANCELLED",
+            dirs_seen,
+            new_rows,
+            sources_completed = completed,
+            errors,
+            pressure_deferred = deferred,
+            "transcript ingest cycle stopped early for daemon shutdown"
+        );
+        return summary;
+    }
     if new_rows > 0 || completed > 0 || errors > 0 || deferred > 0 {
         tracing::info!(
             code = "TRANSCRIPT_INGEST_CYCLE_OK",
@@ -861,7 +910,7 @@ pub(crate) fn spawn_periodic_transcript_ingest(
                 }
                 () = tokio::time::sleep(delay) => {}
             }
-            run_cycle(&m3_state, &root);
+            run_cycle(&m3_state, &root, &cancel);
             delay = std::time::Duration::from_secs(interval_secs);
         }
     });
@@ -925,7 +974,14 @@ fn path_key(path: &Path) -> String {
     raw
 }
 
-fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path) {
+fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path, cancel: &CancellationToken) {
+    if cancel.is_cancelled() {
+        tracing::info!(
+            code = "TRANSCRIPT_INGEST_CYCLE_CANCELLED",
+            "daemon shutdown cancelled transcript ingestion before storage open"
+        );
+        return;
+    }
     let db = {
         let mut state = match m3_state.lock() {
             Ok(state) => state,
@@ -950,7 +1006,7 @@ fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path) {
             }
         }
     };
-    let _summary = ingest_all_spawn_dirs_once(&db, root);
+    let _summary = ingest_all_spawn_dirs_once_with_cancel(&db, root, Some(cancel));
 }
 
 fn parse_secs_env(name: &str, default: u64) -> anyhow::Result<u64> {

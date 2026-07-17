@@ -762,6 +762,22 @@ pub(crate) fn record_top_level_error(detail: &str) -> anyhow::Result<()> {
     )
 }
 
+pub(crate) fn record_forced_exit_nonblocking(
+    cause: &'static str,
+    detail: Value,
+) -> anyhow::Result<()> {
+    let slot = state_slot();
+    let mut guard = slot.try_lock().map_err(|error| {
+        anyhow::anyhow!(
+            "daemon lifecycle state lock unavailable for forced exit ({cause}): {error}"
+        )
+    })?;
+    let Some(state) = guard.as_mut() else {
+        bail!("daemon lifecycle ledger is not configured for forced exit ({cause})");
+    };
+    record_exit_for_state_locked(state, "daemon_exit", cause, detail)
+}
+
 pub(crate) fn health_subsystem() -> SubsystemHealth {
     let slot = state_slot();
     let guard = match slot.lock() {

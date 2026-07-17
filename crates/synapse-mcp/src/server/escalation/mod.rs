@@ -1849,6 +1849,13 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                 _ = signal.notified() => {}
                 _ = interval.tick() => {}
             }
+            if shutdown.is_cancelled() {
+                tracing::debug!(
+                    code = "ESCALATION_WORKER_STOPPED",
+                    "stopping escalation worker before starting a sweep"
+                );
+                break;
+            }
             let now_unix_ms = unix_time_ms_now();
             match process_pending(&db, now_unix_ms).await {
                 Ok(report)
@@ -1882,6 +1889,13 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                         "escalation sweep failed; will retry next tick"
                     );
                 }
+            }
+            if shutdown.is_cancelled() {
+                tracing::debug!(
+                    code = "ESCALATION_WORKER_STOPPED",
+                    "stopping escalation worker before orphan toast cleanup"
+                );
+                break;
             }
             if now_unix_ms.saturating_sub(last_orphan_cleanup_unix_ms) >= 60_000 {
                 last_orphan_cleanup_unix_ms = now_unix_ms;

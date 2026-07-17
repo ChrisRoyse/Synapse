@@ -220,6 +220,7 @@ struct SessionIngestOutcome {
     newly_registered: bool,
     deferred_for_pressure: bool,
     skipped: bool,
+    cancelled: bool,
 }
 
 fn cursor_kv_key(spawn_id: &str) -> Vec<u8> {
@@ -510,10 +511,11 @@ fn emit_lifecycle(
 /// Ingests new bytes for one session file. Returns the structured sticky-error
 /// detail (also persisted on the cursor) when the source is missing, truncated,
 /// or a row exceeds the encoded-size cap.
-fn ingest_session_file(
+fn ingest_session_file_with_cancel(
     db: &Db,
     session_id: &str,
     source_path: &Path,
+    cancel: Option<&CancellationToken>,
 ) -> Result<SessionIngestOutcome, String> {
     let spawn_id = spawn_id_for_session(session_id);
 
@@ -589,14 +591,12 @@ fn ingest_session_file(
     fn trim_terminator(line: &[u8]) -> &[u8] {
         line.strip_suffix(b"\r").unwrap_or(line)
     }
-    let mut lines: Vec<&[u8]> = Vec::new();
-    let mut consumed_bytes = 0_usize;
+    let mut lines: Vec<(&[u8], usize)> = Vec::new();
     let mut start = 0_usize;
     for (index, byte) in new_bytes.iter().enumerate() {
         if *byte == b'\n' {
-            lines.push(trim_terminator(&new_bytes[start..index]));
+            lines.push((trim_terminator(&new_bytes[start..index]), index + 1));
             start = index + 1;
-            consumed_bytes = start;
         }
     }
 
@@ -627,7 +627,20 @@ fn ingest_session_file(
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     let mut last_lifecycle: Option<Lifecycle> = None;
-    for raw_line in &lines {
+    let mut processed_consumed_bytes = 0_usize;
+    let mut cancelled = false;
+    for (raw_line, line_consumed_bytes) in &lines {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            tracing::info!(
+                code = "AMBIENT_INGEST_CYCLE_CANCELLED",
+                spawn_id = %spawn_id,
+                processed_lines = rows.len(),
+                pending_lines = lines.len().saturating_sub(rows.len()),
+                "daemon shutdown cancelled ambient ingestion between source lines"
+            );
+            break;
+        }
         let line_no = cursor.lines_ingested + 1;
         let (record, lifecycle) = parse_session_line(raw_line, line_no, &mut cursor);
         match record.status {
@@ -666,6 +679,7 @@ fn ingest_session_file(
         constellation_rows.push((transcript_key.clone(), encoded.clone(), record.clone()));
         rows.push((transcript_key, encoded));
         cursor.lines_ingested = line_no;
+        processed_consumed_bytes = *line_consumed_bytes;
         if let Some(signal) = lifecycle {
             last_lifecycle = Some(signal);
         }
@@ -697,7 +711,7 @@ fn ingest_session_file(
         }
     }
 
-    cursor.offset_bytes += consumed_bytes as u64;
+    cursor.offset_bytes += processed_consumed_bytes as u64;
     cursor.parsed_rows += new_parsed;
     cursor.invalid_rows += new_invalid;
     cursor.updated_ts_ns = unix_time_ns_now();
@@ -719,6 +733,7 @@ fn ingest_session_file(
         new_parsed_rows: new_parsed,
         new_invalid_rows: new_invalid,
         newly_registered: first_registration,
+        cancelled,
         ..SessionIngestOutcome::default()
     })
 }
@@ -749,7 +764,12 @@ fn seed_cursor(spawn_id: &str, session_id: &str, source_path: &Path) -> AmbientC
 /// One discovery + ingest pass over every session file under `root`. Per-session
 /// errors are sticky and already logged; the cycle continues so one corrupt
 /// session can never stall the rest of the fleet.
-pub(crate) fn ingest_all_once(db: &Db, root: &Path, max_idle_secs: u64) -> Value {
+fn ingest_all_once_with_cancel(
+    db: &Db,
+    root: &Path,
+    max_idle_secs: u64,
+    cancel: Option<&CancellationToken>,
+) -> Value {
     CYCLES_TOTAL.fetch_add(1, Ordering::Relaxed);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -777,8 +797,13 @@ pub(crate) fn ingest_all_once(db: &Db, root: &Path, max_idle_secs: u64) -> Value
     let mut errors = 0_u64;
     let mut deferred = 0_u64;
     let mut skipped_stale = 0_u64;
+    let mut cancelled = false;
 
     for project in project_dirs.flatten() {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break;
+        }
         let project_path = project.path();
         if !project_path.is_dir() {
             continue;
@@ -796,6 +821,10 @@ pub(crate) fn ingest_all_once(db: &Db, root: &Path, max_idle_secs: u64) -> Value
             }
         };
         for file in files.flatten() {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                cancelled = true;
+                break;
+            }
             let path = file.path();
             // Main session transcripts only: `<project>/<uuid>.jsonl`. Subagent
             // sidecars live under `<uuid>/subagents/` and are a follow-up.
@@ -839,7 +868,7 @@ pub(crate) fn ingest_all_once(db: &Db, root: &Path, max_idle_secs: u64) -> Value
             }
 
             sessions_seen += 1;
-            match ingest_session_file(db, stem, &path) {
+            match ingest_session_file_with_cancel(db, stem, &path, cancel) {
                 Ok(outcome) => {
                     new_rows += outcome.new_parsed_rows + outcome.new_invalid_rows;
                     if outcome.newly_registered {
@@ -848,9 +877,16 @@ pub(crate) fn ingest_all_once(db: &Db, root: &Path, max_idle_secs: u64) -> Value
                     if outcome.deferred_for_pressure {
                         deferred += 1;
                     }
+                    if outcome.cancelled {
+                        cancelled = true;
+                        break;
+                    }
                 }
                 Err(_detail) => errors += 1,
             }
+        }
+        if cancelled {
+            break;
         }
     }
 
@@ -861,7 +897,21 @@ pub(crate) fn ingest_all_once(db: &Db, root: &Path, max_idle_secs: u64) -> Value
         "errors": errors,
         "pressure_deferred": deferred,
         "skipped_stale": skipped_stale,
+        "cancelled": cancelled,
     });
+    if cancelled {
+        tracing::info!(
+            code = "AMBIENT_INGEST_CYCLE_CANCELLED",
+            sessions_seen,
+            new_rows,
+            sessions_registered = registered,
+            errors,
+            pressure_deferred = deferred,
+            skipped_stale,
+            "ambient ingest cycle stopped early for daemon shutdown"
+        );
+        return summary;
+    }
     if new_rows > 0 || registered > 0 || errors > 0 {
         tracing::info!(
             code = "AMBIENT_INGEST_CYCLE_OK",
@@ -943,7 +993,7 @@ pub(crate) fn spawn_periodic_ambient_ingest(
                 }
                 () = tokio::time::sleep(delay) => {}
             }
-            run_cycle(&m3_state, &root, max_idle_secs);
+            run_cycle(&m3_state, &root, max_idle_secs, &cancel);
             delay = std::time::Duration::from_secs(interval_secs);
         }
     });
@@ -957,7 +1007,19 @@ fn configured_db_path(m3_state: &Arc<Mutex<M3State>>) -> anyhow::Result<PathBuf>
     Ok(state.db_path.clone().unwrap_or_else(default_db_path))
 }
 
-fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path, max_idle_secs: u64) {
+fn run_cycle(
+    m3_state: &Arc<Mutex<M3State>>,
+    root: &Path,
+    max_idle_secs: u64,
+    cancel: &CancellationToken,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!(
+            code = "AMBIENT_INGEST_CYCLE_CANCELLED",
+            "daemon shutdown cancelled ambient ingestion before storage open"
+        );
+        return;
+    }
     let db = {
         let mut state = match m3_state.lock() {
             Ok(state) => state,
@@ -982,7 +1044,7 @@ fn run_cycle(m3_state: &Arc<Mutex<M3State>>, root: &Path, max_idle_secs: u64) {
             }
         }
     };
-    let _summary = ingest_all_once(&db, root, max_idle_secs);
+    let _summary = ingest_all_once_with_cancel(&db, root, max_idle_secs, Some(cancel));
 }
 
 fn parse_secs_env(name: &str, default: u64) -> anyhow::Result<u64> {
