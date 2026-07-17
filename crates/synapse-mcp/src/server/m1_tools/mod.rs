@@ -6946,29 +6946,52 @@ impl SynapseService {
                         ),
                     ));
                 }
-                let before_response = self
-                    .browser_tabs_impl(
+                let expected_chrome_window_id = self
+                    .active_cdp_target_owner_for_window(
+                        "browser_tabs",
                         session_id,
-                        window_context.clone(),
-                        used_human_os_foreground_window,
-                        BrowserTabsOperation::Activate,
-                        None,
+                        window_context.hwnd,
+                    )?
+                    .and_then(|owner| owner.chrome_window_id);
+                let before_info = crate::chrome_debugger_bridge::target_tab_state(
+                    window_context.hwnd,
+                    requested,
+                    expected_chrome_window_id,
+                    Some(window_context.window_bounds),
+                    Some(&window_context.window_title),
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_tabs operation=activate Chrome bridge exact pre-read chrome.tabs.get failed: {}",
+                            error.detail()
+                        ),
                     )
-                    .await?;
-                let before_tab = before_response
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(requested))
-                    .cloned()
-                    .ok_or_else(|| {
-                        mcp_error(
-                            error_codes::ACTION_TARGET_INVALID,
-                            format!(
-                                "browser_tabs operation=activate could not find target {requested:?} in listed tabs for window {:#x}; refusing to activate a tab outside the requested Chrome window",
-                                before_response.window_hwnd
-                            ),
-                        )
-                    })?;
+                })?;
+                if !before_info.target_id.eq_ignore_ascii_case(requested) {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate exact pre-read returned target {:?}, expected {requested:?}",
+                            before_info.target_id
+                        ),
+                    ));
+                }
+                if let Some(expected_window_id) = expected_chrome_window_id
+                    && before_info.chrome_window_id != Some(expected_window_id)
+                {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate exact pre-read returned Chrome window {:?} for target {requested:?}, expected Chrome window {}",
+                            before_info.chrome_window_id, expected_window_id
+                        ),
+                    ));
+                }
+                let before_tab =
+                    browser_tab_entry_from_target_info(window_context.hwnd, &before_info);
                 let visual_before = if before_tab.active {
                     None
                 } else {
@@ -6985,6 +7008,9 @@ impl SynapseService {
                     window_context.hwnd,
                     requested,
                     DEFAULT_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
+                    before_tab.chrome_window_id.or(expected_chrome_window_id),
+                    Some(window_context.window_bounds),
+                    Some(&window_context.window_title),
                 )
                 .await
                 .map_err(|error| {
@@ -7043,33 +7069,13 @@ impl SynapseService {
                         ),
                     ));
                 }
-                let mut response = self
-                    .browser_tabs_impl(
-                        session_id,
-                        window_context.clone(),
-                        used_human_os_foreground_window,
-                        BrowserTabsOperation::Activate,
-                        None,
-                    )
-                    .await?;
-                let activated_tab = response
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(requested))
-                    .cloned()
-                    .ok_or_else(|| {
-                        mcp_error(
-                            error_codes::ACTION_POSTCONDITION_FAILED,
-                            format!(
-                                "browser_tabs operation=activate postcondition failed: target {requested:?} was absent from tabs.query readback after activation"
-                            ),
-                        )
-                    })?;
+                let activated_tab =
+                    browser_tab_entry_from_activated(window_context.hwnd, &activated);
                 if !activated_tab.active || !activated_tab.highlighted {
                     return Err(mcp_error(
                         error_codes::ACTION_POSTCONDITION_FAILED,
                         format!(
-                            "browser_tabs operation=activate tabs.query postcondition failed: target {requested:?} active={} highlighted={}",
+                            "browser_tabs operation=activate exact postcondition failed: target {requested:?} active={} highlighted={}",
                             activated_tab.active, activated_tab.highlighted
                         ),
                     ));
@@ -7087,15 +7093,20 @@ impl SynapseService {
                         .await?,
                     )
                 };
-                response.mutation = Some(BrowserTabsMutation {
+                let endpoint = activated
+                    .extension_id
+                    .as_deref()
+                    .map(chrome_debugger_endpoint)
+                    .unwrap_or_else(chrome_debugger_default_endpoint);
+                let mutation = BrowserTabsMutation {
                     operation: BrowserTabsOperation::Activate,
                     requested_cdp_target_id: Some(requested.to_owned()),
                     requested_url: None,
                     previous: None,
                     current: None,
                     selected_tab: None,
-                    activated_cdp_target_id: Some(activated.target_id),
-                    activated_tab: Some(activated_tab),
+                    activated_cdp_target_id: Some(activated.target_id.clone()),
+                    activated_tab: Some(activated_tab.clone()),
                     before_active: activated.before_active,
                     active: Some(activated.active),
                     highlighted: activated.highlighted,
@@ -7103,8 +7114,22 @@ impl SynapseService {
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
-                });
-                Ok(response)
+                };
+                Ok(browser_tabs_exact_mutation_response(
+                    session_id,
+                    &window_context,
+                    used_human_os_foreground_window,
+                    BrowserTabsOperation::Activate,
+                    endpoint,
+                    activated.chrome_window_id,
+                    None,
+                    None,
+                    activated.target_selection_reason,
+                    activated.target_candidate_count,
+                    0,
+                    mutation,
+                    vec![activated_tab],
+                ))
             }
             BrowserTabsOperation::New => {
                 let url = params.url.clone().ok_or_else(|| {
@@ -7131,30 +7156,39 @@ impl SynapseService {
                         session_id,
                     )
                     .await?;
-                self.browser_tabs_impl(
+                let opened_tab = browser_tab_entry_from_opened(&opened);
+                let mutation = BrowserTabsMutation {
+                    operation: BrowserTabsOperation::New,
+                    requested_cdp_target_id: None,
+                    requested_url: Some(redact_url_for_public_readback(&url)),
+                    previous: opened.previous,
+                    current: Some(opened.current),
+                    selected_tab: None,
+                    activated_cdp_target_id: None,
+                    activated_tab: None,
+                    before_active: None,
+                    active: None,
+                    highlighted: None,
+                    activation_visual_readback: None,
+                    opened_cdp_target_id: Some(opened.cdp_target_id.clone()),
+                    closed_cdp_target_id: None,
+                    closed: false,
+                };
+                Ok(browser_tabs_exact_mutation_response(
                     session_id,
-                    window_context,
+                    &window_context,
                     used_human_os_foreground_window,
                     BrowserTabsOperation::New,
-                    Some(BrowserTabsMutation {
-                        operation: BrowserTabsOperation::New,
-                        requested_cdp_target_id: None,
-                        requested_url: Some(redact_url_for_public_readback(&url)),
-                        previous: opened.previous,
-                        current: Some(opened.current),
-                        selected_tab: None,
-                        activated_cdp_target_id: None,
-                        activated_tab: None,
-                        before_active: None,
-                        active: None,
-                        highlighted: None,
-                        activation_visual_readback: None,
-                        opened_cdp_target_id: Some(opened.cdp_target_id),
-                        closed_cdp_target_id: None,
-                        closed: false,
-                    }),
-                )
-                .await
+                    opened.endpoint,
+                    opened.chrome_window_id,
+                    opened.chrome_window_focused,
+                    opened.chrome_window_state,
+                    "exact_open_tab_readback".to_owned(),
+                    1,
+                    0,
+                    mutation,
+                    vec![opened_tab],
+                ))
             }
             BrowserTabsOperation::Close => {
                 let target_id = params.cdp_target_id.clone().ok_or_else(|| {
@@ -7191,33 +7225,43 @@ impl SynapseService {
                         ),
                     ));
                 }
+                let endpoint = owner.endpoint.clone();
+                let chrome_window_id = owner.chrome_window_id;
                 let closed = self
                     .cdp_close_tab_impl(session_id, &target_id, &owner_key, owner)
                     .await?;
-                self.browser_tabs_impl(
+                let mutation = BrowserTabsMutation {
+                    operation: BrowserTabsOperation::Close,
+                    requested_cdp_target_id: Some(target_id.clone()),
+                    requested_url: None,
+                    previous: closed.previous,
+                    current: closed.current,
+                    selected_tab: None,
+                    activated_cdp_target_id: None,
+                    activated_tab: None,
+                    before_active: None,
+                    active: None,
+                    highlighted: None,
+                    activation_visual_readback: None,
+                    opened_cdp_target_id: None,
+                    closed_cdp_target_id: Some(target_id),
+                    closed: closed.closed,
+                };
+                Ok(browser_tabs_exact_mutation_response(
                     session_id,
-                    window_context,
+                    &window_context,
                     used_human_os_foreground_window,
                     BrowserTabsOperation::Close,
-                    Some(BrowserTabsMutation {
-                        operation: BrowserTabsOperation::Close,
-                        requested_cdp_target_id: Some(target_id.clone()),
-                        requested_url: None,
-                        previous: closed.previous,
-                        current: closed.current,
-                        selected_tab: None,
-                        activated_cdp_target_id: None,
-                        activated_tab: None,
-                        before_active: None,
-                        active: None,
-                        highlighted: None,
-                        activation_visual_readback: None,
-                        opened_cdp_target_id: None,
-                        closed_cdp_target_id: Some(target_id),
-                        closed: closed.closed,
-                    }),
-                )
-                .await
+                    endpoint,
+                    chrome_window_id,
+                    None,
+                    None,
+                    "exact_close_absence_readback".to_owned(),
+                    1,
+                    0,
+                    mutation,
+                    Vec::new(),
+                ))
             }
         }
     }
@@ -11350,6 +11394,9 @@ impl SynapseService {
             window_hwnd,
             cdp_target_id,
             wait_timeout_ms,
+            None,
+            None,
+            None,
         )
         .await
         .map_err(|error| {
@@ -11809,6 +11856,131 @@ fn browser_tab_entry(
         pinned: tab.pinned,
         target_attached: tab.target_attached,
     }
+}
+
+fn browser_tab_entry_from_opened(opened: &CdpOpenTabResponse) -> BrowserTabEntry {
+    let url = opened.target_url.clone();
+    BrowserTabEntry {
+        target: TargetWire::Cdp {
+            window_hwnd: opened.window_hwnd,
+            cdp_target_id: opened.cdp_target_id.clone(),
+        },
+        window_hwnd: opened.window_hwnd,
+        cdp_target_id: opened.cdp_target_id.clone(),
+        tab_id: chrome_bridge_tab_id_from_target_id_u32(&opened.cdp_target_id).unwrap_or_default(),
+        chrome_window_id: opened.chrome_window_id,
+        index: -1,
+        target_type: opened.target_type.clone(),
+        title: redact_title_for_public_url_readback(&url, opened.target_title.clone()),
+        url,
+        ready_state: String::new(),
+        active: opened.target_active,
+        highlighted: opened.target_highlighted,
+        pinned: false,
+        target_attached: opened.target_attached,
+    }
+}
+
+fn browser_tab_entry_from_target_info(
+    window_hwnd: i64,
+    info: &crate::chrome_debugger_bridge::ChromeDebuggerTargetInfo,
+) -> BrowserTabEntry {
+    let url = redact_url_for_public_readback(&info.url);
+    BrowserTabEntry {
+        target: TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: info.target_id.clone(),
+        },
+        window_hwnd,
+        cdp_target_id: info.target_id.clone(),
+        tab_id: info.tab_id,
+        chrome_window_id: info.chrome_window_id,
+        index: -1,
+        target_type: info.target_type.clone(),
+        title: redact_title_for_public_url_readback(&url, info.title.clone()),
+        url,
+        ready_state: info.ready_state.clone(),
+        active: info.active,
+        highlighted: info.highlighted,
+        pinned: info.pinned,
+        target_attached: false,
+    }
+}
+
+fn browser_tab_entry_from_activated(
+    window_hwnd: i64,
+    activated: &crate::chrome_debugger_bridge::ChromeDebuggerActivateTabResult,
+) -> BrowserTabEntry {
+    let url = redact_url_for_public_readback(&activated.url);
+    BrowserTabEntry {
+        target: TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: activated.target_id.clone(),
+        },
+        window_hwnd,
+        cdp_target_id: activated.target_id.clone(),
+        tab_id: activated.tab_id,
+        chrome_window_id: activated.chrome_window_id,
+        index: -1,
+        target_type: "page".to_owned(),
+        title: redact_title_for_public_url_readback(&url, activated.title.clone()),
+        url,
+        ready_state: activated.ready_state.clone(),
+        active: activated.active,
+        highlighted: activated.highlighted.unwrap_or(false),
+        pinned: false,
+        target_attached: false,
+    }
+}
+
+#[cfg(windows)]
+fn browser_tabs_exact_mutation_response(
+    session_id: &str,
+    window_context: &ForegroundContext,
+    used_human_os_foreground_window: bool,
+    operation: BrowserTabsOperation,
+    endpoint: String,
+    chrome_window_id: Option<i64>,
+    chrome_window_focused: Option<bool>,
+    chrome_window_state: Option<String>,
+    chrome_window_selection_reason: String,
+    chrome_window_candidate_count: u32,
+    chrome_window_non_focused_count: u32,
+    mutation: BrowserTabsMutation,
+    tabs: Vec<BrowserTabEntry>,
+) -> BrowserTabsResponse {
+    let active_tab_count =
+        u32::try_from(tabs.iter().filter(|tab| tab.active).count()).unwrap_or(u32::MAX);
+    let target_count = u32::try_from(tabs.len()).unwrap_or(u32::MAX);
+    BrowserTabsResponse {
+        session_id: session_id.to_owned(),
+        operation,
+        window_hwnd: window_context.hwnd,
+        transport: "chrome_tabs_extension".to_owned(),
+        endpoint,
+        chrome_window_id,
+        chrome_window_focused,
+        chrome_window_state,
+        chrome_window_selection_reason,
+        chrome_window_candidate_count,
+        chrome_window_non_focused_count,
+        target_count,
+        active_tab_count,
+        used_human_os_foreground_window,
+        source_of_truth:
+            "exact chrome.tabs.get present/absent readback for the mutation target; tabs contains only the affected target when still present"
+                .to_owned(),
+        mutation: Some(redact_browser_tabs_mutation_urls(mutation)),
+        tabs,
+    }
+}
+
+fn chrome_bridge_tab_id_from_target_id_u32(target_id: &str) -> Option<u32> {
+    let tab_id = target_id.strip_prefix("chrome-tab:")?;
+    if tab_id.is_empty() || !tab_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    tab_id.parse::<u32>().ok()
 }
 
 fn redact_browser_tabs_mutation_urls(mut mutation: BrowserTabsMutation) -> BrowserTabsMutation {

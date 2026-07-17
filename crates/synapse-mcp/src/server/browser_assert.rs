@@ -1104,9 +1104,8 @@ fn browser_dom_delegate_error(
         restricted_chrome_scripting_scheme(&cause_code, error.message.as_ref(), &cause)
     {
         let message = format!(
-            "{DOM_TOOL} operation={} cannot read target {source_id}: Chrome extension scripting is unavailable for restricted URL scheme {scheme:?}; original error: {}",
-            operation.as_str(),
-            error.message
+            "{DOM_TOOL} operation={} cannot read target {source_id}: Chrome extension scripting is unavailable for restricted URL scheme {scheme:?}",
+            operation.as_str()
         );
         return ErrorData::new(
             error.code,
@@ -1120,7 +1119,7 @@ fn browser_dom_delegate_error(
                 "remediation": DOM_RESTRICTED_SCHEME_REMEDIATION,
                 "restricted_url_scheme": scheme,
                 "original_code": cause_code,
-                "cause": cause,
+                "cause": { "code": cause_code },
             })),
         );
     }

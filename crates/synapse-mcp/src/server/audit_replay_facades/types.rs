@@ -335,6 +335,7 @@ pub struct AuditLifecycleTailResponse {
     pub matched_lines_seen: u64,
     pub oversized_lines_seen: u64,
     pub oversized_lines_skipped: u64,
+    pub oversized_lines_returned: u64,
     pub returned_count: usize,
     pub rows: Vec<AuditLifecycleRowSummary>,
 }
@@ -345,6 +346,7 @@ pub struct AuditLifecycleRowSummary {
     pub line_no: u64,
     pub raw_len_bytes: u64,
     pub raw_sha256: String,
+    pub oversized: bool,
     pub schema_version: Option<u64>,
     pub run_id: Option<String>,
     pub pid: Option<u64>,

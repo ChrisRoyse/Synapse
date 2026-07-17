@@ -6,7 +6,6 @@ use std::{
 };
 
 use rmcp::model::ErrorCode;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use synapse_core::error_codes;
 
@@ -14,18 +13,12 @@ use crate::{daemon_lifecycle, server::ErrorData};
 
 use super::{
     AUDIT_SOT, AUDIT_TOOL,
-    errors::{io_error, lifecycle_corrupt_error, lifecycle_oversized_error},
+    errors::{io_error, lifecycle_corrupt_error},
     types::{AuditLifecycleRowSummary, AuditLifecycleTailParams, AuditLifecycleTailResponse},
     util::{nested_string, prefixed_sha256, sha256_text, string_field},
     validation::validate_lifecycle_params,
 };
 
-#[derive(Debug, Deserialize)]
-struct LifecycleFilterProbe {
-    event_kind: Option<String>,
-    status: Option<String>,
-    tool: Option<String>,
-}
 pub(super) fn lifecycle_path(key: &str) -> Result<PathBuf, ErrorData> {
     let diagnostic = daemon_lifecycle::diagnostic_value();
     let path = diagnostic
@@ -98,6 +91,7 @@ pub(super) fn read_lifecycle_tail(
         matched_lines_seen: state.matched_lines_seen,
         oversized_lines_seen: state.oversized_lines_seen,
         oversized_lines_skipped: state.oversized_lines_skipped,
+        oversized_lines_returned: state.oversized_lines_returned,
         returned_count: rows.len(),
         rows,
     })
@@ -108,6 +102,7 @@ struct LifecycleTailState {
     matched_lines_seen: u64,
     oversized_lines_seen: u64,
     oversized_lines_skipped: u64,
+    oversized_lines_returned: u64,
     rows: VecDeque<AuditLifecycleRowSummary>,
 }
 
@@ -118,6 +113,7 @@ impl LifecycleTailState {
             matched_lines_seen: 0,
             oversized_lines_seen: 0,
             oversized_lines_skipped: 0,
+            oversized_lines_returned: 0,
             rows: VecDeque::with_capacity(params.limit),
         }
     }
@@ -163,26 +159,29 @@ fn read_lifecycle_segment(
         }
         if bytes.len() > params.max_line_bytes {
             state.oversized_lines_seen = state.oversized_lines_seen.saturating_add(1);
-            let probe: LifecycleFilterProbe = serde_json::from_slice(&bytes).map_err(|error| {
+            let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
                 lifecycle_corrupt_error(
                     path,
                     state.total_lines_read,
                     format!("oversized_row JSON decode failed: {error}"),
                 )
             })?;
-            if !lifecycle_probe_matches(&probe, params) {
+            if !lifecycle_matches(&value, params) {
                 state.oversized_lines_skipped = state.oversized_lines_skipped.saturating_add(1);
                 continue;
             }
-            return Err(lifecycle_oversized_error(
-                path,
+            state.matched_lines_seen = state.matched_lines_seen.saturating_add(1);
+            state.oversized_lines_returned = state.oversized_lines_returned.saturating_add(1);
+            if state.rows.len() == params.limit {
+                state.rows.pop_front();
+            }
+            state.rows.push_back(summarize_lifecycle_row(
                 state.total_lines_read,
-                bytes.len(),
-                params.max_line_bytes,
-                &probe.tool,
-                &probe.status,
-                &probe.event_kind,
+                &bytes,
+                &value,
+                true,
             ));
+            continue;
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
             lifecycle_corrupt_error(
@@ -200,28 +199,11 @@ fn read_lifecycle_segment(
                 state.total_lines_read,
                 &bytes,
                 &value,
+                false,
             ));
         }
     }
     Ok(())
-}
-
-fn lifecycle_probe_matches(
-    probe: &LifecycleFilterProbe,
-    params: &AuditLifecycleTailParams,
-) -> bool {
-    params
-        .tool
-        .as_deref()
-        .is_none_or(|tool| probe.tool.as_deref() == Some(tool))
-        && params
-            .status
-            .as_deref()
-            .is_none_or(|status| probe.status.as_deref() == Some(status))
-        && params
-            .event_kind
-            .as_deref()
-            .is_none_or(|event_kind| probe.event_kind.as_deref() == Some(event_kind))
 }
 
 fn lifecycle_matches(value: &Value, params: &AuditLifecycleTailParams) -> bool {
@@ -238,13 +220,19 @@ fn lifecycle_matches(value: &Value, params: &AuditLifecycleTailParams) -> bool {
         })
 }
 
-fn summarize_lifecycle_row(line_no: u64, bytes: &[u8], value: &Value) -> AuditLifecycleRowSummary {
+fn summarize_lifecycle_row(
+    line_no: u64,
+    bytes: &[u8],
+    value: &Value,
+    oversized: bool,
+) -> AuditLifecycleRowSummary {
     let last_tool_event = value.get("last_tool_event");
     let mcp_session_id = string_field(value, "mcp_session_id");
     AuditLifecycleRowSummary {
         line_no,
         raw_len_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         raw_sha256: prefixed_sha256(bytes),
+        oversized,
         schema_version: value.get("schema_version").and_then(Value::as_u64),
         run_id: string_field(value, "run_id"),
         pid: value.get("pid").and_then(Value::as_u64),

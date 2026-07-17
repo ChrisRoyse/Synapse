@@ -1,5 +1,5 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-16-maintenance-alarm-resume-v1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-17-exact-target-owner-ledger-v6";
 const BRIDGE_DECLARED_BUILD_SHA256 = "12e3388c6b9501bd3e7225b4a2b0167c5e4a3bb3279422b3e13b5710c4b66c5c";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
@@ -166,6 +166,7 @@ let DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = null;
 let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
 let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
 let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
+let DURABLE_OWNER_STALE_SESSION_REPAIR = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
@@ -1231,7 +1232,11 @@ function normalizeDurableOwnerLedger(value) {
         : null,
       openedAtUnixMs: Number.isSafeInteger(entry?.openedAtUnixMs)
         ? Math.max(0, entry.openedAtUnixMs)
-        : 0
+        : 0,
+      urlSha256: typeof entry?.urlSha256 === "string" &&
+          /^[0-9a-f]{64}$/i.test(entry.urlSha256)
+        ? entry.urlSha256.toLowerCase()
+        : null
     });
   }
   ledger.openedTabs = Array.from(openedTabsById.values());
@@ -1296,6 +1301,134 @@ function durableOwnerRowCount(ledger = DURABLE_OWNER_LEDGER) {
   ].reduce((count, field) => count + ledger[field].length, 0);
 }
 
+function durableOwnerLedgerTabIds(ledger = DURABLE_OWNER_LEDGER) {
+  const ids = new Set();
+  const add = (tabId) => {
+    if (Number.isSafeInteger(tabId) && tabId >= 0) ids.add(tabId);
+  };
+  for (const entry of ledger.openedTabs) add(entry.tabId);
+  for (const entry of ledger.initScripts) add(entry.tabId);
+  for (const entry of ledger.bindings) add(entry.tabId);
+  for (const tabId of ledger.debuggerTabs) add(tabId);
+  for (const entry of ledger.unresolvedDebuggerCommandTimeouts) add(entry.tabId);
+  for (const tabId of ledger.dialogTabs) add(tabId);
+  for (const tabId of ledger.fileChooserTabs) add(tabId);
+  for (const tabId of ledger.clockTabs) add(tabId);
+  for (const entry of ledger.executedInitScriptEffects) add(entry.tabId);
+  for (const field of [
+    "viewportOverrides",
+    "deviceOverrides",
+    "geolocationOverrides",
+    "localeOverrides",
+    "mediaOverrides",
+    "networkOverrides"
+  ]) {
+    for (const entry of ledger[field]) add(entry.tabId);
+  }
+  return Array.from(ids).sort((left, right) => left - right);
+}
+
+async function persistDurableOwnerLedgerRepairSnapshot() {
+  DURABLE_OWNER_LEDGER.revision += 1;
+  const snapshot = typeof globalThis.structuredClone === "function"
+    ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
+    : JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
+  const write = () => chrome.storage.local.set({
+    [DURABLE_OWNER_STORAGE_KEY]: snapshot
+  });
+  const persisted = DURABLE_OWNER_PERSIST_TAIL.then(write, write);
+  DURABLE_OWNER_PERSIST_TAIL = persisted.catch(() => undefined);
+  await persisted;
+}
+
+async function pruneAbsentTabsFromStaleBrowserSessionLedger() {
+  const checked = [];
+  const absent = [];
+  const closedMatchingOpenedTabs = [];
+  const live = [];
+  const failures = [];
+  const beforeCount = durableOwnerRowCount(DURABLE_OWNER_LEDGER);
+  for (const tabId of durableOwnerLedgerTabIds(DURABLE_OWNER_LEDGER)) {
+    checked.push(tabId);
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const openedOwner = DURABLE_OWNER_LEDGER.openedTabs
+        .find((entry) => entry.tabId === tabId) || null;
+      const expectedUrlSha256 = openedOwner?.urlSha256 || null;
+      const actualUrlSha256 = expectedUrlSha256
+        ? await sha256HexText(tab?.url || "")
+        : null;
+      const chromeWindowMatched = !Number.isSafeInteger(openedOwner?.chromeWindowId) ||
+        openedOwner.chromeWindowId === tab?.windowId;
+      if (
+        openedOwner &&
+        expectedUrlSha256 &&
+        actualUrlSha256 === expectedUrlSha256 &&
+        chromeWindowMatched
+      ) {
+        await chrome.tabs.remove(tabId);
+        await waitForTargetAbsent(openedOwner.targetId, 10000);
+        pruneDurableOwnerLedgerForClosedTab(tabId);
+        closedMatchingOpenedTabs.push({
+          tab_id: tabId,
+          target_id: openedOwner.targetId,
+          chrome_window_id: Number.isSafeInteger(tab?.windowId) ? tab.windowId : null
+        });
+        continue;
+      }
+      live.push({
+        tab_id: tabId,
+        chrome_window_id: Number.isSafeInteger(tab?.windowId) ? tab.windowId : null,
+        opened_tab_url_fingerprint_present: Boolean(expectedUrlSha256),
+        opened_tab_url_fingerprint_matched: Boolean(
+          expectedUrlSha256 && actualUrlSha256 === expectedUrlSha256
+        ),
+        chrome_window_matched: chromeWindowMatched
+      });
+    } catch (error) {
+      if (operatorPanicTargetAbsent(error)) {
+        pruneDurableOwnerLedgerForClosedTab(tabId);
+        absent.push(tabId);
+      } else {
+        failures.push({
+          tab_id: tabId,
+          error: errorMessage(error)
+        });
+      }
+    }
+  }
+  return {
+    checked_tab_ids: checked,
+    absent_tab_ids: absent,
+    closed_matching_opened_tabs: closedMatchingOpenedTabs,
+    live_tabs: live,
+    failures,
+    before_owner_count: beforeCount,
+    after_owner_count: durableOwnerRowCount(DURABLE_OWNER_LEDGER)
+  };
+}
+
+function rebaseDurableOwnerLedgerAfterStaleOwnerDrain() {
+  if (
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED ||
+    !DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID ||
+    durableOwnerRowCount(DURABLE_OWNER_LEDGER) !== 0 ||
+    DURABLE_OWNER_LEDGER.inFlightMutation
+  ) {
+    return false;
+  }
+  DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+  DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+  STALE_BROWSER_SESSION_OWNER_COUNT = 0;
+  DURABLE_OWNER_STATE_LOAD_ERROR = null;
+  if (DURABLE_OWNER_LEDGER.disableSequence === 0) {
+    DURABLE_OWNER_LEDGER.enabled = true;
+    DURABLE_MUTATION_OWNERS_ENABLED =
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
+  }
+  return true;
+}
+
 function newDurableOwnerBrowserSessionId() {
   return typeof globalThis.crypto?.randomUUID === "function"
     ? globalThis.crypto.randomUUID()
@@ -1328,19 +1461,17 @@ async function restoreDurableOwnerLedger() {
       );
     }
     if (!hasLocalLedger) {
-      if (storedBrowserSessionId) {
-        throw new Error(
-          "durable local owner ledger is missing while the current browser-session token exists"
-        );
-      }
-      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
+      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
+        storedBrowserSessionId || newDurableOwnerBrowserSessionId();
       DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
       DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-      await chrome.storage.session.set({
-        [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
-      });
+      if (!storedBrowserSessionId) {
+        await chrome.storage.session.set({
+          [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
+            DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+        });
+      }
       await persistDurableOwnerLedger();
     } else {
       DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(
@@ -1357,20 +1488,46 @@ async function restoreDurableOwnerLedger() {
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED =
         DURABLE_OWNER_LEDGER.browserSessionId ===
           DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-      const staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+      let staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
         (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-      if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners === 0) {
-        DURABLE_OWNER_LEDGER.browserSessionId =
-          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
-        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-        await persistDurableOwnerLedger();
+      if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners > 0) {
+        DURABLE_OWNER_STALE_SESSION_REPAIR =
+          await pruneAbsentTabsFromStaleBrowserSessionLedger();
+        staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+          (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
+        if (DURABLE_OWNER_STALE_SESSION_REPAIR.absent_tab_ids.length > 0) {
+          await persistDurableOwnerLedgerRepairSnapshot();
+        }
+      }
+      if (
+        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+        staleOwners === 0 &&
+        !DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length &&
+        rebaseDurableOwnerLedgerAfterStaleOwnerDrain()
+      ) {
+        await persistDurableOwnerLedgerRepairSnapshot();
       } else if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
         STALE_BROWSER_SESSION_OWNER_COUNT = staleOwners;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
         DURABLE_OWNER_LEDGER.enabled = false;
         DURABLE_OWNER_STATE_LOAD_ERROR =
-          "durable owners belong to a prior browser session; stale tab ids will not be mutated";
+          "durable owners belong to a prior browser session; stale tab ids will not be mutated; " +
+          `stale_owner_count=${staleOwners} ` +
+          `stale_repair_absent_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.absent_tab_ids?.length || 0)} ` +
+          `stale_repair_closed_matching_opened_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.closed_matching_opened_tabs?.length || 0)} ` +
+          `stale_repair_live_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.live_tabs?.length || 0)} ` +
+          `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)}`;
       }
+    }
+    if (
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+      DURABLE_OWNER_LEDGER.enabled === false &&
+      DURABLE_OWNER_LEDGER.disableSequence === 0 &&
+      durableOwnerRowCount(DURABLE_OWNER_LEDGER) === 0 &&
+      !DURABLE_OWNER_LEDGER.inFlightMutation
+    ) {
+      DURABLE_OWNER_LEDGER.enabled = true;
+      await persistDurableOwnerLedger();
     }
     DURABLE_MUTATION_OWNERS_ENABLED = DURABLE_OWNER_LEDGER.enabled &&
       IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
@@ -1509,6 +1666,16 @@ function upsertLedgerOpenedTab(tab) {
   DURABLE_OWNER_LEDGER.openedTabs.push(tab);
 }
 
+async function durableOpenedTabOwnerFromCreatedTab(tab, url) {
+  return {
+    tabId: tab.id,
+    targetId: targetIdForTabId(tab.id),
+    chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
+    openedAtUnixMs: Date.now(),
+    urlSha256: await sha256HexText(url || "about:blank")
+  };
+}
+
 function removeLedgerOpenedTab(tabId) {
   DURABLE_OWNER_LEDGER.openedTabs = DURABLE_OWNER_LEDGER.openedTabs
     .filter((entry) => entry.tabId !== tabId);
@@ -1572,7 +1739,14 @@ function enqueueClosedTabLedgerPrune(tabId) {
     await DURABLE_OWNER_STATE_READY;
     pruneDurableOwnerLedgerForClosedTab(tabId);
     try {
-      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
+        await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      } else {
+        STALE_BROWSER_SESSION_OWNER_COUNT = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+          (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
+        rebaseDurableOwnerLedgerAfterStaleOwnerDrain();
+        await persistDurableOwnerLedgerRepairSnapshot();
+      }
     } catch (error) {
       DURABLE_OWNER_STATE_LOAD_ERROR = `persist closed-tab owner prune failed: ${errorMessage(error)}`;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
@@ -1624,7 +1798,8 @@ function enqueuePersistedBackgroundMutation(kind, operation) {
       if (!DURABLE_MUTATION_OWNERS_ENABLED || !DURABLE_OWNER_STATE_LOADED) {
         throw bridgeError(
           ERROR_ACTION_TARGET_INVALID,
-          `operator panic disabled background mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
+          `operator panic disabled background mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; ` +
+            `refusing ${String(kind)} ${operatorPanicGateErrorSummary()}`
         );
       }
       try {
@@ -2112,7 +2287,8 @@ async function handleCommand(command) {
     if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED) {
       throw bridgeError(
         ERROR_ACTION_TARGET_INVALID,
-        `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
+        `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; ` +
+          `refusing ${String(kind)} ${operatorPanicGateErrorSummary()}`
       );
     }
     if (!["operatorPanicDisable", "operatorPanicCleanup", "operatorPanicCloseTab", "operatorPanicReadback", "operatorPanicEnable"]
@@ -2136,7 +2312,7 @@ async function handleCommand(command) {
     } else if (kind === "capturePageScreenshot") {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "targetInfo" || kind === "targetInfoPageText") {
-      result = await handleTargetInfo(params);
+      result = await handleTargetInfo(params, kind === "targetInfoPageText");
     } else if (kind === "frames") {
       result = await handleFrames(params);
     } else if (kind === "pageContent") {
@@ -2309,6 +2485,15 @@ function arrayBufferToHex(buffer) {
     .join("");
 }
 
+async function sha256HexText(value) {
+  if (!crypto?.subtle?.digest) {
+    throw new Error("crypto.subtle.digest unavailable");
+  }
+  const encoded = new TextEncoder().encode(String(value || ""));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return arrayBufferToHex(digest);
+}
+
 function bridgeIdentity() {
   return {
     extensionId: chrome.runtime.id,
@@ -2364,7 +2549,6 @@ function rejectAttachCommand(kind, params) {
 async function handleOpenTab(params) {
   const requestedUrl = normalizeOpenUrl(params.url);
   const agentSessionId = normalizeOptionalSessionId(params.agentSessionId);
-  const beforePages = await tabTargets();
   const openWindow = await selectOpenWindowForHwndHint(params);
   let tab;
   const createParams = {
@@ -2383,12 +2567,10 @@ async function handleOpenTab(params) {
   if (!tab || typeof tab.id !== "number") {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.create returned no numeric tab id");
   }
-  const openedOwner = {
-    tabId: tab.id,
-    targetId: targetIdForTabId(tab.id),
-    chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
-    openedAtUnixMs: Date.now()
-  };
+  const openedOwner = await durableOpenedTabOwnerFromCreatedTab(
+    tab,
+    createParams.url
+  );
   upsertLedgerOpenedTab(openedOwner);
   try {
     // Persist the exact tab identity immediately after chrome.tabs.create. The
@@ -2416,7 +2598,6 @@ async function handleOpenTab(params) {
     const openedWindow = Number.isInteger(state.chrome_window_id)
       ? await chromeWindowState(state.chrome_window_id)
       : null;
-    const afterPages = await tabTargets();
     return {
       extension_id: chrome.runtime.id,
       target_id: target.id,
@@ -2433,8 +2614,9 @@ async function handleOpenTab(params) {
       url: state.url || target.url || tab.url || requestedUrl || "about:blank",
       title: state.title || target.title || tab.title || "",
       target_attached: Boolean(target.attached),
-      target_count_before: beforePages.length,
-      target_count_after: afterPages.length
+      target_count_before: 0,
+      target_count_after: 1,
+      readback_backend: "chrome.tabs.create+chrome.tabs.get"
     };
   } catch (error) {
     let rollbackFailure = null;
@@ -2463,21 +2645,22 @@ async function handleOpenTab(params) {
 
 async function handleCloseTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
-  const beforePages = await tabTargets();
+  await tabPageState(selected.tabId, selected.target);
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.remove:closeTab:tab=${selected.tabId}`);
     await chrome.tabs.remove(selected.tabId);
   } catch (error) {
     throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.remove(${selected.tabId}): ${errorMessage(error)}`);
   }
-  const afterPages = await waitForTargetAbsent(selected.target.id, 10000);
+  await waitForTargetAbsent(selected.target.id, 10000);
   pruneDurableOwnerLedgerForClosedTab(selected.tabId);
   return {
     extension_id: chrome.runtime.id,
     target_id: selected.target.id,
     tab_id: selected.tabId,
-    target_count_before: beforePages.length,
-    target_count_after: afterPages.length
+    target_count_before: 1,
+    target_count_after: 0,
+    readback_backend: "chrome.tabs.get+chrome.tabs.remove+chrome.tabs.get(absent)"
   };
 }
 
@@ -2514,13 +2697,10 @@ async function handleListTabs(params) {
   };
 }
 
-async function handleTargetInfo(params) {
+async function handleTargetInfo(params, includePageText = false) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const state = await tabPageState(selected.tabId, selected.target);
-  const activeElement = await tabActiveElementState(selected.tabId);
-  const pageText = await tabPageTextState(selected.tabId);
-  const pageVitals = await tabPageVitalsState(selected.tabId);
-  return {
+  const result = {
     extension_id: chrome.runtime.id,
     target_id: state.target_id || selected.target.id,
     tab_id: selected.tabId,
@@ -2532,13 +2712,18 @@ async function handleTargetInfo(params) {
     active: Boolean(state.active),
     highlighted: Boolean(state.highlighted),
     pinned: Boolean(state.pinned),
-    readback_backend: "chrome.tabs.get+chrome.scripting.executeScript",
-    active_element: activeElement,
-    page_text: pageText,
-    page_vitals: pageVitals,
+    readback_backend: includePageText
+      ? "chrome.tabs.get+chrome.scripting.executeScript"
+      : "chrome.tabs.get",
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
+  if (includePageText) {
+    result.active_element = await tabActiveElementState(selected.tabId);
+    result.page_text = await tabPageTextState(selected.tabId);
+    result.page_vitals = await tabPageVitalsState(selected.tabId);
+  }
+  return result;
 }
 
 async function handleEvaluateScript(params) {
@@ -5589,12 +5774,10 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
         `domAction popup intent create returned no numeric tab id kind=${intent.kind} opener_tab_id=${selected.tabId}`
       );
     }
-    const openedOwner = {
-      tabId: tab.id,
-      targetId: targetIdForTabId(tab.id),
-      chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
-      openedAtUnixMs: Date.now()
-    };
+    const openedOwner = await durableOpenedTabOwnerFromCreatedTab(
+      tab,
+      createParams.url
+    );
     upsertLedgerOpenedTab(openedOwner);
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
@@ -5678,7 +5861,9 @@ async function handleNavigateTab(params) {
       await chrome.tabs.update(selected.tabId, { url: requestedUrl });
       if (requestedUrl !== before.url) {
         readbackExpectation = {
-          description: `tab url to become ${JSON.stringify(requestedUrl)} or differ from ${JSON.stringify(before.url)}`,
+          description:
+            `tab url to become ${JSON.stringify(diagnosticUrl(requestedUrl))} ` +
+            `or differ from ${JSON.stringify(diagnosticUrl(before.url))}`,
           matches: (state) => state.url === requestedUrl || state.url !== before.url
         };
       }
@@ -5699,7 +5884,8 @@ async function handleNavigateTab(params) {
       assertPhysicalMutationAdmission(`chrome.tabs.goBack:tab=${selected.tabId}`);
       await chrome.tabs.goBack(selected.tabId);
       readbackExpectation = {
-        description: `tab url to change after chrome.tabs.goBack from ${JSON.stringify(before.url)}`,
+        description:
+          `tab url to change after chrome.tabs.goBack from ${JSON.stringify(diagnosticUrl(before.url))}`,
         matches: (state) => state.url !== before.url
       };
     } else if (action === "forward") {
@@ -5711,7 +5897,8 @@ async function handleNavigateTab(params) {
       assertPhysicalMutationAdmission(`chrome.tabs.goForward:tab=${selected.tabId}`);
       await chrome.tabs.goForward(selected.tabId);
       readbackExpectation = {
-        description: `tab url to change after chrome.tabs.goForward from ${JSON.stringify(before.url)}`,
+        description:
+          `tab url to change after chrome.tabs.goForward from ${JSON.stringify(diagnosticUrl(before.url))}`,
         matches: (state) => state.url !== before.url
       };
     }
@@ -5719,7 +5906,8 @@ async function handleNavigateTab(params) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.${tabsNavigationMethod(action)}(${selected.tabId}) failed: ${errorMessage(error)}; ` +
-        `before url=${JSON.stringify(before.url)} title=${JSON.stringify(before.title)} ` +
+        `before url=${JSON.stringify(diagnosticUrl(before.url))} ` +
+        `title=${JSON.stringify(diagnosticTitle(before.title))} ` +
         `status=${JSON.stringify(before.ready_state)}`
     );
   }
@@ -5853,7 +6041,8 @@ async function waitForNavigateOrDownload(
   }
   const detail = last
     ? `waiting for ${expectation?.description || "complete tab state"} or a Chrome download; ` +
-      `last url=${JSON.stringify(last.url)} title=${JSON.stringify(last.title)} ` +
+      `last url=${JSON.stringify(diagnosticUrl(last.url))} ` +
+      `title=${JSON.stringify(diagnosticTitle(last.title))} ` +
       `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
@@ -5919,7 +6108,7 @@ async function handleActivateTab(params) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.update(${selected.tabId}, {active:true}) failed: ${errorMessage(error)}; ` +
-        `before active=${before.active} url=${JSON.stringify(before.url)}`
+        `before active=${before.active} url=${JSON.stringify(diagnosticUrl(before.url))}`
     );
   }
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, {
@@ -12110,6 +12299,7 @@ function operatorPanicOwnerReadback() {
     browser_session_continuity_matched:
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
     stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
+    stale_browser_session_repair: DURABLE_OWNER_STALE_SESSION_REPAIR,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
@@ -12139,6 +12329,30 @@ function operatorPanicOwnerReadback() {
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
       Object.values(activeAfter).every((count) => count === 0)
   };
+}
+
+function operatorPanicGateErrorSummary() {
+  const readback = operatorPanicOwnerReadback();
+  const activeAfter = readback.active_after || {};
+  const nonZeroOwners = Object.entries(activeAfter)
+    .filter(([, value]) => Number(value || 0) !== 0)
+    .map(([key, value]) => `${key}=${Number(value || 0)}`)
+    .join(",");
+  return (
+    `storage_state_loaded=${Boolean(readback.storage_state_loaded)} ` +
+    `storage_state_load_error=${JSON.stringify(readback.storage_state_load_error || "")} ` +
+    `browser_session_continuity_matched=${Boolean(readback.browser_session_continuity_matched)} ` +
+    `owner_continuity_healthy=${Boolean(readback.owner_continuity_healthy)} ` +
+    `persisted_state_revision=${Number(readback.persisted_state_revision || 0)} ` +
+    `persisted_in_flight_mutation=${readback.persisted_in_flight_mutation ? "present" : "none"} ` +
+    `unresolved_worker_restart_mutation_count=${Number(readback.unresolved_worker_restart_mutation_count || 0)} ` +
+    `stale_browser_session_owner_count=${Number(readback.stale_browser_session_owner_count || 0)} ` +
+    `stale_repair_absent_tab_count=${Number(readback.stale_browser_session_repair?.absent_tab_ids?.length || 0)} ` +
+    `stale_repair_closed_matching_opened_tab_count=${Number(readback.stale_browser_session_repair?.closed_matching_opened_tabs?.length || 0)} ` +
+    `stale_repair_live_tab_count=${Number(readback.stale_browser_session_repair?.live_tabs?.length || 0)} ` +
+    `stale_repair_failure_count=${Number(readback.stale_browser_session_repair?.failures?.length || 0)} ` +
+    `non_zero_owner_counts=${nonZeroOwners || "none"}`
+  );
 }
 
 async function handleOperatorPanicDisable(admission) {
@@ -13329,32 +13543,29 @@ function scheduleRuntimeReload(delayMs) {
 }
 
 async function selectTabTarget(params, options = {}) {
-  const tabs = await tabTargets();
-  if (tabs.length === 0) {
-    throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.query returned no tab targets");
-  }
   const targetIdHint = String(params.targetIdHint || "").trim();
   const expectedWindowId = optionalInteger(params.expectedChromeWindowId);
   const tabIdHint = tabIdFromTargetId(targetIdHint);
   if (Number.isInteger(tabIdHint)) {
-    const selectedById = tabs.find((target) => target.tabId === tabIdHint);
-    if (selectedById) {
-      if (
-        Number.isInteger(expectedWindowId) &&
-        Number.isInteger(selectedById.chromeWindowId) &&
-        selectedById.chromeWindowId !== expectedWindowId
-      ) {
-        throw bridgeError(
-          ERROR_AXTREE_FAILED,
-          `targetIdHint ${targetIdHint} is in Chrome window ${selectedById.chromeWindowId}, expected ${expectedWindowId}`
-        );
+    const selectedById = await tabTargetById(tabIdHint, targetIdHint);
+    let effectiveExpectedWindowId = expectedWindowId;
+    if (!Number.isInteger(effectiveExpectedWindowId)) {
+      const expectedWindow = await expectedChromeWindowForHwndHint(params);
+      if (Number.isInteger(expectedWindow?.windowId)) {
+        effectiveExpectedWindowId = expectedWindow.windowId;
       }
-      return selectedPage(selectedById, tabs.length, "chrome_tab_id_hint");
     }
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `targetIdHint ${targetIdHint} did not match any chrome.tabs tab id`
-    );
+    if (
+      Number.isInteger(effectiveExpectedWindowId) &&
+      Number.isInteger(selectedById.chromeWindowId) &&
+      selectedById.chromeWindowId !== effectiveExpectedWindowId
+    ) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `targetIdHint ${targetIdHint} is in Chrome window ${selectedById.chromeWindowId}, expected ${effectiveExpectedWindowId}`
+      );
+    }
+    return selectedPage(selectedById, 1, "chrome_tab_id_hint_direct");
   }
   if (options.requireTargetId) {
     throw bridgeError(
@@ -13363,6 +13574,10 @@ async function selectTabTarget(params, options = {}) {
         ? `targetIdHint ${targetIdHint} is not a tabs bridge target id; expected ${TAB_TARGET_PREFIX}<tabId>`
         : `targetIdHint is required for mutating tab navigation; expected ${TAB_TARGET_PREFIX}<tabId>`
     );
+  }
+  const tabs = await tabTargets();
+  if (tabs.length === 0) {
+    throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.query returned no tab targets");
   }
   let effectiveExpectedWindowId = expectedWindowId;
   const expectedWindow = await expectedChromeWindowForHwndHint(params);
@@ -13729,8 +13944,8 @@ function chromeWindowCandidateSummaryItem(windowInfo, expectedBounds) {
     ? windowBoundsDeltaScore(windowInfo.bounds, expectedBounds)
     : Number.POSITIVE_INFINITY;
   const scoreText = Number.isFinite(score) ? String(score) : "na";
-  const title = String(windowInfo.activeTabTitle || "").replace(/\s+/g, " ").trim().slice(0, 80);
-  return `id=${windowInfo.id}/focused=${windowInfo.focused}/state=${windowInfo.state || "unknown"}/score=${scoreText}/title=${JSON.stringify(title)}`;
+  const titleLen = String(windowInfo.activeTabTitle || "").trim().length;
+  return `id=${windowInfo.id}/focused=${windowInfo.focused}/state=${windowInfo.state || "unknown"}/score=${scoreText}/title_redacted_len=${titleLen}`;
 }
 
 function chromeWindowBounds(windowInfo) {
@@ -13821,6 +14036,25 @@ async function tabTargets() {
     .map((tab) => tabTargetFromTab(tab));
 }
 
+async function tabTargetById(tabId, targetIdHint) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `targetIdHint ${targetIdHint} did not match a live chrome.tabs tab id: ${errorMessage(error)}`
+    );
+  }
+  if (!tab || typeof tab.id !== "number") {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `chrome.tabs.get(${tabId}) returned no tab for targetIdHint ${targetIdHint}`
+    );
+  }
+  return tabTargetFromTab(tab);
+}
+
 function selectedPage(target, targetCandidateCount, selectionReason) {
   return {
     target,
@@ -13902,37 +14136,90 @@ function urlMatchesHint(url, hint) {
   return url === hint || url.startsWith(hint) || hint.startsWith(url);
 }
 
+function diagnosticUrl(value) {
+  const raw = String(value || "");
+  if (!raw) {
+    return "";
+  }
+  try {
+    const parsed = new URL(raw);
+    const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+    if (["data", "javascript", "mailto", "file", "blob", "filesystem"].includes(scheme)) {
+      return `${scheme}:redacted`;
+    }
+    if (scheme === "about") {
+      return parsed.href.toLowerCase() === "about:blank" ? "about:blank" : "about:redacted";
+    }
+    parsed.username = "";
+    parsed.password = "";
+    if (parsed.pathname && parsed.pathname !== "/") {
+      parsed.pathname = "/redacted";
+    }
+    if (parsed.search) {
+      parsed.search = "?redacted";
+    }
+    if (parsed.hash) {
+      parsed.hash = "#redacted";
+    }
+    return parsed.toString();
+  } catch (_) {
+    return "redacted";
+  }
+}
+
+function diagnosticTitle(value) {
+  return String(value || "").trim() ? "redacted" : "";
+}
+
 async function waitForTabTarget(tabId, waitTimeoutMs) {
   const started = Date.now();
-  let lastCount = 0;
+  let lastError = "";
   while (Date.now() - started <= waitTimeoutMs) {
-    const pages = await tabTargets();
-    lastCount = pages.length;
-    const target = pages.find((candidate) => candidate.tabId === tabId);
-    if (target?.id) {
-      return target;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab && typeof tab.id === "number") {
+        return tabTargetFromTab(tab);
+      }
+      lastError = "chrome.tabs.get returned no numeric tab id";
+    } catch (error) {
+      lastError = errorMessage(error);
     }
     await sleep(100);
   }
   throw bridgeError(
     ERROR_EXTENSION_TIMEOUT,
-    `chrome.tabs.query did not expose a tab target for new tab ${tabId} within ${waitTimeoutMs} ms; lastTabTargetCount=${lastCount}`
+    `chrome.tabs.get(${tabId}) did not expose the new tab target within ${waitTimeoutMs} ms; last_error=${JSON.stringify(lastError)}`
   );
 }
 
 async function waitForTargetAbsent(targetId, waitTimeoutMs) {
+  const tabId = tabIdFromTargetId(String(targetId || ""));
+  if (!Number.isInteger(tabId)) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `waitForTargetAbsent requires ${TAB_TARGET_PREFIX}<tabId>, got ${JSON.stringify(targetId)}`
+    );
+  }
   const started = Date.now();
-  let pages = [];
+  let lastState = null;
+  let lastError = "";
   while (Date.now() - started <= waitTimeoutMs) {
-    pages = await tabTargets();
-    if (!pages.some((candidate) => candidate.id === targetId)) {
-      return pages;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      lastState = tabPageStateFromTab(tab);
+      lastError = "";
+    } catch (error) {
+      lastError = errorMessage(error);
+      return [];
     }
     await sleep(100);
   }
   throw bridgeError(
     ERROR_EXTENSION_TIMEOUT,
-    `chrome.tabs.query still contains closed target ${JSON.stringify(targetId)} after ${waitTimeoutMs} ms; lastTabTargetCount=${pages.length}`
+    `chrome.tabs.get(${tabId}) still returns closed target ${JSON.stringify(targetId)} after ${waitTimeoutMs} ms; ` +
+      `last_url=${JSON.stringify(diagnosticUrl(lastState?.url || ""))} ` +
+      `last_title=${JSON.stringify(diagnosticTitle(lastState?.title || ""))} ` +
+      `last_error=${JSON.stringify(lastError)}`
   );
 }
 
@@ -13955,7 +14242,8 @@ async function waitForTabPageState(tabId, fallbackTarget, waitTimeoutMs, expecta
   }
   const detail = last
     ? `waiting for ${expectation?.description || "complete tab state"}; ` +
-      `last url=${JSON.stringify(last.url)} title=${JSON.stringify(last.title)} ` +
+      `last url=${JSON.stringify(diagnosticUrl(last.url))} ` +
+      `title=${JSON.stringify(diagnosticTitle(last.title))} ` +
       `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
@@ -14176,17 +14464,25 @@ function frameExecutionResults(results) {
 function summarizeFrameExecutionResult(frame) {
   const result = frame?.result && typeof frame.result === "object" ? frame.result : {};
   const text = typeof result.text === "string" ? result.text : null;
+  const rawUrl = result.url == null
+    ? (result.in_page_before_url == null ? null : String(result.in_page_before_url))
+    : String(result.url);
+  const rawTitle = result.title == null
+    ? (result.in_page_title == null ? null : String(result.in_page_title))
+    : String(result.title);
   return {
     index: Number.isSafeInteger(frame?.index) ? frame.index : null,
     frame_id: Number.isSafeInteger(frame?.frame_id) ? frame.frame_id : null,
     document_id: frame?.document_id || null,
     ok: result.ok == null ? null : Boolean(result.ok),
     error_code: result.error_code == null ? null : String(result.error_code),
-    error_detail: result.error_detail == null ? null : trimForReadback(result.error_detail, 240),
+    error_detail: result.error_detail == null
+      ? null
+      : trimForReadback(redactPublicErrorDetail(result.error_detail), 240),
     matched_count: Number.isSafeInteger(result.matched_count) ? result.matched_count : null,
     resolved_by: result.resolved_by == null ? null : String(result.resolved_by),
-    url: result.url == null ? (result.in_page_before_url == null ? null : String(result.in_page_before_url)) : String(result.url),
-    title: result.title == null ? (result.in_page_title == null ? null : String(result.in_page_title)) : String(result.title),
+    url: rawUrl == null ? null : diagnosticUrl(rawUrl),
+    title: rawTitle == null ? null : diagnosticTitle(rawTitle),
     ready_state: result.ready_state == null ? (result.in_page_ready_state == null ? null : String(result.in_page_ready_state)) : String(result.ready_state),
     has_active_element: result.has_active_element == null ? null : Boolean(result.has_active_element),
     is_editable: result.is_editable == null ? null : Boolean(result.is_editable),
@@ -24102,10 +24398,23 @@ function bridgeError(code, detail) {
   return error;
 }
 
+function redactPublicErrorDetail(detail) {
+  let text = String(detail || "");
+  text = text.replace(
+    /(Cannot access contents of url\s+["'])([^"']+)(["'])/gi,
+    (_match, prefix, url, suffix) => `${prefix}${diagnosticUrl(url)}${suffix}`
+  );
+  text = text.replace(
+    /\b(?:https?|data|javascript|file|blob|filesystem|mailto|view-source):[^\s"')]+/gi,
+    (url) => diagnosticUrl(url)
+  );
+  return text;
+}
+
 function errorPayload(error) {
   return {
     code: error?.code || ERROR_ATTACH_FAILED,
-    detail: errorMessage(error)
+    detail: redactPublicErrorDetail(errorMessage(error))
   };
 }
 

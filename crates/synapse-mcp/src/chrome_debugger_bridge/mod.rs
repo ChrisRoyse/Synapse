@@ -42,7 +42,7 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-07-16-maintenance-alarm-resume-v1";
+    "synapse-chrome-bridge-2026-07-17-exact-target-owner-ledger-v6";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "12e3388c6b9501bd3e7225b4a2b0167c5e4a3bb3279422b3e13b5710c4b66c5c";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -6760,6 +6760,38 @@ pub async fn target_info(
     })
 }
 
+pub async fn target_tab_state(
+    hwnd: i64,
+    target_id: &str,
+    expected_chrome_window_id: Option<i64>,
+    expected_window_bounds: Option<Rect>,
+    expected_window_title: Option<&str>,
+) -> Result<ChromeDebuggerTargetInfo, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "targetInfo")?;
+    let result = bridge()
+        .send_command(
+            "targetInfo",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "expectedChromeWindowId": expected_chrome_window_id,
+                "expectedWindowBounds": expected_window_bounds.map(|bounds| json!({
+                    "x": bounds.x,
+                    "y": bounds.y,
+                    "w": bounds.w,
+                    "h": bounds.h,
+                })),
+                "expectedWindowTitle": expected_window_title,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerTargetInfo>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger target tab state response: {error}"
+        ))
+    })
+}
+
 pub struct ChromeDebuggerViewportEmulationRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
@@ -7893,6 +7925,9 @@ pub async fn activate_tab(
     hwnd: i64,
     target_id: &str,
     wait_timeout_ms: u64,
+    expected_chrome_window_id: Option<i64>,
+    expected_window_bounds: Option<Rect>,
+    expected_window_title: Option<&str>,
 ) -> Result<ChromeDebuggerActivateTabResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(hwnd, "activateTab")?;
     let result = bridge()
@@ -7902,6 +7937,14 @@ pub async fn activate_tab(
                 "hwnd": hwnd,
                 "targetIdHint": target_id,
                 "waitTimeoutMs": wait_timeout_ms,
+                "expectedChromeWindowId": expected_chrome_window_id,
+                "expectedWindowBounds": expected_window_bounds.map(|bounds| json!({
+                    "x": bounds.x,
+                    "y": bounds.y,
+                    "w": bounds.w,
+                    "h": bounds.h,
+                })),
+                "expectedWindowTitle": expected_window_title,
             }),
         )
         .await?;
@@ -9222,6 +9265,187 @@ fn digest_bridge_token(token: &str) -> [u8; 32] {
     output
 }
 
+fn redacted_result_url(result: &Value, key: &str) -> Value {
+    result
+        .get(key)
+        .and_then(Value::as_str)
+        .map(bridge_redact_url_for_public_readback)
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+fn redacted_result_title(result: &Value, title_key: &str, url_key: &str) -> Value {
+    let Some(title) = result.get(title_key).and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    let url = result
+        .get(url_key)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Value::String(bridge_redact_title_for_public_url_readback(
+        url,
+        title.to_owned(),
+    ))
+}
+
+fn bridge_redact_url_for_public_readback(url: &str) -> String {
+    const REDACTED: &str = "redacted";
+    if url.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = bridge_strip_scheme_prefix(url, "view-source") {
+        return format!(
+            "view-source:{}",
+            bridge_redact_url_for_public_readback(rest)
+        );
+    }
+    for scheme in ["data", "javascript", "mailto", "blob", "filesystem"] {
+        if bridge_strip_scheme_prefix(url, scheme).is_some() {
+            return format!("{scheme}:{REDACTED}");
+        }
+    }
+    if bridge_strip_scheme_prefix(url, "file").is_some() {
+        return format!("file:{REDACTED}");
+    }
+    if let Some(rest) = bridge_strip_scheme_prefix(url, "about") {
+        return bridge_redact_about_url(rest);
+    }
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => bridge_redact_parsed_url(parsed),
+        Err(_error) => bridge_redact_query_and_fragment_without_parse(url),
+    }
+}
+
+fn bridge_redact_title_for_public_url_readback(url: &str, title: String) -> String {
+    const REDACTED: &str = "redacted";
+    if bridge_url_has_content_bearing_scheme(url) {
+        return REDACTED.to_owned();
+    }
+    bridge_redact_url_like_title_for_public_readback(&title).unwrap_or(title)
+}
+
+fn bridge_url_has_content_bearing_scheme(url: &str) -> bool {
+    if let Some(rest) = bridge_strip_scheme_prefix(url, "view-source") {
+        return bridge_url_has_content_bearing_scheme(rest);
+    }
+    ["data", "javascript", "mailto", "file", "blob", "filesystem"]
+        .iter()
+        .any(|scheme| bridge_strip_scheme_prefix(url, scheme).is_some())
+}
+
+fn bridge_strip_scheme_prefix<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+    let (candidate, rest) = url.split_once(':')?;
+    candidate.eq_ignore_ascii_case(scheme).then_some(rest)
+}
+
+fn bridge_redact_parsed_url(mut parsed: reqwest::Url) -> String {
+    const REDACTED: &str = "redacted";
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        parsed.set_path(&format!("/{REDACTED}"));
+    }
+    if parsed.query().is_some() {
+        parsed.set_query(Some(REDACTED));
+    }
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(Some(REDACTED));
+    }
+    parsed.to_string()
+}
+
+fn bridge_redact_about_url(rest: &str) -> String {
+    const REDACTED: &str = "redacted";
+    if rest.eq_ignore_ascii_case("blank") {
+        return "about:blank".to_owned();
+    }
+    if rest
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("blank?"))
+    {
+        return format!("about:blank?{REDACTED}");
+    }
+    if rest
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("blank#"))
+    {
+        return format!("about:blank#{REDACTED}");
+    }
+    format!("about:{REDACTED}")
+}
+
+fn bridge_redact_query_and_fragment_without_parse(url: &str) -> String {
+    const REDACTED: &str = "redacted";
+    let query_index = url.find('?');
+    let fragment_index = url.find('#');
+    match (query_index, fragment_index) {
+        (None, None) => bridge_redact_unparseable_path(url),
+        (Some(query), None) => {
+            format!(
+                "{}?{REDACTED}",
+                bridge_redact_unparseable_path(&url[..query])
+            )
+        }
+        (None, Some(fragment)) => {
+            format!(
+                "{}#{REDACTED}",
+                bridge_redact_unparseable_path(&url[..fragment])
+            )
+        }
+        (Some(query), Some(fragment)) if query < fragment => format!(
+            "{}?{REDACTED}#{REDACTED}",
+            bridge_redact_unparseable_path(&url[..query])
+        ),
+        (Some(_query), Some(fragment)) => format!(
+            "{}#{REDACTED}",
+            bridge_redact_unparseable_path(&url[..fragment])
+        ),
+    }
+}
+
+fn bridge_redact_unparseable_path(path: &str) -> String {
+    const REDACTED: &str = "redacted";
+    if path.is_empty() || path == "/" {
+        return path.to_owned();
+    }
+    if path.starts_with('/') {
+        return format!("/{REDACTED}");
+    }
+    REDACTED.to_owned()
+}
+
+fn bridge_redact_url_like_title_for_public_readback(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() || trimmed != title {
+        return None;
+    }
+    if reqwest::Url::parse(trimmed).is_ok() {
+        let public = bridge_redact_url_for_public_readback(trimmed);
+        return (public != trimmed).then_some(public);
+    }
+    if !bridge_looks_like_bare_url_path(trimmed) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(&format!("https://{trimmed}")).ok()?;
+    let public = bridge_redact_parsed_url(parsed);
+    public.strip_prefix("https://").map(ToOwned::to_owned)
+}
+
+fn bridge_looks_like_bare_url_path(title: &str) -> bool {
+    if title.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some(separator) = title.find(['/', '?', '#']) else {
+        return false;
+    };
+    let host = &title[..separator];
+    !host.is_empty()
+        && host.contains('.')
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
+}
+
 fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Option<String> {
     let result = result?;
     let summary = match kind {
@@ -9234,7 +9458,7 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "chrome_window_selection_reason": result.get("chrome_window_selection_reason"),
             "chrome_window_candidate_count": result.get("chrome_window_candidate_count"),
             "chrome_window_non_focused_count": result.get("chrome_window_non_focused_count"),
-            "url": result.get("url"),
+            "url": redacted_result_url(result, "url"),
             "target_attached": result.get("target_attached"),
             "target_count_before": result.get("target_count_before"),
             "target_count_after": result.get("target_count_after"),
@@ -9253,9 +9477,9 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "action": result.get("action"),
-            "requested_url": result.get("requested_url"),
-            "before_url": result.get("before_url"),
-            "after_url": result.get("after_url"),
+            "requested_url": redacted_result_url(result, "requested_url"),
+            "before_url": redacted_result_url(result, "before_url"),
+            "after_url": redacted_result_url(result, "after_url"),
             "ready_state": result.get("ready_state"),
             "readback_backend": result.get("readback_backend"),
         }),
@@ -9275,8 +9499,8 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "chrome_window_id": result.get("chrome_window_id"),
             "chrome_window_focused": result.get("chrome_window_focused"),
             "chrome_window_state": result.get("chrome_window_state"),
-            "url": result.get("url"),
-            "title": result.get("title"),
+            "url": redacted_result_url(result, "url"),
+            "title": redacted_result_title(result, "title", "url"),
             "ready_state": result.get("ready_state"),
             "before_active": result.get("before_active"),
             "active_for_capture": result.get("active_for_capture"),
@@ -9451,8 +9675,8 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "chrome_window_id": result.get("chrome_window_id"),
-            "url": result.get("url"),
-            "title": result.get("title"),
+            "url": redacted_result_url(result, "url"),
+            "title": redacted_result_title(result, "title", "url"),
             "ready_state": result.get("ready_state"),
             "viewport_inner_width": result
                 .get("viewport")
@@ -9494,8 +9718,8 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "target_type": result.get("target_type"),
-            "url": result.get("url"),
-            "title": result.get("title"),
+            "url": redacted_result_url(result, "url"),
+            "title": redacted_result_title(result, "title", "url"),
             "page_text_available": result
                 .get("page_text")
                 .and_then(|value| value.get("available")),
@@ -9697,8 +9921,8 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "chrome_window_id": result.get("chrome_window_id"),
-            "url": result.get("url"),
-            "title": result.get("title"),
+            "url": redacted_result_url(result, "url"),
+            "title": redacted_result_title(result, "title", "url"),
             "ready_state": result.get("ready_state"),
             "html_len": result.get("html_len"),
             "truncated": result.get("truncated"),
@@ -9712,9 +9936,9 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "chrome_window_id": result.get("chrome_window_id"),
-            "before_url": result.get("before_url"),
-            "after_url": result.get("after_url"),
-            "after_title": result.get("after_title"),
+            "before_url": redacted_result_url(result, "before_url"),
+            "after_url": redacted_result_url(result, "after_url"),
+            "after_title": redacted_result_title(result, "after_title", "after_url"),
             "ready_state": result.get("ready_state"),
             "html_len": result.get("html_len"),
             "readback_backend": result.get("readback_backend"),
@@ -9786,8 +10010,8 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "init_script_newly_added": result.get("init_script_newly_added"),
             "installed_at_unix_ms": result.get("installed_at_unix_ms"),
             "readback": result.get("readback"),
-            "url": result.get("url"),
-            "title": result.get("title"),
+            "url": redacted_result_url(result, "url"),
+            "title": redacted_result_title(result, "title", "url"),
             "ready_state": result.get("ready_state"),
             "readback_backend": result.get("readback_backend"),
             "backend_tier_used": result.get("backend_tier_used"),
