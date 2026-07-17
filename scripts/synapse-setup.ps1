@@ -1768,6 +1768,149 @@ function Get-SynapseArtifactReadback {
     return [pscustomobject]$readback
 }
 
+function Test-SynapseStatusAccessViolationExit {
+    param([AllowNull()]$Job)
+
+    if (-not $Job) { return $false }
+    $hex = [string]$Job.exit_code_hex
+    if ($hex -ieq '0xC0000005') { return $true }
+    try {
+        if ([uint32]$Job.exit_code_unsigned -eq [uint32]3221225477) { return $true }
+    } catch {}
+    try {
+        if ([int32]$Job.exit_code_signed -eq -1073741819) { return $true }
+    } catch {}
+    return $false
+}
+
+function Get-SynapseWerCrashReadback {
+    param([AllowNull()][string]$SinceUtc)
+
+    $folder = Join-Path $env:LOCALAPPDATA 'CrashDumps'
+    $since = $null
+    if (-not [string]::IsNullOrWhiteSpace($SinceUtc)) {
+        try {
+            $since = ([DateTimeOffset]::Parse($SinceUtc)).UtcDateTime.AddMinutes(-2)
+        } catch {
+            $since = $null
+        }
+    }
+
+    $readback = [ordered]@{
+        schema = 'synapse_setup_wer_crash_readback/v1'
+        folder = $folder
+        folder_exists = $false
+        since_utc = if ($since) { $since.ToString('o') } else { $null }
+        process_names = @('cargo.exe','rustc.exe','rust-lld.exe','lld-link.exe','link.exe')
+        localdump_registry_readable = $false
+        localdump_registry_error = $null
+        localdump_registry = @()
+        recent_dump_count = 0
+        recent_dumps = @()
+    }
+
+    $registryPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps',
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+    )
+    $registryRows = @()
+    foreach ($registryPath in $registryPaths) {
+        try {
+            if (Test-Path -LiteralPath $registryPath) {
+                $root = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
+                $registryRows += [pscustomobject]@{
+                    path = $registryPath
+                    dump_folder = $root.DumpFolder
+                    dump_count = $root.DumpCount
+                    dump_type = $root.DumpType
+                    custom_dump_flags = $root.CustomDumpFlags
+                }
+                foreach ($name in $readback.process_names) {
+                    $childPath = Join-Path $registryPath $name
+                    if (Test-Path -LiteralPath $childPath) {
+                        $child = Get-ItemProperty -LiteralPath $childPath -ErrorAction Stop
+                        $registryRows += [pscustomobject]@{
+                            path = $childPath
+                            dump_folder = $child.DumpFolder
+                            dump_count = $child.DumpCount
+                            dump_type = $child.DumpType
+                            custom_dump_flags = $child.CustomDumpFlags
+                        }
+                    }
+                }
+            }
+            $readback.localdump_registry_readable = $true
+        } catch {
+            $readback.localdump_registry_error = $_.Exception.Message
+        }
+    }
+    $readback.localdump_registry = @($registryRows)
+
+    if (Test-Path -LiteralPath $folder) {
+        $readback.folder_exists = $true
+        $names = @($readback.process_names | ForEach-Object { $_.ToLowerInvariant() })
+        $dumps = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $lowerName = $_.Name.ToLowerInvariant()
+                $matchesName = $false
+                foreach ($name in $names) {
+                    if ($lowerName.StartsWith($name.ToLowerInvariant())) {
+                        $matchesName = $true
+                        break
+                    }
+                }
+                if (-not $matchesName) {
+                    $false
+                } elseif ($since) {
+                    $_.LastWriteTimeUtc -ge $since
+                } else {
+                    $true
+                }
+            } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 20 FullName, Name, Length, @{Name='LastWriteTimeUtc';Expression={$_.LastWriteTimeUtc.ToString('o')}})
+        $readback.recent_dump_count = $dumps.Count
+        $readback.recent_dumps = @($dumps)
+    }
+
+    return [pscustomobject]$readback
+}
+
+function Get-SynapseRustToolchainReadback {
+    param([Parameter(Mandatory=$true)][string]$CargoPath)
+
+    $commands = @('cargo','rustc','rust-lld','lld-link','link')
+    $resolved = @()
+    foreach ($command in $commands) {
+        $row = [ordered]@{
+            command = $command
+            source = $null
+            version = $null
+            error = $null
+        }
+        try {
+            $cmd = Get-Command $command -ErrorAction Stop
+            $row.source = $cmd.Source
+            if ($command -eq 'cargo') {
+                $row.version = (& $CargoPath --version 2>&1 | Select-Object -First 1) -join ''
+            } elseif ($command -eq 'rustc') {
+                $row.version = (& $cmd.Source -vV 2>&1 | Select-Object -First 8) -join "`n"
+            } else {
+                $row.version = (& $cmd.Source --version 2>&1 | Select-Object -First 3) -join "`n"
+            }
+        } catch {
+            $row.error = $_.Exception.Message
+        }
+        $resolved += [pscustomobject]$row
+    }
+
+    return [pscustomobject]@{
+        schema = 'synapse_setup_rust_toolchain_readback/v1'
+        cargo_path = $CargoPath
+        commands = @($resolved)
+    }
+}
+
 function Get-SynapseReleaseBuildFailureKind {
     param(
         [Parameter(Mandatory=$true)]$Diagnostics,
@@ -1792,6 +1935,12 @@ function Get-SynapseReleaseBuildFailureKind {
         return [pscustomobject]@{
             code = 'SYNAPSE_RELEASE_BUILD_ARTIFACT_LOCKED'
             remediation = 'inspect the process table for a build or scanner process holding the release artifact; do not close protected terminal/IDE/WSL host processes'
+        }
+    }
+    if ($job -and (Test-SynapseStatusAccessViolationExit -Job $job)) {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_TOOLCHAIN_ACCESS_VIOLATION'
+            remediation = 'cargo/rustc/linker exited with 0xC0000005 STATUS_ACCESS_VIOLATION; inspect the per-attempt diagnostics/log archive plus WER crash-dump readback, and repair or update the Windows Rust/toolchain host before rerunning setup'
         }
     }
     if ($LogSignal.has_compiler_error) {
@@ -3241,7 +3390,8 @@ function Test-SynapseHealthCriticalSubsystemsReady {
             continue
         }
         $status = [string](Get-SynapseObjectPropertyValue -Object $node -Names @('status'))
-        if ($status -ne 'ok') {
+        $readyStatuses = if ($name -eq 'storage') { @('ok','maintenance') } else { @('ok') }
+        if ($status -notin $readyStatuses) {
             if ([string]::IsNullOrWhiteSpace($status)) {
                 $status = '<missing>'
             }
@@ -6273,6 +6423,7 @@ function Stop-SynapseMcpProcesses {
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [switch]$ForceRestart,
+        [switch]$AllowUnacknowledgedChromeBridgePauseForRollback,
         [int]$TimeoutSeconds = 15
     )
 
@@ -6335,21 +6486,31 @@ function Stop-SynapseMcpProcesses {
                 $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
                 $pause = Request-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $tokenRead.Token -Reason $Reason -PauseMs $SynapseChromeBridgeMaintenancePauseMs -ResumeProbeAfterMs $SynapseChromeBridgeMaintenanceResumeProbeAfterMs
                 if (-not $pause.Ok) {
-                    Die ("{0} reason={1} bind={2} error={3} detail={4} response={5} remediation=forced daemon maintenance requires the already-open Chrome bridge to acknowledge a bounded reconnect pause before shutdown when an active bridge host exists. Reload the installed bridge through the existing Chrome profile or inspect daemon/extension logs; setup will not chase an unbounded stream of recreated Chrome NetworkService peers." -f `
-                        $pause.Code,
-                        $Reason,
-                        $Bind,
-                        $pause.Error,
-                        $pause.Detail,
-                        ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
+                    if ($AllowUnacknowledgedChromeBridgePauseForRollback -and $Reason -eq 'install_health_failed_rollback') {
+                        Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_UNACKNOWLEDGED_ROLLBACK_CONTINUING reason={0} bind={1} code={2} error={3} detail={4} response={5} remediation=install health already failed after replacing the daemon binary, so rollback must restore the previous verified daemon instead of stranding the failed candidate; setup will continue only through authenticated shutdown or exact verified synapse-mcp.exe PID stop, then separately verify the restored daemon and Chrome bridge Source of Truth." -f `
+                            $Reason,
+                            $Bind,
+                            $pause.Code,
+                            $pause.Error,
+                            $pause.Detail,
+                            ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
+                    } else {
+                        Die ("{0} reason={1} bind={2} error={3} detail={4} response={5} remediation=forced daemon maintenance requires the already-open Chrome bridge to acknowledge a bounded reconnect pause before shutdown when an active bridge host exists. Reload the installed bridge through the existing Chrome profile or inspect daemon/extension logs; setup will not chase an unbounded stream of recreated Chrome NetworkService peers." -f `
+                            $pause.Code,
+                            $Reason,
+                            $Bind,
+                            $pause.Error,
+                            $pause.Detail,
+                            ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
+                    }
                 }
-                if ($pause.Skipped) {
+                if ($pause.Ok -and $pause.Skipped) {
                     Info ("FORCE_RESTART: {0} reason={1} bind={2} detail={3}" -f `
                         $pause.Code,
                         $Reason,
                         $Bind,
                         $pause.Detail)
-                } else {
+                } elseif ($pause.Ok) {
                     $pauseUntil = $pause.Response.pause.pause_until_unix_ms
                     if ($null -ne $pauseUntil) {
                         try {
@@ -6954,7 +7115,8 @@ if (-not $SkipBuild) {
     Info "Build parallelism: CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) (logical CPUs: $([Environment]::ProcessorCount))"
     $buildLog = Join-Path $LogDir 'setup-build.log'
     $buildDiagnosticsPath = Join-Path $LogDir 'setup-build-diagnostics.json'
-    if (Test-Path -LiteralPath $buildDiagnosticsPath) { Remove-Item -LiteralPath $buildDiagnosticsPath -Force }
+    # Preserve the last failure diagnostics across later successful retries;
+    # each new failure also writes an immutable per-attempt archive below.
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     Info "Build process tree is job-owned; log: $buildLog"
     $buildInvocationDiagnostics = $null
@@ -6972,22 +7134,52 @@ if (-not $SkipBuild) {
             -Diagnostics $buildInvocationDiagnostics `
             -LogSignal $buildLogSignal `
             -ArtifactReadback $artifactReadback
+        $buildFailureStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
+        $buildFailureDir = Join-Path $LogDir 'setup-build-failures'
+        New-Item -ItemType Directory -Force -Path $buildFailureDir | Out-Null
+        $buildFailurePrefix = "release-build-$buildFailureStamp-pid$PID"
+        $buildLogArchivePath = Join-Path $buildFailureDir "$buildFailurePrefix.build.log"
+        $buildDiagnosticsArchivePath = Join-Path $buildFailureDir "$buildFailurePrefix.diagnostics.json"
+        $buildLogArchiveSha256 = $null
+        if (Test-Path -LiteralPath $buildLog) {
+            Copy-Item -LiteralPath $buildLog -Destination $buildLogArchivePath -Force
+            try {
+                $buildLogArchiveSha256 = Get-SynapseFileSha256 -Path $buildLogArchivePath
+            } catch {
+                $buildLogArchiveSha256 = "hash_failed: $($_.Exception.Message)"
+            }
+        }
+        $buildStartedAtUtc = $null
+        if ($buildInvocationDiagnostics -and $buildInvocationDiagnostics.started_at_utc) {
+            $buildStartedAtUtc = [string]$buildInvocationDiagnostics.started_at_utc
+        }
+        $werCrashReadback = Get-SynapseWerCrashReadback -SinceUtc $buildStartedAtUtc
+        $rustToolchainReadback = Get-SynapseRustToolchainReadback -CargoPath $cargo
         $buildDiagnostics = [ordered]@{
             schema = 'synapse_setup_release_build_failure/v1'
             code = $failureKind.code
+            attempt_id = $buildFailurePrefix
+            observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
             source_dir = $SourceDir
             cargo = $cargo
             cargo_target_dir = $CargoTarget
             expected_artifact = $built
             build_log = $buildLog
+            archived_build_log = $buildLogArchivePath
+            archived_build_log_sha256 = $buildLogArchiveSha256
             build_timeout_minutes = $BuildTimeoutMinutes
             build_exit = $buildExit
             remediation = $failureKind.remediation
+            diagnostics_archive = $buildDiagnosticsArchivePath
             invocation = $buildInvocationDiagnostics
             log_signal = $buildLogSignal
             artifact_readback = $artifactReadback
+            rust_toolchain_readback = $rustToolchainReadback
+            wer_crash_readback = $werCrashReadback
         }
-        $buildDiagnostics | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $buildDiagnosticsPath -Encoding UTF8
+        $buildDiagnosticsJson = $buildDiagnostics | ConvertTo-Json -Depth 32
+        $buildDiagnosticsJson | Set-Content -LiteralPath $buildDiagnosticsPath -Encoding UTF8
+        $buildDiagnosticsJson | Set-Content -LiteralPath $buildDiagnosticsArchivePath -Encoding UTF8
         $job = $buildInvocationDiagnostics.process_job
         $childPid = if ($job -and $job.child_pid) { $job.child_pid } else { '<unknown>' }
         $completionKind = if ($job -and $job.completion_kind) { $job.completion_kind } else { '<unknown>' }
@@ -6997,7 +7189,8 @@ if (-not $SkipBuild) {
         $compilerError = if ($buildLogSignal.has_compiler_error) { 'true' } else { 'false' }
         $childAliveAfter = if ($buildInvocationDiagnostics.cleanup_result) { [string]$buildInvocationDiagnostics.cleanup_result.child_process_alive_after } else { '<unknown>' }
         $afterBuildToolCount = @($buildInvocationDiagnostics.build_tool_processes_after).Count
-        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} live_build_tool_processes_after={10} artifact_exists={11} artifact_sha256={12} artifact_exclusive_open={13} diagnostics={14} log={15} remediation={16}`nTail:`n{17}" -f `
+        $recentWerDumpCount = if ($werCrashReadback) { [int]$werCrashReadback.recent_dump_count } else { 0 }
+        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} live_build_tool_processes_after={10} artifact_exists={11} artifact_sha256={12} artifact_exclusive_open={13} diagnostics={14} diagnostics_archive={15} log={16} log_archive={17} wer_recent_dumps={18} remediation={19}`nTail:`n{20}" -f `
             $failureKind.code,
             $buildExit,
             $childPid,
@@ -7013,7 +7206,10 @@ if (-not $SkipBuild) {
             ($(if ($artifactReadback.sha256) { $artifactReadback.sha256 } else { '<none>' })),
             $artifactReadback.exclusive_open,
             $buildDiagnosticsPath,
+            $buildDiagnosticsArchivePath,
             $buildLog,
+            $buildLogArchivePath,
+            $recentWerDumpCount,
             $failureKind.remediation,
             $buildLogSignal.tail_80)
     }
@@ -7376,7 +7572,7 @@ if (-not $ok) {
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
             Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         }
-        Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -TimeoutSeconds 300
+        Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -AllowUnacknowledgedChromeBridgePauseForRollback -TimeoutSeconds 300
         Copy-Item -LiteralPath $backupPath -Destination $ExePath -Force
         $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
         if ($rollbackHash -ne $oldInstalledHash) {
@@ -7385,6 +7581,8 @@ if (-not $ok) {
         Start-ScheduledTask -TaskName $TaskName
         $rollbackOk = $false
         $rollbackHealth = $null
+        $rollbackLastHealthError = $null
+        $rollbackLastSubsystemStatuses = '<none>'
         $rollbackHealthDeadline = (Get-Date).AddSeconds(180)
         $rollbackHealthAttempt = 0
         while ((Get-Date) -lt $rollbackHealthDeadline) {
@@ -7394,28 +7592,46 @@ if (-not $ok) {
             $rollbackHealthTimeoutSec = [Math]::Min(30, [Math]::Max(5, $remainingSeconds))
             try {
                 $rh = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec $rollbackHealthTimeoutSec
-                if ($rh.ok) {
+                $rollbackLastSubsystemStatuses = Format-SynapseHealthSubsystemStatuses -Health $rh
+                $rollbackCriticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $rh
+                if ($rollbackCriticalReady.Ok) {
                     $rollbackHealth = $rh
                     $rollbackOk = $true
                     break
+                } else {
+                    $rollbackLastHealthError = $rollbackCriticalReady.Detail
+                    Info "WARN: rollback daemon /health responded but critical subsystems are not ready yet attempt=$rollbackHealthAttempt detail=$($rollbackCriticalReady.Detail) subsystem_statuses=$rollbackLastSubsystemStatuses"
                 }
             } catch {
-                Info "WARN: rollback daemon /health not ready yet attempt=$rollbackHealthAttempt timeout_s=$rollbackHealthTimeoutSec remaining_s=$remainingSeconds error=$($_.Exception.Message)"
+                $rollbackLastHealthError = $_.Exception.Message
+                Info "WARN: rollback daemon /health not ready yet attempt=$rollbackHealthAttempt timeout_s=$rollbackHealthTimeoutSec remaining_s=$remainingSeconds error=$rollbackLastHealthError"
             }
         }
         if ($rollbackOk) {
-            Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} original_failure=[{3}] remediation=old daemon is serving again; inspect candidate startup logs before retrying" -f `
+            $rollbackHealth = Assert-SynapseChromeBridgeLiveAfterSetup `
+                -Bind $Bind `
+                -Token $token `
+                -Health $rollbackHealth `
+                -ChromeBridgeInstallerPath $chromeBridgeInstaller `
+                -ChromeNativeHostExePath $ChromeNativeHostExePath
+            $rollbackBridge = $rollbackHealth.subsystems.chrome_bridge
+            Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} rollback_subsystem_statuses={3} rollback_chrome_bridge_status={4} rollback_chrome_bridge_detail={5} original_failure=[{6}] remediation=old daemon and Chrome bridge Source of Truth were re-read after rollback; inspect candidate startup logs before retrying" -f `
                 $installSourceHash,
                 $rollbackHash,
                 $rollbackHealth.pid,
+                $rollbackLastSubsystemStatuses,
+                ($(if ($null -eq $rollbackBridge) { '<missing>' } else { $rollbackBridge.status })),
+                ($(if ($null -eq $rollbackBridge) { '<missing>' } else { $rollbackBridge.detail })),
                 $failureDetail)
         }
 
         $rollbackListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
         $rollbackProcesses = @(Get-SynapseMcpProcessSnapshot)
-        Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_FAILED candidate_sha256={0} rollback_sha256={1} original_failure=[{2}]`nrollback_listeners:`n{3}`nrollback_processes:`n{4}`nremediation=rollback binary was restored but daemon did not become healthy; inspect {5} and synapse.log.* under {6}" -f `
+        Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_FAILED candidate_sha256={0} rollback_sha256={1} rollback_last_health_error={2} rollback_last_subsystem_statuses={3} original_failure=[{4}]`nrollback_listeners:`n{5}`nrollback_processes:`n{6}`nremediation=rollback binary was restored but daemon did not become critical-subsystem ready; inspect {7} and synapse.log.* under {8}" -f `
             $installSourceHash,
             $rollbackHash,
+            ($(if ([string]::IsNullOrWhiteSpace($rollbackLastHealthError)) { '<none>' } else { $rollbackLastHealthError })),
+            $rollbackLastSubsystemStatuses,
             $failureDetail,
             (Format-SynapseTcpBindListenerSnapshot -Snapshot $rollbackListeners),
             (Format-SynapseMcpProcessSnapshot -Snapshot $rollbackProcesses),

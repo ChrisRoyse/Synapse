@@ -59,16 +59,20 @@ fn runtime_lock_unavailable_health<T>(
     runtime_name: &'static str,
     error: TryLockError<T>,
 ) -> SubsystemHealth {
-    let detail = match error {
+    let detail = match &error {
         TryLockError::WouldBlock => format!(
-            "{runtime_name} runtime lock is busy; health is fail-closed and does not wait behind in-flight work"
+            "{runtime_name} runtime lock is busy; health reports busy and does not wait behind in-flight work"
         ),
         TryLockError::Poisoned(_poisoned) => {
             format!("{runtime_name} runtime lock poisoned")
         }
     };
     SubsystemHealth {
-        status: "error".to_owned(),
+        status: match &error {
+            TryLockError::WouldBlock => "busy",
+            TryLockError::Poisoned(_poisoned) => "error",
+        }
+        .to_owned(),
         detail: Some(detail),
         ..SubsystemHealth::default()
     }
@@ -671,13 +675,62 @@ impl SynapseService {
                         apply_storage_maintenance_fields(&mut health, &maintenance);
                         health
                     }
-                    Err(error) => {
-                        let mut health = runtime_lock_unavailable_health("reflex storage", error);
-                        health.db_path = db_path;
-                        health.storage_backend = Some(storage_backend);
-                        apply_storage_maintenance_fields(&mut health, &maintenance);
-                        health
-                    }
+                    Err(error) => match error {
+                        TryLockError::WouldBlock => {
+                            let maintenance_error = storage_maintenance_error(&maintenance);
+                            let maintenance_unsupported = maintenance.unsupported_reason.clone();
+                            let maintenance_active = storage_maintenance_active(&maintenance);
+                            let cf_sizes_skipped_reason = (storage_backend == "calyx")
+                                .then(calyx_health_cf_sizes_skipped_reason);
+                            let mut health = SubsystemHealth {
+                                    status: if maintenance_error.is_some() {
+                                        "error".to_owned()
+                                    } else if maintenance_unsupported.is_some() {
+                                        "maintenance_unsupported".to_owned()
+                                    } else if maintenance_active {
+                                        "maintenance".to_owned()
+                                    } else {
+                                        maintenance
+                                            .pressure_probe
+                                            .last_level
+                                            .map(storage_pressure_status)
+                                            .unwrap_or_else(|| "ok".to_owned())
+                                    },
+                                    detail: Some(match (
+                                        maintenance_error,
+                                        maintenance_unsupported,
+                                        maintenance_active,
+                                    ) {
+                                        (Some(error), _, _) => format!(
+                                            "storage runtime lock busy; daemon storage handle readback says maintenance unhealthy: {error}"
+                                        ),
+                                        (None, Some(reason), _) => format!(
+                                            "storage runtime lock busy; daemon storage handle readback says maintenance unsupported for this backend: {reason}"
+                                        ),
+                                        (None, None, true) => "storage runtime lock busy; daemon storage handle is open and maintenance tick active; health skipped scan-bound CF size readback".to_owned(),
+                                        (None, None, false) => "storage runtime lock busy; daemon storage handle is open, maintenance tasks are running, and pressure probe was observed".to_owned(),
+                                    }),
+                                    db_path,
+                                    storage_backend: Some(storage_backend),
+                                    schema_version: Some(synapse_core::SCHEMA_VERSION),
+                                    cf_sizes: None,
+                                    storage_cf_sizes_skipped_reason: cf_sizes_skipped_reason,
+                                    ..SubsystemHealth::default()
+                                };
+                            apply_storage_maintenance_fields(&mut health, &maintenance);
+                            health
+                        }
+                        TryLockError::Poisoned(poisoned) => {
+                            let mut health = runtime_lock_unavailable_health(
+                                "reflex storage",
+                                TryLockError::Poisoned(poisoned),
+                            );
+                            health.db_path = db_path;
+                            health.storage_backend = Some(storage_backend);
+                            apply_storage_maintenance_fields(&mut health, &maintenance);
+                            health
+                        }
+                    },
                 }
             }
             Err(error) => state_lock_unavailable_health("M3", error),
