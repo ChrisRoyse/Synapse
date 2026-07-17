@@ -4,6 +4,7 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
+use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{Backend, CalyxMathProbeTopKEntry, ChromeBridgeDetail};
 
@@ -35,10 +36,40 @@ pub struct HealthParams {
     pub detail: HealthDetail,
 }
 
-fn state_lock_health() -> SubsystemHealth {
+fn state_lock_unavailable_health<T>(
+    state_name: &'static str,
+    error: TryLockError<T>,
+) -> SubsystemHealth {
+    let detail = match error {
+        TryLockError::WouldBlock => format!(
+            "{state_name} state lock is busy; health is fail-closed and does not wait behind in-flight work"
+        ),
+        TryLockError::Poisoned(_poisoned) => {
+            format!("{state_name} state lock poisoned")
+        }
+    };
     SubsystemHealth {
         status: "error".to_owned(),
-        detail: Some("M3 service state lock poisoned".to_owned()),
+        detail: Some(detail),
+        ..SubsystemHealth::default()
+    }
+}
+
+fn runtime_lock_unavailable_health<T>(
+    runtime_name: &'static str,
+    error: TryLockError<T>,
+) -> SubsystemHealth {
+    let detail = match error {
+        TryLockError::WouldBlock => format!(
+            "{runtime_name} runtime lock is busy; health is fail-closed and does not wait behind in-flight work"
+        ),
+        TryLockError::Poisoned(_poisoned) => {
+            format!("{runtime_name} runtime lock poisoned")
+        }
+    };
+    SubsystemHealth {
+        status: "error".to_owned(),
+        detail: Some(detail),
         ..SubsystemHealth::default()
     }
 }
@@ -137,28 +168,19 @@ impl SynapseService {
         session_id: Option<&str>,
         detail: HealthDetail,
     ) -> Health {
-        self.health_payload_with_http_sessions_and_session_detail(None, session_id, detail)
+        self.health_payload_with_http_sessions_and_session_detail(None, session_id, detail, None)
     }
 
-    pub(crate) fn health_payload_with_http_sessions(
+    pub(crate) fn health_payload_with_http_sessions_and_error(
         &self,
         active_sessions: Option<usize>,
-    ) -> Health {
-        self.health_payload_with_http_sessions_and_session(active_sessions, None)
-    }
-
-    /// Non-MCP callers (HTTP `/health`, dashboard, tests) keep the full detail
-    /// so their existing readback is unchanged; only the frequently-called MCP
-    /// `health` tool defaults to compact.
-    pub(crate) fn health_payload_with_http_sessions_and_session(
-        &self,
-        active_sessions: Option<usize>,
-        session_id: Option<&str>,
+        http_session_read_error: Option<String>,
     ) -> Health {
         self.health_payload_with_http_sessions_and_session_detail(
             active_sessions,
-            session_id,
+            None,
             HealthDetail::Full,
+            http_session_read_error,
         )
     }
 
@@ -167,6 +189,7 @@ impl SynapseService {
         active_sessions: Option<usize>,
         session_id: Option<&str>,
         detail: HealthDetail,
+        http_session_read_error: Option<String>,
     ) -> Health {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
@@ -180,7 +203,10 @@ impl SynapseService {
             "chrome_bridge".to_owned(),
             crate::chrome_debugger_bridge::health_subsystem(),
         );
-        subsystems.insert("http".to_owned(), self.http_health(active_sessions));
+        subsystems.insert(
+            "http".to_owned(),
+            self.http_health(active_sessions, http_session_read_error),
+        );
         subsystems.insert("daemon_drain".to_owned(), self.daemon_drain_health());
         subsystems.insert(
             "daemon_lifecycle".to_owned(),
@@ -218,12 +244,9 @@ impl SynapseService {
     }
 
     fn calyx_vault_health(&self) -> SubsystemHealth {
-        let status = match self.m3_state.lock() {
+        let status = match self.m3_state.try_lock() {
             Ok(state) => state.calyx_vault_status(),
-            Err(poisoned) => {
-                drop(poisoned);
-                return state_lock_health();
-            }
+            Err(error) => return state_lock_unavailable_health("M3", error),
         };
         let health_status = if !status.enabled {
             "disabled"
@@ -502,7 +525,7 @@ impl SynapseService {
     }
 
     fn storage_health(&self) -> SubsystemHealth {
-        match self.m3_state.lock() {
+        match self.m3_state.try_lock() {
             Ok(state) => {
                 let db_path = state
                     .db_path
@@ -585,7 +608,7 @@ impl SynapseService {
                     apply_storage_maintenance_fields(&mut health, &maintenance);
                     return health;
                 };
-                match runtime.lock() {
+                match runtime.try_lock() {
                     Ok(runtime) => {
                         let runtime_backend = runtime.storage_backend_name().to_owned();
                         let runtime_db_path = runtime.storage_path().display().to_string();
@@ -648,27 +671,21 @@ impl SynapseService {
                         apply_storage_maintenance_fields(&mut health, &maintenance);
                         health
                     }
-                    Err(_err) => {
-                        let mut health = SubsystemHealth {
-                            status: "error".to_owned(),
-                            detail: Some(
-                                "reflex runtime lock poisoned while reading storage".to_owned(),
-                            ),
-                            db_path,
-                            storage_backend: Some(storage_backend),
-                            ..SubsystemHealth::default()
-                        };
+                    Err(error) => {
+                        let mut health = runtime_lock_unavailable_health("reflex storage", error);
+                        health.db_path = db_path;
+                        health.storage_backend = Some(storage_backend);
                         apply_storage_maintenance_fields(&mut health, &maintenance);
                         health
                     }
                 }
             }
-            Err(_err) => state_lock_health(),
+            Err(error) => state_lock_unavailable_health("M3", error),
         }
     }
 
     fn reflex_health(&self) -> SubsystemHealth {
-        match self.m3_state.lock() {
+        match self.m3_state.try_lock() {
             Ok(state) => {
                 if let Some(error) = &state.reflex_last_error {
                     return SubsystemHealth {
@@ -694,7 +711,7 @@ impl SynapseService {
                         ..SubsystemHealth::default()
                     };
                 };
-                match runtime.lock() {
+                match runtime.try_lock() {
                     Ok(runtime) => match runtime.recursion_clamps_total() {
                         Ok(recursion_clamps_total) => SubsystemHealth {
                             status: if runtime.degraded_latency() {
@@ -726,19 +743,15 @@ impl SynapseService {
                             ..SubsystemHealth::default()
                         },
                     },
-                    Err(_err) => SubsystemHealth {
-                        status: "error".to_owned(),
-                        detail: Some("reflex runtime lock poisoned".to_owned()),
-                        ..SubsystemHealth::default()
-                    },
+                    Err(error) => runtime_lock_unavailable_health("reflex", error),
                 }
             }
-            Err(_err) => state_lock_health(),
+            Err(error) => state_lock_unavailable_health("M3", error),
         }
     }
 
     fn profile_health(&self) -> SubsystemHealth {
-        match self.m3_state.lock() {
+        match self.m3_state.try_lock() {
             Ok(state) => {
                 if let Some(error) = &state.profile_last_error {
                     return SubsystemHealth {
@@ -790,12 +803,12 @@ impl SynapseService {
                     },
                 )
             }
-            Err(_err) => state_lock_health(),
+            Err(error) => state_lock_unavailable_health("M3", error),
         }
     }
 
     fn perception_health(&self) -> SubsystemHealth {
-        match self.m1_state.lock() {
+        match self.m1_state.try_lock() {
             Ok(state) => SubsystemHealth {
                 status: "ok".to_owned(),
                 detail: Some("perception runtime initialized".to_owned()),
@@ -804,16 +817,12 @@ impl SynapseService {
                 capture_runtime: Some(state.capture_runtime_readback()),
                 ..SubsystemHealth::default()
             },
-            Err(_err) => SubsystemHealth {
-                status: "error".to_owned(),
-                detail: Some("M1 service state lock poisoned".to_owned()),
-                ..SubsystemHealth::default()
-            },
+            Err(error) => state_lock_unavailable_health("M1", error),
         }
     }
 
     fn action_health(&self) -> SubsystemHealth {
-        match self.m2_state.lock() {
+        match self.m2_state.try_lock() {
             Ok(state) => match state.backend_resolution_readback() {
                 Ok((source, policy)) => {
                     let emitter_available = state.emitter_available();
@@ -873,16 +882,12 @@ impl SynapseService {
                     ..SubsystemHealth::default()
                 },
             },
-            Err(_err) => SubsystemHealth {
-                status: "error".to_owned(),
-                detail: Some("M2 service state lock poisoned".to_owned()),
-                ..SubsystemHealth::default()
-            },
+            Err(error) => state_lock_unavailable_health("M2", error),
         }
     }
 
     fn audio_health(&self) -> SubsystemHealth {
-        match self.m3_state.lock() {
+        match self.m3_state.try_lock() {
             Ok(state) => {
                 if let Some(error) = &state.audio_last_error {
                     return SubsystemHealth {
@@ -935,18 +940,33 @@ impl SynapseService {
                     ..SubsystemHealth::default()
                 }
             }
-            Err(_err) => state_lock_health(),
+            Err(error) => state_lock_unavailable_health("M3", error),
         }
     }
 
-    fn http_health(&self, active_sessions: Option<usize>) -> SubsystemHealth {
-        match self.m3_state.lock() {
+    fn http_health(
+        &self,
+        active_sessions: Option<usize>,
+        active_sessions_error: Option<String>,
+    ) -> SubsystemHealth {
+        match self.m3_state.try_lock() {
             Ok(state) => {
+                let session_detail = active_sessions_error
+                    .as_deref()
+                    .map_or_else(String::new, |error| {
+                        format!(" active_session_readback_error={error}")
+                    });
                 if state.shutdown_reason == "http" {
                     let diagnostics = crate::http::http_transport_diagnostics_detail();
                     SubsystemHealth {
-                        status: "ok".to_owned(),
-                        detail: Some(format!("HTTP transport initialized; {diagnostics}")),
+                        status: if active_sessions_error.is_some() {
+                            "error".to_owned()
+                        } else {
+                            "ok".to_owned()
+                        },
+                        detail: Some(format!(
+                            "HTTP transport initialized; {diagnostics}{session_detail}"
+                        )),
                         bind_addr: Some(state.bind.clone()),
                         active_sessions,
                         sse_subscribers: Some(state.sse_state.active_subscription_count()),
@@ -954,8 +974,14 @@ impl SynapseService {
                     }
                 } else {
                     SubsystemHealth {
-                        status: "disabled".to_owned(),
-                        detail: Some("HTTP transport disabled in stdio mode".to_owned()),
+                        status: if active_sessions_error.is_some() {
+                            "error".to_owned()
+                        } else {
+                            "disabled".to_owned()
+                        },
+                        detail: Some(format!(
+                            "HTTP transport disabled in stdio mode{session_detail}"
+                        )),
                         bind_addr: Some(state.bind.clone()),
                         active_sessions: Some(0),
                         sse_subscribers: Some(state.sse_state.active_subscription_count()),
@@ -963,7 +989,7 @@ impl SynapseService {
                     }
                 }
             }
-            Err(_err) => state_lock_health(),
+            Err(error) => state_lock_unavailable_health("M3", error),
         }
     }
 }

@@ -780,9 +780,19 @@ pub(crate) fn record_forced_exit_nonblocking(
 
 pub(crate) fn health_subsystem() -> SubsystemHealth {
     let slot = state_slot();
-    let guard = match slot.lock() {
+    let guard = match slot.try_lock() {
         Ok(guard) => guard,
-        Err(_error) => {
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(
+                    "daemon lifecycle state lock is busy; health is fail-closed and does not wait behind lifecycle writes"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        }
+        Err(std::sync::TryLockError::Poisoned(_error)) => {
             return SubsystemHealth {
                 status: "error".to_owned(),
                 detail: Some("daemon lifecycle state lock poisoned".to_owned()),

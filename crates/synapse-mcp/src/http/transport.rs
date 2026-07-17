@@ -5697,8 +5697,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
     let state_started = Instant::now();
     let mut timing_segments = Vec::new();
     let active_sessions_started = Instant::now();
-    let active_sessions = state.session_manager.sessions.read().await.len();
-    emit_http_active_sessions(active_sessions);
+    let (active_sessions, active_sessions_error) = dashboard_active_session_count(&state);
     dashboard_push_state_timing(
         &mut timing_segments,
         "active_sessions",
@@ -5707,7 +5706,10 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
     let health = dashboard_timed_state_segment(&mut timing_segments, "health", || {
         state
             .health_service
-            .health_payload_with_http_sessions(Some(active_sessions))
+            .health_payload_with_http_sessions_and_error(
+                active_sessions,
+                active_sessions_error.clone(),
+            )
     });
     let sessions = dashboard_timed_state_segment(&mut timing_segments, "sessions", || match state
         .health_service
@@ -9434,17 +9436,63 @@ const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-CicCCuUG.css");
 const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-D_jF422B.js");
 async fn health(State(state): State<HttpState>) -> Json<Health> {
+    let started = Instant::now();
     tracing::info!(
         code = "MCP_HTTP_HEALTH",
         "tool.invocation kind=health transport=http"
     );
-    let active_sessions = state.session_manager.sessions.read().await.len();
-    emit_http_active_sessions(active_sessions);
-    Json(
-        state
-            .health_service
-            .health_payload_with_http_sessions(Some(active_sessions)),
-    )
+    let (active_sessions, active_sessions_error) =
+        active_http_sessions_for_health(&state.session_manager);
+    if let Some(active_sessions) = active_sessions {
+        emit_http_active_sessions(active_sessions);
+    }
+    let payload = state
+        .health_service
+        .health_payload_with_http_sessions_and_error(active_sessions, active_sessions_error);
+    tracing::info!(
+        code = "MCP_HTTP_HEALTH_DONE",
+        ok = payload.ok,
+        duration_ms = started.elapsed().as_millis(),
+        "HTTP health payload assembled"
+    );
+    Json(payload)
+}
+
+fn active_http_sessions_for_health(
+    session_manager: &LocalSessionManager,
+) -> (Option<usize>, Option<String>) {
+    match session_manager.sessions.try_read() {
+        Ok(sessions) => (Some(sessions.len()), None),
+        Err(error) => {
+            let detail = format!("HTTP session manager read lock unavailable for /health: {error}");
+            tracing::error!(
+                code = "MCP_HTTP_HEALTH_SESSION_LOCK_UNAVAILABLE",
+                error = %error,
+                "HTTP health did not wait behind the session manager lock"
+            );
+            (None, Some(detail))
+        }
+    }
+}
+
+fn dashboard_active_session_count(state: &HttpState) -> (Option<usize>, Option<String>) {
+    match state.session_manager.sessions.try_read() {
+        Ok(sessions) => {
+            let count = sessions.len();
+            emit_http_active_sessions(count);
+            (Some(count), None)
+        }
+        Err(error) => {
+            let detail =
+                format!("HTTP session manager read lock unavailable for dashboard state: {error}");
+            tracing::error!(
+                code = "MCP_HTTP_DASHBOARD_SESSION_LOCK_UNAVAILABLE",
+                error = %error,
+                "dashboard state did not wait behind the session manager lock"
+            );
+            (None, Some(detail))
+        }
+    }
 }
 
 async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Response {

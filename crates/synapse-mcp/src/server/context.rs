@@ -1255,7 +1255,7 @@ struct M1AimTrackTargetSource {
 
 impl AimTrackTargetSource for M1AimTrackTargetSource {
     fn snapshot(&self) -> AimTrackTargetSnapshot {
-        let input = {
+        let snapshot = {
             let state = match self.m1_state.lock() {
                 Ok(state) => state,
                 Err(_error) => {
@@ -1264,8 +1264,10 @@ impl AimTrackTargetSource for M1AimTrackTargetSource {
                     );
                 }
             };
-            crate::m1::current_input(&state, AIM_TRACK_TARGET_SOURCE_DEPTH)
+            crate::m1::M1ObservationSnapshot::from_state(&state)
         };
+        let input =
+            crate::m1::current_input_from_snapshot(&snapshot, AIM_TRACK_TARGET_SOURCE_DEPTH);
         match input {
             Ok(input) => AimTrackTargetSnapshot {
                 entities: input.entities,

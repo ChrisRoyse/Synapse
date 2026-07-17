@@ -19,8 +19,8 @@ use synapse_perception::ObservationAssembler;
 use synapse_storage::cf;
 
 use super::{
-    Json, ObserveParams, Parameters, SynapseService, current_input, observe_include,
-    populate_audio_summary, populate_clipboard_summary, populate_fs_recent, tool, tool_router,
+    Json, ObserveParams, Parameters, SynapseService, observe_include, populate_audio_summary,
+    populate_clipboard_summary, populate_fs_recent, tool, tool_router,
 };
 use crate::{
     m1::{ObserveSlot, mcp_error},
@@ -1005,12 +1005,15 @@ impl SynapseService {
             window_hwnd: None,
         };
         let include = observe_include(&params);
-        let state = self.m1_state()?;
-        let mut input = current_input(&state, depth)?;
+        let observation_snapshot = {
+            let state = self.m1_state()?;
+            crate::m1::M1ObservationSnapshot::from_state(&state)
+        };
+        let mut input = crate::m1::current_input_from_snapshot(&observation_snapshot, depth)?;
         if include.fs && input.fs_recent.is_empty() {
+            let state = self.m1_state()?;
             let _ = populate_fs_recent(&mut input, &state.fs_recent_tracker);
         }
-        drop(state);
 
         if include.audio && input.audio == AudioContext::default() {
             populate_audio_summary(&self.m3_state, &mut input);

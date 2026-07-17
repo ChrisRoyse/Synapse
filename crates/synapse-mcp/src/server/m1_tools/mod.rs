@@ -32,16 +32,16 @@ use super::{
     ScreenshotResponse, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
     SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
     SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
-    WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
-    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
-    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
-    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
-    tool_router,
+    WindowListResponse, empty_input_schema, mcp_error, observe_include, populate_audio_summary,
+    populate_clipboard_summary, populate_detection_from_state, populate_fs_recent,
+    read_text_request_uncached, resolve_read_text_request, set_capture_target_in_state,
+    set_perception_mode_in_state, set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
-    CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
-    hidden_desktop_input_from_worker_snapshot,
+    CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, M1ObservationSnapshot,
+    build_find_input_from_snapshot, effective_ocr_backend, global_only_input_from_snapshot,
+    hidden_desktop_input_from_worker_snapshot, observe_input_from_snapshot,
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
 use crate::server::session_continuity::PersistedCdpTargetOwner;
@@ -110,6 +110,9 @@ const BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH: &str =
 const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_wait_for condition response plus daemon-tool-events.jsonl";
 const BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS: u64 = 3_000;
+const PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS: u64 = 10_000;
+const PERCEPTION_CDP_ENRICH_TIMEOUT_MS: u64 = 10_000;
+const PERCEPTION_BROWSER_OCR_TIMEOUT_MS: u64 = 10_000;
 
 type OperatorPanicCdpTargetOwnerRows = (
     Vec<(String, CdpTargetOwner)>,
@@ -140,6 +143,122 @@ fn operator_panic_rollback_failed(
             "source_of_truth": "exact browser target identity plus backend cleanup readback",
         })),
     )
+}
+
+fn perception_stage_timeout_error(
+    code: &'static str,
+    tool: &'static str,
+    phase: &'static str,
+    timeout_ms: u64,
+) -> ErrorData {
+    tracing::error!(
+        code = "MCP_PERCEPTION_STAGE_TIMEOUT",
+        tool,
+        phase,
+        timeout_ms,
+        "bounded perception stage timed out"
+    );
+    mcp_error(
+        code,
+        format!(
+            "{tool} {phase} timed out after {timeout_ms} ms; source_of_truth=daemon-tool-events.jsonl plus MCP_HTTP_HEALTH_DONE logs; remediation=inspect the timed stage, foreground app, and in-flight daemon tool ledger before retrying"
+        ),
+    )
+}
+
+fn perception_join_error(
+    tool: &'static str,
+    phase: &'static str,
+    error: tokio::task::JoinError,
+) -> ErrorData {
+    tracing::error!(
+        code = "MCP_PERCEPTION_STAGE_JOIN_ERROR",
+        tool,
+        phase,
+        error = %error,
+        "bounded perception stage task failed"
+    );
+    mcp_error(
+        error_codes::OBSERVE_INTERNAL,
+        format!("{tool} {phase} task failed before producing readback: {error}"),
+    )
+}
+
+async fn await_blocking_observation_gather(
+    tool: &'static str,
+    phase: &'static str,
+    task: tokio::task::JoinHandle<Result<synapse_perception::ObservationInput, ErrorData>>,
+) -> Result<Result<synapse_perception::ObservationInput, ErrorData>, ErrorData> {
+    let timeout = std::time::Duration::from_millis(PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS);
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(perception_join_error(tool, phase, error)),
+        Err(_elapsed) => Err(perception_stage_timeout_error(
+            error_codes::A11Y_UIA_WORKER_TIMEOUT,
+            tool,
+            phase,
+            PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS,
+        )),
+    }
+}
+
+async fn enrich_input_with_cdp_for_target_bounded(
+    input: &mut synapse_perception::ObservationInput,
+    max_depth: u32,
+    max_nodes: usize,
+    target_id_hint: Option<&str>,
+    tool: &'static str,
+) -> Result<(), ErrorData> {
+    let mut candidate = input.clone();
+    let timeout = std::time::Duration::from_millis(PERCEPTION_CDP_ENRICH_TIMEOUT_MS);
+    match tokio::time::timeout(
+        timeout,
+        super::enrich_input_with_cdp_for_target(
+            &mut candidate,
+            max_depth,
+            max_nodes,
+            target_id_hint,
+        ),
+    )
+    .await
+    {
+        Ok(()) => {
+            *input = candidate;
+            Ok(())
+        }
+        Err(_elapsed) => Err(perception_stage_timeout_error(
+            error_codes::A11Y_CDP_EXTENSION_TIMEOUT,
+            tool,
+            "cdp_enrich",
+            PERCEPTION_CDP_ENRICH_TIMEOUT_MS,
+        )),
+    }
+}
+
+async fn enrich_input_with_browser_ocr_bounded(
+    input: &mut synapse_perception::ObservationInput,
+    max_nodes: usize,
+    tool: &'static str,
+) -> Result<(), ErrorData> {
+    let mut candidate = input.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        super::enrich_input_with_browser_ocr(&mut candidate, max_nodes);
+        candidate
+    });
+    let timeout = std::time::Duration::from_millis(PERCEPTION_BROWSER_OCR_TIMEOUT_MS);
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(candidate)) => {
+            *input = candidate;
+            Ok(())
+        }
+        Ok(Err(error)) => Err(perception_join_error(tool, "browser_ocr_enrich", error)),
+        Err(_elapsed) => Err(perception_stage_timeout_error(
+            error_codes::A11Y_UIA_WORKER_TIMEOUT,
+            tool,
+            "browser_ocr_enrich",
+            PERCEPTION_BROWSER_OCR_TIMEOUT_MS,
+        )),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -376,37 +495,44 @@ impl SynapseService {
             target_cdp_id(&target)
         };
         let mut fs_timeline_events = Vec::new();
-        // Scope the (non-Send) state guard so it is released before any await.
-        let mut input = {
+        let observation_snapshot = {
             let state = self.m1_state()?;
-            let mut input = if needs_window {
-                match observe_input(&state, &params.0, target_hwnd) {
-                    Ok(input) => input,
-                    Err(error) if params.0.subtree_root.is_none() => {
-                        let Some(hwnd) = target_hwnd else {
-                            return Err(error);
-                        };
-                        let Some(session_id) = mcp_session_id else {
-                            return Err(error);
-                        };
-                        self.hidden_desktop_observe_input(
-                            session_id,
-                            hwnd,
-                            crate::m1::observe_gather_depth(&params.0),
-                            state.perception_mode,
-                            error,
-                        )?
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                crate::m1::global_only_input(&state)
-            };
-            if include.fs && input.fs_recent.is_empty() {
-                fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
-            }
-            input
+            M1ObservationSnapshot::from_state(&state)
         };
+        let mut input = if needs_window {
+            let snapshot = observation_snapshot.clone();
+            let params_for_gather = params.0.clone();
+            let gather = tokio::task::spawn_blocking(move || {
+                observe_input_from_snapshot(&snapshot, &params_for_gather, target_hwnd)
+            });
+            let gather =
+                await_blocking_observation_gather("observe", "snapshot_gather", gather).await?;
+            match gather {
+                Ok(input) => input,
+                Err(error) if params.0.subtree_root.is_none() => {
+                    let Some(hwnd) = target_hwnd else {
+                        return Err(error);
+                    };
+                    let Some(session_id) = mcp_session_id else {
+                        return Err(error);
+                    };
+                    self.hidden_desktop_observe_input(
+                        session_id,
+                        hwnd,
+                        crate::m1::observe_gather_depth(&params.0),
+                        observation_snapshot.perception_mode,
+                        error,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            global_only_input_from_snapshot(&observation_snapshot)
+        };
+        if include.fs && input.fs_recent.is_empty() {
+            let state = self.m1_state()?;
+            fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
+        }
         if let Some(since) = params.0.since_event_seq {
             input.recent_events.retain(|event| event.seq > since);
         }
@@ -424,14 +550,16 @@ impl SynapseService {
             } else {
                 include.max_subtree_nodes
             };
-            super::enrich_input_with_cdp_for_target(
+            enrich_input_with_cdp_for_target_bounded(
                 &mut input,
                 include.max_subtree_depth,
                 cdp_max_nodes,
                 cdp_target_id_hint.as_deref(),
+                "observe",
             )
-            .await;
-            super::enrich_input_with_browser_ocr(&mut input, include.max_subtree_nodes);
+            .await?;
+            enrich_input_with_browser_ocr_bounded(&mut input, include.max_subtree_nodes, "observe")
+                .await?;
         }
 
         if include.audio && input.audio == synapse_core::AudioContext::default() {
@@ -546,36 +674,47 @@ impl SynapseService {
         } else {
             target_cdp_id(&target)
         };
-        let mut input = {
-            let mut state = self.m1_state()?;
-            match super::build_find_input(&mut state, &params.0, target_hwnd) {
-                Ok(input) => input,
-                Err(error) => {
-                    let Some(hwnd) = target_hwnd else {
-                        return Err(error);
-                    };
-                    let Some(session_id) = mcp_session_id else {
-                        return Err(error);
-                    };
-                    let mut input = self.hidden_desktop_find_input(
-                        session_id,
-                        hwnd,
-                        state.perception_mode,
-                        error,
-                    )?;
-                    populate_detection_from_state(&mut state, &mut input);
-                    input
-                }
+        let observation_snapshot = {
+            let state = self.m1_state()?;
+            M1ObservationSnapshot::from_state(&state)
+        };
+        let snapshot = observation_snapshot.clone();
+        let params_for_gather = params.0.clone();
+        let gather = tokio::task::spawn_blocking(move || {
+            build_find_input_from_snapshot(&snapshot, &params_for_gather, target_hwnd)
+        });
+        let gather = await_blocking_observation_gather("find", "snapshot_gather", gather).await?;
+        let mut input = match gather {
+            Ok(input) => input,
+            Err(error) => {
+                let Some(hwnd) = target_hwnd else {
+                    return Err(error);
+                };
+                let Some(session_id) = mcp_session_id else {
+                    return Err(error);
+                };
+                self.hidden_desktop_find_input(
+                    session_id,
+                    hwnd,
+                    observation_snapshot.perception_mode,
+                    error,
+                )?
             }
         };
-        super::enrich_input_with_cdp_for_target(
+        enrich_input_with_cdp_for_target_bounded(
             &mut input,
             super::find_snapshot_depth(),
             super::find_cdp_max_nodes(),
             cdp_target_id_hint.as_deref(),
+            "find",
         )
-        .await;
-        super::enrich_input_with_browser_ocr(&mut input, super::find_cdp_max_nodes());
+        .await?;
+        enrich_input_with_browser_ocr_bounded(&mut input, super::find_cdp_max_nodes(), "find")
+            .await?;
+        {
+            let mut state = self.m1_state()?;
+            populate_detection_from_state(&mut state, &mut input);
+        }
         let mut response = super::match_find_input(&input, &params.0);
         attach_find_hygiene_annotations(&mut response);
         Ok(Json(response))
@@ -624,11 +763,13 @@ impl SynapseService {
         target_hwnd: Option<i64>,
         mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
-        let normal_result = ({
+        let observation_snapshot = {
             let state = self.m1_state()?;
-            resolve_read_text_request(&state, &params.0, target_hwnd)
-        })
-        .and_then(|request| self.read_text_request_with_cache(request));
+            M1ObservationSnapshot::from_state(&state)
+        };
+        let normal_result =
+            ({ resolve_read_text_request(&observation_snapshot, &params.0, target_hwnd) })
+                .and_then(|request| self.read_text_request_with_cache(request));
         match normal_result {
             Ok(mut result) => {
                 // #1557 fail-closed gate, applied to the final (post-cache)

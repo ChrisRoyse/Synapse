@@ -165,6 +165,30 @@ impl Default for M1State {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct M1ObservationSnapshot {
+    pub active_capture_config: ObservationCaptureConfig,
+    pub capture_runtime: CaptureRuntimeReadback,
+    pub perception_mode: PerceptionMode,
+    pub synthetic: Option<ObservationInput>,
+    pub force_no_perception: bool,
+    pub force_observe_internal: bool,
+}
+
+impl M1ObservationSnapshot {
+    #[must_use]
+    pub fn from_state(state: &M1State) -> Self {
+        Self {
+            active_capture_config: state.active_capture_config.clone(),
+            capture_runtime: state.capture_runtime_readback(),
+            perception_mode: state.perception_mode,
+            synthetic: state.synthetic.clone(),
+            force_no_perception: state.force_no_perception,
+            force_observe_internal: state.force_observe_internal,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveParams {
@@ -3511,31 +3535,40 @@ pub fn observe_gather_depth(params: &ObserveParams) -> u32 {
     params.depth.unwrap_or(default_depth).min(6)
 }
 
-pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, ErrorData> {
-    if state.force_observe_internal {
+fn attach_observation_snapshot_metadata(
+    input: &mut ObservationInput,
+    snapshot: &M1ObservationSnapshot,
+) {
+    input.capture_config = Some(snapshot.active_capture_config.clone());
+    input.capture_runtime = Some(snapshot.capture_runtime.clone());
+    if snapshot.perception_mode != PerceptionMode::Auto {
+        input.mode_override = Some(snapshot.perception_mode);
+    }
+}
+
+pub fn current_input_from_snapshot(
+    snapshot: &M1ObservationSnapshot,
+    depth: u32,
+) -> Result<ObservationInput, ErrorData> {
+    if snapshot.force_observe_internal {
         return Err(mcp_error(
             error_codes::OBSERVE_INTERNAL,
             "forced observe internal error",
         ));
     }
-    if state.force_no_perception {
+    if snapshot.force_no_perception {
         return Err(mcp_error(
             error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
             "no perception source is available",
         ));
     }
-    if let Some(input) = &state.synthetic {
+    if let Some(input) = &snapshot.synthetic {
         let mut input = input_limited_to_depth(input.clone(), depth);
-        if state.perception_mode != PerceptionMode::Auto {
-            input.mode_override = Some(state.perception_mode);
-        }
-        input.capture_config = Some(state.active_capture_config.clone());
-        input.capture_runtime = Some(state.capture_runtime_readback());
+        attach_observation_snapshot_metadata(&mut input, snapshot);
         return Ok(input);
     }
-    let mut input = platform_input(depth, state.perception_mode)?;
-    input.capture_config = Some(state.active_capture_config.clone());
-    input.capture_runtime = Some(state.capture_runtime_readback());
+    let mut input = platform_input(depth, snapshot.perception_mode)?;
+    attach_observation_snapshot_metadata(&mut input, snapshot);
     Ok(input)
 }
 
@@ -3548,7 +3581,7 @@ pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, Er
 /// that the window/foreground perception path refuses to downgrade (#1508). The
 /// caller populates the requested global slots (fs recent, clipboard, audio)
 /// onto the returned input.
-pub fn global_only_input(state: &M1State) -> ObservationInput {
+pub fn global_only_input_from_snapshot(snapshot: &M1ObservationSnapshot) -> ObservationInput {
     // An honest "no window was observed" foreground: hwnd 0, empty process and
     // title. A global-only observe deliberately reads no window, so the
     // foreground carries no borrowed/foreground identity.
@@ -3572,32 +3605,29 @@ pub fn global_only_input(state: &M1State) -> ObservationInput {
         is_dwm_composed: false,
     };
     let mut input = ObservationInput::new(foreground);
-    input.capture_config = Some(state.active_capture_config.clone());
-    input.capture_runtime = Some(state.capture_runtime_readback());
-    if state.perception_mode != PerceptionMode::Auto {
-        input.mode_override = Some(state.perception_mode);
-    }
+    attach_observation_snapshot_metadata(&mut input, snapshot);
     input
 }
 
-pub fn observe_input(
-    state: &M1State,
+pub fn observe_input_from_snapshot(
+    snapshot: &M1ObservationSnapshot,
     params: &ObserveParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
     let depth = observe_gather_depth(params);
     if let Some(element_id) = &params.subtree_root {
-        return element_input_from_id(element_id, depth, state.perception_mode);
+        let mut input = element_input_from_id(element_id, depth, snapshot.perception_mode)?;
+        attach_observation_snapshot_metadata(&mut input, snapshot);
+        return Ok(input);
     }
     // Precedence: explicit per-call window_hwnd > session active target >
     // foreground. The target path snapshots the window without foregrounding it.
     if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
-        let mut input = window_input_from_hwnd(hwnd, depth, state.perception_mode)?;
-        input.capture_config = Some(state.active_capture_config.clone());
-        input.capture_runtime = Some(state.capture_runtime_readback());
+        let mut input = window_input_from_hwnd(hwnd, depth, snapshot.perception_mode)?;
+        attach_observation_snapshot_metadata(&mut input, snapshot);
         return Ok(input);
     }
-    current_input(state, depth)
+    current_input_from_snapshot(snapshot, depth)
 }
 
 /// Attaches CDP (when reachable) and folds the page's DOM/accessibility tree
@@ -4518,21 +4548,20 @@ const FIND_CDP_MAX_NODES: usize = 300;
 /// Builds the perception input a `find` query searches (foreground or a specific
 /// window), including detection entities. Split from matching so the async `find`
 /// handler can fold in CDP web nodes (#685) before matching.
-pub fn build_find_input(
-    state: &mut M1State,
+pub fn build_find_input_from_snapshot(
+    snapshot: &M1ObservationSnapshot,
     params: &FindParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
     // Precedence matches observe: explicit window_hwnd > session target > foreground.
-    let mut input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
-        let mut input = window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, state.perception_mode)?;
-        input.capture_config = Some(state.active_capture_config.clone());
-        input.capture_runtime = Some(state.capture_runtime_readback());
+    let input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
+        let mut input =
+            window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, snapshot.perception_mode)?;
+        attach_observation_snapshot_metadata(&mut input, snapshot);
         input
     } else {
-        current_input(state, FIND_SNAPSHOT_DEPTH)?
+        current_input_from_snapshot(snapshot, FIND_SNAPSHOT_DEPTH)?
     };
-    populate_detection_from_state(state, &mut input);
     Ok(input)
 }
 

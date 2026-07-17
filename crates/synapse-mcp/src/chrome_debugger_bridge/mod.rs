@@ -6298,7 +6298,7 @@ pub fn health_subsystem() -> SubsystemHealth {
     let self_profile_risks = profile_scan.scan.self_profile_surfaces.clone();
     let layout_infobar_risks = external_chrome_layout_infobar_processes();
     let profile_install_state = profile_scan.install_state();
-    let snapshot = match bridge().inner.lock() {
+    let snapshot = match bridge().inner.try_lock() {
         Ok(inner) => {
             let active_host = inner
                 .active_host_id
@@ -6318,7 +6318,16 @@ pub fn health_subsystem() -> SubsystemHealth {
                 inner.pending.len(),
             )
         }
-        Err(_poisoned) => {
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!(
+                    "chrome_bridge_state_lock_busy tab_control_available=false expected_extension_id={EXTENSION_ID}; health is fail-closed and does not wait behind in-flight bridge work"
+                )),
+                ..SubsystemHealth::default()
+            };
+        }
+        Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
             return SubsystemHealth {
                 status: "error".to_owned(),
                 detail: Some(format!(

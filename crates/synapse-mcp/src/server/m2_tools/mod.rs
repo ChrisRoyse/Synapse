@@ -901,10 +901,19 @@ impl SynapseService {
         resolution_phase: &'static str,
     ) -> Result<ElementId, ErrorData> {
         let find_params = set_field_text_locator_find_params(locator, window_hwnd);
-        let input = {
-            let mut state = self.m1_state()?;
-            crate::m1::build_find_input(&mut state, &find_params, Some(window_hwnd))?
+        let observation_snapshot = {
+            let state = self.m1_state()?;
+            crate::m1::M1ObservationSnapshot::from_state(&state)
         };
+        let mut input = crate::m1::build_find_input_from_snapshot(
+            &observation_snapshot,
+            &find_params,
+            Some(window_hwnd),
+        )?;
+        {
+            let mut state = self.m1_state()?;
+            crate::m1::populate_detection_from_state(&mut state, &mut input);
+        }
         let response = crate::m1::match_find_input(&input, &find_params);
         let results = response
             .results
@@ -3041,10 +3050,20 @@ impl SynapseService {
         require_browser_url: bool,
         session_id: Option<&str>,
     ) -> Result<ActTypeTextReadback, ErrorData> {
-        let mut input = {
+        let observation_snapshot = {
             let state = self.m1_state()?;
-            crate::m1::current_input(&state, 6)?
+            crate::m1::M1ObservationSnapshot::from_state(&state)
         };
+        let mut input = tokio::task::spawn_blocking(move || {
+            crate::m1::current_input_from_snapshot(&observation_snapshot, 6)
+        })
+        .await
+        .map_err(|error| {
+            mcp_error(
+                synapse_core::error_codes::OBSERVE_INTERNAL,
+                format!("act_type_text blocking perception gather task failed: {error}"),
+            )
+        })??;
         crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
         crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
         let bridge_target = self
@@ -3517,23 +3536,30 @@ impl SynapseService {
         include_cursor: bool,
         target_window_hwnd: Option<i64>,
     ) -> Result<ClickDeltaSignature, ErrorData> {
-        let mut input = {
+        let observation_snapshot = {
             let state = self.m1_state()?;
-            if let Some(hwnd) = target_window_hwnd {
-                crate::m1::observe_input(
-                    &state,
-                    &crate::m1::ObserveParams {
-                        depth: Some(6),
-                        max_elements: Some(max_elements),
-                        window_hwnd: Some(hwnd),
-                        ..crate::m1::ObserveParams::default()
-                    },
-                    None,
-                )?
-            } else {
-                crate::m1::current_input(&state, 6)?
-            }
+            crate::m1::M1ObservationSnapshot::from_state(&state)
         };
+        let mut input = tokio::task::spawn_blocking(move || {
+            if let Some(hwnd) = target_window_hwnd {
+                let params = crate::m1::ObserveParams {
+                    depth: Some(6),
+                    max_elements: Some(max_elements),
+                    window_hwnd: Some(hwnd),
+                    ..crate::m1::ObserveParams::default()
+                };
+                crate::m1::observe_input_from_snapshot(&observation_snapshot, &params, None)
+            } else {
+                crate::m1::current_input_from_snapshot(&observation_snapshot, 6)
+            }
+        })
+        .await
+        .map_err(|error| {
+            mcp_error(
+                synapse_core::error_codes::OBSERVE_INTERNAL,
+                format!("action delta blocking perception gather task failed: {error}"),
+            )
+        })??;
         crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
         crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
 

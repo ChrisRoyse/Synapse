@@ -5,7 +5,7 @@ use synapse_perception::{
     read_text_with_provider,
 };
 
-use crate::m1::{M1State, ReadTextParams, current_input, mcp_error};
+use crate::m1::{M1ObservationSnapshot, ReadTextParams, current_input_from_snapshot, mcp_error};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadTextCaptureSource {
@@ -51,11 +51,11 @@ impl ResolvedReadTextRequest {
 }
 
 pub fn resolve_read_text_request(
-    state: &M1State,
+    snapshot: &M1ObservationSnapshot,
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
 ) -> Result<ResolvedReadTextRequest, ErrorData> {
-    let (region, capture_source) = text_region(state, params, target_hwnd)?;
+    let (region, capture_source) = text_region(snapshot, params, target_hwnd)?;
     if !matches!(capture_source, ReadTextCaptureSource::WholeWindow { .. }) {
         validate_ocr_region(region)?;
     }
@@ -65,7 +65,7 @@ pub fn resolve_read_text_request(
         requested_backend: params.backend,
         effective_backend: effective_ocr_backend(params.backend)?,
         lang_hint: params.lang_hint.clone(),
-        synthetic: state.synthetic.is_some(),
+        synthetic: snapshot.synthetic.is_some(),
         require_text: params.require_text,
     })
 }
@@ -200,7 +200,7 @@ pub fn ocr_result_from_web_bitmap(
 }
 
 fn text_region(
-    state: &M1State,
+    snapshot: &M1ObservationSnapshot,
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
 ) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
@@ -213,7 +213,7 @@ fn text_region(
         return Ok((region, capture_source));
     }
     if let Some(element_id) = &params.element_id {
-        if state.synthetic.is_none() {
+        if snapshot.synthetic.is_none() {
             let region = synapse_a11y::element_bounding_rect(element_id).map_err(|err| {
                 mcp_error(
                     error_codes::OCR_NO_TEXT,
@@ -222,7 +222,7 @@ fn text_region(
             })?;
             return Ok((region, ReadTextCaptureSource::Screen));
         }
-        let input = current_input(state, 2)?;
+        let input = current_input_from_snapshot(snapshot, 2)?;
         let region = input
             .elements
             .iter()
@@ -238,7 +238,7 @@ fn text_region(
     }
 
     let Some(hwnd) = target_hwnd else {
-        let input = current_input(state, 2)?;
+        let input = current_input_from_snapshot(snapshot, 2)?;
         let region = input.focused.map(|focused| focused.bbox).ok_or_else(|| {
             mcp_error(
                 error_codes::OCR_NO_TEXT,
