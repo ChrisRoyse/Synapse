@@ -509,26 +509,49 @@ impl SynapseService {
 
 impl SynapseService {
     /// Reality-write permission gate (#1559). Passes when EITHER the startup M3
-    /// grants already include the reality-write set OR a non-expired runtime
-    /// `reality_write_grant` overlay is active. The overlay is scoped to exactly
-    /// the reality-write permission set and is consulted ONLY here, so it never
-    /// widens authority for any other tool. The generic `require_m3_permissions`
-    /// path is unchanged for every non-reality tool. Fail-closed: any lock
-    /// failure or unmet permission denies.
+    /// grants already include the requested reality-write permissions OR a
+    /// non-expired runtime `reality_write_grant` overlay is active. The overlay
+    /// is scoped to exactly the reality-write permission set and is consulted
+    /// only by handlers that explicitly call this gate, so unrelated storage
+    /// registries/secrets do not become writable. Fail-closed: any lock failure
+    /// or unmet permission denies.
     pub(super) fn require_reality_write_permissions(
         &self,
         tool: &'static str,
     ) -> Result<(), ErrorData> {
         let required = required_reality_write_permissions();
+        self.require_reality_write_permission_set(tool, &required)
+    }
+
+    /// Variant of [`Self::require_reality_write_permissions`] for tools whose
+    /// persisted mutation is part of the reality model but whose startup grant
+    /// set is narrower than the full delta-reality writer set. The runtime
+    /// overlay may satisfy only permissions inside `required_reality_write_permissions`;
+    /// anything outside that set still requires an explicit startup grant.
+    pub(super) fn require_reality_write_permission_set(
+        &self,
+        tool: &'static str,
+        required: &RequiredPermissions,
+    ) -> Result<(), ErrorData> {
         let mut state = self.m3_state.lock().map_err(|_err| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 "M3 service state lock poisoned",
             )
         })?;
-        // Active runtime overlay satisfies the whole reality-write set. This
+
+        let missing = state.permission_grants.first_missing(required);
+        if missing.is_none() {
+            return Ok(());
+        }
+
+        let overlay_permissions = required_reality_write_permissions();
+        let overlay_can_satisfy = required
+            .iter()
+            .all(|permission| overlay_permissions.contains(permission));
+        // Active runtime overlay satisfies only reality-write permissions. This
         // check also clears an expired overlay so refusal is restored cleanly.
-        if state.reality_write_grant_active() {
+        if overlay_can_satisfy && state.reality_write_grant_active() {
             let remaining_ms = state
                 .reality_write_grant_snapshot()
                 .map(|snapshot| snapshot.remaining_ms);
@@ -541,7 +564,6 @@ impl SynapseService {
             );
             return Ok(());
         }
-        let missing = state.permission_grants.first_missing(&required);
         let config_source = state.permission_grants_source;
         let effective_grants = state.permission_grants.names().join(", ");
         drop(state);
@@ -551,7 +573,8 @@ impl SynapseService {
                 tool,
                 missing_permission = missing.as_str(),
                 config_source,
-                "reality-write denied: no startup grant and no active runtime overlay (#1559)"
+                overlay_can_satisfy,
+                "reality-write denied: no startup grant and no active applicable runtime overlay (#1559)"
             );
             return Err(reality_write_authorization_error(
                 tool,

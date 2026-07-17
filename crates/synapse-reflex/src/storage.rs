@@ -167,6 +167,24 @@ impl ReflexRuntime {
         self.db.scan_cf_from(cf_name, start_key, max_rows)
     }
 
+    /// Returns up to `max_rows` rows in `[start_key, end_key)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family cannot be scanned or the
+    /// backend cannot support a bounded range for that column family's key
+    /// shape.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, start_key_len = start_key.len(), end_key_len = end_key.len(), max_rows))]
+    pub fn storage_cf_rows_range(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_rows: usize,
+    ) -> StorageResult<synapse_storage::ScanWindow> {
+        self.db.scan_cf_range(cf_name, start_key, end_key, max_rows)
+    }
+
     /// Writes a bounded diagnostic batch to storage and flushes it immediately.
     ///
     /// # Errors
@@ -284,6 +302,21 @@ impl ReflexRuntime {
     ) -> StorageResult<ConstellationPutReport> {
         self.db
             .put_episode_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores native Calyx constellations for already-persisted
+    /// episode rows in one backend batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when row measurement or native Calyx
+    /// constellation persistence fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
+    pub fn storage_put_episode_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        self.db.put_episode_constellations(rows)
     }
 
     /// Measures and stores the native Calyx constellation for one already

@@ -7,10 +7,11 @@ use std::{
 };
 
 use calyx_aster::{
-    cf::{ColumnFamily, prefix_range},
+    cf::{ColumnFamily, KeyRange, prefix_range},
     mvcc::tombstone_value,
     wal,
 };
+use calyx_core::Constellation;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
@@ -83,6 +84,18 @@ pub struct StorageDumpRow {
     pub value_encoding: String,
     pub value_content_omitted: bool,
     pub redaction_policy: String,
+}
+
+struct PendingConstellationReport {
+    source_key: Vec<u8>,
+    raw_bytes: Vec<u8>,
+    slot_count: u64,
+    scalar_count: u64,
+}
+
+struct EpisodeConstellationBatch {
+    constellations: Vec<Constellation>,
+    pending_reports: Vec<PendingConstellationReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,6 +214,10 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &EpisodeRecord,
     ) -> StorageResult<ConstellationPutReport>;
+    fn put_episode_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>>;
     fn put_agent_event_constellation(
         &self,
         source_key: &[u8],
@@ -234,6 +251,13 @@ pub trait StorageBackend: Send + Sync {
         &self,
         cf_name: &str,
         start_key: &[u8],
+        max_rows: usize,
+    ) -> StorageResult<ScanWindow>;
+    fn scan_cf_range(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
         max_rows: usize,
     ) -> StorageResult<ScanWindow>;
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>>;
@@ -795,6 +819,68 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
+    fn put_episode_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put episode Calyx constellation batch",
+            true,
+            |vault| {
+                let batch = build_episode_constellation_batch(vault, rows)?;
+                let readbacks = vault
+                    .put_observation_constellation_batch(batch.constellations)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_constellation",
+                            "put episode observation constellation batch",
+                            &source,
+                        )
+                    })?;
+                episode_constellation_reports(
+                    batch.pending_reports,
+                    readbacks,
+                    constellations::duration_us(started.elapsed()),
+                )
+            },
+        );
+        match result {
+            Ok(reports) => {
+                for report in &reports {
+                    constellations::emit_success_metric(report);
+                }
+                let inserted = reports.iter().filter(|report| report.inserted()).count();
+                let deduped = reports.iter().filter(|report| report.deduped()).count();
+                tracing::debug!(
+                    code = "CALYX_EPISODE_CONSTELLATION_BATCH_PUT",
+                    panel_name = SYN_EPISODE_PANEL_NAME,
+                    panel_version = SYN_EPISODE_PANEL_VERSION,
+                    source_cf = cf::CF_EPISODES,
+                    input_rows = rows.len(),
+                    inserted,
+                    deduped,
+                    duration_us = constellations::duration_us(started.elapsed()),
+                    "episode rows measured into native Calyx constellations as one batch"
+                );
+                Ok(reports)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_EPISODE_PANEL_NAME,
+                    cf::CF_EPISODES,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
     fn put_agent_event_constellation(
         &self,
         source_key: &[u8],
@@ -1021,6 +1107,18 @@ impl StorageBackend for CalyxBackend {
             window.push(row);
         }
         Ok((window, more))
+    }
+
+    fn scan_cf_range(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_rows: usize,
+    ) -> StorageResult<ScanWindow> {
+        self.with_vault(cf_name, "scan Calyx KV fixed-key range", false, |vault| {
+            read_fixed_width_rows_from_vault_range(vault, cf_name, start_key, end_key, max_rows)
+        })
     }
 
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>> {
@@ -1673,6 +1771,151 @@ fn read_all_rows_from_vault_filtered(
     }
     decoded.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(decoded)
+}
+
+fn fixed_width_user_key_len(cf_name: &str) -> Option<usize> {
+    match cf_name {
+        cf::CF_TIMELINE => Some(crate::timeline::TIMELINE_KEY_LEN),
+        cf::CF_EPISODES => Some(crate::episodes::EPISODE_KEY_LEN),
+        _ => None,
+    }
+}
+
+fn read_fixed_width_rows_from_vault_range(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    start_key: &[u8],
+    end_key: &[u8],
+    max_rows: usize,
+) -> StorageResult<ScanWindow> {
+    let Some(key_len) = fixed_width_user_key_len(cf_name) else {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail:
+                "bounded Calyx range scan is only available for fixed-width key column families"
+                    .to_owned(),
+        });
+    };
+    if start_key.len() != key_len || end_key.len() != key_len {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "bounded Calyx range scan for {cf_name} requires {key_len}-byte keys; got start={} end={}",
+                start_key.len(),
+                end_key.len()
+            ),
+        });
+    }
+    if start_key >= end_key {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "bounded Calyx range scan requires start_key < end_key".to_owned(),
+        });
+    }
+
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = KeyRange {
+        start: encode_calyx_key_for_read(cf_name, collection_id, start_key)?,
+        end: Some(encode_calyx_key_for_read(cf_name, collection_id, end_key)?),
+    };
+    let rows = vault
+        .scan_kv_range_at(vault.latest_seq_value(), &range)
+        .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV fixed-key range", &source))?;
+    let now_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
+    let mut decoded = Vec::with_capacity(rows.len().min(max_rows));
+    let mut more = false;
+    for (key, value) in rows {
+        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &key)?;
+        let envelope = decode_calyx_value_raw(&value).map_err(|detail| {
+            tracing::error!(
+                code = error_codes::STORAGE_READ_FAILED,
+                cf = cf_name,
+                detail,
+                "Calyx storage backend rejected malformed KV retention envelope during bounded range scan"
+            );
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail,
+            }
+        })?;
+        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+            continue;
+        }
+        if decoded.len() == max_rows {
+            more = true;
+            break;
+        }
+        decoded.push((user_key, envelope.payload.to_vec()));
+    }
+    Ok((decoded, more))
+}
+
+fn build_episode_constellation_batch(
+    vault: &SynapseCalyxVault,
+    rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
+) -> StorageResult<EpisodeConstellationBatch> {
+    let vault_id = vault.vault_id_value();
+    let created_at_ms = calyx_clock_now_for_write(vault, cf::CF_EPISODES)?;
+    let next_ledger_seq = vault.latest_seq().saturating_add(1);
+    let mut constellations = Vec::with_capacity(rows.len());
+    let mut pending_reports = Vec::with_capacity(rows.len());
+    for (source_key, raw_bytes, record) in rows {
+        let context = NativeConstellationContext {
+            vault_id,
+            cx_id: vault.cx_id_for_input(raw_bytes, SYN_EPISODE_PANEL_VERSION),
+            created_at_ms,
+            next_ledger_seq,
+        };
+        let constellation =
+            constellations::build_episode_constellation(context, source_key, raw_bytes, record)?;
+        pending_reports.push(PendingConstellationReport {
+            source_key: source_key.clone(),
+            raw_bytes: raw_bytes.clone(),
+            slot_count: constellation.slots.len() as u64,
+            scalar_count: constellation.scalars.len() as u64,
+        });
+        constellations.push(constellation);
+    }
+    Ok(EpisodeConstellationBatch {
+        constellations,
+        pending_reports,
+    })
+}
+
+fn episode_constellation_reports(
+    pending: Vec<PendingConstellationReport>,
+    readbacks: Vec<SynapseCalyxObservationPutReadback>,
+    duration_us: u64,
+) -> StorageResult<Vec<ConstellationPutReport>> {
+    if readbacks.len() != pending.len() {
+        return Err(calyx_write_failed_detail(
+            "calyx_constellation",
+            format!(
+                "episode constellation batch returned {} readbacks for {} inputs",
+                readbacks.len(),
+                pending.len()
+            ),
+        ));
+    }
+    Ok(pending
+        .into_iter()
+        .zip(readbacks)
+        .map(|(input, readback)| {
+            constellation_report(ConstellationReportInput {
+                panel_name: SYN_EPISODE_PANEL_NAME,
+                panel_version: SYN_EPISODE_PANEL_VERSION,
+                source_cf: cf::CF_EPISODES,
+                source_key: &input.source_key,
+                raw_bytes: &input.raw_bytes,
+                readback,
+                slot_count: input.slot_count,
+                scalar_count: input.scalar_count,
+                duration_us,
+            })
+        })
+        .collect())
 }
 
 fn latest_calyx_seq(vault: &SynapseCalyxVault) -> u64 {

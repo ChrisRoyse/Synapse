@@ -199,10 +199,11 @@ pub const REALITY_WRITE_GRANT_MAX_TTL: Duration = Duration::from_mins(15);
 /// yields reality-write capability and there was no usable opt-in. This overlay
 /// is that opt-in: when active (non-expired) it satisfies EXACTLY the
 /// reality-write permission set (`READ_STORAGE`/`WRITE_STORAGE`/`READ_EVENTS`)
-/// and is consulted ONLY by the reality-write enforcement path — it never widens
-/// authority for any other tool or permission. Expiry is authoritative from the
-/// monotonic `Instant` (mirrors the input-lease module), immune to wall-clock
-/// changes; `granted_at`/`expires_at` are wall-clock copies for human readback.
+/// and is consulted only by explicit reality-write enforcement paths — it never
+/// widens authority for unrelated storage registries, secrets, or generic M3
+/// permissions. Expiry is authoritative from the monotonic `Instant` (mirrors
+/// the input-lease module), immune to wall-clock changes; `granted_at`/`expires_at`
+/// are wall-clock copies for human readback.
 #[derive(Clone, Debug)]
 pub struct RealityWriteGrant {
     granted_by: String,

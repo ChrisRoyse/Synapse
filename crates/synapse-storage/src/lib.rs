@@ -397,6 +397,22 @@ impl Db {
             .put_episode_constellation(source_key, raw_bytes, record)
     }
 
+    /// Measures and stores native Calyx constellations for persisted
+    /// `CF_EPISODES` rows in one backend batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(row_count = rows.len(), backend = self.backend_name()))]
+    pub fn put_episode_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, synapse_core::types::EpisodeRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        self.backend.put_episode_constellations(rows)
+    }
+
     /// Measures and stores the native Calyx constellation for one persisted
     /// `CF_AGENT_EVENTS` row.
     ///
@@ -519,6 +535,24 @@ impl Db {
         max_rows: usize,
     ) -> StorageResult<ScanWindow> {
         self.backend.scan_cf_from(cf_name, start_key, max_rows)
+    }
+
+    /// Scans up to `max_rows` rows in `[start_key, end_key)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family cannot be scanned or the
+    /// range is invalid for the backend.
+    #[tracing::instrument(skip_all, fields(cf_name, start_key_len = start_key.len(), end_key_len = end_key.len(), max_rows, backend = self.backend_name()))]
+    pub fn scan_cf_range(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_rows: usize,
+    ) -> StorageResult<ScanWindow> {
+        self.backend
+            .scan_cf_range(cf_name, start_key, end_key, max_rows)
     }
 
     /// Scans up to `max_rows` rows from the end of one column family.

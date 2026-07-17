@@ -1981,7 +1981,7 @@ impl SynapseService {
             dry_run = params.0.dry_run,
             "tool.invocation kind=episode_segment"
         );
-        self.require_m3_permissions(
+        self.require_reality_write_permission_set(
             "episode_segment",
             &crate::m3::episodes::required_permissions(&params.0),
         )?;

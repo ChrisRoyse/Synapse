@@ -998,6 +998,41 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Writes a batch of content-addressed observations through Aster's native
+    /// constellation ingestion path under one durable commit lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if schema validation,
+    /// duplicate compatibility checks, ledger append, WAL commit, or any
+    /// native Base/Slot/Scalars row write fails.
+    pub fn put_observation_constellation_batch<I>(
+        &self,
+        constellations: I,
+    ) -> Result<Vec<SynapseCalyxObservationPutReadback>, SynapseCalyxError>
+    where
+        I: IntoIterator<Item = Constellation>,
+    {
+        let outcomes = self
+            .vault
+            .put_observation_batch_with_outcomes(constellations)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "put native Calyx observation constellation batch",
+                    &error,
+                )
+            })?;
+        let latest_seq = self.vault.latest_seq();
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| SynapseCalyxObservationPutReadback {
+                cx_id: outcome.cx_id.to_string(),
+                disposition: outcome.disposition.into(),
+                latest_seq,
+            })
+            .collect())
+    }
+
     /// Runs one physical Aster compaction attempt for the Synapse KV storage CF.
     ///
     /// Synapse maps its storage column families onto namespaces inside Aster's

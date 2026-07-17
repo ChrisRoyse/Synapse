@@ -40,7 +40,8 @@ use super::{
 };
 
 /// Maximum timeline rows scanned per call; a larger range pauses at a day
-/// boundary and returns `next_start_ts_ns`.
+/// boundary and returns `next_start_ts_ns`. A single day exceeding this budget
+/// fails before mutation instead of running past the MCP call window.
 pub const MAX_SCAN_ROWS_PER_CALL: usize = 200_000;
 /// Maximum local days replaced per call.
 pub const MAX_DAYS_PER_CALL: u32 = 92;
@@ -279,38 +280,37 @@ fn day_timeline_rows(
     day_end_ns: u64,
     scanned_rows: &mut u64,
     invalid_rows: &mut u64,
-) -> Result<(Vec<TimelineRecord>, Option<u64>), ErrorData> {
+) -> Result<Vec<TimelineRecord>, ErrorData> {
     let mut records = Vec::new();
-    let mut next_populated_ts: Option<u64> = None;
     let mut start = timeline_codec::timeline_scan_start(day_start_ns);
-    'scan: loop {
+    let end = timeline_codec::timeline_scan_start(day_end_ns);
+    loop {
         let (rows, more) = runtime
-            .storage_cf_rows_from(cf::CF_TIMELINE, &start, SCAN_CHUNK_ROWS)
+            .storage_cf_rows_range(cf::CF_TIMELINE, &start, &end, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             break;
         }
         for (key, value) in &rows {
             *scanned_rows += 1;
+            if usize::try_from(*scanned_rows).unwrap_or(usize::MAX) > MAX_SCAN_ROWS_PER_CALL {
+                return Err(internal(format!(
+                    "EPISODE_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS_PER_CALL} CF_TIMELINE rows while reading day {day_start_ns}..{day_end_ns}; no episode rows were replaced for this day"
+                )));
+            }
             match timeline_codec::decode_timeline_key(key) {
-                Ok((ts_ns, _seq)) => {
-                    if ts_ns >= day_end_ns {
-                        next_populated_ts = Some(ts_ns);
-                        break 'scan;
+                Ok((_ts_ns, _seq)) => match decode_json::<TimelineRecord>(value) {
+                    Ok(record) => records.push(record),
+                    Err(error) => {
+                        *invalid_rows += 1;
+                        tracing::warn!(
+                            code = "TIMELINE_ROW_DECODE_FAILED",
+                            key_hex = %hex_encode(key),
+                            %error,
+                            "episode_segment skipped an undecodable CF_TIMELINE row"
+                        );
                     }
-                    match decode_json::<TimelineRecord>(value) {
-                        Ok(record) => records.push(record),
-                        Err(error) => {
-                            *invalid_rows += 1;
-                            tracing::warn!(
-                                code = "TIMELINE_ROW_DECODE_FAILED",
-                                key_hex = %hex_encode(key),
-                                %error,
-                                "episode_segment skipped an undecodable CF_TIMELINE row"
-                            );
-                        }
-                    }
-                }
+                },
                 Err(error) => {
                     *invalid_rows += 1;
                     tracing::warn!(
@@ -329,7 +329,7 @@ fn day_timeline_rows(
         let Some(last) = last else { break };
         start = key_after(&last);
     }
-    Ok((records, next_populated_ts))
+    Ok(records)
 }
 
 /// Existing `CF_EPISODES` keys with start timestamps in `[start_ns, end_ns)`.
@@ -340,21 +340,17 @@ fn existing_episode_keys(
 ) -> Result<Vec<Vec<u8>>, ErrorData> {
     let mut keys = Vec::new();
     let mut start = episode_codec::episode_scan_start(start_ns);
-    'scan: loop {
+    let end = episode_codec::episode_scan_start(end_ns);
+    loop {
         let (rows, more) = runtime
-            .storage_cf_rows_from(cf::CF_EPISODES, &start, SCAN_CHUNK_ROWS)
+            .storage_cf_rows_range(cf::CF_EPISODES, &start, &end, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             break;
         }
         for (key, _value) in &rows {
             match episode_codec::decode_episode_key(key) {
-                Ok((ts_ns, _ordinal)) => {
-                    if ts_ns >= end_ns {
-                        break 'scan;
-                    }
-                    keys.push(key.clone());
-                }
+                Ok((_ts_ns, _ordinal)) => keys.push(key.clone()),
                 Err(error) => {
                     // A malformed derived-state key is corruption we own:
                     // refuse to replace around it rather than strand it.
@@ -482,7 +478,7 @@ pub fn segment_episodes(
         let day_end = next_local_day_start(day_start)?;
         let end_is_day_boundary = day_end < range_end_snapped;
 
-        let (records, next_populated_ts) = day_timeline_rows(
+        let records = day_timeline_rows(
             &runtime,
             day_start,
             day_end,
@@ -519,7 +515,12 @@ pub fn segment_episodes(
         }
         let deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
-        let measurement_rows = new_rows.clone();
+        let measurement_rows = new_rows
+            .iter()
+            .cloned()
+            .zip(segmentation.episodes.iter().cloned())
+            .map(|((key, value), episode)| (key, value, episode))
+            .collect::<Vec<_>>();
         if !params.dry_run && (deleted > 0 || written > 0) {
             runtime
                 .storage_replace_rows(cf::CF_EPISODES, stale_keys, new_rows)
@@ -537,27 +538,27 @@ pub fn segment_episodes(
         let mut constellations_deduped = 0_u64;
         let mut constellation_failures = 0_u64;
         if !params.dry_run {
-            for ((key, value), episode) in measurement_rows.iter().zip(segmentation.episodes.iter())
-            {
-                match runtime.storage_put_episode_constellation(key, value, episode) {
-                    Ok(report) if report.inserted() => {
-                        constellations_inserted = constellations_inserted.saturating_add(1);
+            match runtime.storage_put_episode_constellations(&measurement_rows) {
+                Ok(reports) => {
+                    for report in reports {
+                        if report.inserted() {
+                            constellations_inserted = constellations_inserted.saturating_add(1);
+                        } else if report.deduped() {
+                            constellations_deduped = constellations_deduped.saturating_add(1);
+                        }
                     }
-                    Ok(report) if report.deduped() => {
-                        constellations_deduped = constellations_deduped.saturating_add(1);
-                    }
-                    Ok(_report) => {}
-                    Err(error) => {
-                        constellation_failures = constellation_failures.saturating_add(1);
-                        tracing::error!(
-                            code = "CALYX_EPISODE_CONSTELLATION_MEASUREMENT_FAILED",
-                            day_start_ns = day_start,
-                            day_end_ns = day_end,
-                            key_hex = %hex_encode(key),
-                            detail = %error,
-                            "episode row was written but native Calyx constellation measurement failed"
-                        );
-                    }
+                }
+                Err(error) => {
+                    constellation_failures =
+                        u64::try_from(measurement_rows.len()).unwrap_or(u64::MAX);
+                    tracing::error!(
+                        code = "CALYX_EPISODE_CONSTELLATION_BATCH_FAILED",
+                        day_start_ns = day_start,
+                        day_end_ns = day_end,
+                        episode_rows = measurement_rows.len(),
+                        detail = %error,
+                        "episode rows were written but native Calyx constellation batch measurement failed"
+                    );
                 }
             }
             if constellation_failures > 0 {
@@ -609,23 +610,7 @@ pub fn segment_episodes(
             "episode_segment replaced one local day"
         );
 
-        // Skip empty stretches fast, but never past days holding stale
-        // episodes: jump to the next populated timeline day (clamped to the
-        // range) unless a skipped day still holds episode rows to clean.
-        let target_day = match next_populated_ts {
-            Some(ts_ns) => local_day_start(ts_ns)?.clamp(day_end, range_end_snapped),
-            None => range_end_snapped,
-        };
-        day_start = if target_day > day_end {
-            let stale_between = existing_episode_keys(&runtime, day_end, target_day)?;
-            if stale_between.is_empty() {
-                target_day
-            } else {
-                day_end
-            }
-        } else {
-            day_end
-        };
+        day_start = day_end;
     }
 
     response.scanned_rows = scanned_rows;
