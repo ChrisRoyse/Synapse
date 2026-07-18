@@ -614,6 +614,10 @@ $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
 $processToolSurfaceSnapshotAtStart = $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
 $script:SynapseMcpProtocolVersion = '2025-06-18'
+# The setup-time MCP readback runs immediately after daemon replacement, while
+# the real Calyx store and Codex reconnect path may still be warming. Keep this
+# finite and diagnostic-rich; do not use the short interactive request budget.
+$script:SynapseSetupMcpRequestTimeoutSec = 120
 # DELETE waits for the daemon's real lifecycle cleanup/readbacks. On the
 # operator Calyx vault, cold post-start cleanup can exceed the old 20s budget.
 $script:SynapseMcpSessionDeleteTimeoutSec = 120
@@ -2773,6 +2777,26 @@ function Get-SynapseDaemonStartupLogSignal {
         'M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY',
         'M4_SHELL_JOB_REAP_STARTUP',
         'MCP_DAEMON_STORAGE_AND_CALYX_OPEN_START',
+        'SYNAPSE_CALYX_VAULT_OPEN_START',
+        'SYNAPSE_CALYX_VAULT_LOCK_ACQUIRED',
+        'SYNAPSE_CALYX_ASTER_OPEN_START',
+        'CALYX_ASTER_RECOVERY_START',
+        'CALYX_ASTER_RECOVERY_MANIFEST_LOADED',
+        'CALYX_ASTER_MANIFESTED_BATCHES_READ_START',
+        'CALYX_ASTER_MANIFESTED_BATCHES_READ_PROGRESS',
+        'CALYX_ASTER_MANIFESTED_BATCHES_READ_DONE',
+        'CALYX_ASTER_RECOVERY_DONE',
+        'CALYX_ASTER_ROUTER_OPEN_START',
+        'CALYX_ASTER_ROUTER_LOAD_START',
+        'CALYX_ASTER_ROUTER_LOAD_DISCOVERY_PROGRESS',
+        'CALYX_ASTER_ROUTER_LOAD_CF_DONE',
+        'CALYX_ASTER_SST_LOOKUP_BUILD_START',
+        'CALYX_ASTER_SST_LOOKUP_BUILD_PROGRESS',
+        'CALYX_ASTER_SST_LOOKUP_BUILD_DONE',
+        'CALYX_ASTER_ROUTER_LOAD_DONE',
+        'CALYX_ASTER_ROUTER_OPEN_DONE',
+        'CALYX_ASTER_ROUTER_OPEN_FAILED',
+        'SYNAPSE_CALYX_ASTER_OPEN_FAILED',
         'SYNAPSE_CALYX_MATH_BACKEND_SELECTED',
         'SYNAPSE_CALYX_VAULT_OPENED',
         'STORAGE_BACKEND_OPENED',
@@ -2844,6 +2868,152 @@ function Format-SynapseDaemonStartupLogSignal {
     }) -join "`n")
 }
 
+function Get-SynapseCalyxPhysicalSnapshot {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $snapshot = [ordered]@{
+        schema = 'synapse_calyx_physical_snapshot/v1'
+        path = $Path
+        exists = $false
+        current_pointer = $null
+        current_manifest_path = $null
+        current_manifest_seq = $null
+        current_manifest_durable_seq = $null
+        current_manifest_derived_content_seq = $null
+        current_manifest_error = $null
+        manifest_file_count = 0
+        manifest_bytes = 0
+        cf_file_count = 0
+        cf_bytes = 0
+        wal_segment_count = 0
+        wal_bytes = 0
+        largest_wal = $null
+        lock_path = (Join-Path $Path 'vault.lock')
+        lock_exists = $false
+        pid_path = (Join-Path $Path 'vault.pid')
+        pid_sidecar = $null
+        pid_process_exists = $null
+        pid_process_name = $null
+        pid_process_exe = $null
+        pid_process_command = $null
+        error = $null
+    }
+
+    try {
+        $snapshot.exists = Test-Path -LiteralPath $Path -PathType Container
+        if (-not $snapshot.exists) {
+            return [pscustomobject]$snapshot
+        }
+
+        $currentPath = Join-Path $Path 'CURRENT'
+        if (Test-Path -LiteralPath $currentPath -PathType Leaf) {
+            try {
+                $snapshot.current_pointer = (Get-Content -LiteralPath $currentPath -Raw).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($snapshot.current_pointer)) {
+                    $manifestPath = Join-Path $Path $snapshot.current_pointer
+                    $snapshot.current_manifest_path = $manifestPath
+                    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+                        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+                        $snapshot.current_manifest_seq = $manifest.manifest_seq
+                        $snapshot.current_manifest_durable_seq = $manifest.durable_seq
+                        $snapshot.current_manifest_derived_content_seq = $manifest.derived_content_seq
+                    } else {
+                        $snapshot.current_manifest_error = "CURRENT target missing: $manifestPath"
+                    }
+                }
+            } catch {
+                $snapshot.current_manifest_error = $_.Exception.Message
+            }
+        }
+
+        $manifestFiles = @(Get-ChildItem -LiteralPath $Path -Filter 'manifest-*.json' -File -ErrorAction SilentlyContinue)
+        if ($manifestFiles.Count -gt 0) {
+            $snapshot.manifest_file_count = $manifestFiles.Count
+            $snapshot.manifest_bytes = ($manifestFiles | Measure-Object Length -Sum).Sum
+        }
+
+        $cfRoot = Join-Path $Path 'cf'
+        if (Test-Path -LiteralPath $cfRoot -PathType Container) {
+            $cfFiles = @(Get-ChildItem -LiteralPath $cfRoot -Recurse -File -ErrorAction SilentlyContinue)
+            if ($cfFiles.Count -gt 0) {
+                $snapshot.cf_file_count = $cfFiles.Count
+                $snapshot.cf_bytes = ($cfFiles | Measure-Object Length -Sum).Sum
+            }
+        }
+
+        $walRoot = Join-Path $Path 'wal'
+        if (Test-Path -LiteralPath $walRoot -PathType Container) {
+            $walFiles = @(Get-ChildItem -LiteralPath $walRoot -Filter '*.wal' -File -ErrorAction SilentlyContinue)
+            if ($walFiles.Count -gt 0) {
+                $snapshot.wal_segment_count = $walFiles.Count
+                $snapshot.wal_bytes = ($walFiles | Measure-Object Length -Sum).Sum
+                $largest = $walFiles | Sort-Object Length -Descending | Select-Object -First 1
+                if ($largest) {
+                    $snapshot.largest_wal = [ordered]@{
+                        name = $largest.Name
+                        bytes = $largest.Length
+                        last_write_utc = $largest.LastWriteTimeUtc.ToString('o')
+                    }
+                }
+            }
+        }
+
+        $snapshot.lock_exists = Test-Path -LiteralPath $snapshot.lock_path -PathType Leaf
+        if (Test-Path -LiteralPath $snapshot.pid_path -PathType Leaf) {
+            try {
+                $pidText = (Get-Content -LiteralPath $snapshot.pid_path -Raw).Trim()
+                $snapshot.pid_sidecar = $pidText
+                $pidJson = $pidText | ConvertFrom-Json
+                $sidecarPid = [int]$pidJson.pid
+                $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$sidecarPid" -ErrorAction SilentlyContinue
+                $snapshot.pid_process_exists = ($null -ne $proc)
+                if ($proc) {
+                    $snapshot.pid_process_name = $proc.Name
+                    $snapshot.pid_process_exe = $proc.ExecutablePath
+                    $snapshot.pid_process_command = $proc.CommandLine
+                }
+            } catch {
+                $snapshot.pid_sidecar = "read_or_decode_failed: $($_.Exception.Message)"
+            }
+        }
+    } catch {
+        $snapshot.error = $_.Exception.Message
+    }
+    return [pscustomobject]$snapshot
+}
+
+function Get-SynapseDefaultCalyxVaultPath {
+    if (-not [string]::IsNullOrWhiteSpace($env:SYNAPSE_CALYX_VAULT_DIR)) {
+        return $env:SYNAPSE_CALYX_VAULT_DIR
+    }
+    return (Join-Path $env:APPDATA 'synapse\vault')
+}
+
+function Format-SynapseCalyxPhysicalSnapshot {
+    param([AllowNull()]$Snapshot)
+    if ($null -eq $Snapshot) {
+        return '<none>'
+    }
+    return ($Snapshot | ConvertTo-Json -Compress -Depth 8)
+}
+
+function Format-SynapseDaemonStartupPhysicalState {
+    param(
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [string]$CalyxVaultPath
+    )
+
+    $dbSnapshot = Get-SynapseCalyxPhysicalSnapshot -Path $DbPath
+    $vaultPath = $CalyxVaultPath
+    if ([string]::IsNullOrWhiteSpace($vaultPath)) {
+        $vaultPath = Get-SynapseDefaultCalyxVaultPath
+    }
+    $vaultSnapshot = Get-SynapseCalyxPhysicalSnapshot -Path $vaultPath
+    return ("storage_db={0}`ncalyx_vault={1}" -f `
+        (Format-SynapseCalyxPhysicalSnapshot -Snapshot $dbSnapshot),
+        (Format-SynapseCalyxPhysicalSnapshot -Snapshot $vaultSnapshot))
+}
+
 function Get-SynapseDaemonStartupProgressKey {
     param([AllowNull()]$Signal)
 
@@ -2867,6 +3037,24 @@ function Test-SynapseInstallHealthProgressSignalCanExtend {
         'M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY',
         'M4_SHELL_JOB_REAP_STARTUP',
         'MCP_DAEMON_STORAGE_AND_CALYX_OPEN_START',
+        'SYNAPSE_CALYX_VAULT_OPEN_START',
+        'SYNAPSE_CALYX_VAULT_LOCK_ACQUIRED',
+        'SYNAPSE_CALYX_ASTER_OPEN_START',
+        'CALYX_ASTER_RECOVERY_START',
+        'CALYX_ASTER_RECOVERY_MANIFEST_LOADED',
+        'CALYX_ASTER_MANIFESTED_BATCHES_READ_START',
+        'CALYX_ASTER_MANIFESTED_BATCHES_READ_PROGRESS',
+        'CALYX_ASTER_MANIFESTED_BATCHES_READ_DONE',
+        'CALYX_ASTER_RECOVERY_DONE',
+        'CALYX_ASTER_ROUTER_OPEN_START',
+        'CALYX_ASTER_ROUTER_LOAD_START',
+        'CALYX_ASTER_ROUTER_LOAD_DISCOVERY_PROGRESS',
+        'CALYX_ASTER_ROUTER_LOAD_CF_DONE',
+        'CALYX_ASTER_SST_LOOKUP_BUILD_START',
+        'CALYX_ASTER_SST_LOOKUP_BUILD_PROGRESS',
+        'CALYX_ASTER_SST_LOOKUP_BUILD_DONE',
+        'CALYX_ASTER_ROUTER_LOAD_DONE',
+        'CALYX_ASTER_ROUTER_OPEN_DONE',
         'SYNAPSE_CALYX_MATH_BACKEND_SELECTED',
         'SYNAPSE_CALYX_VAULT_OPENED',
         'STORAGE_BACKEND_OPENED',
@@ -3746,7 +3934,7 @@ function Invoke-SynapseMcpHttpPost {
         [Parameter(Mandatory=$true)]$Params,
         [int]$Id = 0,
         [string]$SessionId,
-        [int]$TimeoutSec = 8
+        [int]$TimeoutSec = $script:SynapseSetupMcpRequestTimeoutSec
     )
 
     $headers = @{
@@ -3784,7 +3972,18 @@ function Invoke-SynapseMcpHttpPost {
             StatusCode = $response.StatusCode
         }
     } catch {
-        Die "SYNAPSE_MCP_TOOL_SURFACE_READ_FAILED stage=$Method bind=$Bind error=$($_.Exception.Message) remediation=repair streamable HTTP MCP before accepting setup"
+        $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $tcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
+        $processes = @(Get-SynapseMcpProcessSnapshot)
+        Die ("SYNAPSE_MCP_TOOL_SURFACE_READ_FAILED stage={0} bind={1} timeout_s={2} session_id={3} error={4}`nlisteners:`n{5}`ntcp_clients:`n{6}`nprocesses:`n{7}`nremediation=repair streamable HTTP MCP before accepting setup. If process/socket SoT is healthy, inspect MCP session lifecycle/storage logs for slow initialize/tools/list/tool-call handling and raise the bounded setup MCP budget only with measured evidence." -f `
+            $Method,
+            $Bind,
+            $TimeoutSec,
+            ($(if ([string]::IsNullOrWhiteSpace($SessionId)) { '<none>' } else { $SessionId })),
+            $_.Exception.Message,
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
+            (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients),
+            (Format-SynapseMcpProcessSnapshot -Snapshot $processes))
     }
 }
 
@@ -3823,7 +4022,7 @@ function Invoke-SynapseSetupMcpTool {
         [Parameter(Mandatory=$true)]$Arguments,
         [string]$Profile,
         [string]$ProfileReason,
-        [int]$TimeoutSec = 8
+        [int]$TimeoutSec = $script:SynapseSetupMcpRequestTimeoutSec
     )
 
     $sessionId = $null
@@ -4894,14 +5093,16 @@ function Test-SynapseCandidateDaemon {
         if ($null -eq $health) {
             $alive = [bool](Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)
             $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $candidateBind)
-            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} last_error={6} remediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
+            $candidatePhysicalState = Format-SynapseDaemonStartupPhysicalState -DbPath $candidateDb -CalyxVaultPath $candidateCalyxVault
+            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} last_error={6}`nphysical_storage_state:`n{7}`nremediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
                 $CandidateExePath,
                 $candidateHash,
                 $candidate.Id,
                 $alive,
                 $candidateBind,
                 (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
-                $lastHealthError)
+                $lastHealthError,
+                $candidatePhysicalState)
         }
 
         $healthPid = [int]$health.pid
@@ -6330,12 +6531,45 @@ function Request-SynapseChromeBridgeMaintenancePause {
             }
         }
     } else {
-        $detail = "health_preflight_unreadable attempts=$($healthAttempts.Count); proceeding_to_maintenance_pause_post because the POST endpoint is the authoritative bridge pause acknowledgement gate"
-        Info ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_PREFLIGHT_UNREADABLE_PROCEEDING reason={0} bind={1} attempts={2} last_error={3}" -f `
+        $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $tcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
+        $liveListeners = @($listeners | Where-Object { $_.OwnerExists })
+        $liveTcpClients = @($tcpClients | Where-Object { $_.HasLivePeer -and [int]$_.PeerOwningProcess -gt 0 })
+        if ($liveListeners.Count -eq 0 -and $liveTcpClients.Count -eq 0) {
+            $detail = "health_preflight_unreadable attempts=$($healthAttempts.Count); socket_sot=reachable_daemon_endpoint_absent live_listener_count=0 live_tcp_clients=0"
+            Info ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_NO_REACHABLE_DAEMON_ENDPOINT reason={0} bind={1} attempts={2} last_error={3}`nlisteners:`n{4}`ntcp_clients:`n{5}`nremediation=/health is unreadable and the independent process/socket Source of Truth proves there is no live HTTP endpoint or live bridge/client peer to acknowledge. Setup will continue only through exact verified synapse-mcp.exe PID stop and a separate bind-release readback." -f `
+                $Reason,
+                $Bind,
+                $healthAttempts.Count,
+                $healthAttempts[-1].error,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
+                (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
+            return [pscustomobject]@{
+                Ok = $true
+                Skipped = $true
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_NO_REACHABLE_DAEMON_ENDPOINT'
+                Response = [pscustomobject]@{
+                    health = $null
+                    health_attempts = $healthAttempts
+                    listeners = $listeners
+                    tcp_clients = $tcpClients
+                }
+                Error = $null
+                Detail = $detail
+                Attempts = @()
+            }
+        }
+
+        $detail = "health_preflight_unreadable attempts=$($healthAttempts.Count); live_listener_count=$($liveListeners.Count); live_tcp_clients=$($liveTcpClients.Count); proceeding_to_maintenance_pause_post because the POST endpoint is the authoritative bridge pause acknowledgement gate when a live daemon endpoint or live client peer exists"
+        Info ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_PREFLIGHT_UNREADABLE_PROCEEDING reason={0} bind={1} attempts={2} last_error={3} live_listener_count={4} live_tcp_clients={5}`nlisteners:`n{6}`ntcp_clients:`n{7}" -f `
             $Reason,
             $Bind,
             $healthAttempts.Count,
-            $healthAttempts[-1].error)
+            $healthAttempts[-1].error,
+            $liveListeners.Count,
+            $liveTcpClients.Count,
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
+            (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
         if ($Reason -eq 'install_health_failed_rollback' -and
             $script:SynapseManualInstallHealthRollbackProbe -and
             $script:SynapseManualInstallHealthRollbackPauseMode -eq 'force_unacknowledged') {
@@ -7944,13 +8178,11 @@ while ((Get-Date) -lt $installHealthDeadline) {
         $progressKey = Get-SynapseDaemonStartupProgressKey -Signal $progressStartupLog
         $phaseCanExtend = Test-SynapseInstallHealthProgressSignalCanExtend -ProgressKey $progressKey
         $candidateAlive = ($progressTargets.Count -gt 0)
-        if ($candidateAlive -and $phaseCanExtend) {
-            $now = Get-Date
-            $progressChanged = ($progressKey -ne $lastInstallHealthProgressKey)
-            if ($progressChanged) {
-                $lastInstallHealthProgressKey = $progressKey
-                $lastInstallHealthProgressAt = $now
-            }
+        $now = Get-Date
+        $progressChanged = ($progressKey -ne $lastInstallHealthProgressKey)
+        if ($candidateAlive -and $phaseCanExtend -and $progressChanged) {
+            $lastInstallHealthProgressKey = $progressKey
+            $lastInstallHealthProgressAt = $now
             $proposedDeadline = $now.AddSeconds($installHealthProgressWindowSeconds)
             if ($proposedDeadline -gt $installHealthHardDeadline) {
                 $proposedDeadline = $installHealthHardDeadline
@@ -7969,6 +8201,12 @@ while ((Get-Date) -lt $installHealthDeadline) {
                     ((@($progressTargets | ForEach-Object { $_.ProcessId })) -join ','),
                     $progressKey)
             }
+        } elseif ($candidateAlive -and $phaseCanExtend -and -not $progressChanged) {
+            Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS_UNCHANGED_NO_DEADLINE_EXTENSION attempt={0} remaining_s={1} candidate_pids={2} phase_key={3}" -f `
+                $installHealthAttempt,
+                $remainingSeconds,
+                ((@($progressTargets | ForEach-Object { $_.ProcessId })) -join ','),
+                $progressKey)
         }
         Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS attempt={0} remaining_s={1} last_health_error={2}`nlisteners:`n{3}`nprocesses:`n{4}`nstartup_log:`n{5}" -f `
             $installHealthAttempt,
@@ -7983,7 +8221,8 @@ if (-not $ok) {
     $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
     $failureStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $installHealthStartedAtUtc
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} hard_cap_s={5} progress_window_s={6} progress_extensions={7} last_progress_at={8} last_health_error={9} last_subsystem_statuses={10} manual_probe={11} manual_probe_pause_mode={12}`nlisteners:`n{13}`nprocesses:`n{14}`nstartup_log:`n{15}`nremediation=inspect {16} and synapse.log.* under {17} for launch / STORAGE_* / bind errors" -f `
+    $failurePhysicalState = Format-SynapseDaemonStartupPhysicalState -DbPath $DbPath
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} hard_cap_s={5} progress_window_s={6} progress_extensions={7} last_progress_at={8} last_health_error={9} last_subsystem_statuses={10} manual_probe={11} manual_probe_pause_mode={12}`nlisteners:`n{13}`nprocesses:`n{14}`nstartup_log:`n{15}`nphysical_storage_state:`n{16}`nremediation=inspect {17} and synapse.log.* under {18} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
@@ -8000,6 +8239,7 @@ if (-not $ok) {
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
         (Format-SynapseDaemonStartupLogSignal -Signal $failureStartupLog),
+        $failurePhysicalState,
         $launcherLog,
         $LogDir)
 

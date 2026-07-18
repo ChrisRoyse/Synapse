@@ -12,7 +12,7 @@ use crate::resource::{
     LeaseRegistry, LeaseView, MemtableCfStatus, MemtableStatus, ResourceCounters,
 };
 use crate::sst::SstSummary;
-use calyx_core::{Clock, Result, Seq, Ts};
+use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
@@ -67,6 +67,7 @@ pub struct VersionedCfStore {
     rows: RwLock<RowTable>,
     router: RwLock<Option<CfRouter>>,
     router_latest_readback: AtomicBool,
+    router_eager_lookup_on_refresh: AtomicBool,
     read_barriers: RwLock<Vec<ReadBarrier>>,
     leases: LeaseRegistry,
     resource_counters: Arc<ResourceCounters>,
@@ -83,6 +84,7 @@ impl VersionedCfStore {
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(None),
             router_latest_readback: AtomicBool::new(false),
+            router_eager_lookup_on_refresh: AtomicBool::new(true),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
             resource_counters: Arc::new(ResourceCounters::default()),
@@ -92,6 +94,15 @@ impl VersionedCfStore {
     }
 
     pub fn new_with_router(start_seq: Seq, router: CfRouter) -> Self {
+        Self::new_with_router_and_policy(start_seq, router, false, true)
+    }
+
+    pub fn new_with_router_and_policy(
+        start_seq: Seq,
+        router: CfRouter,
+        router_latest_readback: bool,
+        eager_lookup_on_refresh: bool,
+    ) -> Self {
         let resource_counters = router.resource_counters();
         Self {
             seqs: SeqAllocator::new(start_seq),
@@ -99,7 +110,8 @@ impl VersionedCfStore {
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(Some(router)),
-            router_latest_readback: AtomicBool::new(false),
+            router_latest_readback: AtomicBool::new(router_latest_readback),
+            router_eager_lookup_on_refresh: AtomicBool::new(eager_lookup_on_refresh),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
             resource_counters,
@@ -109,9 +121,104 @@ impl VersionedCfStore {
     }
 
     pub fn new_with_router_latest_readback(start_seq: Seq, router: CfRouter) -> Self {
-        let store = Self::new_with_router(start_seq, router);
-        store.router_latest_readback.store(true, Ordering::Release);
-        store
+        Self::new_with_router_and_policy(start_seq, router, true, false)
+    }
+
+    pub(crate) fn refresh_router_cfs_from_disk(
+        &self,
+        cfs: &[ColumnFamily],
+        operation: &'static str,
+    ) -> Result<()> {
+        self.refresh_router_cfs_after_reclaim(cfs, operation, || Ok(()))
+    }
+
+    pub(crate) fn refresh_router_cfs_after_reclaim<T>(
+        &self,
+        cfs: &[ColumnFamily],
+        operation: &'static str,
+        reclaim: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut unique = cfs.to_vec();
+        unique.sort();
+        unique.dedup();
+        if unique.is_empty() {
+            return reclaim();
+        }
+        let eager_lookup = self.router_eager_lookup_on_refresh.load(Ordering::Acquire);
+        let cf_names = unique
+            .iter()
+            .map(|cf| cf.name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let started_at = std::time::Instant::now();
+        let mut router = self.router.write().expect("mvcc router poisoned");
+        let Some(router) = router.as_mut() else {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "{operation}: physical SST reclaim requires a live CF router; cfs={cf_names}"
+            )));
+        };
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_START",
+            operation,
+            cfs = %cf_names,
+            eager_lookup_on_refresh = eager_lookup,
+            "starting exclusive Calyx router reclaim refresh"
+        );
+        let reclaim_result = reclaim();
+        let refresh_result = router.load_existing_cfs_with_lookup_policy(&unique, eager_lookup);
+        match (reclaim_result, refresh_result) {
+            (Ok(value), Ok(())) => {
+                tracing::info!(
+                    code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_DONE",
+                    operation,
+                    cfs = %cf_names,
+                    eager_lookup_on_refresh = eager_lookup,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "completed exclusive Calyx router reclaim refresh"
+                );
+                Ok(value)
+            }
+            (Err(error), Ok(())) => {
+                tracing::error!(
+                    code = error.code,
+                    operation,
+                    cfs = %cf_names,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "Calyx physical SST reclaim failed; router was refreshed to the post-attempt disk state"
+                );
+                Err(error)
+            }
+            (Ok(_), Err(error)) => {
+                tracing::error!(
+                    code = error.code,
+                    operation,
+                    cfs = %cf_names,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "Calyx router refresh failed after physical SST reclaim"
+                );
+                Err(error)
+            }
+            (Err(reclaim_error), Err(refresh_error)) => {
+                tracing::error!(
+                    code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_FAILED",
+                    operation,
+                    cfs = %cf_names,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    reclaim_error = %reclaim_error,
+                    refresh_error = %refresh_error,
+                    "Calyx physical SST reclaim and router refresh both failed"
+                );
+                Err(CalyxError::aster_corrupt_shard(format!(
+                    "{operation}: physical SST reclaim failed and router refresh could not prove the serving view; reclaim_error=[{}: {}] refresh_error=[{}: {}]",
+                    reclaim_error.code,
+                    reclaim_error.message,
+                    refresh_error.code,
+                    refresh_error.message
+                )))
+            }
+        }
     }
 
     /// Latest committed sequence.

@@ -437,8 +437,8 @@ pub struct CalyxBackend {
 impl CalyxBackend {
     pub fn open(path: &Path, schema_version: u32) -> StorageResult<Self> {
         let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
-        let vault =
-            SynapseCalyxVault::open(config).map_err(|source| calyx_open_failed(path, &source))?;
+        let vault = SynapseCalyxVault::open_latest_readback(config)
+            .map_err(|source| calyx_open_failed(path, &source))?;
         verify_calyx_schema_version(&vault, path, schema_version)?;
         Ok(Self {
             path: path.to_path_buf(),

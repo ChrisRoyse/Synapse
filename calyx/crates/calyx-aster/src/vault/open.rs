@@ -46,30 +46,65 @@ where
                 selected.dedup();
             }
         }
+        let router_started_at = std::time::Instant::now();
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_OPEN_START",
+            vault_dir = %vault_dir.as_ref().display(),
+            selected_cfs = ?selected_cfs,
+            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            router_latest_readback = recovery.router_latest_readback,
+            "opening Calyx CF router"
+        );
         let router = match &selected_cfs {
-            Some(cfs) => CfRouter::open_selected_cfs_with_tiering_and_crypto(
+            Some(cfs) => CfRouter::open_selected_cfs_with_tiering_crypto_and_lookup_policy(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
                 cfs.iter().copied(),
                 options.tiering_policy.clone(),
                 options.value_crypto.clone(),
-            )?,
-            None => CfRouter::open_with_tiering_and_crypto(
+                options.eager_router_lookup_on_open,
+            ),
+            None => CfRouter::open_with_tiering_crypto_and_lookup_policy(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
                 options.tiering_policy.clone(),
                 options.value_crypto.clone(),
-            )?,
+                options.eager_router_lookup_on_open,
+            ),
         };
+        let router = match router {
+            Ok(router) => router,
+            Err(error) => {
+                tracing::error!(
+                    code = "CALYX_ASTER_ROUTER_OPEN_FAILED",
+                    vault_dir = %vault_dir.as_ref().display(),
+                    selected_cfs = ?selected_cfs,
+                    eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+                    elapsed_ms = router_started_at.elapsed().as_millis(),
+                    error = %error,
+                    "Calyx CF router open failed"
+                );
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_OPEN_DONE",
+            vault_dir = %vault_dir.as_ref().display(),
+            selected_cfs = ?selected_cfs,
+            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            elapsed_ms = router_started_at.elapsed().as_millis(),
+            "opened Calyx CF router"
+        );
         if recovery.migrate_derived_content_model {
             recovery.derived_content_floor_seq =
                 router.prove_persistent_search_content_watermark(recovery.wal_replay_floor_seq)?;
         }
-        let rows = if recovery.router_latest_readback {
-            VersionedCfStore::new_with_router_latest_readback(recovery.last_recovered_seq, router)
-        } else {
-            VersionedCfStore::new_with_router(recovery.last_recovered_seq, router)
-        };
+        let rows = VersionedCfStore::new_with_router_and_policy(
+            recovery.last_recovered_seq,
+            router,
+            recovery.router_latest_readback,
+            options.eager_router_lookup_on_open,
+        );
         // Derived-content watermark (issue #1100): the manifest floor vouches
         // for checkpointed seqs; replayed batches below re-derive the rest
         // from their CFs.

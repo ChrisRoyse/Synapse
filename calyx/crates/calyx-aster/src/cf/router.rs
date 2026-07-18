@@ -38,6 +38,10 @@ pub struct CfRouter {
 }
 
 impl CfRouter {
+    pub(super) fn vault_dir(&self) -> &Path {
+        &self.vault_dir
+    }
+
     pub(crate) fn prove_persistent_search_content_watermark(
         &self,
         durable_seq: u64,
@@ -85,6 +89,24 @@ impl CfRouter {
         tiering_policy: Option<TieringPolicy>,
         value_crypto: Option<SharedVaultContext>,
     ) -> Result<Self> {
+        Self::open_selected_cfs_with_tiering_crypto_and_lookup_policy(
+            vault_dir,
+            memtable_byte_cap,
+            cfs,
+            tiering_policy,
+            value_crypto,
+            true,
+        )
+    }
+
+    pub(crate) fn open_selected_cfs_with_tiering_crypto_and_lookup_policy(
+        vault_dir: impl AsRef<Path>,
+        memtable_byte_cap: usize,
+        cfs: impl IntoIterator<Item = ColumnFamily>,
+        tiering_policy: Option<TieringPolicy>,
+        value_crypto: Option<SharedVaultContext>,
+        eager_lookup_on_open: bool,
+    ) -> Result<Self> {
         let selected = cfs.into_iter().collect::<BTreeSet<_>>();
         if selected.is_empty() {
             return Err(CalyxError::aster_corrupt_shard(
@@ -96,7 +118,10 @@ impl CfRouter {
         for cf in &selected {
             router.ensure_cf(*cf)?;
         }
-        router.load_existing_cfs(&selected.into_iter().collect::<Vec<_>>())?;
+        router.load_existing_cfs_with_lookup_policy(
+            &selected.into_iter().collect::<Vec<_>>(),
+            eager_lookup_on_open,
+        )?;
         Ok(router)
     }
 
@@ -114,12 +139,28 @@ impl CfRouter {
         tiering_policy: Option<TieringPolicy>,
         value_crypto: Option<SharedVaultContext>,
     ) -> Result<Self> {
+        Self::open_with_tiering_crypto_and_lookup_policy(
+            vault_dir,
+            memtable_byte_cap,
+            tiering_policy,
+            value_crypto,
+            true,
+        )
+    }
+
+    pub(crate) fn open_with_tiering_crypto_and_lookup_policy(
+        vault_dir: impl AsRef<Path>,
+        memtable_byte_cap: usize,
+        tiering_policy: Option<TieringPolicy>,
+        value_crypto: Option<SharedVaultContext>,
+        eager_lookup_on_open: bool,
+    ) -> Result<Self> {
         let mut router =
             Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy, value_crypto)?;
         for cf in ColumnFamily::STATIC {
             router.ensure_cf(cf)?;
         }
-        router.load_existing()?;
+        router.load_existing_with_lookup_policy(eager_lookup_on_open)?;
         Ok(router)
     }
 

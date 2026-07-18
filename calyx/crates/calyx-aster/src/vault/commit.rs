@@ -171,6 +171,9 @@ where
         if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
             crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
         }
+        if let Some(anchor) = crate::ledger_head::newest_checkpoint_from_rows(rows)? {
+            crate::ledger_head::write_checkpoint_anchor(durable.root(), &anchor)?;
+        }
         let mvcc_seq = match self.commit_rows_to_mvcc(rows) {
             Ok(seq) => seq,
             Err(mvcc_error) => {

@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Result};
-use calyx_ledger::{LedgerHeadAnchor, LedgerRow, decode};
+use calyx_ledger::{CheckpointPayload, EntryKind, LedgerHeadAnchor, LedgerRow, decode};
+use serde::{Deserialize, Serialize};
 
 use crate::cf::ColumnFamily;
 use crate::ledger_view::parse_aster_ledger_seq;
@@ -10,9 +11,55 @@ use crate::vault::encode::WriteRow;
 
 const LEDGER_HEAD_DIR: &str = "ledger_head";
 const LEDGER_HEAD_FILE: &str = "current.json";
+const LEDGER_CHECKPOINT_FILE: &str = "latest_checkpoint.json";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LedgerCheckpointAnchor {
+    pub seq: u64,
+    pub entry_hash: [u8; 32],
+    pub range_start: u64,
+    pub range_end: u64,
+}
+
+impl LedgerCheckpointAnchor {
+    pub(crate) fn from_checkpoint_payload(
+        seq: u64,
+        entry_hash: [u8; 32],
+        payload: &CheckpointPayload,
+    ) -> Result<Self> {
+        let anchor = Self {
+            seq,
+            entry_hash,
+            range_start: payload.range_start,
+            range_end: payload.range_end,
+        };
+        anchor.validate()?;
+        Ok(anchor)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.range_start > self.range_end {
+            return Err(CalyxError::ledger_corrupt(format!(
+                "Aster ledger checkpoint pointer range {}..{} is invalid",
+                self.range_start, self.range_end
+            )));
+        }
+        if self.seq != self.range_end {
+            return Err(CalyxError::ledger_corrupt(format!(
+                "Aster ledger checkpoint pointer seq {} does not match checkpoint range_end {}",
+                self.seq, self.range_end
+            )));
+        }
+        Ok(())
+    }
+}
 
 pub fn head_anchor_path(vault: &Path) -> PathBuf {
     vault.join(LEDGER_HEAD_DIR).join(LEDGER_HEAD_FILE)
+}
+
+pub(crate) fn checkpoint_anchor_path(vault: &Path) -> PathBuf {
+    vault.join(LEDGER_HEAD_DIR).join(LEDGER_CHECKPOINT_FILE)
 }
 
 pub fn read_head_anchor(vault: &Path) -> Result<Option<LedgerHeadAnchor>> {
@@ -48,6 +95,46 @@ pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Resu
     crate::fsync::write_atomic_replace(&path, &bytes, "Aster ledger head")
 }
 
+pub(crate) fn read_checkpoint_anchor(vault: &Path) -> Result<Option<LedgerCheckpointAnchor>> {
+    let path = checkpoint_anchor_path(vault);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        CalyxError::disk_pressure(format!("read Aster ledger checkpoint pointer: {error}"))
+    })?;
+    let anchor = serde_json::from_slice::<LedgerCheckpointAnchor>(&bytes).map_err(|error| {
+        CalyxError::ledger_corrupt(format!("decode Aster ledger checkpoint pointer: {error}"))
+    })?;
+    anchor.validate()?;
+    Ok(Some(anchor))
+}
+
+pub(crate) fn write_checkpoint_anchor(vault: &Path, anchor: &LedgerCheckpointAnchor) -> Result<()> {
+    anchor.validate()?;
+    if let Some(current) = read_checkpoint_anchor(vault)? {
+        if anchor.seq < current.seq {
+            return Err(CalyxError::ledger_append_only_violation(format!(
+                "Aster ledger checkpoint pointer regressed from {} to {}",
+                current.seq, anchor.seq
+            )));
+        }
+        if anchor.seq == current.seq {
+            if anchor != &current {
+                return Err(CalyxError::ledger_append_only_violation(
+                    "Aster ledger checkpoint pointer changed at the same seq",
+                ));
+            }
+            return Ok(());
+        }
+    }
+    let path = checkpoint_anchor_path(vault);
+    let bytes = serde_json::to_vec(anchor).map_err(|error| {
+        CalyxError::ledger_corrupt(format!("encode Aster ledger checkpoint pointer: {error}"))
+    })?;
+    crate::fsync::write_atomic_replace(&path, &bytes, "Aster ledger checkpoint pointer")
+}
+
 pub(crate) fn newest_anchor_from_rows(rows: &[WriteRow]) -> Result<Option<LedgerHeadAnchor>> {
     let mut newest = None;
     for row in rows.iter().filter(|row| row.cf == ColumnFamily::Ledger) {
@@ -71,6 +158,56 @@ pub(crate) fn newest_anchor_from_rows(rows: &[WriteRow]) -> Result<Option<Ledger
             LedgerHeadAnchor::new(height, hash)
         })
         .transpose()
+}
+
+pub(crate) fn newest_checkpoint_from_rows(
+    rows: &[WriteRow],
+) -> Result<Option<LedgerCheckpointAnchor>> {
+    let mut newest = None;
+    for row in rows.iter().filter(|row| row.cf == ColumnFamily::Ledger) {
+        let key_seq = parse_aster_ledger_seq(&row.key)?;
+        let entry = decode(&row.value)?;
+        if key_seq != entry.seq {
+            return Err(CalyxError::ledger_corrupt(format!(
+                "Aster ledger key seq {key_seq} does not match entry seq {}",
+                entry.seq
+            )));
+        }
+        if entry.kind != EntryKind::Admin {
+            continue;
+        }
+        let Some(payload) = CheckpointPayload::decode_optional(&entry.payload)? else {
+            continue;
+        };
+        let checkpoint =
+            LedgerCheckpointAnchor::from_checkpoint_payload(entry.seq, entry.entry_hash, &payload)?;
+        if newest
+            .as_ref()
+            .is_none_or(|current: &LedgerCheckpointAnchor| checkpoint.seq > current.seq)
+        {
+            newest = Some(checkpoint);
+        }
+    }
+    Ok(newest)
+}
+
+pub(crate) fn checkpoint_anchor_from_row(
+    row: &LedgerRow,
+) -> Result<Option<LedgerCheckpointAnchor>> {
+    let entry = decode(&row.bytes)?;
+    if row.seq != entry.seq {
+        return Err(CalyxError::ledger_corrupt(format!(
+            "Aster ledger checkpoint row key seq {} does not match entry seq {}",
+            row.seq, entry.seq
+        )));
+    }
+    if entry.kind != EntryKind::Admin {
+        return Ok(None);
+    }
+    let Some(payload) = CheckpointPayload::decode_optional(&entry.payload)? else {
+        return Ok(None);
+    };
+    LedgerCheckpointAnchor::from_checkpoint_payload(entry.seq, entry.entry_hash, &payload).map(Some)
 }
 
 pub(crate) fn require_head_anchor_for_rows(

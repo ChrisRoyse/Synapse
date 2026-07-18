@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MANIFESTED_BATCH_PROGRESS_FILE_INTERVAL: usize = 10_000;
+
 pub(super) fn read_manifested_batches(
     root: &Path,
     tiering_policy: Option<&TieringPolicy>,
@@ -17,6 +19,15 @@ pub(super) fn read_manifested_batches(
     if durable_seq == 0 {
         return Ok(Vec::new());
     }
+    tracing::info!(
+        code = "CALYX_ASTER_MANIFESTED_BATCHES_READ_START",
+        vault_dir = %root.display(),
+        durable_seq,
+        "starting Calyx manifested durable-batch readback"
+    );
+    let mut sst_files_read = 0_usize;
+    let mut rows_read = 0_usize;
+    let mut bytes_read = 0_u64;
     for cf_root in tiered_cf_roots(root, tiering_policy) {
         if !cf_root.exists() {
             continue;
@@ -55,6 +66,9 @@ pub(super) fn read_manifested_batches(
                 if seq > durable_seq {
                     continue;
                 }
+                let file_len = fs::metadata(&path)
+                    .map_err(|error| storage_error("stat SST for recovery readback", error))?
+                    .len();
                 let reader = SstReader::open(&path)?;
                 for (row_offset, row) in reader.iter()?.into_iter().enumerate() {
                     by_seq.entry(seq).or_default().push((
@@ -65,12 +79,26 @@ pub(super) fn read_manifested_batches(
                             value: row.value,
                         },
                     ));
+                    rows_read += 1;
+                }
+                sst_files_read += 1;
+                bytes_read = bytes_read.saturating_add(file_len);
+                if sst_files_read.is_multiple_of(MANIFESTED_BATCH_PROGRESS_FILE_INTERVAL) {
+                    tracing::info!(
+                        code = "CALYX_ASTER_MANIFESTED_BATCHES_READ_PROGRESS",
+                        vault_dir = %root.display(),
+                        durable_seq,
+                        sst_files_read,
+                        rows_read,
+                        bytes_read,
+                        "Calyx manifested durable-batch readback progress"
+                    );
                 }
             }
         }
     }
 
-    Ok(by_seq
+    let batches = by_seq
         .into_iter()
         .map(|(seq, mut rows)| {
             rows.sort_by_key(|(index, _)| *index);
@@ -79,7 +107,18 @@ pub(super) fn read_manifested_batches(
                 rows: rows.into_iter().map(|(_, row)| row).collect(),
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    tracing::info!(
+        code = "CALYX_ASTER_MANIFESTED_BATCHES_READ_DONE",
+        vault_dir = %root.display(),
+        durable_seq,
+        sst_files_read,
+        rows_read,
+        bytes_read,
+        batch_count = batches.len(),
+        "completed Calyx manifested durable-batch readback"
+    );
+    Ok(batches)
 }
 
 /// Lists every on-disk CF that can feed the persistent search generation.

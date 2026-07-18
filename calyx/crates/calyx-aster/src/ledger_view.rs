@@ -24,7 +24,7 @@ use crate::sst::SstEntry;
 use crate::vault::encode::decode_write_batch;
 use crate::wal::{replay_dir_after, stream_records};
 pub use point_read::{LedgerPointReadTierStats, LedgerPointReadTrace};
-use point_read::{read_sst_ledger_rows, unresolved_seqs};
+use point_read::{read_complete_sst_ledger_rows, read_sst_ledger_rows, unresolved_seqs};
 pub use query_index::{LedgerQueryOpenStats, LedgerQuerySnapshot, LedgerQueryVisitStats};
 
 /// Read-only snapshot of a vault's Ledger column family (SSTs + WAL).
@@ -212,15 +212,7 @@ pub fn read_ledger_seqs_traced(
     read_ledger_seqs_unlocked_traced(vault, seqs, None)
 }
 
-pub(crate) fn read_ledger_seqs_unlocked_with_tiering(
-    vault: &Path,
-    seqs: &BTreeSet<u64>,
-    tiering_policy: Option<&TieringPolicy>,
-) -> CalyxResult<BTreeMap<u64, LedgerRow>> {
-    Ok(read_ledger_seqs_unlocked_traced(vault, seqs, tiering_policy)?.0)
-}
-
-fn read_ledger_seqs_unlocked_traced(
+pub(crate) fn read_ledger_seqs_unlocked_traced(
     vault: &Path,
     seqs: &BTreeSet<u64>,
     tiering_policy: Option<&TieringPolicy>,
@@ -246,6 +238,10 @@ fn read_ledger_seqs_unlocked_traced(
             0,
             started,
         );
+    }
+    let unresolved = unresolved_seqs(seqs, &rows);
+    if !layout.ledger_cf_dirs.is_empty() && !unresolved.is_empty() {
+        read_complete_sst_ledger_rows(&layout.ledger_cf_dirs, &unresolved, &mut rows, &mut trace)?;
     }
     Ok((
         rows.into_iter()

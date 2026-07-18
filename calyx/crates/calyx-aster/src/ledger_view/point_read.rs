@@ -13,9 +13,9 @@ use std::time::Instant;
 /// Every tier reports how many seqs it was asked to resolve, how many it
 /// actually resolved, how many SST files it opened doing so, and how long it
 /// took. FSV asserts the resolution path from this record: on a healthy vault
-/// the `commit_ordered` tier resolves everything the exact-name fast path
-/// missed with O(k log n) file opens, and `complete_scan` reports
-/// `wanted == 0` (never entered).
+/// the `commit_ordered` tier resolves durable SST rows with O(k log n) file
+/// opens, WAL-tail rows are checked before the exhaustive audit, and
+/// `complete_scan` is absent on healthy startup hydration.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LedgerPointReadTierStats {
     pub tier: &'static str,
@@ -129,24 +129,34 @@ pub(super) fn read_sst_ledger_rows(
         );
     }
 
-    // Tier 4 (`complete_scan`): the semantic source of truth — every ledger
-    // SST. Correct but O(total files); a healthy vault must resolve every
-    // seq before this tier (FSV asserts `wanted == 0` here from the trace).
+    Ok(())
+}
+
+pub(super) fn read_complete_sst_ledger_rows(
+    ledger_dirs: &[PathBuf],
+    wanted: &BTreeSet<u64>,
+    rows: &mut BTreeMap<u64, Vec<u8>>,
+    trace: &mut LedgerPointReadTrace,
+) -> CalyxResult<()> {
+    // Final tier (`complete_scan`): the semantic source of truth — every
+    // Ledger SST. This runs only after the WAL tail has been inspected, because
+    // unflushed tail rows are expected to be absent from SSTs during startup.
     let unresolved = unresolved_seqs(wanted, rows);
-    if !unresolved.is_empty() {
-        let started = Instant::now();
-        let before = rows.len();
-        let candidates = complete_ledger_sst_candidates(ledger_dirs, &unresolved)?;
-        let files_opened = candidates.len();
-        read_rows_from_candidate_level(candidates, &unresolved, rows)?;
-        trace.record(
-            "complete_scan",
-            unresolved.len(),
-            rows.len() - before,
-            files_opened,
-            started,
-        );
+    if unresolved.is_empty() {
+        return Ok(());
     }
+    let started = Instant::now();
+    let before = rows.len();
+    let candidates = complete_ledger_sst_candidates(ledger_dirs, &unresolved)?;
+    let files_opened = candidates.len();
+    read_rows_from_candidate_level(candidates, &unresolved, rows)?;
+    trace.record(
+        "complete_scan",
+        unresolved.len(),
+        rows.len() - before,
+        files_opened,
+        started,
+    );
     Ok(())
 }
 

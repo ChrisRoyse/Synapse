@@ -122,7 +122,11 @@ where
                     manifest_durable_seq,
                 )?;
                 let net = report.input_bytes.saturating_sub(report.output_bytes) as usize;
-                reclaim_snapshot_inputs(&report)?;
+                self.rows.refresh_router_cfs_after_reclaim(
+                    &[cf],
+                    "reclaim snapshot GC inputs",
+                    || reclaim_snapshot_inputs(&report),
+                )?;
                 bytes_freed = bytes_freed.saturating_add(net);
             }
         }

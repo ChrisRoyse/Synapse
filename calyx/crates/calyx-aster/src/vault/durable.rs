@@ -47,6 +47,11 @@ pub struct VaultOptions {
     /// latest-read workloads that use the CF router as the source of truth
     /// and do not request historical reads.
     pub restore_mvcc_rows: bool,
+    /// Builds validated SST point-lookup metadata during router open. Keep this
+    /// enabled for full-restore handles that must prove every historical row at
+    /// open; disable for latest-readback startup so large routers validate
+    /// lazily when a read touches the relevant SST.
+    pub eager_router_lookup_on_open: bool,
     /// Restores the full in-memory ledger hook on open. Disable only for
     /// explicitly read-only handles that verify/search latest state without
     /// appending ledger entries.
@@ -74,6 +79,7 @@ impl Default for VaultOptions {
             disk_pressure_guard: None,
             value_crypto: None,
             restore_mvcc_rows: true,
+            eager_router_lookup_on_open: true,
             restore_ledger_hook: true,
             read_only: false,
             selected_cfs: None,
@@ -220,8 +226,29 @@ impl DurableVault {
     ) -> Result<RecoveredBatches> {
         Self::validate_options(options)?;
         let root = root.as_ref();
+        tracing::info!(
+            code = "CALYX_ASTER_RECOVERY_START",
+            vault_dir = %root.display(),
+            restore_mvcc_rows = options.restore_mvcc_rows,
+            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            restore_ledger_hook = options.restore_ledger_hook,
+            read_only = options.read_only,
+            selected_cfs = ?options.selected_cfs,
+            "starting Calyx Aster recovery"
+        );
         if root.join("CURRENT").exists() {
             let recovery = recover_vault(root)?;
+            tracing::info!(
+                code = "CALYX_ASTER_RECOVERY_MANIFEST_LOADED",
+                vault_dir = %root.display(),
+                manifest_seq = recovery.manifest.manifest_seq,
+                durable_seq = recovery.manifest.durable_seq,
+                derived_content_seq = recovery.manifest.effective_derived_content_seq(),
+                wal_record_count = recovery.wal_records.len(),
+                restore_mvcc_rows = options.restore_mvcc_rows,
+                eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+                "loaded Calyx Aster manifest recovery state"
+            );
             if let Some(policy) = &recovery.manifest.dedup_policy {
                 validate_dedup_policy(policy, options.panel.as_ref())?;
             }
@@ -250,8 +277,21 @@ impl DurableVault {
                     )?,
                 });
             }
+            let recovered_row_count = batches.iter().map(|batch| batch.rows.len()).sum::<usize>();
             let migrate_derived_content_model =
                 !recovery.manifest.uses_persistent_search_content_model();
+            tracing::info!(
+                code = "CALYX_ASTER_RECOVERY_DONE",
+                vault_dir = %root.display(),
+                batch_count = batches.len(),
+                row_count = recovered_row_count,
+                last_recovered_seq = recovery.last_recovered_seq,
+                wal_replay_floor_seq = recovery.manifest.durable_seq,
+                router_latest_readback,
+                migrate_derived_content_model,
+                torn_tail = ?recovery.torn_tail,
+                "completed Calyx Aster recovery planning"
+            );
             return Ok(RecoveredBatches {
                 batches,
                 last_recovered_seq: recovery.last_recovered_seq,
@@ -272,7 +312,7 @@ impl DurableVault {
 
         let replay = replay_dir(root.join("wal"))?;
         let last_recovered_seq = replay.records.last().map_or(0, |record| record.seq);
-        let batches = replay
+        let batches: Vec<RecoveredBatch> = replay
             .records
             .iter()
             .map(|record| {
@@ -285,6 +325,22 @@ impl DurableVault {
                 })
             })
             .collect::<Result<_>>()?;
+        let recovered_row_count = batches
+            .iter()
+            .map(|batch: &RecoveredBatch| batch.rows.len())
+            .sum::<usize>();
+        tracing::info!(
+            code = "CALYX_ASTER_RECOVERY_DONE",
+            vault_dir = %root.display(),
+            batch_count = batches.len(),
+            row_count = recovered_row_count,
+            last_recovered_seq,
+            wal_replay_floor_seq = 0_u64,
+            router_latest_readback = false,
+            migrate_derived_content_model = false,
+            torn_tail = ?replay.torn_tail,
+            "completed Calyx Aster WAL-only recovery planning"
+        );
         Ok(RecoveredBatches {
             batches,
             last_recovered_seq,

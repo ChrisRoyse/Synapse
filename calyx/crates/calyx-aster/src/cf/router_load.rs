@@ -12,10 +12,26 @@ use calyx_core::{CalyxError, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+const ROUTER_LOAD_PROGRESS_FILE_INTERVAL: usize = 10_000;
 
 impl CfRouter {
-    pub(super) fn load_existing(&mut self) -> Result<()> {
+    pub(super) fn load_existing_with_lookup_policy(
+        &mut self,
+        eager_lookup_on_open: bool,
+    ) -> Result<()> {
+        let started_at = Instant::now();
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_LOAD_START",
+            vault_dir = %self.vault_dir().display(),
+            eager_lookup_on_open,
+            selected_cfs = false,
+            "starting Calyx CF router load"
+        );
         let mut by_cf = HashMap::<ColumnFamily, Vec<PathBuf>>::new();
+        let mut cf_dirs_scanned = 0_usize;
+        let mut sst_files_discovered = 0_usize;
         for cf_root in self.cf_roots() {
             if !cf_root.exists() {
                 continue;
@@ -39,36 +55,140 @@ impl CfRouter {
                         ))
                     })?;
                 let cf = parse_cf_dir_name(&name)?;
-                by_cf.entry(cf).or_default().extend(list_sst_files(&path)?);
+                cf_dirs_scanned += 1;
+                let files = list_sst_files(&path)?;
+                sst_files_discovered = sst_files_discovered.saturating_add(files.len());
+                if sst_files_discovered >= ROUTER_LOAD_PROGRESS_FILE_INTERVAL
+                    && sst_files_discovered % ROUTER_LOAD_PROGRESS_FILE_INTERVAL < files.len()
+                {
+                    tracing::info!(
+                        code = "CALYX_ASTER_ROUTER_LOAD_DISCOVERY_PROGRESS",
+                        vault_dir = %self.vault_dir().display(),
+                        cf_dirs_scanned,
+                        sst_files_discovered,
+                        eager_lookup_on_open,
+                        "Calyx CF router SST discovery progress"
+                    );
+                }
+                by_cf.entry(cf).or_default().extend(files);
             }
         }
+        let mut cfs_loaded = 0_usize;
+        let mut sst_files_loaded = 0_usize;
         for (cf, files) in by_cf {
-            self.load_cf_level(cf, files)?;
+            let file_count = files.len();
+            self.load_cf_level(cf, files, eager_lookup_on_open)?;
+            cfs_loaded += 1;
+            sst_files_loaded = sst_files_loaded.saturating_add(file_count);
+            tracing::info!(
+                code = "CALYX_ASTER_ROUTER_LOAD_CF_DONE",
+                vault_dir = %self.vault_dir().display(),
+                cf = cf.name(),
+                file_count,
+                cfs_loaded,
+                sst_files_loaded,
+                eager_lookup_on_open,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "loaded Calyx CF router level"
+            );
         }
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_LOAD_DONE",
+            vault_dir = %self.vault_dir().display(),
+            cf_dirs_scanned,
+            cfs_loaded,
+            sst_files_discovered,
+            sst_files_loaded,
+            eager_lookup_on_open,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "completed Calyx CF router load"
+        );
         Ok(())
     }
 
-    pub(super) fn load_existing_cfs(&mut self, cfs: &[ColumnFamily]) -> Result<()> {
+    pub(crate) fn load_existing_cfs_with_lookup_policy(
+        &mut self,
+        cfs: &[ColumnFamily],
+        eager_lookup_on_open: bool,
+    ) -> Result<()> {
+        let started_at = Instant::now();
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_LOAD_START",
+            vault_dir = %self.vault_dir().display(),
+            eager_lookup_on_open,
+            selected_cfs = true,
+            selected_cf_count = cfs.len(),
+            "starting selected Calyx CF router load"
+        );
         let mut by_cf = HashMap::<ColumnFamily, Vec<PathBuf>>::new();
+        let mut cf_dirs_scanned = 0_usize;
+        let mut sst_files_discovered = 0_usize;
         for cf_root in self.cf_roots() {
             for cf in cfs {
                 let cf_dir = cf_root.join(cf.name());
                 if cf_dir.exists() {
-                    by_cf
-                        .entry(*cf)
-                        .or_default()
-                        .extend(list_sst_files(&cf_dir)?);
+                    cf_dirs_scanned += 1;
+                    let files = list_sst_files(&cf_dir)?;
+                    sst_files_discovered = sst_files_discovered.saturating_add(files.len());
+                    if sst_files_discovered >= ROUTER_LOAD_PROGRESS_FILE_INTERVAL
+                        && sst_files_discovered % ROUTER_LOAD_PROGRESS_FILE_INTERVAL < files.len()
+                    {
+                        tracing::info!(
+                            code = "CALYX_ASTER_ROUTER_LOAD_DISCOVERY_PROGRESS",
+                            vault_dir = %self.vault_dir().display(),
+                            cf_dirs_scanned,
+                            sst_files_discovered,
+                            eager_lookup_on_open,
+                            selected_cfs = true,
+                            "Calyx selected CF router SST discovery progress"
+                        );
+                    }
+                    by_cf.entry(*cf).or_default().extend(files);
                 }
             }
         }
+        let mut cfs_loaded = 0_usize;
+        let mut sst_files_loaded = 0_usize;
         for cf in cfs {
             let files = by_cf.remove(cf).unwrap_or_default();
-            self.load_cf_level(*cf, files)?;
+            let file_count = files.len();
+            self.load_cf_level(*cf, files, eager_lookup_on_open)?;
+            cfs_loaded += 1;
+            sst_files_loaded = sst_files_loaded.saturating_add(file_count);
+            tracing::info!(
+                code = "CALYX_ASTER_ROUTER_LOAD_CF_DONE",
+                vault_dir = %self.vault_dir().display(),
+                cf = cf.name(),
+                file_count,
+                cfs_loaded,
+                sst_files_loaded,
+                eager_lookup_on_open,
+                selected_cfs = true,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "loaded selected Calyx CF router level"
+            );
         }
+        tracing::info!(
+            code = "CALYX_ASTER_ROUTER_LOAD_DONE",
+            vault_dir = %self.vault_dir().display(),
+            cf_dirs_scanned,
+            cfs_loaded,
+            sst_files_discovered,
+            sst_files_loaded,
+            eager_lookup_on_open,
+            selected_cfs = true,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "completed selected Calyx CF router load"
+        );
         Ok(())
     }
 
-    fn load_cf_level(&mut self, cf: ColumnFamily, mut files: Vec<PathBuf>) -> Result<()> {
+    fn load_cf_level(
+        &mut self,
+        cf: ColumnFamily,
+        mut files: Vec<PathBuf>,
+        eager_lookup_on_open: bool,
+    ) -> Result<()> {
         sort_ssts_by_sequence(&mut files)?;
         files.dedup();
         // Only router-flushed SSTs (legacy and commit-anchored shapes)
@@ -85,21 +205,29 @@ impl CfRouter {
             .unwrap_or(0)
             + 1;
         self.ensure_cf(cf)?;
-        self.levels.insert(cf, load_level_for_cf(cf, files)?);
+        self.levels
+            .insert(cf, load_level_for_cf(cf, files, eager_lookup_on_open)?);
         self.next_file.insert(cf, next);
         Ok(())
     }
 }
 
-fn load_level_for_cf(cf: ColumnFamily, files: Vec<PathBuf>) -> Result<SstLevel> {
-    if eager_lookup_on_open(cf) {
+fn load_level_for_cf(
+    cf: ColumnFamily,
+    files: Vec<PathBuf>,
+    eager_lookup_on_open: bool,
+) -> Result<SstLevel> {
+    if should_build_eager_lookup_on_open(cf, eager_lookup_on_open) {
         SstLevel::from_oldest_first_with_lookup(files)
     } else {
         Ok(SstLevel::from_oldest_first(files))
     }
 }
 
-fn eager_lookup_on_open(cf: ColumnFamily) -> bool {
+fn should_build_eager_lookup_on_open(cf: ColumnFamily, eager_lookup_on_open: bool) -> bool {
+    if !eager_lookup_on_open {
+        return false;
+    }
     // Base and slot CFs are the high-volume point-read surfaces. Retain their
     // exact validated key/offset indexes once so Bloom candidates never
     // reopen and whole-file validate large immutable SSTs per requested row.

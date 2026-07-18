@@ -60,12 +60,24 @@ where
             let mut result = catalog
                 .compact_cf(cf, output, CompactionThrottle::unlimited())
                 .map(Some)?;
+            if let Some(CompactionResult::Compacted(_report)) = &mut result {
+                self.rows
+                    .refresh_router_cfs_from_disk(&[cf], "refresh router after compaction")?;
+            }
             if let Some(CompactionResult::Compacted(report)) = &mut result
                 && cf == ColumnFamily::Recurrence
             {
                 ensure_reclaim_outputs_manifest_bounded(&report.output_paths, durable_seq)?;
-                report.reclaimed_input_files = reclaim_recurrence_inputs(report)?;
-                prune_recurrence_tombstones(report)?;
+                report.reclaimed_input_files = self.rows.refresh_router_cfs_after_reclaim(
+                    &[cf],
+                    "reclaim recurrence compaction inputs",
+                    || reclaim_recurrence_inputs(report),
+                )?;
+                self.rows.refresh_router_cfs_after_reclaim(
+                    &[cf],
+                    "rewrite recurrence tombstone compaction outputs",
+                    || prune_recurrence_tombstones(report),
+                )?;
             }
             Ok(result)
         })
@@ -109,7 +121,20 @@ where
             }
         }
         for cf in unique {
-            purge_tombstoned_cf_once(durable.root(), durable.tiering_policy(), cf, durable_seq)?;
+            let Some(report) = prepare_tombstoned_cf_compaction(
+                durable.root(),
+                durable.tiering_policy(),
+                cf,
+                durable_seq,
+            )?
+            else {
+                continue;
+            };
+            self.rows.refresh_router_cfs_after_reclaim(
+                &[cf],
+                "reclaim tombstoned compaction inputs",
+                || reclaim_compaction_inputs(&report),
+            )?;
         }
         Ok(())
     }
@@ -136,12 +161,12 @@ where
     }
 }
 
-fn purge_tombstoned_cf_once(
+fn prepare_tombstoned_cf_compaction(
     root: &Path,
     tiering_policy: Option<&crate::compaction::TieringPolicy>,
     cf: ColumnFamily,
     seq: u64,
-) -> Result<()> {
+) -> Result<Option<crate::compaction::CompactionReport>> {
     let catalog = catalog_from_vault_tiers(root, tiering_policy)?;
     let output = tiering_policy.map_or_else(
         || root.join("cf").join(cf.name()),
@@ -150,12 +175,11 @@ fn purge_tombstoned_cf_once(
     let output = output.join(format!("compacted-{seq:020}.sst"));
     let mut result = catalog.compact_cf(cf, output, CompactionThrottle::unlimited())?;
     let CompactionResult::Compacted(report) = &mut result else {
-        return Ok(());
+        return Ok(None);
     };
     prune_mvcc_tombstones(report)?;
     ensure_reclaim_outputs_manifest_bounded(&report.output_paths, seq)?;
-    report.reclaimed_input_files = reclaim_compaction_inputs(report)?;
-    Ok(())
+    Ok(Some(report.clone()))
 }
 
 /// Fails closed before input reclaim when the compaction output would not be

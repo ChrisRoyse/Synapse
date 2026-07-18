@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -555,6 +555,9 @@ pub struct SynapseCalyxVaultStatus {
     pub enabled: bool,
     pub phase: String,
     pub open: bool,
+    pub open_mode: Option<String>,
+    pub restore_mvcc_rows: Option<bool>,
+    pub eager_router_lookup_on_open: Option<bool>,
     pub vault_dir: Option<PathBuf>,
     pub identity_path: Option<PathBuf>,
     pub machine_salt_path: Option<PathBuf>,
@@ -674,12 +677,42 @@ impl SynapseCalyxVaultCloseReadback {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SynapseCalyxVaultOpenMode {
+    FullMvccRestore,
+    LatestReadback,
+}
+
+impl SynapseCalyxVaultOpenMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullMvccRestore => "full_mvcc_restore",
+            Self::LatestReadback => "latest_readback",
+        }
+    }
+
+    const fn restore_mvcc_rows(self) -> bool {
+        match self {
+            Self::FullMvccRestore => true,
+            Self::LatestReadback => false,
+        }
+    }
+
+    const fn eager_router_lookup_on_open(self) -> bool {
+        match self {
+            Self::FullMvccRestore => true,
+            Self::LatestReadback => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SynapseCalyxVault {
     config: SynapseCalyxConfig,
     vault: AsterVault<SynapseCalyxClock>,
     lock: VaultLockGuard,
     math_runtime: SynapseCalyxMathRuntime,
+    open_mode: SynapseCalyxVaultOpenMode,
 }
 
 #[derive(Debug)]
@@ -745,6 +778,7 @@ impl SynapseCalyxReadOnlyVault {
         let options = VaultOptions {
             read_only: true,
             restore_mvcc_rows: false,
+            eager_router_lookup_on_open: false,
             restore_ledger_hook: false,
             selected_cfs,
             ..VaultOptions::default()
@@ -882,11 +916,58 @@ impl SynapseCalyxVault {
     /// Returns an error when directories, identity files, the machine-local
     /// salt, the single-instance lock, or Calyx recovery/open fail.
     pub fn open(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
+        let options = VaultOptions::default();
+        Self::open_with_mode(config, &options, SynapseCalyxVaultOpenMode::FullMvccRestore)
+    }
+
+    /// Opens the configured durable Aster vault for latest-state reads/writes.
+    ///
+    /// This mode uses Aster's router as the latest-state Source of Truth and
+    /// does not reconstruct every historical MVCC row at startup. Calls that
+    /// request historical snapshots still fail closed inside Aster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when directories, identity files, the machine-local
+    /// salt, the single-instance lock, or Calyx recovery/open fail.
+    pub fn open_latest_readback(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
+        let options = VaultOptions {
+            restore_mvcc_rows: false,
+            eager_router_lookup_on_open: false,
+            ..VaultOptions::default()
+        };
+        Self::open_with_mode(config, &options, SynapseCalyxVaultOpenMode::LatestReadback)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_with_mode(
+        config: SynapseCalyxConfig,
+        options: &VaultOptions,
+        open_mode: SynapseCalyxVaultOpenMode,
+    ) -> Result<Self, SynapseCalyxError> {
         error_bridge::validate_calyx_error_bridge()?;
         let clock = SynapseCalyxClock::from_tuning(&config.tuning)?;
+        let started_at = Instant::now();
+        tracing::info!(
+            code = "SYNAPSE_CALYX_VAULT_OPEN_START",
+            vault_dir = %config.vault_dir.display(),
+            open_mode = open_mode.as_str(),
+            restore_mvcc_rows = options.restore_mvcc_rows,
+            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            read_only = options.read_only,
+            "opening Synapse Calyx vault"
+        );
         create_dir_all(&config.vault_dir)?;
         create_parent_dir(&config.machine_salt_path)?;
         let lock = VaultLockGuard::acquire(&config.vault_dir)?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_VAULT_LOCK_ACQUIRED",
+            vault_dir = %config.vault_dir.display(),
+            lock_path = %lock.path.display(),
+            pid_path = %lock.pid_path.display(),
+            pid = std::process::id(),
+            "acquired Synapse Calyx vault writer lock"
+        );
         let identity = match load_or_create_identity(&config) {
             Ok(identity) => identity,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
@@ -895,15 +976,37 @@ impl SynapseCalyxVault {
             Ok(vault_id) => vault_id,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
         };
+        tracing::info!(
+            code = "SYNAPSE_CALYX_ASTER_OPEN_START",
+            vault_dir = %config.vault_dir.display(),
+            vault_id = %vault_id,
+            open_mode = open_mode.as_str(),
+            restore_mvcc_rows = options.restore_mvcc_rows,
+            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            read_only = options.read_only,
+            "opening durable Calyx Aster vault"
+        );
         let vault = match AsterVault::open_with_clock(
             &config.vault_dir,
             vault_id,
             identity.machine_salt,
-            VaultOptions::default(),
+            options.clone(),
             clock,
         ) {
             Ok(vault) => vault,
             Err(error) => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_ASTER_OPEN_FAILED",
+                    vault_dir = %config.vault_dir.display(),
+                    vault_id = %vault_id,
+                    open_mode = open_mode.as_str(),
+                    restore_mvcc_rows = options.restore_mvcc_rows,
+                    eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+                    read_only = options.read_only,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "durable Calyx Aster vault open failed"
+                );
                 return Err(cleanup_open_lock(
                     lock,
                     SynapseCalyxError::from_calyx("open durable Calyx Aster vault", &error),
@@ -914,16 +1017,20 @@ impl SynapseCalyxVault {
             Ok(runtime) => runtime,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
         };
-        let status = status_from_vault(&config, &vault, math_runtime.status());
+        let status = status_from_vault(&config, &vault, math_runtime.status(), open_mode);
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_OPENED",
             vault_dir = %config.vault_dir.display(),
+            open_mode = open_mode.as_str(),
+            restore_mvcc_rows = options.restore_mvcc_rows,
+            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
             lock_path = %lock.path.display(),
             pid_path = %lock.pid_path.display(),
             vault_id = status.vault_id.as_deref().unwrap_or(""),
             latest_seq = status.latest_seq,
             last_recovered_seq = status.last_recovered_seq,
             torn_tail = status.torn_tail.as_deref().unwrap_or("none"),
+            elapsed_ms = started_at.elapsed().as_millis(),
             clock_mode = ?config.tuning.clock_mode,
             fixed_clock_unix_ms = config.tuning.fixed_clock_unix_ms,
             rng_seed = config.tuning.rng_seed,
@@ -963,6 +1070,7 @@ impl SynapseCalyxVault {
             vault,
             lock,
             math_runtime,
+            open_mode,
         })
     }
 
@@ -983,7 +1091,12 @@ impl SynapseCalyxVault {
 
     #[must_use]
     pub fn status(&self) -> SynapseCalyxVaultStatus {
-        status_from_vault(&self.config, &self.vault, self.math_runtime.status())
+        status_from_vault(
+            &self.config,
+            &self.vault,
+            self.math_runtime.status(),
+            self.open_mode,
+        )
     }
 
     /// Returns the same millisecond clock source used by this opened vault.
@@ -1369,6 +1482,7 @@ impl SynapseCalyxVault {
             vault,
             lock,
             math_runtime: _,
+            open_mode: _,
         } = self;
         let latest_seq = vault.latest_seq();
         vault.flush().map_err(|error| {
@@ -1553,12 +1667,16 @@ fn status_from_vault(
     config: &SynapseCalyxConfig,
     vault: &AsterVault<SynapseCalyxClock>,
     math_backend: &SynapseCalyxMathBackendStatus,
+    open_mode: SynapseCalyxVaultOpenMode,
 ) -> SynapseCalyxVaultStatus {
     let recovery_report = vault.recovery_report();
     let mut status = SynapseCalyxVaultStatus {
         enabled: true,
         phase: "open".to_owned(),
         open: true,
+        open_mode: Some(open_mode.as_str().to_owned()),
+        restore_mvcc_rows: Some(open_mode.restore_mvcc_rows()),
+        eager_router_lookup_on_open: Some(open_mode.eager_router_lookup_on_open()),
         vault_id: Some(vault.vault_id().to_string()),
         latest_seq: Some(vault.latest_seq()),
         last_recovered_seq: Some(recovery_report.last_recovered_seq),

@@ -2,7 +2,9 @@ use super::durable::RecoveredBatches;
 use super::encode::WriteRow;
 use crate::cf::ColumnFamily;
 use crate::compaction::TieringPolicy;
-use crate::ledger_view::{AsterLedgerCfStore, read_ledger_seqs_unlocked_with_tiering};
+use crate::ledger_view::{
+    AsterLedgerCfStore, LedgerPointReadTrace, read_ledger_seqs_unlocked_traced,
+};
 use calyx_core::{
     CalyxError, Constellation, LedgerRef, METADATA_CHUNK_ID, METADATA_DATABASE_NAME, Result,
     SystemClock,
@@ -16,10 +18,13 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 pub(super) type AsterLedgerHook = Mutex<DefaultLedgerHook<MemoryLedgerStore, SystemClock>>;
 pub(super) type AsterLedgerHookGuard<'a> =
     MutexGuard<'a, DefaultLedgerHook<MemoryLedgerStore, SystemClock>>;
+
+const CHECKPOINT_RECOVERY_BATCH_ROWS: u64 = 128;
 
 pub(super) fn recover_hook(
     recovery: &RecoveredBatches,
@@ -34,6 +39,23 @@ pub(super) fn recover_hook_from_vault_dir(
     checkpoint: Option<CheckpointConfig>,
     tiering_policy: Option<&TieringPolicy>,
 ) -> Result<AsterLedgerHook> {
+    let started_at = Instant::now();
+    let recovery_batch_count = recovery.batches.len();
+    let recovery_ledger_rows = recovery
+        .batches
+        .iter()
+        .flat_map(|batch| batch.rows.iter())
+        .filter(|row| row.cf == ColumnFamily::Ledger)
+        .count();
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_RECOVERY_START",
+        vault_dir = %vault_dir.display(),
+        checkpoint_enabled = checkpoint.is_some(),
+        checkpoint_interval_entries = checkpoint.as_ref().map(|config| config.interval_entries),
+        recovery_batch_count,
+        recovery_ledger_rows,
+        "recovering Calyx ledger hook"
+    );
     let store = match physical_ledger_store(
         vault_dir,
         LedgerViewLock::Acquire,
@@ -43,7 +65,14 @@ pub(super) fn recover_hook_from_vault_dir(
         Some(store) => store,
         None => recovered_ledger_store(recovery)?,
     };
-    recover_hook_from_store(store, checkpoint)
+    let hook = recover_hook_from_store(store, checkpoint)?;
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_RECOVERY_DONE",
+        vault_dir = %vault_dir.display(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "recovered Calyx ledger hook"
+    );
+    Ok(hook)
 }
 
 fn recover_hook_from_store(
@@ -70,7 +99,7 @@ fn recovered_ledger_store(recovery: &RecoveredBatches) -> Result<MemoryLedgerSto
     Ok(store)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LedgerViewLock {
     Acquire,
     AlreadyHeld,
@@ -82,34 +111,101 @@ fn physical_ledger_store(
     checkpoint: Option<&CheckpointConfig>,
     tiering_policy: Option<&TieringPolicy>,
 ) -> Result<Option<MemoryLedgerStore>> {
+    let started_at = Instant::now();
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_PHYSICAL_STORE_START",
+        vault_dir = %vault_dir.display(),
+        lock = ?lock,
+        checkpoint_enabled = checkpoint.is_some(),
+        checkpoint_interval_entries = checkpoint.map(|config| config.interval_entries),
+        "opening physical ledger store for hook recovery"
+    );
+    let lock_started_at = Instant::now();
     let _commit_guard = match lock {
         LedgerViewLock::Acquire => Some(crate::file_lock::FileLockGuard::acquire(
             &durable_commit_lock_path(vault_dir),
         )?),
         LedgerViewLock::AlreadyHeld => None,
     };
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_COMMIT_LOCK_READY",
+        vault_dir = %vault_dir.display(),
+        lock = ?lock,
+        elapsed_ms = lock_started_at.elapsed().as_millis(),
+        "ledger hook recovery commit lock ready"
+    );
     if let Some(anchor) = crate::ledger_head::read_head_anchor(vault_dir)? {
-        return anchored_physical_ledger_store(vault_dir, &anchor, checkpoint, tiering_policy);
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_HEAD_ANCHOR_FOUND",
+            vault_dir = %vault_dir.display(),
+            head_height = anchor.height,
+            "using durable ledger head anchor for hook recovery"
+        );
+        let store = anchored_physical_ledger_store(vault_dir, &anchor, checkpoint, tiering_policy)?;
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_PHYSICAL_STORE_DONE",
+            vault_dir = %vault_dir.display(),
+            source = "head_anchor",
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "opened physical ledger store for hook recovery"
+        );
+        return Ok(store);
     }
 
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_NO_HEAD_ANCHOR_SCAN_START",
+        vault_dir = %vault_dir.display(),
+        "ledger hook recovery has no durable head anchor; probing physical ledger rows"
+    );
+    let view_started_at = Instant::now();
     let view = match AsterLedgerCfStore::open_unlocked_with_tiering(vault_dir, tiering_policy) {
         Ok(view) => view,
         Err(error)
             if error.code == "CALYX_LEDGER_CORRUPT"
                 && error.message.contains("requires real Aster ledger state") =>
         {
+            tracing::info!(
+                code = "CALYX_ASTER_LEDGER_HOOK_NO_PHYSICAL_STORE",
+                vault_dir = %vault_dir.display(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "no physical ledger store available for hook recovery"
+            );
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            tracing::error!(
+                code = "CALYX_ASTER_LEDGER_HOOK_NO_HEAD_ANCHOR_SCAN_FAILED",
+                vault_dir = %vault_dir.display(),
+                elapsed_ms = view_started_at.elapsed().as_millis(),
+                error = %error,
+                "physical ledger scan failed during hook recovery"
+            );
+            return Err(error);
+        }
     };
     let rows = view.scan()?;
     if rows.is_empty() {
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_NO_PHYSICAL_ROWS",
+            vault_dir = %vault_dir.display(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "physical ledger store is empty for hook recovery"
+        );
         return Ok(None);
     }
     let mut store = MemoryLedgerStore::default();
+    let row_count = rows.len();
     for row in rows {
         store.insert_raw(row.seq, row.bytes);
     }
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_PHYSICAL_STORE_DONE",
+        vault_dir = %vault_dir.display(),
+        source = "scan_without_head_anchor",
+        row_count,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "opened physical ledger store for hook recovery"
+    );
     Ok(Some(store))
 }
 
@@ -119,9 +215,27 @@ fn anchored_physical_ledger_store(
     checkpoint: Option<&CheckpointConfig>,
     tiering_policy: Option<&TieringPolicy>,
 ) -> Result<Option<MemoryLedgerStore>> {
+    let started_at = Instant::now();
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_ANCHORED_STORE_START",
+        vault_dir = %vault_dir.display(),
+        head_height = anchor.height,
+        checkpoint_enabled = checkpoint.is_some(),
+        checkpoint_interval_entries = checkpoint.map(|config| config.interval_entries),
+        "opening anchored physical ledger store for hook recovery"
+    );
     let mut store = MemoryLedgerStore::default();
     store.put_head_anchor(anchor)?;
     if anchor.height == 0 {
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_ANCHORED_STORE_DONE",
+            vault_dir = %vault_dir.display(),
+            head_height = anchor.height,
+            hydration_start_seq = 0_u64,
+            hydrated_rows = 0_u64,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "opened empty anchored physical ledger store for hook recovery"
+        );
         return Ok(Some(store));
     }
     let start = match checkpoint {
@@ -130,7 +244,17 @@ fn anchored_physical_ledger_store(
         }
         None => anchor.height - 1,
     };
-    hydrate_physical_ledger_rows(vault_dir, start, anchor.height, &mut store, tiering_policy)?;
+    let hydrated_rows =
+        hydrate_physical_ledger_rows(vault_dir, start, anchor.height, &mut store, tiering_policy)?;
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_ANCHORED_STORE_DONE",
+        vault_dir = %vault_dir.display(),
+        head_height = anchor.height,
+        hydration_start_seq = start,
+        hydrated_rows,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "opened anchored physical ledger store for hook recovery"
+    );
     Ok(Some(store))
 }
 
@@ -153,24 +277,121 @@ fn checkpoint_hydration_start(
         .saturating_mul(2)
         .saturating_add(16)
         .min(head_height);
-    let start = head_height - scan_limit;
-    let rows = read_physical_ledger_rows(vault_dir, start, head_height, tiering_policy)?;
-    for row in rows.iter().rev() {
-        let entry = decode(&row.bytes).map_err(|error| {
-            CalyxError::ledger_corrupt(format!(
-                "decode ledger row {} during checkpoint recovery: {error}",
-                row.seq
-            ))
-        })?;
-        if entry.kind == EntryKind::Admin
-            && CheckpointPayload::decode_optional(&entry.payload)?.is_some()
-        {
-            return Ok(row.seq);
+    let floor = head_height - scan_limit;
+    let batch_rows = scan_limit.clamp(1, CHECKPOINT_RECOVERY_BATCH_ROWS);
+    let started_at = Instant::now();
+    if let Some(anchor) =
+        checkpoint_hydration_start_from_pointer(vault_dir, head_height, scan_limit, tiering_policy)?
+    {
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_DONE",
+            vault_dir = %vault_dir.display(),
+            head_height,
+            hydration_start_seq = anchor,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "selected checkpoint recovery start from durable pointer"
+        );
+        return Ok(anchor);
+    }
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_SCAN_START",
+        vault_dir = %vault_dir.display(),
+        head_height,
+        scan_floor_seq = floor,
+        scan_limit,
+        batch_rows,
+        checkpoint_interval_entries = config.interval_entries,
+        "searching ledger tail for newest checkpoint row"
+    );
+    let mut end = head_height;
+    let mut batches_read = 0_u64;
+    let mut rows_scanned = 0_u64;
+    while end > floor {
+        let start = end.saturating_sub(batch_rows).max(floor);
+        let batch_started_at = Instant::now();
+        let (rows, trace) =
+            read_physical_ledger_rows_traced(vault_dir, start, end, tiering_policy)?;
+        batches_read = batches_read.saturating_add(1);
+        rows_scanned = rows_scanned.saturating_add(rows.len() as u64);
+        log_point_read_trace("checkpoint_scan", start, end, rows.len(), &trace);
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_SCAN_BATCH",
+            vault_dir = %vault_dir.display(),
+            range_start_seq = start,
+            range_end_seq = end,
+            rows_read = rows.len(),
+            batches_read,
+            rows_scanned,
+            elapsed_ms = batch_started_at.elapsed().as_millis(),
+            "read checkpoint recovery scan batch"
+        );
+        for row in rows.iter().rev() {
+            let entry = decode(&row.bytes).map_err(|error| {
+                CalyxError::ledger_corrupt(format!(
+                    "decode ledger row {} during checkpoint recovery: {error}",
+                    row.seq
+                ))
+            })?;
+            if entry.kind != EntryKind::Admin {
+                continue;
+            }
+            if let Some(payload) = CheckpointPayload::decode_optional(&entry.payload)? {
+                let pointer = crate::ledger_head::LedgerCheckpointAnchor::from_checkpoint_payload(
+                    entry.seq,
+                    entry.entry_hash,
+                    &payload,
+                )?;
+                crate::ledger_head::write_checkpoint_anchor(vault_dir, &pointer)?;
+                tracing::info!(
+                    code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_FOUND",
+                    vault_dir = %vault_dir.display(),
+                    checkpoint_seq = row.seq,
+                    checkpoint_range_start = payload.range_start,
+                    checkpoint_range_end = payload.range_end,
+                    head_height,
+                    batches_read,
+                    rows_scanned,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "found newest checkpoint row for ledger hook recovery"
+                );
+                tracing::info!(
+                    code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_REPAIRED",
+                    vault_dir = %vault_dir.display(),
+                    checkpoint_seq = pointer.seq,
+                    checkpoint_range_start = pointer.range_start,
+                    checkpoint_range_end = pointer.range_end,
+                    head_height,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "persisted durable checkpoint pointer from bounded ledger scan"
+                );
+                return Ok(row.seq);
+            }
         }
+        end = start;
     }
     if head_height <= config.interval_entries {
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_SCAN_GENESIS_WINDOW",
+            vault_dir = %vault_dir.display(),
+            head_height,
+            checkpoint_interval_entries = config.interval_entries,
+            batches_read,
+            rows_scanned,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "ledger head has not crossed checkpoint interval; hydrating from genesis"
+        );
         return Ok(0);
     }
+    tracing::error!(
+        code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_SCAN_UNBOUNDED",
+        vault_dir = %vault_dir.display(),
+        head_height,
+        scan_limit,
+        batches_read,
+        rows_scanned,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "ledger hook recovery refused unbounded checkpoint scan"
+    );
     Err(CalyxError {
         code: "CALYX_LEDGER_CHECKPOINT_RECOVERY_UNBOUNDED",
         message: format!(
@@ -180,46 +401,261 @@ fn checkpoint_hydration_start(
     })
 }
 
+fn checkpoint_hydration_start_from_pointer(
+    vault_dir: &Path,
+    head_height: u64,
+    scan_limit: u64,
+    tiering_policy: Option<&TieringPolicy>,
+) -> Result<Option<u64>> {
+    let started_at = Instant::now();
+    let Some(anchor) = crate::ledger_head::read_checkpoint_anchor(vault_dir)? else {
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_MISSING",
+            vault_dir = %vault_dir.display(),
+            head_height,
+            scan_limit,
+            "durable checkpoint pointer is absent; bounded legacy scan will repair it"
+        );
+        return Ok(None);
+    };
+    if anchor.seq >= head_height {
+        checkpoint_pointer_error(
+            vault_dir,
+            head_height,
+            scan_limit,
+            &anchor,
+            "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_OUT_OF_RANGE",
+            format!(
+                "checkpoint pointer seq {} is outside anchored ledger head {}",
+                anchor.seq, head_height
+            ),
+        )?;
+    }
+    let rows_after_pointer = head_height.saturating_sub(anchor.seq);
+    if rows_after_pointer > scan_limit {
+        tracing::error!(
+            code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_TOO_OLD",
+            vault_dir = %vault_dir.display(),
+            checkpoint_seq = anchor.seq,
+            checkpoint_range_start = anchor.range_start,
+            checkpoint_range_end = anchor.range_end,
+            head_height,
+            scan_limit,
+            rows_after_pointer,
+            "durable checkpoint pointer is older than bounded recovery window"
+        );
+        return Err(CalyxError {
+            code: "CALYX_LEDGER_CHECKPOINT_RECOVERY_UNBOUNDED",
+            message: format!(
+                "anchored ledger head {head_height} has checkpoint pointer seq {} older than the bounded {scan_limit}-row recovery window",
+                anchor.seq
+            ),
+            remediation: "repair the persisted checkpoint pointer before reopening the vault; do not bypass by disabling checkpoint recovery",
+        });
+    }
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_VALIDATE_START",
+        vault_dir = %vault_dir.display(),
+        checkpoint_seq = anchor.seq,
+        checkpoint_range_start = anchor.range_start,
+        checkpoint_range_end = anchor.range_end,
+        head_height,
+        scan_limit,
+        "validating durable checkpoint pointer against physical ledger row"
+    );
+    let (rows, trace) =
+        read_physical_ledger_rows_traced(vault_dir, anchor.seq, anchor.seq + 1, tiering_policy)?;
+    log_point_read_trace(
+        "checkpoint_pointer",
+        anchor.seq,
+        anchor.seq + 1,
+        rows.len(),
+        &trace,
+    );
+    let Some(row) = rows.first() else {
+        checkpoint_pointer_error(
+            vault_dir,
+            head_height,
+            scan_limit,
+            &anchor,
+            "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_ROW_MISSING",
+            format!(
+                "checkpoint pointer seq {} is missing from the physical ledger",
+                anchor.seq
+            ),
+        )?;
+        unreachable!("checkpoint_pointer_error always returns Err");
+    };
+    let Some(actual) = crate::ledger_head::checkpoint_anchor_from_row(row)? else {
+        checkpoint_pointer_error(
+            vault_dir,
+            head_height,
+            scan_limit,
+            &anchor,
+            "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_NOT_CHECKPOINT",
+            format!(
+                "checkpoint pointer seq {} does not reference an admin checkpoint row",
+                anchor.seq
+            ),
+        )?;
+        unreachable!("checkpoint_pointer_error always returns Err");
+    };
+    if actual != anchor {
+        checkpoint_pointer_error(
+            vault_dir,
+            head_height,
+            scan_limit,
+            &anchor,
+            "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_MISMATCH",
+            format!(
+                "checkpoint pointer seq {} does not match physical checkpoint row seq {}",
+                anchor.seq, actual.seq
+            ),
+        )?;
+    }
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_VALIDATED",
+        vault_dir = %vault_dir.display(),
+        checkpoint_seq = anchor.seq,
+        checkpoint_entry_hash = %hex(&anchor.entry_hash),
+        checkpoint_range_start = anchor.range_start,
+        checkpoint_range_end = anchor.range_end,
+        head_height,
+        scan_limit,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "validated durable checkpoint pointer for ledger hook recovery"
+    );
+    Ok(Some(anchor.seq))
+}
+
+fn checkpoint_pointer_error(
+    vault_dir: &Path,
+    head_height: u64,
+    scan_limit: u64,
+    anchor: &crate::ledger_head::LedgerCheckpointAnchor,
+    code: &'static str,
+    message: String,
+) -> Result<()> {
+    tracing::error!(
+        code,
+        vault_dir = %vault_dir.display(),
+        checkpoint_seq = anchor.seq,
+        checkpoint_entry_hash = %hex(&anchor.entry_hash),
+        checkpoint_range_start = anchor.range_start,
+        checkpoint_range_end = anchor.range_end,
+        head_height,
+        scan_limit,
+        "durable checkpoint pointer is invalid"
+    );
+    Err(CalyxError::ledger_corrupt(message))
+}
+
 fn hydrate_physical_ledger_rows(
     vault_dir: &Path,
     start: u64,
     end: u64,
     store: &mut MemoryLedgerStore,
     tiering_policy: Option<&TieringPolicy>,
-) -> Result<()> {
-    for row in read_physical_ledger_rows(vault_dir, start, end, tiering_policy)? {
+) -> Result<u64> {
+    let started_at = Instant::now();
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_HYDRATE_START",
+        vault_dir = %vault_dir.display(),
+        range_start_seq = start,
+        range_end_seq = end,
+        requested_rows = end.saturating_sub(start),
+        "hydrating physical ledger rows for hook recovery"
+    );
+    let (rows, trace) = read_physical_ledger_rows_traced(vault_dir, start, end, tiering_policy)?;
+    let hydrated_rows = rows.len() as u64;
+    log_point_read_trace("hydrate", start, end, rows.len(), &trace);
+    for row in rows {
         store.insert_raw(row.seq, row.bytes);
     }
-    Ok(())
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_HOOK_HYDRATE_DONE",
+        vault_dir = %vault_dir.display(),
+        range_start_seq = start,
+        range_end_seq = end,
+        hydrated_rows,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "hydrated physical ledger rows for hook recovery"
+    );
+    Ok(hydrated_rows)
 }
 
-fn read_physical_ledger_rows(
+fn read_physical_ledger_rows_traced(
     vault_dir: &Path,
     start: u64,
     end: u64,
     tiering_policy: Option<&TieringPolicy>,
-) -> Result<Vec<calyx_ledger::LedgerRow>> {
+) -> Result<(Vec<calyx_ledger::LedgerRow>, LedgerPointReadTrace)> {
     if start > end {
+        tracing::error!(
+            code = "CALYX_ASTER_LEDGER_HOOK_PHYSICAL_READ_INVALID_RANGE",
+            vault_dir = %vault_dir.display(),
+            range_start_seq = start,
+            range_end_seq = end,
+            "invalid physical ledger hydration range"
+        );
         return Err(CalyxError::ledger_corrupt(format!(
             "invalid physical ledger hydration range {start}..{end}"
         )));
     }
     let wanted = (start..end).collect::<BTreeSet<_>>();
-    let rows = read_ledger_seqs_unlocked_with_tiering(vault_dir, &wanted, tiering_policy)?;
+    let (rows, trace) = read_ledger_seqs_unlocked_traced(vault_dir, &wanted, tiering_policy)?;
+    let missing = wanted
+        .iter()
+        .filter(|seq| !rows.contains_key(seq))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let samples = missing
+            .iter()
+            .take(3)
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CalyxError::ledger_chain_broken(format!(
+            "anchored physical ledger hydration missing {} of {} requested seqs in range {start}..{end}; sample missing seqs: {samples}",
+            missing.len(),
+            wanted.len(),
+        )));
+    }
     let mut out = Vec::with_capacity(wanted.len());
     for seq in wanted {
-        let row = rows.get(&seq).ok_or_else(|| {
-            CalyxError::ledger_chain_broken(format!(
-                "anchored physical ledger hydration missing seq {seq}"
-            ))
-        })?;
+        let row = rows.get(&seq).expect("missing rows checked above");
         out.push(row.clone());
     }
-    Ok(out)
+    Ok((out, trace))
 }
 
 fn durable_commit_lock_path(vault_dir: &Path) -> std::path::PathBuf {
     vault_dir.join("locks").join("durable.commit.lock")
+}
+
+fn log_point_read_trace(
+    phase: &'static str,
+    start: u64,
+    end: u64,
+    rows_read: usize,
+    trace: &LedgerPointReadTrace,
+) {
+    for tier in &trace.tiers {
+        tracing::info!(
+            code = "CALYX_ASTER_LEDGER_HOOK_POINT_READ_TIER",
+            phase,
+            range_start_seq = start,
+            range_end_seq = end,
+            rows_read,
+            tier = tier.tier,
+            tier_wanted = tier.wanted,
+            tier_resolved = tier.resolved,
+            tier_files_opened = tier.files_opened,
+            tier_elapsed_ms = tier.elapsed_ms,
+            "ledger hook point-read tier"
+        );
+    }
 }
 
 pub(super) fn lock_hook(hook: &AsterLedgerHook) -> Result<AsterLedgerHookGuard<'_>> {

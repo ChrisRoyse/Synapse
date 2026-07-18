@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use crate::storage_names::{SstName, classify_sst};
 
+const SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL: usize = 10_000;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SstLevel {
     pub(super) files: Vec<LevelFile>,
@@ -68,11 +70,41 @@ impl SstLevel {
     }
 
     pub fn from_oldest_first_with_lookup(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let file_count = paths.len();
+        let started_at = std::time::Instant::now();
+        if file_count >= SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL {
+            tracing::info!(
+                code = "CALYX_ASTER_SST_LOOKUP_BUILD_START",
+                file_count,
+                "building eager SST lookup metadata"
+            );
+        }
         let mut files = Vec::new();
-        for path in paths {
+        for (index, path) in paths.into_iter().enumerate() {
             files.push(LevelFile::with_lookup(path)?);
+            let files_opened = index + 1;
+            if file_count >= SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL
+                && files_opened % SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL == 0
+            {
+                tracing::info!(
+                    code = "CALYX_ASTER_SST_LOOKUP_BUILD_PROGRESS",
+                    file_count,
+                    files_opened,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "eager SST lookup metadata build progress"
+                );
+            }
         }
         files.reverse();
+        if file_count >= SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL {
+            tracing::info!(
+                code = "CALYX_ASTER_SST_LOOKUP_BUILD_DONE",
+                file_count,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "completed eager SST lookup metadata build"
+            );
+        }
         Ok(Self { files })
     }
 
