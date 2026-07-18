@@ -458,7 +458,7 @@ impl SynapseService {
     }
 
     fn tool_surface_fingerprint(&self, session_id: Option<&str>) -> ToolSurfaceFingerprint {
-        let mut tools = match self.health_tool_surface(session_id) {
+        let tools = match self.health_tool_surface(session_id) {
             Ok(tools) => tools,
             Err(error) => {
                 tracing::error!(
@@ -476,39 +476,7 @@ impl SynapseService {
                 };
             }
         };
-        tools.sort_by(|left, right| left.name.cmp(&right.name));
-        let names = tools
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect::<Vec<_>>();
-        let canonical = serde_json::json!({
-            "mcp_surface": "tools/list",
-            "tools": tools,
-        });
-        let bytes = match canonical_json_bytes(canonical) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::error!(
-                    code = "MCP_TOOL_SURFACE_FINGERPRINT_SERIALIZE_FAILED",
-                    %error,
-                    "sanitized MCP tool surface failed to serialize for health fingerprinting"
-                );
-                return ToolSurfaceFingerprint {
-                    names,
-                    sha256: "TOOL_SURFACE_FINGERPRINT_ERROR".to_owned(),
-                    error: Some(format!(
-                        "sanitized MCP tool surface failed to serialize for health fingerprinting: {error}"
-                    )),
-                };
-            }
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        ToolSurfaceFingerprint {
-            names,
-            sha256: hex_lower(&hasher.finalize()),
-            error: None,
-        }
+        tool_surface_fingerprint_for_tools(tools)
     }
 
     /// Report the *exact* tool surface the client is served.
@@ -1057,10 +1025,46 @@ impl SynapseService {
     }
 }
 
-struct ToolSurfaceFingerprint {
-    names: Vec<String>,
-    sha256: String,
-    error: Option<String>,
+pub(crate) struct ToolSurfaceFingerprint {
+    pub(crate) names: Vec<String>,
+    pub(crate) sha256: String,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) fn tool_surface_fingerprint_for_tools(mut tools: Vec<Tool>) -> ToolSurfaceFingerprint {
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    let canonical = serde_json::json!({
+        "mcp_surface": "tools/list",
+        "tools": tools,
+    });
+    let bytes = match canonical_json_bytes(canonical) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(
+                code = "MCP_TOOL_SURFACE_FINGERPRINT_SERIALIZE_FAILED",
+                %error,
+                "sanitized MCP tool surface failed to serialize for health fingerprinting"
+            );
+            return ToolSurfaceFingerprint {
+                names,
+                sha256: "TOOL_SURFACE_FINGERPRINT_ERROR".to_owned(),
+                error: Some(format!(
+                    "sanitized MCP tool surface failed to serialize for health fingerprinting: {error}"
+                )),
+            };
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    ToolSurfaceFingerprint {
+        names,
+        sha256: hex_lower(&hasher.finalize()),
+        error: None,
+    }
 }
 
 /// Apply the requested detail verbosity to the assembled subsystem map.

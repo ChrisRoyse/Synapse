@@ -603,7 +603,7 @@ Chrome MV3 extension "Synapse Chrome Bridge" (v0.1.1, min Chrome 125). Controls 
 ### `scripts/` — operational PowerShell / shell / Python
 ```
 synapse-setup.ps1                    # Windows setup: build/install daemon, deploy profiles, gen token, register auto-start HTTP daemon, wire MCP clients (idempotent)
-synapse-codex-doctor.ps1             # shell-runnable Codex/Synapse MCP doctor; writes no-facade restart handoffs when current Codex has no Synapse namespace
+synapse-codex-doctor.ps1             # shell-runnable Codex/Synapse MCP doctor; writes restart handoffs for no-facade and stale-schema Codex sessions
 synapse-install.sh                   # WSL-side installer entry (controlling body is the Windows synapse-mcp.exe HTTP daemon)
 install-synapse-chrome-debugger.ps1  # install/register Chrome native host + debugger extension; self-heal removal of blockers
 add-defender-exclusions.ps1          # add Defender real-time-scan exclusions for the Rust build tree (major build-speed win)

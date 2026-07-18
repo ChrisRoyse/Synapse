@@ -37,8 +37,10 @@ const FACADE_CONTRACT_SOURCE_OF_TRUTH: &str =
 const FACADE_CONTRACT_OPERATION: &str = "validate_facade_contract";
 const FACADE_CONTRACT_ERROR_CODE: &str = "FACADE_CONTRACT_INVALID";
 const FACADE_CONTRACT_STRUCTURED_ERROR: &str = "facade errors must include code, operation, source_of_truth, remediation, and target/source id when applicable";
-const CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH: &str = "%APPDATA%\\synapse\\codex-tool-surface.json + %LOCALAPPDATA%\\synapse\\codex-restart-handoffs + live OS process table";
-const CODEX_CLIENT_SURFACE_REMEDIATION: &str = "restart Codex through the patched launcher when a live stale codex.exe PID is named by the latest handoff; rerun scripts\\synapse-setup.ps1 if the host tool-surface snapshot is missing or does not contain the daemon-visible public tools";
+const CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH: &str = "%APPDATA%\\synapse\\codex-tool-surface.json + live daemon health.tool_surface_sha256 + %LOCALAPPDATA%\\synapse\\codex-restart-handoffs + live OS process table";
+const CODEX_CLIENT_SURFACE_REMEDIATION: &str = "restart Codex through the patched launcher when a live stale codex.exe PID is named by the latest handoff; rerun scripts\\synapse-setup.ps1 if the host tool-surface snapshot is missing, missing public tools, or hash-mismatched with the live daemon surface";
+const CODEX_CLIENT_SURFACE_SCHEMA_STALE_DOCTOR_COMMAND: &str = "pwsh -NoProfile -File .\\scripts\\synapse-codex-doctor.ps1 -ProjectDir C:\\code\\Synapse -ObservedSynapseSchemaStale -ActiveIssue <issue>";
+const CODEX_CLIENT_SURFACE_SCHEMA_STALE_READBACK_COMMAND: &str = "Get-Content .\\STATE\\RECOVERY_NOTES.md; Get-ChildItem \"$env:LOCALAPPDATA\\synapse\\codex-restart-handoffs\" -Filter 'codex-restart-handoff-*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1";
 
 pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[
     "health",
@@ -2454,10 +2456,12 @@ pub(crate) struct ToolProfileSnapshot {
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CodexClientSurfaceStatus {
-    HostSnapshotMatchesPublicTools,
+    HostSnapshotMatchesLiveToolSurface,
     HostSnapshotMissing,
     HostSnapshotReadError,
     HostSnapshotMissingPublicTools,
+    HostSnapshotToolSurfaceHashMismatch,
+    LiveToolSurfaceFingerprintError,
     RestartRequiredForLiveCodexPid,
     RestartHandoffPresentForDeadPid,
     HandoffReadError,
@@ -2522,6 +2526,8 @@ pub(crate) struct CodexRestartHandoffReadback {
     pub daemon_tool_surface_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_process_start_snapshot_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_process_start_tool_surface_sha256: Option<String>,
     #[serde(skip)]
     #[schemars(skip)]
     pub current_process_start_env_hash: Option<String>,
@@ -2551,6 +2557,15 @@ pub(crate) struct CodexClientSurfaceSnapshot {
     pub status: CodexClientSurfaceStatus,
     pub diagnostic_code: &'static str,
     pub remediation: &'static str,
+    pub live_tool_count: usize,
+    pub live_tool_surface_sha256: String,
+    pub host_snapshot_matches_live_tool_surface: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_tool_surface_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_snapshot_live_mismatch_detail: Option<String>,
+    pub stale_schema_doctor_command_hint: &'static str,
+    pub stale_schema_readback_command_hint: &'static str,
     pub host_snapshot: CodexToolSurfaceSnapshotReadback,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_restart_handoff: Option<CodexRestartHandoffReadback>,
@@ -3374,10 +3389,19 @@ impl SynapseService {
             full_tool_names
         };
         let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
+        let mut visible_tools = self.full_sanitized_tools();
+        if session_id.is_some() {
+            visible_tools.retain(|tool| profile.is_visible(tool.name.as_ref()));
+        }
+        let visible_tool_surface = super::health::tool_surface_fingerprint_for_tools(visible_tools);
         let denied_break_glass_tools = denied_break_glass_tools(&visible_tool_names);
         let hidden_tool_routes = hidden_tool_capability_routes(&visible_tool_names);
-        let codex_client_surface =
-            codex_client_surface_snapshot(&public_tool_registry.public_tool_names);
+        let codex_client_surface = codex_client_surface_snapshot(
+            &public_tool_registry.public_tool_names,
+            visible_tool_surface.names.len(),
+            visible_tool_surface.sha256,
+            visible_tool_surface.error,
+        );
         Ok(ToolProfileSnapshot {
             source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
             session_id: session_id.map(ToOwned::to_owned),
@@ -4523,7 +4547,12 @@ fn audit_readback(
     }
 }
 
-fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSurfaceSnapshot {
+fn codex_client_surface_snapshot(
+    public_tool_names: &[String],
+    live_tool_count: usize,
+    live_tool_surface_sha256: String,
+    live_tool_surface_error: Option<String>,
+) -> CodexClientSurfaceSnapshot {
     let host_snapshot = match env_path_checked("APPDATA", ["synapse", "codex-tool-surface.json"]) {
         Ok(path) => codex_tool_surface_snapshot_readback(&path),
         Err(error) => CodexToolSurfaceSnapshotReadback {
@@ -4562,6 +4591,7 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_tool_surface_sha256: None,
                 current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
@@ -4572,11 +4602,31 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
         sorted_missing_names(public_tool_names, &host_snapshot.tool_names);
     let host_snapshot_tools_missing_from_public_registry =
         sorted_missing_names(&host_snapshot.tool_names, public_tool_names);
-    let host_snapshot_is_current = host_snapshot.read_error.is_none()
+    let host_snapshot_has_public_tools = host_snapshot.read_error.is_none()
         && host_snapshot.exists
         && public_tools_missing_from_host_snapshot.is_empty();
+    let host_snapshot_matches_live_tool_surface = host_snapshot
+        .tool_surface_sha256
+        .as_deref()
+        .is_some_and(|hash| tool_surface_hashes_match(hash, &live_tool_surface_sha256));
+    let host_snapshot_live_mismatch_detail = if host_snapshot_has_public_tools
+        && live_tool_surface_error.is_none()
+        && !host_snapshot_matches_live_tool_surface
+    {
+        Some(format!(
+            "host snapshot tool_surface_sha256={} does not match live daemon tool_surface_sha256={} for {} tools; Codex may have cached stale MCP schemas",
+            host_snapshot
+                .tool_surface_sha256
+                .as_deref()
+                .unwrap_or("missing"),
+            live_tool_surface_sha256,
+            live_tool_count
+        ))
+    } else {
+        None
+    };
     let restart_handoff_requires_current = latest_restart_handoff.as_ref().is_some_and(|handoff| {
-        host_snapshot_is_current
+        host_snapshot_has_public_tools
             && restart_handoff_requires_current_codex_restart(handoff, &host_snapshot)
     });
     let live_stale_codex_process = latest_restart_handoff
@@ -4587,7 +4637,7 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
     if let Some(handoff) = latest_restart_handoff.as_mut() {
         resolve_restart_handoff_current_action_readback(
             handoff,
-            host_snapshot_is_current,
+            host_snapshot_has_public_tools,
             restart_handoff_requires_current,
             live_stale_codex_process.is_some(),
         );
@@ -4616,10 +4666,20 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
             CodexClientSurfaceStatus::HandoffReadError,
             "SYNAPSE_CODEX_RESTART_HANDOFF_READ_ERROR",
         )
+    } else if live_tool_surface_error.is_some() {
+        (
+            CodexClientSurfaceStatus::LiveToolSurfaceFingerprintError,
+            "CODEX_CLIENT_SURFACE_LIVE_TOOL_SURFACE_FINGERPRINT_ERROR",
+        )
     } else if live_stale_codex_process.is_some() {
         (
             CodexClientSurfaceStatus::RestartRequiredForLiveCodexPid,
             "SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE",
+        )
+    } else if !host_snapshot_matches_live_tool_surface {
+        (
+            CodexClientSurfaceStatus::HostSnapshotToolSurfaceHashMismatch,
+            "CODEX_CLIENT_SURFACE_HOST_SNAPSHOT_HASH_MISMATCH",
         )
     } else if latest_restart_handoff.as_ref().is_some_and(|handoff| {
         restart_handoff_requires_current_codex_restart(handoff, &host_snapshot)
@@ -4630,7 +4690,7 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
         )
     } else {
         (
-            CodexClientSurfaceStatus::HostSnapshotMatchesPublicTools,
+            CodexClientSurfaceStatus::HostSnapshotMatchesLiveToolSurface,
             "CODEX_CLIENT_SURFACE_OK",
         )
     };
@@ -4640,6 +4700,13 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
         status,
         diagnostic_code,
         remediation: CODEX_CLIENT_SURFACE_REMEDIATION,
+        live_tool_count,
+        live_tool_surface_sha256,
+        host_snapshot_matches_live_tool_surface,
+        live_tool_surface_error,
+        host_snapshot_live_mismatch_detail,
+        stale_schema_doctor_command_hint: CODEX_CLIENT_SURFACE_SCHEMA_STALE_DOCTOR_COMMAND,
+        stale_schema_readback_command_hint: CODEX_CLIENT_SURFACE_SCHEMA_STALE_READBACK_COMMAND,
         host_snapshot,
         latest_restart_handoff,
         live_stale_codex_process,
@@ -4785,6 +4852,7 @@ fn latest_codex_restart_handoff(dir: &Path) -> Option<CodexRestartHandoffReadbac
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_tool_surface_sha256: None,
                 current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
@@ -4852,6 +4920,7 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_tool_surface_sha256: None,
                 current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
@@ -4886,6 +4955,7 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_tool_surface_sha256: None,
                 current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
@@ -4911,6 +4981,8 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 ))
             }
         });
+    let current_process_start_tool_surface_sha256 =
+        json_pointer_string(&value, "/current_process_start_surface/env_hash");
     CodexRestartHandoffReadback {
         path: path_text,
         exists: true,
@@ -4940,10 +5012,9 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
             &value,
             "/current_process_start_surface/snapshot_status",
         ),
-        current_process_start_env_hash: json_pointer_string(
-            &value,
-            "/current_process_start_surface/env_hash",
-        ),
+        current_process_start_tool_surface_sha256: current_process_start_tool_surface_sha256
+            .clone(),
+        current_process_start_env_hash: current_process_start_tool_surface_sha256,
         live_daemon_pid,
         daemon_pid_matches_live_daemon,
         daemon_pid_mismatch_detail,

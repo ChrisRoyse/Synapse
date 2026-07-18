@@ -9,7 +9,8 @@ param(
     [string]$HandoffRoot = (Join-Path $env:LOCALAPPDATA 'synapse\codex-restart-handoffs'),
     [string]$ActiveIssue = $env:SYNAPSE_ACTIVE_ISSUE,
     [int]$FreshProbeTimeoutSec = 240,
-    [switch]$ObservedSynapseFacadeAbsent
+    [switch]$ObservedSynapseFacadeAbsent,
+    [switch]$ObservedSynapseSchemaStale
 )
 
 $ErrorActionPreference = 'Stop'
@@ -413,6 +414,104 @@ function Invoke-SynapseHealthDiagnostic {
     }
 }
 
+function Convert-SynapseToolSurfaceHash {
+    param([AllowNull()][string]$Hash)
+
+    if ([string]::IsNullOrWhiteSpace($Hash)) {
+        return $null
+    }
+    $trimmed = $Hash.Trim()
+    if ($trimmed.StartsWith('sha256:', [StringComparison]::OrdinalIgnoreCase)) {
+        return $trimmed.Substring(7)
+    }
+    return $trimmed
+}
+
+function Test-SynapseToolSurfaceHashMatch {
+    param(
+        [AllowNull()][string]$Left,
+        [AllowNull()][string]$Right
+    )
+
+    $leftHash = Convert-SynapseToolSurfaceHash -Hash $Left
+    $rightHash = Convert-SynapseToolSurfaceHash -Hash $Right
+    return (
+        -not [string]::IsNullOrWhiteSpace($leftHash) -and
+        -not [string]::IsNullOrWhiteSpace($rightHash) -and
+        [string]::Equals($leftHash, $rightHash, [StringComparison]::OrdinalIgnoreCase)
+    )
+}
+
+function Get-SynapseSnapshotStatus {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return 'missing_env'
+    }
+    if (Test-Path -LiteralPath $Path) {
+        return 'readable'
+    }
+    return 'missing_file'
+}
+
+function Get-SynapseCurrentProcessToolSurfaceReadback {
+    param(
+        [Parameter(Mandatory=$true)]$Snapshot,
+        [Parameter(Mandatory=$true)]$Health,
+        [Parameter(Mandatory=$true)]$FreshProbe
+    )
+
+    $processHash = [string]$env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
+    $processToolCount = [string]$env:SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START
+    $processSnapshot = [string]$env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
+    $hostHash = if ($Snapshot -and $Snapshot.valid) { [string]$Snapshot.tool_surface_sha256 } else { $null }
+    $liveHash = if ($FreshProbe -and $FreshProbe.ok -and $FreshProbe.result) { [string]$FreshProbe.result.tool_surface_sha256 } else { $null }
+    $liveToolCount = if ($FreshProbe -and $FreshProbe.ok -and $FreshProbe.result) { $FreshProbe.result.tool_count } else { $null }
+    $livePid = if ($FreshProbe -and $FreshProbe.ok -and $FreshProbe.result) { $FreshProbe.result.pid } elseif ($Health -and $Health.ok) { $Health.pid } else { $null }
+    $processMatchesLive = Test-SynapseToolSurfaceHashMatch -Left $processHash -Right $liveHash
+    $hostMatchesLive = Test-SynapseToolSurfaceHashMatch -Left $hostHash -Right $liveHash
+    $processHashPresent = -not [string]::IsNullOrWhiteSpace($processHash)
+    $hostHashPresent = -not [string]::IsNullOrWhiteSpace($hostHash)
+    $liveHashPresent = -not [string]::IsNullOrWhiteSpace($liveHash)
+    $processMismatchProven = ($processHashPresent -and $liveHashPresent -and -not $processMatchesLive)
+    $hostMismatchProven = ($hostHashPresent -and $liveHashPresent -and -not $hostMatchesLive)
+
+    $diagnostic = if ($processMismatchProven) {
+        'SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE'
+    } elseif ($hostMismatchProven) {
+        'SYNAPSE_CODEX_HOST_SNAPSHOT_SCHEMA_STALE'
+    } elseif ($processMatchesLive -and $hostMatchesLive) {
+        'OK'
+    } else {
+        'SYNAPSE_CODEX_SCHEMA_STALE_UNPROVEN'
+    }
+
+    return [ordered]@{
+        source_of_truth = 'current process environment + %APPDATA%\synapse\codex-tool-surface.json + fresh production Codex mcp__synapse.health result'
+        process_start_hash = if ($processHashPresent) { $processHash } else { $null }
+        process_start_tool_count = if ([string]::IsNullOrWhiteSpace($processToolCount)) { $null } else { $processToolCount }
+        process_start_snapshot_path = if ([string]::IsNullOrWhiteSpace($processSnapshot)) { $null } else { $processSnapshot }
+        process_start_snapshot_status = Get-SynapseSnapshotStatus -Path $processSnapshot
+        host_snapshot_hash = $hostHash
+        host_snapshot_tool_count = if ($Snapshot -and $Snapshot.valid) { $Snapshot.tool_count } else { $null }
+        host_snapshot_path = if ($Snapshot) { $Snapshot.path } else { $null }
+        live_daemon_hash = $liveHash
+        live_daemon_tool_count = $liveToolCount
+        live_daemon_pid = $livePid
+        direct_health_pid = if ($Health -and $Health.ok) { $Health.pid } else { $null }
+        direct_health_tool_count = if ($Health -and $Health.ok) { $Health.tool_count } else { $null }
+        direct_health_tool_surface_sha256 = if ($Health -and $Health.ok) { $Health.tool_surface_sha256 } else { $null }
+        direct_health_surface_scope = 'unscoped HTTP health diagnostic; may be broader than the Codex MCP session surface and is not used for schema-stale comparison'
+        process_start_matches_live_daemon = [bool]$processMatchesLive
+        host_snapshot_matches_live_daemon = [bool]$hostMatchesLive
+        process_start_mismatch_proven = [bool]$processMismatchProven
+        host_snapshot_mismatch_proven = [bool]$hostMismatchProven
+        schema_stale_proven = [bool]($processMismatchProven -or $hostMismatchProven)
+        diagnostic_code = $diagnostic
+        remediation = 'restart Codex through the patched launcher after reading the handoff plus STATE\RECOVERY_NOTES.md; rerun scripts\synapse-setup.ps1 if the host snapshot hash does not match the live daemon'
+    }
+}
+
 function Invoke-SynapseFreshCodexProbe {
     param(
         [Parameter(Mandatory=$true)][string]$ProjectPath,
@@ -746,20 +845,237 @@ function Write-SynapseNoFacadeHandoff {
     }
 }
 
+function Write-SynapseSchemaStaleHandoff {
+    param(
+        [Parameter(Mandatory=$true)]$Report,
+        [Parameter(Mandatory=$true)][string]$Root,
+        [AllowNull()][string]$RepoRoot,
+        [AllowNull()][string]$Issue
+    )
+
+    $activeIssueRef = Get-SynapseNormalizedIssueRef -Issue $Issue
+    $activeIssueNumber = Get-SynapseIssueNumberFromRef -IssueRef $activeIssueRef
+    $activeIssueRead = if ([string]::IsNullOrWhiteSpace($activeIssueNumber)) {
+        $null
+    } else {
+        "gh issue view $activeIssueNumber --repo ChrisRoyse/Synapse --comments"
+    }
+    $codexPid = if ($Report.current_codex_process -and $Report.current_codex_process.pid) { [int]$Report.current_codex_process.pid } else { 0 }
+    $stamp = Get-SynapseNowStamp
+    $baseName = "codex-restart-handoff-$codexPid-$stamp"
+    $jsonPath = Join-Path $Root "$baseName.json"
+    $mdPath = Join-Path $Root "$baseName.md"
+    $recoveryNotesPath = Get-SynapseRecoveryNotesPath -RepoRoot $RepoRoot
+    $postRestartRequiredReads = @(
+        'C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md',
+        'C:\code\Synapse\docs\compressionprompt.md',
+        'C:\code\Synapse\AGENTS.md',
+        $recoveryNotesPath
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $githubReads = @(
+        'gh issue view 351 --repo ChrisRoyse/Synapse --comments',
+        $activeIssueRead,
+        'gh issue list --repo ChrisRoyse/Synapse --state open --limit 100'
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $surface = $Report.current_process_tool_surface
+    $reason = if ($surface.process_start_mismatch_proven) {
+        'current_process_start_hash_mismatch'
+    } elseif ($surface.host_snapshot_mismatch_proven) {
+        'host_snapshot_hash_mismatch'
+    } else {
+        'schema_stale_observed_without_hash_match'
+    }
+    $restartHint = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) {
+        "Close this Codex session completely, start a new Codex session through the patched launcher, verify the active codex.exe PID is not stale PID $codexPid, then resume from GitHub issue state."
+    } else {
+        "Close this Codex session completely, start a new Codex session through the patched launcher, verify the active codex.exe PID is not stale PID $codexPid, then resume $activeIssueRef."
+    }
+    $doctorCommand = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) {
+        'pwsh -NoProfile -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir C:\code\Synapse -ObservedSynapseSchemaStale'
+    } else {
+        "pwsh -NoProfile -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir C:\code\Synapse -ObservedSynapseSchemaStale -ActiveIssue $activeIssueRef"
+    }
+
+    $record = [ordered]@{
+        schema_version = 2
+        artifact_kind = 'synapse_codex_restart_handoff'
+        created_at_utc = [DateTime]::UtcNow.ToString('o')
+        reason_code = 'SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE'
+        reason = $reason
+        phase = 'doctor_observed_schema_stale'
+        required_restart = $true
+        no_in_process_hot_refresh = $true
+        explanation = 'The current Codex process has process-local MCP callable metadata that does not match the live daemon tool surface, or the configured Codex host snapshot is stale against that live daemon. Restart through the patched Codex launcher is the same-agent recovery boundary.'
+        codex_process = $Report.current_codex_process
+        current_process_lineage = $Report.current_process_lineage
+        current_process_start_surface = [ordered]@{
+            env_hash_present = (-not [string]::IsNullOrWhiteSpace([string]$surface.process_start_hash))
+            env_hash = $surface.process_start_hash
+            env_tool_count = $surface.process_start_tool_count
+            env_snapshot_path = $surface.process_start_snapshot_path
+            snapshot_status = $surface.process_start_snapshot_status
+        }
+        daemon = [ordered]@{
+            bind = $Report.bind
+            pid = $surface.live_daemon_pid
+            pid_role = 'installed_configured_daemon'
+            pid_authoritative_for_configured_bind = $true
+            pid_expectation = 'This PID is the live daemon observed by direct diagnostic /health and should own the configured bind unless a later setup run superseded it.'
+            tool_count = $surface.live_daemon_tool_count
+            tool_surface_sha256 = $surface.live_daemon_hash
+            snapshot_path = $Report.tool_surface_snapshot.path
+        }
+        diff = [ordered]@{
+            summary = "process_start_mismatch=$($surface.process_start_mismatch_proven); host_snapshot_mismatch=$($surface.host_snapshot_mismatch_proven); process_start_hash=$($surface.process_start_hash); host_snapshot_hash=$($surface.host_snapshot_hash); live_daemon_hash=$($surface.live_daemon_hash)"
+            process_start_hash = $surface.process_start_hash
+            host_snapshot_hash = $surface.host_snapshot_hash
+            live_daemon_hash = $surface.live_daemon_hash
+            process_start_matches_live_daemon = $surface.process_start_matches_live_daemon
+            host_snapshot_matches_live_daemon = $surface.host_snapshot_matches_live_daemon
+        }
+        current_process_tool_surface = $surface
+        project = $Report.project
+        codex_config = $Report.codex_config
+        token = $Report.token_without_secret
+        tool_surface_snapshot = $Report.tool_surface_snapshot
+        daemon_processes = $Report.daemon_processes
+        tcp = $Report.tcp
+        health_diagnostic = $Report.health_diagnostic
+        fresh_codex_probe = $Report.fresh_codex_probe
+        fresh_codex_probe_pid_matches_direct_health = $Report.fresh_codex_probe_pid_matches_direct_health
+        active_issue = [ordered]@{
+            issue_ref = $activeIssueRef
+            issue_number = $activeIssueNumber
+            source = 'ActiveIssue parameter or SYNAPSE_ACTIVE_ISSUE environment variable'
+            status = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown' } else { 'provided' }
+        }
+        stale_schema_context_issue = [ordered]@{
+            issue_ref = '#1398'
+            role = 'background context for the stale-schema bug class; not the resume target'
+        }
+        github_reads = $githubReads
+        post_restart_required_reads = $postRestartRequiredReads
+        post_restart_verification = @(
+            'Run git status --short --branch and confirm the working tree matches the handoff/recovery notes.',
+            "Read the active Codex process parent chain and confirm the active codex.exe PID is not stale PID $codexPid from this handoff.",
+            'Run deferred tool discovery for Synapse first, then call real mcp__synapse.health and verify daemon pid/tool_surface_sha256 matches or intentionally supersedes this handoff.',
+            'Read tool_profile_status or telemetry operation=status and confirm codex_client_surface.status is CODEX_CLIENT_SURFACE_OK or explains the remaining mismatch with exact hashes.',
+            'If Synapse tool discovery, approval, or metadata is still stale, rerun scripts\synapse-setup.ps1 and keep the issue open.'
+        )
+        restart_command_hint = $restartHint
+        stale_schema_doctor_command = $doctorCommand
+        repo_readback = Get-SynapseGitReadback -RepoRoot $RepoRoot
+        recovery_notes_path = $recoveryNotesPath
+        report_path = $Report.report_path
+    }
+
+    try {
+        New-Item -ItemType Directory -Force -Path $Root | Out-Null
+        Write-SynapseUtf8NoBomFile -Path $jsonPath -Text (($record | ConvertTo-Json -Depth 40) + "`n")
+        $md = @(
+            '# Synapse Codex Restart Handoff',
+            '',
+            "- Reason: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE ($reason)",
+            '- Phase: doctor_observed_schema_stale',
+            "- Created UTC: $($record.created_at_utc)",
+            "- Codex PID: $codexPid",
+            "- Daemon: pid=$($record.daemon.pid) bind=$($record.daemon.bind) tool_count=$($record.daemon.tool_count) tool_surface_sha256=$($record.daemon.tool_surface_sha256)",
+            "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
+            "- Current process start snapshot: status=$($surface.process_start_snapshot_status) hash=$($surface.process_start_hash) path=$($surface.process_start_snapshot_path)",
+            "- Host snapshot: hash=$($surface.host_snapshot_hash) path=$($surface.host_snapshot_path)",
+            "- Live daemon: hash=$($surface.live_daemon_hash) pid=$($surface.live_daemon_pid)",
+            "- Fresh Codex probe PID matches direct health PID: $($Report.fresh_codex_probe_pid_matches_direct_health)",
+            '',
+            '## Required Restart',
+            "The running Codex process cannot hot-add changed MCP tools or mutate cached tool schemas. Close stale Codex PID $codexPid completely, restart Codex through the patched launcher, and prove the active codex.exe PID changed before continuing. Typing continue into the same PID is not a restart.",
+            '',
+            '## Re-run This Doctor',
+            $doctorCommand,
+            '',
+            '## Read After Restart'
+        )
+        foreach ($item in $postRestartRequiredReads) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            '## GitHub Reads'
+        )
+        foreach ($item in $githubReads) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            '## Verification'
+        )
+        foreach ($item in $record.post_restart_verification) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            "JSON artifact: $jsonPath",
+            "Doctor report: $($Report.report_path)",
+            ''
+        )
+        Write-SynapseUtf8NoBomFile -Path $mdPath -Text (($md -join "`n") + "`n")
+
+        if (-not [string]::IsNullOrWhiteSpace($recoveryNotesPath)) {
+            $notes = @(
+                '# Synapse Recovery Notes',
+                '',
+                '## Latest Codex Restart Handoff',
+                '',
+                "- Reason: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE ($reason)",
+                '- Phase: doctor_observed_schema_stale',
+                "- Created UTC: $($record.created_at_utc)",
+                "- JSON: $jsonPath",
+                "- Markdown: $mdPath",
+                "- Doctor report: $($Report.report_path)",
+                "- Stale Codex PID: $codexPid",
+                "- Daemon bind: $($Report.bind)",
+                "- Daemon tool surface: $($surface.live_daemon_hash)",
+                "- Current process start tool surface: $($surface.process_start_hash)",
+                "- Host snapshot tool surface: $($surface.host_snapshot_hash)",
+                "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
+                '',
+                "After restart, re-read AGENTS.md, #351, $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'the active issue from the caller/session context' } else { $activeIssueRef }), git status, and this file before resuming. Run deferred Synapse tool discovery before calling real mcp__synapse tools for FSV; direct helper calls are diagnostics only.",
+                ''
+            )
+            Write-SynapseUtf8NoBomFile -Path $recoveryNotesPath -Text (($notes -join "`n") + "`n")
+        }
+    } catch {
+        throw "SYNAPSE_CODEX_SCHEMA_STALE_HANDOFF_WRITE_FAILED path=$jsonPath error=$($_.Exception.Message) remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-restart-handoffs and rerun this doctor"
+    }
+
+    return [ordered]@{
+        json_path = $jsonPath
+        markdown_path = $mdPath
+        recovery_notes_path = $recoveryNotesPath
+    }
+}
+
 $runDir = New-SynapseDoctorRunDir -Root $RunRoot
 $reportPath = Join-Path $runDir 'doctor-report.json'
-$activeIssueRef = Get-SynapseNormalizedIssueRef -Issue $ActiveIssue
+$activeIssueRef = $null
+$activeIssueParseError = $null
+try {
+    $activeIssueRef = Get-SynapseNormalizedIssueRef -Issue $ActiveIssue
+} catch {
+    $activeIssueParseError = $_.Exception.Message
+}
 $script:Report = [ordered]@{
     schema_version = 1
-    artifact_kind = 'synapse_codex_no_facade_doctor_report'
+    artifact_kind = 'synapse_codex_doctor_report'
     started_at_utc = [DateTime]::UtcNow.ToString('o')
     status = 'running'
     reason_code = $null
     report_path = $reportPath
     run_dir = $runDir
     observed_synapse_facade_absent = [bool]$ObservedSynapseFacadeAbsent
+    observed_synapse_schema_stale = [bool]$ObservedSynapseSchemaStale
     bind = $Bind
     active_issue = $activeIssueRef
+    active_issue_parse_error = $activeIssueParseError
 }
 
 function Get-SynapseDoctorRedactedReport {
@@ -794,6 +1110,14 @@ function Stop-SynapseDoctor {
 }
 
 try {
+    if (-not [string]::IsNullOrWhiteSpace($activeIssueParseError)) {
+        Stop-SynapseDoctor -ReasonCode 'SYNAPSE_ACTIVE_ISSUE_INVALID' -Message $activeIssueParseError
+    }
+
+    if ($ObservedSynapseFacadeAbsent -and $ObservedSynapseSchemaStale) {
+        Stop-SynapseDoctor -ReasonCode 'SYNAPSE_CODEX_DOCTOR_OBSERVATION_CONFLICT' -Message 'ObservedSynapseFacadeAbsent and ObservedSynapseSchemaStale are mutually exclusive; rerun with the single symptom observed in the current Codex session'
+    }
+
     $script:Report.project = Get-SynapseProjectReadback -Path $ProjectDir
     if (-not $script:Report.project.exists) {
         Stop-SynapseDoctor -ReasonCode 'SYNAPSE_CODEX_PROJECT_PATH_MISSING' -Message "project path does not exist: $ProjectDir"
@@ -862,16 +1186,38 @@ try {
     if (-not $script:Report.fresh_codex_probe.ok) {
         Stop-SynapseDoctor -ReasonCode $script:Report.fresh_codex_probe.reason_code -Message "fresh production Codex session did not prove a real Synapse health MCP call"
     }
+    $script:Report.fresh_codex_probe_pid_matches_direct_health = (
+        $script:Report.health_diagnostic.ok -and
+        $script:Report.fresh_codex_probe.result -and
+        [int]$script:Report.fresh_codex_probe.result.pid -eq [int]$script:Report.health_diagnostic.pid
+    )
+    if (-not $script:Report.fresh_codex_probe_pid_matches_direct_health) {
+        Stop-SynapseDoctor -ReasonCode 'SYNAPSE_CODEX_FRESH_SESSION_DAEMON_PID_MISMATCH' -Message "fresh production Codex health MCP call did not reach the same daemon PID as direct diagnostic /health; inspect the doctor report before accepting any restart handoff"
+    }
+    $script:Report.current_process_tool_surface = Get-SynapseCurrentProcessToolSurfaceReadback -Snapshot $script:Report.tool_surface_snapshot -Health $script:Report.health_diagnostic -FreshProbe $script:Report.fresh_codex_probe
 
     if ($ObservedSynapseFacadeAbsent) {
         $script:Report.handoff = Write-SynapseNoFacadeHandoff -Report $script:Report -Root $HandoffRoot -RepoRoot $SourceDir -Issue $ActiveIssue
         $script:Report.status = 'handoff_written'
         $script:Report.reason_code = 'SYNAPSE_CODEX_CURRENT_PROCESS_MCP_ABSENT'
         $script:Report.message = 'current session was observed without Synapse MCP; fresh Codex probe succeeded; restart handoff written'
+    } elseif ($ObservedSynapseSchemaStale) {
+        if (-not $script:Report.current_process_tool_surface.schema_stale_proven) {
+            Stop-SynapseDoctor -ReasonCode 'SYNAPSE_CODEX_SCHEMA_STALE_NOT_REPRODUCED' -Message "ObservedSynapseSchemaStale was supplied, but process-start, host snapshot, and live daemon tool-surface hashes did not prove schema drift"
+        }
+        $script:Report.handoff = Write-SynapseSchemaStaleHandoff -Report $script:Report -Root $HandoffRoot -RepoRoot $SourceDir -Issue $ActiveIssue
+        $script:Report.status = 'handoff_written'
+        $script:Report.reason_code = 'SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE'
+        $script:Report.message = 'current session was observed with stale Synapse MCP schema metadata; fresh Codex probe matched the live daemon; restart handoff written'
+    } elseif ($script:Report.current_process_tool_surface.schema_stale_proven) {
+        $script:Report.handoff = Write-SynapseSchemaStaleHandoff -Report $script:Report -Root $HandoffRoot -RepoRoot $SourceDir -Issue $ActiveIssue
+        $script:Report.status = 'handoff_written'
+        $script:Report.reason_code = 'SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE'
+        $script:Report.message = 'physical hash readbacks proved stale Synapse MCP schema metadata; restart handoff written even without an explicit stale-schema observation switch'
     } else {
         $script:Report.status = 'healthy_no_handoff'
         $script:Report.reason_code = 'OK'
-        $script:Report.message = 'configured Synapse/Codex path is healthy; no no-facade observation was supplied, so no restart handoff was written'
+        $script:Report.message = 'configured Synapse/Codex path is healthy; no no-facade or stale-schema observation was supplied, so no restart handoff was written'
     }
     Write-SynapseDoctorReport
     Write-Output ((Get-SynapseDoctorRedactedReport | ConvertTo-Json -Depth 12 -Compress))

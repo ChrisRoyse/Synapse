@@ -474,9 +474,13 @@ Install Synapse for me and wire it into my AI tools.
    after it has started. If Codex has no Synapse MCP namespace at all but can
    still run shell commands, run
    `pwsh -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir <repo> -ObservedSynapseFacadeAbsent`.
+   If Codex has a Synapse namespace but tool metadata is stale after a daemon
+   tool-surface change, run
+   `pwsh -File .\scripts\synapse-codex-doctor.ps1 -ProjectDir <repo> -ObservedSynapseSchemaStale -ActiveIssue <issue>`.
    The doctor fails closed on broken config/token/daemon state; when a fresh
-   production Codex probe can call real Synapse `health`, it writes a restart
-   handoff under `%LOCALAPPDATA%\synapse\codex-restart-handoffs`.
+   production Codex probe can call real Synapse `health` and the physical
+   readbacks prove the observed symptom, it writes a restart handoff under
+   `%LOCALAPPDATA%\synapse\codex-restart-handoffs`.
 
 I'm on Windows. Use the real absolute Cargo bin path, don't invent one, and tell
 me anything that needs my approval (e.g. installing the Rust toolchain).
