@@ -110,7 +110,8 @@ pub enum TranscriptSource {
     /// the stream-json stdout: each line is an enveloped record
     /// (`parentUuid`/`sessionId`/`cwd`/`timestamp`) whose `message` is the raw
     /// Anthropic API message, plus session metadata records
-    /// (`mode`/`file-history-snapshot`/`summary`/...). This is the source the
+    /// (`mode`/`file-history-snapshot`/`file-history-delta`/`summary`/...).
+    /// This is the source the
     /// ambient-agent discovery pipeline tails for agents Synapse did not spawn.
     ClaudeSessionJsonl,
     /// Codex `exec --json` stdout (verified against the

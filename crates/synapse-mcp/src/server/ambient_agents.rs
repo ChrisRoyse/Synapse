@@ -38,8 +38,8 @@
 //! stdout the #900 ingester parses: each line is an enveloped record
 //! (`parentUuid`/`sessionId`/`cwd`/`gitBranch`/`timestamp`) whose `message` is
 //! the raw Anthropic API message, interleaved with session-metadata records
-//! (`mode`/`file-history-snapshot`/`summary`/`ai-title`/...). Hence a dedicated
-//! parser and the [`TranscriptSource::ClaudeSessionJsonl`] tag. Parsing is
+//! (`mode`/`file-history-snapshot`/`file-history-delta`/`summary`/`ai-title`/...).
+//! Hence a dedicated parser and the [`TranscriptSource::ClaudeSessionJsonl`] tag. Parsing is
 //! fail-loud: an unknown record type still writes an `invalid` row carrying the
 //! structured reason, so format drift is a counted, logged defect — never a
 //! silent skip.
@@ -650,7 +650,10 @@ fn ingest_session_file_with_cancel(
                 tracing::error!(
                     code = "AMBIENT_LINE_INVALID",
                     spawn_id = %spawn_id,
+                    source_path = %source_path.display(),
                     line_no,
+                    raw_line_bytes = record.raw_line_bytes,
+                    raw_line_sha256 = %record.raw_line_sha256,
                     detail = record.parse_error.as_deref().unwrap_or("unknown"),
                     "ambient source line refused by the session-file parser; invalid row written"
                 );
@@ -1057,6 +1060,21 @@ fn parse_secs_env(name: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
+const CLAUDE_SESSION_METADATA_TYPES: &[&str] = &[
+    "mode",
+    "file-history-snapshot",
+    "file-history-delta",
+    "ai-title",
+    "attachment",
+    "last-prompt",
+    "queue-operation",
+    "result",
+    "permission-mode",
+    "pr-link",
+    "worktree-state",
+    "agent-name",
+];
+
 // ---------------------------------------------------------------------------
 // Session-file (~/.claude/projects) line parser
 // ---------------------------------------------------------------------------
@@ -1198,17 +1216,7 @@ fn classify_session_object(
         // by enumerating every record type across the live ~/.claude/projects
         // transcripts), so they are carried as recognized system rows — never
         // refused as unknown.
-        "mode"
-        | "file-history-snapshot"
-        | "ai-title"
-        | "attachment"
-        | "last-prompt"
-        | "queue-operation"
-        | "result"
-        | "permission-mode"
-        | "pr-link"
-        | "worktree-state"
-        | "agent-name" => {
+        event_type if CLAUDE_SESSION_METADATA_TYPES.contains(&event_type) => {
             record.role = Some(TranscriptRole::System);
             record.event_kind = Some(event_type.to_owned());
             Ok(None)
