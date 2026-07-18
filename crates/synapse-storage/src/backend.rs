@@ -13,6 +13,7 @@ use calyx_aster::{
 };
 use calyx_core::Constellation;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
     SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxError,
@@ -21,14 +22,19 @@ use synapse_calyx::{
 use synapse_core::{
     error_codes,
     retention::{DEFAULTS, RetentionDefault, RetentionTtl},
-    types::{AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, TimelineRecord},
+    types::{
+        AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, StoredObservation,
+        StoredReflexAudit, TimelineRecord,
+    },
 };
 
 use crate::constellations::{
-    ConstellationPutReport, NativeConstellationContext, SYN_AGENT_EVENT_PANEL_NAME,
-    SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-    SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    ConstellationPutReport, NativeConstellationContext, SYN_ACTION_PANEL_NAME,
+    SYN_ACTION_PANEL_VERSION, SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION,
+    SYN_AGENT_TRANSCRIPT_PANEL_NAME, SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME,
+    SYN_EPISODE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
+    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME,
+    SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 use crate::{
     CfEstimateMap, OwnedCfWriteBatch, RawRow, ScanWindow, StorageError, StorageResult, cf,
@@ -230,6 +236,30 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &AgentTranscriptRecord,
     ) -> StorageResult<ConstellationPutReport>;
+    fn put_action_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_reflex_audit_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &StoredReflexAudit,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_process_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_sampled_observation_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &StoredObservation,
+    ) -> StorageResult<Option<ConstellationPutReport>>;
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -1025,6 +1055,333 @@ impl StorageBackend for CalyxBackend {
                 constellations::emit_error_metric(
                     SYN_AGENT_TRANSCRIPT_PANEL_NAME,
                     cf::CF_AGENT_TRANSCRIPTS,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_action_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put action Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_ACTION_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_ACTION_LOG)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_action_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put action observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_ACTION_PANEL_NAME,
+                    panel_version: SYN_ACTION_PANEL_VERSION,
+                    source_cf: cf::CF_ACTION_LOG,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_ACTION_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "action row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_ACTION_PANEL_NAME,
+                    cf::CF_ACTION_LOG,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_reflex_audit_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &StoredReflexAudit,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put reflex audit Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_REFLEX_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_REFLEX_AUDIT)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_reflex_audit_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put reflex audit observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_REFLEX_PANEL_NAME,
+                    panel_version: SYN_REFLEX_PANEL_VERSION,
+                    source_cf: cf::CF_REFLEX_AUDIT,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_REFLEX_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "reflex audit row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_REFLEX_PANEL_NAME,
+                    cf::CF_REFLEX_AUDIT,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_process_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put process Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_PROCESS_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_PROCESS_HISTORY)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_process_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put process observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_PROCESS_PANEL_NAME,
+                    panel_version: SYN_PROCESS_PANEL_VERSION,
+                    source_cf: cf::CF_PROCESS_HISTORY,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_PROCESS_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "process row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_PROCESS_PANEL_NAME,
+                    cf::CF_PROCESS_HISTORY,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_sampled_observation_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &StoredObservation,
+    ) -> StorageResult<Option<ConstellationPutReport>> {
+        let started = Instant::now();
+        let sample_permits =
+            match constellations::observation_constellation_sample_permits(source_key) {
+                Ok(sample_permits) => sample_permits,
+                Err(error) => {
+                    constellations::emit_error_metric(
+                        SYN_OBSERVATION_PANEL_NAME,
+                        cf::CF_OBSERVATIONS,
+                        error.code(),
+                        started.elapsed(),
+                    );
+                    return Err(error);
+                }
+            };
+        if !sample_permits {
+            tracing::debug!(
+                code = "CALYX_OBSERVATION_CONSTELLATION_SAMPLE_SKIPPED",
+                source_cf = cf::CF_OBSERVATIONS,
+                source_key_hex = %constellations::hex_encode(source_key),
+                sampler = "ts_ns_seq_modulo_config",
+                "observation row skipped by deterministic Calyx constellation sampler"
+            );
+            return Ok(None);
+        }
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put sampled observation Calyx constellation",
+            true,
+            |vault| {
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(raw_bytes, SYN_OBSERVATION_PANEL_VERSION),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_OBSERVATIONS)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_observation_constellation(
+                    context, source_key, raw_bytes, record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put sampled observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_OBSERVATION_PANEL_NAME,
+                    panel_version: SYN_OBSERVATION_PANEL_VERSION,
+                    source_cf: cf::CF_OBSERVATIONS,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_OBSERVATION_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "sampled observation row measured into native Calyx constellation"
+                );
+                Ok(Some(report))
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_OBSERVATION_PANEL_NAME,
+                    cf::CF_OBSERVATIONS,
                     error.code(),
                     started.elapsed(),
                 );

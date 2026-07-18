@@ -1662,6 +1662,7 @@ pub fn launch_process_history_row(
     params: &ActLaunchParams,
     response: &ActLaunchResponse,
 ) -> Result<Vec<u8>, ErrorData> {
+    let launched_at_unix_ms = launched_at_unix_ms(&response.launched_at)?;
     let row = json!({
         "schema_version": 1,
         "row_kind": "process_start",
@@ -1681,6 +1682,8 @@ pub fn launch_process_history_row(
         "hwnd": response.hwnd,
         "matched_title": response.matched_title,
         "launched_at": response.launched_at,
+        "launched_at_unix_ms": launched_at_unix_ms,
+        "ts_ns": launched_at_unix_ms.saturating_mul(1_000_000),
         "reason": response.reason,
         "cdp_debug": params.cdp_debug,
         "force_renderer_accessibility": params.force_renderer_accessibility,
@@ -1697,6 +1700,21 @@ pub fn launch_process_history_row(
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("act_launch process history row encode failed: {error}"),
+        )
+    })
+}
+
+fn launched_at_unix_ms(launched_at: &str) -> Result<u64, ErrorData> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(launched_at).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_launch process history launched_at parse failed: {error}"),
+        )
+    })?;
+    u64::try_from(parsed.timestamp_millis()).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_launch process history launched_at before Unix epoch: {error}"),
         )
     })
 }

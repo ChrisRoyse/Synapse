@@ -2687,6 +2687,7 @@ function Format-SynapseTcpBindListenerSnapshot {
 function Get-SynapseDaemonStartupLogSignal {
     param(
         [Parameter(Mandatory=$true)][string]$LogDir,
+        [AllowNull()][datetime]$SinceUtc = $null,
         [int]$TailLines = 1600,
         [int]$MaxMatches = 24
     )
@@ -2712,7 +2713,8 @@ function Get-SynapseDaemonStartupLogSignal {
     $pattern = ($patterns | ForEach-Object { [regex]::Escape($_) }) -join '|'
     $paths = @(Get-ChildItem -LiteralPath $LogDir -Filter 'synapse.log*' -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
-        Select-Object -First 2)
+        Select-Object -First 2 |
+        Sort-Object LastWriteTime)
     $matches = @()
     foreach ($path in $paths) {
         $lines = @(Get-Content -LiteralPath $path.FullName -Tail $TailLines -ErrorAction SilentlyContinue |
@@ -2720,6 +2722,23 @@ function Get-SynapseDaemonStartupLogSignal {
             Select-Object -Last $MaxMatches)
         foreach ($line in $lines) {
             $text = [string]$line.Line
+            if ($SinceUtc) {
+                $timestampMatch = [regex]::Match($text, '"timestamp"\s*:\s*"(?<timestamp>[^"]+)"')
+                if (-not $timestampMatch.Success) {
+                    continue
+                }
+                $lineTimestamp = [datetime]::MinValue
+                if (-not [datetime]::TryParse(
+                    $timestampMatch.Groups['timestamp'].Value,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal,
+                    [ref]$lineTimestamp)) {
+                    continue
+                }
+                if ($lineTimestamp.ToUniversalTime() -lt $SinceUtc.ToUniversalTime()) {
+                    continue
+                }
+            }
             if ($text.Length -gt 900) {
                 $text = $text.Substring(0, 900) + '...<truncated>'
             }
@@ -2735,6 +2754,7 @@ function Get-SynapseDaemonStartupLogSignal {
     return [pscustomobject]@{
         schema = 'synapse_daemon_startup_log_signal/v1'
         log_dir = $LogDir
+        since_utc = ($(if ($SinceUtc) { $SinceUtc.ToUniversalTime().ToString('o') } else { $null }))
         files_scanned = @($paths | Select-Object -ExpandProperty FullName)
         matches = @($matches)
     }
@@ -2749,6 +2769,45 @@ function Format-SynapseDaemonStartupLogSignal {
     return ((@($Signal.matches) | ForEach-Object {
         "path=$($_.path) line=$($_.line)"
     }) -join "`n")
+}
+
+function Get-SynapseDaemonStartupProgressKey {
+    param([AllowNull()]$Signal)
+
+    if (-not $Signal -or -not $Signal.matches -or @($Signal.matches).Count -eq 0) {
+        return $null
+    }
+    $last = @($Signal.matches)[@($Signal.matches).Count - 1]
+    return "$($last.path)|$($last.line)"
+}
+
+function Test-SynapseInstallHealthProgressSignalCanExtend {
+    param([AllowNull()][string]$ProgressKey)
+
+    if ([string]::IsNullOrWhiteSpace($ProgressKey)) {
+        return $false
+    }
+    $extendablePatterns = @(
+        'MCP_DAEMON_SINGLE_INSTANCE_ACQUIRED',
+        'MCP_DAEMON_SHELL_JOB_STORE_LOCK_ACQUIRED',
+        'MCP_DAEMON_LIFECYCLE_READY',
+        'M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY',
+        'M4_SHELL_JOB_REAP_STARTUP',
+        'MCP_DAEMON_STORAGE_AND_CALYX_OPEN_START',
+        'SYNAPSE_CALYX_MATH_BACKEND_SELECTED',
+        'SYNAPSE_CALYX_VAULT_OPENED',
+        'STORAGE_BACKEND_OPENED',
+        'MCP_DAEMON_STORAGE_AND_CALYX_OPENED',
+        'TIMELINE_RECORDER_STARTED',
+        'MCP_DAEMON_ACTIVITY_RECORDER_STARTED',
+        'MCP_HTTP_BIND_NORMAL'
+    )
+    foreach ($pattern in $extendablePatterns) {
+        if ($ProgressKey.Contains($pattern)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-SynapseProtectedProcessNames {
@@ -7727,7 +7786,21 @@ if ($ManualInstallHealthRollbackProbe) {
 } else {
     Info "Installed daemon health timeout seconds=$installHealthTimeoutSeconds"
 }
-$installHealthDeadline = (Get-Date).AddSeconds($installHealthTimeoutSeconds)
+$installHealthStartedAt = Get-Date
+$installHealthStartedAtUtc = $installHealthStartedAt.ToUniversalTime().AddSeconds(-5)
+$installHealthDeadline = $installHealthStartedAt.AddSeconds($installHealthTimeoutSeconds)
+$installHealthHardCapSeconds = [Math]::Min(
+    1800,
+    [Math]::Max(
+        ($installHealthTimeoutSeconds * 3),
+        ($installHealthTimeoutSeconds + 900)))
+$installHealthHardDeadline = $installHealthStartedAt.AddSeconds($installHealthHardCapSeconds)
+$installHealthProgressWindowSeconds = [Math]::Min(
+    1200,
+    [Math]::Max(900, $installHealthTimeoutSeconds))
+$installHealthProgressExtensions = 0
+$lastInstallHealthProgressKey = $null
+$lastInstallHealthProgressAt = $null
 $installHealthAttempt = 0
 while ((Get-Date) -lt $installHealthDeadline) {
     $installHealthAttempt++
@@ -7778,7 +7851,37 @@ while ((Get-Date) -lt $installHealthDeadline) {
     if (-not $ok -and ($installHealthAttempt -eq 1 -or ($installHealthAttempt % 15) -eq 0)) {
         $progressListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
         $progressProcesses = @(Get-SynapseMcpProcessSnapshot)
-        $progressStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir
+        $progressStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $installHealthStartedAtUtc
+        $progressTargets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot $progressProcesses -Bind $Bind -DbPath $DbPath)
+        $progressKey = Get-SynapseDaemonStartupProgressKey -Signal $progressStartupLog
+        $phaseCanExtend = Test-SynapseInstallHealthProgressSignalCanExtend -ProgressKey $progressKey
+        $candidateAlive = ($progressTargets.Count -gt 0)
+        if ($candidateAlive -and $phaseCanExtend) {
+            $now = Get-Date
+            $progressChanged = ($progressKey -ne $lastInstallHealthProgressKey)
+            if ($progressChanged) {
+                $lastInstallHealthProgressKey = $progressKey
+                $lastInstallHealthProgressAt = $now
+            }
+            $proposedDeadline = $now.AddSeconds($installHealthProgressWindowSeconds)
+            if ($proposedDeadline -gt $installHealthHardDeadline) {
+                $proposedDeadline = $installHealthHardDeadline
+            }
+            if ($proposedDeadline -gt $installHealthDeadline) {
+                $installHealthDeadline = $proposedDeadline
+                $installHealthProgressExtensions++
+                $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($installHealthDeadline - $now).TotalSeconds))
+                $hardRemainingSeconds = [Math]::Max(0, [int][Math]::Ceiling(($installHealthHardDeadline - $now).TotalSeconds))
+                Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS_DEADLINE_EXTENDED attempt={0} extension_count={1} remaining_s={2} hard_remaining_s={3} progress_changed={4} candidate_pids={5} phase_key={6}" -f `
+                    $installHealthAttempt,
+                    $installHealthProgressExtensions,
+                    $remainingSeconds,
+                    $hardRemainingSeconds,
+                    $progressChanged,
+                    ((@($progressTargets | ForEach-Object { $_.ProcessId })) -join ','),
+                    $progressKey)
+            }
+        }
         Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS attempt={0} remaining_s={1} last_health_error={2}`nlisteners:`n{3}`nprocesses:`n{4}`nstartup_log:`n{5}" -f `
             $installHealthAttempt,
             $remainingSeconds,
@@ -7791,13 +7894,17 @@ while ((Get-Date) -lt $installHealthDeadline) {
 if (-not $ok) {
     $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
-    $failureStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} last_health_error={5} last_subsystem_statuses={6} manual_probe={7} manual_probe_pause_mode={8}`nlisteners:`n{9}`nprocesses:`n{10}`nstartup_log:`n{11}`nremediation=inspect {12} and synapse.log.* under {13} for launch / STORAGE_* / bind errors" -f `
+    $failureStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $installHealthStartedAtUtc
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} hard_cap_s={5} progress_window_s={6} progress_extensions={7} last_progress_at={8} last_health_error={9} last_subsystem_statuses={10} manual_probe={11} manual_probe_pause_mode={12}`nlisteners:`n{13}`nprocesses:`n{14}`nstartup_log:`n{15}`nremediation=inspect {16} and synapse.log.* under {17} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
         ($(if ($backupPath) { $backupPath } else { '<none>' })),
         $installHealthTimeoutSeconds,
+        $installHealthHardCapSeconds,
+        $installHealthProgressWindowSeconds,
+        $installHealthProgressExtensions,
+        ($(if ($lastInstallHealthProgressAt) { $lastInstallHealthProgressAt.ToString('o') } else { '<none>' })),
         ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
         $lastHealthSubsystemStatuses,
         $ManualInstallHealthRollbackProbe,

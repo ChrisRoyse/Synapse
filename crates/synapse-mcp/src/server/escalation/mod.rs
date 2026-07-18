@@ -1857,7 +1857,17 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                 break;
             }
             let now_unix_ms = unix_time_ms_now();
-            match process_pending(&db, now_unix_ms).await {
+            let sweep_result = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(
+                        code = "ESCALATION_WORKER_STOPPED",
+                        "stopping escalation worker during pending sweep"
+                    );
+                    break;
+                }
+                result = process_pending(&db, now_unix_ms) => result,
+            };
+            match sweep_result {
                 Ok(report)
                     if report.tier0_fired
                         + report.tier0_removed
@@ -1910,7 +1920,16 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                         continue;
                     }
                 };
-                let report = remove_orphaned_escalation_toasts(preserve_tags).await;
+                let report = tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::debug!(
+                            code = "ESCALATION_WORKER_STOPPED",
+                            "stopping escalation worker during orphan toast cleanup"
+                        );
+                        break;
+                    }
+                    report = remove_orphaned_escalation_toasts(preserve_tags) => report,
+                };
                 match write_orphan_toast_cleanup_audit(&db, &report, now_unix_ms) {
                     Ok(Some(row_key_hex)) => {
                         tracing::info!(

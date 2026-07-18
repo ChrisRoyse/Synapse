@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, path::Path};
 
-use synapse_core::types::{AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, TimelineRecord};
+use synapse_core::types::{
+    AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, StoredObservation, TimelineRecord,
+};
 use synapse_core::{StoredReflexAudit, error_codes};
 use synapse_storage::{
     CalyxVaultInspect, ConstellationPutReport, DiskPressureLevel, GcReport, PressureReport,
@@ -378,7 +380,25 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_action_log_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.storage_put_rows(cf::CF_ACTION_LOG, rows)
+        let decoded = rows
+            .iter()
+            .map(|(_key, value)| decode_json::<serde_json::Value>(value))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let measured_rows = rows.clone();
+        self.db.put_batch(cf::CF_ACTION_LOG, rows)?;
+        for ((key, value), record) in measured_rows.iter().zip(decoded.iter()) {
+            self.db
+                .put_action_constellation(key, value, record)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        code = "CALYX_ACTION_CONSTELLATION_MEASUREMENT_FAILED",
+                        source_key_hex = %synapse_storage::constellations::hex_encode(key),
+                        detail = %format!("{error:#}"),
+                        "action audit row was written but native Calyx constellation measurement failed"
+                    );
+                })?;
+        }
+        self.db.flush()
     }
 
     /// Writes process start/exit history rows and flushes them immediately.
@@ -391,7 +411,25 @@ impl ReflexRuntime {
         &self,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> StorageResult<()> {
-        self.storage_put_rows(cf::CF_PROCESS_HISTORY, rows)
+        let decoded = rows
+            .iter()
+            .map(|(_key, value)| decode_json::<serde_json::Value>(value))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let measured_rows = rows.clone();
+        self.db.put_batch(cf::CF_PROCESS_HISTORY, rows)?;
+        for ((key, value), record) in measured_rows.iter().zip(decoded.iter()) {
+            self.db
+                .put_process_constellation(key, value, record)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        code = "CALYX_PROCESS_CONSTELLATION_MEASUREMENT_FAILED",
+                        source_key_hex = %synapse_storage::constellations::hex_encode(key),
+                        detail = %format!("{error:#}"),
+                        "process history row was written but native Calyx constellation measurement failed"
+                    );
+                })?;
+        }
+        self.db.flush()
     }
 
     /// Writes profile-linked event rows and flushes them immediately.
@@ -411,7 +449,26 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_observation_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.storage_put_rows(cf::CF_OBSERVATIONS, rows)
+        let decoded = rows
+            .iter()
+            .map(|(_key, value)| decode_json::<StoredObservation>(value))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let measured_rows = rows.clone();
+        self.db.put_batch(cf::CF_OBSERVATIONS, rows)?;
+        for ((key, value), record) in measured_rows.iter().zip(decoded.iter()) {
+            self.db
+                .put_sampled_observation_constellation(key, value, record)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        code = "CALYX_OBSERVATION_CONSTELLATION_MEASUREMENT_FAILED",
+                        observation_id = %record.observation_id,
+                        source_key_hex = %synapse_storage::constellations::hex_encode(key),
+                        detail = %format!("{error:#}"),
+                        "observation row was written but native Calyx constellation measurement failed"
+                    );
+                })?;
+        }
+        self.db.flush()
     }
 
     /// Writes session rows and flushes them immediately.

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::time::Duration;
 
 use calyx_core::{
@@ -13,8 +14,9 @@ use sha2::{Digest as _, Sha256};
 use synapse_calyx::SynapseCalyxPutDisposition;
 use synapse_core::types::{
     AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord, EpisodeBoundary,
-    EpisodeRecord, GenAiOperationName, TimelineActor, TimelineKind, TimelineRecord,
-    TranscriptParseStatus, TranscriptRole, TranscriptSource,
+    EpisodeRecord, GenAiOperationName, SensorStatus, StoredObservation, StoredReflexAudit,
+    TimelineActor, TimelineKind, TimelineRecord, TranscriptParseStatus, TranscriptRole,
+    TranscriptSource,
 };
 use synapse_telemetry::metrics::{
     CALYX_CONSTELLATION_MEASUREMENT_DURATION_US, CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL,
@@ -31,6 +33,16 @@ pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
 pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_665_001;
 pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_665_002;
+pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
+pub const SYN_ACTION_PANEL_VERSION: u32 = 1_666_001;
+pub const SYN_REFLEX_PANEL_NAME: &str = "syn-reflex-v1";
+pub const SYN_REFLEX_PANEL_VERSION: u32 = 1_666_002;
+pub const SYN_PROCESS_PANEL_NAME: &str = "syn-process-v1";
+pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_666_003;
+pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
+pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_666_004;
+pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_SAMPLE_EVERY_N";
+pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
 
 pub const META_PANEL_NAME: &str = "synapse_panel_name";
 pub const META_SOURCE_CF: &str = "synapse_source_cf";
@@ -44,13 +56,17 @@ pub const META_RECENCY_BASIS: &str = "synapse_recency_basis";
 const POINTER_SCHEME: &str = "synapse";
 const TIME_BASIS_UTC: &str = "utc";
 const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100";
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 47;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
 const SECS_PER_HOUR: u64 = 60 * 60;
 const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+const RANK_BOUND_MICROS_PER_UNIT: i64 = 1_000_000;
 const RECENCY_RANK_MAX_UNIX_MS: i64 = 4_102_444_800_000;
+const RECENCY_RANK_MAX_UNIX_MS_MICROS: i64 = RECENCY_RANK_MAX_UNIX_MS * RANK_BOUND_MICROS_PER_UNIT;
 const MAX_DAY_DURATION_MS: i64 = 86_400_000;
+const MAX_DAY_DURATION_MS_MICROS: i64 = MAX_DAY_DURATION_MS * RANK_BOUND_MICROS_PER_UNIT;
 
 const TL_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
 const TL_SLOT_APP_HASH: SlotId = SlotId::new(2);
@@ -102,6 +118,40 @@ const AT_SLOT_OUTPUT_TOKENS_LOG1P: SlotId = SlotId::new(44);
 const AT_SLOT_CACHE_READ_LOG1P: SlotId = SlotId::new(45);
 const AT_SLOT_CACHE_CREATION_LOG1P: SlotId = SlotId::new(46);
 const AT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(47);
+
+// Slot ids are local to each panel/constellation. Calyx's durable slot CF tag
+// codec currently supports 0..=47, so newer panels intentionally reuse local
+// slots instead of extending past the durable tag budget.
+const ACT_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
+const ACT_SLOT_TARGET_HASH: SlotId = SlotId::new(2);
+const ACT_SLOT_PARAMS_RECORD_VECTOR: SlotId = SlotId::new(3);
+const ACT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(4);
+const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(5);
+
+const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(1);
+const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(2);
+const RF_SLOT_LATENCY_LOG1P: SlotId = SlotId::new(3);
+const RF_SLOT_STEP_COUNT_LOG1P: SlotId = SlotId::new(4);
+const RF_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(5);
+const RF_SLOT_DOW_CYCLIC: SlotId = SlotId::new(6);
+const RF_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
+
+const PR_SLOT_PROCESS_HASH: SlotId = SlotId::new(1);
+const PR_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(2);
+const PR_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(3);
+const PR_SLOT_DOW_CYCLIC: SlotId = SlotId::new(4);
+const PR_SLOT_UPTIME_LOG1P: SlotId = SlotId::new(5);
+const PR_SLOT_RECENCY_RANK: SlotId = SlotId::new(6);
+const PR_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
+
+const OB_SLOT_APP_HASH: SlotId = SlotId::new(1);
+const OB_SLOT_ROLE_HISTOGRAM: SlotId = SlotId::new(2);
+const OB_SLOT_ENTITY_MULTI_HOT: SlotId = SlotId::new(3);
+const OB_SLOT_HUD_RECORD_VECTOR: SlotId = SlotId::new(4);
+const OB_SLOT_FLAGS_MULTI_HOT: SlotId = SlotId::new(5);
+const OB_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(6);
+const OB_SLOT_DOW_CYCLIC: SlotId = SlotId::new(7);
+const OB_SLOT_RECORD_VECTOR: SlotId = SlotId::new(8);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstellationPutReport {
@@ -217,7 +267,7 @@ pub fn build_timeline_constellation(
                 "syn.timeline.event_time_rank.v1",
                 Modality::Structured,
                 0,
-                RECENCY_RANK_MAX_UNIX_MS * 1_000_000,
+                RECENCY_RANK_MAX_UNIX_MS_MICROS,
             ),
             record.ts_ns / NS_PER_MS,
         )?,
@@ -225,7 +275,7 @@ pub fn build_timeline_constellation(
 
     let scalars = timeline_scalars(record, raw_bytes)?;
     let metadata = timeline_metadata(source_key, raw_bytes, record)?;
-    Ok(constellation(
+    constellation(
         context,
         SYN_TIMELINE_PANEL_VERSION,
         source_pointer(cf::CF_TIMELINE, source_key),
@@ -233,7 +283,7 @@ pub fn build_timeline_constellation(
         slots,
         scalars,
         metadata,
-    ))
+    )
 }
 
 /// Build the Calyx constellation for an episode record.
@@ -338,7 +388,7 @@ pub fn build_episode_constellation(
                 "syn.episode.duration_rank.v1",
                 Modality::Structured,
                 0,
-                MAX_DAY_DURATION_MS * 1_000_000,
+                MAX_DAY_DURATION_MS_MICROS,
             ),
             duration_ms,
         )?,
@@ -432,7 +482,7 @@ pub fn build_episode_constellation(
 
     let scalars = episode_scalars(record, raw_bytes)?;
     let metadata = episode_metadata(source_key, raw_bytes, record)?;
-    Ok(constellation(
+    constellation(
         context,
         SYN_EPISODE_PANEL_VERSION,
         source_pointer(cf::CF_EPISODES, source_key),
@@ -440,7 +490,7 @@ pub fn build_episode_constellation(
         slots,
         scalars,
         metadata,
-    ))
+    )
 }
 
 /// Build the Calyx constellation for an agent event record.
@@ -585,7 +635,7 @@ pub fn build_agent_event_constellation(
 
     let scalars = agent_event_scalars(record, raw_bytes)?;
     let metadata = agent_event_metadata(source_key, raw_bytes, record)?;
-    Ok(constellation(
+    constellation(
         context,
         SYN_AGENT_EVENT_PANEL_VERSION,
         source_pointer(cf::CF_AGENT_EVENTS, source_key),
@@ -593,7 +643,7 @@ pub fn build_agent_event_constellation(
         slots,
         scalars,
         metadata,
-    ))
+    )
 }
 
 /// Build the Calyx constellation for an agent transcript record.
@@ -753,7 +803,7 @@ pub fn build_agent_transcript_constellation(
 
     let scalars = agent_transcript_scalars(record, raw_bytes)?;
     let metadata = agent_transcript_metadata(source_key, raw_bytes, record)?;
-    Ok(constellation(
+    constellation(
         context,
         SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
         source_pointer(cf::CF_AGENT_TRANSCRIPTS, source_key),
@@ -761,7 +811,361 @@ pub fn build_agent_transcript_constellation(
         slots,
         scalars,
         metadata,
-    ))
+    )
+}
+
+/// Build the Calyx constellation for an action audit row.
+///
+/// # Errors
+///
+/// Returns an error when lens measurement, JSON encoding, or exact scalar
+/// conversion fails.
+pub fn build_action_constellation(
+    context: NativeConstellationContext,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+) -> StorageResult<Constellation> {
+    ensure_json_object(record, cf::CF_ACTION_LOG)?;
+    let mut slots = BTreeMap::new();
+    let ts_ns = json_u64(record, &["ts_ns"]);
+    slots.insert(
+        ACT_SLOT_KIND_ONEHOT,
+        measure_text(
+            SYN_ACTION_PANEL_NAME,
+            AlgorithmicLens::syn_one_hot("syn.action.kind_onehot.v1", Modality::Structured, 64),
+            &action_kind(record),
+        )?,
+    );
+    slots.insert(
+        ACT_SLOT_TARGET_HASH,
+        optional_hash_slot(
+            SYN_ACTION_PANEL_NAME,
+            "syn.action.target_hash.v1",
+            action_target_text(record).as_deref(),
+            2048,
+        )?,
+    );
+    slots.insert(
+        ACT_SLOT_PARAMS_RECORD_VECTOR,
+        measure_json(
+            SYN_ACTION_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.action.params_record_vector.v1",
+                Modality::Structured,
+                96,
+            ),
+            &action_numeric_record(record),
+        )?,
+    );
+    insert_time_slots(
+        &mut slots,
+        SYN_ACTION_PANEL_NAME,
+        ACT_SLOT_HOUR_CYCLIC,
+        ACT_SLOT_DOW_CYCLIC,
+        "syn.action.hour_cyclic.v1",
+        "syn.action.dow_cyclic.v1",
+        ts_ns,
+    )?;
+
+    let scalars = action_scalars(record, raw_bytes)?;
+    let metadata = action_metadata(source_key, raw_bytes, record);
+    constellation(
+        context,
+        SYN_ACTION_PANEL_VERSION,
+        source_pointer(cf::CF_ACTION_LOG, source_key),
+        raw_bytes,
+        slots,
+        scalars,
+        metadata,
+    )
+}
+
+/// Build the Calyx constellation for a reflex audit row.
+///
+/// # Errors
+///
+/// Returns an error when enum serialization, lens measurement, JSON encoding,
+/// or exact scalar conversion fails.
+pub fn build_reflex_audit_constellation(
+    context: NativeConstellationContext,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &StoredReflexAudit,
+) -> StorageResult<Constellation> {
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        RF_SLOT_REFLEX_HASH,
+        optional_hash_slot(
+            SYN_REFLEX_PANEL_NAME,
+            "syn.reflex.reflex_hash.v1",
+            Some(record.reflex_id.as_str()),
+            2048,
+        )?,
+    );
+    slots.insert(
+        RF_SLOT_OUTCOME_ONEHOT,
+        measure_text(
+            SYN_REFLEX_PANEL_NAME,
+            AlgorithmicLens::syn_one_hot("syn.reflex.outcome_onehot.v1", Modality::Structured, 16),
+            &snake_case_name(record.status, "ReflexState")?,
+        )?,
+    );
+    slots.insert(
+        RF_SLOT_LATENCY_LOG1P,
+        optional_log1p_slot(
+            SYN_REFLEX_PANEL_NAME,
+            "syn.reflex.latency_ms_log1p.v1",
+            reflex_latency_ms(record),
+        )?,
+    );
+    slots.insert(
+        RF_SLOT_STEP_COUNT_LOG1P,
+        optional_log1p_slot(
+            SYN_REFLEX_PANEL_NAME,
+            "syn.reflex.step_count_log1p.v1",
+            Some(u64::try_from(record.steps.len()).unwrap_or(u64::MAX)),
+        )?,
+    );
+    insert_time_slots(
+        &mut slots,
+        SYN_REFLEX_PANEL_NAME,
+        RF_SLOT_HOUR_CYCLIC,
+        RF_SLOT_DOW_CYCLIC,
+        "syn.reflex.hour_cyclic.v1",
+        "syn.reflex.dow_cyclic.v1",
+        Some(record.ts_ns),
+    )?;
+    slots.insert(
+        RF_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_REFLEX_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.reflex.record_vector.v1",
+                Modality::Structured,
+                64,
+            ),
+            &reflex_numeric_record(record),
+        )?,
+    );
+
+    let scalars = reflex_scalars(record, raw_bytes)?;
+    let metadata = reflex_metadata(source_key, raw_bytes, record)?;
+    constellation(
+        context,
+        SYN_REFLEX_PANEL_VERSION,
+        source_pointer(cf::CF_REFLEX_AUDIT, source_key),
+        raw_bytes,
+        slots,
+        scalars,
+        metadata,
+    )
+}
+
+/// Build the Calyx constellation for a process-history row.
+///
+/// # Errors
+///
+/// Returns an error when lens measurement, JSON encoding, or exact scalar
+/// conversion fails.
+pub fn build_process_constellation(
+    context: NativeConstellationContext,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+) -> StorageResult<Constellation> {
+    ensure_json_object(record, cf::CF_PROCESS_HISTORY)?;
+    let mut slots = BTreeMap::new();
+    let ts_ns = process_ts_ns(record);
+    slots.insert(
+        PR_SLOT_PROCESS_HASH,
+        optional_hash_slot(
+            SYN_PROCESS_PANEL_NAME,
+            "syn.process.process_hash.v1",
+            process_identity_text(record).as_deref(),
+            2048,
+        )?,
+    );
+    slots.insert(
+        PR_SLOT_EVENT_ONEHOT,
+        measure_text(
+            SYN_PROCESS_PANEL_NAME,
+            AlgorithmicLens::syn_one_hot("syn.process.event_onehot.v1", Modality::Structured, 32),
+            &process_event_kind(record),
+        )?,
+    );
+    insert_time_slots(
+        &mut slots,
+        SYN_PROCESS_PANEL_NAME,
+        PR_SLOT_HOUR_CYCLIC,
+        PR_SLOT_DOW_CYCLIC,
+        "syn.process.hour_cyclic.v1",
+        "syn.process.dow_cyclic.v1",
+        ts_ns,
+    )?;
+    slots.insert(
+        PR_SLOT_UPTIME_LOG1P,
+        optional_log1p_slot(
+            SYN_PROCESS_PANEL_NAME,
+            "syn.process.uptime_ms_log1p.v1",
+            json_u64(record, &["uptime_ms", "duration_ms"]),
+        )?,
+    );
+    slots.insert(
+        PR_SLOT_RECENCY_RANK,
+        optional_rank_slot(
+            SYN_PROCESS_PANEL_NAME,
+            "syn.process.event_time_rank.v1",
+            ts_ns.map(|value| value / NS_PER_MS),
+            0,
+            RECENCY_RANK_MAX_UNIX_MS_MICROS,
+        )?,
+    );
+    slots.insert(
+        PR_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_PROCESS_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.process.record_vector.v1",
+                Modality::Structured,
+                64,
+            ),
+            &process_numeric_record(record),
+        )?,
+    );
+
+    let scalars = process_scalars(record, raw_bytes)?;
+    let metadata = process_metadata(source_key, raw_bytes, record);
+    constellation(
+        context,
+        SYN_PROCESS_PANEL_VERSION,
+        source_pointer(cf::CF_PROCESS_HISTORY, source_key),
+        raw_bytes,
+        slots,
+        scalars,
+        metadata,
+    )
+}
+
+/// Build the Calyx constellation for a sampled observation row.
+///
+/// # Errors
+///
+/// Returns an error when enum serialization, lens measurement, JSON encoding,
+/// or exact scalar conversion fails.
+pub fn build_observation_constellation(
+    context: NativeConstellationContext,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &StoredObservation,
+) -> StorageResult<Constellation> {
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        OB_SLOT_APP_HASH,
+        optional_hash_slot(
+            SYN_OBSERVATION_PANEL_NAME,
+            "syn.observation.app_hash.v1",
+            Some(record.foreground.process_name.as_str()),
+            2048,
+        )?,
+    );
+    let role_histogram = observation_role_histogram(record);
+    slots.insert(
+        OB_SLOT_ROLE_HISTOGRAM,
+        optional_json_slot(
+            SYN_OBSERVATION_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.observation.role_histogram.v1",
+                Modality::Structured,
+                128,
+            ),
+            role_histogram.as_ref(),
+        )?,
+    );
+    let entity_labels = observation_entity_labels(record);
+    slots.insert(
+        OB_SLOT_ENTITY_MULTI_HOT,
+        optional_json_slice_slot(
+            SYN_OBSERVATION_PANEL_NAME,
+            AlgorithmicLens::syn_multi_hot(
+                "syn.observation.entity_multi_hot.v1",
+                Modality::Structured,
+                2048,
+            ),
+            &entity_labels,
+        )?,
+    );
+    let hud_numeric_record = observation_hud_numeric_record(record);
+    slots.insert(
+        OB_SLOT_HUD_RECORD_VECTOR,
+        optional_json_slot(
+            SYN_OBSERVATION_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.observation.hud_scalars.v1",
+                Modality::Structured,
+                128,
+            ),
+            hud_numeric_record.as_ref(),
+        )?,
+    );
+    slots.insert(
+        OB_SLOT_FLAGS_MULTI_HOT,
+        optional_json_slice_slot(
+            SYN_OBSERVATION_PANEL_NAME,
+            AlgorithmicLens::syn_multi_hot(
+                "syn.observation.flags_multi_hot.v1",
+                Modality::Structured,
+                2048,
+            ),
+            &observation_flags(record)?,
+        )?,
+    );
+    insert_time_slots(
+        &mut slots,
+        SYN_OBSERVATION_PANEL_NAME,
+        OB_SLOT_HOUR_CYCLIC,
+        OB_SLOT_DOW_CYCLIC,
+        "syn.observation.hour_cyclic.v1",
+        "syn.observation.dow_cyclic.v1",
+        Some(record.ts_ns),
+    )?;
+    slots.insert(
+        OB_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_OBSERVATION_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.observation.record_vector.v1",
+                Modality::Structured,
+                128,
+            ),
+            &observation_numeric_record(record),
+        )?,
+    );
+
+    let scalars = observation_scalars(record, raw_bytes)?;
+    let metadata = observation_metadata(source_key, raw_bytes, record)?;
+    constellation(
+        context,
+        SYN_OBSERVATION_PANEL_VERSION,
+        source_pointer(cf::CF_OBSERVATIONS, source_key),
+        raw_bytes,
+        slots,
+        scalars,
+        metadata,
+    )
+}
+
+/// Returns whether a persisted observation key is selected for Calyx
+/// measurement under the configured bounded-rate sampler.
+///
+/// # Errors
+///
+/// Returns a storage error when the sampler config is invalid or the key does
+/// not match the `ts_ns || seq` observation-key codec.
+pub fn observation_constellation_sample_permits(source_key: &[u8]) -> StorageResult<bool> {
+    let every_n = observation_constellation_sample_every_n()?;
+    let seq = observation_source_key_seq(source_key)?;
+    Ok(u64::from(seq) % every_n == 0)
 }
 
 pub fn emit_success_metric(report: &ConstellationPutReport) {
@@ -858,8 +1262,9 @@ fn constellation(
     slots: BTreeMap<SlotId, SlotVector>,
     scalars: BTreeMap<String, f64>,
     metadata: BTreeMap<String, String>,
-) -> Constellation {
-    Constellation {
+) -> StorageResult<Constellation> {
+    validate_durable_slot_budget(panel_version, &pointer, &slots)?;
+    Ok(Constellation {
         cx_id: context.cx_id,
         vault_id: context.vault_id,
         panel_version,
@@ -884,7 +1289,26 @@ fn constellation(
             novel_region: false,
             redacted_input: false,
         },
+    })
+}
+
+fn validate_durable_slot_budget(
+    panel_version: u32,
+    pointer: &str,
+    slots: &BTreeMap<SlotId, SlotVector>,
+) -> StorageResult<()> {
+    for slot in slots.keys() {
+        if slot.get() > CALYX_DURABLE_SLOT_ID_MAX {
+            return Err(StorageError::WriteFailed {
+                cf_name: "calyx_constellation".to_owned(),
+                detail: format!(
+                    "panel_version={panel_version} pointer={pointer} uses slot id {} beyond Calyx durable slot CF tag maximum {CALYX_DURABLE_SLOT_ID_MAX}; slot ids are local to each panel and must stay within 0..={CALYX_DURABLE_SLOT_ID_MAX}",
+                    slot.get()
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 fn timeline_scalars(
@@ -1122,6 +1546,157 @@ fn agent_transcript_scalars(
     Ok(scalars)
 }
 
+fn action_scalars(record: &Value, raw_bytes: &[u8]) -> StorageResult<BTreeMap<String, f64>> {
+    let mut scalars = BTreeMap::new();
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "schema_version",
+        json_u64(record, &["schema_version"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "ts_unix_ms",
+        json_u64(record, &["ts_ns"]).map(|value| value / NS_PER_MS),
+    )?;
+    insert_optional_u64_scalar(&mut scalars, "seq", json_u64(record, &["seq"]))?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "payload_bytes",
+        json_u64(record, &["payload_bytes"]),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "error_present",
+        bool_u64(json_non_null(record, &["error"]) || json_non_null(record, &["error_code"])),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "raw_len_bytes",
+        u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+    )?;
+    Ok(scalars)
+}
+
+fn reflex_scalars(
+    record: &StoredReflexAudit,
+    raw_bytes: &[u8],
+) -> StorageResult<BTreeMap<String, f64>> {
+    let mut scalars = BTreeMap::new();
+    insert_u64_scalar(
+        &mut scalars,
+        "schema_version",
+        u64::from(record.schema_version),
+    )?;
+    insert_u64_scalar(&mut scalars, "ts_unix_ms", record.ts_ns / NS_PER_MS)?;
+    insert_u64_scalar(
+        &mut scalars,
+        "step_count",
+        u64::try_from(record.steps.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "error_present",
+        bool_u64(record.error_code.as_deref().and_then(non_empty).is_some()),
+    )?;
+    insert_optional_u64_scalar(&mut scalars, "latency_ms", reflex_latency_ms(record))?;
+    insert_u64_scalar(
+        &mut scalars,
+        "raw_len_bytes",
+        u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+    )?;
+    Ok(scalars)
+}
+
+fn process_scalars(record: &Value, raw_bytes: &[u8]) -> StorageResult<BTreeMap<String, f64>> {
+    let mut scalars = BTreeMap::new();
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "schema_version",
+        json_u64(record, &["schema_version"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "ts_unix_ms",
+        process_ts_ns(record).map(|value| value / NS_PER_MS),
+    )?;
+    insert_optional_u64_scalar(&mut scalars, "pid", json_u64(record, &["pid"]))?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "window_owner_pid",
+        json_u64(record, &["window_owner_pid"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "uptime_ms",
+        json_u64(record, &["uptime_ms", "duration_ms"]),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "raw_len_bytes",
+        u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+    )?;
+    Ok(scalars)
+}
+
+fn observation_scalars(
+    record: &StoredObservation,
+    raw_bytes: &[u8],
+) -> StorageResult<BTreeMap<String, f64>> {
+    let mut scalars = BTreeMap::new();
+    insert_u64_scalar(
+        &mut scalars,
+        "schema_version",
+        u64::from(record.schema_version),
+    )?;
+    insert_u64_scalar(&mut scalars, "ts_unix_ms", record.ts_ns / NS_PER_MS)?;
+    insert_u64_scalar(
+        &mut scalars,
+        "element_count",
+        u64::try_from(record.elements.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "entity_count",
+        u64::try_from(record.entities.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "hud_field_count",
+        u64::try_from(record.hud.by_name.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "hud_error_count",
+        u64::try_from(record.hud.errors.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_f64_scalar(
+        &mut scalars,
+        "foreground_dpi_scale",
+        f64::from(record.foreground.dpi_scale),
+    )?;
+    insert_f64_scalar(
+        &mut scalars,
+        "assembled_in_ms",
+        f64::from(record.diagnostics.assembled_in_ms),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "size_bytes",
+        u64::from(record.diagnostics.size_bytes),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "size_estimate_tokens",
+        u64::from(record.diagnostics.size_estimate_tokens),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "raw_len_bytes",
+        u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+    )?;
+    Ok(scalars)
+}
+
 fn insert_u64_scalar(
     scalars: &mut BTreeMap<String, f64>,
     name: &'static str,
@@ -1134,6 +1709,21 @@ fn insert_u64_scalar(
         ));
     }
     scalars.insert(name.to_owned(), exact_u64_as_f64(value));
+    Ok(())
+}
+
+fn insert_f64_scalar(
+    scalars: &mut BTreeMap<String, f64>,
+    name: &'static str,
+    value: f64,
+) -> StorageResult<()> {
+    if !value.is_finite() {
+        return Err(measurement_error(
+            "non-finite scalar value",
+            format!("{name}={value}"),
+        ));
+    }
+    scalars.insert(name.to_owned(), value);
     Ok(())
 }
 
@@ -1449,6 +2039,168 @@ fn agent_transcript_metadata(
     Ok(metadata)
 }
 
+fn action_metadata(
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+) -> BTreeMap<String, String> {
+    let mut metadata = common_metadata(
+        SYN_ACTION_PANEL_NAME,
+        cf::CF_ACTION_LOG,
+        source_key,
+        raw_bytes,
+    );
+    metadata.insert("action_kind".to_owned(), action_kind(record));
+    insert_optional_metadata(
+        &mut metadata,
+        "action_tool",
+        json_string(record, &["tool"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "action_verb",
+        json_string(record, &["verb"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "action_status",
+        json_string(record, &["status", "outcome"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "action_error_code",
+        json_string(record, &["error_code"]).as_deref(),
+    );
+    if let Some(ts_ns) = json_u64(record, &["ts_ns"]) {
+        metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
+        metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    }
+    if let Some(target) = action_target_text(record).as_deref().and_then(non_empty) {
+        metadata.insert(
+            "action_target_excerpt".to_owned(),
+            truncate_metadata(target),
+        );
+    }
+    metadata
+}
+
+fn reflex_metadata(
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &StoredReflexAudit,
+) -> StorageResult<BTreeMap<String, String>> {
+    let mut metadata = common_metadata(
+        SYN_REFLEX_PANEL_NAME,
+        cf::CF_REFLEX_AUDIT,
+        source_key,
+        raw_bytes,
+    );
+    metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
+    metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    metadata.insert("reflex_id".to_owned(), truncate_metadata(&record.reflex_id));
+    metadata.insert(
+        "reflex_audit_id".to_owned(),
+        truncate_metadata(&record.audit_id),
+    );
+    metadata.insert(
+        "reflex_status".to_owned(),
+        snake_case_name(record.status, "ReflexState")?,
+    );
+    insert_optional_metadata(&mut metadata, "reflex_event_id", record.event_id.as_deref());
+    insert_optional_metadata(
+        &mut metadata,
+        "reflex_error_code",
+        record.error_code.as_deref(),
+    );
+    Ok(metadata)
+}
+
+fn process_metadata(
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+) -> BTreeMap<String, String> {
+    let mut metadata = common_metadata(
+        SYN_PROCESS_PANEL_NAME,
+        cf::CF_PROCESS_HISTORY,
+        source_key,
+        raw_bytes,
+    );
+    metadata.insert("process_event_kind".to_owned(), process_event_kind(record));
+    if let Some(ts_ns) = process_ts_ns(record) {
+        metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
+        metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        metadata.insert(
+            META_RECENCY_BASIS.to_owned(),
+            RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
+        );
+    }
+    insert_optional_metadata(
+        &mut metadata,
+        "process_target",
+        json_string(record, &["target"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "process_path",
+        json_string(record, &["process_path", "path", "target"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "process_status",
+        json_string(record, &["status"]).as_deref(),
+    );
+    metadata
+}
+
+fn observation_metadata(
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &StoredObservation,
+) -> StorageResult<BTreeMap<String, String>> {
+    let mut metadata = common_metadata(
+        SYN_OBSERVATION_PANEL_NAME,
+        cf::CF_OBSERVATIONS,
+        source_key,
+        raw_bytes,
+    );
+    metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
+    metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    metadata.insert(
+        "observation_id".to_owned(),
+        truncate_metadata(&record.observation_id),
+    );
+    metadata.insert(
+        "observation_mode".to_owned(),
+        snake_case_name(record.mode, "PerceptionMode")?,
+    );
+    metadata.insert(
+        "observation_reason".to_owned(),
+        truncate_metadata(&record.reason),
+    );
+    metadata.insert(
+        "observation_process_name".to_owned(),
+        truncate_metadata(&record.foreground.process_name),
+    );
+    metadata.insert(
+        "observation_window_title_excerpt".to_owned(),
+        truncate_metadata(&record.foreground.window_title),
+    );
+    if let Some(session_id) = record.session_id.as_deref().and_then(non_empty) {
+        metadata.insert(
+            "observation_session_id".to_owned(),
+            truncate_metadata(session_id),
+        );
+    }
+    if let Some(profile_id) = record.foreground.profile_id.as_deref().and_then(non_empty) {
+        metadata.insert(
+            "observation_profile_id".to_owned(),
+            truncate_metadata(profile_id),
+        );
+    }
+    Ok(metadata)
+}
+
 fn insert_optional_metadata(
     metadata: &mut BTreeMap<String, String>,
     key: &'static str,
@@ -1518,13 +2270,42 @@ fn measure_json<T>(
     value: &T,
 ) -> StorageResult<SlotVector>
 where
-    T: Serialize,
+    T: Serialize + ?Sized,
 {
     let bytes = serde_json::to_vec(value).map_err(|source| StorageError::EncodeJson {
         type_name: "calyx_constellation_slot_input",
         source,
     })?;
     measure_input(panel_name, lens, Input::new(Modality::Structured, bytes))
+}
+
+fn optional_json_slot<T>(
+    panel_name: &'static str,
+    lens: AlgorithmicLens,
+    value: Option<&T>,
+) -> StorageResult<SlotVector>
+where
+    T: Serialize,
+{
+    value.map_or_else(
+        || Ok(absent(AbsentReason::NotApplicable)),
+        |value| measure_json(panel_name, lens, value),
+    )
+}
+
+fn optional_json_slice_slot<T>(
+    panel_name: &'static str,
+    lens: AlgorithmicLens,
+    value: &[T],
+) -> StorageResult<SlotVector>
+where
+    T: Serialize,
+{
+    if value.is_empty() {
+        Ok(absent(AbsentReason::NotApplicable))
+    } else {
+        measure_json(panel_name, lens, value)
+    }
 }
 
 fn optional_hash_slot(
@@ -1578,6 +2359,68 @@ fn optional_log1p_slot(
             )
         },
     )
+}
+
+fn optional_rank_slot(
+    panel_name: &'static str,
+    lens_name: &'static str,
+    value: Option<u64>,
+    min_micros: i64,
+    max_micros: i64,
+) -> StorageResult<SlotVector> {
+    value.map_or_else(
+        || Ok(absent(AbsentReason::NotApplicable)),
+        |value| {
+            measure_number(
+                panel_name,
+                AlgorithmicLens::syn_scalar_rank(
+                    lens_name,
+                    Modality::Structured,
+                    min_micros,
+                    max_micros,
+                ),
+                value,
+            )
+        },
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "slot ids and frozen lens names are part of each panel's stable public contract"
+)]
+fn insert_time_slots(
+    slots: &mut BTreeMap<SlotId, SlotVector>,
+    panel_name: &'static str,
+    hour_slot: SlotId,
+    dow_slot: SlotId,
+    hour_lens_name: &'static str,
+    dow_lens_name: &'static str,
+    ts_ns: Option<u64>,
+) -> StorageResult<()> {
+    if let Some(ts_ns) = ts_ns {
+        let (hour, dow) = utc_hour_and_dow(ts_ns);
+        slots.insert(
+            hour_slot,
+            measure_number(
+                panel_name,
+                AlgorithmicLens::syn_cyclic_time(hour_lens_name, Modality::Structured, 24),
+                hour,
+            )?,
+        );
+        slots.insert(
+            dow_slot,
+            measure_number(
+                panel_name,
+                AlgorithmicLens::syn_cyclic_time(dow_lens_name, Modality::Structured, 7),
+                dow,
+            )?,
+        );
+    } else {
+        slots.insert(hour_slot, absent(AbsentReason::NotApplicable));
+        slots.insert(dow_slot, absent(AbsentReason::NotApplicable));
+    }
+    Ok(())
 }
 
 #[allow(
@@ -1902,6 +2745,361 @@ fn transcript_tool_result_bytes_total(record: &AgentTranscriptRecord) -> u64 {
     record.tool_calls.iter().fold(0_u64, |sum, tool| {
         sum.saturating_add(tool.result_bytes.unwrap_or(0))
     })
+}
+
+fn action_kind(record: &Value) -> String {
+    let tool = json_string(record, &["tool"]);
+    let verb = json_string(record, &["verb"]);
+    let status = json_string(record, &["status", "outcome", "phase"]);
+    match (tool, verb, status) {
+        (Some(tool), Some(verb), _) => format!("{tool}:{verb}"),
+        (Some(tool), None, Some(status)) => format!("{tool}:{status}"),
+        (Some(tool), None, None) => tool,
+        (None, Some(verb), _) => verb,
+        (None, None, Some(status)) => status,
+        (None, None, None) => {
+            json_string(record, &["row_kind"]).unwrap_or_else(|| "unknown_action".to_owned())
+        }
+    }
+}
+
+fn action_target_text(record: &Value) -> Option<String> {
+    json_pointer_text(
+        record,
+        &[
+            "/target",
+            "/payload_bounded/target",
+            "/details/target",
+            "/details/request/target",
+            "/actor/tool",
+        ],
+    )
+}
+
+fn action_numeric_record(record: &Value) -> Value {
+    json!({
+        "record_present": 1,
+        "schema_version": json_u64(record, &["schema_version"]).unwrap_or(0),
+        "ts_unix_ms": json_u64(record, &["ts_ns"]).map_or(0, |value| value / NS_PER_MS),
+        "seq": json_u64(record, &["seq"]).unwrap_or(0),
+        "payload_bytes": json_u64(record, &["payload_bytes"]).unwrap_or(0),
+        "payload_truncated": bool_u64(json_bool(record, &["payload_truncated"]).unwrap_or(false)),
+        "has_target": bool_u64(action_target_text(record).as_deref().and_then(non_empty).is_some()),
+        "has_error": bool_u64(json_non_null(record, &["error"]) || json_non_null(record, &["error_code"])),
+        "redacted": bool_u64(json_bool(record, &["redacted"]).unwrap_or(false)),
+    })
+}
+
+fn reflex_latency_ms(record: &StoredReflexAudit) -> Option<u64> {
+    json_u64(
+        &record.details,
+        &[
+            "latency_ms",
+            "elapsed_ms",
+            "duration_ms",
+            "dispatch_latency_ms",
+            "total_latency_ms",
+        ],
+    )
+}
+
+fn reflex_numeric_record(record: &StoredReflexAudit) -> Value {
+    json!({
+        "record_present": 1,
+        "schema_version": record.schema_version,
+        "ts_unix_ms": record.ts_ns / NS_PER_MS,
+        "step_count": record.steps.len(),
+        "latency_ms": reflex_latency_ms(record).unwrap_or(0),
+        "has_event_id": bool_u64(record.event_id.as_deref().and_then(non_empty).is_some()),
+        "has_error": bool_u64(record.error_code.as_deref().and_then(non_empty).is_some()),
+        "redacted": bool_u64(record.redacted),
+    })
+}
+
+fn process_event_kind(record: &Value) -> String {
+    json_string(record, &["row_kind", "event", "status"])
+        .unwrap_or_else(|| "process_event".to_owned())
+}
+
+fn process_identity_text(record: &Value) -> Option<String> {
+    json_pointer_text(
+        record,
+        &[
+            "/process_path",
+            "/path",
+            "/target",
+            "/command_line",
+            "/matched_title",
+        ],
+    )
+}
+
+fn process_ts_ns(record: &Value) -> Option<u64> {
+    json_u64(record, &["ts_ns"]).or_else(|| {
+        json_u64(record, &["launched_at_unix_ms"]).map(|value| value.saturating_mul(NS_PER_MS))
+    })
+}
+
+fn process_numeric_record(record: &Value) -> Value {
+    json!({
+        "record_present": 1,
+        "schema_version": json_u64(record, &["schema_version"]).unwrap_or(0),
+        "ts_unix_ms": process_ts_ns(record).map_or(0, |value| value / NS_PER_MS),
+        "pid": json_u64(record, &["pid"]).unwrap_or(0),
+        "window_owner_pid": json_u64(record, &["window_owner_pid"]).unwrap_or(0),
+        "has_hwnd": bool_u64(json_non_null(record, &["hwnd"])),
+        "reused_existing_window": bool_u64(json_bool(record, &["reused_existing_window"]).unwrap_or(false)),
+        "uptime_ms": json_u64(record, &["uptime_ms", "duration_ms"]).unwrap_or(0),
+        "has_cdp_debug_port": bool_u64(json_non_null(record, &["cdp_debug_port"])),
+        "has_desktop": bool_u64(json_non_null(record, &["desktop"])),
+    })
+}
+
+fn observation_role_histogram(record: &StoredObservation) -> Option<Value> {
+    let mut counts = BTreeMap::<String, u64>::new();
+    for role in record
+        .elements
+        .iter()
+        .filter_map(|element| non_empty(&element.role))
+    {
+        *counts.entry(role.to_ascii_lowercase()).or_default() += 1;
+    }
+    if let Some(focused) = record.focused.as_ref()
+        && let Some(role) = non_empty(&focused.role)
+    {
+        *counts
+            .entry(format!("focused_{}", role.to_ascii_lowercase()))
+            .or_default() += 1;
+    }
+    if counts.is_empty() {
+        None
+    } else {
+        counts.insert(
+            "_total_elements".to_owned(),
+            u64::try_from(record.elements.len()).unwrap_or(u64::MAX),
+        );
+        Some(json!(counts))
+    }
+}
+
+fn observation_entity_labels(record: &StoredObservation) -> Vec<String> {
+    record
+        .entities
+        .iter()
+        .filter_map(|entity| non_empty(&entity.class_label))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn observation_hud_numeric_record(record: &StoredObservation) -> Option<Value> {
+    if record.hud.by_name.is_empty() && record.hud.errors.is_empty() {
+        return None;
+    }
+    let mut fields = BTreeMap::<String, f64>::new();
+    fields.insert(
+        "hud_field_count".to_owned(),
+        metric_u64_as_f64(u64::try_from(record.hud.by_name.len()).unwrap_or(u64::MAX)),
+    );
+    fields.insert(
+        "hud_error_count".to_owned(),
+        metric_u64_as_f64(u64::try_from(record.hud.errors.len()).unwrap_or(u64::MAX)),
+    );
+    for (name, reading) in &record.hud.by_name {
+        if let synapse_core::HudValue::Number(value) = reading.parsed
+            && value.is_finite()
+        {
+            fields.insert(format!("field/{name}/value"), value);
+        }
+        fields.insert(
+            format!("field/{name}/confidence"),
+            f64::from(reading.confidence),
+        );
+        fields.insert(
+            format!("field/{name}/stale_ms"),
+            f64::from(reading.stale_ms),
+        );
+    }
+    Some(json!(fields))
+}
+
+fn observation_flags(record: &StoredObservation) -> StorageResult<Vec<String>> {
+    let mut flags = Vec::new();
+    flags.push(format!(
+        "mode:{}",
+        snake_case_name(record.mode, "PerceptionMode")?
+    ));
+    flags.push(format!(
+        "a11y:{}",
+        sensor_status_code(&record.diagnostics.a11y_status)
+    ));
+    flags.push(format!(
+        "capture:{}",
+        sensor_status_code(&record.diagnostics.capture_status)
+    ));
+    flags.push(format!(
+        "detection:{}",
+        sensor_status_code(&record.diagnostics.detection_status)
+    ));
+    flags.push(format!(
+        "audio:{}",
+        sensor_status_code(&record.diagnostics.audio_status)
+    ));
+    if record.foreground.is_fullscreen {
+        flags.push("foreground_fullscreen".to_owned());
+    }
+    if record.foreground.is_dwm_composed {
+        flags.push("dwm_composed".to_owned());
+    }
+    if record.diagnostics.elements_truncated {
+        flags.push("elements_truncated".to_owned());
+    }
+    if record.diagnostics.entities_truncated {
+        flags.push("entities_truncated".to_owned());
+    }
+    if record.diagnostics.is_minimized {
+        flags.push("target_minimized".to_owned());
+    }
+    if record.redacted {
+        flags.push("redacted".to_owned());
+    }
+    flags.sort();
+    flags.dedup();
+    Ok(flags)
+}
+
+fn observation_numeric_record(record: &StoredObservation) -> Value {
+    json!({
+        "record_present": 1,
+        "schema_version": record.schema_version,
+        "ts_unix_ms": record.ts_ns / NS_PER_MS,
+        "element_count": record.elements.len(),
+        "entity_count": record.entities.len(),
+        "hud_field_count": record.hud.by_name.len(),
+        "hud_error_count": record.hud.errors.len(),
+        "recent_event_count": record.recent_events.len(),
+        "fs_recent_count": record.fs_recent.len(),
+        "audio_recent_event_count": record.audio.recent_events.len(),
+        "foreground_dpi_scale": record.foreground.dpi_scale,
+        "foreground_monitor_index": record.foreground.monitor_index,
+        "foreground_fullscreen": bool_u64(record.foreground.is_fullscreen),
+        "foreground_dwm_composed": bool_u64(record.foreground.is_dwm_composed),
+        "assembled_in_ms": record.diagnostics.assembled_in_ms,
+        "size_bytes": record.diagnostics.size_bytes,
+        "size_estimate_tokens": record.diagnostics.size_estimate_tokens,
+        "elements_truncated": bool_u64(record.diagnostics.elements_truncated),
+        "entities_truncated": bool_u64(record.diagnostics.entities_truncated),
+        "redacted": bool_u64(record.redacted),
+    })
+}
+
+const fn sensor_status_code(status: &SensorStatus) -> &'static str {
+    match status {
+        SensorStatus::Healthy => "healthy",
+        SensorStatus::DegradedLatency { .. } => "degraded_latency",
+        SensorStatus::DegradedSensorFailed { .. } => "degraded_sensor_failed",
+        SensorStatus::Disabled => "disabled",
+        SensorStatus::Unavailable => "unavailable",
+    }
+}
+
+fn json_string(record: &Value, keys: &[&str]) -> Option<String> {
+    let object = record.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .and_then(non_empty)
+        .map(str::to_owned)
+}
+
+fn ensure_json_object(record: &Value, cf_name: &'static str) -> StorageResult<()> {
+    if record.is_object() {
+        Ok(())
+    } else {
+        Err(StorageError::WriteFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!("Calyx panel measurement requires a JSON object row; got {record}"),
+        })
+    }
+}
+
+fn json_u64(record: &Value, keys: &[&str]) -> Option<u64> {
+    let object = record.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_u64))
+}
+
+fn json_bool(record: &Value, keys: &[&str]) -> Option<bool> {
+    let object = record.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_bool))
+}
+
+fn json_non_null(record: &Value, keys: &[&str]) -> bool {
+    record.as_object().is_some_and(|object| {
+        keys.iter()
+            .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    })
+}
+
+fn json_pointer_text(record: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| record.pointer(pointer))
+        .and_then(json_value_text)
+        .and_then(|value| non_empty(&value).map(str::to_owned))
+}
+
+fn json_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).ok(),
+    }
+}
+
+fn observation_constellation_sample_every_n() -> StorageResult<u64> {
+    match env::var(SYN_OBSERVATION_SAMPLE_EVERY_N_ENV) {
+        Ok(raw) => {
+            let parsed = raw.parse::<u64>().map_err(|error| StorageError::WriteFailed {
+                cf_name: cf::CF_OBSERVATIONS.to_owned(),
+                detail: format!(
+                    "{SYN_OBSERVATION_SAMPLE_EVERY_N_ENV} must be a positive integer; got {raw:?}: {error}"
+                ),
+            })?;
+            if parsed == 0 {
+                return Err(StorageError::WriteFailed {
+                    cf_name: cf::CF_OBSERVATIONS.to_owned(),
+                    detail: format!("{SYN_OBSERVATION_SAMPLE_EVERY_N_ENV} must be >= 1"),
+                });
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT),
+        Err(env::VarError::NotUnicode(value)) => Err(StorageError::WriteFailed {
+            cf_name: cf::CF_OBSERVATIONS.to_owned(),
+            detail: format!(
+                "{} is not valid Unicode: {}",
+                SYN_OBSERVATION_SAMPLE_EVERY_N_ENV,
+                value.display()
+            ),
+        }),
+    }
+}
+
+fn observation_source_key_seq(source_key: &[u8]) -> StorageResult<u32> {
+    if source_key.len() != 12 {
+        return Err(StorageError::WriteFailed {
+            cf_name: cf::CF_OBSERVATIONS.to_owned(),
+            detail: format!(
+                "CF_OBSERVATIONS key must be ts_ns||seq (12 bytes) for deterministic Calyx sampling; got {} bytes",
+                source_key.len()
+            ),
+        });
+    }
+    let mut seq = [0_u8; 4];
+    seq.copy_from_slice(&source_key[8..12]);
+    Ok(u32::from_be_bytes(seq))
 }
 
 fn url_host(url: &str) -> Option<String> {

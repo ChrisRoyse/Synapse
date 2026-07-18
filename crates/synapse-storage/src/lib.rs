@@ -22,9 +22,13 @@ pub use backend::{
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
-    ConstellationPutReport, SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION,
-    SYN_AGENT_TRANSCRIPT_PANEL_NAME, SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME,
-    SYN_EPISODE_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    ConstellationPutReport, SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION,
+    SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+    SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
+    SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
+    SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT, SYN_OBSERVATION_SAMPLE_EVERY_N_ENV,
+    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME,
+    SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
@@ -449,6 +453,83 @@ impl Db {
     ) -> StorageResult<ConstellationPutReport> {
         self.backend
             .put_agent_transcript_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_ACTION_LOG` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_action_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &serde_json::Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_action_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_REFLEX_AUDIT` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_reflex_audit_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::StoredReflexAudit,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_reflex_audit_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_PROCESS_HISTORY` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when Syn* lens measurement, native Calyx
+    /// validation, duplicate compatibility, ledger append, or Base/Slot/Scalars
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_process_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &serde_json::Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_process_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx constellation for one persisted
+    /// `CF_OBSERVATIONS` row when its key is selected by the deterministic
+    /// bounded-rate sampler.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the sampler config/key is invalid or Syn*
+    /// lens measurement, native Calyx validation, duplicate compatibility,
+    /// ledger append, or Base/Slot/Scalars persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_sampled_observation_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::StoredObservation,
+    ) -> StorageResult<Option<ConstellationPutReport>> {
+        self.backend
+            .put_sampled_observation_constellation(source_key, raw_bytes, record)
     }
 
     /// Runs one disk-pressure check immediately.

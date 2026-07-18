@@ -16,9 +16,21 @@ use synapse_storage::{Db, StorageResult, cf, encode_json};
     )
 )]
 pub fn write_audit(db: &Db, audit: &StoredReflexAudit) -> StorageResult<()> {
-    let key = audit_key(audit);
+    let key = audit_key(audit).into_bytes();
     let value = encode_json(audit)?;
-    db.put_batch(cf::CF_REFLEX_AUDIT, [(key.into_bytes(), value)])
+    db.put_batch(cf::CF_REFLEX_AUDIT, [(key.clone(), value.clone())])?;
+    db.put_reflex_audit_constellation(&key, &value, audit)
+        .inspect_err(|error| {
+            tracing::error!(
+                code = "CALYX_REFLEX_CONSTELLATION_MEASUREMENT_FAILED",
+                reflex_id = %audit.reflex_id,
+                audit_id = %audit.audit_id,
+                ts_ns = audit.ts_ns,
+                detail = %format!("{error:#}"),
+                "reflex audit row was written but native Calyx constellation measurement failed"
+            );
+        })?;
+    Ok(())
 }
 
 fn audit_key(audit: &StoredReflexAudit) -> String {

@@ -4,6 +4,10 @@ use super::common::{delegate_error, facade_params_error, validate_exact_operatio
 use crate::m3::{
     armed_routines::{ArmedRoutineTickParams, ArmedRoutineTickResponse},
     profile_authoring::{RoutineAutomateParams, RoutineAutomateResponse},
+    reflex::{
+        ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
+        ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,
+    },
     routines::{
         RoutineFeedbackParams, RoutineFeedbackResponse, RoutineInspectParams,
         RoutineInspectResponse, RoutineLabelExportParams, RoutineLabelExportResponse,
@@ -15,8 +19,7 @@ use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 
 pub(super) const ROUTINE_TOOL: &str = "routine";
-const ROUTINE_SOURCE_OF_TRUTH: &str =
-    "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows";
+const ROUTINE_SOURCE_OF_TRUTH: &str = "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows + CF_REFLEX_AUDIT + reflex runtime";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +32,10 @@ pub enum RoutineOperation {
     Label,
     Automate,
     ArmedTick,
+    ReflexRegister,
+    ReflexCancel,
+    ReflexList,
+    ReflexHistory,
 }
 
 impl RoutineOperation {
@@ -42,6 +49,10 @@ impl RoutineOperation {
             Self::Label => "label",
             Self::Automate => "automate",
             Self::ArmedTick => "armed_tick",
+            Self::ReflexRegister => "reflex_register",
+            Self::ReflexCancel => "reflex_cancel",
+            Self::ReflexList => "reflex_list",
+            Self::ReflexHistory => "reflex_history",
         }
     }
 }
@@ -66,6 +77,14 @@ pub struct RoutineParams {
     pub automate: Option<RoutineAutomateParams>,
     #[serde(default)]
     pub armed_tick: Option<ArmedRoutineTickParams>,
+    #[serde(default)]
+    pub reflex_register: Option<ReflexRegisterParams>,
+    #[serde(default)]
+    pub reflex_cancel: Option<ReflexCancelParams>,
+    #[serde(default)]
+    pub reflex_list: Option<ReflexListParams>,
+    #[serde(default)]
+    pub reflex_history: Option<ReflexHistoryParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -90,6 +109,14 @@ pub struct RoutineResponse {
     pub automate: Option<RoutineAutomateResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed_tick: Option<ArmedRoutineTickResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_register: Option<ReflexRegisterResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_cancel: Option<ReflexCancelResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_list: Option<ReflexListResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_history: Option<ReflexHistoryResponse>,
 }
 
 pub(super) async fn handle(
@@ -343,6 +370,123 @@ pub(super) async fn handle(
                 |out| out.armed_tick = Some(response),
             )))
         }
+        RoutineOperation::ReflexRegister => {
+            let spec = params
+                .0
+                .reflex_register
+                .ok_or_else(|| missing_routine_spec("reflex_register"))?;
+            let source_id = format!(
+                "reflex_register:kind={} priority={} lifetime={:?}",
+                spec.kind, spec.priority, spec.lifetime
+            );
+            let response = service
+                .reflex_register(Parameters(spec))
+                .await
+                .map_err(|error| {
+                    routine_delegate_error(
+                        operation,
+                        source_id,
+                        error,
+                        "fix reflex register params or explicit WRITE_REFLEX grant and inspect CF_REFLEX_AUDIT plus reflex runtime state",
+                    )
+                })?
+                .0;
+            Ok(Json(routine_response(
+                operation,
+                format!(
+                    "CF_REFLEX_AUDIT register reflex_id={} state={:?}",
+                    response.reflex_id, response.state.state
+                ),
+                |out| out.reflex_register = Some(response),
+            )))
+        }
+        RoutineOperation::ReflexCancel => {
+            let spec = params
+                .0
+                .reflex_cancel
+                .ok_or_else(|| missing_routine_spec("reflex_cancel"))?;
+            let source_id = spec.reflex_id.clone();
+            let response = service
+                .reflex_cancel(Parameters(spec))
+                .await
+                .map_err(|error| {
+                    routine_delegate_error(
+                        operation,
+                        source_id,
+                        error,
+                        "provide an existing reflex_id and inspect CF_REFLEX_AUDIT plus reflex runtime state",
+                    )
+                })?
+                .0;
+            Ok(Json(routine_response(
+                operation,
+                format!(
+                    "CF_REFLEX_AUDIT cancel cancelled={} reason={:?}",
+                    response.cancelled, response.reason
+                ),
+                |out| out.reflex_cancel = Some(response),
+            )))
+        }
+        RoutineOperation::ReflexList => {
+            let spec = params
+                .0
+                .reflex_list
+                .ok_or_else(|| missing_routine_spec("reflex_list"))?;
+            let source_id = format!("reflex_list:include_expired={}", spec.include_expired);
+            let response = service
+                .reflex_list(Parameters(spec))
+                .await
+                .map_err(|error| {
+                    routine_delegate_error(
+                        operation,
+                        source_id,
+                        error,
+                        "inspect live reflex runtime state and CF_REFLEX_AUDIT terminal rows",
+                    )
+                })?
+                .0;
+            Ok(Json(routine_response(
+                operation,
+                format!(
+                    "reflex runtime + CF_REFLEX_AUDIT list returned={}",
+                    response.reflexes.len()
+                ),
+                |out| out.reflex_list = Some(response),
+            )))
+        }
+        RoutineOperation::ReflexHistory => {
+            let spec = params
+                .0
+                .reflex_history
+                .ok_or_else(|| missing_routine_spec("reflex_history"))?;
+            let source_id = format!(
+                "reflex_history:reflex_id={} limit={}",
+                spec.reflex_id.as_deref().unwrap_or("<all>"),
+                spec.limit
+            );
+            let limit = spec.limit;
+            let response = service
+                .reflex_history(Parameters(spec))
+                .await
+                .map_err(|error| {
+                    routine_delegate_error(
+                        operation,
+                        source_id,
+                        error,
+                        "provide a valid reflex_id/limit and inspect CF_REFLEX_AUDIT rows",
+                    )
+                })?
+                .0;
+            Ok(Json(routine_response(
+                operation,
+                format!(
+                    "CF_REFLEX_AUDIT history returned={} limit={}",
+                    response.events.len(),
+                    limit
+                ),
+                |out| out.reflex_history = Some(response),
+            )))
+        }
     }
 }
 
@@ -359,6 +503,10 @@ pub(super) fn validate_routine_facade_params(params: &RoutineParams) -> Result<(
             ("label", params.label.is_some()),
             ("automate", params.automate.is_some()),
             ("armed_tick", params.armed_tick.is_some()),
+            ("reflex_register", params.reflex_register.is_some()),
+            ("reflex_cancel", params.reflex_cancel.is_some()),
+            ("reflex_list", params.reflex_list.is_some()),
+            ("reflex_history", params.reflex_history.is_some()),
         ],
     )
 }
@@ -408,6 +556,10 @@ fn routine_response(
         label: None,
         automate: None,
         armed_tick: None,
+        reflex_register: None,
+        reflex_cancel: None,
+        reflex_list: None,
+        reflex_history: None,
     };
     populate(&mut response);
     response
