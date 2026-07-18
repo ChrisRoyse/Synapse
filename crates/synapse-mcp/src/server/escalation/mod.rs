@@ -1055,6 +1055,20 @@ fn note_transition_inner(
         }
         return Ok(());
     };
+    if let Some(policy_suppressed_reason) = operator_interrupt_suppressed_reason(transition) {
+        tracing::info!(
+            code = "ESCALATION_SUPPRESSED",
+            anchor = %transition.anchor,
+            state_to = transition.state_to.as_str(),
+            reason_code = %transition.reason_code,
+            policy_suppressed_reason = %policy_suppressed_reason,
+            "operator-facing escalation suppressed by policy before item creation"
+        );
+        if superseded {
+            wake_worker();
+        }
+        return Ok(());
+    }
     let already_open = open_items_for_anchor(db, &transition.anchor)?
         .into_iter()
         .any(|item| item.attention_state == new_state);

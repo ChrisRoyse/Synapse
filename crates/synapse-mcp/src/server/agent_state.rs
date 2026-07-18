@@ -23,7 +23,9 @@
 //! - `working`/`spawning` and silent past the threshold (default 120 s):
 //!   process alive + no fresh spawn artifact output → `stuck`
 //!   (`silent_timeout`), process gone → `dead`
-//!   (`process_gone_without_exit_event`).
+//!   (`process_gone_without_exit_event`). Observed ambient transcript agents
+//!   with no process handle are not actionable stuck work from silence alone;
+//!   they stay visible until the unprobeable-dead threshold below reaps them.
 //! - any non-dead agent whose known PID has vanished → `dead`.
 //! - runaway: the same tool called with identical argument digests N times
 //!   consecutively (default 5) → `stuck` with `runaway = true`
@@ -114,6 +116,8 @@ pub(crate) const DEFAULT_UNPROBEABLE_DEAD_AFTER_MS: u64 = 30 * 60 * 1000;
 /// and real activity later resumes, so the multiplier only trades a longer
 /// dormant-but-visible window for far fewer false reaps of working agents (#1594).
 pub(crate) const UNPROBEABLE_INFLIGHT_TOOL_GRACE_MULT: u64 = 4;
+
+const AMBIENT_SPAWN_ID_PREFIX: &str = "agent-spawn-ambient-";
 
 /// The `reason_code` the unprobeable-silence reaper stamps on an *inferred*
 /// death. Unlike a confirmed terminal event (`Killed`/`Exited`/process-gone),
@@ -231,7 +235,7 @@ impl AgentAttentionClass {
 fn normal_terminal_reason(reason_code: Option<&str>) -> bool {
     matches!(
         reason_code,
-        Some("spawn_completed" | "local_agent_completed")
+        Some("spawn_completed" | "local_agent_completed" | UNPROBEABLE_SILENT_ENDED_REASON)
     )
 }
 
@@ -377,6 +381,15 @@ impl AgentEntry {
     }
 }
 
+fn is_ambient_without_process_handle(entry: &AgentEntry) -> bool {
+    entry.probe_pid().is_none()
+        && entry
+            .spawn_id
+            .as_deref()
+            .unwrap_or(entry.anchor.as_str())
+            .starts_with(AMBIENT_SPAWN_ID_PREFIX)
+}
+
 fn late_exit_reconciles_process_probe_death(entry: &AgentEntry, record: &AgentEventRecord) -> bool {
     record.kind == AgentEventKind::Exited
         && entry.reason_code.as_deref() == Some("process_gone_without_exit_event")
@@ -468,8 +481,8 @@ impl Default for LivenessConfig {
 static LIVENESS_CONFIG: OnceLock<LivenessConfig> = OnceLock::new();
 
 /// Parses the liveness env knobs (`SYNAPSE_AGENT_STUCK_AFTER_MS`,
-/// `SYNAPSE_AGENT_LIVENESS_SWEEP_MS`, `SYNAPSE_AGENT_RUNAWAY_TOOL_CALLS`)
-/// and installs them process-wide.
+/// `SYNAPSE_AGENT_LIVENESS_SWEEP_MS`, `SYNAPSE_AGENT_RUNAWAY_TOOL_CALLS`,
+/// `SYNAPSE_AGENT_UNPROBEABLE_DEAD_AFTER_MS`) and installs them process-wide.
 ///
 /// # Errors
 ///
@@ -806,6 +819,9 @@ impl AgentStateTracker {
                         }),
                         now_unix_ms,
                     ));
+                    continue;
+                }
+                if is_ambient_without_process_handle(entry) {
                     continue;
                 }
             }
