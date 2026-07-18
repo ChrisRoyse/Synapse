@@ -779,6 +779,11 @@ impl SynapseService {
                             last_tick_jitter_us: runtime.last_tick_jitter_us(),
                             p99_tick_jitter_us: runtime.p99_tick_jitter_us(),
                             late_tick_count: Some(runtime.late_tick_count()),
+                            deadline_miss_streak: runtime.deadline_miss_streak(),
+                            deadline_miss_audit_after: Some(runtime.deadline_miss_audit_after()),
+                            severe_deadline_miss_after_us: Some(
+                                runtime.severe_deadline_miss_after_us(),
+                            ),
                             degraded_tick_count: Some(runtime.degraded_tick_count()),
                             recursion_clamps_total: Some(recursion_clamps_total),
                             ..SubsystemHealth::default()
@@ -792,6 +797,11 @@ impl SynapseService {
                             last_tick_jitter_us: runtime.last_tick_jitter_us(),
                             p99_tick_jitter_us: runtime.p99_tick_jitter_us(),
                             late_tick_count: Some(runtime.late_tick_count()),
+                            deadline_miss_streak: runtime.deadline_miss_streak(),
+                            deadline_miss_audit_after: Some(runtime.deadline_miss_audit_after()),
+                            severe_deadline_miss_after_us: Some(
+                                runtime.severe_deadline_miss_after_us(),
+                            ),
                             degraded_tick_count: Some(runtime.degraded_tick_count()),
                             ..SubsystemHealth::default()
                         },

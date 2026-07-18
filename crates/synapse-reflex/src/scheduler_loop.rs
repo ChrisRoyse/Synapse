@@ -73,6 +73,7 @@ pub(super) struct RuntimeState {
     pub(super) audit_context: Option<StoredAuditContext>,
     pub(super) action_gate: Option<ReflexActionGateHandle>,
     pub(super) tick_index: u64,
+    pub(super) deadline_miss_streak: u32,
     pub(super) last_tick_late_signal: Option<TickLateSignal>,
 }
 

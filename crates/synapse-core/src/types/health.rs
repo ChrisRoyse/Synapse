@@ -189,6 +189,12 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late_tick_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_miss_streak: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_miss_audit_after: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severe_deadline_miss_after_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_tick_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recursion_clamps_total: Option<u64>,

@@ -444,18 +444,29 @@ fn record_tick_sample(
     let jitter_metric = f64::from(u32::try_from(jitter_us).unwrap_or(u32::MAX));
     metrics::histogram!(REFLEX_TICK_JITTER_METRIC).record(jitter_metric);
     let deadline_late = elapsed > runtime.config.late_after;
+    if deadline_late {
+        runtime.deadline_miss_streak = runtime.deadline_miss_streak.saturating_add(1);
+    } else {
+        runtime.deadline_miss_streak = 0;
+    }
     let late = deadline_late || dispatch_blocked;
-    if late {
-        let reason = if dispatch_blocked {
-            "dispatch_blocked"
-        } else {
-            "deadline_miss"
-        };
+    if let Some((reason, classification)) =
+        tick_late_audit_classification(runtime, elapsed, dispatch_blocked, deadline_late, degraded)
+    {
         let signal = TickLateSignal { reason, degraded };
         if runtime.last_tick_late_signal != Some(signal) {
-            emit_tick_late(runtime, elapsed_us, jitter_us, reason, degraded);
+            emit_tick_late(
+                runtime,
+                elapsed_us,
+                jitter_us,
+                reason,
+                classification,
+                degraded,
+            );
         }
         runtime.last_tick_late_signal = Some(signal);
+    } else if deadline_late {
+        log_deadline_miss_sample(runtime, elapsed_us, jitter_us);
     } else {
         runtime.last_tick_late_signal = None;
     }
@@ -468,6 +479,7 @@ fn record_tick_sample(
         pulled_events: event_count,
         dispatched_actions,
         late,
+        deadline_miss_streak: runtime.deadline_miss_streak,
         degraded,
     };
     tracing::trace!(
@@ -486,11 +498,53 @@ fn record_tick_sample(
     runtime.tick_index = runtime.tick_index.saturating_add(1);
 }
 
+fn tick_late_audit_classification(
+    runtime: &RuntimeState,
+    elapsed: Duration,
+    dispatch_blocked: bool,
+    deadline_late: bool,
+    degraded: bool,
+) -> Option<(&'static str, &'static str)> {
+    if dispatch_blocked {
+        return Some(("dispatch_blocked", "dispatch_blocked"));
+    }
+    if !deadline_late {
+        return None;
+    }
+    if degraded {
+        return Some(("deadline_miss", "degraded_deadline_miss"));
+    }
+    if elapsed >= runtime.config.severe_deadline_miss_after {
+        return Some(("deadline_miss", "severe_deadline_miss"));
+    }
+    if runtime.deadline_miss_streak >= runtime.config.deadline_miss_audit_after {
+        return Some(("deadline_miss", "sustained_deadline_miss"));
+    }
+    None
+}
+
+fn log_deadline_miss_sample(runtime: &RuntimeState, elapsed_us: u64, jitter_us: u64) {
+    tracing::debug!(
+        component = "reflex_scheduler",
+        code = "REFLEX_TICK_JITTER_SAMPLE",
+        tick_index = runtime.tick_index,
+        elapsed_us,
+        jitter_us,
+        target_us = duration_us(runtime.config.target_interval),
+        late_after_us = duration_us(runtime.config.late_after),
+        deadline_miss_streak = runtime.deadline_miss_streak,
+        deadline_miss_audit_after = runtime.config.deadline_miss_audit_after,
+        severe_deadline_miss_after_us = duration_us(runtime.config.severe_deadline_miss_after),
+        "reflex scheduler deadline miss kept as sample telemetry"
+    );
+}
+
 fn emit_tick_late(
     runtime: &RuntimeState,
     elapsed_us: u64,
     jitter_us: u64,
     reason: &str,
+    classification: &str,
     degraded: bool,
 ) {
     let event = Event {
@@ -504,12 +558,23 @@ fn emit_tick_late(
             "jitter_us": jitter_us,
             "target_us": duration_us(runtime.config.target_interval),
             "reason": reason,
+            "classification": classification,
+            "deadline_miss_streak": runtime.deadline_miss_streak,
+            "deadline_miss_audit_after": runtime.config.deadline_miss_audit_after,
+            "severe_deadline_miss_after_us": duration_us(runtime.config.severe_deadline_miss_after),
             "degraded": degraded,
         }),
         correlations: Vec::new(),
     };
     let _report = runtime.event_bus.publish(event);
-    write_tick_late_audit(runtime, elapsed_us, jitter_us, reason, degraded);
+    write_tick_late_audit(
+        runtime,
+        elapsed_us,
+        jitter_us,
+        reason,
+        classification,
+        degraded,
+    );
 }
 
 fn write_tick_late_audit(
@@ -517,6 +582,7 @@ fn write_tick_late_audit(
     elapsed_us: u64,
     jitter_us: u64,
     reason: &str,
+    classification: &str,
     degraded: bool,
 ) {
     let Some(db) = runtime.audit_db.as_deref() else {
@@ -540,7 +606,11 @@ fn write_tick_late_audit(
             "target_us": duration_us(runtime.config.target_interval),
             "late_after_us": duration_us(runtime.config.late_after),
             "fallback_interval_us": duration_us(runtime.config.fallback_interval),
+            "deadline_miss_streak": runtime.deadline_miss_streak,
+            "deadline_miss_audit_after": runtime.config.deadline_miss_audit_after,
+            "severe_deadline_miss_after_us": duration_us(runtime.config.severe_deadline_miss_after),
             "reason": reason,
+            "classification": classification,
             "degraded": degraded,
         }),
         redacted: false,

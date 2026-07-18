@@ -237,11 +237,13 @@ Each candidate reflex's actions are decomposed into `ConflictResource`s: `Keyboa
 | `target_interval` | `1 ms` | Target tick period |
 | `fallback_interval` | `2 ms` | Tokio interval used in degraded mode |
 | `late_after` | `2 ms` (`target_interval * 2`) | A tick is "late" if its elapsed time exceeds this |
+| `deadline_miss_audit_after` | `3` | Consecutive non-degraded deadline misses required before a normal jitter episode writes a durable audit row |
+| `severe_deadline_miss_after` | `8 ms` (`fallback_interval * 4`) | Non-degraded deadline miss large enough to write a durable audit row immediately |
 | `sample_limit` | `DEFAULT_SAMPLE_LIMIT = 4096` | Tick-sample ring buffer size |
 | `max_ticks` | `None` | Optional tick cap (testing); `with_max_ticks(n)` |
 | `force_degraded` | `false` | Forces the tokio fallback loop |
 
-`validate()` rejects zero `target_interval`, zero `fallback_interval`, and zero `sample_limit` (`ReflexError::ParamsInvalid`).
+`validate()` rejects zero `target_interval`, zero `fallback_interval`, zero `sample_limit`, zero `deadline_miss_audit_after`, and `severe_deadline_miss_after <= late_after` (`ReflexError::ParamsInvalid`).
 
 Other limits: `MAX_SCHEDULED_REFLEXES = 32`, `MAX_REFLEX_PRIORITY = 1000`, `DEFAULT_REFLEX_PRIORITY = 100`, `REFLEX_TICK_LATE_KIND = "reflex_tick_late"`.
 
@@ -270,7 +272,7 @@ Each `tick`:
 
 ### 4.4 Tick sampling and lateness (`scheduler_tick.rs`)
 
-`TickSample { tick_index, elapsed_us, jitter_us, target_us, pulled_events, dispatched_actions, late, degraded }`. `jitter_us = |elapsed_us - target_us|`. A tick is `late` when `elapsed > late_after` (reason `"deadline_miss"`) **or** `dispatch_blocked` (reason `"dispatch_blocked"`). A `reflex_tick_late` event + audit is emitted only on an edge (when the late signal changes), de-duplicated via `last_tick_late_signal`. Samples are stored in a `sample_limit`-bounded `VecDeque` (oldest dropped). `p99_jitter_us` (`scheduler_stats.rs`) sorts the jitter values and returns the value at index `ceil(len*99/100) - 1` (0 for empty).
+`TickSample { tick_index, elapsed_us, jitter_us, target_us, pulled_events, dispatched_actions, late, deadline_miss_streak, degraded }`. `jitter_us = |elapsed_us - target_us|`. A tick is `late` when `elapsed > late_after` **or** `dispatch_blocked`. Single non-degraded deadline misses stay in the sample ring, metric histogram, trace tick log, and bounded `REFLEX_TICK_JITTER_SAMPLE` debug logs. A durable `reflex_tick_late` event + audit is emitted immediately for `dispatch_blocked`, degraded fallback deadline misses, or a non-degraded miss at/above `severe_deadline_miss_after`; otherwise it is emitted only after `deadline_miss_audit_after` consecutive non-degraded misses. Audit rows include `reason`, `classification`, `deadline_miss_streak`, `deadline_miss_audit_after`, and `severe_deadline_miss_after_us`, and are de-duplicated via `last_tick_late_signal`. Samples are stored in a `sample_limit`-bounded `VecDeque` (oldest dropped). `p99_jitter_us` (`scheduler_stats.rs`) sorts the jitter values and returns the value at index `ceil(len*99/100) - 1` (0 for empty).
 
 ### 4.5 Registration / cancellation lifecycle (`lifecycle.rs`)
 
@@ -312,7 +314,7 @@ Audit rows written across the subsystem:
 | Lifetime expired (incl. one-shot, combo/path-follow completion) | `scheduler_loop.rs` | `Expired` | `REFLEX_LIFETIME_EXPIRED` | `reflex_lifetime_expired` (+ optional `combo_completion`/`path_follow_completion`) |
 | Track lost | `scheduler_loop.rs` | `Expired` | `REFLEX_TRACK_LOST` | `reflex_track_lost` |
 | Starvation | `scheduler_tick.rs` | `Starved` | `REFLEX_STARVED` | `reflex_starved` |
-| Tick late | `scheduler_tick.rs` | `Active` (reflex_id `"__scheduler__"`) | `REFLEX_TICK_LATE` | `reflex_tick_late` |
+| Tick late | `scheduler_tick.rs` | `Active` (reflex_id `"__scheduler__"`) | `REFLEX_TICK_LATE` | `reflex_tick_late` for dispatch-blocked, degraded, severe, or sustained deadline misses; isolated normal jitter stays telemetry-only |
 | Aim-track correction | `scheduler_stateful.rs` | `Active` | none | `aim_track_correction` (cursor/target/raw_delta/smoothed_delta/params/target_context) |
 | Path-follow tick | `scheduler_stateful.rs` | `Active` | none | `reflex_path_follow_tick` (per-sample dispatch steps) |
 

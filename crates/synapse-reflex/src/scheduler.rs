@@ -37,12 +37,15 @@ pub const MAX_REFLEX_PRIORITY: u32 = 1000;
 pub const REFLEX_TICK_LATE_KIND: &str = "reflex_tick_late";
 pub const DEFAULT_SAMPLE_LIMIT: usize = 4096;
 pub const DEFAULT_REFLEX_PRIORITY: u32 = 100;
+pub const DEFAULT_DEADLINE_MISS_AUDIT_AFTER: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
     pub target_interval: Duration,
     pub fallback_interval: Duration,
     pub late_after: Duration,
+    pub deadline_miss_audit_after: u32,
+    pub severe_deadline_miss_after: Duration,
     pub sample_limit: usize,
     pub max_ticks: Option<u64>,
     pub force_degraded: bool,
@@ -51,10 +54,14 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         let target_interval = Duration::from_millis(1);
+        let fallback_interval = Duration::from_millis(2);
+        let late_after = target_interval.saturating_mul(2);
         Self {
             target_interval,
-            fallback_interval: Duration::from_millis(2),
-            late_after: target_interval.saturating_mul(2),
+            fallback_interval,
+            late_after,
+            deadline_miss_audit_after: DEFAULT_DEADLINE_MISS_AUDIT_AFTER,
+            severe_deadline_miss_after: fallback_interval.saturating_mul(4),
             sample_limit: DEFAULT_SAMPLE_LIMIT,
             max_ticks: None,
             force_degraded: false,
@@ -83,6 +90,17 @@ impl SchedulerConfig {
         if self.sample_limit == 0 {
             return Err(ReflexError::ParamsInvalid {
                 detail: "scheduler sample limit must be non-zero".to_owned(),
+            });
+        }
+        if self.deadline_miss_audit_after == 0 {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "scheduler deadline-miss audit streak must be non-zero".to_owned(),
+            });
+        }
+        if self.severe_deadline_miss_after <= self.late_after {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "scheduler severe deadline-miss threshold must exceed late_after"
+                    .to_owned(),
             });
         }
         Ok(())
@@ -282,6 +300,7 @@ pub struct TickSample {
     pub pulled_events: usize,
     pub dispatched_actions: usize,
     pub late: bool,
+    pub deadline_miss_streak: u32,
     pub degraded: bool,
 }
 
@@ -548,6 +567,7 @@ impl ReflexScheduler {
             audit_context,
             action_gate,
             tick_index: 0,
+            deadline_miss_streak: 0,
             last_tick_late_signal: None,
         };
 

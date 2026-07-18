@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use synapse_action::ActionHandle;
 use synapse_core::{ReflexId, ReflexState, ReflexStatus, StoredAuditContext};
@@ -150,6 +150,33 @@ impl ReflexRuntime {
         })
     }
 
+    /// Returns the latest consecutive non-degraded scheduler deadline-miss streak.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn deadline_miss_streak(&self) -> Option<u32> {
+        self.scheduler.as_ref().and_then(|scheduler| {
+            scheduler
+                .samples()
+                .last()
+                .map(|sample| sample.deadline_miss_streak)
+        })
+    }
+
+    /// Returns the configured consecutive deadline misses required for a
+    /// non-degraded jitter episode to become a durable audit row.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn deadline_miss_audit_after(&self) -> u32 {
+        self.scheduler_config.deadline_miss_audit_after
+    }
+
+    /// Returns the severe non-degraded deadline miss threshold in microseconds.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn severe_deadline_miss_after_us(&self) -> u64 {
+        duration_us(self.scheduler_config.severe_deadline_miss_after)
+    }
+
     /// Returns retained tick samples that ran through the degraded fallback interval.
     #[must_use]
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
@@ -170,7 +197,14 @@ impl ReflexRuntime {
         self.scheduler
             .as_ref()
             .and_then(|scheduler| scheduler.samples().last().copied())
-            .is_some_and(|sample| sample.degraded || sample.late)
+            .is_some_and(|sample| {
+                sample.degraded
+                    || (sample.late
+                        && (sample.deadline_miss_streak
+                            >= self.scheduler_config.deadline_miss_audit_after
+                            || sample.elapsed_us
+                                >= duration_us(self.scheduler_config.severe_deadline_miss_after)))
+            })
     }
 
     /// Returns the action emitter handle used by reflex controllers.
@@ -223,4 +257,8 @@ impl ReflexRuntime {
     pub fn audit_context(&self) -> Option<StoredAuditContext> {
         self.audit_context.clone()
     }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
