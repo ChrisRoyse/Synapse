@@ -34,10 +34,11 @@ use crate::constellations::{
     ConstellationPutReport, NativeConstellationContext, SYN_ACTION_PANEL_NAME,
     SYN_ACTION_PANEL_VERSION, SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION,
     SYN_AGENT_TRANSCRIPT_PANEL_NAME, SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME,
-    SYN_EPISODE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
-    SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
-    SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    SYN_EPISODE_PANEL_VERSION, SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION,
+    SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME,
+    SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION,
+    SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME,
+    SYN_TIMELINE_PANEL_VERSION,
 };
 use crate::{
     CfEstimateMap, OwnedCfWriteBatch, RawRow, ScanWindow, StorageError, StorageResult, cf,
@@ -363,6 +364,12 @@ pub trait StorageBackend: Send + Sync {
     fn put_outcome_constellation(
         &self,
         source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_mcp_usage_constellation(
+        &self,
         source_key: &[u8],
         raw_bytes: &[u8],
         record: &Value,
@@ -1529,7 +1536,7 @@ impl StorageBackend for CalyxBackend {
             "put outcome Calyx constellation",
             true,
             |vault| {
-                let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+                let panel = constellations::anchor_panel_for_source_row(source_cf, source_key)?;
                 if panel.panel_name != SYN_OUTCOME_PANEL_NAME
                     || panel.panel_version != SYN_OUTCOME_PANEL_VERSION
                 {
@@ -1616,6 +1623,106 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
+    fn put_mcp_usage_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put MCP usage Calyx constellation",
+            true,
+            |vault| {
+                let panel = constellations::anchor_panel_for_source_row(cf::CF_KV, source_key)?;
+                if panel.panel_name != SYN_MCP_USAGE_PANEL_NAME
+                    || panel.panel_version != SYN_MCP_USAGE_PANEL_VERSION
+                {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_constellation",
+                        format!(
+                            "put_mcp_usage_constellation requires an MCP usage source row; key_hex={} maps to {} version {}",
+                            constellations::hex_encode(source_key),
+                            panel.panel_name,
+                            panel.panel_version
+                        ),
+                    ));
+                }
+                let input_bytes = constellations::source_constellation_input_bytes(
+                    panel.input_mode,
+                    cf::CF_KV,
+                    source_key,
+                    raw_bytes,
+                );
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(&input_bytes, panel.panel_version),
+                    created_at_ms: calyx_clock_now_for_write(vault, cf::CF_KV)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_mcp_usage_constellation(
+                    context,
+                    source_key,
+                    raw_bytes,
+                    &input_bytes,
+                    record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put MCP usage observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_MCP_USAGE_PANEL_NAME,
+                    panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+                    source_cf: cf::CF_KV,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_MCP_USAGE_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "MCP usage row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_MCP_USAGE_PANEL_NAME,
+                    cf::CF_KV,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
     fn put_grounding_anchor_for_source(
         &self,
         source_cf: &'static str,
@@ -1630,7 +1737,7 @@ impl StorageBackend for CalyxBackend {
             "put grounded Calyx anchor",
             true,
             |vault| {
-                let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+                let panel = constellations::anchor_panel_for_source_row(source_cf, source_key)?;
                 let input_bytes = constellations::source_constellation_input_bytes(
                     panel.input_mode,
                     source_cf,
@@ -1806,7 +1913,7 @@ impl StorageBackend for CalyxBackend {
             "scan grounded Calyx anchors",
             false,
             |vault| {
-                let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+                let panel = constellations::anchor_panel_for_source_row(source_cf, source_key)?;
                 let input_bytes = constellations::source_constellation_input_bytes(
                     panel.input_mode,
                     source_cf,
@@ -2479,7 +2586,8 @@ fn prepare_grounding_anchor_sources(
     let mut prepared = Vec::with_capacity(sources.len());
     let mut calyx_entries = Vec::with_capacity(sources.len());
     for source in sources {
-        let panel = constellations::anchor_panel_for_source_cf(source.source_cf)?;
+        let panel =
+            constellations::anchor_panel_for_source_row(source.source_cf, &source.source_key)?;
         let input_bytes = constellations::source_constellation_input_bytes(
             panel.input_mode,
             source.source_cf,

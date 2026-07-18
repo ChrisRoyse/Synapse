@@ -346,13 +346,13 @@ pub fn inspect_storage_anchors(
     runtime: &Arc<Mutex<ReflexRuntime>>,
     params: &StorageAnchorsParams,
 ) -> Result<StorageAnchorsResponse, ErrorData> {
-    let cf_name = known_anchor_source_cf(&params.cf_name)?;
     let key = hex_decode(params.key_hex.trim()).map_err(|detail| {
         mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!("storage operation=anchors key_hex invalid: {detail}"),
         )
     })?;
+    let cf_name = known_anchor_source_cf_for_key(&params.cf_name, &key)?;
     let runtime = lock_runtime(runtime)?;
     let rows = runtime
         .storage_cf_prefix_rows(cf_name, &key, 2)
@@ -722,7 +722,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-fn known_anchor_source_cf(raw: &str) -> Result<&'static str, ErrorData> {
+fn known_anchor_source_cf_for_key(raw: &str, key: &[u8]) -> Result<&'static str, ErrorData> {
     let trimmed = raw.trim();
     let Some(cf_name) = cf::ALL_COLUMN_FAMILIES
         .iter()
@@ -734,7 +734,7 @@ fn known_anchor_source_cf(raw: &str) -> Result<&'static str, ErrorData> {
             format!("storage operation=anchors cf_name is not known: {trimmed:?}"),
         ));
     };
-    synapse_storage::constellations::anchor_panel_for_source_cf(cf_name)
+    synapse_storage::constellations::anchor_panel_for_source_row(cf_name, key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(cf_name)
 }

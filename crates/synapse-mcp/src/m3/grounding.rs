@@ -13,6 +13,7 @@ pub(crate) const SOURCE_EPISODE_SEGMENT: &str = "synapse-episode-segment";
 pub(crate) const SOURCE_APPROVAL: &str = "synapse-approval";
 pub(crate) const SOURCE_VERIFICATION: &str = "synapse-verification";
 pub(crate) const SOURCE_ESCALATION: &str = "synapse-escalation";
+pub(crate) const SOURCE_MCP_USAGE: &str = "synapse-mcp-usage";
 
 const MS_PER_NS: u64 = 1_000_000;
 

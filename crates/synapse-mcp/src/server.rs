@@ -257,6 +257,7 @@ mod m1_tools;
 mod m2_tools;
 mod m3_tools;
 pub(crate) mod m4_tools;
+pub(crate) mod mcp_usage;
 mod notify_tools;
 mod operational_facades;
 pub(crate) mod operator_panic_boundary;

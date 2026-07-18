@@ -179,6 +179,68 @@ struct ToolEvent {
     detail: Option<Value>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinishedToolCallReadback {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub pid: u32,
+    pub seq: u64,
+    pub event_kind: String,
+    pub tool: String,
+    pub operation: Option<String>,
+    pub route_id: Option<String>,
+    pub profile: Option<String>,
+    pub tool_surface_sha256: Option<String>,
+    pub status: String,
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
+    pub duration_ms: u64,
+    pub mcp_session_id: Option<String>,
+    pub effective_target: Option<Value>,
+    pub error: Option<Value>,
+    pub panic: Option<Value>,
+}
+
+impl TryFrom<ToolEvent> for FinishedToolCallReadback {
+    type Error = anyhow::Error;
+
+    fn try_from(event: ToolEvent) -> anyhow::Result<Self> {
+        let finished_at_unix_ms = event.finished_at_unix_ms.ok_or_else(|| {
+            anyhow::anyhow!(
+                "daemon lifecycle terminal event {} is missing finished_at_unix_ms",
+                event.seq
+            )
+        })?;
+        let duration_ms = event.duration_ms.ok_or_else(|| {
+            anyhow::anyhow!(
+                "daemon lifecycle terminal event {} is missing duration_ms",
+                event.seq
+            )
+        })?;
+        Ok(Self {
+            schema_version: event.schema_version,
+            run_id: event.run_id,
+            pid: event.pid,
+            seq: event.seq,
+            event_kind: event.event_kind,
+            tool: event.tool,
+            operation: event.operation,
+            route_id: event.route_id,
+            profile: event.profile,
+            tool_surface_sha256: event.tool_surface_sha256,
+            status: event.status,
+            started_at_unix_ms: event.started_at_unix_ms,
+            finished_at_unix_ms,
+            duration_ms,
+            mcp_session_id: event.mcp_session_id,
+            effective_target: event.effective_target,
+            error: event.error,
+            panic: event.panic,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExitEvent {
     schema_version: u32,
@@ -608,11 +670,11 @@ impl ToolCallGuard {
     pub(crate) fn finish_ok_with_effective_target(
         mut self,
         effective_target: Option<Value>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<FinishedToolCallReadback> {
         self.finish("ok", None, None, effective_target)
     }
 
-    pub(crate) fn finish_error(mut self, error: Value) -> anyhow::Result<()> {
+    pub(crate) fn finish_error(mut self, error: Value) -> anyhow::Result<FinishedToolCallReadback> {
         self.finish("error", Some(error), None, None)
     }
 
@@ -620,11 +682,11 @@ impl ToolCallGuard {
         mut self,
         error: Value,
         effective_target: Option<Value>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<FinishedToolCallReadback> {
         self.finish("error", Some(error), None, effective_target)
     }
 
-    pub(crate) fn finish_panic(mut self, panic: Value) -> anyhow::Result<()> {
+    pub(crate) fn finish_panic(mut self, panic: Value) -> anyhow::Result<FinishedToolCallReadback> {
         self.finish("panic", None, Some(panic), None)
     }
 
@@ -634,7 +696,7 @@ impl ToolCallGuard {
         error: Option<Value>,
         panic: Option<Value>,
         effective_target: Option<Value>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<FinishedToolCallReadback> {
         let seq = self
             .seq
             .ok_or_else(|| anyhow::anyhow!("daemon lifecycle tool guard is already terminal"))?;
@@ -668,7 +730,7 @@ impl Drop for ToolCallGuard {
             )
         }));
         match fallback {
-            Ok(Ok(())) => {
+            Ok(Ok(_readback)) => {
                 tracing::error!(
                     code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
                     detail_code = "MCP_TOOL_CALL_GUARD_DROPPED_UNFINISHED",
@@ -1087,7 +1149,7 @@ fn finish_tool_call(
     error: Option<Value>,
     panic: Option<Value>,
     effective_target: Option<Value>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<FinishedToolCallReadback> {
     let slot = state_slot();
     let mut guard = slot
         .lock()
@@ -1113,7 +1175,7 @@ fn finish_tool_call(
     event.panic = panic;
     write_tool_event(state, &event)?;
     state.in_flight.remove(&seq);
-    Ok(())
+    FinishedToolCallReadback::try_from(event)
 }
 
 fn record_panic(info: &std::panic::PanicHookInfo<'_>) -> anyhow::Result<()> {

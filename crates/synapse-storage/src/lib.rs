@@ -27,6 +27,7 @@ pub use constellations::{
     ConstellationPutReport, SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION,
     SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
+    SYN_MCP_USAGE_KEY_PREFIX, SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION,
     SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
     SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT, SYN_OBSERVATION_SAMPLE_EVERY_N_ENV,
     SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
@@ -552,6 +553,25 @@ impl Db {
     ) -> StorageResult<ConstellationPutReport> {
         self.backend
             .put_outcome_constellation(source_cf, source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx MCP usage constellation for one
+    /// persisted `CF_KV mcp-usage/v1/` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source key is outside the MCP usage
+    /// namespace, row measurement fails, or native Calyx constellation
+    /// persistence fails.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_mcp_usage_constellation(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &serde_json::Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_mcp_usage_constellation(source_key, raw_bytes, record)
     }
 
     /// Writes a grounded anchor for one persisted source row and separately

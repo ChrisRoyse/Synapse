@@ -23,6 +23,8 @@ impl ServerHandler for SynapseService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
+        let argument_shape =
+            super::mcp_usage::argument_shape_from_arguments(request.arguments.as_ref());
         let operation = tool_operation_from_arguments(&tool_name, request.arguments.as_ref());
         let lifecycle_guard = self.begin_daemon_lifecycle_tool_call(
             &tool_name,
@@ -32,9 +34,15 @@ impl ServerHandler for SynapseService {
         if let Some(session_id) = mcp_session_id.as_deref()
             && let Err(error) = self.reject_terminated_session_tool_call(&tool_name, session_id)
         {
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
+            let error = super::mcp_usage::record_error_and_attach_steering(
+                self,
+                finished,
+                argument_shape,
+                error,
+            )?;
             return Err(error);
         }
         if let Err(error) = self.admit_tool_call_for_profile(&tool_name, mcp_session_id.as_deref())
@@ -42,9 +50,15 @@ impl ServerHandler for SynapseService {
             // Terminalize lifecycle ownership before the best-effort peer
             // notification. The peer await is transport-owned and may be
             // cancelled if the caller disconnects.
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
+            let error = super::mcp_usage::record_error_and_attach_steering(
+                self,
+                finished,
+                argument_shape,
+                error,
+            )?;
             if profile_policy_denied(&error) {
                 match context.peer.notify_tool_list_changed().await {
                     Ok(()) => {
@@ -71,9 +85,15 @@ impl ServerHandler for SynapseService {
         let shutdown_cancel = match self.shutdown_cancel_token() {
             Ok(shutdown_cancel) => shutdown_cancel,
             Err(error) => {
-                lifecycle_guard
+                let finished = lifecycle_guard
                     .finish_error(error_snapshot(&error))
                     .map_err(lifecycle_mcp_error)?;
+                let error = super::mcp_usage::record_error_and_attach_steering(
+                    self,
+                    finished,
+                    argument_shape,
+                    error,
+                )?;
                 return Err(error);
             }
         };
@@ -89,9 +109,15 @@ impl ServerHandler for SynapseService {
             };
             let error =
                 daemon_restarting_mcp_error(&tool_name, mcp_session_id.as_deref(), snapshot);
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
+            let error = super::mcp_usage::record_error_and_attach_steering(
+                self,
+                finished,
+                argument_shape,
+                error,
+            )?;
             return Err(error);
         }
         let operator_panic_boundary =
@@ -107,6 +133,7 @@ impl ServerHandler for SynapseService {
         let child_service = self.clone();
         let child_tool_name = tool_name.clone();
         let child_mcp_session_id = mcp_session_id.clone();
+        let child_argument_shape = argument_shape.clone();
         let (result_sender, mut result_receiver) = oneshot::channel();
         let authority_completion = match self.spawn_cooperative_authority_transaction(
             move |supervisor_cancellation| async move {
@@ -155,9 +182,11 @@ impl ServerHandler for SynapseService {
                                 )
                                 .await;
                                 let result = finish_routed_tool_call(
+                                    &child_service,
                                     lifecycle_guard,
                                     &child_tool_name,
                                     child_mcp_session_id.as_deref(),
+                                    child_argument_shape,
                                     execution,
                                 );
                                 if result_sender.send(result).is_err() {
@@ -190,9 +219,15 @@ impl ServerHandler for SynapseService {
                         "failed_supervisor_admission_take",
                     ));
                 };
-                lifecycle_guard
+                let finished = lifecycle_guard
                     .finish_error(error_snapshot(&error))
                     .map_err(lifecycle_mcp_error)?;
+                let error = super::mcp_usage::record_error_and_attach_steering(
+                    self,
+                    finished,
+                    argument_shape,
+                    error,
+                )?;
                 return Err(error);
             }
         };
@@ -350,33 +385,53 @@ where
 }
 
 fn finish_routed_tool_call(
+    service: &SynapseService,
     lifecycle_guard: crate::daemon_lifecycle::ToolCallGuard,
     tool_name: &str,
     mcp_session_id: Option<&str>,
+    argument_shape: super::mcp_usage::McpArgumentShape,
     execution: RoutedToolExecution<Result<CallToolResult, ErrorData>>,
 ) -> Result<CallToolResult, ErrorData> {
     match execution {
-        RoutedToolExecution::Completed(Ok(result)) => {
+        RoutedToolExecution::Completed(Ok(mut result)) => {
             let effective_target = effective_target_from_tool_result(&result);
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_ok_with_effective_target(effective_target)
                 .map_err(lifecycle_mcp_error)?;
+            super::mcp_usage::record_success_and_attach_steering(
+                service,
+                finished,
+                argument_shape,
+                &mut result,
+            )?;
             Ok(result)
         }
         RoutedToolExecution::Completed(Err(error)) => {
             let error = normalize_tool_error(tool_name, error);
             let error_snapshot = error_snapshot(&error);
             let effective_target = effective_target_from_error_snapshot(&error_snapshot);
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_error_with_effective_target(error_snapshot, effective_target)
                 .map_err(lifecycle_mcp_error)?;
+            let error = super::mcp_usage::record_error_and_attach_steering(
+                service,
+                finished,
+                argument_shape,
+                error,
+            )?;
             Err(error)
         }
         RoutedToolExecution::CancelledBeforeMutation(reason) => {
             let error = routed_call_cancelled_mcp_error(tool_name, mcp_session_id, reason);
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_error(error_snapshot(&error))
                 .map_err(lifecycle_mcp_error)?;
+            let error = super::mcp_usage::record_error_and_attach_steering(
+                service,
+                finished,
+                argument_shape,
+                error,
+            )?;
             Err(error)
         }
         RoutedToolExecution::Panicked(panic_message) => {
@@ -385,10 +440,17 @@ fn finish_routed_tool_call(
                 "tool": tool_name,
                 "mcp_session_id": mcp_session_id,
             });
-            lifecycle_guard
+            let finished = lifecycle_guard
                 .finish_panic(panic)
                 .map_err(lifecycle_mcp_error)?;
-            Err(tool_panic_mcp_error(tool_name, mcp_session_id))
+            let error = tool_panic_mcp_error(tool_name, mcp_session_id);
+            let error = super::mcp_usage::record_error_and_attach_steering(
+                service,
+                finished,
+                argument_shape,
+                error,
+            )?;
+            Err(error)
         }
     }
 }

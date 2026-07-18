@@ -43,6 +43,9 @@ pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
 pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_666_004;
 pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
 pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_669_001;
+pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
+pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_691_001;
+pub const SYN_MCP_USAGE_KEY_PREFIX: &[u8] = b"mcp-usage/v1/";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_SAMPLE_EVERY_N";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
 
@@ -163,6 +166,19 @@ const OUT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(5);
 const OUT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(6);
 const OUT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
 
+const MU_SLOT_TOOL_ONEHOT: SlotId = SlotId::new(1);
+const MU_SLOT_OPERATION_ONEHOT: SlotId = SlotId::new(2);
+const MU_SLOT_ROUTE_HASH: SlotId = SlotId::new(3);
+const MU_SLOT_PARAM_SHAPE_HASH: SlotId = SlotId::new(4);
+const MU_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(5);
+const MU_SLOT_ERROR_ONEHOT: SlotId = SlotId::new(6);
+const MU_SLOT_PROFILE_HASH: SlotId = SlotId::new(7);
+const MU_SLOT_SURFACE_HASH: SlotId = SlotId::new(8);
+const MU_SLOT_SESSION_SEQUENCE_RANK: SlotId = SlotId::new(9);
+const MU_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(10);
+const MU_SLOT_DOW_CYCLIC: SlotId = SlotId::new(11);
+const MU_SLOT_RECORD_VECTOR: SlotId = SlotId::new(12);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstellationPutReport {
     pub panel_name: &'static str,
@@ -202,6 +218,7 @@ pub struct NativeConstellationContext {
 pub enum CalyxConstellationInputMode {
     SourceValue,
     FramedSourceRow,
+    McpUsageFramedSourceRow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +293,27 @@ pub fn anchor_panel_for_source_cf(cf_name: &str) -> StorageResult<CalyxAnchorPan
     Ok(panel)
 }
 
+/// Returns the native Calyx panel for one source row. `CF_KV` hosts several
+/// row families, so row-key namespaces select the correct panel where needed.
+///
+/// # Errors
+///
+/// Returns a write-scoped storage error when the source row has no native
+/// constellation contract.
+pub fn anchor_panel_for_source_row(
+    cf_name: &'static str,
+    source_key: &[u8],
+) -> StorageResult<CalyxAnchorPanel> {
+    if cf_name == cf::CF_KV && source_key.starts_with(SYN_MCP_USAGE_KEY_PREFIX) {
+        return Ok(CalyxAnchorPanel {
+            panel_name: SYN_MCP_USAGE_PANEL_NAME,
+            panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::McpUsageFramedSourceRow,
+        });
+    }
+    anchor_panel_for_source_cf(cf_name)
+}
+
 #[must_use]
 pub fn source_constellation_input_bytes(
     mode: CalyxConstellationInputMode,
@@ -287,6 +325,9 @@ pub fn source_constellation_input_bytes(
         CalyxConstellationInputMode::SourceValue => source_value.to_vec(),
         CalyxConstellationInputMode::FramedSourceRow => {
             outcome_constellation_input_bytes(source_cf, source_key, source_value)
+        }
+        CalyxConstellationInputMode::McpUsageFramedSourceRow => {
+            mcp_usage_constellation_input_bytes(source_cf, source_key, source_value)
         }
     }
 }
@@ -305,6 +346,26 @@ pub fn outcome_constellation_input_bytes(
             + 24,
     );
     append_framed(&mut out, b"synapse-outcome-input-v1");
+    append_framed(&mut out, source_cf.as_bytes());
+    append_framed(&mut out, source_key);
+    append_framed(&mut out, source_value);
+    out
+}
+
+#[must_use]
+pub fn mcp_usage_constellation_input_bytes(
+    source_cf: &str,
+    source_key: &[u8],
+    source_value: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        "synapse-mcp-usage-input-v1".len()
+            + source_cf.len()
+            + source_key.len()
+            + source_value.len()
+            + 24,
+    );
+    append_framed(&mut out, b"synapse-mcp-usage-input-v1");
     append_framed(&mut out, source_cf.as_bytes());
     append_framed(&mut out, source_key);
     append_framed(&mut out, source_value);
@@ -1368,6 +1429,153 @@ pub fn build_outcome_constellation(
     )
 }
 
+/// Build the Calyx constellation for a persisted MCP usage row.
+///
+/// # Errors
+///
+/// Returns an error when the key is outside the MCP usage namespace, the row is
+/// not a JSON object, JSON field extraction fails, lens measurement fails, or
+/// exact scalar conversion fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "MCP usage panel construction is a stable slot-by-slot Calyx contract"
+)]
+pub fn build_mcp_usage_constellation(
+    context: NativeConstellationContext,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    constellation_input_bytes: &[u8],
+    record: &Value,
+) -> StorageResult<Constellation> {
+    ensure_json_object(record, cf::CF_KV)?;
+    if !source_key.starts_with(SYN_MCP_USAGE_KEY_PREFIX) {
+        return Err(StorageError::WriteFailed {
+            cf_name: cf::CF_KV.to_owned(),
+            detail: format!(
+                "MCP usage constellation requires a source key with prefix {}; got key_hex={}",
+                String::from_utf8_lossy(SYN_MCP_USAGE_KEY_PREFIX),
+                hex_encode(source_key)
+            ),
+        });
+    }
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        MU_SLOT_TOOL_ONEHOT,
+        optional_onehot_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.tool_onehot.v1",
+            json_string(record, &["tool"]).as_deref(),
+            128,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_OPERATION_ONEHOT,
+        optional_onehot_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.operation_onehot.v1",
+            json_string(record, &["operation"]).as_deref(),
+            128,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_ROUTE_HASH,
+        optional_hash_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.route_hash.v1",
+            json_string(record, &["route_id"]).as_deref(),
+            2048,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_PARAM_SHAPE_HASH,
+        optional_hash_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.param_shape_hash.v1",
+            json_string(record, &["argument_shape_sha256"]).as_deref(),
+            2048,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_STATUS_ONEHOT,
+        optional_onehot_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.status_onehot.v1",
+            json_string(record, &["status"]).as_deref(),
+            64,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_ERROR_ONEHOT,
+        optional_onehot_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.error_onehot.v1",
+            json_string(record, &["error_type"]).as_deref(),
+            128,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_PROFILE_HASH,
+        optional_hash_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.profile_hash.v1",
+            json_string(record, &["profile"]).as_deref(),
+            1024,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_SURFACE_HASH,
+        optional_hash_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.tool_surface_hash.v1",
+            json_string(record, &["tool_surface_sha256"]).as_deref(),
+            2048,
+        )?,
+    );
+    slots.insert(
+        MU_SLOT_SESSION_SEQUENCE_RANK,
+        optional_rank_slot(
+            SYN_MCP_USAGE_PANEL_NAME,
+            "syn.mcp_usage.session_sequence_rank.v1",
+            json_u64(record, &["session_sequence_position"]),
+            0,
+            RECENCY_RANK_MAX_UNIX_MS_MICROS,
+        )?,
+    );
+    insert_time_slots(
+        &mut slots,
+        SYN_MCP_USAGE_PANEL_NAME,
+        MU_SLOT_HOUR_CYCLIC,
+        MU_SLOT_DOW_CYCLIC,
+        "syn.mcp_usage.hour_cyclic.v1",
+        "syn.mcp_usage.dow_cyclic.v1",
+        mcp_usage_ts_ns(record),
+    )?;
+    slots.insert(
+        MU_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_MCP_USAGE_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.mcp_usage.record_vector.v1",
+                Modality::Structured,
+                128,
+            ),
+            &mcp_usage_numeric_record(record, raw_bytes),
+        )?,
+    );
+
+    let scalars = mcp_usage_scalars(record, raw_bytes)?;
+    let metadata = mcp_usage_metadata(source_key, raw_bytes, record);
+    constellation(
+        context,
+        SYN_MCP_USAGE_PANEL_VERSION,
+        source_pointer(cf::CF_KV, source_key),
+        constellation_input_bytes,
+        slots,
+        scalars,
+        metadata,
+    )
+}
+
 /// Returns whether a persisted observation key is selected for Calyx
 /// measurement under the configured bounded-rate sampler.
 ///
@@ -1935,6 +2143,67 @@ fn outcome_scalars(record: &Value, raw_bytes: &[u8]) -> StorageResult<BTreeMap<S
     Ok(scalars)
 }
 
+fn mcp_usage_scalars(record: &Value, raw_bytes: &[u8]) -> StorageResult<BTreeMap<String, f64>> {
+    let mut scalars = BTreeMap::new();
+    insert_u64_scalar(
+        &mut scalars,
+        "raw_len_bytes",
+        u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "schema_version",
+        json_u64(record, &["schema_version"]),
+    )?;
+    insert_optional_u64_scalar(&mut scalars, "seq", json_u64(record, &["seq"]))?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "session_sequence_position",
+        json_u64(record, &["session_sequence_position"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "duration_ms",
+        json_u64(record, &["duration_ms"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "response_size_bytes",
+        json_u64(record, &["response_size_bytes"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "response_content_count",
+        json_u64(record, &["response_content_count"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "argument_top_level_key_count",
+        json_u64(record, &["argument_top_level_key_count"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "argument_nested_path_count",
+        json_u64(record, &["argument_nested_path_count"]),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "error_present",
+        bool_u64(json_string(record, &["error_type"]).is_some()),
+    )?;
+    insert_u64_scalar(
+        &mut scalars,
+        "steering_emitted",
+        bool_u64(json_bool(record, &["steering_emitted"]).unwrap_or(false)),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "finished_unix_ms",
+        json_u64(record, &["finished_at_unix_ms"]),
+    )?;
+    Ok(scalars)
+}
+
 fn insert_u64_scalar(
     scalars: &mut BTreeMap<String, f64>,
     name: &'static str,
@@ -2468,6 +2737,53 @@ fn outcome_metadata(
         &mut metadata,
         "outcome_target",
         outcome_target(record).as_deref(),
+    );
+    metadata
+}
+
+fn mcp_usage_metadata(
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+) -> BTreeMap<String, String> {
+    let mut metadata = common_metadata(SYN_MCP_USAGE_PANEL_NAME, cf::CF_KV, source_key, raw_bytes);
+    if let Some(ts_ns) = mcp_usage_ts_ns(record) {
+        metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
+        metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        metadata.insert(
+            META_RECENCY_BASIS.to_owned(),
+            RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
+        );
+    }
+    insert_optional_metadata(
+        &mut metadata,
+        "mcp_usage_tool",
+        json_string(record, &["tool"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "mcp_usage_operation",
+        json_string(record, &["operation"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "mcp_usage_route_id",
+        json_string(record, &["route_id"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "mcp_usage_status",
+        json_string(record, &["status"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "mcp_usage_error_type",
+        json_string(record, &["error_type"]).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "mcp_usage_argument_shape_sha256",
+        json_string(record, &["argument_shape_sha256"]).as_deref(),
     );
     metadata
 }
@@ -3337,6 +3653,12 @@ fn outcome_ts_ns(record: &Value) -> Option<u64> {
     })
 }
 
+fn mcp_usage_ts_ns(record: &Value) -> Option<u64> {
+    json_u64(record, &["finished_at_unix_ms"])
+        .or_else(|| json_u64(record, &["started_at_unix_ms"]))
+        .map(|ms| ms.saturating_mul(NS_PER_MS))
+}
+
 fn outcome_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
     json!({
         "raw_len_bytes": u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
@@ -3346,6 +3668,29 @@ fn outcome_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
         "has_timestamp": bool_u64(outcome_ts_ns(record).is_some()),
         "code_count": json_u64(record, &["code_count"]).unwrap_or(0),
         "ladder_index": json_u64(record, &["ladder_index"]).unwrap_or(0),
+    })
+}
+
+fn mcp_usage_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
+    json!({
+        "raw_len_bytes": u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+        "schema_version": json_u64(record, &["schema_version"]).unwrap_or(0),
+        "seq": json_u64(record, &["seq"]).unwrap_or(0),
+        "session_sequence_position": json_u64(record, &["session_sequence_position"]).unwrap_or(0),
+        "duration_ms": json_u64(record, &["duration_ms"]).unwrap_or(0),
+        "response_size_bytes": json_u64(record, &["response_size_bytes"]).unwrap_or(0),
+        "response_content_count": json_u64(record, &["response_content_count"]).unwrap_or(0),
+        "argument_top_level_key_count": json_u64(record, &["argument_top_level_key_count"]).unwrap_or(0),
+        "argument_nested_path_count": json_u64(record, &["argument_nested_path_count"]).unwrap_or(0),
+        "has_tool": bool_u64(json_string(record, &["tool"]).is_some()),
+        "has_operation": bool_u64(json_string(record, &["operation"]).is_some()),
+        "has_route_id": bool_u64(json_string(record, &["route_id"]).is_some()),
+        "has_profile": bool_u64(json_string(record, &["profile"]).is_some()),
+        "has_surface_hash": bool_u64(json_string(record, &["tool_surface_sha256"]).is_some()),
+        "has_session": bool_u64(json_string(record, &["mcp_session_id_sha256"]).is_some()),
+        "has_error": bool_u64(json_string(record, &["error_type"]).is_some()),
+        "steering_emitted": bool_u64(json_bool(record, &["steering_emitted"]).unwrap_or(false)),
+        "finished_unix_ms": json_u64(record, &["finished_at_unix_ms"]).unwrap_or(0),
     })
 }
 

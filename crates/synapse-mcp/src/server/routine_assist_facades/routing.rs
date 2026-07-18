@@ -17,7 +17,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for intent and suggestion assist operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to intent_current/intent_detect_tick/suggestion_tick/suggestion_list/suggestion_accept and returns CF_KV suggestion plus intent-tracker readback metadata."
+        description = "Facade for intent, suggestion, and MCP usage-guidance assist operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to intent_current/intent_detect_tick/suggestion_tick/suggestion_list/suggestion_accept and MCP usage guide/policy/promotion controls, returning durable source-of-truth readback metadata."
     )]
     pub async fn assist(
         &self,
