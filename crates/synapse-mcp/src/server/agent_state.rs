@@ -63,11 +63,13 @@ use std::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::{AgentEventKind, AgentEventRecord, Event, EventSource};
+use synapse_core::{AgentEndState, AgentEventKind, AgentEventRecord, Event, EventSource};
 use synapse_reflex::EventBus;
 use synapse_storage::{Db, StorageResult, agent_events::agent_event_scan_start, cf, decode_json};
 
-use super::agent_events::{record_agent_events_unobserved, unix_time_ns_now};
+use super::agent_events::{
+    provider_for_agent_kind, record_agent_events, record_agent_events_unobserved, unix_time_ns_now,
+};
 
 /// Payload marker distinguishing machine-emitted `state_changed` rows from
 /// sender-pushed ones. The tracker never consumes its own output live, and
@@ -318,6 +320,12 @@ pub(crate) struct StateTransition {
     pub evidence: Value,
 }
 
+#[derive(Clone, Debug, Default)]
+struct LivenessSweepActions {
+    terminal_events: Vec<AgentEventRecord>,
+    transitions: Vec<StateTransition>,
+}
+
 #[derive(Clone, Debug)]
 struct AgentEntry {
     anchor: String,
@@ -430,6 +438,125 @@ fn newest_spawn_artifact_activity(entry: &AgentEntry) -> Option<AgentArtifactAct
     .into_iter()
     .filter_map(|(source, file_name)| artifact_activity(log_dir, source, file_name))
     .max_by_key(|activity| (activity.modified_unix_ms, activity.len_bytes))
+}
+
+fn process_gone_terminal_event(
+    entry: &AgentEntry,
+    probed_pid: u32,
+    now_unix_ms: u64,
+) -> AgentEventRecord {
+    let completion = entry
+        .log_dir
+        .as_deref()
+        .map(read_spawn_completion_for_process_gone)
+        .unwrap_or_else(|| SpawnCompletionForProcessGone {
+            read_error: Some("agent state entry had no log_dir".to_owned()),
+            ..SpawnCompletionForProcessGone::default()
+        });
+    let reason_code = if completion.status.as_deref() == Some("ok")
+        && matches!(completion.exit_code, Some(0) | None)
+    {
+        "spawn_completed"
+    } else {
+        "process_gone_without_exit_event"
+    };
+    let mut record = AgentEventRecord::new(
+        now_unix_ms.saturating_mul(1_000_000),
+        AgentEventKind::Exited,
+    );
+    record.spawn_id.clone_from(&entry.spawn_id);
+    record.session_id.clone_from(&entry.session_id);
+    record.reason_code = Some(reason_code.to_owned());
+    record.end_state = Some(completion.end_state());
+    record.attributes.agent_name.clone_from(&entry.agent_kind);
+    record.attributes.provider_name = entry
+        .agent_kind
+        .as_deref()
+        .and_then(provider_for_agent_kind);
+    record
+        .attributes
+        .conversation_id
+        .clone_from(&entry.session_id);
+    record.payload = json!({
+        "source_of_truth": "OS process table + agent spawn completion-status.json",
+        "probed_pid": probed_pid,
+        "silent_ms": now_unix_ms.saturating_sub(entry.last_event_unix_ms),
+        "last_event_kind": entry.last_event_kind,
+        "log_dir": entry.log_dir,
+        "completion_status_path": completion.path,
+        "completion_status": completion.status,
+        "completion_status_read_error": completion.read_error,
+        "exit_code": completion.exit_code,
+        "error_message": completion.error_message,
+        "final_message_bytes": completion.final_message_bytes,
+        "fallback_final_message_written": completion.fallback_final_message_written,
+    });
+    record
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpawnCompletionForProcessGone {
+    path: Option<String>,
+    status: Option<String>,
+    read_error: Option<String>,
+    exit_code: Option<i64>,
+    error_message: Option<String>,
+    final_message_bytes: Option<u64>,
+    fallback_final_message_written: Option<bool>,
+}
+
+impl SpawnCompletionForProcessGone {
+    fn end_state(&self) -> AgentEndState {
+        match (self.status.as_deref(), self.exit_code) {
+            (Some("ok"), Some(0) | None) => AgentEndState::Success,
+            (Some("running") | None, _) => AgentEndState::Indeterminate,
+            (Some("ok"), Some(_)) => AgentEndState::Error,
+            (Some(_), _) => AgentEndState::Error,
+        }
+    }
+}
+
+fn read_spawn_completion_for_process_gone(log_dir: &str) -> SpawnCompletionForProcessGone {
+    let path = Path::new(log_dir).join("completion-status.json");
+    let path_display = path.display().to_string();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return SpawnCompletionForProcessGone {
+                path: Some(path_display),
+                read_error: Some(format!("read completion-status.json: {error}")),
+                ..SpawnCompletionForProcessGone::default()
+            };
+        }
+    };
+    let status = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(status) => status,
+        Err(error) => {
+            return SpawnCompletionForProcessGone {
+                path: Some(path_display),
+                read_error: Some(format!("parse completion-status.json: {error}")),
+                ..SpawnCompletionForProcessGone::default()
+            };
+        }
+    };
+    SpawnCompletionForProcessGone {
+        path: Some(path_display),
+        status: status
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        read_error: None,
+        exit_code: status.get("exit_code").and_then(Value::as_i64),
+        error_message: status
+            .get("error_message")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.chars().take(512).collect::<String>()),
+        final_message_bytes: status.get("final_message_bytes").and_then(Value::as_u64),
+        fallback_final_message_written: status
+            .get("fallback_final_message_written")
+            .and_then(Value::as_bool),
+    }
 }
 
 fn artifact_activity(
@@ -724,14 +851,14 @@ impl AgentStateTracker {
     }
 
     /// Heartbeat-silence + process-table liveness pass (#898).
-    pub(crate) fn sweep(
+    fn sweep(
         &mut self,
         now_unix_ms: u64,
         stuck_after_ms: u64,
         unprobeable_dead_after_ms: u64,
         process_alive: &dyn Fn(u32) -> bool,
-    ) -> Vec<StateTransition> {
-        let mut transitions = Vec::new();
+    ) -> LivenessSweepActions {
+        let mut actions = LivenessSweepActions::default();
         for entry in self.agents.values_mut() {
             if entry.state == AgentLifecycleState::Dead {
                 continue;
@@ -741,18 +868,9 @@ impl AgentStateTracker {
             if let Some(pid) = entry.probe_pid()
                 && !process_alive(pid)
             {
-                transitions.push(force_transition(
-                    entry,
-                    AgentLifecycleState::Dead,
-                    "process_gone_without_exit_event",
-                    None,
-                    json!({
-                        "probed_pid": pid,
-                        "silent_ms": now_unix_ms.saturating_sub(entry.last_event_unix_ms),
-                        "last_event_kind": entry.last_event_kind,
-                    }),
-                    now_unix_ms,
-                ));
+                actions
+                    .terminal_events
+                    .push(process_gone_terminal_event(entry, pid, now_unix_ms));
                 continue;
             }
             if matches!(
@@ -767,7 +885,7 @@ impl AgentStateTracker {
                 let observed_at_unix_ms = activity.modified_unix_ms.min(now_unix_ms);
                 entry.last_event_unix_ms = entry.last_event_unix_ms.max(observed_at_unix_ms);
                 if entry.state == AgentLifecycleState::Stuck {
-                    transitions.push(force_transition(
+                    actions.transitions.push(force_transition(
                         entry,
                         AgentLifecycleState::Working,
                         "artifact_activity_resumed",
@@ -806,7 +924,7 @@ impl AgentStateTracker {
                     unprobeable_dead_after_ms
                 };
                 if silent_ms >= dead_after_ms {
-                    transitions.push(force_transition(
+                    actions.transitions.push(force_transition(
                         entry,
                         AgentLifecycleState::Dead,
                         UNPROBEABLE_SILENT_ENDED_REASON,
@@ -844,7 +962,7 @@ impl AgentStateTracker {
             } else {
                 "silent_timeout_unprobeable"
             };
-            transitions.push(force_transition(
+            actions.transitions.push(force_transition(
                 entry,
                 AgentLifecycleState::Stuck,
                 reason,
@@ -859,7 +977,7 @@ impl AgentStateTracker {
             ));
         }
         self.prune_dead(now_unix_ms);
-        transitions
+        actions
     }
 
     fn prune_dead(&mut self, now_unix_ms: u64) {
@@ -1282,7 +1400,7 @@ pub(crate) fn observe_recorded_events(db: &Db, records: &[AgentEventRecord]) {
 /// thresholds. Returns the number of transitions emitted.
 pub(crate) fn liveness_sweep_once(db: &Db, now_unix_ms: u64) -> usize {
     let config = liveness_config();
-    let transitions = {
+    let actions = {
         let mut guard = match tracker().lock() {
             Ok(guard) => guard,
             Err(_poisoned) => {
@@ -1300,8 +1418,24 @@ pub(crate) fn liveness_sweep_once(db: &Db, now_unix_ms: u64) -> usize {
             &|pid| crate::m4::process_exists(pid),
         )
     };
-    emit_transitions(db, &transitions);
-    transitions.len()
+    let mut emitted = 0usize;
+    if !actions.terminal_events.is_empty() {
+        match record_agent_events(db, &actions.terminal_events) {
+            Ok(_readbacks) => {
+                emitted = emitted.saturating_add(actions.terminal_events.len());
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "AGENT_STATE_TERMINAL_EVENT_WRITE_FAILED",
+                    event_count = actions.terminal_events.len(),
+                    detail = %error,
+                    "process-gone terminal agent events could not be journaled; tracker state was left unchanged so the next liveness pass can retry"
+                );
+            }
+        }
+    }
+    emit_transitions(db, &actions.transitions);
+    emitted.saturating_add(actions.transitions.len())
 }
 
 /// Journals + publishes transitions. A journal failure here is logged loudly

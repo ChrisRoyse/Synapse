@@ -11,13 +11,15 @@ use calyx_aster::{
     mvcc::tombstone_value,
     wal,
 };
-use calyx_core::Constellation;
+use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxError,
-    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault, SynapseCalyxVault,
+    SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
+    SynapseCalyxAnchorWriteReadback, SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConfig,
+    SynapseCalyxError, SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
+    SynapseCalyxVault,
 };
 use synapse_core::{
     error_codes,
@@ -33,8 +35,9 @@ use crate::constellations::{
     SYN_ACTION_PANEL_VERSION, SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION,
     SYN_AGENT_TRANSCRIPT_PANEL_NAME, SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME,
     SYN_EPISODE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
-    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME,
-    SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
+    SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 use crate::{
     CfEstimateMap, OwnedCfWriteBatch, RawRow, ScanWindow, StorageError, StorageResult, cf,
@@ -135,6 +138,103 @@ pub struct CalyxVaultCollectionInspect {
     pub stored_value_bytes: u64,
     pub total_logical_bytes: u64,
     pub expires_at_ms_histogram: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroundingAnchorValue {
+    Bool(bool),
+    Enum(String),
+    Number(f64),
+    Text(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroundingAnchor {
+    pub kind_label: String,
+    pub value: GroundingAnchorValue,
+    pub source: String,
+    pub observed_at_ms: u64,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalyxAnchorWriteReport {
+    pub source_cf: String,
+    pub source_key_hex: String,
+    pub source_value_sha256: String,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub cx_id: String,
+    pub anchor_kind: String,
+    pub anchor_value: CalyxAnchorValueReadback,
+    pub anchor_source: String,
+    pub confidence: f32,
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
+    pub latest_seq: u64,
+    pub readback_anchor_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroundingAnchorSource {
+    pub source_cf: &'static str,
+    pub source_key: Vec<u8>,
+    pub raw_bytes: Vec<u8>,
+    pub anchor: GroundingAnchor,
+}
+
+struct PreparedGroundingAnchorSource {
+    source_cf: &'static str,
+    source_key: Vec<u8>,
+    cx_id: CxId,
+    anchor: Anchor,
+}
+
+type PreparedGroundingAnchorBatch = (Vec<PreparedGroundingAnchorSource>, Vec<(CxId, Vec<Anchor>)>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalyxAnchorBatchWriteReport {
+    pub requested_anchor_count: u64,
+    pub written_anchor_count: u64,
+    pub existing_anchor_count: u64,
+    pub readback_exact_match_count: u64,
+    pub ledger_seq: Option<u64>,
+    pub ledger_hash: Option<String>,
+    pub latest_seq: u64,
+    pub duration_us: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalyxAnchorRow {
+    pub key_hex: String,
+    pub cx_id: String,
+    pub kind: String,
+    pub value: CalyxAnchorValueReadback,
+    pub source: String,
+    pub observed_at_ms: u64,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalyxAnchorScanReport {
+    pub source_cf: String,
+    pub source_key_hex: String,
+    pub source_value_sha256: String,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub cx_id: String,
+    pub anchors: Vec<CalyxAnchorRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalyxAnchorValueReadback {
+    pub value_type: String,
+    pub bool_value: Option<bool>,
+    pub text_value: Option<String>,
+    pub number_value: Option<f64>,
+    pub one_hot_values: Vec<String>,
+    pub vector_len: Option<u64>,
+    pub vector_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -260,6 +360,32 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &StoredObservation,
     ) -> StorageResult<Option<ConstellationPutReport>>;
+    fn put_outcome_constellation(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport>;
+    fn put_grounding_anchor_for_source(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        anchor: GroundingAnchor,
+        ledger_payload: &Value,
+    ) -> StorageResult<CalyxAnchorWriteReport>;
+    fn put_grounding_anchors_for_sources(
+        &self,
+        sources: Vec<GroundingAnchorSource>,
+        ledger_payload: &Value,
+    ) -> StorageResult<CalyxAnchorBatchWriteReport>;
+    fn calyx_anchor_scan_for_source(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+    ) -> StorageResult<CalyxAnchorScanReport>;
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -1390,6 +1516,320 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
+    fn put_outcome_constellation(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put outcome Calyx constellation",
+            true,
+            |vault| {
+                let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+                if panel.panel_name != SYN_OUTCOME_PANEL_NAME
+                    || panel.panel_version != SYN_OUTCOME_PANEL_VERSION
+                {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_constellation",
+                        format!(
+                            "put_outcome_constellation requires an outcome-panel source CF; {source_cf} maps to {} version {}",
+                            panel.panel_name, panel.panel_version
+                        ),
+                    ));
+                }
+                let input_bytes = constellations::source_constellation_input_bytes(
+                    panel.input_mode,
+                    source_cf,
+                    source_key,
+                    raw_bytes,
+                );
+                let context = NativeConstellationContext {
+                    vault_id: vault.vault_id_value(),
+                    cx_id: vault.cx_id_for_input(&input_bytes, panel.panel_version),
+                    created_at_ms: calyx_clock_now_for_write(vault, source_cf)?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let constellation = constellations::build_outcome_constellation(
+                    context,
+                    source_cf,
+                    source_key,
+                    raw_bytes,
+                    &input_bytes,
+                    record,
+                )?;
+                let slot_count = constellation.slots.len() as u64;
+                let scalar_count = constellation.scalars.len() as u64;
+                let readback =
+                    vault
+                        .put_observation_constellation(constellation)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put outcome observation constellation",
+                                &source,
+                            )
+                        })?;
+                Ok(constellation_report(ConstellationReportInput {
+                    panel_name: SYN_OUTCOME_PANEL_NAME,
+                    panel_version: SYN_OUTCOME_PANEL_VERSION,
+                    source_cf,
+                    source_key,
+                    raw_bytes,
+                    readback,
+                    slot_count,
+                    scalar_count,
+                    duration_us: constellations::duration_us(started.elapsed()),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report);
+                tracing::debug!(
+                    code = "CALYX_OUTCOME_CONSTELLATION_PUT",
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    raw_sha256 = %report.raw_sha256,
+                    cx_id = %report.cx_id,
+                    disposition = report.disposition.as_str(),
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "outcome row measured into native Calyx constellation"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_OUTCOME_PANEL_NAME,
+                    source_cf,
+                    error.code(),
+                    started.elapsed(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_grounding_anchor_for_source(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        anchor: GroundingAnchor,
+        ledger_payload: &Value,
+    ) -> StorageResult<CalyxAnchorWriteReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_anchors",
+            "put grounded Calyx anchor",
+            true,
+            |vault| {
+                let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+                let input_bytes = constellations::source_constellation_input_bytes(
+                    panel.input_mode,
+                    source_cf,
+                    source_key,
+                    raw_bytes,
+                );
+                let cx_id = vault.cx_id_for_input(&input_bytes, panel.panel_version);
+                let calyx_anchor = grounding_anchor_to_calyx(anchor)?;
+                let payload = serde_json::to_vec(ledger_payload).map_err(|source| {
+                    StorageError::EncodeJson {
+                        type_name: "calyx_grounding_anchor_ledger_payload",
+                        source,
+                    }
+                })?;
+                let write =
+                    vault
+                        .put_grounding_anchors(
+                            cx_id,
+                            vec![calyx_anchor.clone()],
+                            payload,
+                            "synapse-outcome-anchors",
+                        )
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_anchors",
+                                "put ledger-stamped grounded anchor",
+                                &source,
+                            )
+                        })?;
+                let rows = vault.scan_anchors_for_cx(cx_id).map_err(|source| {
+                    calyx_read_failed("calyx_anchors", "read back grounded anchors", &source)
+                })?;
+                let exact_matches = rows
+                    .iter()
+                    .filter(|row| row.anchor == calyx_anchor)
+                    .count();
+                if exact_matches != 1 {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_anchors",
+                        format!(
+                            "grounded anchor readback mismatch for cx_id={cx_id}: expected exactly 1 matching anchor, found {exact_matches}; total anchors={}",
+                            rows.len()
+                        ),
+                    ));
+                }
+                Ok(anchor_write_report(AnchorWriteReportInput {
+                    source_cf,
+                    source_key,
+                    raw_bytes,
+                    panel_name: panel.panel_name,
+                    panel_version: panel.panel_version,
+                    cx_id,
+                    anchor: &calyx_anchor,
+                    write,
+                    readback_anchor_count: rows.len(),
+                }))
+            },
+        );
+        match result {
+            Ok(report) => {
+                tracing::info!(
+                    code = "CALYX_GROUNDING_ANCHOR_PUT",
+                    source_cf = report.source_cf,
+                    source_key_hex = %report.source_key_hex,
+                    panel_name = report.panel_name,
+                    panel_version = report.panel_version,
+                    cx_id = %report.cx_id,
+                    anchor_kind = %report.anchor_kind,
+                    anchor_source = %report.anchor_source,
+                    confidence = report.confidence,
+                    ledger_seq = report.ledger_seq,
+                    latest_seq = report.latest_seq,
+                    duration_us = constellations::duration_us(started.elapsed()),
+                    "grounded anchor written with physical Anchors CF readback"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "CALYX_GROUNDING_ANCHOR_FAILED",
+                    source_cf,
+                    source_key_hex = %constellations::hex_encode(source_key),
+                    raw_sha256 = %constellations::sha256_hex(raw_bytes),
+                    detail = %error,
+                    duration_us = constellations::duration_us(started.elapsed()),
+                    "grounded anchor write/readback failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn put_grounding_anchors_for_sources(
+        &self,
+        sources: Vec<GroundingAnchorSource>,
+        ledger_payload: &Value,
+    ) -> StorageResult<CalyxAnchorBatchWriteReport> {
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_anchors",
+            "put grounded Calyx anchor batch",
+            true,
+            |vault| {
+                if sources.is_empty() {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_anchors",
+                        "grounded anchor batch must contain at least one source row",
+                    ));
+                }
+                let payload = serde_json::to_vec(ledger_payload).map_err(|source| {
+                    StorageError::EncodeJson {
+                        type_name: "calyx_grounding_anchor_batch_ledger_payload",
+                        source,
+                    }
+                })?;
+                let (prepared, calyx_entries) = prepare_grounding_anchor_sources(vault, sources)?;
+                let write = vault
+                    .put_grounding_anchors_for_many(
+                        calyx_entries,
+                        payload,
+                        "synapse-outcome-anchors",
+                    )
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_anchors",
+                            "put multi-constellation ledger-stamped grounded anchors",
+                            &source,
+                        )
+                    })?;
+                let readback_exact_match_count = readback_grounding_anchor_batch(vault, &prepared)?;
+                Ok(anchor_batch_write_report(
+                    write,
+                    readback_exact_match_count,
+                    constellations::duration_us(started.elapsed()),
+                ))
+            },
+        );
+        match result {
+            Ok(report) => {
+                tracing::info!(
+                    code = "CALYX_GROUNDING_ANCHOR_BATCH_PUT",
+                    requested_anchor_count = report.requested_anchor_count,
+                    written_anchor_count = report.written_anchor_count,
+                    existing_anchor_count = report.existing_anchor_count,
+                    readback_exact_match_count = report.readback_exact_match_count,
+                    ledger_seq = ?report.ledger_seq,
+                    latest_seq = report.latest_seq,
+                    duration_us = report.duration_us,
+                    "grounded anchor batch written with physical Anchors CF readback"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "CALYX_GROUNDING_ANCHOR_BATCH_FAILED",
+                    detail = %error,
+                    duration_us = constellations::duration_us(started.elapsed()),
+                    "grounded anchor batch write/readback failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn calyx_anchor_scan_for_source(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+    ) -> StorageResult<CalyxAnchorScanReport> {
+        self.with_vault(
+            "calyx_anchors",
+            "scan grounded Calyx anchors",
+            false,
+            |vault| {
+                let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+                let input_bytes = constellations::source_constellation_input_bytes(
+                    panel.input_mode,
+                    source_cf,
+                    source_key,
+                    raw_bytes,
+                );
+                let cx_id = vault.cx_id_for_input(&input_bytes, panel.panel_version);
+                let rows = vault.scan_anchors_for_cx(cx_id).map_err(|source| {
+                    calyx_read_failed("calyx_anchors", "scan grounded anchors", &source)
+                })?;
+                Ok(CalyxAnchorScanReport {
+                    source_cf: source_cf.to_owned(),
+                    source_key_hex: constellations::hex_encode(source_key),
+                    source_value_sha256: constellations::sha256_hex(raw_bytes),
+                    panel_name: panel.panel_name.to_owned(),
+                    panel_version: panel.panel_version,
+                    cx_id: cx_id.to_string(),
+                    anchors: anchor_rows(cx_id, rows),
+                })
+            },
+        )
+    }
+
     fn run_pressure_check_once(
         &self,
         storage_path: &Path,
@@ -1994,6 +2434,249 @@ fn constellation_report(input: ConstellationReportInput<'_>) -> ConstellationPut
         slot_count: input.slot_count,
         scalar_count: input.scalar_count,
         duration_us: input.duration_us,
+    }
+}
+
+fn grounding_anchor_to_calyx(anchor: GroundingAnchor) -> StorageResult<Anchor> {
+    let kind_label = nonblank_owned(&anchor.kind_label, "grounding anchor kind_label")?;
+    let source = nonblank_owned(&anchor.source, "grounding anchor source")?;
+    let value = match anchor.value {
+        GroundingAnchorValue::Bool(value) => AnchorValue::Bool(value),
+        GroundingAnchorValue::Enum(value) => {
+            AnchorValue::Enum(nonblank_owned(&value, "grounding anchor enum value")?)
+        }
+        GroundingAnchorValue::Text(value) => {
+            AnchorValue::Text(nonblank_owned(&value, "grounding anchor text value")?)
+        }
+        GroundingAnchorValue::Number(value) if value.is_finite() => AnchorValue::Number(value),
+        GroundingAnchorValue::Number(value) => {
+            return Err(calyx_write_failed_detail(
+                "calyx_anchors",
+                format!("grounding anchor number value is non-finite: {value}"),
+            ));
+        }
+    };
+    let anchor = Anchor {
+        kind: AnchorKind::Label(kind_label),
+        value,
+        source,
+        observed_at: anchor.observed_at_ms,
+        confidence: anchor.confidence,
+    };
+    anchor.validate_schema().map_err(|error| {
+        calyx_write_failed_detail(
+            "calyx_anchors",
+            format!("grounding anchor schema invalid: {error}"),
+        )
+    })?;
+    Ok(anchor)
+}
+
+fn prepare_grounding_anchor_sources(
+    vault: &SynapseCalyxVault,
+    sources: Vec<GroundingAnchorSource>,
+) -> StorageResult<PreparedGroundingAnchorBatch> {
+    let mut prepared = Vec::with_capacity(sources.len());
+    let mut calyx_entries = Vec::with_capacity(sources.len());
+    for source in sources {
+        let panel = constellations::anchor_panel_for_source_cf(source.source_cf)?;
+        let input_bytes = constellations::source_constellation_input_bytes(
+            panel.input_mode,
+            source.source_cf,
+            &source.source_key,
+            &source.raw_bytes,
+        );
+        let cx_id = vault.cx_id_for_input(&input_bytes, panel.panel_version);
+        let anchor = grounding_anchor_to_calyx(source.anchor)?;
+        calyx_entries.push((cx_id, vec![anchor.clone()]));
+        prepared.push(PreparedGroundingAnchorSource {
+            source_cf: source.source_cf,
+            source_key: source.source_key,
+            cx_id,
+            anchor,
+        });
+    }
+    Ok((prepared, calyx_entries))
+}
+
+fn readback_grounding_anchor_batch(
+    vault: &SynapseCalyxVault,
+    prepared: &[PreparedGroundingAnchorSource],
+) -> StorageResult<u64> {
+    let mut readback_exact_match_count = 0_u64;
+    for source in prepared {
+        let rows = vault.scan_anchors_for_cx(source.cx_id).map_err(|source| {
+            calyx_read_failed("calyx_anchors", "read back grounded anchors", &source)
+        })?;
+        let exact_matches = rows
+            .iter()
+            .filter(|row| row.anchor == source.anchor)
+            .count();
+        if exact_matches != 1 {
+            return Err(calyx_write_failed_detail(
+                "calyx_anchors",
+                format!(
+                    "grounded anchor batch readback mismatch for source_cf={} key_hex={} cx_id={}: expected exactly 1 matching anchor, found {exact_matches}; total anchors={}",
+                    source.source_cf,
+                    constellations::hex_encode(&source.source_key),
+                    source.cx_id,
+                    rows.len()
+                ),
+            ));
+        }
+        readback_exact_match_count = readback_exact_match_count.saturating_add(1);
+    }
+    Ok(readback_exact_match_count)
+}
+
+fn nonblank_owned(value: &str, field: &'static str) -> StorageResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(calyx_write_failed_detail(
+            "calyx_anchors",
+            format!("{field} must not be blank"),
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+struct AnchorWriteReportInput<'a> {
+    source_cf: &'static str,
+    source_key: &'a [u8],
+    raw_bytes: &'a [u8],
+    panel_name: &'static str,
+    panel_version: u32,
+    cx_id: CxId,
+    anchor: &'a Anchor,
+    write: SynapseCalyxAnchorWriteReadback,
+    readback_anchor_count: usize,
+}
+
+fn anchor_write_report(input: AnchorWriteReportInput<'_>) -> CalyxAnchorWriteReport {
+    CalyxAnchorWriteReport {
+        source_cf: input.source_cf.to_owned(),
+        source_key_hex: constellations::hex_encode(input.source_key),
+        source_value_sha256: constellations::sha256_hex(input.raw_bytes),
+        panel_name: input.panel_name.to_owned(),
+        panel_version: input.panel_version,
+        cx_id: input.cx_id.to_string(),
+        anchor_kind: anchor_kind_label(&input.anchor.kind),
+        anchor_value: anchor_value_readback(&input.anchor.value),
+        anchor_source: input.anchor.source.clone(),
+        confidence: input.anchor.confidence,
+        ledger_seq: input.write.ledger_seq,
+        ledger_hash: input.write.ledger_hash,
+        latest_seq: input.write.latest_seq,
+        readback_anchor_count: u64::try_from(input.readback_anchor_count).unwrap_or(u64::MAX),
+    }
+}
+
+fn anchor_batch_write_report(
+    input: SynapseCalyxAnchorBatchWriteReadback,
+    readback_exact_match_count: u64,
+    duration_us: u64,
+) -> CalyxAnchorBatchWriteReport {
+    CalyxAnchorBatchWriteReport {
+        requested_anchor_count: u64::try_from(input.anchor_count).unwrap_or(u64::MAX),
+        written_anchor_count: u64::try_from(input.written_anchor_count).unwrap_or(u64::MAX),
+        existing_anchor_count: u64::try_from(input.existing_anchor_count).unwrap_or(u64::MAX),
+        readback_exact_match_count,
+        ledger_seq: input.ledger_seq,
+        ledger_hash: input.ledger_hash,
+        latest_seq: input.latest_seq,
+        duration_us,
+    }
+}
+
+fn anchor_rows(cx_id: CxId, rows: Vec<SynapseCalyxAnchorReadback>) -> Vec<CalyxAnchorRow> {
+    rows.into_iter()
+        .map(|row| CalyxAnchorRow {
+            key_hex: constellations::hex_encode(&row.key),
+            cx_id: cx_id.to_string(),
+            kind: anchor_kind_label(&row.anchor.kind),
+            value: anchor_value_readback(&row.anchor.value),
+            source: row.anchor.source,
+            observed_at_ms: row.anchor.observed_at,
+            confidence: row.anchor.confidence,
+        })
+        .collect()
+}
+
+fn anchor_kind_label(kind: &AnchorKind) -> String {
+    match kind {
+        AnchorKind::TestPass => "test_pass".to_owned(),
+        AnchorKind::TieFormed => "tie_formed".to_owned(),
+        AnchorKind::Thumbs => "thumbs".to_owned(),
+        AnchorKind::Reward => "reward".to_owned(),
+        AnchorKind::SpeakerMatch => "speaker_match".to_owned(),
+        AnchorKind::StyleHold => "style_hold".to_owned(),
+        AnchorKind::Recurrence => "recurrence".to_owned(),
+        AnchorKind::Label(value) => format!("label:{value}"),
+    }
+}
+
+fn anchor_value_readback(value: &AnchorValue) -> CalyxAnchorValueReadback {
+    match value {
+        AnchorValue::Bool(value) => CalyxAnchorValueReadback {
+            value_type: "bool".to_owned(),
+            bool_value: Some(*value),
+            text_value: None,
+            number_value: None,
+            one_hot_values: Vec::new(),
+            vector_len: None,
+            vector_sha256: None,
+        },
+        AnchorValue::Enum(value) => CalyxAnchorValueReadback {
+            value_type: "enum".to_owned(),
+            bool_value: None,
+            text_value: Some(value.clone()),
+            number_value: None,
+            one_hot_values: Vec::new(),
+            vector_len: None,
+            vector_sha256: None,
+        },
+        AnchorValue::Number(value) => CalyxAnchorValueReadback {
+            value_type: "number".to_owned(),
+            bool_value: None,
+            text_value: None,
+            number_value: Some(*value),
+            one_hot_values: Vec::new(),
+            vector_len: None,
+            vector_sha256: None,
+        },
+        AnchorValue::OneHot(values) => CalyxAnchorValueReadback {
+            value_type: "one_hot".to_owned(),
+            bool_value: None,
+            text_value: None,
+            number_value: None,
+            one_hot_values: values.clone(),
+            vector_len: None,
+            vector_sha256: None,
+        },
+        AnchorValue::Text(value) => CalyxAnchorValueReadback {
+            value_type: "text".to_owned(),
+            bool_value: None,
+            text_value: Some(value.clone()),
+            number_value: None,
+            one_hot_values: Vec::new(),
+            vector_len: None,
+            vector_sha256: None,
+        },
+        AnchorValue::Vector(values) => {
+            let mut bytes = Vec::with_capacity(values.len().saturating_mul(4));
+            for value in values {
+                bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+            CalyxAnchorValueReadback {
+                value_type: "vector".to_owned(),
+                bool_value: None,
+                text_value: None,
+                number_value: None,
+                one_hot_values: Vec::new(),
+                vector_len: Some(u64::try_from(values.len()).unwrap_or(u64::MAX)),
+                vector_sha256: Some(sha256_hex(&bytes)),
+            }
+        }
     }
 }
 

@@ -17,7 +17,7 @@ pub struct Anchor {
     pub source: String,
     /// Server-observed timestamp.
     pub observed_at: Ts,
-    /// Confidence in `[0, 1]`; deterministic oracles use `1.0`.
+    /// Confidence in `(0, 1]`; deterministic oracles use `1.0`.
     pub confidence: f32,
 }
 
@@ -42,9 +42,12 @@ pub enum AnchorValue {
 impl Anchor {
     /// Validates a grounded anchor before it is written to a record boundary.
     pub fn validate_schema(&self) -> Result<()> {
-        if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
+        if self.source.trim().is_empty() {
+            return Err(record_schema_error("anchor source must not be blank"));
+        }
+        if !self.confidence.is_finite() || self.confidence <= 0.0 || self.confidence > 1.0 {
             return Err(record_schema_error(
-                "anchor confidence must be finite and within [0, 1]",
+                "anchor confidence must be finite and within (0, 1]",
             ));
         }
         self.value.validate_schema()

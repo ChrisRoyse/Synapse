@@ -54,9 +54,10 @@
 
 .PARAMETER AllowedPermissions
   Explicit M3 permission grant list passed to the daemon as
-  --allowed-permissions. Omit for the fail-closed read-only default. Use a
-  whitespace/comma-separated list such as
-  "READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE".
+  --allowed-permissions. Defaults to the full local agent grant set required by
+  the installed Codex/Synapse transport. Pass an explicit empty string for the
+  daemon's fail-closed read-only default. Use a whitespace/comma-separated list
+  such as "READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE".
 
 .PARAMETER Bind
   Loopback address the daemon binds. Default 127.0.0.1:7700.
@@ -156,7 +157,7 @@ param(
     [string]$PostExitContinuationReason = '',
     [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
-    [string]$AllowedPermissions = $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS,
+    [AllowNull()][string]$AllowedPermissions = $(if ([string]::IsNullOrWhiteSpace($env:SYNAPSE_MCP_ALLOWED_PERMISSIONS)) { 'READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE' } else { $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS }),
     [ValidateRange(60, 3600)]
     [int]$InstallHealthTimeoutSeconds = 600,
     [switch]$ManualInstallHealthRollbackProbe,
@@ -915,6 +916,7 @@ $SupervisorState = __SUPERVISOR_STATE__
 $SupervisorEvents = __SUPERVISOR_EVENTS__
 $MaintenanceLockPath = __MAINTENANCE_LOCK_PATH__
 $DaemonArgumentText = __DAEMON_ARGUMENT_TEXT__
+$ExpectedAllowedPermissions = __EXPECTED_ALLOWED_PERMISSIONS__
 
 $restartFloorSeconds = 2
 $restartCeilingSeconds = 60
@@ -997,6 +999,34 @@ function Get-ProcessInfoForPid {
     Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
 }
 
+function Get-CommandLineArgumentValue {
+    param(
+        [string]$CommandLine,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+    $escapedName = [regex]::Escape($Name)
+    $pattern = "(?i)(?:^|\s)$escapedName(?:\s+|=)(?:""(?<quoted>[^""]*)""|(?<bare>\S+))"
+    $match = [regex]::Match($CommandLine, $pattern)
+    if (-not $match.Success) { return $null }
+    if ($match.Groups['quoted'].Success) { return $match.Groups['quoted'].Value }
+    return $match.Groups['bare'].Value
+}
+
+function Normalize-AllowedPermissionsArgument {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    $tokens = @($Value -split '[,;\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($tokens.Count -eq 0) {
+        return ''
+    }
+
+    return ($tokens -join ',')
+}
+
 function Test-ExpectedDaemonProcess {
     param([AllowNull()][object]$ProcessInfo)
     if ($null -eq $ProcessInfo) {
@@ -1006,9 +1036,17 @@ function Test-ExpectedDaemonProcess {
         return $false
     }
     $commandLine = [string]$ProcessInfo.CommandLine
-    return ($commandLine.IndexOf('--mode http', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+    $baseMatches = ($commandLine.IndexOf('--mode http', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
         ($commandLine.IndexOf($Bind, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
         ($commandLine.IndexOf($DbPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    if (-not $baseMatches) {
+        return $false
+    }
+
+    $actualAllowedRaw = Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--allowed-permissions'
+    $actualAllowed = Normalize-AllowedPermissionsArgument -Value $actualAllowedRaw
+    $expectedAllowed = Normalize-AllowedPermissionsArgument -Value $ExpectedAllowedPermissions
+    return ($actualAllowed -ceq $expectedAllowed)
 }
 
 function Test-SetupMaintenanceLockActive {
@@ -1175,7 +1213,8 @@ while ($true) {
         Replace('__SUPERVISOR_STATE__', (Quote-PowerShellSingleQuotedString $supervisorState)).
         Replace('__SUPERVISOR_EVENTS__', (Quote-PowerShellSingleQuotedString $supervisorEvents)).
         Replace('__MAINTENANCE_LOCK_PATH__', (Quote-PowerShellSingleQuotedString $MaintenanceLockPath)).
-        Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText))
+        Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText)).
+        Replace('__EXPECTED_ALLOWED_PERMISSIONS__', (Quote-PowerShellSingleQuotedString $allowedPermissionsArgument))
 
     $supervisorScript | Set-Content -Path $supervisorPath -Encoding ascii
 
@@ -2552,6 +2591,40 @@ function Select-SynapseMcpDeployTargetProcesses {
             if ($process.DeployTargetMatched) { $process }
         }
     })
+}
+
+function Get-SynapseLiveDaemonArgumentDrift {
+    param(
+        [object[]]$Snapshot,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [AllowNull()][string]$AllowedPermissions
+    )
+
+    $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    $targets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot $Snapshot -Bind $Bind -DbPath $DbPath)
+    $drifts = @()
+    foreach ($target in $targets) {
+        $actualAllowedRaw = Get-SynapseCommandLineArgumentValue `
+            -CommandLine $target.CommandLine `
+            -Name '--allowed-permissions'
+        $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $actualAllowedRaw
+        if ($actualAllowed -ne $expectedAllowed) {
+            $drifts += [pscustomobject]@{
+                pid = $target.ProcessId
+                expected_allowed_permissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
+                actual_allowed_permissions = if ([string]::IsNullOrWhiteSpace($actualAllowed)) { '<default-read-only>' } else { $actualAllowed }
+                command_line = $target.CommandLine
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        HasDrift = ($drifts.Count -gt 0)
+        TargetCount = $targets.Count
+        DesiredAllowedPermissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
+        Drifts = $drifts
+    }
 }
 
 function Get-SynapseBindEndpoint {
@@ -7528,6 +7601,7 @@ if ($candidatePreflight.Sha256 -ne $installSourceHash) {
 }
 Info "Candidate daemon accepted for handoff sha256=$installSourceHash tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256)"
 $installedBinaryAlreadyVerified = $false
+$liveDaemonArgumentDrift = $null
 if ($SkipBuild) {
     $resolvedInstallSourcePath = [System.IO.Path]::GetFullPath($installSourcePath)
     $resolvedExePath = [System.IO.Path]::GetFullPath($ExePath)
@@ -7537,7 +7611,20 @@ if ($SkipBuild) {
         ((Get-SynapseFileSha256 -Path $ExePath) -eq $installSourceHash)
     )
     if ($installedBinaryAlreadyVerified) {
-        Info "SkipBuild candidate is already installed; setup will keep the live daemon and let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash"
+        $liveDaemonArgumentDrift = Get-SynapseLiveDaemonArgumentDrift `
+            -Snapshot @(Get-SynapseMcpProcessSnapshot) `
+            -Bind $Bind `
+            -DbPath $DbPath `
+            -AllowedPermissions $AllowedPermissions
+        if ($liveDaemonArgumentDrift.HasDrift) {
+            Info ("SkipBuild candidate is already installed, but live daemon launch arguments drifted; setup will perform a daemon handoff. path={0} sha256={1} desired_allowed_permissions={2} drift={3}" -f `
+                $ExePath,
+                $installSourceHash,
+                $liveDaemonArgumentDrift.DesiredAllowedPermissions,
+                ($liveDaemonArgumentDrift.Drifts | ConvertTo-Json -Depth 6 -Compress))
+        } else {
+            Info "SkipBuild candidate is already installed and live daemon launch arguments match; setup may let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash desired_allowed_permissions=$($liveDaemonArgumentDrift.DesiredAllowedPermissions)"
+        }
     }
 }
 if ($ManualInstallHealthRollbackProbe -and $installedBinaryAlreadyVerified) {
@@ -7580,9 +7667,10 @@ if ($script:SynapsePostExitStartOnly) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Drain the running daemon only when binary bytes must be replaced
+# 5. Drain the running daemon when binary bytes or launch arguments changed
 # ---------------------------------------------------------------------------
-if ($installedBinaryAlreadyVerified) {
+$liveDaemonHandoffRequired = ((-not $installedBinaryAlreadyVerified) -or ($liveDaemonArgumentDrift -and $liveDaemonArgumentDrift.HasDrift))
+if (-not $liveDaemonHandoffRequired) {
     Step "Verified installed daemon binary without live drain -> $ExePath"
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
@@ -7727,7 +7815,7 @@ if ($script:SynapseBindPostExitContinuationRequired) {
 # 7. Register + start the auto-start HTTP daemon (interactive desktop session)
 # ---------------------------------------------------------------------------
 Step "Registering auto-start daemon task '$TaskName'"
-if ($installedBinaryAlreadyVerified) {
+if (-not $liveDaemonHandoffRequired) {
     $existingTaskForAdoption = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($existingTaskForAdoption -and [string]$existingTaskForAdoption.State -eq 'Running') {
         Die "SYNAPSE_TASK_RUNNING_LIVE_ADOPTION_REREGISTER_UNSAFE task=$TaskName remediation=the installed binary is unchanged, but the existing scheduled task is already running; rerun setup during an explicit daemon maintenance window so the old task can be stopped before registration is replaced"

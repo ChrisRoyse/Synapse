@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use synapse_core::error_codes;
 use synapse_core::routines::{MiningDay, RoutineMiningConfig, mine_routines};
 use synapse_core::types::{
-    ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_FEEDBACK_EVENTS,
+    EpisodeRecord, ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_FEEDBACK_EVENTS,
     ROUTINE_STATE_MAX_TRANSITIONS, ROUTINE_STATE_RECORD_VERSION, RoutineConfidencePoint,
     RoutineDowClass, RoutineFeedbackEvent, RoutineFeedbackOutcome, RoutineGranularity,
     RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep,
@@ -56,6 +56,7 @@ use super::hygiene::{HygieneTaintRecord, read_taint_record_from_db};
 use super::profile_authoring::{RoutineAutomationRecord, load_routine_automation_record};
 use super::{
     M3ToolStub,
+    grounding::{self, SOURCE_OPERATOR},
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -67,6 +68,9 @@ pub const MAX_SCAN_ROWS_PER_CALL: usize = 200_000;
 const SCAN_CHUNK_ROWS: usize = 4_096;
 /// Upper bound for the `max_pattern_len` parameter.
 pub const MAX_PATTERN_LEN_LIMIT: u32 = 12;
+
+type RoutineStateRawRow = (Vec<u8>, Vec<u8>, RoutineStateRecord);
+type EpisodeEvidenceRow = (Vec<u8>, Vec<u8>, EpisodeRecord);
 /// Upper bound for the `min_support_days` parameter (the mining window is
 /// at most the 90-day episode retention horizon).
 pub const MIN_SUPPORT_DAYS_LIMIT: u32 = 92;
@@ -444,6 +448,13 @@ pub(crate) fn load_state_row(
     db: &Db,
     routine_id: &str,
 ) -> Result<Option<RoutineStateRecord>, ErrorData> {
+    load_state_row_with_raw(db, routine_id).map(|row| row.map(|(_key, _value, record)| record))
+}
+
+fn load_state_row_with_raw(
+    db: &Db,
+    routine_id: &str,
+) -> Result<Option<RoutineStateRawRow>, ErrorData> {
     let key =
         routine_codec::routine_state_key(routine_id).map_err(|error| invalid(error.to_string()))?;
     let rows = db
@@ -463,7 +474,8 @@ pub(crate) fn load_state_row(
             ),
         ));
     }
-    decode_state_row(row_key, value).map(Some)
+    let record = decode_state_row(row_key, value)?;
+    Ok(Some((row_key.clone(), value.clone(), record)))
 }
 
 /// Point lookup of one `CF_ROUTINES` row by routine id.
@@ -2144,13 +2156,14 @@ pub fn update_routine(
 
     // Read-your-write against the physical row: the response carries what
     // storage actually holds, never just the in-memory value.
-    let readback = load_state_row(db, &params.routine_id)?.ok_or_else(|| {
-        internal(format!(
-            "ROUTINE_STATE_READBACK_MISSING: CF_ROUTINE_STATE row for {} vanished immediately \
+    let (state_key, state_value, readback) = load_state_row_with_raw(db, &params.routine_id)?
+        .ok_or_else(|| {
+            internal(format!(
+                "ROUTINE_STATE_READBACK_MISSING: CF_ROUTINE_STATE row for {} vanished immediately \
              after a flushed write",
-            params.routine_id
-        ))
-    })?;
+                params.routine_id
+            ))
+        })?;
     if readback != state {
         return Err(internal(format!(
             "ROUTINE_STATE_READBACK_MISMATCH: CF_ROUTINE_STATE row for {} does not match the \
@@ -2158,6 +2171,7 @@ pub fn update_routine(
             params.routine_id, state.lifecycle, readback.lifecycle
         )));
     }
+    anchor_routine_transition(db, &state_key, &state_value, &readback, params.action, now)?;
 
     tracing::info!(
         code = "ROUTINE_LIFECYCLE_TRANSITION",
@@ -2184,4 +2198,184 @@ pub fn update_routine(
         state: readback,
         armed,
     })
+}
+
+fn anchor_routine_transition(
+    db: &Arc<Db>,
+    state_key: &[u8],
+    state_value: &[u8],
+    state: &RoutineStateRecord,
+    action: RoutineUpdateAction,
+    transition_ts_ns: u64,
+) -> Result<(), ErrorData> {
+    let Some(anchor_value) = routine_transition_anchor_value(action) else {
+        return Ok(());
+    };
+    let observed_at_ms = grounding::observed_at_ms_from_ns(transition_ts_ns);
+    let state_record_value = serde_json::to_value(state).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "routine state anchor projection failed to serialize routine {}: {error}",
+                state.routine_id
+            ),
+        )
+    })?;
+    let state_report = grounding::write_outcome_constellation_and_anchor(
+        db,
+        cf::CF_ROUTINE_STATE,
+        state_key,
+        state_value,
+        &state_record_value,
+        grounding::enum_anchor(
+            "synapse:routine_transition",
+            anchor_value,
+            SOURCE_OPERATOR,
+            observed_at_ms,
+        ),
+        "routine state anchor",
+    )?;
+    tracing::info!(
+        code = "ROUTINE_STATE_ANCHORED",
+        routine_id = %state.routine_id,
+        action = ?action,
+        source_key_hex = %state_report.source_key_hex,
+        cx_id = %state_report.cx_id,
+        ledger_seq = state_report.ledger_seq,
+        "routine transition grounded on routine state constellation"
+    );
+
+    let Some(routine) = load_routine_record(db, &state.routine_id)? else {
+        tracing::warn!(
+            code = "ROUTINE_EVIDENCE_ANCHOR_SKIPPED_NO_DERIVED_ROW",
+            routine_id = %state.routine_id,
+            "routine transition state was anchored, but no current CF_ROUTINES row exists for evidence episodes"
+        );
+        return Ok(());
+    };
+    let episode_rows = routine_evidence_episode_rows(db, &routine)?;
+    let evidence_kind = format!(
+        "synapse:routine_evidence_transition:{}:{}",
+        state.routine_id, transition_ts_ns
+    );
+    for (episode_key, episode_value, episode) in episode_rows {
+        db.put_episode_constellation(&episode_key, &episode_value, &episode)
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "routine evidence anchor failed to ensure episode constellation for routine {} episode {}: {error}",
+                        state.routine_id, episode.episode_id
+                    ),
+                )
+            })?;
+        let report = grounding::write_anchor_for_existing_constellation(
+            db,
+            cf::CF_EPISODES,
+            &episode_key,
+            &episode_value,
+            grounding::enum_anchor(
+                evidence_kind.clone(),
+                anchor_value,
+                SOURCE_OPERATOR,
+                observed_at_ms,
+            ),
+            "routine evidence episode anchor",
+        )?;
+        tracing::info!(
+            code = "ROUTINE_EVIDENCE_EPISODE_ANCHORED",
+            routine_id = %state.routine_id,
+            episode_id = %episode.episode_id,
+            action = ?action,
+            source_key_hex = %report.source_key_hex,
+            cx_id = %report.cx_id,
+            ledger_seq = report.ledger_seq,
+            "routine transition grounded on evidence episode constellation"
+        );
+    }
+    Ok(())
+}
+
+fn routine_transition_anchor_value(action: RoutineUpdateAction) -> Option<&'static str> {
+    match action {
+        RoutineUpdateAction::Confirm => Some("confirmed"),
+        RoutineUpdateAction::Disable => Some("disabled"),
+        RoutineUpdateAction::Rename => Some("labeled"),
+        RoutineUpdateAction::Enable
+        | RoutineUpdateAction::Archive
+        | RoutineUpdateAction::Arm
+        | RoutineUpdateAction::Disarm => None,
+    }
+}
+
+fn routine_evidence_episode_rows(
+    db: &Db,
+    routine: &RoutineRecord,
+) -> Result<Vec<EpisodeEvidenceRow>, ErrorData> {
+    let mut episode_ids = routine
+        .evidence
+        .iter()
+        .flat_map(|evidence| evidence.episode_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    episode_ids.sort();
+    episode_ids.dedup();
+    if episode_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let targets = episode_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut found = BTreeMap::new();
+    let mut scanned = 0_usize;
+    let mut start = Vec::new();
+    loop {
+        if scanned >= MAX_SCAN_ROWS_PER_CALL {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "routine evidence anchor scan exhausted {MAX_SCAN_ROWS_PER_CALL} CF_EPISODES rows before finding all evidence for routine {}",
+                    routine.routine_id
+                ),
+            ));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_EPISODES, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            scanned = scanned.saturating_add(1);
+            let (_day_start, _ordinal, episode) = decode_episode_row(key, value)?;
+            if targets.contains(&episode.episode_id) {
+                found.insert(
+                    episode.episode_id.clone(),
+                    (key.clone(), value.clone(), episode),
+                );
+            }
+        }
+        if found.len() == targets.len() || !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    if found.len() != targets.len() {
+        let missing = targets
+            .into_iter()
+            .filter(|episode_id| !found.contains_key(episode_id))
+            .collect::<Vec<_>>();
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "routine {} evidence references missing CF_EPISODES rows: {}",
+                routine.routine_id,
+                missing.join(", ")
+            ),
+        ));
+    }
+    Ok(found.into_values().collect())
 }

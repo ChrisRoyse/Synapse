@@ -7,6 +7,7 @@ pub mod audit_export;
 pub mod audit_retention;
 pub mod demo_recording;
 pub mod episodes;
+pub(crate) mod grounding;
 pub mod hygiene;
 pub mod intent;
 pub mod intent_events;

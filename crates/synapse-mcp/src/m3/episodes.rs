@@ -36,6 +36,7 @@ use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
+    grounding::{self, SOURCE_EPISODE_SEGMENT},
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -547,6 +548,7 @@ pub fn segment_episodes(
                             constellations_deduped = constellations_deduped.saturating_add(1);
                         }
                     }
+                    anchor_segmented_episode_rows(&runtime, &measurement_rows)?;
                 }
                 Err(error) => {
                     constellation_failures =
@@ -616,6 +618,49 @@ pub fn segment_episodes(
     response.scanned_rows = scanned_rows;
     response.invalid_rows = invalid_rows;
     Ok(response)
+}
+
+fn anchor_segmented_episode_rows(
+    runtime: &ReflexRuntime,
+    rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
+) -> Result<(), ErrorData> {
+    for (source_key, source_value, episode) in rows {
+        let outcome = episode_segment_outcome(episode);
+        let report = grounding::write_runtime_anchor_for_existing_constellation(
+            runtime,
+            cf::CF_EPISODES,
+            source_key,
+            source_value,
+            grounding::enum_anchor(
+                "synapse:episode_segmentation_outcome",
+                outcome,
+                SOURCE_EPISODE_SEGMENT,
+                grounding::observed_at_ms_from_ns(episode.end_ts_ns),
+            ),
+            "episode segmentation anchor",
+        )?;
+        tracing::debug!(
+            code = "EPISODE_SEGMENT_ANCHORED",
+            episode_id = %episode.episode_id,
+            outcome,
+            source_key_hex = %hex_encode(source_key),
+            cx_id = %report.cx_id,
+            ledger_seq = report.ledger_seq,
+            "episode segmentation outcome grounded on episode constellation"
+        );
+    }
+    Ok(())
+}
+
+fn episode_segment_outcome(episode: &EpisodeRecord) -> &'static str {
+    if episode.interruption_count > 0
+        || episode.interrupted_ms > 0
+        || matches!(episode.ended_because, EpisodeBoundary::RangeEdge)
+    {
+        "interrupted"
+    } else {
+        "completed"
+    }
 }
 
 // === episode_list / episode_get (#847) ===

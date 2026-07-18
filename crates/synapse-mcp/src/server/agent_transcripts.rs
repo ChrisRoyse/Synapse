@@ -68,6 +68,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::m3::{M3State, default_daemon_db_path, default_db_path};
 
+use super::agent_events::anchor_spawn_end_state_from_storage;
+
 /// Environment variable: seconds between periodic ingest cycles.
 pub(crate) const INTERVAL_ENV: &str = "SYNAPSE_TRANSCRIPT_INGEST_INTERVAL_SECS";
 /// Environment variable: delay before the first cycle.
@@ -145,6 +147,14 @@ pub(crate) struct TranscriptCursor {
     pub source_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_reason: Option<String>,
+    /// End-state outcome last grounded from the durable terminal event. Older
+    /// cursor rows omit this, so completed sources without it are rechecked
+    /// once instead of being permanently skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_state_anchor_outcome: Option<String>,
+    /// Physical transcript row count covered by the last end-state grounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_state_anchor_rows: Option<u64>,
     /// Sticky structured error. A spawn with a sticky error is skipped (and
     /// counted) until an operator clears the cursor row; ingestion never
     /// guesses past a corrupt source.
@@ -433,6 +443,8 @@ fn ingest_spawn_dir_once_with_cancel(
                         source_epoch_unix_ms: manifest_seed.created_unix_ms,
                         source_complete: false,
                         completed_reason: None,
+                        end_state_anchor_outcome: None,
+                        end_state_anchor_rows: None,
                         error: None,
                         updated_ts_ns: unix_time_ns_now(),
                     };
@@ -457,20 +469,14 @@ fn ingest_spawn_dir_once_with_cancel(
                 source_epoch_unix_ms: manifest_seed.created_unix_ms,
                 source_complete: false,
                 completed_reason: None,
+                end_state_anchor_outcome: None,
+                end_state_anchor_rows: None,
                 error: None,
                 updated_ts_ns: unix_time_ns_now(),
             }
         }
     };
 
-    if cursor.source_complete {
-        return Ok(SpawnIngestOutcome {
-            lines_ingested_total: cursor.lines_ingested,
-            source_complete: true,
-            skipped: true,
-            ..SpawnIngestOutcome::default()
-        });
-    }
     if let Some(error) = &cursor.error {
         tracing::debug!(
             code = "TRANSCRIPT_INGEST_PARKED",
@@ -505,6 +511,31 @@ fn ingest_spawn_dir_once_with_cancel(
             cursor.offset_bytes
         );
         return Err(stick_cursor_error(db, &mut cursor, detail));
+    }
+
+    if cursor.source_complete {
+        if file_size > cursor.offset_bytes {
+            tracing::warn!(
+                code = "TRANSCRIPT_SOURCE_COMPLETE_DRIFT",
+                spawn_id,
+                cursor_offset_bytes = cursor.offset_bytes,
+                file_size,
+                completed_reason = cursor.completed_reason.as_deref().unwrap_or("unknown"),
+                "completed transcript source grew after cursor completion; reopening ingestion before end-state grounding"
+            );
+            cursor.source_complete = false;
+            cursor.completed_reason = None;
+            cursor.end_state_anchor_outcome = None;
+            cursor.end_state_anchor_rows = None;
+        } else {
+            ensure_completed_spawn_end_state_anchored(db, &mut cursor)?;
+            return Ok(SpawnIngestOutcome {
+                lines_ingested_total: cursor.lines_ingested,
+                source_complete: true,
+                skipped: true,
+                ..SpawnIngestOutcome::default()
+            });
+        }
     }
 
     let finalize = finalize || completion_is_terminal(log_dir);
@@ -691,6 +722,25 @@ fn ingest_spawn_dir_once_with_cancel(
             );
             return Err(stick_cursor_error(db, &mut cursor, detail));
         }
+        match ensure_completed_spawn_end_state_anchored(db, &mut cursor)? {
+            Some(outcome) => {
+                tracing::info!(
+                    code = "TRANSCRIPT_END_STATE_ANCHORED",
+                    spawn_id,
+                    outcome,
+                    physical_rows = physical_rows.len(),
+                    "completed transcript source rows grounded from durable terminal event"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    code = "TRANSCRIPT_END_STATE_ANCHOR_DEFERRED",
+                    spawn_id,
+                    physical_rows = physical_rows.len(),
+                    "completed transcript source has no durable terminal agent event yet; terminal event writer will anchor transcripts when it arrives"
+                );
+            }
+        }
         SOURCES_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             code = "TRANSCRIPT_SOURCE_COMPLETED",
@@ -714,6 +764,54 @@ fn ingest_spawn_dir_once_with_cancel(
         cancelled,
         ..SpawnIngestOutcome::default()
     })
+}
+
+fn ensure_completed_spawn_end_state_anchored(
+    db: &Db,
+    cursor: &mut TranscriptCursor,
+) -> Result<Option<String>, String> {
+    if cursor
+        .end_state_anchor_rows
+        .is_some_and(|rows| rows == cursor.lines_ingested)
+        && cursor.end_state_anchor_outcome.is_some()
+    {
+        return Ok(cursor.end_state_anchor_outcome.clone());
+    }
+
+    let physical_rows = db
+        .scan_cf_prefix(
+            cf::CF_AGENT_TRANSCRIPTS,
+            &agent_transcript_spawn_prefix(&cursor.spawn_id),
+        )
+        .map_err(|error| format!("TRANSCRIPT_READBACK_FAILED: {error}"))?;
+    if physical_rows.len() as u64 != cursor.lines_ingested {
+        let detail = format!(
+            "TRANSCRIPT_READBACK_MISMATCH: {} physical rows but cursor ingested {} lines",
+            physical_rows.len(),
+            cursor.lines_ingested
+        );
+        return Err(stick_cursor_error(db, cursor, detail));
+    }
+
+    match anchor_spawn_end_state_from_storage(db, &cursor.spawn_id).map_err(|error| {
+        stick_cursor_error(
+            db,
+            cursor,
+            format!(
+                "TRANSCRIPT_END_STATE_ANCHOR_FAILED: could not ground completed spawn {} from durable terminal event: {error}",
+                cursor.spawn_id
+            ),
+        )
+    })? {
+        Some(outcome) => {
+            cursor.end_state_anchor_outcome = Some(outcome.to_owned());
+            cursor.end_state_anchor_rows = Some(physical_rows.len() as u64);
+            cursor.updated_ts_ns = unix_time_ns_now();
+            store_cursor(db, cursor)?;
+            Ok(Some(outcome.to_owned()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// One pass over every spawn dir under `root`. Per-spawn errors are sticky
@@ -827,7 +925,7 @@ fn ingest_all_spawn_dirs_once_with_cancel(
 /// "rotation/teardown handled"): consumes the tail (the processes are dead
 /// by the time this runs) and marks the source complete.
 pub(crate) fn finalize_spawn_transcripts(db: &Db, spawn_id: &str, log_dir: &Path) {
-    match ingest_spawn_dir_once(db, spawn_id, log_dir, true) {
+    match finalize_spawn_transcripts_result(db, spawn_id, log_dir) {
         Ok(outcome) => {
             tracing::info!(
                 code = "TRANSCRIPT_TEARDOWN_FLUSH_OK",
@@ -848,6 +946,14 @@ pub(crate) fn finalize_spawn_transcripts(db: &Db, spawn_id: &str, log_dir: &Path
             );
         }
     }
+}
+
+pub(crate) fn finalize_spawn_transcripts_result(
+    db: &Db,
+    spawn_id: &str,
+    log_dir: &Path,
+) -> Result<SpawnIngestOutcome, String> {
+    ingest_spawn_dir_once(db, spawn_id, log_dir, true)
 }
 
 /// Spawns the periodic ingest task (daemon HTTP startup), mirroring the

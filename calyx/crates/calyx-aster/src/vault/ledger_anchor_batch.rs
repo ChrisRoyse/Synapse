@@ -16,6 +16,14 @@ struct AnchorBatchLedgerInput {
     actor: ActorId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiCxAnchorBatchOutcome {
+    pub ledger_ref: Option<LedgerRef>,
+    pub requested_anchor_count: usize,
+    pub existing_anchor_count: usize,
+    pub written_anchor_count: usize,
+}
+
 impl<C> AsterVault<C>
 where
     C: Clock,
@@ -115,6 +123,110 @@ where
                 guard.commit_staged(row)?;
             }
             Ok(ledger_ref)
+        })
+    }
+
+    /// Adds anchors for many constellations in one durable commit.
+    ///
+    /// Each requested `(CxId, AnchorKind)` is checked at the same snapshot. Exact
+    /// pre-existing anchors are accepted as idempotent; missing anchors are
+    /// staged with one shared ledger entry and become visible atomically in one
+    /// MVCC/WAL commit. Conflicting anchor rows or Base/Anchors divergence fail
+    /// before any new anchor is written.
+    pub fn anchors_for_many_with_ledger_entry(
+        &self,
+        entries: Vec<(CxId, Vec<Anchor>)>,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<MultiCxAnchorBatchOutcome> {
+        let requested_anchor_count = validate_multi_cx_anchor_batch(&entries)?;
+        let entry = AnchorBatchLedgerInput {
+            kind,
+            subject,
+            payload,
+            actor,
+        };
+        self.with_durable_commit_lock(|| {
+            let latest = self.snapshot();
+            let mut existing_anchor_count = 0usize;
+            let mut missing_entries = Vec::<(CxId, calyx_core::Constellation, Vec<Anchor>)>::new();
+            for (id, anchors) in &entries {
+                let constellation = self.get(*id, latest)?;
+                let mut missing = Vec::new();
+                for anchor in anchors {
+                    match classify_anchor_state(self, latest, *id, &constellation, anchor)? {
+                        AnchorState::Existing => {
+                            existing_anchor_count = existing_anchor_count.saturating_add(1);
+                        }
+                        AnchorState::Missing => missing.push(anchor.clone()),
+                    }
+                }
+                if !missing.is_empty() {
+                    missing_entries.push((*id, constellation, missing));
+                }
+            }
+            if missing_entries.is_empty() {
+                return Ok(MultiCxAnchorBatchOutcome {
+                    ledger_ref: None,
+                    requested_anchor_count,
+                    existing_anchor_count,
+                    written_anchor_count: 0,
+                });
+            }
+
+            let Some(hook) = &self.ledger_hook else {
+                let store = AnchorBatchRawLedgerStore { vault: self };
+                let appender = LedgerAppender::open(store, SystemClock)?;
+                let prepared =
+                    appender.prepare(entry.kind, entry.subject, entry.payload, entry.actor)?;
+                let ledger_ref = prepared.ledger_ref();
+                let mut rows = multi_cx_anchor_rows_with_ledger_ref(missing_entries, &ledger_ref)?;
+                rows.push(encode::WriteRow {
+                    cf: ColumnFamily::Ledger,
+                    key: ledger_key(prepared.seq()),
+                    value: prepared.bytes().to_vec(),
+                });
+                self.commit_rows_locked(&rows)?;
+                let written_anchor_count =
+                    requested_anchor_count.saturating_sub(existing_anchor_count);
+                return Ok(MultiCxAnchorBatchOutcome {
+                    ledger_ref: Some(ledger_ref),
+                    requested_anchor_count,
+                    existing_anchor_count,
+                    written_anchor_count,
+                });
+            };
+
+            let mut guard = ledger_hook::lock_hook(hook)?;
+            let staged = guard.stage_with_checkpoints(
+                entry.kind,
+                entry.subject,
+                entry.payload,
+                entry.actor,
+            )?;
+            let ledger_ref = staged
+                .first()
+                .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
+                .ledger_ref();
+            let mut rows = multi_cx_anchor_rows_with_ledger_ref(missing_entries, &ledger_ref)?;
+            rows.extend(staged.iter().map(|row| encode::WriteRow {
+                cf: ColumnFamily::Ledger,
+                key: row.key().to_vec(),
+                value: row.value().to_vec(),
+            }));
+            self.commit_rows_locked(&rows)?;
+            for row in &staged {
+                guard.commit_staged(row)?;
+            }
+            let written_anchor_count = requested_anchor_count.saturating_sub(existing_anchor_count);
+            Ok(MultiCxAnchorBatchOutcome {
+                ledger_ref: Some(ledger_ref),
+                requested_anchor_count,
+                existing_anchor_count,
+                written_anchor_count,
+            })
         })
     }
 }
@@ -233,6 +345,26 @@ fn anchor_batch_rows_with_ledger_ref(
     Ok(rows)
 }
 
+fn multi_cx_anchor_rows_with_ledger_ref(
+    entries: Vec<(CxId, calyx_core::Constellation, Vec<Anchor>)>,
+    ledger_ref: &LedgerRef,
+) -> Result<Vec<encode::WriteRow>> {
+    let anchor_count = entries
+        .iter()
+        .map(|(_id, _constellation, anchors)| anchors.len())
+        .sum::<usize>();
+    let mut rows = Vec::with_capacity(entries.len().saturating_add(anchor_count));
+    for (id, mut constellation, anchors) in entries {
+        rows.extend(anchor_batch_rows_with_ledger_ref(
+            id,
+            &mut constellation,
+            &anchors,
+            ledger_ref,
+        )?);
+    }
+    Ok(rows)
+}
+
 fn validate_anchor_batch(anchors: &[Anchor]) -> Result<()> {
     if anchors.is_empty() {
         return Err(CalyxError::aster_corrupt_shard(
@@ -250,6 +382,29 @@ fn validate_anchor_batch(anchors: &[Anchor]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_multi_cx_anchor_batch(entries: &[(CxId, Vec<Anchor>)]) -> Result<usize> {
+    if entries.is_empty() {
+        return Err(CalyxError::aster_corrupt_shard(
+            "multi-constellation ledger-stamped anchor batch must contain at least one constellation",
+        ));
+    }
+    let mut requested = 0usize;
+    let mut unique = BTreeSet::new();
+    for (id, anchors) in entries {
+        validate_anchor_batch(anchors)?;
+        for anchor in anchors {
+            requested = requested.saturating_add(1);
+            if !unique.insert((*id, anchor.kind.clone())) {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "multi-constellation ledger-stamped anchor batch contains duplicate request for {id} {:?}",
+                    anchor.kind
+                )));
+            }
+        }
+    }
+    Ok(requested)
 }
 
 struct AnchorBatchRawLedgerStore<'a, C> {

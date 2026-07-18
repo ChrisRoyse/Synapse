@@ -15,7 +15,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use backend::{
-    CalyxVaultCollectionInspect, CalyxVaultInspect, STORAGE_METADATA_ONLY_REDACTION_POLICY,
+    CalyxAnchorBatchWriteReport, CalyxAnchorRow, CalyxAnchorScanReport, CalyxAnchorValueReadback,
+    CalyxAnchorWriteReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
+    GroundingAnchorSource, GroundingAnchorValue, STORAGE_METADATA_ONLY_REDACTION_POLICY,
     StorageBackendKind, StorageCfDump, StorageDumpRow, dump_cf_read_only,
     dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
     scan_cf_read_only_with_expired,
@@ -27,8 +29,9 @@ pub use constellations::{
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
     SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
     SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT, SYN_OBSERVATION_SAMPLE_EVERY_N_ENV,
-    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME,
-    SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
+    SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
@@ -530,6 +533,87 @@ impl Db {
     ) -> StorageResult<Option<ConstellationPutReport>> {
         self.backend
             .put_sampled_observation_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores the native Calyx outcome constellation for one
+    /// persisted outcome/audit row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source CF has no outcome panel, row
+    /// measurement fails, or native Calyx constellation persistence fails.
+    #[tracing::instrument(skip_all, fields(source_cf, source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_outcome_constellation(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &serde_json::Value,
+    ) -> StorageResult<ConstellationPutReport> {
+        self.backend
+            .put_outcome_constellation(source_cf, source_key, raw_bytes, record)
+    }
+
+    /// Writes a grounded anchor for one persisted source row and separately
+    /// reads the physical Calyx `Anchors` CF to prove it landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the target constellation is missing,
+    /// anchor validation fails, a conflicting anchor exists, ledger stamping
+    /// fails, or the post-write `Anchors` readback does not contain exactly one
+    /// matching anchor.
+    #[tracing::instrument(skip_all, fields(source_cf, source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_grounding_anchor_for_source(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        anchor: GroundingAnchor,
+        ledger_payload: &serde_json::Value,
+    ) -> StorageResult<CalyxAnchorWriteReport> {
+        self.backend.put_grounding_anchor_for_source(
+            source_cf,
+            source_key,
+            raw_bytes,
+            anchor,
+            ledger_payload,
+        )
+    }
+
+    /// Writes grounded Calyx anchors for many already-persisted source rows in
+    /// one durable batch, then reads every physical `Anchors` CF row back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when any source row cannot map to a Calyx
+    /// constellation, any anchor fails validation, the batch ledger commit
+    /// fails, or any post-commit anchor readback is missing or conflicting.
+    #[tracing::instrument(skip_all, fields(source_count = sources.len(), backend = self.backend_name()))]
+    pub fn put_grounding_anchors_for_sources(
+        &self,
+        sources: Vec<GroundingAnchorSource>,
+        ledger_payload: &serde_json::Value,
+    ) -> StorageResult<CalyxAnchorBatchWriteReport> {
+        self.backend
+            .put_grounding_anchors_for_sources(sources, ledger_payload)
+    }
+
+    /// Reads decoded physical Calyx `Anchors` rows for one persisted source row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source CF cannot receive anchors or the
+    /// physical `Anchors` CF cannot be decoded.
+    #[tracing::instrument(skip_all, fields(source_cf, source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn calyx_anchor_scan_for_source(
+        &self,
+        source_cf: &'static str,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+    ) -> StorageResult<CalyxAnchorScanReport> {
+        self.backend
+            .calyx_anchor_scan_for_source(source_cf, source_key, raw_bytes)
     }
 
     /// Runs one disk-pressure check immediately.

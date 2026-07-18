@@ -12,11 +12,14 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use calyx_aster::cf::{ColumnFamily, KeyRange};
+use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::mvcc::{Freshness, Snapshot};
-use calyx_aster::vault::{AsterVault, PutDisposition, VaultOptions};
-use calyx_core::{CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId};
+use calyx_aster::vault::{
+    AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, VaultOptions, encode as vault_encode,
+};
+use calyx_core::{Anchor, CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -83,6 +86,31 @@ pub struct SynapseCalyxObservationPutReadback {
     pub cx_id: String,
     pub disposition: SynapseCalyxPutDisposition,
     pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxAnchorWriteReadback {
+    pub cx_id: String,
+    pub anchor_count: usize,
+    pub ledger_seq: Seq,
+    pub ledger_hash: String,
+    pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxAnchorBatchWriteReadback {
+    pub anchor_count: usize,
+    pub written_anchor_count: usize,
+    pub existing_anchor_count: usize,
+    pub ledger_seq: Option<Seq>,
+    pub ledger_hash: Option<String>,
+    pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxAnchorReadback {
+    pub key: Vec<u8>,
+    pub anchor: Anchor,
 }
 
 const SYNAPSE_DIR_NAME: &str = "synapse";
@@ -829,6 +857,20 @@ impl SynapseCalyxReadOnlyVault {
             .scan_cf_range_at(snapshot, cf, range)
             .map_err(|error| SynapseCalyxError::from_calyx("scan Calyx CF range", &error))
     }
+
+    /// Decodes the physical `Anchors` CF rows currently visible for one
+    /// constellation id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the Anchors range cannot be
+    /// read or any physical anchor row fails to decode.
+    pub fn scan_anchors_for_cx(
+        &self,
+        cx_id: CxId,
+    ) -> Result<Vec<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
+        scan_anchors_for_cx_from_vault(&self.vault, cx_id)
+    }
 }
 
 impl SynapseCalyxVault {
@@ -1033,6 +1075,80 @@ impl SynapseCalyxVault {
             .collect())
     }
 
+    /// Writes grounded anchors through Aster's ledger-stamped anchor path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the target constellation is
+    /// absent, anchor validation fails, a conflicting anchor already exists, the
+    /// ledger entry cannot be appended, or the durable commit/readback fails.
+    pub fn put_grounding_anchors(
+        &self,
+        cx_id: CxId,
+        anchors: Vec<Anchor>,
+        payload: Vec<u8>,
+        actor_service: impl Into<String>,
+    ) -> Result<SynapseCalyxAnchorWriteReadback, SynapseCalyxError> {
+        let anchor_count = anchors.len();
+        let actor = ActorId::Service(actor_service.into());
+        let ledger_ref = self
+            .vault
+            .anchors_with_ledger_entry(
+                cx_id,
+                anchors,
+                EntryKind::Grounding,
+                SubjectId::Cx(cx_id),
+                payload,
+                actor,
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("put ledger-stamped Calyx anchors", &error)
+            })?;
+        Ok(SynapseCalyxAnchorWriteReadback {
+            cx_id: cx_id.to_string(),
+            anchor_count,
+            ledger_seq: ledger_ref.seq,
+            ledger_hash: hex_bytes(&ledger_ref.hash),
+            latest_seq: self.vault.latest_seq(),
+        })
+    }
+
+    /// Writes grounded anchors for many content-addressed constellations in
+    /// one durable commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if any target constellation is
+    /// absent, anchor validation fails, a conflicting anchor already exists,
+    /// ledger append fails, or the durable commit cannot apply the full batch.
+    pub fn put_grounding_anchors_for_many(
+        &self,
+        entries: Vec<(CxId, Vec<Anchor>)>,
+        payload: Vec<u8>,
+        actor_service: impl Into<String>,
+    ) -> Result<SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxError> {
+        let actor = ActorId::Service(actor_service.into());
+        let outcome = self
+            .vault
+            .anchors_for_many_with_ledger_entry(
+                entries,
+                EntryKind::Grounding,
+                SubjectId::Query(b"synapse.grounding_anchor.multi.v1".to_vec()),
+                payload,
+                actor,
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "put multi-constellation ledger-stamped Calyx anchors",
+                    &error,
+                )
+            })?;
+        Ok(anchor_batch_write_readback(
+            &outcome,
+            self.vault.latest_seq(),
+        ))
+    }
+
     /// Runs one physical Aster compaction attempt for the Synapse KV storage CF.
     ///
     /// Synapse maps its storage column families onto namespaces inside Aster's
@@ -1182,6 +1298,20 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("scan Calyx CF range from pinned snapshot", &error)
             })
+    }
+
+    /// Decodes the physical `Anchors` CF rows currently visible for one
+    /// constellation id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the Anchors range cannot be
+    /// read or any physical anchor row fails to decode.
+    pub fn scan_anchors_for_cx(
+        &self,
+        cx_id: CxId,
+    ) -> Result<Vec<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
+        scan_anchors_for_cx_from_vault(&self.vault, cx_id)
     }
 
     /// Pins a bounded reader lease.
@@ -1680,6 +1810,50 @@ fn write_machine_salt_atomic(
             IDENTITY_REMEDIATION,
         )
     })
+}
+
+fn anchor_batch_write_readback(
+    outcome: &MultiCxAnchorBatchOutcome,
+    latest_seq: Seq,
+) -> SynapseCalyxAnchorBatchWriteReadback {
+    SynapseCalyxAnchorBatchWriteReadback {
+        anchor_count: outcome.requested_anchor_count,
+        written_anchor_count: outcome.written_anchor_count,
+        existing_anchor_count: outcome.existing_anchor_count,
+        ledger_seq: outcome.ledger_ref.as_ref().map(|ledger_ref| ledger_ref.seq),
+        ledger_hash: outcome
+            .ledger_ref
+            .as_ref()
+            .map(|ledger_ref| hex_bytes(&ledger_ref.hash)),
+        latest_seq,
+    }
+}
+
+fn scan_anchors_for_cx_from_vault<C: Clock>(
+    vault: &AsterVault<C>,
+    cx_id: CxId,
+) -> Result<Vec<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
+    let range = anchor_prefix_range(cx_id);
+    let rows = vault
+        .scan_cf_range_at(vault.latest_seq(), ColumnFamily::Anchors, &range)
+        .map_err(|error| SynapseCalyxError::from_calyx("scan Calyx Anchors CF", &error))?;
+    rows.into_iter()
+        .map(|(key, value)| {
+            let anchor = vault_encode::decode_anchor(&value).map_err(|error| {
+                SynapseCalyxError::from_calyx("decode Calyx Anchors CF row", &error)
+            })?;
+            Ok(SynapseCalyxAnchorReadback { key, anchor })
+        })
+        .collect()
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 fn write_pid_sidecar(path: &Path) -> Result<(), SynapseCalyxError> {

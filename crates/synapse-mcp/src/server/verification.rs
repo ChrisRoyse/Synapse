@@ -16,10 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rmcp::{RoleServer, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use synapse_storage::{Db, cf};
+use synapse_storage::{Db, cf, decode_json};
 
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 use crate::m1::{CdpTargetInfoParams, mcp_error};
+use crate::m3::grounding::{self, SOURCE_VERIFICATION};
 use crate::server::url_redaction::redact_url_for_public_readback;
 
 const AUDIT_PREFIX: &str = "verification/audit/v1/";
@@ -678,6 +679,56 @@ impl SynapseService {
                 format!("verification audit row flush failed: {error}"),
             )
         })?;
+        let key_bytes = key.as_bytes().to_vec();
+        let readback_value = db
+            .get_cf(cf::CF_KV, &key_bytes)
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("verification audit row readback failed: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!("verification audit row absent immediately after write for key {key}"),
+                )
+            })?;
+        let readback: VerificationAuditRow = decode_json(&readback_value).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("verification audit row readback decode failed: {error}"),
+            )
+        })?;
+        let source_record = serde_json::to_value(&readback).map_err(|error| {
+            mcp_error(
+                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                format!("verification audit anchor projection failed: {error}"),
+            )
+        })?;
+        let report = grounding::write_outcome_constellation_and_anchor(
+            &db,
+            cf::CF_KV,
+            &key_bytes,
+            &readback_value,
+            &source_record,
+            grounding::bool_anchor(
+                "synapse:verification_outcome",
+                readback.code_count > 0,
+                SOURCE_VERIFICATION,
+                readback.read_at_unix_ms,
+            ),
+            "verification audit anchor",
+        )?;
+        tracing::info!(
+            code = "VERIFICATION_OUTCOME_ANCHORED",
+            audit_key = %key,
+            source = %readback.source,
+            code_count = readback.code_count,
+            cx_id = %report.cx_id,
+            ledger_seq = report.ledger_seq,
+            "verification audit outcome grounded on CF_KV audit constellation"
+        );
         Ok(key)
     }
 }

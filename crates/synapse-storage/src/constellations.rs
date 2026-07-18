@@ -41,6 +41,8 @@ pub const SYN_PROCESS_PANEL_NAME: &str = "syn-process-v1";
 pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_666_003;
 pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
 pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_666_004;
+pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
+pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_669_001;
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_SAMPLE_EVERY_N";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
 
@@ -153,6 +155,14 @@ const OB_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(6);
 const OB_SLOT_DOW_CYCLIC: SlotId = SlotId::new(7);
 const OB_SLOT_RECORD_VECTOR: SlotId = SlotId::new(8);
 
+const OUT_SLOT_SOURCE_CF_ONEHOT: SlotId = SlotId::new(1);
+const OUT_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(2);
+const OUT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(3);
+const OUT_SLOT_TARGET_HASH: SlotId = SlotId::new(4);
+const OUT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(5);
+const OUT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(6);
+const OUT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstellationPutReport {
     pub panel_name: &'static str,
@@ -186,6 +196,119 @@ pub struct NativeConstellationContext {
     pub cx_id: CxId,
     pub created_at_ms: u64,
     pub next_ledger_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CalyxConstellationInputMode {
+    SourceValue,
+    FramedSourceRow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CalyxAnchorPanel {
+    pub panel_name: &'static str,
+    pub panel_version: u32,
+    pub input_mode: CalyxConstellationInputMode,
+}
+
+/// Returns the native Calyx panel used to derive the source row's `CxId`.
+///
+/// # Errors
+///
+/// Returns a write-scoped storage error when the source column family has no
+/// native constellation contract and therefore cannot receive grounded anchors.
+pub fn anchor_panel_for_source_cf(cf_name: &str) -> StorageResult<CalyxAnchorPanel> {
+    let panel = match cf_name {
+        cf::CF_TIMELINE => CalyxAnchorPanel {
+            panel_name: SYN_TIMELINE_PANEL_NAME,
+            panel_version: SYN_TIMELINE_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_EPISODES => CalyxAnchorPanel {
+            panel_name: SYN_EPISODE_PANEL_NAME,
+            panel_version: SYN_EPISODE_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_AGENT_EVENTS => CalyxAnchorPanel {
+            panel_name: SYN_AGENT_EVENT_PANEL_NAME,
+            panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_AGENT_TRANSCRIPTS => CalyxAnchorPanel {
+            panel_name: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            panel_version: SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_ACTION_LOG => CalyxAnchorPanel {
+            panel_name: SYN_ACTION_PANEL_NAME,
+            panel_version: SYN_ACTION_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_REFLEX_AUDIT => CalyxAnchorPanel {
+            panel_name: SYN_REFLEX_PANEL_NAME,
+            panel_version: SYN_REFLEX_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_PROCESS_HISTORY => CalyxAnchorPanel {
+            panel_name: SYN_PROCESS_PANEL_NAME,
+            panel_version: SYN_PROCESS_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_OBSERVATIONS => CalyxAnchorPanel {
+            panel_name: SYN_OBSERVATION_PANEL_NAME,
+            panel_version: SYN_OBSERVATION_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        cf::CF_KV | cf::CF_ROUTINE_STATE => CalyxAnchorPanel {
+            panel_name: SYN_OUTCOME_PANEL_NAME,
+            panel_version: SYN_OUTCOME_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::FramedSourceRow,
+        },
+        other => {
+            return Err(StorageError::WriteFailed {
+                cf_name: other.to_owned(),
+                detail: format!(
+                    "source column family {other:?} has no Calyx constellation panel for grounded anchors"
+                ),
+            });
+        }
+    };
+    Ok(panel)
+}
+
+#[must_use]
+pub fn source_constellation_input_bytes(
+    mode: CalyxConstellationInputMode,
+    source_cf: &str,
+    source_key: &[u8],
+    source_value: &[u8],
+) -> Vec<u8> {
+    match mode {
+        CalyxConstellationInputMode::SourceValue => source_value.to_vec(),
+        CalyxConstellationInputMode::FramedSourceRow => {
+            outcome_constellation_input_bytes(source_cf, source_key, source_value)
+        }
+    }
+}
+
+#[must_use]
+pub fn outcome_constellation_input_bytes(
+    source_cf: &str,
+    source_key: &[u8],
+    source_value: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        "synapse-outcome-input-v1".len()
+            + source_cf.len()
+            + source_key.len()
+            + source_value.len()
+            + 24,
+    );
+    append_framed(&mut out, b"synapse-outcome-input-v1");
+    append_framed(&mut out, source_cf.as_bytes());
+    append_framed(&mut out, source_key);
+    append_framed(&mut out, source_value);
+    out
 }
 
 /// Build the Calyx constellation for a timeline record.
@@ -1155,6 +1278,96 @@ pub fn build_observation_constellation(
     )
 }
 
+/// Build the Calyx constellation for a persisted Synapse outcome/audit row.
+///
+/// # Errors
+///
+/// Returns an error when JSON field extraction, lens measurement, JSON
+/// encoding, or exact scalar conversion fails.
+pub fn build_outcome_constellation(
+    context: NativeConstellationContext,
+    source_cf: &'static str,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    constellation_input_bytes: &[u8],
+    record: &Value,
+) -> StorageResult<Constellation> {
+    ensure_json_object(record, source_cf)?;
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        OUT_SLOT_SOURCE_CF_ONEHOT,
+        measure_text(
+            SYN_OUTCOME_PANEL_NAME,
+            AlgorithmicLens::syn_one_hot(
+                "syn.outcome.source_cf_onehot.v1",
+                Modality::Structured,
+                64,
+            ),
+            source_cf,
+        )?,
+    );
+    slots.insert(
+        OUT_SLOT_EVENT_ONEHOT,
+        optional_onehot_slot(
+            SYN_OUTCOME_PANEL_NAME,
+            "syn.outcome.event_onehot.v1",
+            outcome_event(record).as_deref(),
+            128,
+        )?,
+    );
+    slots.insert(
+        OUT_SLOT_STATUS_ONEHOT,
+        optional_onehot_slot(
+            SYN_OUTCOME_PANEL_NAME,
+            "syn.outcome.status_onehot.v1",
+            outcome_status(record).as_deref(),
+            64,
+        )?,
+    );
+    slots.insert(
+        OUT_SLOT_TARGET_HASH,
+        optional_hash_slot(
+            SYN_OUTCOME_PANEL_NAME,
+            "syn.outcome.target_hash.v1",
+            outcome_target(record).as_deref(),
+            2048,
+        )?,
+    );
+    insert_time_slots(
+        &mut slots,
+        SYN_OUTCOME_PANEL_NAME,
+        OUT_SLOT_HOUR_CYCLIC,
+        OUT_SLOT_DOW_CYCLIC,
+        "syn.outcome.hour_cyclic.v1",
+        "syn.outcome.dow_cyclic.v1",
+        outcome_ts_ns(record),
+    )?;
+    slots.insert(
+        OUT_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_OUTCOME_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.outcome.record_vector.v1",
+                Modality::Structured,
+                128,
+            ),
+            &outcome_numeric_record(record, raw_bytes),
+        )?,
+    );
+
+    let scalars = outcome_scalars(record, raw_bytes)?;
+    let metadata = outcome_metadata(source_cf, source_key, raw_bytes, record);
+    constellation(
+        context,
+        SYN_OUTCOME_PANEL_VERSION,
+        source_pointer(source_cf, source_key),
+        constellation_input_bytes,
+        slots,
+        scalars,
+        metadata,
+    )
+}
+
 /// Returns whether a persisted observation key is selected for Calyx
 /// measurement under the configured bounded-rate sampler.
 ///
@@ -1697,6 +1910,31 @@ fn observation_scalars(
     Ok(scalars)
 }
 
+fn outcome_scalars(record: &Value, raw_bytes: &[u8]) -> StorageResult<BTreeMap<String, f64>> {
+    let mut scalars = BTreeMap::new();
+    insert_u64_scalar(
+        &mut scalars,
+        "raw_len_bytes",
+        u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "ts_unix_ms",
+        outcome_ts_ns(record).map(|ts_ns| ts_ns / NS_PER_MS),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "code_count",
+        json_u64(record, &["code_count"]),
+    )?;
+    insert_optional_u64_scalar(
+        &mut scalars,
+        "ladder_index",
+        json_u64(record, &["ladder_index"]),
+    )?;
+    Ok(scalars)
+}
+
 fn insert_u64_scalar(
     scalars: &mut BTreeMap<String, f64>,
     name: &'static str,
@@ -2201,6 +2439,39 @@ fn observation_metadata(
     Ok(metadata)
 }
 
+fn outcome_metadata(
+    source_cf: &'static str,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+) -> BTreeMap<String, String> {
+    let mut metadata = common_metadata(SYN_OUTCOME_PANEL_NAME, source_cf, source_key, raw_bytes);
+    if let Some(ts_ns) = outcome_ts_ns(record) {
+        metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
+        metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        metadata.insert(
+            META_RECENCY_BASIS.to_owned(),
+            RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
+        );
+    }
+    insert_optional_metadata(
+        &mut metadata,
+        "outcome_event",
+        outcome_event(record).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "outcome_status",
+        outcome_status(record).as_deref(),
+    );
+    insert_optional_metadata(
+        &mut metadata,
+        "outcome_target",
+        outcome_target(record).as_deref(),
+    );
+    metadata
+}
+
 fn insert_optional_metadata(
     metadata: &mut BTreeMap<String, String>,
     key: &'static str,
@@ -2213,7 +2484,7 @@ fn insert_optional_metadata(
 
 fn common_metadata(
     panel_name: &'static str,
-    source_cf: &'static str,
+    source_cf: &str,
     source_key: &[u8],
     raw_bytes: &[u8],
 ) -> BTreeMap<String, String> {
@@ -3002,6 +3273,82 @@ const fn sensor_status_code(status: &SensorStatus) -> &'static str {
     }
 }
 
+fn outcome_event(record: &Value) -> Option<String> {
+    json_string(record, &["event", "action", "kind"])
+}
+
+fn outcome_status(record: &Value) -> Option<String> {
+    json_string(
+        record,
+        &["after_status", "status", "outcome", "decision", "lifecycle"],
+    )
+    .or_else(|| {
+        json_bool(record, &["matched"]).map(|matched| {
+            if matched {
+                "matched".to_owned()
+            } else {
+                "not_matched".to_owned()
+            }
+        })
+    })
+    .or_else(|| {
+        json_u64(record, &["code_count"]).map(|count| {
+            if count > 0 {
+                "codes_found".to_owned()
+            } else {
+                "no_codes_found".to_owned()
+            }
+        })
+    })
+}
+
+fn outcome_target(record: &Value) -> Option<String> {
+    json_string(
+        record,
+        &[
+            "routine_id",
+            "approval_id",
+            "escalation_id",
+            "event_id",
+            "audit_id",
+            "source",
+            "spawn_id",
+            "session_id",
+            "episode_id",
+            "target",
+        ],
+    )
+    .or_else(|| json_pointer_text(record, &["/detail/approval_id", "/detail/escalation_id"]))
+}
+
+fn outcome_ts_ns(record: &Value) -> Option<u64> {
+    json_u64(record, &["ts_ns"]).or_else(|| {
+        json_u64(
+            record,
+            &[
+                "at_unix_ms",
+                "updated_at_unix_ms",
+                "read_at_unix_ms",
+                "created_at_unix_ms",
+                "bound_at_unix_ms",
+            ],
+        )
+        .map(|ms| ms.saturating_mul(NS_PER_MS))
+    })
+}
+
+fn outcome_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
+    json!({
+        "raw_len_bytes": u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+        "has_event": bool_u64(outcome_event(record).is_some()),
+        "has_status": bool_u64(outcome_status(record).is_some()),
+        "has_target": bool_u64(outcome_target(record).is_some()),
+        "has_timestamp": bool_u64(outcome_ts_ns(record).is_some()),
+        "code_count": json_u64(record, &["code_count"]).unwrap_or(0),
+        "ladder_index": json_u64(record, &["ladder_index"]).unwrap_or(0),
+    })
+}
+
 fn json_string(record: &Value, keys: &[&str]) -> Option<String> {
     let object = record.as_object()?;
     keys.iter()
@@ -3129,8 +3476,13 @@ fn url_host(url: &str) -> Option<String> {
     non_empty(host).map(str::to_ascii_lowercase)
 }
 
-fn source_pointer(source_cf: &'static str, source_key: &[u8]) -> String {
+fn source_pointer(source_cf: &str, source_key: &[u8]) -> String {
     format!("{POINTER_SCHEME}://{source_cf}/{}", hex_encode(source_key))
+}
+
+fn append_framed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn truncate_metadata(value: &str) -> String {

@@ -18,8 +18,8 @@ use crate::m3::{
         LocalModelUpdateResponse,
     },
     storage::{
-        StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-        StorageSummaryResponse,
+        StorageAnchorsParams, StorageAnchorsResponse, StorageGcOnceParams, StorageGcOnceResponse,
+        StorageInspectParams, StorageInspectResponse, StorageSummaryResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -28,6 +28,7 @@ pub enum StorageOperation {
     Inspect,
     Summary,
     GcOnce,
+    Anchors,
 }
 
 impl StorageOperation {
@@ -36,6 +37,7 @@ impl StorageOperation {
             Self::Inspect => "inspect",
             Self::Summary => "summary",
             Self::GcOnce => "gc_once",
+            Self::Anchors => "anchors",
         }
     }
 }
@@ -50,6 +52,8 @@ pub struct StorageParams {
     pub summary: Option<StorageInspectParams>,
     #[serde(default)]
     pub gc_once: Option<StorageGcOnceParams>,
+    #[serde(default)]
+    pub anchors: Option<StorageAnchorsParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -64,6 +68,8 @@ pub struct StorageResponse {
     pub summary: Option<StorageSummaryResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_once: Option<StorageGcOnceResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchors: Option<StorageAnchorsResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

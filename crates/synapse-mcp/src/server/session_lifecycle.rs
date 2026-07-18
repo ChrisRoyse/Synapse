@@ -1021,7 +1021,8 @@ impl SessionLifecycleState {
         report.reason.clone_from(&registry_reason);
         report.subscriptions = self.cleanup_subscriptions(session_id);
         report.session_store = self.delete_session_store_row(session_id);
-        report.registry = self.record_registry_closed(session_id, &registry_reason);
+        report.registry =
+            self.record_registry_closed(session_id, &registry_reason, &report.processes);
         report.finalize();
         if report.failure_count == 0 {
             tracing::info!(
@@ -2052,6 +2053,7 @@ impl SessionLifecycleState {
         &self,
         session_id: &str,
         reason: &str,
+        processes: &SessionProcessCleanupReport,
     ) -> SessionRegistryCleanupReport {
         let transitioned = match self.session_registry.lock() {
             Ok(mut registry) => {
@@ -2075,9 +2077,12 @@ impl SessionLifecycleState {
             error_message: None,
         };
         if transitioned {
-            // Terminal lifecycle fact: journal it durably (#897). The agent's
-            // task outcome is unknown to teardown, hence `indeterminate`.
-            match self.journal_session_exited_event(session_id, reason) {
+            // Terminal lifecycle fact: journal it durably (#897). For spawned
+            // agents the process cleanup report includes the exact spawn
+            // completion artifact, so the event must carry that spawn id and
+            // end state instead of degrading the outcome to a session-only
+            // indeterminate exit.
+            match self.journal_session_exited_event(session_id, reason, processes) {
                 Ok(()) => report.journal_event_written = true,
                 Err(error) => {
                     report.failed = true;
@@ -2088,7 +2093,12 @@ impl SessionLifecycleState {
         report
     }
 
-    fn journal_session_exited_event(&self, session_id: &str, reason: &str) -> Result<(), String> {
+    fn journal_session_exited_event(
+        &self,
+        session_id: &str,
+        reason: &str,
+        processes: &SessionProcessCleanupReport,
+    ) -> Result<(), String> {
         let db = session_store_db(&self.m3_state)?;
         let mut record = synapse_core::AgentEventRecord::new(
             super::agent_events::unix_time_ns_now(),
@@ -2096,8 +2106,19 @@ impl SessionLifecycleState {
         );
         record.session_id = Some(session_id.to_owned());
         record.reason_code = Some(reason.to_owned());
-        record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
         record.attributes.conversation_id = Some(session_id.to_owned());
+        if let Some(spawn_exit) = spawned_agent_exit_attribution(processes) {
+            record.spawn_id = Some(spawn_exit.spawn_id.clone());
+            record.end_state = Some(spawn_exit.end_state());
+            if let Some(agent_cli) = spawn_exit.agent_cli.as_deref() {
+                record.attributes.agent_name = Some(agent_cli.to_owned());
+                record.attributes.provider_name =
+                    super::agent_events::provider_for_agent_kind(agent_cli);
+            }
+            record.payload = spawn_exit.payload();
+        } else {
+            record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
+        }
         super::agent_events::record_agent_event_durable(&db, &record)
             .map(|_readback| ())
             .map_err(|error| format!("journal session exited event: {error}"))
@@ -2547,6 +2568,138 @@ fn cleanup_observed_ok_completion(processes: &SessionProcessCleanupReport) -> bo
                 .as_deref()
                 == Some("ok")
     })
+}
+
+#[derive(Clone, Debug)]
+struct SpawnExitAttribution {
+    spawn_id: String,
+    agent_cli: Option<String>,
+    completion_status_path: Option<String>,
+    completion_status: Option<String>,
+    completion_status_read_error: Option<String>,
+    exit_code: Option<i64>,
+    error_message: Option<String>,
+    final_message_bytes: Option<u64>,
+    fallback_final_message_written: Option<bool>,
+}
+
+impl SpawnExitAttribution {
+    fn end_state(&self) -> synapse_core::AgentEndState {
+        match (self.completion_status.as_deref(), self.exit_code) {
+            (Some("ok"), Some(0) | None) => synapse_core::AgentEndState::Success,
+            (Some("running") | None, _) => synapse_core::AgentEndState::Indeterminate,
+            (Some("ok"), Some(_)) => synapse_core::AgentEndState::Error,
+            (Some(_), _) => synapse_core::AgentEndState::Error,
+        }
+    }
+
+    fn payload(&self) -> serde_json::Value {
+        json!({
+            "source_of_truth": "session process cleanup report + agent spawn completion-status.json",
+            "completion_status_path": self.completion_status_path,
+            "completion_status": self.completion_status,
+            "completion_status_read_error": self.completion_status_read_error,
+            "exit_code": self.exit_code,
+            "error_message": self.error_message,
+            "final_message_bytes": self.final_message_bytes,
+            "fallback_final_message_written": self.fallback_final_message_written,
+        })
+    }
+}
+
+fn spawned_agent_exit_attribution(
+    processes: &SessionProcessCleanupReport,
+) -> Option<SpawnExitAttribution> {
+    let item = processes.items.iter().find(|item| {
+        item.tool == ACT_SPAWN_AGENT_TOOL_NAME
+            && item
+                .resource_id
+                .as_deref()
+                .is_some_and(|spawn_id| spawn_id.starts_with("agent-spawn-"))
+    })?;
+    let mut read = item
+        .completion_status_path
+        .as_deref()
+        .map(read_spawn_completion_for_exit)
+        .unwrap_or_else(|| SpawnCompletionRead {
+            status: item.completion_status_before_cleanup.clone(),
+            read_error: Some(
+                "session process cleanup item had no completion_status_path".to_owned(),
+            ),
+            ..SpawnCompletionRead::default()
+        });
+    if read.status.is_none() {
+        read.status
+            .clone_from(&item.completion_status_before_cleanup);
+    }
+    Some(SpawnExitAttribution {
+        spawn_id: item.resource_id.clone()?,
+        agent_cli: item.agent_cli.clone(),
+        completion_status_path: item.completion_status_path.clone(),
+        completion_status: read.status,
+        completion_status_read_error: read.read_error,
+        exit_code: read.exit_code,
+        error_message: read.error_message,
+        final_message_bytes: read.final_message_bytes,
+        fallback_final_message_written: read.fallback_final_message_written,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpawnCompletionRead {
+    status: Option<String>,
+    read_error: Option<String>,
+    exit_code: Option<i64>,
+    error_message: Option<String>,
+    final_message_bytes: Option<u64>,
+    fallback_final_message_written: Option<bool>,
+}
+
+fn read_spawn_completion_for_exit(path: &str) -> SpawnCompletionRead {
+    let path = Path::new(path);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return SpawnCompletionRead {
+                read_error: Some(format!(
+                    "read completion-status.json at {}: {error}",
+                    path.display()
+                )),
+                ..SpawnCompletionRead::default()
+            };
+        }
+    };
+    let status = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(status) => status,
+        Err(error) => {
+            return SpawnCompletionRead {
+                read_error: Some(format!(
+                    "parse completion-status.json at {}: {error}",
+                    path.display()
+                )),
+                ..SpawnCompletionRead::default()
+            };
+        }
+    };
+    SpawnCompletionRead {
+        status: status
+            .get("status")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        read_error: None,
+        exit_code: status.get("exit_code").and_then(|value| value.as_i64()),
+        error_message: status
+            .get("error_message")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.chars().take(512).collect::<String>()),
+        final_message_bytes: status
+            .get("final_message_bytes")
+            .and_then(|value| value.as_u64()),
+        fallback_final_message_written: status
+            .get("fallback_final_message_written")
+            .and_then(|value| value.as_bool()),
+    }
 }
 
 fn spawned_agent_completion_status(log_dir: &str) -> Option<String> {

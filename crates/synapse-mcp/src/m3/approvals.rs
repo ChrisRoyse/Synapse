@@ -26,6 +26,7 @@ use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
+    grounding::{self, SOURCE_APPROVAL, SOURCE_OPERATOR},
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -1486,7 +1487,7 @@ fn write_item_and_audit(
     note: Option<String>,
 ) -> Result<(ApprovalRowEvidence, ApprovalRowEvidence), ErrorData> {
     let (item_key, item_value) = item_kv(item)?;
-    let (audit_key, audit_value) = audit_kv(
+    let (audit_key, audit_value, audit_record) = audit_kv(
         approval_id,
         event,
         at_unix_ms,
@@ -1495,6 +1496,7 @@ fn write_item_and_audit(
         after_status,
         note,
     )?;
+    let audit_value_for_anchor = audit_value.clone();
     db.put_batch_pressure_bypass(
         cf::CF_KV,
         [
@@ -1505,6 +1507,7 @@ fn write_item_and_audit(
     .map_err(storage_error)?;
     let item_row = readback_row(db, &item_key, "approval item+audit item write")?;
     let audit_row = readback_row(db, &audit_key, "approval item+audit audit write")?;
+    anchor_approval_decision(db, &audit_key, &audit_value_for_anchor, &audit_record)?;
     Ok((item_row, audit_row))
 }
 
@@ -1518,7 +1521,7 @@ fn write_audit(
     after_status: ApprovalStatus,
     note: Option<String>,
 ) -> Result<ApprovalRowEvidence, ErrorData> {
-    let (key, value) = audit_kv(
+    let (key, value, audit_record) = audit_kv(
         approval_id,
         event,
         at_unix_ms,
@@ -1527,9 +1530,73 @@ fn write_audit(
         after_status,
         note,
     )?;
+    let value_for_anchor = value.clone();
     db.put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), value)])
         .map_err(storage_error)?;
-    readback_row(db, &key, "approval audit write")
+    let row = readback_row(db, &key, "approval audit write")?;
+    anchor_approval_decision(db, &key, &value_for_anchor, &audit_record)?;
+    Ok(row)
+}
+
+fn anchor_approval_decision(
+    db: &Arc<Db>,
+    audit_key: &[u8],
+    audit_value: &[u8],
+    audit: &ApprovalAuditRecord,
+) -> Result<(), ErrorData> {
+    let Some(anchor_value) = approval_anchor_value(audit.after_status) else {
+        return Ok(());
+    };
+    let source =
+        if audit.by_session == TIMEOUT_DECIDER_SESSION || audit.by_session.contains("timeout") {
+            SOURCE_APPROVAL
+        } else {
+            SOURCE_OPERATOR
+        };
+    let record_value = serde_json::to_value(audit).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "approval audit anchor projection failed to serialize audit {}: {error}",
+                audit.event_id
+            ),
+        )
+    })?;
+    let report = grounding::write_outcome_constellation_and_anchor(
+        db,
+        cf::CF_KV,
+        audit_key,
+        audit_value,
+        &record_value,
+        grounding::enum_anchor(
+            "synapse:approval_decision",
+            anchor_value,
+            source,
+            audit.at_unix_ms,
+        ),
+        "approval decision anchor",
+    )?;
+    tracing::info!(
+        code = "APPROVAL_DECISION_ANCHORED",
+        approval_id = %audit.approval_id,
+        event_id = %audit.event_id,
+        after_status = audit.after_status.as_str(),
+        source_key_hex = %report.source_key_hex,
+        cx_id = %report.cx_id,
+        anchor_kind = %report.anchor_kind,
+        ledger_seq = report.ledger_seq,
+        "approval terminal decision grounded in Calyx Anchors CF"
+    );
+    Ok(())
+}
+
+fn approval_anchor_value(status: ApprovalStatus) -> Option<&'static str> {
+    match status {
+        ApprovalStatus::Accepted => Some("granted"),
+        ApprovalStatus::Declined => Some("rejected"),
+        ApprovalStatus::Ignored => Some("ignored"),
+        ApprovalStatus::Pending | ApprovalStatus::Snoozed => None,
+    }
 }
 
 fn item_kv(item: &ApprovalItemRecord) -> Result<(Vec<u8>, Vec<u8>), ErrorData> {
@@ -1554,7 +1621,7 @@ fn audit_kv(
     before_status: Option<ApprovalStatus>,
     after_status: ApprovalStatus,
     note: Option<String>,
-) -> Result<(Vec<u8>, Vec<u8>), ErrorData> {
+) -> Result<(Vec<u8>, Vec<u8>, ApprovalAuditRecord), ErrorData> {
     let audit = ApprovalAuditRecord {
         schema_version: SCHEMA_VERSION,
         approval_id: approval_id.to_owned(),
@@ -1573,7 +1640,7 @@ fn audit_kv(
             format!("approval audit encode failed for {approval_id}/{event}: {error}"),
         )
     })?;
-    Ok((key, value))
+    Ok((key, value, audit))
 }
 
 fn write_activation(

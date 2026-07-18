@@ -61,6 +61,7 @@ pub use keyspace::{
     CALYX_VAULT_KEYSPACE_MISMATCH, KeyspaceGuard, VaultWriteLock, VaultWriteLockGuard, vault_prefix,
 };
 pub use layer_commit::CfLedgerEntry;
+pub use ledger_anchor_batch::MultiCxAnchorBatchOutcome;
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,

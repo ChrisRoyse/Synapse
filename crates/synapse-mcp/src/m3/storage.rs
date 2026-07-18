@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{
+    CalyxAnchorScanReport as BackendCalyxAnchorScanReport,
+    CalyxAnchorValueReadback as BackendCalyxAnchorValueReadback,
     CalyxVaultCollectionInspect as BackendCalyxVaultCollectionInspect,
     CalyxVaultInspect as BackendCalyxVaultInspect, DiskPressureLevel, GcReport, PressureReport,
     STORAGE_METADATA_ONLY_REDACTION_POLICY, cf,
@@ -35,6 +37,14 @@ const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len()] = cf::ALL_COLUMN
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageInspectParams {}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageAnchorsParams {
+    pub cf_name: String,
+    /// Hex-encoded exact source-row key in `cf_name`.
+    pub key_hex: String,
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +107,50 @@ pub struct StorageInspectResponse {
     pub cf_row_samples: BTreeMap<String, Vec<StorageRowSample>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vault: Option<StorageCalyxVaultInspect>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageAnchorsResponse {
+    pub source_cf: String,
+    pub source_key_hex: String,
+    pub source_value_len_bytes: u64,
+    pub source_value_sha256: String,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub cx_id: String,
+    pub anchor_count: u64,
+    pub anchors: Vec<StorageAnchorRow>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageAnchorRow {
+    pub key_hex: String,
+    pub cx_id: String,
+    pub kind: String,
+    pub value: StorageAnchorValue,
+    pub source: String,
+    pub observed_at_ms: u64,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageAnchorValue {
+    pub value_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bool_value: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_hot_values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -261,6 +315,11 @@ pub fn required_permissions_inspect(_params: &StorageInspectParams) -> RequiredP
 }
 
 #[must_use]
+pub fn required_permissions_anchors(_params: &StorageAnchorsParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
 pub fn required_permissions_put(_params: &StoragePutProbeRowsParams) -> RequiredPermissions {
     required([Permission::WriteStorage])
 }
@@ -281,6 +340,38 @@ pub fn inspect_storage(
 ) -> Result<StorageInspectResponse, ErrorData> {
     let runtime = lock_runtime(runtime)?;
     inspect_locked(&runtime)
+}
+
+pub fn inspect_storage_anchors(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &StorageAnchorsParams,
+) -> Result<StorageAnchorsResponse, ErrorData> {
+    let cf_name = known_anchor_source_cf(&params.cf_name)?;
+    let key = hex_decode(params.key_hex.trim()).map_err(|detail| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage operation=anchors key_hex invalid: {detail}"),
+        )
+    })?;
+    let runtime = lock_runtime(runtime)?;
+    let rows = runtime
+        .storage_cf_prefix_rows(cf_name, &key, 2)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let Some((_row_key, source_value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key)
+    else {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "storage operation=anchors source row not found: cf_name={cf_name} key_hex={}",
+                params.key_hex.trim()
+            ),
+        ));
+    };
+    let source_value_len_bytes = u64::try_from(source_value.len()).unwrap_or(u64::MAX);
+    let report = runtime
+        .storage_calyx_anchor_scan_for_source(cf_name, &key, &source_value)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(storage_anchors_response(report, source_value_len_bytes))
 }
 
 pub fn inspect_storage_summary(
@@ -538,6 +629,47 @@ fn storage_calyx_vault_collection(
     }
 }
 
+fn storage_anchors_response(
+    report: BackendCalyxAnchorScanReport,
+    source_value_len_bytes: u64,
+) -> StorageAnchorsResponse {
+    StorageAnchorsResponse {
+        source_cf: report.source_cf,
+        source_key_hex: report.source_key_hex,
+        source_value_len_bytes,
+        source_value_sha256: report.source_value_sha256,
+        panel_name: report.panel_name,
+        panel_version: report.panel_version,
+        cx_id: report.cx_id,
+        anchor_count: u64::try_from(report.anchors.len()).unwrap_or(u64::MAX),
+        anchors: report
+            .anchors
+            .into_iter()
+            .map(|row| StorageAnchorRow {
+                key_hex: row.key_hex,
+                cx_id: row.cx_id,
+                kind: row.kind,
+                value: storage_anchor_value(row.value),
+                source: row.source,
+                observed_at_ms: row.observed_at_ms,
+                confidence: row.confidence,
+            })
+            .collect(),
+    }
+}
+
+fn storage_anchor_value(value: BackendCalyxAnchorValueReadback) -> StorageAnchorValue {
+    StorageAnchorValue {
+        value_type: value.value_type,
+        bool_value: value.bool_value,
+        text_value: value.text_value,
+        number_value: value.number_value,
+        one_hot_values: value.one_hot_values,
+        vector_len: value.vector_len,
+        vector_sha256: value.vector_sha256,
+    }
+}
+
 fn classify_value_encoding(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "empty".to_owned();
@@ -559,6 +691,52 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("empty hex string".to_owned());
+    }
+    if !value.len().is_multiple_of(2) {
+        return Err(format!("hex length must be even; got {}", value.len()));
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for index in (0..bytes.len()).step_by(2) {
+        let hi = hex_digit(bytes[index])
+            .ok_or_else(|| format!("invalid hex digit at byte offset {index}"))?;
+        let lo = hex_digit(bytes[index + 1])
+            .ok_or_else(|| format!("invalid hex digit at byte offset {}", index + 1))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn known_anchor_source_cf(raw: &str) -> Result<&'static str, ErrorData> {
+    let trimmed = raw.trim();
+    let Some(cf_name) = cf::ALL_COLUMN_FAMILIES
+        .iter()
+        .copied()
+        .find(|cf_name| *cf_name == trimmed)
+    else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage operation=anchors cf_name is not known: {trimmed:?}"),
+        ));
+    };
+    synapse_storage::constellations::anchor_panel_for_source_cf(cf_name)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(cf_name)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

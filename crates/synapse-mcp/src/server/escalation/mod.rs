@@ -57,6 +57,7 @@ use crate::m3::approvals::{
     ApprovalAllow, ApprovalAuditRecord, ApprovalItemRecord, ApprovalKind, ApprovalStatus,
     ApprovalTimeoutDecision, ApprovalToastState,
 };
+use crate::m3::grounding::{self, SOURCE_ESCALATION};
 
 type CfKvRow = (Vec<u8>, Vec<u8>);
 type CfKvRows = Vec<CfKvRow>;
@@ -490,7 +491,7 @@ fn write_item_and_audit_with_extra_rows(
             ),
         )
     })?;
-    read_exact_row(db, &audit_key)?.ok_or_else(|| {
+    let audit_readback_value = read_exact_row(db, &audit_key)?.ok_or_else(|| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(
@@ -510,6 +511,34 @@ fn write_item_and_audit_with_extra_rows(
             )
         })?;
     }
+    let audit_readback: Value = decode_json(&audit_readback_value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "escalation audit row decode failed immediately after write for {}: {error}",
+                item.escalation_id
+            ),
+        )
+    })?;
+    let report = grounding::write_outcome_constellation_and_anchor(
+        db,
+        cf::CF_KV,
+        &audit_key,
+        &audit_readback_value,
+        &audit_readback,
+        grounding::enum_anchor("synapse:escalation_event", event, SOURCE_ESCALATION, at),
+        "escalation audit anchor",
+    )?;
+    tracing::info!(
+        code = "ESCALATION_EVENT_ANCHORED",
+        escalation_id = %item.escalation_id,
+        event,
+        status = item.status.as_str(),
+        source_key = %String::from_utf8_lossy(&audit_key),
+        cx_id = %report.cx_id,
+        ledger_seq = report.ledger_seq,
+        "escalation audit outcome grounded on CF_KV audit constellation"
+    );
     Ok(())
 }
 

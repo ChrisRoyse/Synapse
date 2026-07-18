@@ -19,6 +19,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("inspect", params.inspect.is_some()),
             ("summary", params.summary.is_some()),
             ("gc_once", params.gc_once.is_some()),
+            ("anchors", params.anchors.is_some()),
         ],
     )
 }

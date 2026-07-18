@@ -89,6 +89,48 @@ pub(super) async fn handle(
                 |out| out.summary = Some(response),
             )))
         }
+        StorageOperation::Anchors => {
+            let spec = params
+                .0
+                .anchors
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "anchors"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_anchors(&spec),
+            )?;
+            let runtime = service.reflex_runtime().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "reflex_runtime",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/reflex initialization and retry storage operation=anchors",
+                )
+            })?;
+            let response =
+                crate::m3::storage::inspect_storage_anchors(&runtime, &spec).map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &spec.cf_name,
+                        STORAGE_SOT,
+                        error,
+                        "pass an exact source cf_name/key_hex pair and inspect the source row before retrying",
+                    )
+                })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx Anchors CF source_cf={} key={} cx_id={} anchors={}",
+                    response.source_cf,
+                    response.source_key_hex,
+                    response.cx_id,
+                    response.anchor_count
+                ),
+                |out| out.anchors = Some(response),
+            )))
+        }
         StorageOperation::GcOnce => {
             let spec = params
                 .0
