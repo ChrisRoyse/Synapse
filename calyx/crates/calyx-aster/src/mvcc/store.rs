@@ -391,9 +391,7 @@ impl VersionedCfStore {
         }
 
         let mut table = self.rows.write().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC row-table lock was poisoned during atomic commit",
-            )
+            CalyxError::aster_corrupt_shard("MVCC row-table lock was poisoned during atomic commit")
         })?;
         if let Some(router) = self.router.write().expect("mvcc router poisoned").as_mut() {
             // Rows written here belong to the seq allocated below (current + 1,
