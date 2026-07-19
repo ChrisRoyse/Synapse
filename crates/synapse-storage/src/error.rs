@@ -28,6 +28,12 @@ pub enum StorageError {
     },
     #[error("storage write failed in {cf_name}: {detail}")]
     WriteFailed { cf_name: String, detail: String },
+    #[error("Calyx storage write failed in {cf_name}: {detail}")]
+    CalyxWriteFailed {
+        cf_name: String,
+        code: &'static str,
+        detail: String,
+    },
     #[error("storage write shed in {cf_name} under disk pressure {pressure_level}: {rows} rows")]
     WriteShed {
         cf_name: String,
@@ -38,6 +44,12 @@ pub enum StorageError {
     UnsafeGcEvictionRefused { cf_name: String, detail: String },
     #[error("storage read failed in {cf_name}: {detail}")]
     ReadFailed { cf_name: String, detail: String },
+    #[error("Calyx storage read failed in {cf_name}: {detail}")]
+    CalyxReadFailed {
+        cf_name: String,
+        code: &'static str,
+        detail: String,
+    },
     #[error("storage schema mismatch: expected {expected}, actual {actual}")]
     SchemaMismatch { expected: u32, actual: u32 },
 }
@@ -53,6 +65,7 @@ impl StorageError {
             Self::EncodeJson { .. } | Self::WriteFailed { .. } | Self::WriteShed { .. } => {
                 error_codes::STORAGE_WRITE_FAILED
             }
+            Self::CalyxWriteFailed { code, .. } | Self::CalyxReadFailed { code, .. } => code,
             Self::UnsafeGcEvictionRefused { .. } => error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED,
             Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,

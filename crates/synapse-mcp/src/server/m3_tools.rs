@@ -1632,8 +1632,8 @@ impl SynapseService {
             "storage_inspect",
             &crate::m3::storage::required_permissions_inspect(&params.0),
         )?;
-        let runtime = self.reflex_runtime()?;
-        inspect_storage(&runtime, &params.0).map(Json)
+        let db = self.m3_storage()?;
+        inspect_storage(&db, &params.0).map(Json)
     }
 
     #[tool(
@@ -2178,8 +2178,8 @@ impl SynapseService {
             "storage_gc_once",
             &crate::m3::storage::required_permissions_gc(&params.0),
         )?;
-        let runtime = self.reflex_runtime()?;
-        run_storage_gc_once(&runtime, &params.0).map(Json)
+        let db = self.m3_storage()?;
+        run_storage_gc_once(&db, &params.0).map(Json)
     }
 
     #[tool(description = "Apply one synthetic free-byte sample through storage pressure handling")]

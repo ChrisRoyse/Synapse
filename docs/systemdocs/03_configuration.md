@@ -66,7 +66,7 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | bool | `false` | Force reflex into degraded mode (testing/diagnostic). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | u64 (BYTES) | none | Inject a synthetic free-bytes value for disk-pressure logic. |
 | `--calyx-vault` | `SYNAPSE_CALYX_VAULT` | bool | `true` | Enable the embedded Calyx vault. |
-| `--calyx-vault-dir` | `SYNAPSE_CALYX_VAULT_DIR` | path | `%APPDATA%\synapse\vault` | Durable Calyx vault directory. Empty value is a hard startup error. |
+| `--calyx-vault-dir` | `SYNAPSE_CALYX_VAULT_DIR` | path | same as `--db` | Compatibility assertion for the sole storage-owned Calyx vault. If set, it must resolve to the configured DB path; a conflicting side-vault path is a hard startup error. |
 | `--calyx-config` | `SYNAPSE_CALYX_CONFIG` | path | none | Optional TOML file with exactly one `[calyx]` section. Unknown keys, missing section, unreadable file, invalid values, and contradictory clock settings fail startup with remediation. |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | NonZeroUsize | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | Cap on event-bus subscriptions. |
 | `--allow-shell` (repeatable) | `SYNAPSE_ALLOW_SHELL` (comma-sep) | regex list | empty | Allowlist regexes for `act_run_shell` command lines (merged with env, §1). |

@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 pub use backend::{
     CalyxAnchorBatchWriteReport, CalyxAnchorRow, CalyxAnchorScanReport, CalyxAnchorValueReadback,
     CalyxAnchorWriteReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
-    GroundingAnchorSource, GroundingAnchorValue, STORAGE_METADATA_ONLY_REDACTION_POLICY,
-    StorageBackendKind, StorageCfDump, StorageDumpRow, dump_cf_read_only,
-    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
-    scan_cf_read_only_with_expired,
+    GroundingAnchorSource, GroundingAnchorValue, McpUsageGroundedPublicationReport,
+    STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind, StorageCfDump, StorageDumpRow,
+    dump_cf_read_only, dump_cf_read_only_with_expired, inspect_calyx_vault_read_only,
+    scan_cf_read_only, scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
@@ -367,6 +367,29 @@ impl Db {
         self.backend.calyx_vault_inspect()
     }
 
+    /// Returns the status of the exact process-local Calyx vault that owns
+    /// Synapse storage and native intelligence rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the lifecycle owner is poisoned or closed.
+    pub fn calyx_vault_status(&self) -> StorageResult<synapse_calyx::SynapseCalyxVaultStatus> {
+        self.backend.calyx_vault_status()
+    }
+
+    /// Flushes and explicitly closes the sole process-local Calyx vault.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed while any cloned physical-operation handle remains active,
+    /// or when flush, PID-sidecar removal, unlock, or re-lock proof fails.
+    pub fn close_calyx_vault(
+        &self,
+        reason: &'static str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxVaultCloseReadback> {
+        self.backend.close_calyx_vault(reason)
+    }
+
     /// Measures and stores the native Calyx constellation for one persisted
     /// `CF_TIMELINE` row.
     ///
@@ -572,6 +595,36 @@ impl Db {
     ) -> StorageResult<ConstellationPutReport> {
         self.backend
             .put_mcp_usage_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Atomically persists MCP usage source rows and their grounded native
+    /// Calyx observation, then separately reads every physical source and
+    /// anchor row back before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source rows do not contain exactly one
+    /// requested MCP usage record, constellation or anchor validation fails,
+    /// the atomic Calyx commit fails, or any separate physical readback differs
+    /// from the committed source, observation, or anchor.
+    #[tracing::instrument(skip_all, fields(source_row_count = source_rows.len(), source_key_len = source_key.len(), backend = self.backend_name()))]
+    pub fn put_mcp_usage_grounded_publication(
+        &self,
+        source_rows: Vec<RawRow>,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &serde_json::Value,
+        anchor: GroundingAnchor,
+        ledger_payload: &serde_json::Value,
+    ) -> StorageResult<McpUsageGroundedPublicationReport> {
+        self.backend.put_mcp_usage_grounded_publication(
+            source_rows,
+            source_key,
+            raw_bytes,
+            record,
+            anchor,
+            ledger_payload,
+        )
     }
 
     /// Writes a grounded anchor for one persisted source row and separately

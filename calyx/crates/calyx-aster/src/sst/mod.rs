@@ -7,6 +7,9 @@ mod io_helpers;
 pub mod level;
 mod page;
 mod point_read;
+mod reader_cache;
+
+pub use reader_cache::{invalidate_reader, shared_reader};
 
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;

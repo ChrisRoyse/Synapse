@@ -300,7 +300,6 @@ pub struct M3State {
     pub storage_pressure_free_bytes_sample: Option<u64>,
     pub calyx_vault_enabled: bool,
     pub calyx_vault_config: Option<synapse_calyx::SynapseCalyxConfig>,
-    pub calyx_vault: Option<synapse_calyx::SynapseCalyxVault>,
     pub calyx_vault_status: synapse_calyx::SynapseCalyxVaultStatus,
     /// Shared storage handle. Opened once (eagerly at daemon startup, or lazily
     /// on first reflex use) and reused by the reflex runtime so there is never
@@ -473,16 +472,29 @@ impl M3State {
         let reflex_force_degraded =
             parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
-        let calyx_vault_config = if calyx_vault_enabled {
-            Some(
-                synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir_and_config_path(
-                    calyx_vault_dir,
-                    calyx_config_path,
-                )?,
-            )
-        } else {
-            None
-        };
+        if !calyx_vault_enabled {
+            anyhow::bail!(
+                "SYNAPSE_CALYX_STORAGE_VAULT_REQUIRED: the sole supported storage backend is Calyx, so disabling its vault would disable storage; remove --no-calyx-vault/SYNAPSE_CALYX_VAULT=false"
+            );
+        }
+        let storage_vault_dir = db_path.clone().unwrap_or_else(default_db_path);
+        if let Some(requested) = calyx_vault_dir.as_ref() {
+            let requested = std::path::absolute(requested)?;
+            let storage = std::path::absolute(&storage_vault_dir)?;
+            if requested != storage {
+                anyhow::bail!(
+                    "SYNAPSE_CALYX_VAULT_PATH_CONFLICT: configured Calyx vault {} differs from the sole storage vault {}; set SYNAPSE_CALYX_VAULT_DIR/--calyx-vault-dir to the DB path or remove it",
+                    requested.display(),
+                    storage.display()
+                );
+            }
+        }
+        let calyx_vault_config = Some(
+            synapse_calyx::SynapseCalyxConfig::from_optional_vault_dir_and_config_path(
+                Some(storage_vault_dir),
+                calyx_config_path,
+            )?,
+        );
         let calyx_vault_status = calyx_vault_config
             .as_ref()
             .map_or_else(synapse_calyx::SynapseCalyxVaultStatus::disabled, |config| {
@@ -517,7 +529,6 @@ impl M3State {
             storage_pressure_free_bytes_sample,
             calyx_vault_enabled,
             calyx_vault_config,
-            calyx_vault: None,
             calyx_vault_status,
             db: None,
             storage_gc_task: None,
@@ -705,25 +716,27 @@ impl M3State {
             self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::disabled();
             return Ok(self.calyx_vault_status.clone());
         }
-        if let Some(vault) = &self.calyx_vault {
-            self.calyx_vault_status = vault.status();
-            return Ok(self.calyx_vault_status.clone());
-        }
-        let Some(config) = self.calyx_vault_config.clone() else {
+        let Some(config) = self.calyx_vault_config.as_ref() else {
             let error = synapse_calyx::SynapseCalyxError::new(
                 "SYNAPSE_CALYX_CONFIG_MISSING",
                 "Calyx vault is enabled but no resolved vault configuration is present",
-                "restart with SYNAPSE_CALYX_VAULT=true and a valid APPDATA or SYNAPSE_CALYX_VAULT_DIR",
+                "restart with the Calyx storage DB path configured as the sole vault path",
             );
             self.calyx_vault_status =
                 synapse_calyx::SynapseCalyxVaultStatus::error(None, "error", &error);
             return Err(error);
         };
-        match synapse_calyx::SynapseCalyxVault::open(config.clone()) {
-            Ok(vault) => {
-                let status = vault.status();
+        let config = config.clone();
+        let status = self
+            .ensure_storage()
+            .map_err(|error| storage_owned_calyx_error("open sole Calyx storage vault", &error))?
+            .calyx_vault_status()
+            .map_err(|error| {
+                storage_owned_calyx_error("read sole Calyx storage vault status", &error)
+            });
+        match status {
+            Ok(status) => {
                 self.calyx_vault_status = status.clone();
-                self.calyx_vault = Some(vault);
                 Ok(status)
             }
             Err(error) => {
@@ -748,12 +761,12 @@ impl M3State {
                 reason,
             ));
         }
-        let Some(vault) = self.calyx_vault.take() else {
+        let Some(db) = self.db.as_ref() else {
             if expected_open {
                 let error = synapse_calyx::SynapseCalyxError::new(
                     "SYNAPSE_CALYX_VAULT_MISSING_AT_SHUTDOWN",
-                    "Calyx vault was expected to be open during daemon shutdown but no handle was present",
-                    "inspect startup logs; the daemon must open the vault before serving and retain the handle until shutdown",
+                    "the sole Calyx storage vault was expected during daemon shutdown but storage was not open",
+                    "inspect startup logs; the daemon must open the storage-owned vault before serving and retain the Db owner until shutdown",
                 );
                 self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus::error(
                     self.calyx_vault_config.as_ref(),
@@ -767,7 +780,9 @@ impl M3State {
                 self.calyx_vault_config.as_ref(),
             ));
         };
-        match vault.close(reason) {
+        match db.close_calyx_vault(reason).map_err(|error| {
+            storage_owned_calyx_error("flush and close sole Calyx storage vault", &error)
+        }) {
             Ok(readback) => {
                 self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus {
                     enabled: true,
@@ -794,9 +809,10 @@ impl M3State {
 
     #[must_use]
     pub fn calyx_vault_status(&self) -> synapse_calyx::SynapseCalyxVaultStatus {
-        self.calyx_vault
+        self.db
             .as_ref()
-            .map_or_else(|| self.calyx_vault_status.clone(), |vault| vault.status())
+            .and_then(|db| db.calyx_vault_status().ok())
+            .unwrap_or_else(|| self.calyx_vault_status.clone())
     }
 
     #[must_use]
@@ -1113,6 +1129,17 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 58] {
         intent::intent_current(),
         intent_events::intent_detect_tick(),
     ]
+}
+
+fn storage_owned_calyx_error(
+    operation: &str,
+    error: &impl std::fmt::Display,
+) -> synapse_calyx::SynapseCalyxError {
+    synapse_calyx::SynapseCalyxError::new(
+        "SYNAPSE_CALYX_STORAGE_VAULT_FAILED",
+        format!("{operation}: {error}"),
+        "inspect the storage-owned Calyx vault lock/PID, manifest, WAL, and the preceding structured storage error; repair that one vault and retry",
+    )
 }
 
 fn parse_bool_env(name: &str, value: Option<&str>) -> Result<bool> {

@@ -46,9 +46,8 @@ impl ReflexRuntime {
     ///
     /// # Errors
     ///
-    /// The scaffold currently cannot fail after receiving initialized handles.
-    /// Later M3 scheduler/bus work extends this result with OS-thread setup
-    /// errors.
+    /// Fails closed when the schema-owned reflex audit migration cannot prove
+    /// every legacy retention-corrupted row was repaired and read back.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn spawn(
         db: Arc<Db>,
@@ -62,7 +61,8 @@ impl ReflexRuntime {
     ///
     /// # Errors
     ///
-    /// The scaffold currently cannot fail after receiving initialized handles.
+    /// Fails closed when reflex audit storage contains unrecognized invalid
+    /// rows or a schema-owned migration cannot be durably read back.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn spawn_with_config(
         db: Arc<Db>,
@@ -70,6 +70,7 @@ impl ReflexRuntime {
         event_bus: EventBus,
         scheduler_config: SchedulerConfig,
     ) -> ReflexResult<Self> {
+        crate::audit_migration::repair_reflex_audit_retention_corruption(&db)?;
         Ok(Self {
             db,
             action_handle,

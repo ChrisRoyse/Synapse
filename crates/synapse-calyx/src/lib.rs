@@ -12,13 +12,16 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_prefix_range};
+use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_key, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::{
-    AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, VaultOptions, encode as vault_encode,
+    AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook, VaultOptions,
+    encode as vault_encode,
 };
-use calyx_core::{Anchor, CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId};
+use calyx_core::{
+    Anchor, AnchorKind, CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId,
+};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -105,6 +108,28 @@ pub struct SynapseCalyxAnchorBatchWriteReadback {
     pub ledger_seq: Option<Seq>,
     pub ledger_hash: Option<String>,
     pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxGroundedObservationReadback {
+    pub cx_id: String,
+    pub disposition: SynapseCalyxPutDisposition,
+    pub ledger_seq: Seq,
+    pub ledger_hash: String,
+    pub source_row_count: usize,
+    pub committed_seq: Seq,
+    pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxNativeFanoutReadback {
+    pub attempted_cfs: usize,
+    pub compacted_cfs: usize,
+    pub skipped_cfs: usize,
+    pub reclaimed_input_files: usize,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub compacted_cf_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -509,13 +534,22 @@ impl SynapseCalyxError {
     #[must_use]
     pub fn from_calyx(action: &str, error: &calyx_core::CalyxError) -> Self {
         let code = error_bridge::map_calyx_error_code(error.code).unwrap_or_else(|| {
-            tracing::error!(
-                code = error_bridge::SYNAPSE_CALYX_UNMAPPED_ERROR,
-                calyx_code = error.code,
-                action,
-                "unmapped Calyx error reached the Synapse bridge"
-            );
-            error_bridge::SYNAPSE_CALYX_UNMAPPED_ERROR
+            if error.code.starts_with("CALYX_") {
+                tracing::debug!(
+                    code = error.code,
+                    action,
+                    "preserving subsystem-local Calyx error code across the Synapse bridge"
+                );
+                error.code
+            } else {
+                tracing::error!(
+                    code = error_bridge::SYNAPSE_CALYX_UNMAPPED_ERROR,
+                    calyx_code = error.code,
+                    action,
+                    "invalid non-Calyx error code reached the Synapse bridge"
+                );
+                error_bridge::SYNAPSE_CALYX_UNMAPPED_ERROR
+            }
         });
         Self {
             code,
@@ -905,6 +939,20 @@ impl SynapseCalyxReadOnlyVault {
     ) -> Result<Vec<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
         scan_anchors_for_cx_from_vault(&self.vault, cx_id)
     }
+
+    /// Reads one exact physical `Anchors` CF row by its canonical key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the exact row cannot be
+    /// read or its physical value fails to decode.
+    pub fn read_anchor_exact(
+        &self,
+        cx_id: CxId,
+        kind: &AnchorKind,
+    ) -> Result<Option<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
+        read_anchor_exact_from_vault(&self.vault, cx_id, kind)
+    }
 }
 
 impl SynapseCalyxVault {
@@ -946,6 +994,19 @@ impl SynapseCalyxVault {
         open_mode: SynapseCalyxVaultOpenMode,
     ) -> Result<Self, SynapseCalyxError> {
         error_bridge::validate_calyx_error_bridge()?;
+        let mut options = options.clone();
+        let recovery_vault_dir = config.vault_dir.clone();
+        options.recovery_progress = Some(RecoveryProgressHook::new(
+            move |bytes_replayed, bytes_total| {
+                tracing::info!(
+                    code = "SYNAPSE_CALYX_WAL_RECOVERY_PROGRESS",
+                    vault_dir = %recovery_vault_dir.display(),
+                    bytes_replayed,
+                    bytes_total,
+                    "Calyx WAL recovery made physical byte progress"
+                );
+            },
+        ));
         let clock = SynapseCalyxClock::from_tuning(&config.tuning)?;
         let started_at = Instant::now();
         tracing::info!(
@@ -1262,6 +1323,54 @@ impl SynapseCalyxVault {
         ))
     }
 
+    /// Atomically publishes physical source rows and the grounded native
+    /// observation derived from them under one Aster commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error before visibility when source
+    /// rows are empty/duplicated/non-KV, the source or constellation already
+    /// exists, schema/grounding validation fails, or the ledger/WAL commit
+    /// cannot complete.
+    pub fn put_grounded_observation_with_source_rows(
+        &self,
+        source_rows: Vec<SynapseCalyxCfWrite>,
+        content_addressed_source_identity: Vec<u8>,
+        constellation: Constellation,
+        anchor: Anchor,
+        ledger_payload: Vec<u8>,
+        actor_service: impl Into<String>,
+    ) -> Result<SynapseCalyxGroundedObservationReadback, SynapseCalyxError> {
+        let outcome = self
+            .vault
+            .put_grounded_observation_with_source_rows(
+                source_rows
+                    .into_iter()
+                    .map(|row| (row.cf, row.key, row.value))
+                    .collect(),
+                content_addressed_source_identity,
+                constellation,
+                anchor,
+                ledger_payload,
+                ActorId::Service(actor_service.into()),
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "put atomic grounded Calyx observation with source rows",
+                    &error,
+                )
+            })?;
+        Ok(SynapseCalyxGroundedObservationReadback {
+            cx_id: outcome.cx_id.to_string(),
+            disposition: outcome.disposition.into(),
+            ledger_seq: outcome.ledger_ref.seq,
+            ledger_hash: hex_bytes(&outcome.ledger_ref.hash),
+            source_row_count: outcome.source_row_count,
+            committed_seq: outcome.committed_seq,
+            latest_seq: self.vault.latest_seq(),
+        })
+    }
+
     /// Runs one physical Aster compaction attempt for the Synapse KV storage CF.
     ///
     /// Synapse maps its storage column families onto namespaces inside Aster's
@@ -1280,6 +1389,47 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("compact Calyx KV CF", &error))
     }
 
+    /// Runs one bounded file-count/byte-debt maintenance pass across native
+    /// Aster column families and returns physical reclamation readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if manifest coverage cannot be
+    /// proven, an SST is malformed, output publication fails, router refresh
+    /// fails, or any proven superseded input cannot be reclaimed.
+    pub fn compact_native_fanout_once(
+        &self,
+    ) -> Result<SynapseCalyxNativeFanoutReadback, SynapseCalyxError> {
+        let results = self.vault.compact_native_fanout_once().map_err(|error| {
+            SynapseCalyxError::from_calyx("compact native Calyx CF fan-out", &error)
+        })?;
+        let attempted_cfs = results.len();
+        let mut compacted_cfs = 0_usize;
+        let mut reclaimed_input_files = 0_usize;
+        let mut input_bytes = 0_u64;
+        let mut output_bytes = 0_u64;
+        let mut compacted_cf_names = Vec::new();
+        for result in results {
+            if let CompactionResult::Compacted(report) = result {
+                compacted_cfs = compacted_cfs.saturating_add(1);
+                reclaimed_input_files =
+                    reclaimed_input_files.saturating_add(report.reclaimed_input_files);
+                input_bytes = input_bytes.saturating_add(report.input_bytes);
+                output_bytes = output_bytes.saturating_add(report.output_bytes);
+                compacted_cf_names.push(report.cf.name().clone());
+            }
+        }
+        Ok(SynapseCalyxNativeFanoutReadback {
+            attempted_cfs,
+            compacted_cfs,
+            skipped_cfs: attempted_cfs.saturating_sub(compacted_cfs),
+            reclaimed_input_files,
+            input_bytes,
+            output_bytes,
+            compacted_cf_names,
+        })
+    }
+
     /// Prunes durable MVCC tombstones from the Synapse KV storage CF.
     ///
     /// # Errors
@@ -1290,6 +1440,25 @@ impl SynapseCalyxVault {
         self.vault
             .purge_tombstoned_cfs(&[ColumnFamily::Kv])
             .map_err(|error| SynapseCalyxError::from_calyx("purge Calyx KV tombstones", &error))
+    }
+
+    /// Flushes pending Aster checkpoints and performs one bounded physical WAL
+    /// recycle pass using the manifest durable sequence as the sole reclaim
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when either bound is zero,
+    /// checkpoint/manifest coverage cannot be proven, WAL inventory is
+    /// corrupt, or a bounded segment truncate/fsync fails.
+    pub fn recycle_durable_wal_once(
+        &self,
+        max_segments: usize,
+        fsync_budget: usize,
+    ) -> Result<calyx_aster::wal::WalRecycleReport, SynapseCalyxError> {
+        self.vault
+            .recycle_durable_wal_once(max_segments, fsync_budget)
+            .map_err(|error| SynapseCalyxError::from_calyx("recycle durable Calyx WAL", &error))
     }
 
     /// Writes raw CF rows through Aster's durable WAL/MVCC commit path.
@@ -1425,6 +1594,20 @@ impl SynapseCalyxVault {
         cx_id: CxId,
     ) -> Result<Vec<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
         scan_anchors_for_cx_from_vault(&self.vault, cx_id)
+    }
+
+    /// Reads one exact physical `Anchors` CF row by its canonical key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the exact row cannot be
+    /// read or its physical value fails to decode.
+    pub fn read_anchor_exact(
+        &self,
+        cx_id: CxId,
+        kind: &AnchorKind,
+    ) -> Result<Option<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
+        read_anchor_exact_from_vault(&self.vault, cx_id, kind)
     }
 
     /// Pins a bounded reader lease.
@@ -1963,6 +2146,27 @@ fn scan_anchors_for_cx_from_vault<C: Clock>(
             Ok(SynapseCalyxAnchorReadback { key, anchor })
         })
         .collect()
+}
+
+fn read_anchor_exact_from_vault<C: Clock>(
+    vault: &AsterVault<C>,
+    cx_id: CxId,
+    kind: &AnchorKind,
+) -> Result<Option<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
+    let key = anchor_key(cx_id, kind);
+    let value = vault
+        .read_cf_at(vault.latest_seq(), ColumnFamily::Anchors, &key)
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx("read exact Calyx Anchors CF row", &error)
+        })?;
+    value
+        .map(|value| {
+            let anchor = vault_encode::decode_anchor(&value).map_err(|error| {
+                SynapseCalyxError::from_calyx("decode exact Calyx Anchors CF row", &error)
+            })?;
+            Ok(SynapseCalyxAnchorReadback { key, anchor })
+        })
+        .transpose()
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

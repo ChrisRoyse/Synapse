@@ -4,13 +4,15 @@ use super::{
     SstShard, WRITE_AMP_SCALE,
 };
 use crate::cf::ColumnFamily;
-use crate::sst::{SstStreamingReader, SstSummary, write_sst};
+use crate::sst::{SstStreamingReader, SstSummary, shared_reader, write_sst};
 use crate::storage_names::{SstName, classify_sst};
 use calyx_core::{CalyxError, Result};
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const SST_HEADER_LEN: u64 = 32;
 const SST_RECORD_HEADER_LEN: u64 = 12;
@@ -43,36 +45,45 @@ pub(super) fn compact_shards_with_target(
         CalyxError::disk_pressure(format!("create compaction output dir: {error}"))
     })?;
 
-    let mut cursors = Vec::with_capacity(inputs.len());
-    let mut heap = BinaryHeap::new();
-    for (precedence, shard) in inputs.iter().enumerate() {
-        let cursor_index = cursors.len();
-        cursors.push(SstCursor::open(shard, precedence)?);
-        push_cursor_front(&mut heap, &cursors, cursor_index);
-    }
-
     let mut writer = RollingSstWriter::new(&output_path, output_target_bytes)?;
     let mut logical_bytes = 0_u64;
     let mut emitted_keys = 0_u64;
-    while let Some(item) = heap.pop() {
-        let key = item.key;
-        let mut winner_precedence = item.precedence;
-        let mut winner = cursors[item.cursor_index].entry_at_current()?;
-        advance_cursor(&mut heap, &mut cursors, item.cursor_index);
-
-        while heap.peek().is_some_and(|next| next.key == key) {
-            let duplicate = heap.pop().expect("heap peeked duplicate");
-            let candidate = cursors[duplicate.cursor_index].entry_at_current()?;
-            if duplicate.precedence >= winner_precedence {
-                winner_precedence = duplicate.precedence;
-                winner = candidate;
-            }
-            advance_cursor(&mut heap, &mut cursors, duplicate.cursor_index);
+    if throttle.max_input_bytes.is_some() {
+        let merged = materialize_byte_bounded_inputs(inputs)?;
+        for (key, value) in merged {
+            logical_bytes = logical_bytes.saturating_add(value.len() as u64);
+            emitted_keys = emitted_keys.saturating_add(1);
+            writer.push(key, value)?;
+        }
+    } else {
+        let mut cursors = Vec::with_capacity(inputs.len());
+        let mut heap = BinaryHeap::new();
+        for (precedence, shard) in inputs.iter().enumerate() {
+            let cursor_index = cursors.len();
+            cursors.push(SstCursor::open(shard, precedence)?);
+            push_cursor_front(&mut heap, &cursors, cursor_index);
         }
 
-        logical_bytes = logical_bytes.saturating_add(winner.value.len() as u64);
-        emitted_keys = emitted_keys.saturating_add(1);
-        writer.push(winner.key, winner.value)?;
+        while let Some(item) = heap.pop() {
+            let key = item.key;
+            let mut winner_precedence = item.precedence;
+            let mut winner = cursors[item.cursor_index].entry_at_current()?;
+            advance_cursor(&mut heap, &mut cursors, item.cursor_index);
+
+            while heap.peek().is_some_and(|next| next.key == key) {
+                let duplicate = heap.pop().expect("heap peeked duplicate");
+                let candidate = cursors[duplicate.cursor_index].entry_at_current()?;
+                if duplicate.precedence >= winner_precedence {
+                    winner_precedence = duplicate.precedence;
+                    winner = candidate;
+                }
+                advance_cursor(&mut heap, &mut cursors, duplicate.cursor_index);
+            }
+
+            logical_bytes = logical_bytes.saturating_add(winner.value.len() as u64);
+            emitted_keys = emitted_keys.saturating_add(1);
+            writer.push(winner.key, winner.value)?;
+        }
     }
     let summaries = writer.finish(emitted_keys == 0)?;
     let output_shards = summaries
@@ -100,7 +111,7 @@ pub(super) fn compact_shards_with_target(
         .ok_or_else(|| CalyxError::disk_pressure("compaction produced no output SST"))?;
     let write_amp_milli = output_bytes.saturating_mul(WRITE_AMP_SCALE) / logical_bytes.max(1);
 
-    Ok(CompactionResult::Compacted(CompactionReport {
+    Ok(CompactionResult::Compacted(Box::new(CompactionReport {
         cf,
         input_files: inputs.len(),
         input_paths: inputs.iter().map(|shard| shard.path.clone()).collect(),
@@ -114,7 +125,73 @@ pub(super) fn compact_shards_with_target(
         output_path,
         output_paths,
         staging_parent: parent,
-    }))
+    })))
+}
+
+/// Reads file-and-byte-bounded inputs in parallel chunks, then merges each
+/// chunk in canonical oldest-to-newest order.
+///
+/// Live maintenance always supplies a hard physical byte ceiling before
+/// entering this path. Materializing under that ceiling avoids the pathological
+/// two-open-per-row behavior of a tens-of-thousands-way streaming merge while
+/// retaining deterministic newest-wins semantics. Chunking bounds transient
+/// decoded-file memory independently from the full input set.
+fn materialize_byte_bounded_inputs(inputs: &[SstShard]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    const PARALLEL_READ_CHUNK_FILES: usize = 1_024;
+    const COMPACTION_READ_THREADS: usize = 4;
+
+    tracing::info!(
+        code = "CALYX_ASTER_COMPACTION_BOUNDED_PARALLEL_READ_START",
+        input_files = inputs.len(),
+        input_bytes = inputs.iter().map(|input| input.bytes).sum::<u64>(),
+        parallel_read_chunk_files = PARALLEL_READ_CHUNK_FILES,
+        compaction_read_threads = COMPACTION_READ_THREADS,
+        "starting byte-bounded parallel SST materialization"
+    );
+    let started = std::time::Instant::now();
+    let pool = compaction_read_pool(COMPACTION_READ_THREADS)?;
+    let mut merged = BTreeMap::new();
+    for chunk in inputs.chunks(PARALLEL_READ_CHUNK_FILES) {
+        let decoded = pool.install(|| {
+            chunk
+                .par_iter()
+                .map(|shard| shared_reader(&shard.path)?.iter())
+                .collect::<Result<Vec<_>>>()
+        })?;
+        // Rayon preserves indexed collect order, so later shard rows overwrite
+        // earlier ones exactly as the canonical compaction catalog requires.
+        for rows in decoded {
+            for row in rows {
+                merged.insert(row.key, row.value);
+            }
+        }
+    }
+    tracing::info!(
+        code = "CALYX_ASTER_COMPACTION_BOUNDED_PARALLEL_READ_DONE",
+        input_files = inputs.len(),
+        merged_rows = merged.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "completed byte-bounded parallel SST materialization"
+    );
+    Ok(merged)
+}
+
+fn compaction_read_pool(threads: usize) -> Result<&'static ThreadPool> {
+    static POOL: OnceLock<std::result::Result<ThreadPool, String>> = OnceLock::new();
+    match POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("calyx-compaction-read-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(pool) => Ok(pool),
+        Err(error) => Err(CalyxError {
+            code: "CALYX_ASTER_COMPACTION_POOL_INIT_FAILED",
+            message: format!("initialize dedicated {threads}-thread compaction read pool: {error}"),
+            remediation: "inspect host thread limits and the preceding OS error, then retry",
+        }),
+    }
 }
 
 struct SstCursor {
@@ -359,28 +436,17 @@ fn rolled_compaction_output_path(base_path: &Path, ordinal: usize) -> Result<Pat
             base_path.display()
         ))
     })?;
-    let (seq, index) = match name {
+    let (seq, upper_index) = match name {
         SstName::DurableBatch { seq, index } => {
-            let index = index.checked_sub(ordinal).ok_or_else(|| {
+            let upper_index = index.checked_sub(1).ok_or_else(|| {
                 CalyxError::aster_corrupt_shard(format!(
                     "rolled compaction adoption slots exhausted below {}",
                     base_path.display()
                 ))
             })?;
-            (seq, index)
+            (seq, upper_index)
         }
-        SstName::Compacted { seq } => {
-            let offset = ordinal.saturating_sub(1);
-            let index = COMPACTION_ADOPTION_LAST_INDEX
-                .checked_sub(offset)
-                .ok_or_else(|| {
-                    CalyxError::aster_corrupt_shard(format!(
-                        "rolled compaction adoption slots exhausted below {}",
-                        base_path.display()
-                    ))
-                })?;
-            (seq, index)
-        }
+        SstName::Compacted { seq } => (seq, COMPACTION_ADOPTION_LAST_INDEX),
         SstName::RouterLegacy { .. } | SstName::Flush { .. } => {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "rolled compaction output must be commit-domain named: {}",
@@ -388,16 +454,23 @@ fn rolled_compaction_output_path(base_path: &Path, ordinal: usize) -> Result<Pat
             )));
         }
     };
-    if !(COMPACTION_ADOPTION_FIRST_INDEX..=COMPACTION_ADOPTION_LAST_INDEX).contains(&index) {
-        return Err(CalyxError {
-            code: "CALYX_ASTER_COMPACTION_SLOTS_EXHAUSTED",
-            message: format!(
-                "no rolled compaction adoption slot remains for commit seq {seq} in {}",
-                parent.display()
-            ),
-            remediation: "advance the vault durable seq or remove superseded compaction outputs \
-                          via a verified compaction before retrying",
-        });
+    let capped_upper = upper_index.min(COMPACTION_ADOPTION_LAST_INDEX);
+    if capped_upper >= COMPACTION_ADOPTION_FIRST_INDEX {
+        for index in (COMPACTION_ADOPTION_FIRST_INDEX..=capped_upper).rev() {
+            let path = parent.join(format!("{seq:020}-{index:04}.sst"));
+            if !path.exists() {
+                return Ok(path);
+            }
+        }
     }
-    Ok(parent.join(format!("{seq:020}-{index:04}.sst")))
+    Err(CalyxError {
+        code: "CALYX_ASTER_COMPACTION_SLOTS_EXHAUSTED",
+        message: format!(
+            "no free rolled compaction adoption slot remains below {} for commit seq {seq} in {}",
+            base_path.display(),
+            parent.display()
+        ),
+        remediation: "advance the vault durable seq or remove superseded compaction outputs via a \
+                      verified compaction before retrying",
+    })
 }

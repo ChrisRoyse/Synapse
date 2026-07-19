@@ -87,9 +87,9 @@ struct ActParams {
     #[serde(default)]
     reason: Option<String>,
     /// Foreground input lease lifetime for operation=foreground or
-    /// operation=lease_acquire. Must be in [100, 30000].
+    /// operation=lease_acquire. Must be in [100, 300000].
     #[serde(default)]
-    #[schemars(range(min = 100, max = 30000))]
+    #[schemars(range(min = 100, max = 300000))]
     ttl_ms: Option<u64>,
 }
 

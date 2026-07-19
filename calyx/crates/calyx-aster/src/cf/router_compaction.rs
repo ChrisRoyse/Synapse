@@ -1,7 +1,7 @@
 use super::{CfRouter, ColumnFamily, NO_COMMIT_DOMAIN};
 use crate::mvcc::is_tombstone_value;
 use crate::sst::level::SstLevel;
-use crate::sst::write_sst;
+use crate::sst::{invalidate_reader, write_sst};
 use crate::storage_names::flush_sst_file_name;
 use calyx_core::{CalyxError, Result};
 use std::fs;
@@ -66,6 +66,7 @@ impl CfRouter {
             if input == output {
                 continue;
             }
+            invalidate_reader(&input);
             fs::remove_file(&input).map_err(|error| {
                 CalyxError::disk_pressure(format!(
                     "reclaim router compaction input {}: {error}",

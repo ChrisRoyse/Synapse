@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError as MutexTryLockError};
 use std::time::Duration;
 
 static PROCESS_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
@@ -27,6 +27,48 @@ impl FileLockGuard {
             _process_guard: process_guard,
             _file: file,
         })
+    }
+
+    /// Attempts to acquire a durable lock without joining an in-process or
+    /// cross-process waiter queue.
+    ///
+    /// Long-running maintenance uses this admission path so an already-active
+    /// pass is observable as backpressure immediately instead of consuming an
+    /// entire caller deadline while waiting to perform redundant work.
+    pub(crate) fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let key = lock_key(path)?;
+        let process_guard = match process_mutex(&key).try_lock() {
+            Ok(guard) => guard,
+            Err(MutexTryLockError::WouldBlock) => return Ok(None),
+            Err(MutexTryLockError::Poisoned(_)) => {
+                return Err(CalyxError::backpressure("file lock mutex poisoned"));
+            }
+        };
+        let Some(file) = try_open_lock_file(path)? else {
+            return Ok(None);
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self {
+                _process_guard: process_guard,
+                _file: file,
+            })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) if is_windows_lock_contention(&error) => Ok(None),
+            Err(TryLockError::Error(error)) => {
+                tracing::error!(
+                    path = %path.display(),
+                    kind = ?error.kind(),
+                    os_error = error.raw_os_error(),
+                    "nonblocking durable file lock acquisition failed"
+                );
+                Err(CalyxError::backpressure(format!(
+                    "try lock file {}: kind={:?} raw_os_error={:?}: {error}",
+                    path.display(),
+                    error.kind(),
+                    error.raw_os_error()
+                )))
+            }
+        }
     }
 }
 
@@ -78,6 +120,32 @@ fn open_lock_file(path: &Path) -> Result<File> {
                     error.raw_os_error()
                 )));
             }
+        }
+    }
+}
+
+fn try_open_lock_file(path: &Path) -> Result<Option<File>> {
+    match OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if is_windows_lock_contention(&error) => Ok(None),
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                kind = ?error.kind(),
+                os_error = error.raw_os_error(),
+                "open durable lock file for nonblocking acquisition failed"
+            );
+            Err(CalyxError::disk_pressure(format!(
+                "open lock file {} for nonblocking acquisition: kind={:?} raw_os_error={:?}: {error}",
+                path.display(),
+                error.kind(),
+                error.raw_os_error()
+            )))
         }
     }
 }

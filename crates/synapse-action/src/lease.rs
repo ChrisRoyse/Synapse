@@ -34,7 +34,13 @@ pub const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 /// Minimum acceptable lease lifetime (clamped by [`ttl_from_ms`]).
 pub const MIN_LEASE_TTL_MS: u64 = 100;
 /// Maximum acceptable lease lifetime (clamped by [`ttl_from_ms`]).
-pub const MAX_LEASE_TTL_MS: u64 = 30_000;
+///
+/// The default stays short, but explicit maintenance/debug paths can request a
+/// longer audited lease so slow-but-live MCP/storage round trips do not expire
+/// the foreground authority precondition before the next request reaches the
+/// daemon. A lapsed holder still expires lazily and leaves the cleanup-pending
+/// record described above.
+pub const MAX_LEASE_TTL_MS: u64 = 300_000;
 /// Synthetic holder used when the operator panic hotkey preempts agents.
 pub const OPERATOR_LEASE_OWNER_SESSION_ID: &str = "__operator__";
 /// How long the operator owns the real-input resource after panic preemption.

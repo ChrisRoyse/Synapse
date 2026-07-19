@@ -18,7 +18,7 @@ use super::recovery_readback::tiered_cf_roots;
 use super::storage_error;
 use crate::cf::ColumnFamily;
 use crate::compaction::TieringPolicy;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::storage_names::{SstName, classify_sst, parse_cf_dir_name};
 use calyx_core::{CalyxError, Result};
 use std::collections::BTreeMap;
@@ -72,7 +72,7 @@ pub(in crate::vault) fn router_only_rows(
                 ) {
                     continue;
                 }
-                for row in SstReader::open(&path)?.iter()? {
+                for row in shared_reader(&path)?.iter()? {
                     if covered(cf, &row.key) {
                         continue;
                     }

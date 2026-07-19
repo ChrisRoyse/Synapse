@@ -6,11 +6,9 @@ use crate::compaction::{
 };
 use crate::gc::{GcRateLimit, GcResult, SnapshotGcTick};
 use crate::mvcc::Snapshot;
-use crate::storage_names::{classify_sst, sst_order_key};
+use crate::storage_names::sst_order_key;
 use crate::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
-use std::fs;
-use std::path::PathBuf;
 
 impl<C> AsterVault<C>
 where
@@ -122,11 +120,18 @@ where
                     manifest_durable_seq,
                 )?;
                 let net = report.input_bytes.saturating_sub(report.output_bytes) as usize;
-                self.rows.refresh_router_cfs_after_reclaim(
+                let reclaimed = self.rows.refresh_router_cfs_after_reclaim(
                     &[cf],
                     "reclaim snapshot GC inputs",
-                    || reclaim_snapshot_inputs(&report),
+                    || super::compaction_bridge::reclaim_compaction_inputs(&report),
                 )?;
+                if reclaimed != report.input_files {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "snapshot GC reclaimed {reclaimed} of {} proven input files for {}",
+                        report.input_files,
+                        cf.name()
+                    )));
+                }
                 bytes_freed = bytes_freed.saturating_add(net);
             }
         }
@@ -137,41 +142,4 @@ where
             ..GcResult::default()
         })
     }
-}
-
-fn reclaim_snapshot_inputs(report: &crate::compaction::CompactionReport) -> Result<usize> {
-    let outputs = canonical_output_paths(report)?;
-    let mut reclaimed = 0;
-    for input in &report.input_paths {
-        let input = match fs::canonicalize(input) {
-            Ok(path) => path,
-            Err(_) => continue,
-        };
-        if outputs.contains(&input) {
-            continue;
-        }
-        if classify_sst(&input)?.is_none() {
-            continue;
-        }
-        fs::remove_file(&input).map_err(|error| {
-            CalyxError::disk_pressure(format!(
-                "reclaim snapshot GC input {}: {error}",
-                input.display()
-            ))
-        })?;
-        reclaimed += 1;
-    }
-    Ok(reclaimed)
-}
-
-fn canonical_output_paths(report: &crate::compaction::CompactionReport) -> Result<Vec<PathBuf>> {
-    report
-        .output_paths
-        .iter()
-        .map(|path| {
-            fs::canonicalize(path).map_err(|error| {
-                CalyxError::disk_pressure(format!("stat snapshot GC output: {error}"))
-            })
-        })
-        .collect()
 }

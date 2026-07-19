@@ -300,9 +300,9 @@ Process-global, renewable, TTL-bounded lease over the single physical cursor/key
 |---|---|
 | `DEFAULT_LEASE_TTL_MS` | `5_000` |
 | `MIN_LEASE_TTL_MS` | `100` |
-| `MAX_LEASE_TTL_MS` | `30_000` |
+| `MAX_LEASE_TTL_MS` | `300_000` |
 | `OPERATOR_LEASE_OWNER_SESSION_ID` | `"__operator__"` |
-| `OPERATOR_PREEMPT_LEASE_TTL_MS` | `30_000` (= MAX) |
+| `OPERATOR_PREEMPT_LEASE_TTL_MS` | `300_000` (= MAX) |
 
 | API | Notes |
 |---|---|
@@ -310,8 +310,8 @@ Process-global, renewable, TTL-bounded lease over the single physical cursor/key
 | `renew(session_id, Option<ttl>)` / `release(session_id)` | `Result<LeaseStatus, LeaseError::NotHeld>` |
 | `handoff(from, to, ttl)` | atomic transfer without an unheld gap → `LeaseHandoff{prior,current}` |
 | `release_if_owner(session_id) -> bool` | infallible owner-scoped release |
-| `force_preempt(reason)` / `force_clear(reason)` / `force_clear_if_owner(session_id, reason)` | operator overrides; preempt installs the `__operator__` holder for 30 s |
-| `ttl_from_ms(ms) -> Duration` | clamps to [100, 30000] |
+| `force_preempt(reason)` / `force_clear(reason)` / `force_clear_if_owner(session_id, reason)` | operator overrides; preempt installs the `__operator__` holder for 300 s |
+| `ttl_from_ms(ms) -> Duration` | clamps to [100, 300000] |
 | `status() -> LeaseStatus` | lazily expires lapsed lease; never blocks `/health` |
 | `expired_cleanup_snapshot()` / `complete_expired_cleanup(session_id)` | pending held-input cleanup ledger |
 

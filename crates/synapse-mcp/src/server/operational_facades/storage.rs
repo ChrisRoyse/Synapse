@@ -30,27 +30,26 @@ pub(super) async fn handle(
                 STORAGE_TOOL,
                 &crate::m3::storage::required_permissions_inspect(&spec),
             )?;
-            let runtime = service.reflex_runtime().map_err(|error| {
+            let db = service.m3_storage().map_err(|error| {
                 facade_delegate_error(
                     STORAGE_TOOL,
                     operation.as_str(),
-                    "reflex_runtime",
+                    "storage",
                     STORAGE_SOT,
                     error,
                     "repair storage/reflex initialization and retry storage operation=inspect",
                 )
             })?;
-            let response =
-                crate::m3::storage::inspect_storage(&runtime, &spec).map_err(|error| {
-                    facade_delegate_error(
-                        STORAGE_TOOL,
-                        operation.as_str(),
-                        "storage_inspect",
-                        STORAGE_SOT,
-                        error,
-                        "inspect storage health and CF metadata before retrying",
-                    )
-                })?;
+            let response = crate::m3::storage::inspect_storage(&db, &spec).map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "storage_inspect",
+                    STORAGE_SOT,
+                    error,
+                    "inspect storage health and CF metadata before retrying",
+                )
+            })?;
             Ok(Json(storage_response(
                 operation,
                 format!(
@@ -98,18 +97,18 @@ pub(super) async fn handle(
                 STORAGE_TOOL,
                 &crate::m3::storage::required_permissions_anchors(&spec),
             )?;
-            let runtime = service.reflex_runtime().map_err(|error| {
+            let db = service.m3_storage().map_err(|error| {
                 facade_delegate_error(
                     STORAGE_TOOL,
                     operation.as_str(),
-                    "reflex_runtime",
+                    "storage",
                     STORAGE_SOT,
                     error,
                     "repair storage/reflex initialization and retry storage operation=anchors",
                 )
             })?;
             let response =
-                crate::m3::storage::inspect_storage_anchors(&runtime, &spec).map_err(|error| {
+                crate::m3::storage::inspect_storage_anchors(&db, &spec).map_err(|error| {
                     facade_delegate_error(
                         STORAGE_TOOL,
                         operation.as_str(),
@@ -148,9 +147,9 @@ pub(super) async fn handle(
                 STORAGE_TOOL,
                 &crate::m3::storage::required_permissions_gc(&spec),
             )?;
-            let runtime = service.reflex_runtime()?;
+            let db = service.m3_storage()?;
             let response =
-                crate::m3::storage::run_storage_gc_once(&runtime, &spec).map_err(|error| {
+                crate::m3::storage::run_storage_gc_once(&db, &spec).map_err(|error| {
                     facade_delegate_error(
                         STORAGE_TOOL,
                         operation.as_str(),

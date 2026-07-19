@@ -416,8 +416,8 @@ impl SynapseService {
     pub(crate) fn storage_summary_snapshot(
         &self,
     ) -> Result<crate::m3::storage::StorageSummaryResponse, ErrorData> {
-        let runtime = self.reflex_runtime()?;
-        crate::m3::storage::inspect_storage_summary(&runtime)
+        let db = self.m3_storage()?;
+        crate::m3::storage::inspect_storage_summary(&db)
     }
 
     pub(crate) fn m3_bind_addr(&self) -> Result<String, ErrorData> {

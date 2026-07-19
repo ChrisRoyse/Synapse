@@ -14,7 +14,7 @@ use crate::pressure::DiskPressureGuard;
 use crate::resource::ResourceCounters;
 use crate::security::value_crypto::{SharedVaultContext, open_rows, seal_rows};
 use crate::timetravel::RetentionHorizon;
-use crate::wal::{GroupCommitBatcher, WalOptions, replay_dir};
+use crate::wal::{GroupCommitBatcher, ReplayRecord, WalOptions, WalRecycleReport, replay_dir};
 use calyx_core::{CalyxError, Panel, Result, SystemClock, TemporalPolicy};
 use calyx_ledger::CheckpointConfig;
 use std::fs;
@@ -22,6 +22,31 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Optional durable-recovery progress hook: `(bytes_replayed, bytes_total)`.
+///
+/// The hook fires only as WAL replay genuinely advances, allowing embedding
+/// runtimes to distinguish slow recovery from a frozen open.
+#[derive(Clone)]
+pub struct RecoveryProgressHook(Arc<dyn Fn(u64, u64) + Send + Sync>);
+
+impl RecoveryProgressHook {
+    pub fn new(hook: impl Fn(u64, u64) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    fn report(&self, bytes_replayed: u64, bytes_total: u64) {
+        (self.0)(bytes_replayed, bytes_total);
+    }
+}
+
+impl std::fmt::Debug for RecoveryProgressHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryProgressHook")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VaultOptions {
@@ -62,6 +87,8 @@ pub struct VaultOptions {
     /// Restricts router recovery to a concrete CF set for read-only handles.
     /// This keeps analytical/search reads from enumerating unrelated large CFs.
     pub selected_cfs: Option<Vec<ColumnFamily>>,
+    /// Optional callback fired as WAL payload bytes are decoded during open.
+    pub recovery_progress: Option<RecoveryProgressHook>,
 }
 
 impl Default for VaultOptions {
@@ -83,6 +110,7 @@ impl Default for VaultOptions {
             restore_ledger_hook: true,
             read_only: false,
             selected_cfs: None,
+            recovery_progress: None,
         }
     }
 }
@@ -268,15 +296,12 @@ impl DurableVault {
                     std::mem::take(&mut batch.rows),
                 )?;
             }
-            for record in recovery.wal_records {
-                batches.push(RecoveredBatch {
-                    seq: record.seq,
-                    rows: open_rows(
-                        options.value_crypto.as_ref(),
-                        decode_write_batch(&record.payload)?,
-                    )?,
-                });
-            }
+            replay_records_into(
+                &mut batches,
+                recovery.wal_records,
+                options.value_crypto.as_ref(),
+                options.recovery_progress.as_ref(),
+            )?;
             let recovered_row_count = batches.iter().map(|batch| batch.rows.len()).sum::<usize>();
             let migrate_derived_content_model =
                 !recovery.manifest.uses_persistent_search_content_model();
@@ -312,19 +337,13 @@ impl DurableVault {
 
         let replay = replay_dir(root.join("wal"))?;
         let last_recovered_seq = replay.records.last().map_or(0, |record| record.seq);
-        let batches: Vec<RecoveredBatch> = replay
-            .records
-            .iter()
-            .map(|record| {
-                Ok(RecoveredBatch {
-                    seq: record.seq,
-                    rows: open_rows(
-                        options.value_crypto.as_ref(),
-                        decode_write_batch(&record.payload)?,
-                    )?,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let mut batches = Vec::new();
+        replay_records_into(
+            &mut batches,
+            replay.records,
+            options.value_crypto.as_ref(),
+            options.recovery_progress.as_ref(),
+        )?;
         let recovered_row_count = batches
             .iter()
             .map(|batch: &RecoveredBatch| batch.rows.len())
@@ -411,6 +430,16 @@ impl DurableVault {
         self.flush_pending_checkpoints()
     }
 
+    pub(super) fn recycle_durable_wal_segments(
+        &self,
+        max_segments: usize,
+        fsync_budget: usize,
+    ) -> Result<WalRecycleReport> {
+        let newest_durable_seq = self.manifest_durable_seq()?;
+        self.batcher
+            .recycle_durable_segments(newest_durable_seq, max_segments, fsync_budget)
+    }
+
     pub(super) fn root(&self) -> &Path {
         &self.root
     }
@@ -425,6 +454,10 @@ impl DurableVault {
 
     pub(super) fn commit_lock_path(&self) -> PathBuf {
         self.root.join("locks").join("durable.commit.lock")
+    }
+
+    pub(super) fn native_compaction_lock_path(&self) -> PathBuf {
+        self.root.join("locks").join("native.compaction.lock")
     }
 
     pub(super) fn recover_current_batches(&self) -> Result<RecoveredBatches> {
@@ -461,6 +494,44 @@ impl DurableVault {
             |policy| policy.place_current_cf(cf).absolute_dir(),
         )
     }
+}
+
+const RECOVERY_PROGRESS_STRIDE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn replay_records_into(
+    batches: &mut Vec<RecoveredBatch>,
+    records: Vec<ReplayRecord>,
+    value_crypto: Option<&SharedVaultContext>,
+    progress: Option<&RecoveryProgressHook>,
+) -> Result<()> {
+    let total_bytes = records.iter().fold(0_u64, |total, record| {
+        total.saturating_add(u64::try_from(record.payload.len()).unwrap_or(u64::MAX))
+    });
+    if let Some(hook) = progress {
+        hook.report(0, total_bytes);
+    }
+    let mut replayed_bytes = 0_u64;
+    let mut last_reported = 0_u64;
+    for record in records {
+        let payload_bytes = u64::try_from(record.payload.len()).unwrap_or(u64::MAX);
+        batches.push(RecoveredBatch {
+            seq: record.seq,
+            rows: open_rows(value_crypto, decode_write_batch(&record.payload)?)?,
+        });
+        replayed_bytes = replayed_bytes.saturating_add(payload_bytes);
+        if let Some(hook) = progress
+            && replayed_bytes.saturating_sub(last_reported) >= RECOVERY_PROGRESS_STRIDE_BYTES
+        {
+            hook.report(replayed_bytes, total_bytes);
+            last_reported = replayed_bytes;
+        }
+    }
+    if let Some(hook) = progress
+        && replayed_bytes != last_reported
+    {
+        hook.report(replayed_bytes, total_bytes);
+    }
+    Ok(())
 }
 
 fn validate_dedup_policy(policy: &DedupPolicy, panel: Option<&Panel>) -> Result<()> {

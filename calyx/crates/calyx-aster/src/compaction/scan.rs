@@ -1,5 +1,7 @@
 use super::{CompactionCatalog, SstShard, TieringPolicy};
-use crate::storage_names::{ensure_unambiguous_sst_order, parse_cf_dir_name, sst_order_key};
+use crate::storage_names::{
+    SstName, classify_sst, ensure_unambiguous_sst_order, parse_cf_dir_name, sst_order_key,
+};
 use calyx_core::{CalyxError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,8 +14,31 @@ pub fn catalog_from_vault_tiers(
     vault_dir: impl AsRef<Path>,
     tiering_policy: Option<&TieringPolicy>,
 ) -> Result<CompactionCatalog> {
+    catalog_from_vault_tiers_inner(vault_dir.as_ref(), tiering_policy, None)
+}
+
+/// Builds a catalog whose commit-domain files are covered by `durable_seq`.
+///
+/// Legacy router files have no commit-domain watermark and remain eligible
+/// under the existing unambiguous-order gate. This bounded view lets live
+/// compaction release the durable commit lock before the expensive directory
+/// scan without adopting a concurrently committed SST that the captured
+/// manifest did not yet cover.
+pub(crate) fn catalog_from_vault_tiers_through_seq(
+    vault_dir: impl AsRef<Path>,
+    tiering_policy: Option<&TieringPolicy>,
+    durable_seq: u64,
+) -> Result<CompactionCatalog> {
+    catalog_from_vault_tiers_inner(vault_dir.as_ref(), tiering_policy, Some(durable_seq))
+}
+
+fn catalog_from_vault_tiers_inner(
+    vault_dir: &Path,
+    tiering_policy: Option<&TieringPolicy>,
+    durable_seq: Option<u64>,
+) -> Result<CompactionCatalog> {
     let mut shards = Vec::new();
-    for cf_root in tiered_cf_roots(vault_dir.as_ref(), tiering_policy) {
+    for cf_root in tiered_cf_roots(vault_dir, tiering_policy) {
         if !cf_root.exists() {
             continue;
         }
@@ -39,6 +64,22 @@ pub fn catalog_from_vault_tiers(
                 })?;
             let cf = parse_cf_dir_name(&name)?;
             for sst in list_ssts(&path)? {
+                if durable_seq.is_some_and(|durable_seq| {
+                    matches!(
+                        classify_sst(&sst),
+                        Ok(Some(
+                            SstName::Flush {
+                                watermark,
+                                ordinal: _
+                            } | SstName::DurableBatch {
+                                seq: watermark,
+                                index: _
+                            } | SstName::Compacted { seq: watermark }
+                        )) if watermark > durable_seq
+                    )
+                }) {
+                    continue;
+                }
                 shards.push(SstShard::new(cf, sst, 0)?);
             }
         }

@@ -6,21 +6,28 @@ mod scheduler;
 mod tiering;
 
 use crate::cf::ColumnFamily;
-use crate::sst::SstReader;
-use crate::storage_names::{SstName, classify_sst};
+use crate::sst::shared_reader;
+use crate::storage_names::{SstName, classify_sst, sst_order_key};
 use calyx_core::{CalyxError, Result};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// Default per-CF compaction target used for debt scoring (PRD 24 §8).
 pub const DEFAULT_COMPACTION_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+/// File-count ceiling used for live fan-out admission. Tiny commit SSTs can
+/// create severe read/recovery amplification while remaining far below the
+/// per-output byte target; total logical CF bytes are not themselves
+/// reclaimable in a flat immutable-file layout.
+pub const DEFAULT_COMPACTION_TARGET_FILES: usize = 256;
 const WRITE_AMP_SCALE: u64 = 1_000;
 const COMPACTION_ADOPTION_FIRST_INDEX: usize = 9_000;
 const COMPACTION_ADOPTION_LAST_INDEX: usize = 9_999;
 
 pub(crate) use rolling::RollingSstWriter;
 use rolling::compact_shards_with_target;
+pub(crate) use scan::catalog_from_vault_tiers_through_seq;
 pub use scan::{catalog_from_vault_dir, catalog_from_vault_tiers};
 pub use scheduler::{
     AdaptiveCompactionSchedule, CompactionScheduleDecision, CompactionScheduleHook,
@@ -62,7 +69,7 @@ pub struct CompactionSnapshot {
 impl CompactionSnapshot {
     pub fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
         for shard in self.shards.iter().rev().filter(|shard| shard.cf == cf) {
-            if let Some(value) = SstReader::open(&shard.path)?.get(key)? {
+            if let Some(value) = shared_reader(&shard.path)?.get(key)? {
                 return Ok(Some(value));
             }
         }
@@ -133,6 +140,97 @@ impl CompactionCatalog {
             .cloned()
             .collect();
         next.extend(compacted);
+        *self.active.write().expect("catalog lock") = Arc::new(next);
+        Ok(CompactionResult::Compacted(report))
+    }
+
+    /// Compacts at most the oldest `max_input_files` for one CF.
+    ///
+    /// Selecting an oldest contiguous prefix preserves newest-wins ordering
+    /// when newer shards remain live. The caller must name the output from the
+    /// selected inputs' commit domain and reclaim only `report.input_paths`.
+    pub fn compact_cf_oldest_files(
+        &self,
+        cf: ColumnFamily,
+        output_path: impl AsRef<Path>,
+        throttle: CompactionThrottle,
+        max_input_files: usize,
+    ) -> Result<CompactionResult> {
+        self.compact_cf_file_range(cf, output_path, throttle, 0, max_input_files)
+    }
+
+    /// Compacts one contiguous range in canonical oldest-to-newest order.
+    ///
+    /// A range output must be named in the maximum commit domain represented
+    /// by that range. That leaves every unselected newer SST later in the
+    /// canonical order and therefore preserves newest-wins reads.
+    pub fn compact_cf_file_range(
+        &self,
+        cf: ColumnFamily,
+        output_path: impl AsRef<Path>,
+        throttle: CompactionThrottle,
+        start_input_file: usize,
+        input_files: usize,
+    ) -> Result<CompactionResult> {
+        if input_files < 2 {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "bounded compaction requires input_files >= 2, got {input_files}"
+            )));
+        }
+        let before = self.pin_snapshot();
+        let all_inputs = before
+            .shards
+            .iter()
+            .filter(|shard| shard.cf == cf)
+            .cloned()
+            .collect::<Vec<_>>();
+        let end_input_file = start_input_file.checked_add(input_files).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard("bounded compaction input range overflow")
+        })?;
+        if end_input_file > all_inputs.len() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "bounded compaction input range {start_input_file}..{end_input_file} exceeds {} files for {}",
+                all_inputs.len(),
+                cf.name()
+            )));
+        }
+        let inputs = all_inputs[start_input_file..end_input_file].to_vec();
+        let CompactionResult::Compacted(report) =
+            compact_shards(cf, &inputs, output_path, throttle)?
+        else {
+            return Ok(CompactionResult::Skipped {
+                debt: CompactionDebt::measure(&inputs, DEFAULT_COMPACTION_TARGET_BYTES),
+            });
+        };
+
+        let next_level = inputs.iter().map(|shard| shard.level).max().unwrap_or(0) + 1;
+        let compacted = report
+            .output_paths
+            .iter()
+            .map(|path| SstShard::new(cf, path, next_level))
+            .collect::<Result<Vec<_>>>()?;
+        let compacted_inputs = inputs
+            .iter()
+            .map(|shard| shard.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut next = self
+            .active
+            .read()
+            .expect("catalog lock")
+            .iter()
+            .filter(|shard| !compacted_inputs.contains(&shard.path))
+            .cloned()
+            .collect::<Vec<_>>();
+        next.extend(compacted);
+        next.sort_by(|left, right| {
+            left.cf
+                .name()
+                .cmp(&right.cf.name())
+                .then_with(|| {
+                    canonical_sst_order(&left.path).cmp(&canonical_sst_order(&right.path))
+                })
+                .then_with(|| left.path.cmp(&right.path))
+        });
         *self.active.write().expect("catalog lock") = Arc::new(next);
         Ok(CompactionResult::Compacted(report))
     }
@@ -253,26 +351,53 @@ impl CompactionThrottle {
 pub struct CompactionDebt {
     pub pending_bytes: u64,
     pub target_bytes: u64,
+    pub pending_files: usize,
+    pub target_files: usize,
+    pub byte_score_milli: u64,
+    pub file_score_milli: u64,
     pub score_milli: u64,
 }
 
 impl CompactionDebt {
     pub fn measure(shards: &[SstShard], target_bytes: u64) -> Self {
-        let pending_bytes = shards.iter().map(|shard| shard.bytes).sum();
+        let pending_bytes: u64 = shards.iter().map(|shard| shard.bytes).sum();
         let target_bytes = target_bytes.max(1);
+        let pending_files = shards.len();
+        let target_files = DEFAULT_COMPACTION_TARGET_FILES.max(1);
+        // `target_bytes` is the desired size of one rolled output SST, not a
+        // cap on the total logical size of a CF. Total bytes alone are not
+        // reclaimable debt in this flat immutable-file layout: repeatedly
+        // rewriting four healthy 64 MiB files into four new 64 MiB files
+        // changes no physical state. Keep the raw byte ratio for telemetry,
+        // but admit maintenance only on file fan-out.
+        let byte_score_milli = pending_bytes.saturating_mul(WRITE_AMP_SCALE) / target_bytes;
+        let file_score_milli = u64::try_from(pending_files)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(WRITE_AMP_SCALE)
+            / u64::try_from(target_files).unwrap_or(u64::MAX);
         Self {
             pending_bytes,
             target_bytes,
-            score_milli: pending_bytes.saturating_mul(WRITE_AMP_SCALE) / target_bytes,
+            pending_files,
+            target_files,
+            byte_score_milli,
+            file_score_milli,
+            score_milli: file_score_milli,
         }
     }
+}
+
+fn canonical_sst_order(path: &Path) -> crate::storage_names::SstOrderKey {
+    sst_order_key(path)
+        .expect("compaction catalog contains only validated SST paths")
+        .expect("compaction catalog path has an SST order")
 }
 
 /// Result of one compaction attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionResult {
     Skipped { debt: CompactionDebt },
-    Compacted(CompactionReport),
+    Compacted(Box<CompactionReport>),
 }
 
 /// Physical compaction metrics.

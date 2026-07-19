@@ -1,5 +1,6 @@
 mod action_combo_bridge;
 pub mod audit;
+mod audit_migration;
 mod audit_state;
 pub mod bus;
 pub mod conflict;

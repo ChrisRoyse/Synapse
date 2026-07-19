@@ -89,10 +89,13 @@ crates/synapse-storage/src/routines.rs       # routine CF read/write helpers
 crates/synapse-storage/src/agent_events.rs   # agent-event CF read/write helpers
 crates/synapse-storage/src/agent_transcripts.rs # agent-transcript CF read/write helpers
 crates/synapse-storage/src/error.rs          # StorageError / StorageResult
-crates/synapse-storage/src/{batch,compaction,gc,open,pressure}_tests.rs # in-crate unit tests
 crates/synapse-storage/build.rs              # build script (storage codec guard)
+crates/synapse-reflex/src/audit_migration.rs # exact one-time repair for legacy retention-corrupted reflex audit rows
+calyx/crates/calyx-aster/src/sst/reader_cache.rs # bounded checksum-verified process-wide immutable SST reader cache
+calyx/crates/calyx-aster/src/vault/grounded_observation.rs # atomic source + constellation + anchor + ledger publication
 ```
-`examples/dump_cf.rs` dumps a column family; `benches/batch_throughput.rs` write-throughput bench.
+`examples/dump_cf.rs` dumps a column family for manual inspection. The
+repository carries no automated test or benchmark targets; see AGENTS.md D1.
 
 ### crates/synapse-a11y
 Windows UI Automation + Chrome DevTools Protocol (CDP) accessibility. `#![allow(unsafe_code)]`. Depends on `synapse-core`.
@@ -618,8 +621,10 @@ manual_mcp_stdio_probe.py            # manual MCP-over-stdio probe (launches syn
 swarm.py                             # run a local-model agent swarm against a live daemon (operational probe)
 ```
 
-### `tests/` (workspace-level)
-Only `tests/fixtures/` (e.g. `fixtures/audio/`) — shared test fixture assets consumed by crate integration tests. No workspace-level `.rs` integration suites; integration tests live per-crate under `crates/*/tests/`.
+### Automated test surface
+
+There is no workspace-level or per-crate automated test/benchmark surface.
+Behavioral acceptance is manual FSV under AGENTS.md D1.
 
 ---
 

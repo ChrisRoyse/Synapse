@@ -1,6 +1,8 @@
 //! Collector assembling [`ResourceStatus`] from an open vault store + its directory.
 
-use crate::compaction::{DEFAULT_COMPACTION_TARGET_BYTES, catalog_from_vault_dir};
+use crate::compaction::{
+    DEFAULT_COMPACTION_TARGET_BYTES, DEFAULT_COMPACTION_TARGET_FILES, catalog_from_vault_dir,
+};
 use crate::mvcc::VersionedCfStore;
 use crate::resource::heap::heap_rss_bytes;
 use crate::resource::status::{
@@ -75,15 +77,20 @@ pub(crate) fn collect_compaction(vault_dir: &Path) -> Result<CompactionDebtStatu
             cf: cf.name().to_string(),
             sst_files: catalog.shard_count_for_cf(cf),
             pending_bytes: debt.pending_bytes,
+            byte_score_milli: debt.byte_score_milli,
+            file_score_milli: debt.file_score_milli,
             score_milli: debt.score_milli,
         });
     }
     per_cf.sort_by(|left, right| left.cf.cmp(&right.cf));
     let total_pending_bytes = per_cf.iter().map(|cf| cf.pending_bytes).sum();
+    let total_pending_files = per_cf.iter().map(|cf| cf.sst_files).sum();
     let max_score_milli = per_cf.iter().map(|cf| cf.score_milli).max().unwrap_or(0);
     Ok(CompactionDebtStatus {
         target_bytes,
+        target_files: DEFAULT_COMPACTION_TARGET_FILES,
         total_pending_bytes,
+        total_pending_files,
         max_score_milli,
         per_cf,
     })

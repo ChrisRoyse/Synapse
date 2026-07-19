@@ -20,7 +20,7 @@ use crate::cf::ColumnFamily;
 use crate::ledger_head::read_head_anchor;
 use crate::manifest::ManifestStore;
 use crate::mvcc::is_tombstone_value;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::storage_names::sst_order_key;
 use crate::vault::encode::decode_write_batch_refs;
 use crate::wal::stream_records_after;
@@ -86,7 +86,7 @@ pub fn build_base_page_index(
             ))
         })?;
         let path = relative_path(vault, file);
-        for (record_offset, entry) in SstReader::open(file)?.iter_with_offsets()? {
+        for (record_offset, entry) in shared_reader(file)?.iter_with_offsets()? {
             let tombstoned = is_tombstone_value(&entry.value);
             rows.insert(
                 entry.key,

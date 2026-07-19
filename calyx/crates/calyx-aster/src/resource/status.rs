@@ -69,6 +69,8 @@ pub struct CfCompactionDebt {
     pub cf: String,
     pub sst_files: usize,
     pub pending_bytes: u64,
+    pub byte_score_milli: u64,
+    pub file_score_milli: u64,
     pub score_milli: u64,
 }
 
@@ -76,7 +78,9 @@ pub struct CfCompactionDebt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionDebtStatus {
     pub target_bytes: u64,
+    pub target_files: usize,
     pub total_pending_bytes: u64,
+    pub total_pending_files: usize,
     pub max_score_milli: u64,
     pub per_cf: Vec<CfCompactionDebt>,
 }
@@ -150,12 +154,32 @@ impl ResourceStatus {
                 labels.clone(),
                 cf.pending_bytes,
             );
+            metric(
+                "calyx_compaction_pending_sst_files",
+                labels.clone(),
+                u64::try_from(cf.sst_files).unwrap_or(u64::MAX),
+            );
+            metric(
+                "calyx_compaction_byte_debt_score_milli",
+                labels.clone(),
+                cf.byte_score_milli,
+            );
+            metric(
+                "calyx_compaction_file_debt_score_milli",
+                labels.clone(),
+                cf.file_score_milli,
+            );
             metric("calyx_compaction_debt_score_milli", labels, cf.score_milli);
         }
         metric(
             "calyx_compaction_target_bytes",
             base.clone(),
             self.compaction.target_bytes,
+        );
+        metric(
+            "calyx_compaction_target_sst_files",
+            base.clone(),
+            u64::try_from(self.compaction.target_files).unwrap_or(u64::MAX),
         );
         metric(
             "calyx_gc_versions_reclaimed_total",

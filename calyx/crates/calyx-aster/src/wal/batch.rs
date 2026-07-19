@@ -1,4 +1,4 @@
-use super::{AppendAck, Wal};
+use super::{AppendAck, Wal, WalRecycleReport};
 use calyx_core::{CalyxError, Clock, Result};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -11,12 +11,18 @@ enum BatchOp {
     Append(Vec<u8>),
     Flush,
     TipSeq,
+    Recycle {
+        newest_durable_seq: u64,
+        max_segments: usize,
+        fsync_budget: usize,
+    },
 }
 
 enum BatchResponse {
     Ack(AppendAck),
     Flush,
     TipSeq(u64),
+    Recycle(WalRecycleReport),
 }
 
 struct BatchRequest {
@@ -96,6 +102,33 @@ impl GroupCommitBatcher {
             Err(error) => Err(error),
         }
     }
+
+    pub fn recycle_durable_segments(
+        &self,
+        newest_durable_seq: u64,
+        max_segments: usize,
+        fsync_budget: usize,
+    ) -> Result<WalRecycleReport> {
+        let (respond, receive) = mpsc::channel();
+        self.sender
+            .send(BatchRequest {
+                op: BatchOp::Recycle {
+                    newest_durable_seq,
+                    max_segments,
+                    fsync_budget,
+                },
+                respond,
+            })
+            .map_err(|_| CalyxError::disk_pressure("group commit batcher is closed"))?;
+        match receive
+            .recv()
+            .map_err(|_| CalyxError::disk_pressure("group commit recycle channel closed"))?
+        {
+            Ok(BatchResponse::Recycle(report)) => Ok(report),
+            Ok(_) => Err(CalyxError::disk_pressure("missing WAL recycle report")),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub(super) fn validate_window(window: Duration) -> Result<()> {
@@ -148,31 +181,17 @@ fn flush_requests(wal: &Mutex<Wal>, requests: Vec<BatchRequest>) {
         .iter()
         .filter_map(|request| match &request.op {
             BatchOp::Append(payload) => Some(payload.as_slice()),
-            BatchOp::Flush | BatchOp::TipSeq => None,
+            BatchOp::Flush | BatchOp::TipSeq | BatchOp::Recycle { .. } => None,
         })
         .collect();
-    let wants_tip = requests
-        .iter()
-        .any(|request| matches!(request.op, BatchOp::TipSeq));
-    let (acks, tip_seq) = {
-        let mut wal = wal.lock().expect("group commit WAL lock poisoned");
-        let acks = if payloads.is_empty() {
-            Vec::new()
-        } else {
-            match wal.append_batch(&payloads) {
-                Ok(acks) => acks,
-                Err(error) => return send_error(&requests, error),
-            }
-        };
-        let tip_seq = if wants_tip {
-            match wal.durable_tip_seq() {
-                Ok(seq) => Some(seq),
-                Err(error) => return send_error(&requests, error),
-            }
-        } else {
-            None
-        };
-        (acks, tip_seq)
+    let mut wal = wal.lock().expect("group commit WAL lock poisoned");
+    let acks = if payloads.is_empty() {
+        Vec::new()
+    } else {
+        match wal.append_batch(&payloads) {
+            Ok(acks) => acks,
+            Err(error) => return send_error(&requests, error),
+        }
     };
     let mut acks = acks.into_iter();
     for request in requests {
@@ -182,9 +201,14 @@ fn flush_requests(wal: &Mutex<Wal>, requests: Vec<BatchRequest>) {
                 .map(BatchResponse::Ack)
                 .ok_or_else(|| CalyxError::disk_pressure("missing WAL ack")),
             BatchOp::Flush => Ok(BatchResponse::Flush),
-            BatchOp::TipSeq => tip_seq
-                .map(BatchResponse::TipSeq)
-                .ok_or_else(|| CalyxError::disk_pressure("missing WAL tip")),
+            BatchOp::TipSeq => wal.durable_tip_seq().map(BatchResponse::TipSeq),
+            BatchOp::Recycle {
+                newest_durable_seq,
+                max_segments,
+                fsync_budget,
+            } => wal
+                .recycle_durable_segments(newest_durable_seq, max_segments, fsync_budget)
+                .map(BatchResponse::Recycle),
         };
         let _ = request.respond.send(response);
     }

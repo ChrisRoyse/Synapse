@@ -14,6 +14,7 @@ mod durable;
 pub mod encode;
 mod gc_bridge;
 pub mod grant;
+mod grounded_observation;
 mod htap;
 mod ingest_precondition;
 mod input_pointer;
@@ -42,7 +43,7 @@ use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status}
 use crate::timetravel::RetentionHorizon;
 use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
-use crate::wal::TornTail;
+use crate::wal::{TornTail, WalRecycleReport};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemClock, VaultId};
 use std::{path::Path, sync::Mutex};
 
@@ -50,6 +51,7 @@ pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
+pub use grounded_observation::GroundedObservationCommit;
 pub use htap::HtapDualRead;
 pub use ingest_precondition::{
     CALYX_INGEST_PRECONDITION_FAILED, CALYX_INGEST_PRECONDITION_INVALID, IngestPrecondition,
@@ -68,7 +70,10 @@ pub use slot_column::{
     read_materialized_slot_column,
 };
 pub use store::{PutDisposition, PutOutcome};
-pub use {context::VaultContext, durable::VaultOptions};
+pub use {
+    context::VaultContext,
+    durable::{RecoveryProgressHook, VaultOptions},
+};
 
 const DEFAULT_LEASE_MS: u64 = 5_000;
 
@@ -402,6 +407,37 @@ where
         }
         self.rows.flush_all_cfs()?;
         Ok(())
+    }
+
+    /// Flushes pending checkpoints, advances the durable manifest floor, then
+    /// reclaims at most `max_segments.min(fsync_budget)` WAL segments whose
+    /// complete sequence range is covered by that manifest.
+    pub fn recycle_durable_wal_once(
+        &self,
+        max_segments: usize,
+        fsync_budget: usize,
+    ) -> Result<WalRecycleReport> {
+        if max_segments == 0 || fsync_budget == 0 {
+            return Err(CalyxError::disk_pressure(
+                "WAL recycle limits must both be non-zero",
+            ));
+        }
+        self.with_durable_commit_lock(|| {
+            self.flush_locked()?;
+            let Some(durable) = &self.durable else {
+                return Ok(WalRecycleReport::default());
+            };
+            let manifest_durable_seq = self.verified_durable_coverage_seq(durable)?;
+            let report =
+                durable.recycle_durable_wal_segments(max_segments, fsync_budget)?;
+            if report.newest_durable_seq != manifest_durable_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "WAL recycler used durable sequence {} but locked manifest coverage is {manifest_durable_seq}",
+                    report.newest_durable_seq
+                )));
+            }
+            Ok(report)
+        })
     }
 
     /// Pins an explicit reader lease tracked for oldest-pinned-seq accounting.

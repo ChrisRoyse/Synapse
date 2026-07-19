@@ -145,6 +145,7 @@ fn open_page_cursor(
     let file_sources = level
         .files
         .par_iter()
+        .filter(|file| file.may_intersect(lower, end))
         .map(|file| {
             let reader = SstStreamingReader::open(&file.path)?;
             let mut pos = reader.lower_bound(lower, exclusive);

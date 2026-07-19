@@ -335,15 +335,14 @@ pub fn required_permissions_pressure(_params: &StoragePressureSampleParams) -> R
 }
 
 pub fn inspect_storage(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &synapse_storage::Db,
     _params: &StorageInspectParams,
 ) -> Result<StorageInspectResponse, ErrorData> {
-    let runtime = lock_runtime(runtime)?;
-    inspect_locked(&runtime)
+    inspect_db(db)
 }
 
 pub fn inspect_storage_anchors(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &synapse_storage::Db,
     params: &StorageAnchorsParams,
 ) -> Result<StorageAnchorsResponse, ErrorData> {
     let key = hex_decode(params.key_hex.trim()).map_err(|detail| {
@@ -353,10 +352,10 @@ pub fn inspect_storage_anchors(
         )
     })?;
     let cf_name = known_anchor_source_cf_for_key(&params.cf_name, &key)?;
-    let runtime = lock_runtime(runtime)?;
-    let rows = runtime
-        .storage_cf_prefix_rows(cf_name, &key, 2)
+    let mut rows = db
+        .scan_cf_prefix(cf_name, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    rows.truncate(2);
     let Some((_row_key, source_value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key)
     else {
         return Err(mcp_error(
@@ -368,28 +367,27 @@ pub fn inspect_storage_anchors(
         ));
     };
     let source_value_len_bytes = u64::try_from(source_value.len()).unwrap_or(u64::MAX);
-    let report = runtime
-        .storage_calyx_anchor_scan_for_source(cf_name, &key, &source_value)
+    let report = db
+        .calyx_anchor_scan_for_source(cf_name, &key, &source_value)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(storage_anchors_response(report, source_value_len_bytes))
 }
 
 pub fn inspect_storage_summary(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &synapse_storage::Db,
 ) -> Result<StorageSummaryResponse, ErrorData> {
-    let runtime = lock_runtime(runtime)?;
-    let (cf_sizes, missing_cf_size_estimates) = runtime
-        .storage_cf_live_data_size_estimates()
+    let (cf_sizes, missing_cf_size_estimates) = db
+        .cf_live_data_size_estimates()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let (cf_row_counts, missing_cf_row_count_estimates) = runtime
-        .storage_cf_estimated_row_counts()
+    let (cf_row_counts, missing_cf_row_count_estimates) = db
+        .cf_estimated_row_counts()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(StorageSummaryResponse {
-        schema_version: runtime.schema_version(),
-        storage_backend: runtime.storage_backend_name().to_owned(),
-        pressure_level: pressure_level(runtime.storage_pressure_level()),
-        pressure_transition_codes: runtime
-            .storage_pressure_transition_codes()
+        schema_version: db.schema_version,
+        storage_backend: db.backend_name().to_owned(),
+        pressure_level: pressure_level(db.pressure_level()),
+        pressure_transition_codes: db
+            .pressure_transition_codes()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?
             .into_iter()
             .map(str::to_owned)
@@ -454,18 +452,17 @@ pub fn put_probe_rows(
 }
 
 pub fn run_storage_gc_once(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &synapse_storage::Db,
     params: &StorageGcOnceParams,
 ) -> Result<StorageGcOnceResponse, ErrorData> {
     validate_gc_params(params)?;
     if params.cf_name.trim() == AUDIT_RETENTION_MODE {
-        let runtime = lock_runtime(runtime)?;
-        let before_counts = runtime
-            .storage_cf_row_counts()
+        let before_counts = db
+            .cf_row_counts()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let before = audit_rows_total(&before_counts);
         let result = run_audit_retention(
-            &runtime,
+            db,
             &AuditRetentionRunConfig {
                 run_id: params.run_id.clone(),
                 now_ns: params.now_ns,
@@ -476,11 +473,10 @@ pub fn run_storage_gc_once(
                 hard_cap_rows: params.hard_cap_rows,
             },
         )?;
-        let after_counts = runtime
-            .storage_cf_row_counts()
+        let after_counts = db
+            .cf_row_counts()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let after = audit_rows_total(&after_counts);
-        drop(runtime);
         return Ok(StorageGcOnceResponse {
             cf_name: AUDIT_RETENTION_MODE.to_owned(),
             before_rows: before,
@@ -494,15 +490,13 @@ pub fn run_storage_gc_once(
     }
     reject_audit_retention_fields(params)?;
     let cf_name = probe_writable_cf(&params.cf_name)?;
-    let runtime = lock_runtime(runtime)?;
-    let report = runtime
-        .storage_run_gc_once_with_row_caps(cf_name, params.soft_cap_rows, params.hard_cap_rows)
+    let report = db
+        .run_gc_once_with_row_caps(cf_name, params.soft_cap_rows, params.hard_cap_rows)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let (before, after) = report
         .cf(cf_name)
         .map(|cf_report| (cf_report.before_value, cf_report.after_value))
         .unwrap_or((0, 0));
-    drop(runtime);
     Ok(gc_response(cf_name, before, after, report))
 }
 
@@ -531,39 +525,39 @@ pub fn apply_storage_pressure_sample(
     })
 }
 
-fn inspect_locked(runtime: &ReflexRuntime) -> Result<StorageInspectResponse, ErrorData> {
+fn inspect_db(db: &synapse_storage::Db) -> Result<StorageInspectResponse, ErrorData> {
     Ok(StorageInspectResponse {
-        schema_version: runtime.schema_version(),
-        storage_backend: runtime.storage_backend_name().to_owned(),
-        pressure_level: pressure_level(runtime.storage_pressure_level()),
-        pressure_transition_codes: runtime
-            .storage_pressure_transition_codes()
+        schema_version: db.schema_version,
+        storage_backend: db.backend_name().to_owned(),
+        pressure_level: pressure_level(db.pressure_level()),
+        pressure_transition_codes: db
+            .pressure_transition_codes()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?
             .into_iter()
             .map(str::to_owned)
             .collect(),
         audit_retention_policies: audit_retention_policies(),
-        cf_sizes: runtime
-            .storage_cf_sizes()
+        cf_sizes: db
+            .cf_sizes()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?,
-        cf_row_counts: runtime
-            .storage_cf_row_counts()
+        cf_row_counts: db
+            .cf_row_counts()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?,
-        cf_row_samples: cf_row_samples(runtime)?,
-        calyx_vault: runtime
-            .storage_calyx_vault_inspect()
+        cf_row_samples: cf_row_samples(db)?,
+        calyx_vault: db
+            .calyx_vault_inspect()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?
             .map(storage_calyx_vault_inspect),
     })
 }
 
 fn cf_row_samples(
-    runtime: &ReflexRuntime,
+    db: &synapse_storage::Db,
 ) -> Result<BTreeMap<String, Vec<StorageRowSample>>, ErrorData> {
     let mut samples = BTreeMap::new();
     for cf_name in cf::ALL_COLUMN_FAMILIES {
-        let rows = runtime
-            .storage_cf_tail_rows(cf_name, MAX_INSPECT_SAMPLE_ROWS_PER_CF)
+        let rows = db
+            .scan_cf_tail(cf_name, MAX_INSPECT_SAMPLE_ROWS_PER_CF)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         samples.insert(
             cf_name.to_owned(),

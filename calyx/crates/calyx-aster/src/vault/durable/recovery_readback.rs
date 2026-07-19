@@ -1,7 +1,7 @@
 use super::super::encode::WriteRow;
 use super::{RecoveredBatch, storage_error};
 use crate::compaction::TieringPolicy;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::storage_names::{SstName, classify_sst, parse_cf_dir_name};
 use calyx_core::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,7 +69,7 @@ pub(super) fn read_manifested_batches(
                 let file_len = fs::metadata(&path)
                     .map_err(|error| storage_error("stat SST for recovery readback", error))?
                     .len();
-                let reader = SstReader::open(&path)?;
+                let reader = shared_reader(&path)?;
                 for (row_offset, row) in reader.iter()?.into_iter().enumerate() {
                     by_seq.entry(seq).or_default().push((
                         index + row_offset,

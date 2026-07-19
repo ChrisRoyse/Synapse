@@ -1,7 +1,7 @@
 use super::{insert_ledger_bytes, parse_aster_ledger_seq};
 use crate::cf::ledger_key;
 use crate::sst::level::SstLevel;
-use crate::sst::{SstLookupMetadata, SstReader};
+use crate::sst::{SstLookupMetadata, shared_reader};
 use crate::storage_names::{SstName, classify_sst, sst_order_key};
 use calyx_core::{CalyxError, Result as CalyxResult};
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,7 +95,7 @@ pub(super) fn read_sst_ledger_rows(
             if let Some(path) = index.resolve(*seq)? {
                 let path = path.clone();
                 index.files_opened += 1;
-                let reader = SstReader::open(&path)?;
+                let reader = shared_reader(&path)?;
                 if let Some(value) = reader.get(&ledger_key(*seq))? {
                     insert_ledger_bytes(rows, *seq, value)?;
                 }
@@ -348,7 +348,7 @@ impl CommitOrderedLedgerIndex {
 }
 
 fn ledger_sst_lookup_metadata(path: &Path) -> CalyxResult<SstLookupMetadata> {
-    SstReader::open(path)?.lookup_metadata().ok_or_else(|| {
+    shared_reader(path)?.lookup_metadata().ok_or_else(|| {
         CalyxError::aster_corrupt_shard(format!("ledger SST {} has no keys", path.display()))
     })
 }

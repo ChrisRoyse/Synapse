@@ -124,14 +124,6 @@ impl VersionedCfStore {
         Self::new_with_router_and_policy(start_seq, router, true, false)
     }
 
-    pub(crate) fn refresh_router_cfs_from_disk(
-        &self,
-        cfs: &[ColumnFamily],
-        operation: &'static str,
-    ) -> Result<()> {
-        self.refresh_router_cfs_after_reclaim(cfs, operation, || Ok(()))
-    }
-
     pub(crate) fn refresh_router_cfs_after_reclaim<T>(
         &self,
         cfs: &[ColumnFamily],

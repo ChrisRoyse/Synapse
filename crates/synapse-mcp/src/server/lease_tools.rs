@@ -27,12 +27,12 @@ use synapse_core::error_codes;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLeaseAcquireParams {
-    /// Lease lifetime in milliseconds. Must be in [100, 30000]. The lease is
+    /// Lease lifetime in milliseconds. Must be in [100, 300000]. The lease is
     /// renewed on every leased action and on a repeat acquire by the holder, so
     /// a short TTL is the safety floor against a crashed holder, not a hard cap
     /// on how long real work can take.
     #[serde(default = "default_lease_ttl_ms")]
-    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 30000))]
+    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 300000))]
     pub ttl_ms: u64,
 }
 
@@ -42,9 +42,9 @@ pub struct ControlLeaseHandoffParams {
     /// Live MCP session id that should receive the foreground input lease.
     pub to_session: String,
     /// Fresh lease lifetime in milliseconds for the recipient. Must be in
-    /// [100, 30000] like `control_lease_acquire`.
+    /// [100, 300000] like `control_lease_acquire`.
     #[serde(default = "default_lease_ttl_ms")]
-    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 30000))]
+    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 300000))]
     pub ttl_ms: u64,
 }
 
@@ -918,7 +918,7 @@ fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, E
         Err(error) => match &error {
             // #1556: releasing an unheld/expired lease is the *expected* end
             // state of a correct short-TTL client whose happy path outlived the
-            // lease (TTL max 30s). Make it idempotent: success with a physically
+            // lease. Make it idempotent: success with a physically
             // honest readback (released=false, was_held=false, holder=null). The
             // caller still audits it. Erroring here trained callers to swallow
             // release errors, which masked the one case that matters below.

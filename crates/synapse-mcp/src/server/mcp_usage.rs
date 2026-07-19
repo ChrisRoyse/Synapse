@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 use synapse_storage::{
     CalyxAnchorValueReadback, CalyxAnchorWriteReport, ConstellationPutReport, Db, GroundingAnchor,
-    cf,
+    McpUsageGroundedPublicationReport, cf,
 };
 
 use crate::daemon_lifecycle::FinishedToolCallReadback;
@@ -24,7 +24,6 @@ const USAGE_SCHEMA_VERSION: u32 = 1;
 const USAGE_CALL_PREFIX: &str = "mcp-usage/v1/call/";
 const USAGE_POLICY_PREFIX: &str = "mcp-usage/v1/policy/";
 const USAGE_PROMOTION_PREFIX: &str = "mcp-usage/v1/promotion/";
-const USAGE_SESSION_SEQ_PREFIX: &str = "mcp-usage/v1/session-seq/";
 const STEERING_HINT_SIZE_LIMIT_BYTES: usize = 4 * 1024;
 const PROMOTED_VALUE_SIZE_LIMIT_BYTES: usize = 1024;
 const PROMOTED_VALUE_DEPTH_LIMIT: u32 = 8;
@@ -279,16 +278,6 @@ struct McpUsageRecord {
     steering_hint_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SessionSequenceCounter {
-    schema_version: u32,
-    row_kind: String,
-    mcp_session_id_sha256: String,
-    last_sequence_position: u64,
-    updated_at_unix_ms: u64,
-}
-
 #[derive(Clone, Debug)]
 struct PersistedUsageRecord {
     row_key: String,
@@ -309,9 +298,6 @@ struct UsageEvidence {
     latest_row_key: Option<String>,
     latest_value_sha256: Option<String>,
 }
-
-type UsageCounterRow = Option<(Vec<u8>, Vec<u8>)>;
-type UsageSequenceReadback = (u64, UsageCounterRow);
 
 pub(crate) fn argument_shape_from_arguments(
     arguments: Option<&Map<String, Value>>,
@@ -699,8 +685,10 @@ fn persist_finished_call(
 ) -> Result<UsagePersistReadback, ErrorData> {
     let session_hash = finished.mcp_session_id.as_deref().map(sha256_text);
     let observed_at_unix_ms = finished.finished_at_unix_ms;
-    let (session_sequence_position, counter_row) =
-        next_session_sequence_row(db, session_hash.as_deref(), observed_at_unix_ms)?;
+    // The daemon lifecycle sequence is already a durable, monotone ordering
+    // authority. Reusing it avoids a contended mutable per-session counter and
+    // makes each usage publication append-only and atomically retry-detectable.
+    let session_sequence_position = finished.seq;
     let route_id = finished
         .route_id
         .clone()
@@ -742,67 +730,44 @@ fn persist_finished_call(
     );
     let record_value = serde_json::to_value(&record).map_err(serialize_mcp_usage_error)?;
     let encoded = serde_json::to_vec(&record_value).map_err(serialize_mcp_usage_error)?;
-    let storage = put_usage_kv_and_readback(db, &row_key, encoded.clone(), counter_row)?;
-    let constellation = put_usage_constellation_readback(db, &row_key, &encoded, &record_value)?;
+    let source_rows = vec![(row_key.as_bytes().to_vec(), encoded.clone())];
     let anchor = grounding::enum_anchor(
         "synapse:mcp_tool_call_outcome",
         &record.status,
         grounding::SOURCE_MCP_USAGE,
         observed_at_unix_ms,
     );
-    let anchor = write_usage_anchor_readback(db, &row_key, &encoded, anchor)?;
+    let ledger_payload =
+        grounding::anchor_ledger_payload(cf::CF_KV, row_key.as_bytes(), &encoded, &anchor);
+    let publication = db
+        .put_mcp_usage_grounded_publication(
+            source_rows,
+            row_key.as_bytes(),
+            &encoded,
+            &record_value,
+            anchor,
+            &ledger_payload,
+        )
+        .map_err(|error| storage_mcp_error("atomically publish grounded MCP usage", error))?;
+    if publication.source_row_count != publication.source_readback_exact_match_count {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "MCP_USAGE_ATOMIC_SOURCE_READBACK_MISMATCH: source_rows={} exact_readbacks={} committed_seq={}",
+                publication.source_row_count,
+                publication.source_readback_exact_match_count,
+                publication.committed_seq
+            ),
+        ));
+    }
+    let storage = atomic_usage_source_readback(&publication, &row_key, &encoded)?;
+    let constellation = constellation_readback(publication.constellation);
+    let anchor = anchor_readback(publication.anchor);
     Ok(UsagePersistReadback {
         storage,
         constellation,
         anchor,
     })
-}
-
-fn next_session_sequence_row(
-    db: &Db,
-    session_hash: Option<&str>,
-    observed_at_unix_ms: u64,
-) -> Result<UsageSequenceReadback, ErrorData> {
-    let Some(session_hash) = session_hash else {
-        return Ok((0, None));
-    };
-    let key = format!("{USAGE_SESSION_SEQ_PREFIX}{session_hash}");
-    let previous = db
-        .get_cf(cf::CF_KV, key.as_bytes())
-        .map_err(|error| storage_mcp_error("read MCP usage session sequence counter", error))?;
-    let next = match previous {
-        Some(bytes) => {
-            let counter: SessionSequenceCounter =
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "MCP_USAGE_SESSION_COUNTER_CORRUPT: key={key} decode failed: {error}"
-                        ),
-                    )
-                })?;
-            if counter.mcp_session_id_sha256 != session_hash {
-                return Err(mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "MCP_USAGE_SESSION_COUNTER_ID_MISMATCH: key={key} stored_hash={} expected_hash={session_hash}",
-                        counter.mcp_session_id_sha256
-                    ),
-                ));
-            }
-            counter.last_sequence_position.saturating_add(1)
-        }
-        None => 1,
-    };
-    let counter = SessionSequenceCounter {
-        schema_version: USAGE_SCHEMA_VERSION,
-        row_kind: "session_sequence_counter".to_owned(),
-        mcp_session_id_sha256: session_hash.to_owned(),
-        last_sequence_position: next,
-        updated_at_unix_ms: observed_at_unix_ms,
-    };
-    let encoded = serde_json::to_vec(&counter).map_err(serialize_mcp_usage_error)?;
-    Ok((next, Some((key.into_bytes(), encoded))))
 }
 
 fn put_usage_kv_and_readback(
@@ -849,6 +814,39 @@ fn put_usage_kv_and_readback(
         value_len_bytes: u64::try_from(readback.len()).unwrap_or(u64::MAX),
         value_sha256: sha256_hex(&readback),
         exact_value_match,
+    })
+}
+
+fn atomic_usage_source_readback(
+    publication: &McpUsageGroundedPublicationReport,
+    row_key: &str,
+    encoded: &[u8],
+) -> Result<McpUsageStorageReadback, ErrorData> {
+    let expected_key_hex = hex_encode(row_key.as_bytes());
+    let expected_value_len_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    let expected_value_sha256 = sha256_hex(encoded);
+    if publication.source_key_hex != expected_key_hex
+        || publication.source_value_len_bytes != expected_value_len_bytes
+        || publication.source_value_sha256 != expected_value_sha256
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "MCP_USAGE_ATOMIC_PHYSICAL_READBACK_MISMATCH: cf={} row_key={row_key} expected_key_hex={expected_key_hex} actual_key_hex={} expected_value_len_bytes={expected_value_len_bytes} actual_value_len_bytes={} expected_sha256={expected_value_sha256} actual_sha256={}",
+                cf::CF_KV,
+                publication.source_key_hex,
+                publication.source_value_len_bytes,
+                publication.source_value_sha256
+            ),
+        ));
+    }
+    Ok(McpUsageStorageReadback {
+        cf_name: cf::CF_KV.to_owned(),
+        row_key: row_key.to_owned(),
+        row_key_hex: publication.source_key_hex.clone(),
+        value_len_bytes: publication.source_value_len_bytes,
+        value_sha256: publication.source_value_sha256.clone(),
+        exact_value_match: true,
     })
 }
 

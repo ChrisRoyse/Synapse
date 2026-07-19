@@ -4,7 +4,7 @@ mod error;
 mod quarantine;
 
 use crate::dedup::DedupPolicy;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::timetravel::RetentionHorizon;
 use crate::wal::{ReplayRecord, TornTail, replay_dir_after};
 use calyx_core::{CalyxError, Result, TemporalPolicy};
@@ -21,6 +21,7 @@ const CURRENT_FILE: &str = "CURRENT";
 const MANIFEST_FILE: &str = "MANIFEST";
 const MANIFEST_PREFIX: &str = "manifest-";
 const MANIFEST_SUFFIX: &str = ".json";
+const MANIFEST_GENERATIONS_RETAINED: usize = 32;
 const SUPPORTED_MANIFEST_MAJOR: u16 = 1;
 const SUPPORTED_MANIFEST_MINOR: u16 = 0;
 /// Watermark model 2 tracks only the CFs consumed by the persistent search
@@ -292,12 +293,23 @@ impl ManifestStore {
         write_atomic(&manifest_path, &bytes)?;
         write_atomic(&mirror_path, &bytes)?;
         write_atomic(&current_path, pointer.as_bytes())?;
+        verify_manifest_publication(
+            &manifest_path,
+            &mirror_path,
+            &current_path,
+            &pointer,
+            &bytes,
+        )?;
+        let retention = reclaim_old_manifest_generations(&self.vault_dir, &pointer)?;
 
         Ok(ManifestWrite {
             manifest_path,
             mirror_path,
             current_path,
             pointer,
+            manifest_generations_before: retention.before,
+            manifest_generations_after: retention.after,
+            manifest_generations_reclaimed: retention.reclaimed,
         })
     }
 
@@ -349,6 +361,9 @@ pub struct ManifestWrite {
     pub mirror_path: PathBuf,
     pub current_path: PathBuf,
     pub pointer: String,
+    pub manifest_generations_before: usize,
+    pub manifest_generations_after: usize,
+    pub manifest_generations_reclaimed: usize,
 }
 
 /// Recovery result after loading MANIFEST first, then replaying WAL past it.
@@ -386,7 +401,7 @@ pub fn recover_vault(vault_dir: impl AsRef<Path>) -> Result<RecoveryOutcome> {
 
 /// Reads a base CF shard through the fail-closed SST path.
 pub fn read_base_shard(path: impl AsRef<Path>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    SstReader::open(path)?.get(key)
+    shared_reader(path.as_ref())?.get(key)
 }
 
 pub fn is_quarantined(manifest: &VaultManifest, seq: u64) -> bool {
@@ -429,12 +444,145 @@ fn manifest_filename(seq: u64) -> String {
     format!("{MANIFEST_PREFIX}{seq:020}{MANIFEST_SUFFIX}")
 }
 
+fn manifest_sequence_from_filename(name: &str) -> Option<u64> {
+    let digits = name
+        .strip_prefix(MANIFEST_PREFIX)?
+        .strip_suffix(MANIFEST_SUFFIX)?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 fn valid_manifest_filename(name: &str) -> bool {
     if !name.starts_with(MANIFEST_PREFIX) || !name.ends_with(MANIFEST_SUFFIX) {
         return false;
     }
     let digits = &name[MANIFEST_PREFIX.len()..name.len() - MANIFEST_SUFFIX.len()];
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestRetention {
+    before: usize,
+    after: usize,
+    reclaimed: usize,
+}
+
+fn verify_manifest_publication(
+    manifest_path: &Path,
+    mirror_path: &Path,
+    current_path: &Path,
+    pointer: &str,
+    expected_manifest: &[u8],
+) -> Result<()> {
+    let immutable = fs::read(manifest_path).map_err(|error| {
+        storage_error(
+            "read immutable manifest after publish",
+            manifest_path,
+            error,
+        )
+    })?;
+    if immutable != expected_manifest {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "immutable manifest readback differs after publish: {}",
+            manifest_path.display()
+        )));
+    }
+    let mirror = fs::read(mirror_path)
+        .map_err(|error| storage_error("read MANIFEST mirror after publish", mirror_path, error))?;
+    if mirror != expected_manifest {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "MANIFEST mirror readback differs after publish: {}",
+            mirror_path.display()
+        )));
+    }
+    let current = fs::read(current_path)
+        .map_err(|error| storage_error("read CURRENT after publish", current_path, error))?;
+    if current != pointer.as_bytes() {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "CURRENT readback differs after publish: expected {pointer:?}, got {:?}",
+            String::from_utf8_lossy(&current)
+        )));
+    }
+    Ok(())
+}
+
+fn reclaim_old_manifest_generations(
+    vault_dir: &Path,
+    current_pointer: &str,
+) -> Result<ManifestRetention> {
+    let mut generations = Vec::new();
+    let entries = fs::read_dir(vault_dir)
+        .map_err(|error| storage_error("list manifest generations", vault_dir, error))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| storage_error("read manifest generation entry", vault_dir, error))?;
+        let file_type = entry.file_type().map_err(|error| {
+            storage_error("read manifest generation file type", &entry.path(), error)
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(sequence) = manifest_sequence_from_filename(name) else {
+            continue;
+        };
+        generations.push((sequence, name.to_owned(), entry.path()));
+    }
+    generations.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    let before = generations.len();
+    if before <= MANIFEST_GENERATIONS_RETAINED {
+        return Ok(ManifestRetention {
+            before,
+            after: before,
+            reclaimed: 0,
+        });
+    }
+
+    let mut retained = BTreeSet::from([current_pointer.to_owned()]);
+    for (_, name, _) in &generations {
+        if retained.len() >= MANIFEST_GENERATIONS_RETAINED {
+            break;
+        }
+        retained.insert(name.clone());
+    }
+    if !retained.contains(current_pointer) {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "manifest retention cannot prove CURRENT target {current_pointer:?} is retained"
+        )));
+    }
+
+    let mut reclaimed = 0usize;
+    for (_, name, path) in generations {
+        if retained.contains(&name) {
+            continue;
+        }
+        fs::remove_file(&path)
+            .map_err(|error| storage_error("reclaim old manifest generation", &path, error))?;
+        reclaimed = reclaimed.saturating_add(1);
+    }
+    crate::fsync::sync_dir(vault_dir, "manifest generation retention")?;
+    let after = before.saturating_sub(reclaimed);
+    tracing::info!(
+        code = "CALYX_ASTER_MANIFEST_GENERATIONS_RECLAIMED",
+        current_pointer,
+        generations_before = before,
+        generations_after = after,
+        generations_reclaimed = reclaimed,
+        retained_limit = MANIFEST_GENERATIONS_RETAINED,
+        source_of_truth =
+            "CURRENT + exact manifest-<20 digit seq>.json files + synced vault directory",
+        "reclaimed old immutable manifest generations after durable CURRENT readback"
+    );
+    Ok(ManifestRetention {
+        before,
+        after,
+        reclaimed,
+    })
 }
 
 fn encode_manifest(manifest: &VaultManifest) -> Result<Vec<u8>> {

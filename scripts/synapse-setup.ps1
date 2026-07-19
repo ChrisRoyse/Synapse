@@ -2982,13 +2982,6 @@ function Get-SynapseCalyxPhysicalSnapshot {
     return [pscustomobject]$snapshot
 }
 
-function Get-SynapseDefaultCalyxVaultPath {
-    if (-not [string]::IsNullOrWhiteSpace($env:SYNAPSE_CALYX_VAULT_DIR)) {
-        return $env:SYNAPSE_CALYX_VAULT_DIR
-    }
-    return (Join-Path $env:APPDATA 'synapse\vault')
-}
-
 function Format-SynapseCalyxPhysicalSnapshot {
     param([AllowNull()]$Snapshot)
     if ($null -eq $Snapshot) {
@@ -3006,7 +2999,7 @@ function Format-SynapseDaemonStartupPhysicalState {
     $dbSnapshot = Get-SynapseCalyxPhysicalSnapshot -Path $DbPath
     $vaultPath = $CalyxVaultPath
     if ([string]::IsNullOrWhiteSpace($vaultPath)) {
-        $vaultPath = Get-SynapseDefaultCalyxVaultPath
+        $vaultPath = $DbPath
     }
     $vaultSnapshot = Get-SynapseCalyxPhysicalSnapshot -Path $vaultPath
     return ("storage_db={0}`ncalyx_vault={1}" -f `
@@ -5046,7 +5039,7 @@ function Test-SynapseCandidateDaemon {
 
     $candidateRoot = New-SynapseSetupRunDirectory -Root (Join-Path $LogDir 'setup-candidates') -Purpose 'candidate'
     $candidateDb = Join-Path $candidateRoot 'db'
-    $candidateCalyxVault = Join-Path $candidateRoot 'vault'
+    $candidateCalyxVault = $candidateDb
     $candidateShellJobRoot = Join-Path $candidateRoot 'shell-jobs'
     New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
     New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
@@ -6753,6 +6746,7 @@ function Assert-SynapseRestartAllowed {
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$TokenPath,
+        [ValidateRange(1, 300)][int]$HealthTimeoutSec = 120,
         [switch]$ForceRestart,
         [switch]$AllowActiveClientDrain
     )
@@ -6786,9 +6780,9 @@ function Assert-SynapseRestartAllowed {
     $activeSessions = $null
     $healthRead = $null
     if ($tokenRead.Ok) {
-        $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $tokenRead.Token
+        $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $tokenRead.Token -TimeoutSec $HealthTimeoutSec
         if (-not $healthRead.Ok) {
-            $message = "SYNAPSE_RESTART_GUARD_HEALTH_UNREADABLE reason=$Reason bind=$Bind error=$($healthRead.Error) remediation=do not restart blindly; repair the daemon/token or rerun with -ForceRestart after coordinating a maintenance window"
+            $message = "SYNAPSE_RESTART_GUARD_HEALTH_UNREADABLE reason=$Reason bind=$Bind timeout_s=$($healthRead.TimeoutSec) error=$($healthRead.Error) remediation=do not restart blindly; repair the daemon/token or rerun with -ForceRestart after coordinating a maintenance window"
             if ($ForceRestart) {
                 Info "FORCE_RESTART: $message"
             } else {
@@ -6873,7 +6867,7 @@ function Assert-SynapseRestartAllowed {
             Die $message
         }
     } else {
-        Info "Synapse restart guard reason=$Reason verdict=clear active_sessions=$activeSessions live_tcp_clients=0 stale_tcp_connections=$($staleTcpConnections.Count) process_count=$($processes.Count)"
+        Info "Synapse restart guard reason=$Reason verdict=clear health_timeout_s=$($healthRead.TimeoutSec) active_sessions=$activeSessions live_tcp_clients=0 stale_tcp_connections=$($staleTcpConnections.Count) process_count=$($processes.Count)"
     }
 }
 
@@ -7498,7 +7492,7 @@ Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintena
 
 if ($Remove) {
     Step "Removing scheduled task '$TaskName'"
-    Assert-SynapseRestartAllowed -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
+    Assert-SynapseRestartAllowed -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask  -TaskName $TaskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -7908,7 +7902,7 @@ if (-not $liveDaemonHandoffRequired) {
     Step "Verified installed daemon binary without live drain -> $ExePath"
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
-    Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
+    Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
     $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
     Suspend-SynapseDaemonTaskForInstallHandoff -TaskName $TaskName -SupervisorPath $daemonSupervisorPath
     Stop-SynapseMcpProcessesForInstallHandoff -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300

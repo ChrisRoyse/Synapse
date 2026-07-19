@@ -3,7 +3,7 @@
 use crate::cf::ColumnFamily;
 use crate::compaction::{CompactionCatalog, catalog_from_vault_dir};
 use crate::mvcc::is_tombstone_value;
-use crate::sst::SstReader;
+use crate::sst::shared_reader;
 use crate::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
 use std::fmt::Write as _;
@@ -466,7 +466,7 @@ pub fn scan_catalog_tombstones(catalog: &CompactionCatalog) -> Result<TombstoneI
                 io_stats.bytes_written_by_flush =
                     io_stats.bytes_written_by_flush.saturating_add(shard.bytes);
             }
-            for entry in SstReader::open(&shard.path)?.iter()? {
+            for entry in shared_reader(&shard.path)?.iter()? {
                 if is_tombstone_value(&entry.value) {
                     stats.tombstone_keys += 1;
                     stats.tombstone_value_bytes = stats

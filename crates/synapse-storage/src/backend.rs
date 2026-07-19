@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
@@ -18,8 +18,9 @@ use sha2::{Digest, Sha256};
 use synapse_calyx::{
     SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
     SynapseCalyxAnchorWriteReadback, SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConfig,
-    SynapseCalyxError, SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
-    SynapseCalyxVault,
+    SynapseCalyxError, SynapseCalyxGroundedObservationReadback, SynapseCalyxObservationPutReadback,
+    SynapseCalyxReadOnlyVault, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
+    SynapseCalyxVaultStatus,
 };
 use synapse_core::{
     error_codes,
@@ -57,8 +58,9 @@ const CALYX_KV_VALUE_HEADER_BYTES: usize = 1 + 8 + 8;
 const CALYX_KV_NAMESPACE: u64 = 0;
 const CALYX_COLLECTION_ID_BASE: u64 = 0x5359_4e43_4600_0000;
 const CALYX_METADATA_COLLECTION_ID: u64 = CALYX_COLLECTION_ID_BASE | 0xffff;
-const CALYX_UNSUPPORTED_MAINTENANCE_DETAIL: &str = "storage_backend=\"calyx\" supports Db read/write/scan/delete/pressure/GC parity; direct compact_cf and compact_cf_range are unavailable because Synapse column families are logical namespaces inside the physical Calyx KV column family";
 const CALYX_GC_CF: &str = "storage_gc";
+const CALYX_GC_WAL_RECYCLE_MAX_SEGMENTS: usize = 8;
+const CALYX_GC_WAL_RECYCLE_FSYNC_BUDGET: usize = 8;
 const CALYX_GC_PROTECTED_CF_POLICY_SKIPPED: &str = "protected_cf_policy_skipped";
 const CALYX_GC_CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
 const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
@@ -174,6 +176,18 @@ pub struct CalyxAnchorWriteReport {
     pub ledger_hash: String,
     pub latest_seq: u64,
     pub readback_anchor_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpUsageGroundedPublicationReport {
+    pub source_row_count: u64,
+    pub source_readback_exact_match_count: u64,
+    pub source_key_hex: String,
+    pub source_value_len_bytes: u64,
+    pub source_value_sha256: String,
+    pub committed_seq: u64,
+    pub constellation: ConstellationPutReport,
+    pub anchor: CalyxAnchorWriteReport,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +322,11 @@ pub trait StorageBackend: Send + Sync {
     fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap>;
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
+    fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus>;
+    fn close_calyx_vault(
+        &self,
+        reason: &'static str,
+    ) -> StorageResult<SynapseCalyxVaultCloseReadback>;
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>>;
     fn put_timeline_constellation(
         &self,
@@ -374,6 +393,15 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &Value,
     ) -> StorageResult<ConstellationPutReport>;
+    fn put_mcp_usage_grounded_publication(
+        &self,
+        source_rows: Vec<RawRow>,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+        anchor: GroundingAnchor,
+        ledger_payload: &Value,
+    ) -> StorageResult<McpUsageGroundedPublicationReport>;
     fn put_grounding_anchor_for_source(
         &self,
         source_cf: &'static str,
@@ -430,8 +458,137 @@ pub trait StorageBackend: Send + Sync {
 
 pub struct CalyxBackend {
     path: PathBuf,
-    vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
+    vault: Arc<CalyxVaultRuntime>,
     pressure: Arc<pressure::PressureState>,
+}
+
+/// Shared lifecycle owner for the process-local Calyx vault.
+///
+/// Aster already provides its own fine-grained row/router locks and a durable
+/// commit lock. Holding a second process-wide mutex across every storage
+/// operation collapsed that concurrency and let a long GC pass block unrelated
+/// reads and MCP response persistence. The lifecycle lock here is held only
+/// long enough to clone the immutable vault handle; physical operations then
+/// execute against Aster's authoritative synchronization.
+struct CalyxVaultRuntime {
+    vault: RwLock<Option<Arc<SynapseCalyxVault>>>,
+}
+
+impl CalyxVaultRuntime {
+    fn new(vault: SynapseCalyxVault) -> Self {
+        Self {
+            vault: RwLock::new(Some(Arc::new(vault))),
+        }
+    }
+
+    fn with_vault<T>(
+        &self,
+        cf_name: &str,
+        operation: &'static str,
+        write: bool,
+        f: impl FnOnce(&SynapseCalyxVault) -> StorageResult<T>,
+    ) -> StorageResult<T> {
+        let vault = {
+            let guard = self.vault.read().map_err(|poisoned| {
+                calyx_operation_failed(
+                    cf_name,
+                    write,
+                    format!("{operation}: Calyx vault lifecycle lock poisoned: {poisoned}"),
+                )
+            })?;
+            guard.as_ref().cloned().ok_or_else(|| {
+                calyx_operation_failed(
+                    cf_name,
+                    write,
+                    format!("{operation}: Calyx vault handle has already been closed"),
+                )
+            })?
+        };
+        f(&vault)
+    }
+
+    fn status(&self) -> StorageResult<SynapseCalyxVaultStatus> {
+        self.with_vault(
+            "<calyx-vault>",
+            "read live Calyx vault status",
+            false,
+            |vault| Ok(vault.status()),
+        )
+    }
+
+    fn close(&self, reason: &'static str) -> StorageResult<SynapseCalyxVaultCloseReadback> {
+        let vault = {
+            let mut slot = self.vault.write().map_err(|poisoned| {
+                calyx_write_failed_detail(
+                    "<calyx-vault>",
+                    format!("close Calyx vault: lifecycle lock poisoned: {poisoned}"),
+                )
+            })?;
+            let vault = slot.take().ok_or_else(|| {
+                calyx_write_failed_detail(
+                    "<calyx-vault>",
+                    "close Calyx vault: handle has already been closed".to_owned(),
+                )
+            })?;
+            match Arc::try_unwrap(vault) {
+                Ok(vault) => {
+                    drop(slot);
+                    vault
+                }
+                Err(vault) => {
+                    let active_operations = Arc::strong_count(&vault).saturating_sub(1);
+                    *slot = Some(vault);
+                    drop(slot);
+                    return Err(calyx_write_failed_detail(
+                        "<calyx-vault>",
+                        format!(
+                            "close Calyx vault refused while {active_operations} physical operation handle(s) remain active"
+                        ),
+                    ));
+                }
+            }
+        };
+        vault.close(reason).map_err(|source| {
+            calyx_write_failed("<calyx-vault>", "flush and close live Calyx vault", &source)
+        })
+    }
+}
+
+impl Drop for CalyxVaultRuntime {
+    fn drop(&mut self) {
+        let slot = match self.vault.get_mut() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!(
+                    code = "STORAGE_CALYX_DROP_LOCK_POISONED",
+                    error = %poisoned,
+                    "Calyx storage lifecycle lock poisoned during drop; attempting close anyway"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let Some(vault) = slot.take() else {
+            return;
+        };
+        let vault = match Arc::try_unwrap(vault) {
+            Ok(vault) => vault,
+            Err(vault) => {
+                tracing::error!(
+                    code = "STORAGE_CALYX_DROP_ACTIVE_OPERATION",
+                    strong_count = Arc::strong_count(&vault),
+                    "Calyx storage runtime reached final drop with active vault operations; deterministic close refused"
+                );
+                return;
+            }
+        };
+        if let Err(error) = vault.close("synapse_storage_calyx_runtime_drop") {
+            tracing::error!(
+                code = error.code,
+                error = %error,
+                "Calyx storage backend close failed during drop"
+            );
+        }
+    }
 }
 
 impl CalyxBackend {
@@ -442,15 +599,11 @@ impl CalyxBackend {
         verify_calyx_schema_version(&vault, path, schema_version)?;
         Ok(Self {
             path: path.to_path_buf(),
-            vault: Arc::new(Mutex::new(Some(vault))),
+            vault: Arc::new(CalyxVaultRuntime::new(vault)),
             pressure: Arc::new(pressure::PressureState::default()),
         })
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the mutex guard intentionally owns the single process-local Calyx vault for the whole storage operation"
-    )]
     fn with_vault<T>(
         &self,
         cf_name: &str,
@@ -458,21 +611,7 @@ impl CalyxBackend {
         write: bool,
         f: impl FnOnce(&SynapseCalyxVault) -> StorageResult<T>,
     ) -> StorageResult<T> {
-        let guard = self.vault.lock().map_err(|poisoned| {
-            calyx_operation_failed(
-                cf_name,
-                write,
-                format!("{operation}: Calyx vault mutex poisoned: {poisoned}"),
-            )
-        })?;
-        let Some(vault) = guard.as_ref() else {
-            return Err(calyx_operation_failed(
-                cf_name,
-                write,
-                format!("{operation}: Calyx vault handle has already been closed"),
-            ));
-        };
-        f(vault)
+        self.vault.with_vault(cf_name, operation, write, f)
     }
 
     fn commit_rows(&self, cf_name: &str, rows: Vec<SynapseCalyxCfWrite>) -> StorageResult<()> {
@@ -491,82 +630,46 @@ impl CalyxBackend {
     }
 }
 
-impl Drop for CalyxBackend {
-    fn drop(&mut self) {
-        let vault = match self.vault.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(poisoned) => {
-                tracing::error!(
-                    code = "STORAGE_CALYX_DROP_LOCK_POISONED",
-                    error = %poisoned,
-                    "Calyx storage backend mutex poisoned during drop; attempting close anyway"
-                );
-                poisoned.into_inner().take()
-            }
-        };
-        if let Some(vault) = vault
-            && let Err(error) = vault.close("synapse_storage_calyx_backend_drop")
-        {
-            tracing::error!(
-                code = error.code,
-                error = %error,
-                "Calyx storage backend close failed during drop"
-            );
-        }
-    }
-}
-
 struct CalyxPressureMaintenance {
-    vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
+    vault: Arc<CalyxVaultRuntime>,
 }
 
 impl CalyxPressureMaintenance {
-    const fn new(vault: Arc<Mutex<Option<SynapseCalyxVault>>>) -> Self {
+    const fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
         Self { vault }
     }
 }
 
 impl pressure::PressureMaintenance for CalyxPressureMaintenance {
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the vault mutex intentionally serializes physical Calyx compaction with storage reads/writes"
-    )]
     fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>> {
-        let guard = self.vault.lock().map_err(|poisoned| {
-            calyx_operation_failed(
-                pressure::PRESSURE_CF,
-                true,
-                format!("compact Calyx KV for pressure: vault mutex poisoned: {poisoned}"),
-            )
-        })?;
-        let Some(vault) = guard.as_ref() else {
-            return Err(calyx_operation_failed(
-                pressure::PRESSURE_CF,
-                true,
-                "compact Calyx KV for pressure: vault handle has already been closed".to_owned(),
-            ));
-        };
-        let compacted = vault.compact_kv_once().map_err(|source| {
-            calyx_write_failed(
-                pressure::PRESSURE_CF,
-                "compact Calyx KV for pressure",
-                &source,
-            )
-        })?;
-        if compacted {
-            Ok(cf::ALL_COLUMN_FAMILIES.to_vec())
-        } else {
-            Ok(Vec::new())
-        }
+        self.vault.with_vault(
+            pressure::PRESSURE_CF,
+            "compact Calyx KV for pressure",
+            true,
+            |vault| {
+                let compacted = vault.compact_kv_once().map_err(|source| {
+                    calyx_write_failed(
+                        pressure::PRESSURE_CF,
+                        "compact Calyx KV for pressure",
+                        &source,
+                    )
+                })?;
+                if compacted {
+                    Ok(cf::ALL_COLUMN_FAMILIES.to_vec())
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        )
     }
 }
 
 struct CalyxGcRunner {
-    vault: Arc<Mutex<Option<SynapseCalyxVault>>>,
+    vault: Arc<CalyxVaultRuntime>,
 }
 
 impl CalyxGcRunner {
-    const fn new(vault: Arc<Mutex<Option<SynapseCalyxVault>>>) -> Self {
+    const fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
         Self { vault }
     }
 
@@ -585,26 +688,11 @@ impl CalyxGcRunner {
         self.run_with_budgets(std::slice::from_ref(&budget))
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the vault mutex intentionally serializes physical Calyx GC scans, tombstone writes, and tombstone purges"
-    )]
     fn run_with_budgets(&self, budgets: &[CalyxGcBudget]) -> StorageResult<gc::GcReport> {
-        let guard = self.vault.lock().map_err(|poisoned| {
-            calyx_operation_failed(
-                CALYX_GC_CF,
-                true,
-                format!("run Calyx GC: vault mutex poisoned: {poisoned}"),
-            )
-        })?;
-        let Some(vault) = guard.as_ref() else {
-            return Err(calyx_operation_failed(
-                CALYX_GC_CF,
-                true,
-                "run Calyx GC: vault handle has already been closed".to_owned(),
-            ));
-        };
-        run_calyx_gc_budgets(vault, budgets)
+        self.vault
+            .with_vault(CALYX_GC_CF, "run Calyx GC", true, |vault| {
+                run_calyx_gc_budgets(vault, budgets)
+            })
     }
 }
 
@@ -819,6 +907,17 @@ impl StorageBackend for CalyxBackend {
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap> {
         let counts = self.cf_row_counts()?;
         Ok((counts, Vec::new()))
+    }
+
+    fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus> {
+        self.vault.status()
+    }
+
+    fn close_calyx_vault(
+        &self,
+        reason: &'static str,
+    ) -> StorageResult<SynapseCalyxVaultCloseReadback> {
+        self.vault.close(reason)
     }
 
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
@@ -1723,6 +1822,38 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
+    fn put_mcp_usage_grounded_publication(
+        &self,
+        source_rows: Vec<RawRow>,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+        anchor: GroundingAnchor,
+        ledger_payload: &Value,
+    ) -> StorageResult<McpUsageGroundedPublicationReport> {
+        let started = Instant::now();
+        validate_mcp_usage_source_rows(&source_rows, source_key, raw_bytes)?;
+        self.with_vault(
+            "calyx_mcp_usage_publication",
+            "atomically publish grounded MCP usage",
+            true,
+            |vault| {
+                let prepared = prepare_mcp_usage_grounded_publication(
+                    vault,
+                    source_rows,
+                    source_key,
+                    raw_bytes,
+                    record,
+                    anchor,
+                    ledger_payload,
+                )?;
+                commit_mcp_usage_grounded_publication(
+                    vault, prepared, source_key, raw_bytes, started,
+                )
+            },
+        )
+    }
+
     fn put_grounding_anchor_for_source(
         &self,
         source_cf: &'static str,
@@ -2036,12 +2167,66 @@ impl StorageBackend for CalyxBackend {
         Ok(rows)
     }
 
-    fn compact_cf(&self, _cf_name: &str) -> StorageResult<()> {
-        Err(calyx_unsupported_maintenance("compact_cf"))
+    fn compact_cf(&self, cf_name: &str) -> StorageResult<()> {
+        calyx_collection_id_for_cf_write(cf_name)?;
+        self.with_vault(
+            cf_name,
+            "compact logical Calyx storage namespace",
+            true,
+            |vault| {
+                vault.purge_kv_tombstones().map_err(|source| {
+                    calyx_write_failed(
+                        cf_name,
+                        "compact physical Calyx KV CF and purge tombstones",
+                        &source,
+                    )
+                })?;
+                tracing::info!(
+                    code = "STORAGE_CALYX_LOGICAL_CF_COMPACTED",
+                    cf = cf_name,
+                    physical_cf = ColumnFamily::Kv.name(),
+                    "compacted the physical Calyx KV CF backing the requested logical namespace"
+                );
+                Ok(())
+            },
+        )
     }
 
-    fn compact_cf_range(&self, _cf_name: &str, _start: &[u8], _end: &[u8]) -> StorageResult<()> {
-        Err(calyx_unsupported_maintenance("compact_cf_range"))
+    fn compact_cf_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        calyx_collection_id_for_cf_write(cf_name)?;
+        if start >= end {
+            return Err(calyx_write_failed_detail(
+                cf_name,
+                format!(
+                    "invalid Calyx compaction range: start must be strictly below end; start_len={} end_len={}",
+                    start.len(),
+                    end.len()
+                ),
+            ));
+        }
+        self.with_vault(
+            cf_name,
+            "compact logical Calyx storage range",
+            true,
+            |vault| {
+                vault.purge_kv_tombstones().map_err(|source| {
+                    calyx_write_failed(
+                        cf_name,
+                        "compact physical Calyx KV CF and purge range tombstones",
+                        &source,
+                    )
+                })?;
+                tracing::info!(
+                    code = "STORAGE_CALYX_LOGICAL_CF_RANGE_COMPACTED",
+                    cf = cf_name,
+                    start_len = start.len(),
+                    end_len = end.len(),
+                    physical_cf = ColumnFamily::Kv.name(),
+                    "compacted the physical Calyx KV CF that durably contains the requested logical range"
+                );
+                Ok(())
+            },
+        )
     }
 }
 
@@ -2528,6 +2713,367 @@ struct ConstellationReportInput<'a> {
     duration_us: u64,
 }
 
+struct PreparedMcpUsageGroundedPublication {
+    context: NativeConstellationContext,
+    content_addressed_source_identity: Vec<u8>,
+    constellation: Constellation,
+    slot_count: u64,
+    scalar_count: u64,
+    anchor: Anchor,
+    ledger_payload: Vec<u8>,
+    physical_source_rows: Vec<SynapseCalyxCfWrite>,
+}
+
+struct VerifiedMcpUsageSourceReadback {
+    exact_match_count: usize,
+    logical_key_hex: String,
+    logical_value_len_bytes: u64,
+    logical_value_sha256: String,
+}
+
+fn validate_mcp_usage_source_rows(
+    source_rows: &[RawRow],
+    source_key: &[u8],
+    raw_bytes: &[u8],
+) -> StorageResult<()> {
+    let exact_source_count = source_rows
+        .iter()
+        .filter(|(key, value)| key == source_key && value == raw_bytes)
+        .count();
+    if exact_source_count != 1 {
+        return Err(calyx_write_failed_detail(
+            cf::CF_KV,
+            format!(
+                "atomic MCP usage publication requires exactly one source row matching source_key/raw_bytes; found {exact_source_count}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_mcp_usage_grounded_publication(
+    vault: &SynapseCalyxVault,
+    source_rows: Vec<RawRow>,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &Value,
+    anchor: GroundingAnchor,
+    ledger_payload: &Value,
+) -> StorageResult<PreparedMcpUsageGroundedPublication> {
+    let panel = constellations::anchor_panel_for_source_row(cf::CF_KV, source_key)?;
+    if panel.panel_name != SYN_MCP_USAGE_PANEL_NAME
+        || panel.panel_version != SYN_MCP_USAGE_PANEL_VERSION
+    {
+        return Err(calyx_write_failed_detail(
+            "calyx_mcp_usage_publication",
+            format!(
+                "atomic MCP usage publication requires an MCP usage source row; key_hex={} maps to {} version {}",
+                constellations::hex_encode(source_key),
+                panel.panel_name,
+                panel.panel_version
+            ),
+        ));
+    }
+    let input_bytes = constellations::source_constellation_input_bytes(
+        panel.input_mode,
+        cf::CF_KV,
+        source_key,
+        raw_bytes,
+    );
+    let context = NativeConstellationContext {
+        vault_id: vault.vault_id_value(),
+        cx_id: vault.cx_id_for_input(&input_bytes, panel.panel_version),
+        created_at_ms: calyx_clock_now_for_write(vault, cf::CF_KV)?,
+        next_ledger_seq: vault.latest_seq().saturating_add(1),
+    };
+    let constellation = constellations::build_mcp_usage_constellation(
+        context,
+        source_key,
+        raw_bytes,
+        &input_bytes,
+        record,
+    )?;
+    let slot_count = u64::try_from(constellation.slots.len()).unwrap_or(u64::MAX);
+    let scalar_count = u64::try_from(constellation.scalars.len()).unwrap_or(u64::MAX);
+    let anchor = grounding_anchor_to_calyx(anchor)?;
+    let ledger_payload =
+        serde_json::to_vec(ledger_payload).map_err(|source| StorageError::EncodeJson {
+            type_name: "calyx_mcp_usage_atomic_ledger_payload",
+            source,
+        })?;
+    let collection_id = calyx_collection_id_for_cf_write(cf::CF_KV)?;
+    let now_ms = calyx_clock_now_for_write(vault, cf::CF_KV)?;
+    let physical_source_rows = source_rows
+        .into_iter()
+        .map(|(key, value)| calyx_put_row(cf::CF_KV, collection_id, &key, &value, now_ms))
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(PreparedMcpUsageGroundedPublication {
+        context,
+        content_addressed_source_identity: input_bytes,
+        constellation,
+        slot_count,
+        scalar_count,
+        anchor,
+        ledger_payload,
+        physical_source_rows,
+    })
+}
+
+fn commit_mcp_usage_grounded_publication(
+    vault: &SynapseCalyxVault,
+    prepared: PreparedMcpUsageGroundedPublication,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    started: Instant,
+) -> StorageResult<McpUsageGroundedPublicationReport> {
+    let PreparedMcpUsageGroundedPublication {
+        context,
+        content_addressed_source_identity,
+        constellation,
+        slot_count,
+        scalar_count,
+        anchor,
+        ledger_payload,
+        physical_source_rows,
+    } = prepared;
+    let expected_source_rows = physical_source_rows.clone();
+    let atomic_write_started = Instant::now();
+    let write = vault
+        .put_grounded_observation_with_source_rows(
+            physical_source_rows,
+            content_addressed_source_identity,
+            constellation,
+            anchor.clone(),
+            ledger_payload,
+            "synapse-mcp-usage",
+        )
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_mcp_usage_publication",
+                "commit atomic MCP usage source/constellation/anchor rows",
+                &source,
+            )
+        })?;
+    let atomic_write_us = constellations::duration_us(atomic_write_started.elapsed());
+    if write.source_row_count != expected_source_rows.len() {
+        return Err(calyx_write_failed_detail(
+            "calyx_mcp_usage_publication",
+            format!(
+                "atomic MCP usage committed source row count mismatch: committed={} expected={}",
+                write.source_row_count,
+                expected_source_rows.len()
+            ),
+        ));
+    }
+    let source_readback_started = Instant::now();
+    let source_readback =
+        verify_mcp_usage_source_readback(vault, &expected_source_rows, source_key, raw_bytes)?;
+    let source_readback_us = constellations::duration_us(source_readback_started.elapsed());
+    let anchor_readback_started = Instant::now();
+    let readback_anchor_count = verify_mcp_usage_anchor_readback(vault, context.cx_id, &anchor)?;
+    let anchor_readback_us = constellations::duration_us(anchor_readback_started.elapsed());
+    tracing::info!(
+        code = "CALYX_MCP_USAGE_PUBLICATION_STAGE_TIMINGS",
+        cx_id = %context.cx_id,
+        atomic_write_us,
+        source_readback_us,
+        exact_anchor_readback_us = anchor_readback_us,
+        total_us = constellations::duration_us(started.elapsed()),
+        "completed MCP usage publication stage timing readback"
+    );
+    Ok(finish_mcp_usage_grounded_publication(
+        context,
+        slot_count,
+        scalar_count,
+        &anchor,
+        &write,
+        &source_readback,
+        readback_anchor_count,
+        source_key,
+        raw_bytes,
+        started,
+    ))
+}
+
+fn verify_mcp_usage_source_readback(
+    vault: &SynapseCalyxVault,
+    expected_source_rows: &[SynapseCalyxCfWrite],
+    source_key: &[u8],
+    raw_bytes: &[u8],
+) -> StorageResult<VerifiedMcpUsageSourceReadback> {
+    let snapshot = vault.latest_seq();
+    let collection_id = calyx_collection_id_for_cf_write(cf::CF_KV)?;
+    let requested_physical_key = encode_calyx_key_for_write(cf::CF_KV, collection_id, source_key)?;
+    let mut requested_readback = None;
+    for expected in expected_source_rows {
+        let actual = vault
+            .read_cf_at(snapshot, ColumnFamily::Kv, &expected.key)
+            .map_err(|source| {
+                calyx_read_failed(cf::CF_KV, "read back atomic MCP usage source row", &source)
+            })?;
+        let Some(actual) = actual else {
+            return Err(calyx_write_failed_detail(
+                "calyx_mcp_usage_publication",
+                format!(
+                    "atomic MCP usage physical source readback missing: key_hex={}",
+                    constellations::hex_encode(&expected.key)
+                ),
+            ));
+        };
+        if actual != expected.value {
+            return Err(calyx_write_failed_detail(
+                "calyx_mcp_usage_publication",
+                format!(
+                    "atomic MCP usage physical source readback mismatch: key_hex={} expected_sha256={} actual_sha256={}",
+                    constellations::hex_encode(&expected.key),
+                    constellations::sha256_hex(&expected.value),
+                    constellations::sha256_hex(&actual)
+                ),
+            ));
+        }
+        if expected.key == requested_physical_key {
+            let envelope = decode_calyx_value_raw(&actual).map_err(|detail| {
+                calyx_write_failed_detail(
+                    "calyx_mcp_usage_publication",
+                    format!(
+                        "atomic MCP usage physical source readback has an invalid retention envelope: key_hex={} detail={detail}",
+                        constellations::hex_encode(source_key)
+                    ),
+                )
+            })?;
+            if envelope.payload != raw_bytes {
+                return Err(calyx_write_failed_detail(
+                    "calyx_mcp_usage_publication",
+                    format!(
+                        "atomic MCP usage logical payload readback mismatch: key_hex={} expected_sha256={} actual_sha256={}",
+                        constellations::hex_encode(source_key),
+                        constellations::sha256_hex(raw_bytes),
+                        constellations::sha256_hex(envelope.payload)
+                    ),
+                ));
+            }
+            requested_readback = Some(VerifiedMcpUsageSourceReadback {
+                exact_match_count: expected_source_rows.len(),
+                logical_key_hex: constellations::hex_encode(source_key),
+                logical_value_len_bytes: u64::try_from(envelope.payload.len()).unwrap_or(u64::MAX),
+                logical_value_sha256: sha256_hex(envelope.payload),
+            });
+        }
+    }
+    requested_readback.ok_or_else(|| {
+        calyx_write_failed_detail(
+            "calyx_mcp_usage_publication",
+            format!(
+                "atomic MCP usage physical source readback omitted requested key: key_hex={}",
+                constellations::hex_encode(source_key)
+            ),
+        )
+    })
+}
+
+fn verify_mcp_usage_anchor_readback(
+    vault: &SynapseCalyxVault,
+    cx_id: CxId,
+    expected_anchor: &Anchor,
+) -> StorageResult<usize> {
+    let anchor_row = vault
+        .read_anchor_exact(cx_id, &expected_anchor.kind)
+        .map_err(|source| {
+            calyx_read_failed(
+                "calyx_anchors",
+                "read back exact atomic MCP usage grounded anchor",
+                &source,
+            )
+        })?
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                "calyx_mcp_usage_publication",
+                format!(
+                    "atomic MCP usage exact physical anchor row is missing for cx_id={cx_id} kind={}",
+                    anchor_kind_label(&expected_anchor.kind)
+                ),
+            )
+        })?;
+    if anchor_row.anchor != *expected_anchor {
+        return Err(calyx_write_failed_detail(
+            "calyx_mcp_usage_publication",
+            format!(
+                "atomic MCP usage exact physical anchor readback mismatch for cx_id={cx_id} kind={}",
+                anchor_kind_label(&expected_anchor.kind)
+            ),
+        ));
+    }
+    Ok(1)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "final report construction receives the independently verified commit facts"
+)]
+fn finish_mcp_usage_grounded_publication(
+    context: NativeConstellationContext,
+    slot_count: u64,
+    scalar_count: u64,
+    expected_anchor: &Anchor,
+    write: &SynapseCalyxGroundedObservationReadback,
+    source_readback: &VerifiedMcpUsageSourceReadback,
+    readback_anchor_count: usize,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    started: Instant,
+) -> McpUsageGroundedPublicationReport {
+    let observation = grounded_observation_as_observation_readback(write);
+    let anchor_write = grounded_observation_as_anchor_readback(write);
+    let duration_us = constellations::duration_us(started.elapsed());
+    let constellation = constellation_report(ConstellationReportInput {
+        panel_name: SYN_MCP_USAGE_PANEL_NAME,
+        panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+        source_cf: cf::CF_KV,
+        source_key,
+        raw_bytes,
+        readback: observation,
+        slot_count,
+        scalar_count,
+        duration_us,
+    });
+    let anchor = anchor_write_report(AnchorWriteReportInput {
+        source_cf: cf::CF_KV,
+        source_key,
+        raw_bytes,
+        panel_name: SYN_MCP_USAGE_PANEL_NAME,
+        panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+        cx_id: context.cx_id,
+        anchor: expected_anchor,
+        write: anchor_write,
+        readback_anchor_count,
+    });
+    tracing::info!(
+        code = "CALYX_MCP_USAGE_ATOMIC_PUBLICATION_COMMITTED",
+        source_row_count = write.source_row_count,
+        source_readback_exact_match_count = source_readback.exact_match_count,
+        source_key_hex = %source_readback.logical_key_hex,
+        source_value_len_bytes = source_readback.logical_value_len_bytes,
+        source_value_sha256 = %source_readback.logical_value_sha256,
+        cx_id = %context.cx_id,
+        ledger_seq = write.ledger_seq,
+        committed_seq = write.committed_seq,
+        latest_seq = write.latest_seq,
+        duration_us,
+        "MCP usage source rows, constellation, anchor, and ledger entry committed atomically with physical readback"
+    );
+    McpUsageGroundedPublicationReport {
+        source_row_count: u64::try_from(write.source_row_count).unwrap_or(u64::MAX),
+        source_readback_exact_match_count: u64::try_from(source_readback.exact_match_count)
+            .unwrap_or(u64::MAX),
+        source_key_hex: source_readback.logical_key_hex.clone(),
+        source_value_len_bytes: source_readback.logical_value_len_bytes,
+        source_value_sha256: source_readback.logical_value_sha256.clone(),
+        committed_seq: write.committed_seq,
+        constellation,
+        anchor,
+    }
+}
+
 fn constellation_report(input: ConstellationReportInput<'_>) -> ConstellationPutReport {
     ConstellationPutReport {
         panel_name: input.panel_name,
@@ -2541,6 +3087,28 @@ fn constellation_report(input: ConstellationReportInput<'_>) -> ConstellationPut
         slot_count: input.slot_count,
         scalar_count: input.scalar_count,
         duration_us: input.duration_us,
+    }
+}
+
+fn grounded_observation_as_observation_readback(
+    readback: &SynapseCalyxGroundedObservationReadback,
+) -> SynapseCalyxObservationPutReadback {
+    SynapseCalyxObservationPutReadback {
+        cx_id: readback.cx_id.clone(),
+        disposition: readback.disposition,
+        latest_seq: readback.latest_seq,
+    }
+}
+
+fn grounded_observation_as_anchor_readback(
+    readback: &SynapseCalyxGroundedObservationReadback,
+) -> SynapseCalyxAnchorWriteReadback {
+    SynapseCalyxAnchorWriteReadback {
+        cx_id: readback.cx_id.clone(),
+        anchor_count: 1,
+        ledger_seq: readback.ledger_seq,
+        ledger_hash: readback.ledger_hash.clone(),
+        latest_seq: readback.latest_seq,
     }
 }
 
@@ -3442,6 +4010,52 @@ fn run_calyx_gc_budgets(
         );
     }
 
+    let native_fanout = vault.compact_native_fanout_once().map_err(|source| {
+        calyx_write_failed(
+            CALYX_GC_CF,
+            "run bounded native Calyx CF fan-out maintenance",
+            &source,
+        )
+    })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_NATIVE_FANOUT_MAINTENANCE_COMPLETED",
+        attempted_cfs = native_fanout.attempted_cfs,
+        compacted_cfs = native_fanout.compacted_cfs,
+        skipped_cfs = native_fanout.skipped_cfs,
+        reclaimed_input_files = native_fanout.reclaimed_input_files,
+        input_bytes = native_fanout.input_bytes,
+        output_bytes = native_fanout.output_bytes,
+        compacted_cf_names = ?native_fanout.compacted_cf_names,
+        "Calyx storage GC completed bounded native-CF file-count maintenance"
+    );
+
+    let wal_recycle = vault
+        .recycle_durable_wal_once(
+            CALYX_GC_WAL_RECYCLE_MAX_SEGMENTS,
+            CALYX_GC_WAL_RECYCLE_FSYNC_BUDGET,
+        )
+        .map_err(|source| {
+            calyx_write_failed(
+                CALYX_GC_CF,
+                "flush checkpoints and recycle durable Calyx WAL segments",
+                &source,
+            )
+        })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_WAL_RECYCLE_COMPLETED",
+        newest_durable_seq = wal_recycle.newest_durable_seq,
+        bytes_before = wal_recycle.bytes_before,
+        bytes_after = wal_recycle.bytes_after,
+        segments_before = wal_recycle.segments_before,
+        recyclable_segments_before = wal_recycle.recyclable_segments_before,
+        segments_recycled = wal_recycle.segments_recycled,
+        bytes_recycled = wal_recycle.bytes_recycled,
+        recycled_paths = ?wal_recycle.recycled_paths,
+        max_segments = CALYX_GC_WAL_RECYCLE_MAX_SEGMENTS,
+        fsync_budget = CALYX_GC_WAL_RECYCLE_FSYNC_BUDGET,
+        "Calyx storage GC completed bounded durable WAL recycling"
+    );
+
     Ok(gc::GcReport { cf_reports })
 }
 
@@ -4085,8 +4699,9 @@ fn calyx_read_failed(
         error = %source,
         "Calyx storage backend read failed"
     );
-    StorageError::ReadFailed {
+    StorageError::CalyxReadFailed {
         cf_name: cf_name.to_owned(),
+        code: source.code,
         detail: format!("{action}: {source}"),
     }
 }
@@ -4101,8 +4716,9 @@ fn calyx_write_failed(cf_name: &str, action: &str, source: &SynapseCalyxError) -
         error = %source,
         "Calyx storage backend write failed"
     );
-    StorageError::WriteFailed {
+    StorageError::CalyxWriteFailed {
         cf_name: cf_name.to_owned(),
+        code: source.code,
         detail: format!("{action}: {source}"),
     }
 }
@@ -4132,20 +4748,6 @@ fn calyx_operation_failed(cf_name: &str, write: bool, detail: String) -> Storage
             cf_name: cf_name.to_owned(),
             detail,
         }
-    }
-}
-
-fn calyx_unsupported_maintenance(operation: &'static str) -> StorageError {
-    tracing::error!(
-        code = error_codes::STORAGE_BACKEND_UNIMPLEMENTED,
-        backend = StorageBackendKind::Calyx.as_str(),
-        operation,
-        detail = CALYX_UNSUPPORTED_MAINTENANCE_DETAIL,
-        "Calyx storage backend maintenance API is unavailable"
-    );
-    StorageError::BackendUnavailable {
-        backend: StorageBackendKind::Calyx.as_str().to_owned(),
-        detail: format!("{operation}: {CALYX_UNSUPPORTED_MAINTENANCE_DETAIL}"),
     }
 }
 
