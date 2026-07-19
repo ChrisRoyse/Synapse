@@ -550,13 +550,10 @@ pub fn demo_record_status_snapshot(
 }
 
 fn load_persisted(db: &Db) -> Result<PersistedDemoRecordState> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, DEMO_RECORD_KEY)
+    let value = db
+        .get_cf(cf::CF_KV, DEMO_RECORD_KEY)
         .context("read demo record control row from CF_KV")?;
-    let Some((_key, value)) = rows
-        .into_iter()
-        .find(|(key, _value)| key.as_slice() == DEMO_RECORD_KEY)
-    else {
+    let Some(value) = value else {
         return Ok(PersistedDemoRecordState::inactive(0, "initial"));
     };
     let state: PersistedDemoRecordState =

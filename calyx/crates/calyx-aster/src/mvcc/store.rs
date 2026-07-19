@@ -393,17 +393,9 @@ impl VersionedCfStore {
         let mut table = self.rows.write().map_err(|_| {
             CalyxError::aster_corrupt_shard("MVCC row-table lock was poisoned during atomic commit")
         })?;
-        if let Some(router) = self.router.write().expect("mvcc router poisoned").as_mut() {
-            // Rows written here belong to the seq allocated below (current + 1,
-            // exact because all allocations happen under the row write lock
-            // held here). A memtable flush triggered by these puts must carry
-            // that commit watermark so the flush SST orders correctly against
-            // durable batches (issue #1138).
-            let commit_watermark = self.current_seq() + 1;
-            for (cf, key, value) in &rows {
-                router.put_at(*cf, key, value, commit_watermark)?;
-            }
-        }
+        let mut router = self.router.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
+        })?;
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
         // this commit's seq must already observe its watermark (issue #1100).
@@ -418,13 +410,51 @@ impl VersionedCfStore {
                 .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
         }
         let seq = self.seqs.allocate();
-        for (cf, key, value) in rows {
+        for (cf, key, value) in &rows {
             table
-                .entry(cf)
+                .entry(*cf)
                 .or_default()
-                .entry(key)
+                .entry(key.clone())
                 .or_default()
-                .push(VersionedValue { seq, value });
+                .push(VersionedValue {
+                    seq,
+                    value: value.clone(),
+                });
+        }
+
+        if let Some(router) = router.as_mut() {
+            // Publish the authoritative version chains and their sequence
+            // before attempting the fallible router projection. Both write
+            // guards remain held, so readers still observe one atomic latest
+            // transition. If a put or flush fails part-way through the router
+            // batch, every logical row already exists at `seq` and masks any
+            // partial router state as soon as the guards are released.
+            for (cf, key, value) in &rows {
+                if let Err(error) = router.put_at(*cf, key, value, seq) {
+                    tracing::error!(
+                        code = "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
+                        committed_seq = seq,
+                        cf = cf.name(),
+                        key_len = key.len(),
+                        value_len = value.len(),
+                        router_error_code = error.code,
+                        router_error = %error,
+                        "MVCC rows committed atomically but the router projection failed; the committed sequence must be reconciled before retry"
+                    );
+                    return Err(CalyxError {
+                        code: "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
+                        message: format!(
+                            "MVCC batch is committed at seq {seq}, but router publication failed at {} key_len={} value_len={}: error[{}]: {}",
+                            cf.name(),
+                            key.len(),
+                            value.len(),
+                            error.code,
+                            error.message
+                        ),
+                        remediation: "treat committed_seq as applied; reconcile from the authoritative WAL/row-table state before retrying, and inspect the router disk/crypto error",
+                    });
+                }
+            }
         }
         Ok(seq)
     }
@@ -534,11 +564,11 @@ impl VersionedCfStore {
         let Some(router) = router.as_mut() else {
             return Ok(Vec::new());
         };
-        // Read the watermark while holding the router lock: every commit at or
-        // below `current_seq()` has already routed its rows into the memtables
-        // (puts happen before seq allocation), and an in-flight commit whose
-        // seq is not yet allocated only understates the watermark, which is
-        // the safe direction (issue #1138).
+        // Read the watermark while holding the router lock. Commits acquire
+        // that same write lock before sequence publication and retain it until
+        // every router put completes, so every commit at or below
+        // `current_seq()` has already routed its rows. A commit still waiting
+        // for this lock has not published its sequence (issue #1138).
         let commit_watermark = self.current_seq();
         router.flush_pending_at(commit_watermark)
     }

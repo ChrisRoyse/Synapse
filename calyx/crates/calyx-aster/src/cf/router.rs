@@ -1,6 +1,6 @@
 use super::ColumnFamily;
 use crate::compaction::TieringPolicy;
-use crate::memtable::{Memtable, MemtableUsage};
+use crate::memtable::{FrozenMemtable, Memtable, MemtableUsage};
 use crate::resource::ResourceCounters;
 use crate::security::value_crypto::{
     SharedVaultContext, open_value as open_encrypted_value, seal_value,
@@ -307,26 +307,80 @@ impl CfRouter {
         let path = self
             .cf_dir(cf)
             .join(flush_sst_file_name(commit_watermark, ordinal));
-        let summary = match &self.value_crypto {
-            Some(context) => {
-                let entries = frozen
-                    .iter()
-                    .map(|(key, value)| Ok((key.to_vec(), seal_value(context, cf, key, value)?)))
-                    .collect::<Result<Vec<_>>>()?;
-                crate::sst::write_sst(
-                    &path,
-                    entries
+        let publish = (|| -> Result<SstSummary> {
+            let summary = match &self.value_crypto {
+                Some(context) => {
+                    let entries = frozen
                         .iter()
-                        .map(|(key, value)| (key.as_slice(), value.as_slice())),
-                )?
+                        .map(|(key, value)| {
+                            Ok((key.to_vec(), seal_value(context, cf, key, value)?))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    crate::sst::write_sst(
+                        &path,
+                        entries
+                            .iter()
+                            .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                    )?
+                }
+                None => frozen.flush_to_sst(&path)?,
+            };
+            self.levels
+                .entry(cf)
+                .or_default()
+                .push_with_lookup(summary.path.clone())?;
+            Ok(summary)
+        })();
+
+        match publish {
+            Ok(summary) => Ok(summary),
+            Err(publish_error) => {
+                // Rotation happens before encryption and durable SST
+                // publication. Restore the exact frozen rows into the fresh
+                // memtable before returning any failure; otherwise an error
+                // would silently remove previously accepted rows from the
+                // router's serving view. A target SST that did reach disk is
+                // intentionally retained as an idempotent physical projection.
+                if let Err(restore_error) = self.restore_frozen_memtable(cf, &frozen) {
+                    tracing::error!(
+                        code = "CALYX_ASTER_ROUTER_FLUSH_RESTORE_FAILED",
+                        cf = cf.name(),
+                        commit_watermark,
+                        path = %path.display(),
+                        publish_error_code = publish_error.code,
+                        publish_error = %publish_error,
+                        restore_error_code = restore_error.code,
+                        restore_error = %restore_error,
+                        "router flush failed and the rotated memtable could not be restored"
+                    );
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "router flush for {} at watermark {commit_watermark} failed and the rotated memtable could not be restored: publish=error[{}]: {}; restore=error[{}]: {}",
+                        cf.name(),
+                        publish_error.code,
+                        publish_error.message,
+                        restore_error.code,
+                        restore_error.message
+                    )));
+                }
+                tracing::error!(
+                    code = publish_error.code,
+                    cf = cf.name(),
+                    commit_watermark,
+                    path = %path.display(),
+                    error = %publish_error,
+                    "router flush failed; restored the complete rotated memtable before returning the error"
+                );
+                Err(publish_error)
             }
-            None => frozen.flush_to_sst(&path)?,
-        };
-        self.levels
-            .entry(cf)
-            .or_default()
-            .push_with_lookup(summary.path.clone())?;
-        Ok(summary)
+        }
+    }
+
+    fn restore_frozen_memtable(&mut self, cf: ColumnFamily, frozen: &FrozenMemtable) -> Result<()> {
+        let memtable = self.memtable_mut(cf);
+        for (key, value) in frozen.iter() {
+            memtable.write(key, value, 0)?;
+        }
+        Ok(())
     }
 
     pub(super) fn ensure_cf(&mut self, cf: ColumnFamily) -> Result<()> {

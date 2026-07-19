@@ -48,6 +48,10 @@ pub enum StorageError {
         cf_name: String,
         code: &'static str,
         detail: String,
+        /// Exact applied sequence when Calyx proved the failure happened after
+        /// its irreversible commit boundary. `None` means no applied sequence
+        /// was proven and callers must not infer one from the global tip.
+        committed_seq: Option<u64>,
     },
     #[error("storage write shed in {cf_name} under disk pressure {pressure_level}: {rows} rows")]
     WriteShed {
@@ -86,6 +90,18 @@ impl StorageError {
             Self::UnsafeGcEvictionRefused { .. } => error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED,
             Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,
+        }
+    }
+
+    /// Returns the exact sequence of an operation that failed after commit.
+    ///
+    /// This is typed commit-outcome metadata, not a sequence parsed from an
+    /// error message and not a potentially unrelated latest-vault sequence.
+    #[must_use]
+    pub const fn committed_seq(&self) -> Option<u64> {
+        match self {
+            Self::CalyxWriteFailed { committed_seq, .. } => *committed_seq,
+            _ => None,
         }
     }
 }

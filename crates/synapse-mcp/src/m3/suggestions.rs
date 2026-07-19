@@ -754,21 +754,15 @@ fn load_exact_kv_value(
     key: &[u8],
     context: &'static str,
 ) -> Result<Option<Vec<u8>>, ErrorData> {
-    let rows = db.scan_cf_prefix(cf::CF_KV, key).map_err(storage_error)?;
-    let mut exact_values = rows
-        .into_iter()
-        .filter_map(|(row_key, value)| (row_key == key).then_some(value))
-        .collect::<Vec<_>>();
-    if exact_values.len() > 1 {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
+    db.get_cf(cf::CF_KV, key).map_err(|error| {
+        mcp_error(
+            error.code(),
             format!(
-                "SUGGESTION_EXACT_KEY_DUPLICATE: {context} key {} appeared more than once in CF_KV",
+                "SUGGESTION_EXACT_KEY_READ_FAILED: {context} key {} in CF_KV: {error}",
                 String::from_utf8_lossy(key)
             ),
-        ));
-    }
-    Ok(exact_values.pop())
+        )
+    })
 }
 
 fn suggestion_id_index_record(

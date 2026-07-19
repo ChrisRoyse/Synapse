@@ -352,12 +352,10 @@ pub fn inspect_storage_anchors(
         )
     })?;
     let cf_name = known_anchor_source_cf_for_key(&params.cf_name, &key)?;
-    let mut rows = db
-        .scan_cf_prefix(cf_name, &key)
+    let source_value = db
+        .get_cf(cf_name, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    rows.truncate(2);
-    let Some((_row_key, source_value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key)
-    else {
+    let Some(source_value) = source_value else {
         return Err(mcp_error(
             error_codes::STORAGE_READ_FAILED,
             format!(

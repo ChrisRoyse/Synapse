@@ -2574,15 +2574,13 @@ fn validate_spawn_id(spawn_id: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
-/// Reads exactly one `CF_KV` row by full key. `scan_cf_prefix` returns every
-/// row whose key *starts with* the argument, so the exact-key filter is
-/// essential: `cost/price/v1/gpt-5` is a prefix of `cost/price/v1/gpt-5-mini`.
+/// Reads exactly one `CF_KV` row by full key. A point read is required here:
+/// `cost/price/v1/gpt-5` is a prefix of `cost/price/v1/gpt-5-mini`, and an
+/// exact lookup must not enumerate either that sibling row or unrelated KV
+/// state.
 fn get_exact_kv_row(db: &Db, row_key: &str) -> Result<Option<Vec<u8>>, ErrorData> {
-    Ok(db
-        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?
-        .into_iter()
-        .find_map(|(key, value)| (key == row_key.as_bytes()).then_some(value)))
+    db.get_cf(cf::CF_KV, row_key.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
 }
 
 fn readback_exact_kv_row(db: &Db, row_key: &str) -> Result<KvRowReadback, ErrorData> {

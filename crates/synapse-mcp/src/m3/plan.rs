@@ -322,9 +322,8 @@ pub fn compile_routine_plan(
 
 pub fn load_plan(db: &Arc<Db>, routine_id: &str) -> Result<Option<PlanDocument>, ErrorData> {
     let key = plan_key(routine_id);
-    let rows = db.scan_cf_prefix(cf::CF_KV, &key).map_err(storage_error)?;
-    match rows.into_iter().find(|(k, _)| k == &key) {
-        Some((_, value)) => {
+    match db.get_cf(cf::CF_KV, &key).map_err(storage_error)? {
+        Some(value) => {
             let plan: PlanDocument = decode_json(&value).map_err(|error| {
                 mcp_error(
                     error_codes::STORAGE_CORRUPTED,

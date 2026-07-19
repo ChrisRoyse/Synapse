@@ -45,12 +45,13 @@ use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
 use crate::wal::{TornTail, WalRecycleReport};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemClock, VaultId};
+use calyx_ledger::LedgerHeadAnchor;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Mutex,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
@@ -98,6 +99,11 @@ pub struct AsterVault<C = SystemClock> {
     commit_lock: Mutex<()>,
     recurrence_write_lock: Mutex<()>,
     ledger_state_reconciliation_required: AtomicBool,
+    /// Exact sequence of the most recent commit that returned an error after
+    /// crossing its irreversible publication boundary. This is consumed while
+    /// the durable commit lock is still held by APIs that expose typed
+    /// committed-outcome metadata; zero means no such outcome is pending.
+    post_commit_error_seq: AtomicU64,
     recovery_report: VaultRecoveryReport,
     residency: Option<crate::residency::Residency>,
 }
@@ -167,6 +173,32 @@ pub struct MultiConditionalCfWriteOutcome {
     pub conflict: Option<ConditionalCfWriteConflict>,
 }
 
+/// Error from a revision-guarded batch, including an exact applied sequence
+/// when the operation crossed the commit boundary before failing.
+///
+/// `committed_seq = Some(_)` is a fail-stop outcome: callers must reconcile the
+/// identified commit from physical truth and must not blindly retry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalCfWriteError {
+    pub source: CalyxError,
+    pub committed_seq: Option<Seq>,
+}
+
+impl std::fmt::Display for ConditionalCfWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.committed_seq {
+            Some(seq) => write!(formatter, "{}; committed_seq={seq}", self.source),
+            None => self.source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ConditionalCfWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Compatibility result for one durable revision-guarded CF batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConditionalCfWriteOutcome {
@@ -184,8 +216,19 @@ fn invalid_conditional_write(message: String) -> CalyxError {
     CalyxError {
         code: CALYX_ASTER_CONDITIONAL_WRITE_INVALID,
         message,
-        remediation: "supply a non-empty unique guard set and exactly one mutation for every guarded CF/key",
+        remediation: "supply a non-empty unique guard set with non-empty keys and at most one mutation for each guarded CF/key",
     }
+}
+
+fn conditional_write_error(source: CalyxError) -> ConditionalCfWriteError {
+    ConditionalCfWriteError {
+        source,
+        committed_seq: None,
+    }
+}
+
+fn nonzero_seq(seq: Seq) -> Option<Seq> {
+    (seq != 0).then_some(seq)
 }
 
 fn raw_ledger_write_forbidden(operation: &str, detail: String) -> CalyxError {
@@ -234,7 +277,7 @@ fn reject_raw_ledger_guards(operation: &str, guards: &[CfRevisionGuard]) -> Resu
 fn guarded_row_indices(
     guards: &[CfRevisionGuard],
     rows: &[encode::WriteRow],
-) -> Result<Vec<usize>> {
+) -> Result<Vec<Option<usize>>> {
     if guards.is_empty() {
         return Err(invalid_conditional_write(
             "conditional CF write requires at least one revision guard".to_owned(),
@@ -274,15 +317,15 @@ fn guarded_row_indices(
                 .get(&(guard.cf, guard.key.as_slice()))
                 .copied()
                 .unwrap_or((0, 0));
-            if matching_rows != 1 {
+            if matching_rows > 1 {
                 return Err(invalid_conditional_write(format!(
-                    "conditional CF write requires exactly one mutation for every guard: guard_index={guard_index} guard_cf={:?} guard_key_len={} matching_rows={matching_rows} total_rows={}",
+                    "conditional CF write permits at most one mutation for every guard: guard_index={guard_index} guard_cf={:?} guard_key_len={} matching_rows={matching_rows} total_rows={}",
                     guard.cf,
                     guard.key.len(),
                     rows.len()
                 )));
             }
-            Ok(row_index)
+            Ok((matching_rows == 1).then_some(row_index))
         })
         .collect()
 }
@@ -346,6 +389,7 @@ where
             commit_lock: Mutex::new(()),
             recurrence_write_lock: Mutex::new(()),
             ledger_state_reconciliation_required: AtomicBool::new(false),
+            post_commit_error_seq: AtomicU64::new(0),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,
@@ -524,10 +568,12 @@ where
     /// Atomically compares all latest CF value revisions and commits one batch.
     ///
     /// The guard list and every guard key must be non-empty, guards must be
-    /// unique by `(cf, key)`, and each guarded key must occur exactly once in
-    /// `rows`. Validation happens before lock acquisition. Revision comparison,
-    /// the single WAL/MVCC commit, and outcome construction share the same
-    /// process and cross-process commit boundary.
+    /// unique by `(cf, key)`, and a guarded key may occur at most once in
+    /// `rows`. A guard with no matching row is a read-only precondition: its
+    /// observed revision is returned unchanged after the commit. Validation
+    /// happens before lock acquisition. Revision comparison, the single
+    /// WAL/MVCC commit, and outcome construction share the same process and
+    /// cross-process commit boundary.
     ///
     /// A conflict returns the first mismatching guard in input order plus the
     /// actual revisions of every guard. It does not append to the WAL, advance
@@ -542,18 +588,23 @@ where
         &self,
         guards: impl IntoIterator<Item = CfRevisionGuard>,
         rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
-    ) -> Result<MultiConditionalCfWriteOutcome> {
+    ) -> std::result::Result<MultiConditionalCfWriteOutcome, ConditionalCfWriteError> {
         let guards = guards.into_iter().collect::<Vec<_>>();
         let rows = rows
             .into_iter()
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
-        reject_raw_ledger_guards("write_cf_batch_if_revisions", &guards)?;
-        reject_raw_ledger_rows("write_cf_batch_if_revisions", &rows)?;
-        let guard_row_indices = guarded_row_indices(&guards, &rows)?;
-        self.ensure_writeable("revision-guarded CF batch")?;
+        reject_raw_ledger_guards("write_cf_batch_if_revisions", &guards)
+            .map_err(conditional_write_error)?;
+        reject_raw_ledger_rows("write_cf_batch_if_revisions", &rows)
+            .map_err(conditional_write_error)?;
+        let guard_row_indices =
+            guarded_row_indices(&guards, &rows).map_err(conditional_write_error)?;
+        self.ensure_writeable("revision-guarded CF batch")
+            .map_err(conditional_write_error)?;
 
-        self.with_durable_commit_lock(|| {
+        let mut committed_seq_on_error = None;
+        let outcome = self.with_durable_commit_lock(|| {
             let reads = guards
                 .iter()
                 .map(|guard| CfRead::new(guard.cf, guard.key.clone()))
@@ -586,12 +637,26 @@ where
                 });
             }
 
-            let seq = self.commit_rows_locked(&rows)?;
+            // Clear any prior operation's marker while this commit boundary is
+            // exclusively held. `commit_prepared_rows` sets it only after an
+            // irreversible commit has occurred and a later step fails.
+            self.post_commit_error_seq.store(0, Ordering::Release);
+            let seq = match self.commit_rows_locked(&rows) {
+                Ok(seq) => seq,
+                Err(error) => {
+                    committed_seq_on_error =
+                        nonzero_seq(self.post_commit_error_seq.swap(0, Ordering::AcqRel));
+                    return Err(error);
+                }
+            };
             let committed_revisions = guard_row_indices
                 .iter()
-                .map(|row_index| {
-                    let value = &rows[*row_index].value;
-                    (!is_tombstone_value(value)).then(|| value_revision(value))
+                .enumerate()
+                .map(|(guard_index, row_index)| {
+                    row_index.map_or(actual_revisions[guard_index], |row_index| {
+                        let value = &rows[row_index].value;
+                        (!is_tombstone_value(value)).then(|| value_revision(value))
+                    })
                 })
                 .collect();
             Ok(MultiConditionalCfWriteOutcome {
@@ -601,6 +666,10 @@ where
                 committed_revisions,
                 conflict: None,
             })
+        });
+        outcome.map_err(|source| ConditionalCfWriteError {
+            source,
+            committed_seq: committed_seq_on_error,
         })
     }
 
@@ -615,10 +684,12 @@ where
         expected_revision: Option<[u8; 32]>,
         rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
     ) -> Result<ConditionalCfWriteOutcome> {
-        let outcome = self.write_cf_batch_if_revisions(
-            [CfRevisionGuard::new(guard_cf, guard_key, expected_revision)],
-            rows,
-        )?;
+        let outcome = self
+            .write_cf_batch_if_revisions(
+                [CfRevisionGuard::new(guard_cf, guard_key, expected_revision)],
+                rows,
+            )
+            .map_err(|error| error.source)?;
         let previous_revision = outcome.actual_revisions.first().copied().ok_or_else(|| {
             CalyxError::aster_corrupt_shard(
                 "single-key conditional write returned no actual guard revision",
@@ -652,23 +723,146 @@ where
 
     /// Internal compatibility path for a `LedgerCfStore` operating on a vault
     /// that has no persistent in-memory Ledger hook. Public raw CF APIs reserve
-    /// Ledger so a caller cannot make a configured hook stale.
-    fn write_raw_ledger_row_without_hook(&self, key: Vec<u8>, value: Vec<u8>) -> Result<Seq> {
+    /// Ledger so a caller cannot make a configured hook stale. Semantic
+    /// admission, authoritative chain validation, absence, and commit share
+    /// the durable boundary.
+    fn write_raw_ledger_row_without_hook(&self, seq: u64, value: &[u8]) -> Result<Seq> {
         if self.ledger_hook.is_some() {
             return Err(raw_ledger_write_forbidden(
                 "write_raw_ledger_row_without_hook",
                 format!(
                     "trusted no-hook path was invoked while a persistent Ledger hook is configured: key_len={} value_len={}",
-                    key.len(),
+                    crate::cf::ledger_key(seq).len(),
                     value.len()
                 ),
             ));
         }
-        self.commit_rows(&[encode::WriteRow {
-            cf: ColumnFamily::Ledger,
-            key,
-            value,
-        }])
+        self.with_durable_commit_lock(|| {
+            self.validate_decoded_ledger_append_locked(
+                "write_raw_ledger_row_without_hook",
+                seq,
+                value,
+            )?;
+            let key = crate::cf::ledger_key(seq);
+            self.commit_rows_locked(&[encode::WriteRow {
+                cf: ColumnFamily::Ledger,
+                key,
+                value: value.to_vec(),
+            }])
+        })
+    }
+
+    /// Validates the head callback made by `LedgerAppender` after the trusted
+    /// no-hook row commit. `commit_rows_locked` already advanced the durable
+    /// sidecar while holding the process and cross-process commit boundary, so
+    /// this callback must never perform a second, unlocked sidecar write.
+    pub(super) fn validate_committed_ledger_head_anchor(
+        &self,
+        requested: &LedgerHeadAnchor,
+    ) -> Result<()> {
+        match self.with_durable_commit_lock(|| {
+            self.validate_committed_ledger_head_anchor_locked(requested)
+        }) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.committed_ledger_head_validation_error(requested, error)),
+        }
+    }
+
+    pub(super) fn validate_committed_ledger_head_anchor_locked(
+        &self,
+        requested: &LedgerHeadAnchor,
+    ) -> Result<()> {
+        let validation = (|| -> Result<()> {
+            if requested.height == 0 {
+                return Err(CalyxError::ledger_chain_broken(
+                    "post-append Ledger head validation received height 0",
+                ));
+            }
+            self.validate_ledger_head_tip_row_locked(requested, "requested post-append head")?;
+            let Some(durable) = &self.durable else {
+                return Ok(());
+            };
+            let physical =
+                crate::ledger_head::read_head_anchor(durable.root())?.ok_or_else(|| {
+                    CalyxError::ledger_chain_broken(format!(
+                        "durable Ledger head sidecar is missing after committing height {}",
+                        requested.height
+                    ))
+                })?;
+            match physical.height.cmp(&requested.height) {
+                std::cmp::Ordering::Less => Err(CalyxError::ledger_chain_broken(format!(
+                    "durable Ledger head sidecar regressed: requested_height={} physical_height={}",
+                    requested.height, physical.height
+                ))),
+                std::cmp::Ordering::Equal if physical.tip_hash != requested.tip_hash => {
+                    Err(CalyxError::ledger_chain_broken(format!(
+                        "durable Ledger head sidecar hash mismatch at height {}: requested_tip={:02x?} physical_tip={:02x?}",
+                        requested.height, requested.tip_hash, physical.tip_hash
+                    )))
+                }
+                std::cmp::Ordering::Equal => Ok(()),
+                std::cmp::Ordering::Greater => self
+                    .validate_ledger_head_tip_row_locked(&physical, "newer durable head sidecar"),
+            }
+        })();
+        validation.map_err(|error| self.committed_ledger_head_validation_error(requested, error))
+    }
+
+    fn validate_ledger_head_tip_row_locked(
+        &self,
+        anchor: &LedgerHeadAnchor,
+        witness: &'static str,
+    ) -> Result<()> {
+        let row_seq = anchor.height.checked_sub(1).ok_or_else(|| {
+            CalyxError::ledger_chain_broken(format!(
+                "{witness} has height 0 and cannot witness a committed row"
+            ))
+        })?;
+        let key = crate::cf::ledger_key(row_seq);
+        let bytes = self
+            .read_cf_at(self.latest_seq(), ColumnFamily::Ledger, &key)?
+            .ok_or_else(|| {
+                CalyxError::ledger_chain_broken(format!(
+                    "{witness} height {} requires missing Ledger seq {row_seq}",
+                    anchor.height
+                ))
+            })?;
+        let entry = calyx_ledger::decode(&bytes)?;
+        if entry.seq != row_seq || entry.entry_hash != anchor.tip_hash {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "{witness} tip mismatch: height={} row_seq={row_seq} encoded_seq={} witness_tip={:02x?} row_tip={:02x?}",
+                anchor.height, entry.seq, anchor.tip_hash, entry.entry_hash
+            )));
+        }
+        Ok(())
+    }
+
+    fn committed_ledger_head_validation_error(
+        &self,
+        requested: &LedgerHeadAnchor,
+        error: CalyxError,
+    ) -> CalyxError {
+        self.ledger_state_reconciliation_required
+            .store(true, std::sync::atomic::Ordering::Release);
+        if error.code == CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED {
+            return error;
+        }
+        tracing::error!(
+            code = CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+            requested_height = requested.height,
+            requested_tip = ?requested.tip_hash,
+            validation_error_code = error.code,
+            validation_error = %error,
+            "Ledger row is committed but its post-commit head witness could not be validated"
+        );
+        CalyxError {
+            code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+            message: format!(
+                "Ledger row at committed height {} cannot complete post-commit head validation: validation=error[{}]: {}",
+                requested.height, error.code, error.message
+            ),
+            remediation: "treat the Ledger row as committed; reconcile the physical Ledger rows and derived head sidecar before retrying the logical operation",
+        }
     }
 
     /// Scans visible raw CF rows at `snapshot`; use `scan_cf_pages_at` for large data CFs.

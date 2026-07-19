@@ -83,11 +83,16 @@ const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// Escalation delivery can spend up to one bounded HTTP timeout on contract
+// preflight and one on POST, then must durably checkpoint the outcome. Its
+// supervisor grace must exceed that declared boundary or shutdown itself can
+// create an ambiguous remote side effect.
+const HTTP_ESCALATION_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_BACKGROUND_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_SECS";
-const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
+const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const DASHBOARD_CONTEXT_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -908,7 +913,12 @@ async fn drain_http_background_tasks(
     // gets its own graceful and post-abort deadlines without serially adding
     // those deadlines to every later task's shutdown latency.
     let outcomes = join_all(tasks.into_iter().map(|(name, mut task)| async move {
-        match time::timeout(HTTP_BACKGROUND_TASK_STOP_TIMEOUT, &mut task).await {
+        let stop_timeout = if name == "escalation_worker" {
+            HTTP_ESCALATION_WORKER_STOP_TIMEOUT
+        } else {
+            HTTP_BACKGROUND_TASK_STOP_TIMEOUT
+        };
+        match time::timeout(stop_timeout, &mut task).await {
             Ok(result) => {
                 let outcome = match result {
                     Ok(()) => (name, true, false, true, None),
@@ -924,6 +934,25 @@ async fn drain_http_background_tasks(
                 outcome
             }
             Err(_elapsed) => {
+                if name == "escalation_worker" {
+                    // Tier-0/Tier-1 effects cross OS/network boundaries. An
+                    // abort would drop the Rust future while its serialized
+                    // WinRT/HTTP operation can still complete, severing the
+                    // durable classification owner. Leave the exact task live;
+                    // ShutdownTaskOwner::drop moves it to the retained-owner
+                    // registry, which keeps daemon lifetime locks held until
+                    // the terminal join and audit are observed.
+                    return (
+                        name,
+                        false,
+                        false,
+                        false,
+                        Some(format!(
+                            "{name}: did not stop within {} ms after shutdown cancellation; abort prohibited for external side-effect ownership, exact JoinHandle retained until terminal durable reconciliation or process teardown",
+                            stop_timeout.as_millis()
+                        )),
+                    );
+                }
                 task.abort();
                 match time::timeout(HTTP_BACKGROUND_TASK_ABORT_TIMEOUT, &mut task).await {
                     Ok(result) => {
@@ -934,7 +963,7 @@ async fn drain_http_background_tasks(
                             true,
                             Some(format!(
                                 "{name}: did not stop within {} ms after shutdown cancellation; abort_join={result:?}",
-                                HTTP_BACKGROUND_TASK_STOP_TIMEOUT.as_millis()
+                                stop_timeout.as_millis()
                             )),
                         );
                         task.acknowledge_terminal_outcome();
@@ -947,7 +976,7 @@ async fn drain_http_background_tasks(
                         false,
                         Some(format!(
                             "{name}: did not stop within {} ms after shutdown cancellation and did not join within {} ms after abort; exact JoinHandle retained until process teardown",
-                            HTTP_BACKGROUND_TASK_STOP_TIMEOUT.as_millis(),
+                            stop_timeout.as_millis(),
                             HTTP_BACKGROUND_TASK_ABORT_TIMEOUT.as_millis()
                         )),
                     ),
@@ -2839,6 +2868,14 @@ fn router(
         .map_err(|detail| anyhow::anyhow!("agent liveness configuration invalid: {detail}"))?;
     crate::server::agent_state::rebuild_from_journal(&agent_events_db)
         .context("rebuild agent state tracker from CF_AGENT_EVENTS")?;
+    crate::server::escalation::reconcile_transition_projections(&agent_events_db).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "reconcile durable transition projections before serving MCP traffic: {}",
+                error.message
+            )
+        },
+    )?;
     // Install process-global projections only after every fallible router
     // preflight has passed. Both sinks are non-owning/one-shot callbacks and no
     // fallible return remains after this point.
@@ -3658,11 +3695,11 @@ struct PersistedMcpSessionState {
 impl SessionStore for SynapseMcpSessionStore {
     async fn load(&self, session_id: &str) -> Result<Option<SessionState>, SessionStoreError> {
         let key = mcp_session_store_key(session_id);
-        let rows = self
+        let Some(value) = self
             .db
-            .scan_cf_prefix(cf::CF_KV, &key)
-            .map_err(session_store_error)?;
-        let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
+            .get_cf(cf::CF_KV, &key)
+            .map_err(session_store_error)?
+        else {
             return Ok(None);
         };
         let now_ms = unix_time_ms()?;
@@ -3735,14 +3772,66 @@ impl SessionStore for SynapseMcpSessionStore {
         };
         let encoded = synapse_storage::encode_json(&persisted).map_err(session_store_error)?;
         self.db
-            .put_batch_pressure_bypass(cf::CF_KV, [(key, encoded)])
+            .put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), encoded.clone())])
             .map_err(session_store_error)?;
+        let readback = self
+            .db
+            .get_cf(cf::CF_KV, &key)
+            .map_err(session_store_error)?;
+        let Some(readback) = readback else {
+            tracing::error!(
+                code = "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISSING",
+                session_id,
+                stored_at_unix_ms,
+                cf = cf::CF_KV,
+                key_len = key.len(),
+                "MCP HTTP session write succeeded but its exact CF_KV point readback was absent"
+            );
+            return Err(session_store_error(
+                synapse_storage::StorageError::ReadFailed {
+                    cf_name: cf::CF_KV.to_owned(),
+                    detail: format!(
+                        "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISSING: session_id={session_id:?} key_len={} stored_at_unix_ms={stored_at_unix_ms}",
+                        key.len()
+                    ),
+                },
+            ));
+        };
+        if readback != encoded {
+            let expected_sha256 = session_store_value_sha256(&encoded);
+            let actual_sha256 = session_store_value_sha256(&readback);
+            tracing::error!(
+                code = "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISMATCH",
+                session_id,
+                stored_at_unix_ms,
+                cf = cf::CF_KV,
+                key_len = key.len(),
+                expected_value_len = encoded.len(),
+                actual_value_len = readback.len(),
+                expected_sha256,
+                actual_sha256,
+                "MCP HTTP session write exact CF_KV point readback did not match the committed value"
+            );
+            return Err(session_store_error(
+                synapse_storage::StorageError::ReadFailed {
+                    cf_name: cf::CF_KV.to_owned(),
+                    detail: format!(
+                        "MCP_HTTP_SESSION_STORE_WRITE_READBACK_MISMATCH: session_id={session_id:?} key_len={} stored_at_unix_ms={stored_at_unix_ms} expected_value_len={} actual_value_len={} expected_sha256={expected_sha256} actual_sha256={actual_sha256}",
+                        key.len(),
+                        encoded.len(),
+                        readback.len()
+                    ),
+                },
+            ));
+        }
         tracing::info!(
             code = "MCP_HTTP_SESSION_STORE_WRITE",
             session_id,
             stored_at_unix_ms,
             ttl_ms = self.ttl.map(duration_millis_u64),
-            "persisted MCP HTTP session state to CF_KV"
+            readback_value_len = readback.len(),
+            exact_point_readback = true,
+            "persisted and exactly read back MCP HTTP session state from CF_KV"
         );
         let newly_visible = record_registry_initialized(
             &self.session_registry,
@@ -3878,6 +3967,15 @@ fn delete_session_continuity_rows(db: &Db, session_id: &str) -> Result<(), Sessi
 
 fn session_store_error(error: synapse_storage::StorageError) -> SessionStoreError {
     Box::new(error)
+}
+
+fn session_store_value_sha256(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn unix_time_ms() -> Result<u64, SessionStoreError> {
@@ -6726,10 +6824,38 @@ fn dashboard_save_view_row(
             None,
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
+    db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded.clone())])
         .map_err(|error| {
             dashboard_storage_error_response("dashboard saved view write failed", error)
         })?;
+    let readback = db
+        .get_cf(cf::CF_KV, row_key.as_bytes())
+        .map_err(|error| {
+            dashboard_storage_error_response("dashboard saved view readback failed", error)
+        })?
+        .ok_or_else(|| {
+            dashboard_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                synapse_core::error_codes::STORAGE_CORRUPTED,
+                "dashboard saved view row is absent after write",
+                Some(serde_json::json!({
+                    "row_key": row_key,
+                    "expected_bytes": encoded.len(),
+                })),
+            )
+        })?;
+    if readback != encoded {
+        return Err(dashboard_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "dashboard saved view row differs from committed bytes",
+            Some(serde_json::json!({
+                "row_key": row_key,
+                "expected_bytes": encoded.len(),
+                "actual_bytes": readback.len(),
+            })),
+        ));
+    }
     tracing::info!(
         code = "DASHBOARD_SAVED_VIEW_WRITTEN",
         row_key,
@@ -6743,15 +6869,10 @@ fn dashboard_read_saved_view_by_key(
     db: &Db,
     row_key: &str,
 ) -> Result<Option<DashboardSavedViewRow>, Response> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
-        .map_err(|error| {
-            dashboard_storage_error_response("dashboard saved view read failed", error)
-        })?;
-    let Some((_key, value)) = rows
-        .into_iter()
-        .find(|(key, _value)| key == row_key.as_bytes())
-    else {
+    let value = db.get_cf(cf::CF_KV, row_key.as_bytes()).map_err(|error| {
+        dashboard_storage_error_response("dashboard saved view read failed", error)
+    })?;
+    let Some(value) = value else {
         return Ok(None);
     };
     let row = serde_json::from_slice::<DashboardSavedViewRow>(&value).map_err(|error| {
@@ -6768,6 +6889,26 @@ fn dashboard_read_saved_view_by_key(
             None,
         )
     })?;
+    if row.schema_version != DASHBOARD_SAVED_VIEW_SCHEMA_VERSION
+        || row.row_key != row_key
+        || dashboard_saved_view_row_key(&row.view_id) != row_key
+        || row.updated_unix_ms < row.created_unix_ms
+    {
+        return Err(dashboard_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "dashboard saved view row identity invariant failed",
+            Some(serde_json::json!({
+                "requested_row_key": row_key,
+                "stored_row_key": row.row_key,
+                "stored_view_id": row.view_id,
+                "stored_schema_version": row.schema_version,
+                "expected_schema_version": DASHBOARD_SAVED_VIEW_SCHEMA_VERSION,
+                "created_unix_ms": row.created_unix_ms,
+                "updated_unix_ms": row.updated_unix_ms,
+            })),
+        ));
+    }
     Ok(Some(row))
 }
 

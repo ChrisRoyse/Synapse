@@ -435,23 +435,18 @@ pub fn load_armed_routine_record(
 ) -> Result<Option<ArmedRoutineRecord>, ErrorData> {
     validate_routine_id_param("routine_inspect", routine_id)?;
     let key = armed_routine_key(routine_id);
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-        .map_err(storage_error)?;
-    match rows
-        .into_iter()
-        .find(|(row_key, _value)| row_key == key.as_bytes())
+    match db
+        .get_cf(cf::CF_KV, key.as_bytes())
+        .map_err(storage_error)?
     {
-        Some((_key, value)) => {
-            decode_json::<ArmedRoutineRecord>(&value)
-                .map(Some)
-                .map_err(|error| {
-                    mcp_error(
-                        error_codes::STORAGE_CORRUPTED,
-                        format!("ARMED_ROUTINE_ROW_DECODE_FAILED for {routine_id}: {error}"),
-                    )
-                })
-        }
+        Some(value) => decode_json::<ArmedRoutineRecord>(&value)
+            .map(Some)
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!("ARMED_ROUTINE_ROW_DECODE_FAILED for {routine_id}: {error}"),
+                )
+            }),
         None => Ok(None),
     }
 }
@@ -927,21 +922,15 @@ fn load_exact_cf_value(
     key: &[u8],
     context: &'static str,
 ) -> Result<Option<Vec<u8>>, ErrorData> {
-    let rows = db.scan_cf_prefix(cf_name, key).map_err(storage_error)?;
-    let mut exact_values = rows
-        .into_iter()
-        .filter_map(|(row_key, value)| (row_key == key).then_some(value))
-        .collect::<Vec<_>>();
-    if exact_values.len() > 1 {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
+    db.get_cf(cf_name, key).map_err(|error| {
+        mcp_error(
+            error.code(),
             format!(
-                "ARMED_ROUTINE_EXACT_KEY_DUPLICATE: {context} key {} appeared more than once in {cf_name}",
+                "ARMED_ROUTINE_EXACT_KEY_READ_FAILED: {context} key {} in {cf_name}: {error}",
                 String::from_utf8_lossy(key)
             ),
-        ));
-    }
-    Ok(exact_values.pop())
+        )
+    })
 }
 
 fn load_routine_record_with_raw(
@@ -1724,14 +1713,11 @@ fn write_armed_and_run_records(
 
 fn load_armed_run(db: &Arc<Db>, run_id: &str) -> Result<Option<ArmedRoutineRunRecord>, ErrorData> {
     let key = armed_run_key(run_id);
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-        .map_err(storage_error)?;
-    match rows
-        .into_iter()
-        .find(|(row_key, _value)| row_key == key.as_bytes())
+    match db
+        .get_cf(cf::CF_KV, key.as_bytes())
+        .map_err(storage_error)?
     {
-        Some((_key, value)) => decode_json::<ArmedRoutineRunRecord>(&value)
+        Some(value) => decode_json::<ArmedRoutineRunRecord>(&value)
             .map(Some)
             .map_err(|error| {
                 mcp_error(

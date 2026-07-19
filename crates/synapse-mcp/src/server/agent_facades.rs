@@ -7,9 +7,10 @@ use super::{
         AgentSteerResponse, AgentSuspendResponse,
     },
     agent_mailbox::{
-        AgentInboxParams, AgentInboxResponse, AgentReceiptsParams, AgentReceiptsResponse,
-        AgentSendBroadcastParams, AgentSendBroadcastResponse, AgentSendParams, AgentSendResponse,
-        AgentWaitParams, AgentWaitResponse,
+        AgentInboxParams, AgentInboxResponse, AgentMailboxRepairParams, AgentMailboxRepairResponse,
+        AgentReceiptsParams, AgentReceiptsResponse, AgentSendBroadcastParams,
+        AgentSendBroadcastResponse, AgentSendParams, AgentSendResponse, AgentWaitParams,
+        AgentWaitResponse,
     },
     agent_query::{AgentQueryParams, AgentQueryResponse},
     agent_stats::{AgentStatsParams, AgentStatsResponse},
@@ -17,14 +18,16 @@ use super::{
         EmptyParams, TaskCancelParams, TaskClaimParams, TaskCreateParams, TaskDispatchOnceParams,
         TaskDispatchOnceResponse, TaskGetResponse, TaskIdParams, TaskListParams, TaskListResponse,
         TaskMutationResponse, TaskNextParams, TaskNextResponse, TaskReconcileResponse,
-        TaskUpdateParams,
+        TaskSequenceRepairParams, TaskSequenceRepairResponse, TaskUpdateParams,
     },
     agent_templates::{
         AgentTemplateDeleteParams, AgentTemplateDeleteResponse, AgentTemplateGetParams,
         AgentTemplateGetResponse, AgentTemplateListParams, AgentTemplateListResponse,
         AgentTemplatePutParams, AgentTemplatePutResponse,
     },
-    tool, tool_router,
+    tool,
+    tool_profiles::ToolProfileKind,
+    tool_router,
 };
 
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
@@ -34,8 +37,9 @@ use synapse_core::error_codes;
 
 const AGENT_TOOL: &str = "agent";
 const TASK_TOOL: &str = "task";
-const AGENT_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\synapse\\agent-spawns + CF_AGENT_EVENTS/CF_AGENT_TRANSCRIPTS + CF_KV mailbox/template rows";
-const TASK_SOURCE_OF_TRUTH: &str = "CF_KV agent task rows + agent task event/readback rows";
+const AGENT_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\synapse\\agent-spawns + CF_AGENT_EVENTS/CF_AGENT_TRANSCRIPTS + CF_KV mailbox rows/durable queue state/template rows";
+const TASK_SOURCE_OF_TRUTH: &str =
+    "CF_KV agent task rows + guarded enqueue watermark + agent task event/readback rows";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +51,7 @@ pub enum AgentOperation {
     Wait,
     Broadcast,
     Receipts,
+    MailboxRepair,
     Stats,
     TemplatePut,
     TemplateGet,
@@ -71,6 +76,7 @@ impl AgentOperation {
             Self::Wait => "wait",
             Self::Broadcast => "broadcast",
             Self::Receipts => "receipts",
+            Self::MailboxRepair => "mailbox_repair",
             Self::Stats => "stats",
             Self::TemplatePut => "template_put",
             Self::TemplateGet => "template_get",
@@ -105,6 +111,8 @@ pub struct AgentParams {
     pub broadcast: Option<AgentSendBroadcastParams>,
     #[serde(default)]
     pub receipts: Option<AgentReceiptsParams>,
+    #[serde(default)]
+    pub mailbox_repair: Option<AgentMailboxRepairParams>,
     #[serde(default)]
     pub stats: Option<AgentStatsParams>,
     #[serde(default)]
@@ -152,6 +160,8 @@ pub struct AgentResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipts: Option<AgentReceiptsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_repair: Option<AgentMailboxRepairResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<AgentStatsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_put: Option<AgentTemplatePutResponse>,
@@ -188,6 +198,7 @@ pub enum TaskOperation {
     List,
     Next,
     Reconcile,
+    RepairSequence,
     DispatchOnce,
 }
 
@@ -202,6 +213,7 @@ impl TaskOperation {
             Self::List => "list",
             Self::Next => "next",
             Self::Reconcile => "reconcile",
+            Self::RepairSequence => "repair_sequence",
             Self::DispatchOnce => "dispatch_once",
         }
     }
@@ -227,6 +239,8 @@ pub struct TaskParams {
     pub next: Option<TaskNextParams>,
     #[serde(default)]
     pub reconcile: Option<EmptyParams>,
+    #[serde(default)]
+    pub repair_sequence: Option<TaskSequenceRepairParams>,
     #[serde(default)]
     pub dispatch_once: Option<TaskDispatchOnceParams>,
 }
@@ -254,13 +268,15 @@ pub struct TaskResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconcile: Option<TaskReconcileResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_sequence: Option<TaskSequenceRepairResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_once: Option<TaskDispatchOnceResponse>,
 }
 
 #[tool_router(router = agent_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for spawned-agent lifecycle, mailbox, stats, templates, and controls in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Every mutating operation delegates to the real lifecycle/mailbox/template/control implementation and returns its physical source-of-truth readback."
+        description = "Facade for spawned-agent lifecycle, mailbox, stats, templates, and controls in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Every mutating operation delegates to the real lifecycle/mailbox/template/control implementation and returns its physical source-of-truth readback. mailbox_repair is an explicit break-glass/full-capability-only guarded metadata repair; normal mailbox use fails closed on corrupt or drifted queue state."
     )]
     pub async fn agent(
         &self,
@@ -455,6 +471,41 @@ impl SynapseService {
                         response.this_session_id, response.returned_count, response.deleted_count
                     ),
                     |out| out.receipts = Some(response),
+                )))
+            }
+            AgentOperation::MailboxRepair => {
+                let spec = params
+                    .0
+                    .mailbox_repair
+                    .ok_or_else(|| missing_agent_spec("mailbox_repair"))?;
+                let source_id = spec.recipient_session_id.clone();
+                require_queue_repair_profile(
+                    self,
+                    &request_context,
+                    AGENT_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    AGENT_SOURCE_OF_TRUTH,
+                )?;
+                let response = self.mailbox_repair_state_impl(spec).map_err(|error| {
+                    agent_delegate_error(
+                        operation,
+                        source_id,
+                        error,
+                        "inspect the raw global/recipient state rows and supply monotonic floors from the last known-good physical readback",
+                    )
+                })?;
+                Ok(Json(agent_response(
+                    operation,
+                    format!(
+                        "CF_KV mailbox state repaired global_seq={} recipient={} count={} generation={} committed_seq={}",
+                        response.repaired_global_sequence,
+                        response.recipient_session_id,
+                        response.repaired_recipient_count,
+                        response.repaired_recipient_generation,
+                        response.committed_seq
+                    ),
+                    |out| out.mailbox_repair = Some(response),
                 )))
             }
             AgentOperation::Stats => {
@@ -776,7 +827,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return the task row readback from the real task implementation."
+        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return the task row readback from the real task implementation. repair_sequence is an explicit break-glass/full-capability-only guarded watermark repair; task creation fails closed on malformed or drifted sequence state."
     )]
     pub async fn task(
         &self,
@@ -971,6 +1022,40 @@ impl SynapseService {
                     |out| out.reconcile = Some(response),
                 )))
             }
+            TaskOperation::RepairSequence => {
+                let spec = params
+                    .0
+                    .repair_sequence
+                    .ok_or_else(|| missing_task_spec("repair_sequence"))?;
+                require_queue_repair_profile(
+                    self,
+                    &request_context,
+                    TASK_TOOL,
+                    operation.as_str(),
+                    TASK_SEQUENCE_KEY_SOURCE_ID,
+                    TASK_SOURCE_OF_TRUTH,
+                )?;
+                let response = self
+                    .task_repair_sequence_impl(spec)
+                    .map_err(|error| {
+                        task_delegate_error(
+                            operation,
+                            "sequence_watermark",
+                            error,
+                            "inspect the raw watermark and task rows, then supply a monotonic floor from the last known-good physical readback",
+                        )
+                    })?;
+                Ok(Json(task_response(
+                    operation,
+                    format!(
+                        "CF_KV task sequence repaired={} observed_max={} committed_seq={}",
+                        response.repaired_sequence,
+                        response.observed_max_task_sequence,
+                        response.committed_seq
+                    ),
+                    |out| out.repair_sequence = Some(response),
+                )))
+            }
             TaskOperation::DispatchOnce => {
                 let spec = params
                     .0
@@ -1006,6 +1091,42 @@ impl SynapseService {
     }
 }
 
+const TASK_SEQUENCE_KEY_SOURCE_ID: &str = "agent-task/v1/meta/last_enqueue_seq";
+
+fn require_queue_repair_profile(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+    tool_name: &'static str,
+    operation: &'static str,
+    source_id: &str,
+    source_of_truth: &'static str,
+) -> Result<(), ErrorData> {
+    let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
+    let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
+    if matches!(
+        snapshot.profile,
+        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
+    ) {
+        return Ok(());
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool_name} operation={operation} is not allowed for profile {}",
+            snapshot.profile.as_str()
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
+            "tool": tool_name,
+            "operation": operation,
+            "source_id": source_id,
+            "profile": snapshot.profile.as_str(),
+            "source_of_truth": source_of_truth,
+            "remediation": "switch to an explicit break_glass or full_capability profile with operator intent before repairing durable queue metadata",
+        })),
+    ))
+}
+
 fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
     validate_exact_operation_spec(
         AGENT_TOOL,
@@ -1018,6 +1139,7 @@ fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
             ("wait", params.wait.is_some()),
             ("broadcast", params.broadcast.is_some()),
             ("receipts", params.receipts.is_some()),
+            ("mailbox_repair", params.mailbox_repair.is_some()),
             ("stats", params.stats.is_some()),
             ("template_put", params.template_put.is_some()),
             ("template_get", params.template_get.is_some()),
@@ -1047,6 +1169,7 @@ fn validate_task_facade_params(params: &TaskParams) -> Result<(), ErrorData> {
             ("list", params.list.is_some()),
             ("next", params.next.is_some()),
             ("reconcile", params.reconcile.is_some()),
+            ("repair_sequence", params.repair_sequence.is_some()),
             ("dispatch_once", params.dispatch_once.is_some()),
         ],
     )
@@ -1204,6 +1327,7 @@ fn agent_response(
         wait: None,
         broadcast: None,
         receipts: None,
+        mailbox_repair: None,
         stats: None,
         template_put: None,
         template_get: None,
@@ -1241,6 +1365,7 @@ fn task_response(
         list: None,
         next: None,
         reconcile: None,
+        repair_sequence: None,
         dispatch_once: None,
     };
     populate(&mut response);

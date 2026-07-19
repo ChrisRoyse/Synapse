@@ -3,10 +3,10 @@ use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
-    ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow,
-    QueryId, ReproduceInputResolver, ReproduceLensRegistry, ReproduceResult, StagedLedgerRow,
-    SubjectId, reproduce_payload_bytes, reproduce_verdict_with_input_resolver,
-    reproduce_with_input_resolver,
+    ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerHeadAnchor,
+    LedgerRow, QueryId, RedactionPolicy, ReproduceInputResolver, ReproduceLensRegistry,
+    ReproduceResult, StagedLedgerRow, SubjectId, reproduce_payload_bytes,
+    reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
 };
 
 struct LedgerEntryInput {
@@ -239,25 +239,93 @@ where
         Ok(ledger_ref)
     }
 
+    /// Decodes and admits one already-framed Ledger row against the exact
+    /// append boundary currently protected by the durable commit lock.
+    ///
+    /// Both external adapters and the low-level `LedgerCfStore::put_new` seam
+    /// use this validator so pre-encoded rows cannot bypass the semantic
+    /// actor/payload checks performed by `LedgerAppender::prepare`, nor race a
+    /// stale recovered tip between preparation and physical publication.
+    pub(super) fn validate_decoded_ledger_append_locked(
+        &self,
+        operation: &'static str,
+        requested_seq: u64,
+        bytes: &[u8],
+    ) -> Result<LedgerEntry> {
+        let entry = calyx_ledger::decode(bytes)?;
+        if entry.seq != requested_seq {
+            return Err(CalyxError::ledger_append_only_violation(format!(
+                "{operation}: Ledger row identity mismatch: requested_seq={requested_seq} encoded_seq={}",
+                entry.seq
+            )));
+        }
+        requested_seq.checked_add(1).ok_or_else(|| {
+            CalyxError::ledger_chain_broken(format!(
+                "{operation}: Ledger sequence {requested_seq} cannot be represented by the required post-commit head height"
+            ))
+        })?;
+
+        RedactionPolicy::check_payload(&entry.payload)?;
+        let appender = LedgerAppender::open(AsterRawLedgerStore { vault: self }, SystemClock)?;
+        entry.actor.validate()?;
+
+        let key = ledger_key(requested_seq);
+        if self
+            .read_cf_at(self.latest_seq(), ColumnFamily::Ledger, &key)?
+            .is_some()
+        {
+            return Err(CalyxError::ledger_append_only_violation(format!(
+                "{operation}: Ledger seq {requested_seq} already exists at the durable append boundary"
+            )));
+        }
+        if requested_seq != appender.next_seq() || entry.prev_hash != appender.prev_hash() {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "{operation}: Ledger row is not the exact next chain member: requested_seq={requested_seq} authoritative_next_seq={} expected_prev={:02x?} actual_prev={:02x?}",
+                appender.next_seq(),
+                appender.prev_hash(),
+                entry.prev_hash
+            )));
+        }
+        if entry.ts <= appender.last_ts() {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "{operation}: Ledger timestamp must advance monotonically: seq={requested_seq} previous_ts={} incoming_ts={}",
+                appender.last_ts(),
+                entry.ts
+            )));
+        }
+        Ok(entry)
+    }
+
     /// Appends a ledger row prepared by an external adapter while keeping the
     /// vault-owned live ledger hook synchronized with the durable Ledger CF.
     pub fn append_external_ledger_row(&self, seq: u64, bytes: &[u8]) -> Result<()> {
         self.with_durable_commit_lock(|| {
+            let entry = self.validate_decoded_ledger_append_locked(
+                "append_external_ledger_row",
+                seq,
+                bytes,
+            )?;
+            let committed_head = if self.durable.is_none() {
+                Some(LedgerHeadAnchor::new(
+                    seq.checked_add(1).ok_or_else(|| {
+                        CalyxError::ledger_chain_broken("ledger sequence exhausted")
+                    })?,
+                    entry.entry_hash,
+                )?)
+            } else {
+                None
+            };
             let key = ledger_key(seq);
-            if self
-                .read_cf_at(self.latest_seq(), ColumnFamily::Ledger, &key)?
-                .is_some()
-            {
-                return Err(CalyxError::ledger_append_only_violation(format!(
-                    "Aster ledger seq {seq} already exists"
-                )));
-            }
             let rows = [encode::WriteRow {
                 cf: ColumnFamily::Ledger,
                 key,
                 value: bytes.to_vec(),
             }];
             self.commit_rows_locked(&rows)?;
+            if let Some(committed_head) = committed_head {
+                self.validate_committed_ledger_head_anchor_locked(&committed_head)?;
+                return Ok(());
+            }
             self.ledger_state_reconciliation_required
                 .store(true, std::sync::atomic::Ordering::Release);
             match self.reconcile_ledger_state_from_durable_locked() {
@@ -481,18 +549,8 @@ where
     }
 
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {
-        let key = ledger_key(seq);
-        if self
-            .vault
-            .read_cf_at(self.vault.snapshot(), ColumnFamily::Ledger, &key)?
-            .is_some()
-        {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "ledger seq {seq} already exists"
-            )));
-        }
         self.vault
-            .write_raw_ledger_row_without_hook(key, bytes.to_vec())
+            .write_raw_ledger_row_without_hook(seq, bytes)
             .map(|_| ())
     }
 
@@ -509,9 +567,6 @@ where
     }
 
     fn put_head_anchor(&mut self, anchor: &LedgerHeadAnchor) -> Result<()> {
-        if let Some(durable) = &self.vault.durable {
-            crate::ledger_head::write_head_anchor(durable.root(), anchor)?;
-        }
-        Ok(())
+        self.vault.validate_committed_ledger_head_anchor(anchor)
     }
 }

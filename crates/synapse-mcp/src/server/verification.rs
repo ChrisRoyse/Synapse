@@ -608,35 +608,27 @@ impl SynapseService {
     ) -> Result<Option<VerificationBinding>, ErrorData> {
         let db = self.verification_db()?;
         let key = format!("{BINDING_PREFIX}{source}");
-        let rows = db
-            .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("verification binding lookup failed for source {source:?}: {error}"),
-                )
-            })?;
-        for (raw_key, raw) in rows {
-            if raw_key.as_slice() != key.as_bytes() {
-                continue; // exact-source match only (avoid prefix collisions)
-            }
-            let binding = serde_json::from_slice::<VerificationBinding>(&raw).map_err(|error| {
-                mcp_error(
-                    synapse_core::error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "verification binding decode failed for source {source:?} key {key:?}: {error}"
-                    ),
-                )
-            })?;
-            if let Some(window_hwnd) = binding.window_hwnd {
-                validate_persisted_verification_hwnd(
-                    "verification_persisted_binding",
-                    window_hwnd,
-                )?;
-            }
-            return Ok(binding.enabled.then_some(binding));
+        let raw = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("verification binding lookup failed for source {source:?}: {error}"),
+            )
+        })?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let binding = serde_json::from_slice::<VerificationBinding>(&raw).map_err(|error| {
+            mcp_error(
+                synapse_core::error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "verification binding decode failed for source {source:?} key {key:?}: {error}"
+                ),
+            )
+        })?;
+        if let Some(window_hwnd) = binding.window_hwnd {
+            validate_persisted_verification_hwnd("verification_persisted_binding", window_hwnd)?;
         }
-        Ok(None)
+        Ok(binding.enabled.then_some(binding))
     }
 
     fn verification_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {

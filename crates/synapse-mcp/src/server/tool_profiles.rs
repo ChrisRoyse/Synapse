@@ -1093,7 +1093,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "agent",
         "AgentOperation",
-        "%LOCALAPPDATA%\\synapse\\agent-spawns + CF_AGENT_EVENTS/CF_AGENT_TRANSCRIPTS + CF_KV mailbox/template rows",
+        "%LOCALAPPDATA%\\synapse\\agent-spawns + CF_AGENT_EVENTS/CF_AGENT_TRANSCRIPTS + CF_KV mailbox rows/durable queue state/template rows",
         &[
             op(
                 "spawn",
@@ -1157,6 +1157,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("returned/deleted receipt rows"),
                 error_codes::TOOL_INTERNAL_ERROR,
                 "inspect this session's receipt rows before retrying",
+            ),
+            op(
+                "mailbox_repair",
+                true,
+                false,
+                "CF_KV mailbox global state + recipient queue state + exact recipient message rows",
+                Some(
+                    "guarded global/recipient state row readbacks plus stable physical recipient-row count",
+                ),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit break_glass or full_capability profile, inspect physical mailbox rows, and supply monotonic repair floors",
             ),
             op(
                 "stats",
@@ -1271,7 +1282,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "task",
         "TaskOperation",
-        "CF_KV agent task rows + task event/readback rows",
+        "CF_KV agent task rows + guarded enqueue watermark + task event/readback rows",
         &[
             op(
                 "create",
@@ -1344,6 +1355,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("orphan/settled task row readbacks"),
                 error_codes::TOOL_INTERNAL_ERROR,
                 "inspect in-progress rows, spawn artifacts, and live sessions",
+            ),
+            op(
+                "repair_sequence",
+                true,
+                false,
+                "CF_KV guarded agent task enqueue watermark + exact task rows",
+                Some("guarded watermark readback plus physical maximum task enqueue sequence"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit break_glass or full_capability profile, inspect physical task rows, and supply a monotonic repair floor",
             ),
             op(
                 "dispatch_once",
@@ -3585,10 +3605,10 @@ impl SynapseService {
     ) -> Result<Option<ToolProfileRowReadback>, ErrorData> {
         let db = self.m3_storage()?;
         let key = tool_profile_key(session_id);
-        let rows = db
-            .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        let value = db
+            .get_cf(cf::CF_SESSIONS, &key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let Some((read_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
+        let Some(value) = value else {
             return Ok(None);
         };
         let persisted =
@@ -3625,7 +3645,7 @@ impl SynapseService {
         };
         Ok(Some(ToolProfileRowReadback {
             cf_name: cf::CF_SESSIONS,
-            key_hex: hex_lower(&read_key),
+            key_hex: hex_lower(&key),
             value_len_bytes: value.len() as u64,
             value_sha256: sha256_hex(&value),
             record,

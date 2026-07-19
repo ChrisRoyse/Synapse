@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use synapse_calyx::{
     SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
     SynapseCalyxAnchorWriteReadback, SynapseCalyxCfRangePage, SynapseCalyxCfRows,
-    SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxError,
+    SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxError,
     SynapseCalyxGroundedObservationReadback, SynapseCalyxMultiConditionalWriteOutcome,
     SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault, SynapseCalyxRevisionGuard,
     SynapseCalyxVault, SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus,
@@ -43,11 +43,11 @@ use crate::constellations::{
     SYN_TIMELINE_PANEL_VERSION,
 };
 use crate::{
-    CfEstimateMap, FixedWidthScanPage, OwnedCfWriteBatch, RawRow, RevisionGuard,
-    RevisionGuardConflict, RevisionGuardedMutationOutcome, RevisionGuardedWriteOutcome,
-    RevisionedRawValue, STORAGE_REVISION_GUARD_INVALID, STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
-    STORAGE_REVISION_GUARDED_OUTCOME_INVALID, ScanWindow, StorageError, StorageResult, cf,
-    constellations, gc, pressure,
+    CfEstimateMap, CfRevisionGuard, FixedWidthScanPage, OwnedCfWriteBatch, PhysicalScanPage,
+    RawRow, RevisionGuard, RevisionGuardConflict, RevisionGuardedMutationOutcome,
+    RevisionGuardedWriteOutcome, RevisionedRawValue, STORAGE_REVISION_GUARD_INVALID,
+    STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE, STORAGE_REVISION_GUARDED_OUTCOME_INVALID, ScanWindow,
+    StorageError, StorageResult, cf, constellations, gc, pressure,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -302,6 +302,11 @@ pub trait StorageBackend: Send + Sync {
     fn put_batch(&self, cf_name: &str, rows: Vec<RawRow>) -> StorageResult<()>;
     fn put_batch_pressure_bypass(&self, cf_name: &str, rows: Vec<RawRow>) -> StorageResult<()>;
     fn put_cf_batches_pressure_bypass(&self, batches: Vec<OwnedCfWriteBatch>) -> StorageResult<()>;
+    fn put_cf_batches_if_revisions_pressure_bypass(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+    ) -> StorageResult<RevisionGuardedMutationOutcome>;
     fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
     fn get_cf_revisioned(
         &self,
@@ -468,6 +473,12 @@ pub trait StorageBackend: Send + Sync {
         start_key: &[u8],
         max_rows: usize,
     ) -> StorageResult<ScanWindow>;
+    fn scan_cf_physical_page(
+        &self,
+        cf_name: &str,
+        after_physical: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage>;
     fn scan_cf_range(
         &self,
         cf_name: &str,
@@ -807,7 +818,42 @@ impl StorageBackend for CalyxBackend {
                         )?);
                     }
                 }
-                commit_calyx_rows_to_vault(vault, "<multi-cf>", writes)
+                commit_calyx_rows_atomically_to_vault(vault, "<multi-cf>", writes)
+            },
+        )
+    }
+
+    fn put_cf_batches_if_revisions_pressure_bypass(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+    ) -> StorageResult<RevisionGuardedMutationOutcome> {
+        validate_cross_cf_revision_guarded_put(&guards, &batches)?;
+        self.with_vault(
+            "<multi-cf>",
+            "write revision-guarded Calyx multi-CF KV batch",
+            true,
+            |vault| {
+                let now_ms = calyx_clock_now_for_write(vault, "<multi-cf>")?;
+                let mut physical_guards = Vec::with_capacity(guards.len());
+                for guard in &guards {
+                    let collection_id = calyx_collection_id_for_cf_write(&guard.cf_name)?;
+                    let physical_key =
+                        encode_calyx_key_for_write(&guard.cf_name, collection_id, &guard.key)?;
+                    physical_guards.push(SynapseCalyxRevisionGuard::new(
+                        ColumnFamily::Kv,
+                        physical_key,
+                        guard.expected_revision_sha256,
+                    ));
+                }
+                let mut writes = Vec::new();
+                for (cf_name, rows) in &batches {
+                    let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
+                    for (key, value) in rows {
+                        writes.push(calyx_put_row(cf_name, collection_id, key, value, now_ms)?);
+                    }
+                }
+                commit_calyx_cross_cf_rows_if_revisions(vault, &guards, &physical_guards, writes)
             },
         )
     }
@@ -2300,6 +2346,25 @@ impl StorageBackend for CalyxBackend {
             window.push(row);
         }
         Ok((window, more))
+    }
+
+    fn scan_cf_physical_page(
+        &self,
+        cf_name: &str,
+        after_physical: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage> {
+        calyx_collection_id_for_cf_read(cf_name)?;
+        validate_physical_page_request(cf_name, after_physical, max_rows)?;
+        if max_rows == 0 {
+            return Ok(PhysicalScanPage::empty());
+        }
+        self.with_vault(
+            cf_name,
+            "scan candidate-bounded physical Calyx KV namespace page",
+            false,
+            |vault| read_physical_page_from_vault(vault, cf_name, after_physical, max_rows),
+        )
     }
 
     fn scan_cf_range(
@@ -3796,6 +3861,194 @@ fn read_fixed_width_rows_from_vault_range(
     Ok((decoded, more))
 }
 
+fn validate_physical_page_request(
+    cf_name: &str,
+    after_physical: Option<&[u8]>,
+    max_rows: usize,
+) -> StorageResult<()> {
+    if max_rows > LATEST_CF_RANGE_PAGE_MAX_ROWS {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "candidate-bounded physical Calyx page max_rows {max_rows} exceeds the hard maximum {LATEST_CF_RANGE_PAGE_MAX_ROWS}"
+            ),
+        });
+    }
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    if let Some(cursor) = after_physical {
+        decode_calyx_user_key_for_read(cf_name, collection_id, cursor).map_err(|error| {
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "candidate-bounded physical Calyx page rejected an opaque cursor outside the exact {cf_name} namespace: cursor_hex={} detail={error}",
+                    hex_prefix_for_log(cursor)
+                ),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn read_physical_page_from_vault(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    after_physical: Option<&[u8]>,
+    max_rows: usize,
+) -> StorageResult<PhysicalScanPage> {
+    validate_physical_page_request(cf_name, after_physical, max_rows)?;
+    if max_rows == 0 {
+        return Ok(PhysicalScanPage::empty());
+    }
+    let candidate_budget = max_rows.checked_add(1).ok_or_else(|| StorageError::ReadFailed {
+        cf_name: cf_name.to_owned(),
+        detail: "candidate-bounded physical Calyx page max_rows cannot be usize::MAX because exact continuation requires one lookahead candidate"
+            .to_owned(),
+    })?;
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    let page = vault
+        .scan_kv_range_page_latest(&range, after_physical, max_rows)
+        .map_err(|source| {
+            calyx_read_failed(
+                cf_name,
+                "scan candidate-bounded physical Calyx KV namespace page",
+                &source,
+            )
+        })?;
+    validate_physical_page_shape(
+        cf_name,
+        collection_id,
+        after_physical,
+        max_rows,
+        candidate_budget,
+        &page,
+    )?;
+    let now_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
+    let (rows, expired_rows_skipped) =
+        decode_physical_page_rows(cf_name, collection_id, after_physical, now_ms, &page)?;
+    Ok(PhysicalScanPage {
+        rows,
+        resume_after_physical: page.resume_after,
+        more: page.more,
+        snapshot_seq: Some(page.snapshot_seq),
+        candidate_rows_examined: page.examined_rows,
+        expired_rows_skipped,
+    })
+}
+
+fn validate_physical_page_shape(
+    cf_name: &str,
+    collection_id: u64,
+    after_physical: Option<&[u8]>,
+    max_rows: usize,
+    candidate_budget: usize,
+    page: &SynapseCalyxCfRangePage,
+) -> StorageResult<()> {
+    let resume_present = page.resume_after.is_some();
+    let expected_resume = page.examined_rows != 0;
+    let expected_more = page.examined_rows > max_rows;
+    if page.examined_rows > candidate_budget
+        || page.rows.len() > max_rows
+        || page.rows.len() > page.examined_rows
+        || resume_present != expected_resume
+        || page.more != expected_more
+    {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "candidate-bounded physical Calyx page violated its shape/budget contract: snapshot_seq={} examined={} candidate_budget={candidate_budget} output_rows={} output_budget={max_rows} more={} expected_more={expected_more} resume_present={resume_present} expected_resume={expected_resume}",
+                page.snapshot_seq,
+                page.examined_rows,
+                page.rows.len(),
+                page.more
+            ),
+        });
+    }
+    if let Some(resume) = page.resume_after.as_deref() {
+        decode_calyx_user_key_for_read(cf_name, collection_id, resume).map_err(|error| {
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "candidate-bounded physical Calyx page returned an invalid namespace cursor: snapshot_seq={} cursor_hex={} detail={error}",
+                    page.snapshot_seq,
+                    hex_prefix_for_log(resume)
+                ),
+            }
+        })?;
+        if after_physical.is_some_and(|after| resume <= after) {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "candidate-bounded physical Calyx page returned a non-progressing cursor: snapshot_seq={} previous_cursor_hex={} returned_cursor_hex={}",
+                    page.snapshot_seq,
+                    after_physical.map_or_else(|| "none".to_owned(), hex_prefix_for_log),
+                    hex_prefix_for_log(resume)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn decode_physical_page_rows(
+    cf_name: &str,
+    collection_id: u64,
+    after_physical: Option<&[u8]>,
+    now_ms: u64,
+    page: &SynapseCalyxCfRangePage,
+) -> StorageResult<(Vec<RawRow>, usize)> {
+    let mut rows = Vec::with_capacity(page.rows.len());
+    let mut expired_rows_skipped = 0_usize;
+    let mut previous_key = after_physical;
+    for (physical_key, value) in &page.rows {
+        if previous_key.is_some_and(|previous| physical_key.as_slice() <= previous)
+            || page
+                .resume_after
+                .as_deref()
+                .is_none_or(|resume| physical_key.as_slice() > resume)
+        {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "candidate-bounded physical Calyx page returned an unordered or out-of-cursor row: snapshot_seq={} previous_key_hex={} row_key_hex={} resume_after_hex={}",
+                    page.snapshot_seq,
+                    previous_key.map_or_else(|| "none".to_owned(), hex_prefix_for_log),
+                    hex_prefix_for_log(physical_key),
+                    page.resume_after
+                        .as_deref()
+                        .map_or_else(|| "none".to_owned(), hex_prefix_for_log)
+                ),
+            });
+        }
+        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, physical_key)?;
+        let envelope = decode_calyx_value_raw(value).map_err(|detail| {
+            tracing::error!(
+                code = error_codes::STORAGE_READ_FAILED,
+                cf = cf_name,
+                physical_key_hex = %hex_prefix_for_log(physical_key),
+                detail,
+                "Calyx storage backend rejected a malformed retention envelope during a candidate-bounded physical page"
+            );
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "candidate-bounded physical Calyx page found a malformed retention envelope at physical_key_hex={}: {detail}",
+                    hex_prefix_for_log(physical_key)
+                ),
+            }
+        })?;
+        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+            expired_rows_skipped = expired_rows_skipped.saturating_add(1);
+        } else {
+            rows.push((user_key, envelope.payload.to_vec()));
+        }
+        previous_key = Some(physical_key);
+    }
+    Ok((rows, expired_rows_skipped))
+}
+
 fn validate_fixed_width_page_request(
     cf_name: &str,
     start_key: &[u8],
@@ -4153,9 +4406,285 @@ fn commit_calyx_rows_to_vault(
             "Calyx CF write batch was split below the WAL record ceiling"
         );
     }
-    vault
-        .flush()
-        .map_err(|source| calyx_write_failed(cf_name, "flush Calyx CF batch", &source))
+    // Every chunk has already crossed its own fsynced WAL boundary. Do not run
+    // a post-commit maintenance flush in the logical write path: if it failed,
+    // callers would receive a retryable-looking error after durable mutation.
+    // Explicit storage flush/checkpoint operations retain their own observable
+    // error contract.
+    Ok(())
+}
+
+fn commit_calyx_rows_atomically_to_vault(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    rows: Vec<SynapseCalyxCfWrite>,
+) -> StorageResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let plan = plan_calyx_write_batches(cf_name, rows)?;
+    let mut chunks = plan.chunks.into_iter();
+    let chunk = chunks.next().ok_or_else(|| {
+        calyx_write_failed_detail(
+            cf_name,
+            "atomic Calyx batch planner returned no rows for non-empty input".to_owned(),
+        )
+    })?;
+    if chunks.next().is_some() {
+        return Err(revision_guarded_mutation_failed(
+            cf_name,
+            STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
+            format!(
+                "atomic Calyx batch exceeds one WAL record: total_rows={} total_payload_bytes={} max_payload_bytes={}; split was refused because the API promises cross-CF atomicity",
+                plan.total_rows, plan.total_payload_bytes, CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    vault.write_cf_batch(chunk.rows).map_err(|source| {
+        calyx_write_failed(
+            cf_name,
+            &format!(
+                "write one atomic Calyx batch rows={} estimated_payload_bytes={} max_payload_bytes={}",
+                plan.total_rows, plan.total_payload_bytes, CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES
+            ),
+            &source,
+        )
+    })?;
+    // `write_cf_batch` has already crossed Calyx's fsynced WAL boundary. A
+    // subsequent memtable/SST flush is maintenance, not part of this logical
+    // commit; surfacing its failure here would turn a known-applied operation
+    // into an ordinary error and invite an unsafe retry.
+    Ok(())
+}
+
+fn validate_cross_cf_revision_guarded_put(
+    guards: &[CfRevisionGuard],
+    batches: &[OwnedCfWriteBatch],
+) -> StorageResult<()> {
+    const CF_NAME: &str = "<multi-cf>";
+    if guards.is_empty() {
+        return Err(revision_guarded_mutation_failed(
+            CF_NAME,
+            STORAGE_REVISION_GUARD_INVALID,
+            "cross-CF revision-guarded write requires at least one logical guard".to_owned(),
+        ));
+    }
+    let mut mutation_counts = BTreeMap::<(&str, &[u8]), usize>::new();
+    for (batch_index, (cf_name, rows)) in batches.iter().enumerate() {
+        if cf_name.trim().is_empty() {
+            return Err(revision_guarded_mutation_failed(
+                CF_NAME,
+                STORAGE_REVISION_GUARD_INVALID,
+                format!(
+                    "cross-CF batch has an empty column-family name: batch_index={batch_index}"
+                ),
+            ));
+        }
+        for (row_index, (key, _value)) in rows.iter().enumerate() {
+            if key.is_empty() {
+                return Err(revision_guarded_mutation_failed(
+                    CF_NAME,
+                    STORAGE_REVISION_GUARD_INVALID,
+                    format!(
+                        "cross-CF mutation key must be non-empty: batch_index={batch_index} row_index={row_index} cf={cf_name}"
+                    ),
+                ));
+            }
+            let count = mutation_counts
+                .entry((cf_name.as_str(), key.as_slice()))
+                .or_default();
+            *count += 1;
+            if *count != 1 {
+                return Err(revision_guarded_mutation_failed(
+                    CF_NAME,
+                    STORAGE_REVISION_GUARD_INVALID,
+                    format!(
+                        "cross-CF mutation identities must be unique: cf={cf_name} key_len={} count={count}",
+                        key.len()
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut unique_guards = BTreeSet::<(&str, &[u8])>::new();
+    for (guard_index, guard) in guards.iter().enumerate() {
+        if guard.cf_name.trim().is_empty() || guard.key.is_empty() {
+            return Err(revision_guarded_mutation_failed(
+                CF_NAME,
+                STORAGE_REVISION_GUARD_INVALID,
+                format!(
+                    "cross-CF guard identity must be non-empty: guard_index={guard_index} cf_empty={} key_len={}",
+                    guard.cf_name.trim().is_empty(),
+                    guard.key.len()
+                ),
+            ));
+        }
+        if !unique_guards.insert((guard.cf_name.as_str(), guard.key.as_slice())) {
+            return Err(revision_guarded_mutation_failed(
+                CF_NAME,
+                STORAGE_REVISION_GUARD_INVALID,
+                format!(
+                    "cross-CF guard identities must be unique: guard_index={guard_index} cf={} key_len={}",
+                    guard.cf_name,
+                    guard.key.len()
+                ),
+            ));
+        }
+        let matching_mutations = mutation_counts
+            .get(&(guard.cf_name.as_str(), guard.key.as_slice()))
+            .copied()
+            .unwrap_or_default();
+        if matching_mutations > 1 {
+            return Err(revision_guarded_mutation_failed(
+                CF_NAME,
+                STORAGE_REVISION_GUARD_INVALID,
+                format!(
+                    "cross-CF guarded write permits at most one mutation for every guard: guard_index={guard_index} cf={} key_len={} matching_mutations={matching_mutations}",
+                    guard.cf_name,
+                    guard.key.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn commit_calyx_cross_cf_rows_if_revisions(
+    vault: &SynapseCalyxVault,
+    logical_guards: &[CfRevisionGuard],
+    physical_guards: &[SynapseCalyxRevisionGuard],
+    rows: Vec<SynapseCalyxCfWrite>,
+) -> StorageResult<RevisionGuardedMutationOutcome> {
+    const CF_NAME: &str = "<multi-cf>";
+    let plan = plan_calyx_write_batches(CF_NAME, rows)?;
+    let mut chunks = plan.chunks.into_iter();
+    let chunk = chunks.next().ok_or_else(|| {
+        revision_guarded_mutation_failed(
+            CF_NAME,
+            STORAGE_REVISION_GUARD_INVALID,
+            "cross-CF revision-guarded Calyx mutation must contain at least one row".to_owned(),
+        )
+    })?;
+    if chunks.next().is_some() {
+        return Err(revision_guarded_mutation_failed(
+            CF_NAME,
+            STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
+            format!(
+                "cross-CF revision-guarded Calyx batch exceeds one atomic WAL record: total_rows={} total_payload_bytes={} max_payload_bytes={}; split would violate journal/projection atomicity",
+                plan.total_rows, plan.total_payload_bytes, CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    let outcome = vault
+        .write_cf_batch_if_revisions(physical_guards.to_vec(), chunk.rows)
+        .map_err(|source| {
+            calyx_conditional_write_failed(
+                CF_NAME,
+                &format!(
+                    "write cross-CF revision-guarded Calyx batch guards={} rows={} estimated_payload_bytes={} max_payload_bytes={}",
+                    physical_guards.len(),
+                    plan.total_rows,
+                    plan.total_payload_bytes,
+                    CALYX_WRITE_BATCH_MAX_PAYLOAD_BYTES
+                ),
+                &source,
+            )
+        })?;
+    // The guarded Aster call is itself the durable WAL/MVCC boundary. A
+    // second fallible flush here would turn a known applied commit into an
+    // ambiguous ordinary error and make an append-only retry unsafe.
+    validate_cross_cf_revision_guarded_outcome(logical_guards, physical_guards, &outcome)?;
+    if let Some(conflict) = &outcome.conflict {
+        let logical = &logical_guards[conflict.guard_index];
+        tracing::warn!(
+            code = "STORAGE_CALYX_REVISION_CONFLICT",
+            cf = %logical.cf_name,
+            committed_seq = outcome.committed_seq,
+            guard_index = conflict.guard_index,
+            guard_key_len = logical.key.len(),
+            expected_revision_present = conflict.expected_revision_sha256.is_some(),
+            actual_revision_present = conflict.actual_revision_sha256.is_some(),
+            guard_count = logical_guards.len(),
+            "cross-CF revision-guarded Calyx batch was not applied because a guarded value changed"
+        );
+    }
+    Ok(RevisionGuardedMutationOutcome {
+        applied: outcome.applied,
+        committed_seq: outcome.committed_seq,
+        actual_revisions_sha256: outcome.actual_revisions_sha256,
+        committed_revisions_sha256: outcome.committed_revisions_sha256,
+        conflict: outcome.conflict.map(|conflict| RevisionGuardConflict {
+            guard_index: conflict.guard_index,
+            key: logical_guards[conflict.guard_index].key.clone(),
+            expected_revision_sha256: conflict.expected_revision_sha256,
+            actual_revision_sha256: conflict.actual_revision_sha256,
+        }),
+    })
+}
+
+fn validate_cross_cf_revision_guarded_outcome(
+    logical_guards: &[CfRevisionGuard],
+    physical_guards: &[SynapseCalyxRevisionGuard],
+    outcome: &SynapseCalyxMultiConditionalWriteOutcome,
+) -> StorageResult<()> {
+    const CF_NAME: &str = "<multi-cf>";
+    let guard_count = logical_guards.len();
+    let shape_valid = physical_guards.len() == guard_count
+        && outcome.actual_revisions_sha256.len() == guard_count
+        && if outcome.applied {
+            outcome.conflict.is_none() && outcome.committed_revisions_sha256.len() == guard_count
+        } else {
+            outcome.committed_revisions_sha256.is_empty() && outcome.conflict.is_some()
+        };
+    if !shape_valid {
+        return Err(revision_guarded_mutation_failed(
+            CF_NAME,
+            STORAGE_REVISION_GUARDED_OUTCOME_INVALID,
+            format!(
+                "cross-CF guarded outcome shape violated contract: applied={} logical_guards={guard_count} physical_guards={} actual_revisions={} committed_revisions={} conflict_present={}",
+                outcome.applied,
+                physical_guards.len(),
+                outcome.actual_revisions_sha256.len(),
+                outcome.committed_revisions_sha256.len(),
+                outcome.conflict.is_some()
+            ),
+        ));
+    }
+    let Some(conflict) = &outcome.conflict else {
+        return Ok(());
+    };
+    let Some(logical_guard) = logical_guards.get(conflict.guard_index) else {
+        return Err(revision_guarded_mutation_failed(
+            CF_NAME,
+            STORAGE_REVISION_GUARDED_OUTCOME_INVALID,
+            format!(
+                "cross-CF guarded conflict index is out of bounds: guard_index={} guard_count={guard_count}",
+                conflict.guard_index
+            ),
+        ));
+    };
+    let physical_guard = &physical_guards[conflict.guard_index];
+    let actual_revision = outcome.actual_revisions_sha256[conflict.guard_index];
+    if conflict.cf != physical_guard.cf
+        || conflict.key != physical_guard.key
+        || conflict.expected_revision_sha256 != logical_guard.expected_revision_sha256
+        || conflict.actual_revision_sha256 != actual_revision
+    {
+        return Err(revision_guarded_mutation_failed(
+            CF_NAME,
+            STORAGE_REVISION_GUARDED_OUTCOME_INVALID,
+            format!(
+                "cross-CF guarded conflict identity violated contract: guard_index={} cf_matches={} key_matches={} expected_matches={} actual_matches={}",
+                conflict.guard_index,
+                conflict.cf == physical_guard.cf,
+                conflict.key == physical_guard.key,
+                conflict.expected_revision_sha256 == logical_guard.expected_revision_sha256,
+                conflict.actual_revision_sha256 == actual_revision
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_revision_guarded_mutation(
@@ -4220,12 +4749,12 @@ fn validate_revision_guarded_mutation(
             .get(guard.key.as_slice())
             .copied()
             .unwrap_or_default();
-        if matching_mutations != 1 {
+        if matching_mutations > 1 {
             return Err(revision_guarded_mutation_failed(
                 cf_name,
                 STORAGE_REVISION_GUARD_INVALID,
                 format!(
-                    "revision-guarded mutation requires exactly one delete or put for every guard: guard_index={guard_index} guard_key_len={} matching_mutations={matching_mutations} deletes={} puts={}",
+                    "revision-guarded mutation permits at most one delete or put for every guard: guard_index={guard_index} guard_key_len={} matching_mutations={matching_mutations} deletes={} puts={}",
                     guard.key.len(),
                     deletes.len(),
                     puts.len()
@@ -4265,7 +4794,7 @@ fn commit_calyx_rows_if_revisions(
     let outcome = vault
         .write_cf_batch_if_revisions(physical_guards.to_vec(), chunk.rows)
         .map_err(|source| {
-            calyx_write_failed(
+            calyx_conditional_write_failed(
                 cf_name,
                 &format!(
                     "write multi-key revision-guarded Calyx CF batch guards={} rows={} estimated_payload_bytes={} max_payload_bytes={}",
@@ -4277,11 +4806,8 @@ fn commit_calyx_rows_if_revisions(
                 &source,
             )
         })?;
-    if outcome.applied {
-        vault.flush().map_err(|source| {
-            calyx_write_failed(cf_name, "flush revision-guarded Calyx CF batch", &source)
-        })?;
-    }
+    // `write_cf_batch_if_revisions` returns the durable commit outcome. Do
+    // not overwrite that known outcome with a later maintenance-flush error.
     validate_revision_guarded_outcome(cf_name, logical_guards, physical_guards, &outcome)?;
 
     if let Some(conflict) = &outcome.conflict {
@@ -5395,6 +5921,30 @@ fn calyx_write_failed(cf_name: &str, action: &str, source: &SynapseCalyxError) -
         cf_name: cf_name.to_owned(),
         code: source.code,
         detail: format!("{action}: {source}"),
+        committed_seq: None,
+    }
+}
+
+fn calyx_conditional_write_failed(
+    cf_name: &str,
+    action: &str,
+    source: &SynapseCalyxConditionalWriteError,
+) -> StorageError {
+    tracing::error!(
+        code = source.source.code,
+        source_code = source.source.source_code.unwrap_or("none"),
+        remediation = source.source.remediation,
+        committed_seq = source.committed_seq,
+        cf_name,
+        action,
+        error = %source,
+        "revision-guarded Calyx storage write failed"
+    );
+    StorageError::CalyxWriteFailed {
+        cf_name: cf_name.to_owned(),
+        code: source.source.code,
+        detail: format!("{action}: {}", source.source),
+        committed_seq: source.committed_seq,
     }
 }
 

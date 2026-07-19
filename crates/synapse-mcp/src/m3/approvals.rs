@@ -1666,47 +1666,35 @@ fn read_item_by_key(
     db: &Arc<Db>,
     key: &[u8],
 ) -> Result<Option<(ApprovalItemRecord, ApprovalRowEvidence)>, ErrorData> {
-    let rows = db.scan_cf_prefix(cf::CF_KV, key).map_err(storage_error)?;
-    for (row_key, value) in rows {
-        if row_key == key {
-            let item = decode_item(&row_key, &value)?;
-            return Ok(Some((item, row_evidence(cf::CF_KV, &row_key, &value))));
-        }
-    }
-    Ok(None)
+    let Some(value) = db.get_cf(cf::CF_KV, key).map_err(storage_error)? else {
+        return Ok(None);
+    };
+    let item = decode_item(key, &value)?;
+    Ok(Some((item, row_evidence(cf::CF_KV, key, &value))))
 }
 
 fn read_activation_by_key(
     db: &Arc<Db>,
     key: &[u8],
 ) -> Result<Option<(ApprovalActivationRecord, ApprovalRowEvidence)>, ErrorData> {
-    let rows = db.scan_cf_prefix(cf::CF_KV, key).map_err(storage_error)?;
-    for (row_key, value) in rows {
-        if row_key == key {
-            let activation = decode_json::<ApprovalActivationRecord>(&value).map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "approval activation decode failed for key_hex={}: {error}",
-                        hex_encode(&row_key)
-                    ),
-                )
-            })?;
-            return Ok(Some((
-                activation,
-                row_evidence(cf::CF_KV, &row_key, &value),
-            )));
-        }
-    }
-    Ok(None)
+    let Some(value) = db.get_cf(cf::CF_KV, key).map_err(storage_error)? else {
+        return Ok(None);
+    };
+    let activation = decode_json::<ApprovalActivationRecord>(&value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "approval activation decode failed for key_hex={}: {error}",
+                hex_encode(key)
+            ),
+        )
+    })?;
+    Ok(Some((activation, row_evidence(cf::CF_KV, key, &value))))
 }
 
 fn readback_row(db: &Arc<Db>, key: &[u8], context: &str) -> Result<ApprovalRowEvidence, ErrorData> {
-    let rows = db.scan_cf_prefix(cf::CF_KV, key).map_err(storage_error)?;
-    for (row_key, value) in rows {
-        if row_key == key {
-            return Ok(row_evidence(cf::CF_KV, &row_key, &value));
-        }
+    if let Some(value) = db.get_cf(cf::CF_KV, key).map_err(storage_error)? {
+        return Ok(row_evidence(cf::CF_KV, key, &value));
     }
     Err(mcp_error(
         error_codes::STORAGE_WRITE_FAILED,

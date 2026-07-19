@@ -40,7 +40,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use synapse_core::error_codes;
-use synapse_storage::{Db, cf};
+use synapse_storage::{Db, RevisionGuard, cf};
 
 use super::{
     ErrorData, Json, Parameters, SynapseService, mcp_error, session_registry::unix_time_ms_now,
@@ -56,6 +56,7 @@ use crate::m4::{
 const TASK_NAMESPACE: &str = "agent-task/v1";
 const TASK_SCHEMA_VERSION: u32 = 1;
 const TASK_SEQUENCE_KEY: &str = "agent-task/v1/meta/last_enqueue_seq";
+const TASK_CREATE_MAX_CONFLICT_RETRIES: usize = 64;
 
 const MAX_TASK_ID_CHARS: usize = 200;
 const MAX_TITLE_CHARS: usize = 500;
@@ -385,6 +386,30 @@ pub struct TaskReconcileResponse {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct TaskSequenceRepairParams {
+    /// Operator-observed lower bound. Required so repairing malformed bytes can
+    /// never reuse a sequence that may have existed before corruption.
+    pub minimum_last_enqueue_seq: u64,
+    /// Audit reason for the explicit destructive metadata repair.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSequenceRepairResponse {
+    pub ok: bool,
+    pub observed_task_rows: usize,
+    pub observed_max_task_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_decodable_sequence: Option<u64>,
+    pub requested_minimum_sequence: u64,
+    pub repaired_sequence: u64,
+    pub committed_seq: u64,
+    pub written_row: TaskRowReadback,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TaskDispatchOnceParams {
     /// Max concurrently in-flight tasks; no spawn occurs when already at cap.
     #[serde(default = "default_cap")]
@@ -623,12 +648,40 @@ fn encode_task(task: &AgentTask) -> Result<Vec<u8>, ErrorData> {
 }
 
 fn decode_task(row_key: &str, bytes: &[u8]) -> Result<AgentTask, ErrorData> {
-    serde_json::from_slice(bytes).map_err(|error| {
+    let task: AgentTask = serde_json::from_slice(bytes).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_CORRUPTED,
             format!("agent_task row {row_key} is corrupt and could not be decoded: {error}"),
         )
-    })
+    })?;
+    let prefix = task_prefix();
+    let expected_task_id = row_key.strip_prefix(&prefix).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_TASK_ROW_KEY_INVALID: physical row {row_key:?} is outside the expected \
+                 task namespace {prefix:?}"
+            ),
+        )
+    })?;
+    if expected_task_id.is_empty()
+        || expected_task_id.contains('/')
+        || task.schema_version != TASK_SCHEMA_VERSION
+        || task.task_id != expected_task_id
+        || task.enqueue_seq == 0
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_TASK_ROW_IDENTITY_INVALID: physical_row={row_key:?} \
+                 expected_task_id={expected_task_id:?} stored_task_id={:?} schema_version={} \
+                 expected_schema={TASK_SCHEMA_VERSION} enqueue_seq={}; task queue operations are \
+                 disabled until the exact corrupt row is repaired",
+                task.task_id, task.schema_version, task.enqueue_seq
+            ),
+        ));
+    }
+    Ok(task)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -642,6 +695,12 @@ struct SpawnTerminalCompletion {
 struct AgentTaskRow {
     key: Vec<u8>,
     task: AgentTask,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevisionedTaskSequence {
+    value: u64,
+    revision_sha256: [u8; 32],
 }
 
 impl SpawnTerminalCompletion {
@@ -724,20 +783,15 @@ impl SynapseService {
 
     fn read_task(db: &Db, task_id: &str) -> Result<Option<AgentTask>, ErrorData> {
         let key = task_key(task_id);
-        let rows = db
-            .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("agent_task failed to read {key}: {error}"),
-                )
-            })?;
-        for (raw_key, raw_value) in rows {
-            if raw_key == key.as_bytes() {
-                return Ok(Some(decode_task(&key, &raw_value)?));
-            }
-        }
-        Ok(None)
+        let value = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("agent_task failed to read {key}: {error}"),
+            )
+        })?;
+        value
+            .map(|raw_value| decode_task(&key, &raw_value))
+            .transpose()
     }
 
     pub(crate) fn read_all_tasks(db: &Db) -> Result<Vec<AgentTask>, ErrorData> {
@@ -785,80 +839,136 @@ impl SynapseService {
         Ok(out)
     }
 
-    fn read_enqueue_seq_watermark(db: &Db) -> Result<Option<u64>, ErrorData> {
-        let rows = db
-            .scan_cf_prefix(cf::CF_KV, TASK_SEQUENCE_KEY.as_bytes())
+    fn decode_enqueue_seq_watermark(value: &[u8]) -> Result<u64, ErrorData> {
+        let text = std::str::from_utf8(value).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_SEQUENCE_CORRUPTED: {TASK_SEQUENCE_KEY} is not UTF-8: {error}; \
+                     task creation is disabled until the physical watermark is repaired"
+                ),
+            )
+        })?;
+        let parsed = text.parse::<u64>().map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_SEQUENCE_CORRUPTED: {TASK_SEQUENCE_KEY} is not a canonical u64: \
+                     {error}; task creation is disabled until the physical watermark is repaired"
+                ),
+            )
+        })?;
+        let canonical = parsed.to_string();
+        if canonical != text {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_SEQUENCE_CORRUPTED: {TASK_SEQUENCE_KEY} uses non-canonical decimal \
+                     bytes {text:?}; expected {canonical:?}; task creation is disabled until the \
+                     physical watermark is repaired"
+                ),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    fn read_enqueue_seq_watermark_revisioned(
+        db: &Db,
+    ) -> Result<Option<RevisionedTaskSequence>, ErrorData> {
+        let revisioned = db
+            .get_cf_revisioned(cf::CF_KV, TASK_SEQUENCE_KEY.as_bytes())
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_task failed to read sequence watermark: {error}"),
+                    format!("agent_task failed to read revisioned sequence watermark: {error}"),
                 )
             })?;
-        for (key, value) in rows {
-            if key == TASK_SEQUENCE_KEY.as_bytes() {
-                let text = std::str::from_utf8(&value).map_err(|error| {
-                    mcp_error(
-                        error_codes::STORAGE_CORRUPTED,
-                        format!("agent_task sequence watermark is not UTF-8: {error}"),
-                    )
-                })?;
-                let seq = text.parse::<u64>().map_err(|error| {
-                    mcp_error(
-                        error_codes::STORAGE_CORRUPTED,
-                        format!("agent_task sequence watermark is not a u64: {error}"),
-                    )
-                })?;
-                return Ok(Some(seq));
+        let Some(revisioned) = revisioned else {
+            return Ok(None);
+        };
+        let value = revisioned.value.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_SEQUENCE_CORRUPTED: {TASK_SEQUENCE_KEY} has a physical expired \
+                     envelope instead of a live watermark; task creation is disabled"
+                ),
+            )
+        })?;
+        Ok(Some(RevisionedTaskSequence {
+            value: Self::decode_enqueue_seq_watermark(&value)?,
+            revision_sha256: revisioned.revision_sha256,
+        }))
+    }
+
+    fn initialize_enqueue_seq_watermark(db: &Db) -> Result<RevisionedTaskSequence, ErrorData> {
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            if let Some(sequence) = Self::read_enqueue_seq_watermark_revisioned(db)? {
+                return Ok(sequence);
             }
+            let max_seq = Self::scan_task_rows(db)?
+                .iter()
+                .map(|row| row.task.enqueue_seq)
+                .max()
+                .unwrap_or(0);
+            let encoded = max_seq.to_string().into_bytes();
+            let outcome = db
+                .mutate_batch_if_revisions_pressure_bypass(
+                    cf::CF_KV,
+                    [RevisionGuard::new(TASK_SEQUENCE_KEY.as_bytes(), None)],
+                    std::iter::empty::<Vec<u8>>(),
+                    [(TASK_SEQUENCE_KEY.as_bytes().to_vec(), encoded.clone())],
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "agent_task failed to initialize the guarded sequence watermark: \
+                             {error}; exact key={TASK_SEQUENCE_KEY}"
+                        ),
+                    )
+                })?;
+            if !outcome.applied {
+                tracing::warn!(
+                    code = "AGENT_TASK_SEQUENCE_INIT_CONFLICT",
+                    retry,
+                    conflict_guard_index = outcome
+                        .conflict
+                        .as_ref()
+                        .map(|conflict| conflict.guard_index),
+                    "guarded task sequence initialization conflicted; rereading physical state"
+                );
+                continue;
+            }
+            let initialized = Self::read_enqueue_seq_watermark_revisioned(db)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_SEQUENCE_READBACK_MISSING: guarded initialization committed_seq={} \
+                         but {TASK_SEQUENCE_KEY} is physically absent",
+                        outcome.committed_seq
+                    ),
+                )
+            })?;
+            if initialized.value != max_seq {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_SEQUENCE_READBACK_DRIFT: guarded initialization committed_seq={} \
+                         expected_watermark={max_seq} actual_watermark={}; task creation is disabled",
+                        outcome.committed_seq, initialized.value
+                    ),
+                ));
+            }
+            return Ok(initialized);
         }
-        Ok(None)
-    }
-
-    fn write_enqueue_seq_watermark(db: &Db, seq: u64) -> Result<(), ErrorData> {
-        db.put_batch(
-            cf::CF_KV,
-            [(
-                TASK_SEQUENCE_KEY.as_bytes().to_vec(),
-                seq.to_string().into_bytes(),
-            )],
-        )
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("agent_task failed to persist sequence watermark: {error}"),
-            )
-        })?;
-        db.flush().map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("agent_task sequence watermark persisted but failed to flush: {error}"),
-            )
-        })
-    }
-
-    fn ensure_enqueue_seq_watermark(db: &Db) -> Result<u64, ErrorData> {
-        if let Some(seq) = Self::read_enqueue_seq_watermark(db)? {
-            return Ok(seq);
-        }
-        let max_seq = Self::scan_task_rows(db)?
-            .iter()
-            .map(|row| row.task.enqueue_seq)
-            .max()
-            .unwrap_or(0);
-        Self::write_enqueue_seq_watermark(db, max_seq)?;
-        Ok(max_seq)
-    }
-
-    fn next_enqueue_seq(db: &Db) -> Result<u64, ErrorData> {
-        let current = Self::ensure_enqueue_seq_watermark(db)?;
-        let next = current.checked_add(1).ok_or_else(|| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "agent_task enqueue sequence overflowed u64",
-            )
-        })?;
-        Self::write_enqueue_seq_watermark(db, next)?;
-        Ok(next)
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_SEQUENCE_CONTENTION: could not initialize {TASK_SEQUENCE_KEY} after \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} revision conflicts"
+            ),
+        ))
     }
 
     fn delete_task_keys(db: &Db, mut keys: Vec<Vec<u8>>) -> Result<usize, ErrorData> {
@@ -923,9 +1033,51 @@ impl SynapseService {
     }
 
     fn prune_terminal_tasks(db: &Db, now: u64) -> Result<usize, ErrorData> {
-        Self::ensure_enqueue_seq_watermark(db)?;
-        let rows = Self::scan_task_rows(db)?;
-        Self::prune_terminal_task_rows(db, now, &rows)
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            let before = Self::initialize_enqueue_seq_watermark(db)?;
+            let rows = Self::scan_task_rows(db)?;
+            let after = Self::read_enqueue_seq_watermark_revisioned(db)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_SEQUENCE_MISSING: {TASK_SEQUENCE_KEY} disappeared during a \
+                         physical queue audit"
+                    ),
+                )
+            })?;
+            if before.revision_sha256 != after.revision_sha256 {
+                tracing::debug!(
+                    code = "AGENT_TASK_SEQUENCE_AUDIT_CONFLICT",
+                    retry,
+                    "task sequence changed during the physical row audit; rereading both SoTs"
+                );
+                continue;
+            }
+            let max_row_sequence = rows
+                .iter()
+                .map(|row| row.task.enqueue_seq)
+                .max()
+                .unwrap_or(0);
+            if max_row_sequence > after.value {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_SEQUENCE_DRIFT: physical task max_enqueue_seq={max_row_sequence} \
+                         exceeds durable watermark={}; task mutations are disabled until the \
+                         watermark is explicitly repaired",
+                        after.value
+                    ),
+                ));
+            }
+            return Self::prune_terminal_task_rows(db, now, &rows);
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_SEQUENCE_AUDIT_CONTENTION: {TASK_SEQUENCE_KEY} changed during \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} consecutive physical queue audits"
+            ),
+        ))
     }
 
     /// Persists a task row and flushes so it is durable + immediately visible on
@@ -1112,35 +1264,221 @@ impl SynapseService {
         let db = self.agent_task_db()?;
         let now = unix_time_ms_now();
         Self::prune_terminal_tasks(&db, now)?;
-        if Self::read_task(&db, &params.task_id)?.is_some() {
+        let row_key = task_key(&params.task_id);
+        let (task, written_row) = 'create: {
+            for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+                let sequence = Self::initialize_enqueue_seq_watermark(&db)?;
+                let existing = db
+                    .get_cf_revisioned(cf::CF_KV, row_key.as_bytes())
+                    .map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "agent_task failed to read revisioned create key {row_key}: {error}"
+                            ),
+                        )
+                    })?;
+                if let Some(existing) = existing {
+                    let existing_value = existing.value.ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            format!(
+                                "AGENT_TASK_ROW_EXPIRED: {row_key} has a physical expired envelope; \
+                                 task ids are permanent identities and cannot be reused"
+                            ),
+                        )
+                    })?;
+                    let existing_task = decode_task(&row_key, &existing_value)?;
+                    return Err(mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!(
+                            "agent_task {:?} already exists with enqueue_seq={}; use task_update to modify it",
+                            existing_task.task_id, existing_task.enqueue_seq
+                        ),
+                    ));
+                }
+                let next_seq = sequence.value.checked_add(1).ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "AGENT_TASK_SEQUENCE_EXHAUSTED: {TASK_SEQUENCE_KEY} is u64::MAX; no \
+                             unique FIFO sequence remains"
+                        ),
+                    )
+                })?;
+                let task = AgentTask {
+                    schema_version: TASK_SCHEMA_VERSION,
+                    task_id: params.task_id.clone(),
+                    state: TaskState::Todo,
+                    title: params.title.clone(),
+                    description: params.description.clone(),
+                    acceptance: params.acceptance.clone(),
+                    priority: params.priority,
+                    template_id: params.template_id.clone(),
+                    template_params: params.template_params.clone(),
+                    enqueue_seq: next_seq,
+                    attempts: Vec::new(),
+                    review_reason: None,
+                    created_unix_ms: now,
+                    updated_unix_ms: now,
+                };
+                let encoded_task = encode_task(&task)?;
+                let encoded_sequence = next_seq.to_string().into_bytes();
+                let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+                    cf::CF_KV,
+                    [
+                        RevisionGuard::new(
+                            TASK_SEQUENCE_KEY.as_bytes(),
+                            Some(sequence.revision_sha256),
+                        ),
+                        RevisionGuard::new(row_key.as_bytes(), None),
+                    ],
+                    std::iter::empty::<Vec<u8>>(),
+                    [
+                        (
+                            TASK_SEQUENCE_KEY.as_bytes().to_vec(),
+                            encoded_sequence.clone(),
+                        ),
+                        (row_key.as_bytes().to_vec(), encoded_task.clone()),
+                    ],
+                );
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let stored_task = db.get_cf(cf::CF_KV, row_key.as_bytes()).map_err(
+                            |read_error| {
+                                mcp_error(
+                                    read_error.code(),
+                                    format!(
+                                        "AGENT_TASK_CREATE_COMMIT_AMBIGUOUS: guarded create for \
+                                         {row_key} failed ({error}) and exact item readback also \
+                                         failed ({read_error}); inspect {TASK_SEQUENCE_KEY} and \
+                                         {row_key} before retrying"
+                                    ),
+                                )
+                            },
+                        )?;
+                        let stored_sequence = Self::read_enqueue_seq_watermark_revisioned(&db)?;
+                        if let (Some(stored_task), Some(stored_sequence)) =
+                            (stored_task, stored_sequence)
+                        {
+                            let decoded = decode_task(&row_key, &stored_task)?;
+                            if stored_task == encoded_task
+                                && decoded.task_id == task.task_id
+                                && decoded.enqueue_seq == next_seq
+                                && stored_sequence.value >= next_seq
+                            {
+                                tracing::warn!(
+                                    code = "AGENT_TASK_CREATE_AMBIGUOUS_COMMIT_RECONCILED",
+                                    task_id = %task.task_id,
+                                    enqueue_seq = next_seq,
+                                    watermark_after = stored_sequence.value,
+                                    exact_bytes_match = stored_task == encoded_task,
+                                    "separate physical item/watermark readback proved the guarded create committed"
+                                );
+                                break 'create (
+                                    task,
+                                    TaskRowReadback {
+                                        cf_name: cf::CF_KV.to_owned(),
+                                        row_key,
+                                        value_len_bytes: encoded_task.len() as u64,
+                                    },
+                                );
+                            }
+                        }
+                        return Err(mcp_error(
+                            error.code(),
+                            format!(
+                                "AGENT_TASK_CREATE_NOT_COMMITTED: guarded create for {row_key} \
+                                 failed: {error}; separate item/watermark readback did not prove \
+                                 this create committed, so no stale sequence retry was attempted"
+                            ),
+                        ));
+                    }
+                };
+                if !outcome.applied {
+                    tracing::warn!(
+                        code = "AGENT_TASK_CREATE_REVISION_CONFLICT",
+                        task_id = %task.task_id,
+                        retry,
+                        conflict_guard_index = outcome
+                            .conflict
+                            .as_ref()
+                            .map(|conflict| conflict.guard_index),
+                        "guarded task create conflicted; rereading task and watermark before recomputing"
+                    );
+                    continue;
+                }
+                let stored_task = db
+                    .get_cf(cf::CF_KV, row_key.as_bytes())
+                    .map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "AGENT_TASK_CREATE_READBACK_FAILED: committed_seq={} exact task \
+                                 readback for {row_key} failed: {error}",
+                                outcome.committed_seq
+                            ),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            format!(
+                                "AGENT_TASK_CREATE_READBACK_MISSING: committed_seq={} but task row \
+                                 {row_key} is physically absent",
+                                outcome.committed_seq
+                            ),
+                        )
+                    })?;
+                let decoded = decode_task(&row_key, &stored_task)?;
+                let stored_sequence = Self::read_enqueue_seq_watermark_revisioned(&db)?
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            format!(
+                                "AGENT_TASK_CREATE_WATERMARK_MISSING: committed_seq={} but \
+                                 {TASK_SEQUENCE_KEY} is physically absent",
+                                outcome.committed_seq
+                            ),
+                        )
+                    })?;
+                if decoded.task_id != task.task_id
+                    || decoded.enqueue_seq != next_seq
+                    || stored_sequence.value < next_seq
+                {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "AGENT_TASK_CREATE_READBACK_DRIFT: committed_seq={} expected_task={} \
+                             expected_enqueue_seq={next_seq} actual_task={} actual_enqueue_seq={} \
+                             watermark={}; task creation is disabled",
+                            outcome.committed_seq,
+                            task.task_id,
+                            decoded.task_id,
+                            decoded.enqueue_seq,
+                            stored_sequence.value
+                        ),
+                    ));
+                }
+                break 'create (
+                    task,
+                    TaskRowReadback {
+                        cf_name: cf::CF_KV.to_owned(),
+                        row_key,
+                        value_len_bytes: encoded_task.len() as u64,
+                    },
+                );
+            }
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                error_codes::STORAGE_WRITE_FAILED,
                 format!(
-                    "agent_task {:?} already exists; use task_update to modify it",
+                    "AGENT_TASK_CREATE_CONTENTION: task {:?} could not linearize after \
+                     {TASK_CREATE_MAX_CONFLICT_RETRIES} guarded conflicts",
                     params.task_id
                 ),
             ));
-        }
-        // Strict global FIFO survives terminal-row pruning via a durable
-        // namespace watermark instead of deriving from retained rows.
-        let next_seq = Self::next_enqueue_seq(&db)?;
-        let task = AgentTask {
-            schema_version: TASK_SCHEMA_VERSION,
-            task_id: params.task_id,
-            state: TaskState::Todo,
-            title: params.title,
-            description: params.description,
-            acceptance: params.acceptance,
-            priority: params.priority,
-            template_id: params.template_id,
-            template_params: params.template_params,
-            enqueue_seq: next_seq,
-            attempts: Vec::new(),
-            review_reason: None,
-            created_unix_ms: now,
-            updated_unix_ms: now,
         };
-        let written_row = Self::write_task(&db, &task)?;
         tracing::info!(
             code = "AGENT_TASK_CREATE",
             task_id = %task.task_id,
@@ -1346,6 +1684,136 @@ impl SynapseService {
             scanned_in_progress: scanned,
             flagged_orphans: flagged,
         })
+    }
+
+    pub(crate) fn task_repair_sequence_impl(
+        &self,
+        params: TaskSequenceRepairParams,
+    ) -> Result<TaskSequenceRepairResponse, ErrorData> {
+        if params.reason.trim().is_empty() {
+            return Err(params_error(
+                "task sequence repair requires a non-empty audit reason",
+            ));
+        }
+        validate_text("repair reason", &params.reason, MAX_TEXT_CHARS)?;
+        let db = self.agent_task_db()?;
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            let current = db
+                .get_cf_revisioned(cf::CF_KV, TASK_SEQUENCE_KEY.as_bytes())
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("read raw task sequence state for explicit repair: {error}"),
+                    )
+                })?;
+            let expected_revision = current
+                .as_ref()
+                .map(|revisioned| revisioned.revision_sha256);
+            let previous_decodable_sequence = current
+                .as_ref()
+                .and_then(|revisioned| revisioned.value.as_deref())
+                .and_then(|value| Self::decode_enqueue_seq_watermark(value).ok());
+            if current.is_some()
+                && previous_decodable_sequence.is_none()
+                && params.minimum_last_enqueue_seq == 0
+            {
+                return Err(params_error(
+                    "task sequence repair found an undecodable physical watermark; \
+                     minimum_last_enqueue_seq must be the non-zero last known-good physical \
+                     sequence so repair cannot reuse an unknown allocation",
+                ));
+            }
+            let rows = Self::scan_task_rows(&db)?;
+            let observed_max_task_sequence = rows
+                .iter()
+                .map(|row| row.task.enqueue_seq)
+                .max()
+                .unwrap_or(0);
+            let repaired_sequence = params
+                .minimum_last_enqueue_seq
+                .max(observed_max_task_sequence)
+                .max(previous_decodable_sequence.unwrap_or(0));
+            let encoded = repaired_sequence.to_string().into_bytes();
+            let outcome = db
+                .mutate_batch_if_revisions_pressure_bypass(
+                    cf::CF_KV,
+                    [RevisionGuard::new(
+                        TASK_SEQUENCE_KEY.as_bytes(),
+                        expected_revision,
+                    )],
+                    std::iter::empty::<Vec<u8>>(),
+                    [(TASK_SEQUENCE_KEY.as_bytes().to_vec(), encoded.clone())],
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "TASK_SEQUENCE_REPAIR_COMMIT_FAILED: explicit guarded repair failed: \
+                             {error}; key={TASK_SEQUENCE_KEY} requested_minimum={} \
+                             observed_max={observed_max_task_sequence}",
+                            params.minimum_last_enqueue_seq
+                        ),
+                    )
+                })?;
+            if !outcome.applied {
+                tracing::warn!(
+                    code = "AGENT_TASK_SEQUENCE_REPAIR_CONFLICT",
+                    retry,
+                    "task sequence changed during explicit repair; rereading every repair SoT"
+                );
+                continue;
+            }
+            let readback = Self::read_enqueue_seq_watermark_revisioned(&db)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "TASK_SEQUENCE_REPAIR_READBACK_MISSING: committed_seq={} key={TASK_SEQUENCE_KEY}",
+                        outcome.committed_seq
+                    ),
+                )
+            })?;
+            if readback.value != repaired_sequence {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "TASK_SEQUENCE_REPAIR_READBACK_DRIFT: committed_seq={} expected={} actual={}",
+                        outcome.committed_seq, repaired_sequence, readback.value
+                    ),
+                ));
+            }
+            tracing::warn!(
+                code = "AGENT_TASK_SEQUENCE_REPAIRED",
+                reason = %params.reason,
+                observed_task_rows = rows.len(),
+                observed_max_task_sequence,
+                previous_decodable_sequence,
+                requested_minimum_sequence = params.minimum_last_enqueue_seq,
+                repaired_sequence,
+                committed_seq = outcome.committed_seq,
+                "explicit guarded task sequence repair completed with separate physical readback"
+            );
+            return Ok(TaskSequenceRepairResponse {
+                ok: true,
+                observed_task_rows: rows.len(),
+                observed_max_task_sequence,
+                previous_decodable_sequence,
+                requested_minimum_sequence: params.minimum_last_enqueue_seq,
+                repaired_sequence,
+                committed_seq: outcome.committed_seq,
+                written_row: TaskRowReadback {
+                    cf_name: cf::CF_KV.to_owned(),
+                    row_key: TASK_SEQUENCE_KEY.to_owned(),
+                    value_len_bytes: encoded.len() as u64,
+                },
+            });
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "TASK_SEQUENCE_REPAIR_CONTENTION: guarded repair conflicted \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} times"
+            ),
+        ))
     }
 
     fn record_failed_attempt_internal(

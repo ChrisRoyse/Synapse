@@ -457,25 +457,14 @@ fn load_state_row_with_raw(
 ) -> Result<Option<RoutineStateRawRow>, ErrorData> {
     let key =
         routine_codec::routine_state_key(routine_id).map_err(|error| invalid(error.to_string()))?;
-    let rows = db
-        .scan_cf_prefix(cf::CF_ROUTINE_STATE, &key)
+    let value = db
+        .get_cf(cf::CF_ROUTINE_STATE, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let Some((row_key, value)) = rows.first() else {
+    let Some(value) = value else {
         return Ok(None);
     };
-    if rows.len() > 1 || row_key != &key {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "ROUTINE_STATE_KEY_COLLISION in CF_ROUTINE_STATE: prefix lookup for \
-                 {routine_id} returned {} rows, first key {}",
-                rows.len(),
-                hex_encode(row_key)
-            ),
-        ));
-    }
-    let record = decode_state_row(row_key, value)?;
-    Ok(Some((row_key.clone(), value.clone(), record)))
+    let record = decode_state_row(&key, &value)?;
+    Ok(Some((key, value, record)))
 }
 
 /// Point lookup of one `CF_ROUTINES` row by routine id.
@@ -484,24 +473,13 @@ pub(crate) fn load_routine_record(
     routine_id: &str,
 ) -> Result<Option<RoutineRecord>, ErrorData> {
     let key = routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
-    let rows = db
-        .scan_cf_prefix(cf::CF_ROUTINES, &key)
+    let value = db
+        .get_cf(cf::CF_ROUTINES, &key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let Some((row_key, value)) = rows.first() else {
+    let Some(value) = value else {
         return Ok(None);
     };
-    if rows.len() > 1 || row_key != &key {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "ROUTINE_KEY_COLLISION in CF_ROUTINES: prefix lookup for {routine_id} \
-                 returned {} rows, first key {}",
-                rows.len(),
-                hex_encode(row_key)
-            ),
-        ));
-    }
-    decode_routine_record_row(row_key, value).map(Some)
+    decode_routine_record_row(&key, &value).map(Some)
 }
 
 /// Decodes one `CF_ROUTINES` row (key + JSON value) into a [`RoutineRecord`].

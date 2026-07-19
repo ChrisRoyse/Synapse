@@ -434,21 +434,15 @@ impl SynapseService {
     /// Reads the stored row for a template id, if any.
     fn read_template(db: &Db, template_id: &str) -> Result<Option<SpawnTemplate>, ErrorData> {
         let key = template_key(template_id);
-        let rows = db
-            .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("agent_template failed to read template {key}: {error}"),
-                )
-            })?;
-        for (raw_key, raw_value) in rows {
-            // scan_cf_prefix is a prefix scan; only the exact key is this row.
-            if raw_key == key.as_bytes() {
-                return Ok(Some(decode_template(&key, &raw_value)?));
-            }
-        }
-        Ok(None)
+        let value = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("agent_template failed to read template {key}: {error}"),
+            )
+        })?;
+        value
+            .map(|raw_value| decode_template(&key, &raw_value))
+            .transpose()
     }
 
     fn agent_template_put_impl(

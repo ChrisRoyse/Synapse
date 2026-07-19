@@ -8,7 +8,14 @@ pub const DEFAULT_BASE_PAGE_INDEX_PAGE_SIZE: usize = 1024;
 pub(super) const INDEX_MAGIC: &str = "calyx.base_page_index";
 pub(super) const LEGACY_INDEX_VERSION: u32 = 1;
 pub(super) const GENERATION_INDEX_VERSION: u32 = 2;
-pub(super) const INDEX_VERSION: u32 = 3;
+/// Version 3 bound read-time freshness to the global ledger head, so any
+/// Answer/Guard/Assay-only append falsely staled a byte-identical Base index.
+/// It remains structurally decodable but is rejected at read time until the
+/// index is rebuilt into the current version.
+pub(super) const PRIOR_INDEX_VERSION: u32 = 3;
+/// Version 4 binds freshness to a content-derived Base-source digest over the
+/// ordered Base SST identity set plus the Base WAL-row tail.
+pub(super) const INDEX_VERSION: u32 = 4;
 pub(super) const MISSING_CODE: &str = "CALYX_BASE_PAGE_INDEX_MISSING";
 pub(super) const STALE_CODE: &str = "CALYX_BASE_PAGE_INDEX_STALE";
 pub(super) const CORRUPT_CODE: &str = "CALYX_BASE_PAGE_INDEX_CORRUPT";
@@ -20,6 +27,17 @@ pub struct BasePageIndexManifest {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
+    /// SHA-256 over the ordered Base SST identity set plus the Base WAL-row
+    /// tail after `base_durable_seq`. Pre-v4 manifests decode with an empty
+    /// value and are rejected as stale before this field is consulted.
+    #[serde(default)]
+    pub base_source_digest_hex: String,
+    /// Durable sequence floor used to select the WAL tail. This is retained
+    /// for diagnostics; freshness is gated by `base_source_digest_hex`.
+    #[serde(default)]
+    pub base_durable_seq: u64,
+    /// Informational build-time ledger head. Version 4 does not use the global
+    /// ledger head as its freshness boundary.
     pub ledger_head_height: u64,
     pub ledger_head_tip_hash_hex: String,
     pub page_size: usize,

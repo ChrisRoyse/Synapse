@@ -2117,13 +2117,13 @@ pub(crate) fn read_taint_record_from_db(
     artifact_id: &str,
 ) -> Result<Option<HygieneTaintRecord>, ErrorData> {
     let key = taint_key(artifact_kind, artifact_id);
-    let rows = db.scan_cf_prefix(cf::CF_KV, &key).map_err(|error| {
+    let value = db.get_cf(cf::CF_KV, &key).map_err(|error| {
         mcp_error(
             error.code(),
             format!("HYGIENE_TAINT_READ_FAILED for {artifact_kind}/{artifact_id}: {error}"),
         )
     })?;
-    let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
+    let Some(value) = value else {
         return Ok(None);
     };
     decode_taint_record(artifact_kind, artifact_id, &value).map(Some)

@@ -237,9 +237,8 @@ pub fn load_plan_execution(
     execution_id: &str,
 ) -> Result<Option<PlanExecutionRecord>, ErrorData> {
     let key = plan_execution_key(execution_id);
-    let rows = db.scan_cf_prefix(cf::CF_KV, &key).map_err(storage_error)?;
-    match rows.into_iter().find(|(k, _)| k == &key) {
-        Some((_, value)) => {
+    match db.get_cf(cf::CF_KV, &key).map_err(storage_error)? {
+        Some(value) => {
             let record: PlanExecutionRecord = decode_json(&value).map_err(|error| {
                 mcp_error(
                     error_codes::STORAGE_CORRUPTED,

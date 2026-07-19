@@ -116,6 +116,32 @@ pub struct SynapseCalyxMultiConditionalWriteOutcome {
     pub conflict: Option<SynapseCalyxConditionalWriteConflict>,
 }
 
+/// Structured failure from a guarded Calyx write.
+///
+/// `committed_seq` is present only when Calyx proved that the operation crossed
+/// its irreversible commit boundary before the reported failure. Callers must
+/// reconcile that exact sequence and must not infer it from a later global tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynapseCalyxConditionalWriteError {
+    pub source: SynapseCalyxError,
+    pub committed_seq: Option<Seq>,
+}
+
+impl std::fmt::Display for SynapseCalyxConditionalWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.committed_seq {
+            Some(seq) => write!(formatter, "{}; committed_seq={seq}", self.source),
+            None => self.source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SynapseCalyxConditionalWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl From<calyx_aster::vault::MultiConditionalCfWriteOutcome>
     for SynapseCalyxMultiConditionalWriteOutcome
 {
@@ -1695,7 +1721,8 @@ impl SynapseCalyxVault {
     /// matches.
     ///
     /// Guards must be non-empty and unique, every guard key must be non-empty,
-    /// and every guarded `(cf, key)` must occur exactly once in `rows`.
+    /// and every guarded `(cf, key)` may occur at most once in `rows`. A guard
+    /// without a matching row is an atomic read-only precondition.
     /// Comparison and the single WAL/MVCC commit share Aster's process and
     /// cross-process commit boundary. A conflict is a non-mutating outcome.
     ///
@@ -1708,18 +1735,19 @@ impl SynapseCalyxVault {
         &self,
         guards: Vec<SynapseCalyxRevisionGuard>,
         rows: Vec<SynapseCalyxCfWrite>,
-    ) -> Result<SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxError> {
+    ) -> Result<SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxConditionalWriteError> {
         self.vault
             .write_cf_batch_if_revisions(
                 guards.into_iter().map(Into::into),
                 rows.into_iter().map(|row| (row.cf, row.key, row.value)),
             )
             .map(SynapseCalyxMultiConditionalWriteOutcome::from)
-            .map_err(|error| {
-                SynapseCalyxError::from_calyx(
+            .map_err(|error| SynapseCalyxConditionalWriteError {
+                committed_seq: error.committed_seq,
+                source: SynapseCalyxError::from_calyx(
                     "write multi-key revision-guarded Calyx CF batch",
-                    &error,
-                )
+                    &error.source,
+                ),
             })
     }
 

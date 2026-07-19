@@ -321,20 +321,17 @@ pub struct ExclusionUpdate {
 }
 
 fn load_persisted(db: &Db) -> Result<PersistedControlState> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, TIMELINE_CONTROL_KEY)
+    let value = db
+        .get_cf(cf::CF_KV, TIMELINE_CONTROL_KEY)
         .context("read timeline control row from CF_KV")?;
-    let Some((key, value)) = rows
-        .into_iter()
-        .find(|(key, _value)| key.as_slice() == TIMELINE_CONTROL_KEY)
-    else {
+    let Some(value) = value else {
         return Ok(PersistedControlState::initial());
     };
     let state: PersistedControlState = serde_json::from_slice(&value).with_context(|| {
         format!(
             "decode timeline control row (CF_KV key {:?}); the row is corrupt — \
              inspect and delete it to reset recorder controls",
-            String::from_utf8_lossy(&key)
+            String::from_utf8_lossy(TIMELINE_CONTROL_KEY)
         )
     })?;
     if state.version != TIMELINE_CONTROL_VERSION {

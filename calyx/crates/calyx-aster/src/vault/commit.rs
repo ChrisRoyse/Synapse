@@ -174,8 +174,31 @@ where
         let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
         let mut all_rows = rows.to_vec();
         all_rows.push(encode::WriteRow { cf, key, value });
-        let committed = self.commit_prepared_rows(&all_rows)?;
+        let committed = match self.commit_prepared_rows(&all_rows) {
+            Ok(committed) => committed,
+            Err(error) => {
+                // A non-durable vault can publish the authoritative MVCC row
+                // table and then fail its router projection. Under this
+                // exclusive commit boundary, observing exactly the predicted
+                // new MVCC sequence proves this operation applied. Preserve a
+                // lower layer's durable marker when one already exists.
+                if self.rows.current_seq() == predicted {
+                    let _ = self.post_commit_error_seq.compare_exchange(
+                        0,
+                        predicted,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                }
+                return Err(error);
+            }
+        };
         if committed != predicted {
+            // The batch crossed the irreversible commit boundary even though
+            // the time-index invariant failed. Preserve that exact sequence
+            // for guarded callers just like every other post-commit failure.
+            self.post_commit_error_seq
+                .store(committed, std::sync::atomic::Ordering::Release);
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "time-index seqno prediction {predicted} diverged from committed seq {committed}"
             )));
@@ -223,6 +246,12 @@ where
         match publish {
             Ok(seq) => Ok(seq),
             Err(post_wal_error) => {
+                // Preserve the exact irreversible sequence as typed state for
+                // the outer guarded-write API. It consumes this marker before
+                // releasing the durable commit lock, so another writer cannot
+                // overwrite or misattribute the outcome.
+                self.post_commit_error_seq
+                    .store(durable_seq, std::sync::atomic::Ordering::Release);
                 let restore = self.restore_committed_rows(durable_seq, rows);
                 let head_repair = head_anchor.as_ref().map_or(Ok(()), |anchor| {
                     crate::ledger_head::write_head_anchor(durable.root(), anchor)

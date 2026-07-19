@@ -215,6 +215,9 @@ pub const NOTIFY_DISABLED_BY_MANIFEST: &str = "NOTIFY_DISABLED_BY_MANIFEST";
 pub const NOTIFY_XML_PAYLOAD_INVALID: &str = "NOTIFY_XML_PAYLOAD_INVALID";
 pub const NOTIFY_SHOW_FAILED: &str = "NOTIFY_SHOW_FAILED";
 pub const NOTIFY_DELIVERY_UNVERIFIED: &str = "NOTIFY_DELIVERY_UNVERIFIED";
+/// A deadline-gated notification was still queued when its authority expired;
+/// no platform Show call was made.
+pub const NOTIFY_DELIVERY_EXPIRED: &str = "NOTIFY_DELIVERY_EXPIRED";
 pub const NOTIFY_WORKER_FAILED: &str = "NOTIFY_WORKER_FAILED";
 
 // === Safety (06 section 8.9) ===

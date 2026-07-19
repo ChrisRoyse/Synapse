@@ -40,7 +40,7 @@
 //! never silent loss.
 
 use std::{
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -58,10 +58,8 @@ use synapse_core::{
     TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::{
-    Db,
-    agent_transcripts::{
-        agent_transcript_key, agent_transcript_spawn_prefix, agent_transcript_ts_index_key,
-    },
+    CfRevisionGuard, Db,
+    agent_transcripts::{agent_transcript_key, agent_transcript_ts_index_key},
     cf, decode_json, encode_json,
 };
 use tokio_util::sync::CancellationToken;
@@ -93,6 +91,704 @@ const STABLE_TS_SPAN_MS: u64 = 20 * 365 * 24 * 60 * 60 * 1_000;
 /// rows far below this; exceeding it means an ingester bug, surfaced as a
 /// sticky error for the spawn.
 pub(crate) const MAX_AGENT_TRANSCRIPT_VALUE_BYTES: usize = 32 * 1024;
+
+/// Maximum bytes in one logical JSONL record, excluding CR/LF terminators.
+/// A missing delimiter can therefore never grow the ingester's memory without
+/// bound. Ten MiB matches the established production log-harvester ceiling
+/// while leaving ample room for CLI tool-result envelopes that normalize into
+/// the much smaller durable row above.
+pub(crate) const MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The source/index mutation for one chunk is at most 64 * 32 KiB of durable
+/// values plus small deterministic keys and retention envelopes. This remains
+/// a small fraction of Calyx's 64 MiB WAL-record ceiling; the storage layer
+/// independently rejects the mutation if that physical invariant ever drifts.
+pub(crate) const MAX_AGENT_TRANSCRIPT_COMMIT_ROWS: usize = 64;
+const MAX_AGENT_TRANSCRIPT_ROWS_PER_PASS: usize = 4 * MAX_AGENT_TRANSCRIPT_COMMIT_ROWS;
+const MAX_AGENT_TRANSCRIPT_SOURCE_BYTES_PER_PASS: u64 = 32 * 1024 * 1024;
+const AGENT_TRANSCRIPT_READ_BUFFER_BYTES: usize = 64 * 1024;
+const AGENT_TRANSCRIPT_SOURCE_FINGERPRINT_BYTES: u64 = 64 * 1024;
+const AGENT_TRANSCRIPT_SOURCE_BOUNDARY_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug)]
+pub(super) struct PreparedTranscriptRow {
+    pub source_key: Vec<u8>,
+    pub encoded: Vec<u8>,
+    pub ts_index_key: Vec<u8>,
+    pub record: AgentTranscriptRecord,
+    pub source_offset_bytes: u64,
+    pub consumed_bytes: u64,
+}
+
+#[derive(Debug)]
+pub(super) struct TranscriptSourceFingerprint {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug)]
+pub(super) struct TranscriptSourceBoundary {
+    pub start_offset_bytes: u64,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+pub(super) struct TranscriptSourceBoundaryState<'a> {
+    pub cursor_offset_bytes: u64,
+    pub lines_ingested: u64,
+    pub start_offset_bytes: &'a mut Option<u64>,
+    pub bytes: &'a mut Option<u64>,
+    pub sha256: &'a mut Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) enum BoundedTailRead {
+    Line {
+        bytes: Vec<u8>,
+        consumed_bytes: u64,
+        source_offset_bytes: u64,
+    },
+    SnapshotEof,
+    IncompleteTail {
+        source_offset_bytes: u64,
+        buffered_bytes: usize,
+    },
+    Cancelled,
+}
+
+/// A reader bounded to the file length observed before the pass. Appends after
+/// that snapshot are deliberately left for the next pass; truncation during a
+/// read is surfaced instead of being mistaken for a clean EOF.
+pub(super) struct BoundedTranscriptTailReader {
+    reader: BufReader<std::io::Take<std::fs::File>>,
+    source_path: PathBuf,
+    next_offset_bytes: u64,
+    code_prefix: &'static str,
+}
+
+impl BoundedTranscriptTailReader {
+    pub(super) fn open(
+        source_path: &Path,
+        offset_bytes: u64,
+        snapshot_size_bytes: u64,
+        code_prefix: &'static str,
+    ) -> Result<Self, String> {
+        let remaining = snapshot_size_bytes.checked_sub(offset_bytes).ok_or_else(|| {
+            format!(
+                "{code_prefix}_SOURCE_TRUNCATED: path={} offset_bytes={offset_bytes} snapshot_size_bytes={snapshot_size_bytes}; remediation=restore the original append-only source or clear the cursor only after reconciling its durable transcript rows",
+                source_path.display()
+            )
+        })?;
+        let mut file = std::fs::File::open(source_path).map_err(|error| {
+            format!(
+                "{code_prefix}_SOURCE_OPEN_FAILED: path={} offset_bytes={offset_bytes}: {error}; remediation=restore read access to the exact source file and retry without changing the cursor",
+                source_path.display()
+            )
+        })?;
+        file.seek(SeekFrom::Start(offset_bytes)).map_err(|error| {
+            format!(
+                "{code_prefix}_SOURCE_SEEK_FAILED: path={} offset_bytes={offset_bytes}: {error}; remediation=repair the source filesystem/file handle and retry from the persisted cursor",
+                source_path.display()
+            )
+        })?;
+        Ok(Self {
+            reader: BufReader::with_capacity(
+                AGENT_TRANSCRIPT_READ_BUFFER_BYTES,
+                file.take(remaining),
+            ),
+            source_path: source_path.to_path_buf(),
+            next_offset_bytes: offset_bytes,
+            code_prefix,
+        })
+    }
+
+    pub(super) fn next_line(
+        &mut self,
+        finalize: bool,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<BoundedTailRead, String> {
+        let source_offset_bytes = self.next_offset_bytes;
+        let mut line = Vec::with_capacity(AGENT_TRANSCRIPT_READ_BUFFER_BYTES);
+        loop {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(BoundedTailRead::Cancelled);
+            }
+
+            let available = self.reader.fill_buf().map_err(|error| {
+                format!(
+                    "{}_SOURCE_READ_FAILED: path={} offset_bytes={}: {error}; remediation=repair source read access and retry from the persisted cursor",
+                    self.code_prefix,
+                    self.source_path.display(),
+                    self.next_offset_bytes
+                )
+            })?;
+            if available.is_empty() {
+                if self.reader.get_ref().limit() != 0 {
+                    return Err(format!(
+                        "{}_SOURCE_CHANGED_DURING_READ: path={} line_start_offset_bytes={source_offset_bytes} unread_snapshot_bytes={}; remediation=stop replacing/truncating the append-only source and restore bytes matching the persisted cursor",
+                        self.code_prefix,
+                        self.source_path.display(),
+                        self.reader.get_ref().limit()
+                    ));
+                }
+                if line.is_empty() {
+                    return Ok(BoundedTailRead::SnapshotEof);
+                }
+                if !finalize {
+                    return Ok(BoundedTailRead::IncompleteTail {
+                        source_offset_bytes,
+                        buffered_bytes: line.len(),
+                    });
+                }
+                if line.len() > MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES {
+                    return Err(self.oversized_detail(source_offset_bytes, line.len()));
+                }
+                return Ok(BoundedTailRead::Line {
+                    consumed_bytes: u64::try_from(line.len()).unwrap_or(u64::MAX),
+                    source_offset_bytes,
+                    bytes: line,
+                });
+            }
+
+            let newline_at = available.iter().position(|byte| *byte == b'\n');
+            let take = newline_at.map_or(available.len(), |index| index + 1);
+            line.extend_from_slice(&available[..take]);
+            self.reader.consume(take);
+            self.next_offset_bytes = self
+                .next_offset_bytes
+                .checked_add(u64::try_from(take).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    format!(
+                        "{}_SOURCE_OFFSET_OVERFLOW: path={} line_start_offset_bytes={source_offset_bytes}; remediation=quarantine the impossible-size source and reconcile the cursor",
+                        self.code_prefix,
+                        self.source_path.display()
+                    )
+                })?;
+
+            if newline_at.is_some() {
+                let consumed_bytes = u64::try_from(line.len()).unwrap_or(u64::MAX);
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if line.len() > MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES {
+                    return Err(self.oversized_detail(source_offset_bytes, line.len()));
+                }
+                return Ok(BoundedTailRead::Line {
+                    bytes: line,
+                    consumed_bytes,
+                    source_offset_bytes,
+                });
+            }
+
+            let over_limit = line.len() > MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES
+                && !(line.len() == MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES + 1
+                    && line.last() == Some(&b'\r'));
+            if over_limit {
+                return Err(self.oversized_detail(source_offset_bytes, line.len()));
+            }
+        }
+    }
+
+    fn oversized_detail(&self, source_offset_bytes: u64, observed_bytes: usize) -> String {
+        format!(
+            "{}_SOURCE_RECORD_OVERSIZED: path={} line_start_offset_bytes={source_offset_bytes} observed_bytes={observed_bytes} max_line_bytes={MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES}; remediation=fix or rotate the producer output without skipping/truncating this record, then clear the sticky cursor only after reconciling the source bytes",
+            self.code_prefix,
+            self.source_path.display()
+        )
+    }
+}
+
+pub(super) fn read_transcript_source_fingerprint(
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    expected_bytes: Option<u64>,
+    code_prefix: &'static str,
+) -> Result<TranscriptSourceFingerprint, String> {
+    let bytes = expected_bytes
+        .unwrap_or_else(|| snapshot_size_bytes.min(AGENT_TRANSCRIPT_SOURCE_FINGERPRINT_BYTES));
+    if bytes == 0 || bytes > AGENT_TRANSCRIPT_SOURCE_FINGERPRINT_BYTES {
+        return Err(format!(
+            "{code_prefix}_SOURCE_FINGERPRINT_LENGTH_INVALID: path={} fingerprint_bytes={bytes} max_fingerprint_bytes={AGENT_TRANSCRIPT_SOURCE_FINGERPRINT_BYTES}; remediation=repair the corrupt cursor fingerprint from the source/transcript SoTs",
+            source_path.display()
+        ));
+    }
+    if snapshot_size_bytes < bytes {
+        return Err(format!(
+            "{code_prefix}_SOURCE_FINGERPRINT_TRUNCATED: path={} snapshot_size_bytes={snapshot_size_bytes} fingerprint_bytes={bytes}; remediation=restore the original append-only source bytes before clearing the cursor",
+            source_path.display()
+        ));
+    }
+    let buffer_len = usize::try_from(bytes).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_FINGERPRINT_LENGTH_INVALID: path={} fingerprint_bytes={bytes}: {error}; remediation=repair the corrupt cursor fingerprint",
+            source_path.display()
+        )
+    })?;
+    let mut file = std::fs::File::open(source_path).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_FINGERPRINT_OPEN_FAILED: path={}: {error}; remediation=restore read access to the exact append-only source",
+            source_path.display()
+        )
+    })?;
+    let mut buffer = vec![0_u8; buffer_len];
+    file.read_exact(&mut buffer).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_FINGERPRINT_READ_FAILED: path={} fingerprint_bytes={bytes}: {error}; remediation=restore the original append-only source bytes/read access",
+            source_path.display()
+        )
+    })?;
+    Ok(TranscriptSourceFingerprint {
+        bytes,
+        sha256: sha256_hex(&buffer),
+    })
+}
+
+pub(super) fn ensure_transcript_source_fingerprint(
+    db: &Db,
+    source_id: &str,
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    cursor_offset_bytes: u64,
+    fingerprint_bytes: &mut Option<u64>,
+    fingerprint_sha256: &mut Option<String>,
+    code_prefix: &'static str,
+) -> Result<bool, String> {
+    match (*fingerprint_bytes, fingerprint_sha256.as_deref()) {
+        (Some(bytes), Some(expected_sha256)) => {
+            if !is_lower_sha256(expected_sha256) {
+                return Err(format!(
+                    "{code_prefix}_SOURCE_FINGERPRINT_INVALID: source_id={source_id} path={} fingerprint_bytes={bytes} fingerprint_sha256={expected_sha256:?}; remediation=repair the corrupt cursor fingerprint from the source/transcript SoTs",
+                    source_path.display()
+                ));
+            }
+            let actual = read_transcript_source_fingerprint(
+                source_path,
+                snapshot_size_bytes,
+                Some(bytes),
+                code_prefix,
+            )?;
+            if actual.sha256 != expected_sha256 {
+                return Err(format!(
+                    "{code_prefix}_SOURCE_IDENTITY_MISMATCH: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} fingerprint_bytes={bytes} expected_sha256={expected_sha256} actual_sha256={}; remediation=restore the original append-only source or reconcile every durable transcript row before rebuilding the cursor",
+                    source_path.display(),
+                    actual.sha256
+                ));
+            }
+            Ok(false)
+        }
+        (None, None) if cursor_offset_bytes == 0 => Ok(false),
+        (None, None) => {
+            // Legacy cursors predate the persisted fingerprint. Establish one
+            // only after the first physical source line exactly matches the
+            // deterministic row already covered by that cursor.
+            let mut reader = BoundedTranscriptTailReader::open(
+                source_path,
+                0,
+                snapshot_size_bytes,
+                code_prefix,
+            )?;
+            let first_line = match reader.next_line(true, None)? {
+                BoundedTailRead::Line { bytes, .. } => bytes,
+                BoundedTailRead::SnapshotEof | BoundedTailRead::IncompleteTail { .. } => {
+                    return Err(format!(
+                        "{code_prefix}_SOURCE_FINGERPRINT_MIGRATION_FAILED: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} source has no first record; remediation=restore the original source before migrating its cursor",
+                        source_path.display()
+                    ));
+                }
+                BoundedTailRead::Cancelled => {
+                    return Err(format!(
+                        "{code_prefix}_SOURCE_FINGERPRINT_MIGRATION_CANCELLED: source_id={source_id} path={}; remediation=retry migration from the unchanged cursor",
+                        source_path.display()
+                    ));
+                }
+            };
+            let first_key = agent_transcript_key(source_id, 1);
+            let first_row = db
+                .get_cf(cf::CF_AGENT_TRANSCRIPTS, &first_key)
+                .map_err(|error| {
+                    format!(
+                        "{code_prefix}_SOURCE_FINGERPRINT_ROW_READ_FAILED: source_id={source_id} path={} key_hex={}: {error}; remediation=repair the first transcript row before migrating the cursor",
+                        source_path.display(),
+                        synapse_storage::constellations::hex_encode(&first_key)
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "{code_prefix}_SOURCE_FINGERPRINT_ROW_MISSING: source_id={source_id} path={} key_hex={}; remediation=restore the first deterministic transcript row before migrating the cursor",
+                        source_path.display(),
+                        synapse_storage::constellations::hex_encode(&first_key)
+                    )
+                })?;
+            let first_record: AgentTranscriptRecord = decode_json(&first_row).map_err(|error| {
+                format!(
+                    "{code_prefix}_SOURCE_FINGERPRINT_ROW_INVALID: source_id={source_id} path={} key_hex={}: {error}; remediation=repair the first transcript row before migrating the cursor",
+                    source_path.display(),
+                    synapse_storage::constellations::hex_encode(&first_key)
+                )
+            })?;
+            let first_sha256 = sha256_hex(&first_line);
+            if first_record.spawn_id != source_id
+                || first_record.line_no != 1
+                || first_record.raw_line_bytes
+                    != u64::try_from(first_line.len()).unwrap_or(u64::MAX)
+                || first_record.raw_line_sha256 != first_sha256
+            {
+                return Err(format!(
+                    "{code_prefix}_SOURCE_FINGERPRINT_ROW_MISMATCH: source_id={source_id} path={} expected_first_line_sha256={} stored_first_line_sha256={} expected_first_line_bytes={} stored_first_line_bytes={}; remediation=restore the original append-only source or reconcile every durable transcript row before rebuilding the cursor",
+                    source_path.display(),
+                    first_sha256,
+                    first_record.raw_line_sha256,
+                    first_line.len(),
+                    first_record.raw_line_bytes
+                ));
+            }
+            let fingerprint = read_transcript_source_fingerprint(
+                source_path,
+                snapshot_size_bytes,
+                None,
+                code_prefix,
+            )?;
+            *fingerprint_bytes = Some(fingerprint.bytes);
+            *fingerprint_sha256 = Some(fingerprint.sha256);
+            Ok(true)
+        }
+        _ => Err(format!(
+            "{code_prefix}_SOURCE_FINGERPRINT_PARTIAL: source_id={source_id} path={} fingerprint_bytes={fingerprint_bytes:?} fingerprint_sha256_present={}; remediation=repair the corrupt cursor fingerprint pair from the source/transcript SoTs",
+            source_path.display(),
+            fingerprint_sha256.is_some()
+        )),
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn read_transcript_source_range(
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    start_offset_bytes: u64,
+    bytes: u64,
+    code_prefix: &'static str,
+    purpose: &'static str,
+) -> Result<Vec<u8>, String> {
+    if bytes == 0 {
+        return Err(format!(
+            "{code_prefix}_SOURCE_{purpose}_LENGTH_INVALID: path={} start_offset_bytes={start_offset_bytes} bytes=0; remediation=repair the corrupt cursor source-boundary state",
+            source_path.display()
+        ));
+    }
+    let end_offset_bytes = start_offset_bytes.checked_add(bytes).ok_or_else(|| {
+        format!(
+            "{code_prefix}_SOURCE_{purpose}_OFFSET_OVERFLOW: path={} start_offset_bytes={start_offset_bytes} bytes={bytes}; remediation=repair the corrupt cursor source-boundary state",
+            source_path.display()
+        )
+    })?;
+    if end_offset_bytes > snapshot_size_bytes {
+        return Err(format!(
+            "{code_prefix}_SOURCE_{purpose}_TRUNCATED: path={} snapshot_size_bytes={snapshot_size_bytes} start_offset_bytes={start_offset_bytes} bytes={bytes}; remediation=restore the original append-only source bytes before clearing the cursor",
+            source_path.display()
+        ));
+    }
+    let buffer_len = usize::try_from(bytes).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_{purpose}_LENGTH_INVALID: path={} bytes={bytes}: {error}; remediation=repair the corrupt cursor source-boundary state",
+            source_path.display()
+        )
+    })?;
+    let mut file = std::fs::File::open(source_path).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_{purpose}_OPEN_FAILED: path={} start_offset_bytes={start_offset_bytes}: {error}; remediation=restore read access to the exact append-only source",
+            source_path.display()
+        )
+    })?;
+    file.seek(SeekFrom::Start(start_offset_bytes))
+        .map_err(|error| {
+            format!(
+                "{code_prefix}_SOURCE_{purpose}_SEEK_FAILED: path={} start_offset_bytes={start_offset_bytes}: {error}; remediation=repair the source filesystem/file handle and retry from the persisted cursor",
+                source_path.display()
+            )
+        })?;
+    let mut buffer = vec![0_u8; buffer_len];
+    file.read_exact(&mut buffer).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_{purpose}_READ_FAILED: path={} start_offset_bytes={start_offset_bytes} bytes={bytes}: {error}; remediation=restore the original append-only source bytes/read access",
+            source_path.display()
+        )
+    })?;
+    Ok(buffer)
+}
+
+fn read_transcript_source_boundary(
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    cursor_offset_bytes: u64,
+    code_prefix: &'static str,
+) -> Result<TranscriptSourceBoundary, String> {
+    if cursor_offset_bytes == 0 {
+        return Err(format!(
+            "{code_prefix}_SOURCE_BOUNDARY_OFFSET_INVALID: path={} cursor_offset_bytes=0; remediation=repair the corrupt non-empty cursor boundary state",
+            source_path.display()
+        ));
+    }
+    let bytes = cursor_offset_bytes.min(AGENT_TRANSCRIPT_SOURCE_BOUNDARY_BYTES);
+    let start_offset_bytes = cursor_offset_bytes.checked_sub(bytes).ok_or_else(|| {
+        format!(
+            "{code_prefix}_SOURCE_BOUNDARY_OFFSET_OVERFLOW: path={} cursor_offset_bytes={cursor_offset_bytes} bytes={bytes}; remediation=repair the corrupt cursor boundary state",
+            source_path.display()
+        )
+    })?;
+    let buffer = read_transcript_source_range(
+        source_path,
+        snapshot_size_bytes,
+        start_offset_bytes,
+        bytes,
+        code_prefix,
+        "BOUNDARY",
+    )?;
+    Ok(TranscriptSourceBoundary {
+        start_offset_bytes,
+        bytes,
+        sha256: sha256_hex(&buffer),
+    })
+}
+
+fn last_logical_line_before_cursor(
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    cursor_offset_bytes: u64,
+    code_prefix: &'static str,
+) -> Result<Vec<u8>, String> {
+    let max_window_bytes = u64::try_from(MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(2);
+    let bytes = cursor_offset_bytes.min(max_window_bytes);
+    let start_offset_bytes = cursor_offset_bytes.checked_sub(bytes).ok_or_else(|| {
+        format!(
+            "{code_prefix}_SOURCE_BOUNDARY_OFFSET_OVERFLOW: path={} cursor_offset_bytes={cursor_offset_bytes} bytes={bytes}; remediation=repair the corrupt legacy cursor",
+            source_path.display()
+        )
+    })?;
+    let buffer = read_transcript_source_range(
+        source_path,
+        snapshot_size_bytes,
+        start_offset_bytes,
+        bytes,
+        code_prefix,
+        "BOUNDARY_MIGRATION",
+    )?;
+    let mut end = buffer.len();
+    if buffer.get(end.wrapping_sub(1)) == Some(&b'\n') {
+        end -= 1;
+        if buffer.get(end.wrapping_sub(1)) == Some(&b'\r') {
+            end -= 1;
+        }
+    }
+    let start = buffer[..end]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let line = buffer[start..end].to_vec();
+    if line.len() > MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES {
+        return Err(format!(
+            "{code_prefix}_SOURCE_BOUNDARY_MIGRATION_RECORD_OVERSIZED: path={} cursor_offset_bytes={cursor_offset_bytes} observed_bytes={} max_line_bytes={MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES}; remediation=restore the original bounded source record before migrating the cursor",
+            source_path.display(),
+            line.len()
+        ));
+    }
+    Ok(line)
+}
+
+fn verify_legacy_boundary_row(
+    db: &Db,
+    source_id: &str,
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    cursor_offset_bytes: u64,
+    lines_ingested: u64,
+    code_prefix: &'static str,
+) -> Result<(), String> {
+    if lines_ingested == 0 {
+        return Err(format!(
+            "{code_prefix}_SOURCE_BOUNDARY_MIGRATION_COUNTER_INVALID: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} lines_ingested=0; remediation=repair the corrupt cursor from the physical source/transcript SoTs",
+            source_path.display()
+        ));
+    }
+    let line = last_logical_line_before_cursor(
+        source_path,
+        snapshot_size_bytes,
+        cursor_offset_bytes,
+        code_prefix,
+    )?;
+    let key = agent_transcript_key(source_id, lines_ingested);
+    let encoded = db
+        .get_cf(cf::CF_AGENT_TRANSCRIPTS, &key)
+        .map_err(|error| {
+            format!(
+                "{code_prefix}_SOURCE_BOUNDARY_MIGRATION_ROW_READ_FAILED: source_id={source_id} path={} line_no={lines_ingested} key_hex={}: {error}; remediation=repair the last cursor-covered transcript row before migrating the boundary",
+                source_path.display(),
+                synapse_storage::constellations::hex_encode(&key)
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "{code_prefix}_SOURCE_BOUNDARY_MIGRATION_ROW_MISSING: source_id={source_id} path={} line_no={lines_ingested} key_hex={}; remediation=restore the last cursor-covered transcript row before migrating the boundary",
+                source_path.display(),
+                synapse_storage::constellations::hex_encode(&key)
+            )
+        })?;
+    let record: AgentTranscriptRecord = decode_json(&encoded).map_err(|error| {
+        format!(
+            "{code_prefix}_SOURCE_BOUNDARY_MIGRATION_ROW_INVALID: source_id={source_id} path={} line_no={lines_ingested} key_hex={}: {error}; remediation=repair the corrupt transcript row before migrating the boundary",
+            source_path.display(),
+            synapse_storage::constellations::hex_encode(&key)
+        )
+    })?;
+    let line_sha256 = sha256_hex(&line);
+    if record.spawn_id != source_id
+        || record.line_no != lines_ingested
+        || record.raw_line_bytes != u64::try_from(line.len()).unwrap_or(u64::MAX)
+        || record.raw_line_sha256 != line_sha256
+    {
+        return Err(format!(
+            "{code_prefix}_SOURCE_BOUNDARY_MIGRATION_ROW_MISMATCH: source_id={source_id} path={} line_no={lines_ingested} cursor_offset_bytes={cursor_offset_bytes} expected_line_sha256={line_sha256} stored_line_sha256={} expected_line_bytes={} stored_line_bytes={}; remediation=restore the original append-only source or reconcile every durable transcript row before rebuilding the cursor",
+            source_path.display(),
+            record.raw_line_sha256,
+            line.len(),
+            record.raw_line_bytes
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_transcript_source_boundary(
+    db: &Db,
+    source_id: &str,
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    state: TranscriptSourceBoundaryState<'_>,
+    code_prefix: &'static str,
+) -> Result<bool, String> {
+    let TranscriptSourceBoundaryState {
+        cursor_offset_bytes,
+        lines_ingested,
+        start_offset_bytes: boundary_start_offset_bytes,
+        bytes: boundary_bytes,
+        sha256: boundary_sha256,
+    } = state;
+    if cursor_offset_bytes == 0 {
+        if lines_ingested != 0
+            || boundary_start_offset_bytes.is_some()
+            || boundary_bytes.is_some()
+            || boundary_sha256.is_some()
+        {
+            return Err(format!(
+                "{code_prefix}_SOURCE_BOUNDARY_ZERO_OFFSET_INVALID: source_id={source_id} path={} lines_ingested={lines_ingested} boundary_start_offset_bytes={boundary_start_offset_bytes:?} boundary_bytes={boundary_bytes:?} boundary_sha256_present={}; remediation=repair the corrupt cursor from the physical source/transcript SoTs",
+                source_path.display(),
+                boundary_sha256.is_some()
+            ));
+        }
+        return Ok(false);
+    }
+    if lines_ingested == 0 {
+        return Err(format!(
+            "{code_prefix}_SOURCE_BOUNDARY_COUNTER_INVALID: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} lines_ingested=0; remediation=repair the corrupt cursor from the physical source/transcript SoTs",
+            source_path.display()
+        ));
+    }
+
+    match (
+        *boundary_start_offset_bytes,
+        *boundary_bytes,
+        boundary_sha256.as_deref(),
+    ) {
+        (Some(stored_start), Some(stored_bytes), Some(stored_sha256)) => {
+            let actual = read_transcript_source_boundary(
+                source_path,
+                snapshot_size_bytes,
+                cursor_offset_bytes,
+                code_prefix,
+            )?;
+            if stored_start != actual.start_offset_bytes
+                || stored_bytes != actual.bytes
+                || !is_lower_sha256(stored_sha256)
+            {
+                return Err(format!(
+                    "{code_prefix}_SOURCE_BOUNDARY_INVALID: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} stored_start_offset_bytes={stored_start} expected_start_offset_bytes={} stored_bytes={stored_bytes} expected_bytes={} stored_sha256={stored_sha256:?}; remediation=repair the corrupt cursor boundary from the physical source/transcript SoTs",
+                    source_path.display(),
+                    actual.start_offset_bytes,
+                    actual.bytes
+                ));
+            }
+            if actual.sha256 != stored_sha256 {
+                return Err(format!(
+                    "{code_prefix}_SOURCE_BOUNDARY_MISMATCH: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} boundary_start_offset_bytes={stored_start} boundary_bytes={stored_bytes} expected_sha256={stored_sha256} actual_sha256={}; remediation=restore the original append-only source bytes at the persisted cursor boundary or reconcile every durable transcript row before rebuilding the cursor",
+                    source_path.display(),
+                    actual.sha256
+                ));
+            }
+            Ok(false)
+        }
+        (None, None, None) => {
+            verify_legacy_boundary_row(
+                db,
+                source_id,
+                source_path,
+                snapshot_size_bytes,
+                cursor_offset_bytes,
+                lines_ingested,
+                code_prefix,
+            )?;
+            refresh_transcript_source_boundary(
+                source_path,
+                snapshot_size_bytes,
+                TranscriptSourceBoundaryState {
+                    cursor_offset_bytes,
+                    lines_ingested,
+                    start_offset_bytes: boundary_start_offset_bytes,
+                    bytes: boundary_bytes,
+                    sha256: boundary_sha256,
+                },
+                code_prefix,
+            )?;
+            Ok(true)
+        }
+        _ => Err(format!(
+            "{code_prefix}_SOURCE_BOUNDARY_PARTIAL: source_id={source_id} path={} cursor_offset_bytes={cursor_offset_bytes} boundary_start_offset_bytes={boundary_start_offset_bytes:?} boundary_bytes={boundary_bytes:?} boundary_sha256_present={}; remediation=repair the corrupt cursor boundary tuple from the physical source/transcript SoTs",
+            source_path.display(),
+            boundary_sha256.is_some()
+        )),
+    }
+}
+
+pub(super) fn refresh_transcript_source_boundary(
+    source_path: &Path,
+    snapshot_size_bytes: u64,
+    state: TranscriptSourceBoundaryState<'_>,
+    code_prefix: &'static str,
+) -> Result<(), String> {
+    let TranscriptSourceBoundaryState {
+        cursor_offset_bytes,
+        start_offset_bytes: boundary_start_offset_bytes,
+        bytes: boundary_bytes,
+        sha256: boundary_sha256,
+        ..
+    } = state;
+    let boundary = read_transcript_source_boundary(
+        source_path,
+        snapshot_size_bytes,
+        cursor_offset_bytes,
+        code_prefix,
+    )?;
+    *boundary_start_offset_bytes = Some(boundary.start_offset_bytes);
+    *boundary_bytes = Some(boundary.bytes);
+    *boundary_sha256 = Some(boundary.sha256);
+    Ok(())
+}
 
 static LINES_PARSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LINES_INVALID_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -142,6 +838,21 @@ pub(crate) struct TranscriptCursor {
     /// timestamp/UUIDv7 time anchor so retries encode the same row bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_epoch_unix_ms: Option<u64>,
+    /// Stable content identity for the append-only source. The prefix length
+    /// is frozen when the first chunk commits; later growth does not alter it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint_sha256: Option<String>,
+    /// Exact bounded bytes ending at `offset_bytes`. Unlike the stable prefix
+    /// identity above, this moves after every committed chunk and proves that
+    /// resume still lands on the same physical source boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_boundary_start_offset_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_boundary_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_boundary_sha256: Option<String>,
     /// True once the source reached its terminal state and the tail was
     /// fully consumed; complete spawns are skipped by later cycles.
     pub source_complete: bool,
@@ -217,6 +928,247 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Publishes one bounded transcript chunk, then performs independent point
+/// reads of every source and timestamp-index row before any cursor may cover
+/// the corresponding source bytes. Constellation publication performs its own
+/// native Calyx readback and remains before the cursor commit marker.
+pub(super) fn commit_transcript_chunk(
+    db: &Db,
+    code_prefix: &'static str,
+    source_id: &str,
+    source_path: &Path,
+    rows: &[PreparedTranscriptRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if rows.len() > MAX_AGENT_TRANSCRIPT_COMMIT_ROWS {
+        return Err(format!(
+            "{code_prefix}_COMMIT_INVARIANT_FAILED: source_id={source_id} path={} rows={} max_rows={MAX_AGENT_TRANSCRIPT_COMMIT_ROWS}; remediation=repair the ingester chunk planner before retrying",
+            source_path.display(),
+            rows.len()
+        ));
+    }
+    let encoded_value_bytes = rows
+        .iter()
+        .try_fold(0_usize, |total, row| total.checked_add(row.encoded.len()));
+    let max_encoded_value_bytes =
+        MAX_AGENT_TRANSCRIPT_COMMIT_ROWS.saturating_mul(MAX_AGENT_TRANSCRIPT_VALUE_BYTES);
+    let Some(encoded_value_bytes) = encoded_value_bytes else {
+        return Err(format!(
+            "{code_prefix}_COMMIT_SIZE_OVERFLOW: source_id={source_id} path={}; remediation=repair the ingester size accounting before retrying",
+            source_path.display()
+        ));
+    };
+    if encoded_value_bytes > max_encoded_value_bytes {
+        return Err(format!(
+            "{code_prefix}_COMMIT_INVARIANT_FAILED: source_id={source_id} path={} encoded_value_bytes={encoded_value_bytes} max_encoded_value_bytes={max_encoded_value_bytes}; remediation=repair the row-size/chunk invariant before retrying",
+            source_path.display()
+        ));
+    }
+
+    let mut guards = Vec::with_capacity(rows.len().saturating_mul(2));
+    for row in rows {
+        let source_revision = db
+            .get_cf_revisioned(cf::CF_AGENT_TRANSCRIPTS, &row.source_key)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_ROW_PRECONDITION_READ_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} key_hex={}: {error}; remediation=repair the Calyx revisioned point-read before retrying",
+                    source_path.display(),
+                    row.record.line_no,
+                    row.source_offset_bytes,
+                    synapse_storage::constellations::hex_encode(&row.source_key)
+                )
+            })?;
+        let expected_source_revision = match source_revision {
+            Some(revisioned) => {
+                if revisioned.value.as_deref() != Some(row.encoded.as_slice()) {
+                    return Err(format!(
+                        "{code_prefix}_ROW_IDENTITY_CONFLICT: source_id={source_id} path={} line_no={} source_offset_bytes={} key_hex={} expected_sha256={} actual_sha256={}; remediation=restore the original source/cursor or reconcile the conflicting deterministic transcript row without overwriting it",
+                        source_path.display(),
+                        row.record.line_no,
+                        row.source_offset_bytes,
+                        synapse_storage::constellations::hex_encode(&row.source_key),
+                        sha256_hex(&row.encoded),
+                        revisioned
+                            .value
+                            .as_deref()
+                            .map_or_else(|| "expired".to_owned(), sha256_hex)
+                    ));
+                }
+                Some(revisioned.revision_sha256)
+            }
+            None => None,
+        };
+        guards.push(CfRevisionGuard::new(
+            cf::CF_AGENT_TRANSCRIPTS,
+            row.source_key.clone(),
+            expected_source_revision,
+        ));
+
+        let index_revision = db
+            .get_cf_revisioned(cf::CF_KV, &row.ts_index_key)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_INDEX_PRECONDITION_READ_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={}: {error}; remediation=repair the Calyx revisioned point-read before retrying",
+                    source_path.display(),
+                    row.record.line_no,
+                    row.source_offset_bytes,
+                    synapse_storage::constellations::hex_encode(&row.ts_index_key)
+                )
+            })?;
+        let expected_index_revision = match index_revision {
+            Some(revisioned) => {
+                if revisioned.value.as_deref() != Some(row.source_key.as_slice()) {
+                    return Err(format!(
+                        "{code_prefix}_INDEX_IDENTITY_CONFLICT: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={} expected_source_key_hex={} actual_sha256={}; remediation=reconcile the conflicting deterministic timestamp index without overwriting it",
+                        source_path.display(),
+                        row.record.line_no,
+                        row.source_offset_bytes,
+                        synapse_storage::constellations::hex_encode(&row.ts_index_key),
+                        synapse_storage::constellations::hex_encode(&row.source_key),
+                        revisioned
+                            .value
+                            .as_deref()
+                            .map_or_else(|| "expired".to_owned(), sha256_hex)
+                    ));
+                }
+                Some(revisioned.revision_sha256)
+            }
+            None => None,
+        };
+        guards.push(CfRevisionGuard::new(
+            cf::CF_KV,
+            row.ts_index_key.clone(),
+            expected_index_revision,
+        ));
+    }
+
+    let transcript_rows = rows
+        .iter()
+        .map(|row| (row.source_key.clone(), row.encoded.clone()))
+        .collect();
+    let timestamp_rows = rows
+        .iter()
+        .map(|row| (row.ts_index_key.clone(), row.source_key.clone()))
+        .collect();
+    let outcome = db
+        .put_cf_batches_if_revisions_pressure_bypass(
+            guards,
+            vec![
+                (cf::CF_AGENT_TRANSCRIPTS, transcript_rows),
+                (cf::CF_KV, timestamp_rows),
+            ],
+        )
+        .map_err(|error| {
+            format!(
+                "{code_prefix}_ROWS_WRITE_FAILED: source_id={source_id} path={} first_offset_bytes={} rows={} encoded_value_bytes={encoded_value_bytes}: {error}; remediation=repair the Calyx guarded write failure and retry from the unchanged cursor",
+                source_path.display(),
+                rows[0].source_offset_bytes,
+                rows.len()
+            )
+        })?;
+    if !outcome.applied {
+        let conflict = outcome.conflict.map_or_else(
+            || "missing_conflict_detail".to_owned(),
+            |conflict| {
+                format!(
+                    "guard_index={} key_hex={} expected_revision={} actual_revision={}",
+                    conflict.guard_index,
+                    synapse_storage::constellations::hex_encode(&conflict.key),
+                    conflict.expected_revision_sha256.map_or_else(
+                        || "absent".to_owned(),
+                        |value| synapse_storage::constellations::hex_encode(&value)
+                    ),
+                    conflict.actual_revision_sha256.map_or_else(
+                        || "absent".to_owned(),
+                        |value| synapse_storage::constellations::hex_encode(&value)
+                    )
+                )
+            },
+        );
+        return Err(format!(
+            "{code_prefix}_ROWS_REVISION_CONFLICT: source_id={source_id} path={} first_offset_bytes={} rows={} conflict={conflict}; remediation=discard this stale prepared chunk and reload the authoritative cursor/source state",
+            source_path.display(),
+            rows[0].source_offset_bytes,
+            rows.len()
+        ));
+    }
+
+    for row in rows {
+        let actual = db
+            .get_cf(cf::CF_AGENT_TRANSCRIPTS, &row.source_key)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_ROW_READBACK_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} key_hex={}: {error}; remediation=repair the Calyx point-read path and retry from the unchanged cursor",
+                    source_path.display(),
+                    row.record.line_no,
+                    row.source_offset_bytes,
+                    synapse_storage::constellations::hex_encode(&row.source_key)
+                )
+            })?;
+        if actual.as_deref() != Some(row.encoded.as_slice()) {
+            return Err(format!(
+                "{code_prefix}_ROW_READBACK_MISMATCH: source_id={source_id} path={} line_no={} source_offset_bytes={} key_hex={} expected_sha256={} actual_sha256={}; remediation=quarantine and repair the divergent Calyx row before clearing the cursor",
+                source_path.display(),
+                row.record.line_no,
+                row.source_offset_bytes,
+                synapse_storage::constellations::hex_encode(&row.source_key),
+                sha256_hex(&row.encoded),
+                actual
+                    .as_deref()
+                    .map_or_else(|| "absent".to_owned(), sha256_hex)
+            ));
+        }
+
+        let actual_index = db.get_cf(cf::CF_KV, &row.ts_index_key).map_err(|error| {
+            format!(
+                "{code_prefix}_INDEX_READBACK_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={}: {error}; remediation=repair the Calyx point-read path and retry from the unchanged cursor",
+                source_path.display(),
+                row.record.line_no,
+                row.source_offset_bytes,
+                synapse_storage::constellations::hex_encode(&row.ts_index_key)
+            )
+        })?;
+        if actual_index.as_deref() != Some(row.source_key.as_slice()) {
+            return Err(format!(
+                "{code_prefix}_INDEX_READBACK_MISMATCH: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={} expected_source_key_hex={} actual_sha256={}; remediation=quarantine and repair the divergent timestamp index before clearing the cursor",
+                source_path.display(),
+                row.record.line_no,
+                row.source_offset_bytes,
+                synapse_storage::constellations::hex_encode(&row.ts_index_key),
+                synapse_storage::constellations::hex_encode(&row.source_key),
+                actual_index
+                    .as_deref()
+                    .map_or_else(|| "absent".to_owned(), sha256_hex)
+            ));
+        }
+
+        db.put_agent_transcript_constellation(&row.source_key, &row.encoded, &row.record)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_CONSTELLATION_MEASUREMENT_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} source_key_hex={}: {error}; remediation=repair native Calyx constellation publication and retry from the unchanged cursor",
+                    source_path.display(),
+                    row.record.line_no,
+                    row.source_offset_bytes,
+                    synapse_storage::constellations::hex_encode(&row.source_key)
+                )
+            })?;
+    }
+
+    tracing::debug!(
+        code = "TRANSCRIPT_CHUNK_COMMITTED",
+        source_kind = code_prefix,
+        source_id,
+        source_path = %source_path.display(),
+        first_offset_bytes = rows[0].source_offset_bytes,
+        rows = rows.len(),
+        encoded_value_bytes,
+        "bounded transcript source/index rows and native constellations have exact physical readback"
+    );
+    Ok(())
+}
+
 /// Truncates `text` to at most `max_chars` characters on a char boundary.
 /// Returns the bounded text and whether truncation occurred.
 fn bounded_chars(text: &str, max_chars: usize) -> (String, bool) {
@@ -254,14 +1206,31 @@ fn validate_spawn_id_shape(spawn_id: &str) -> Result<(), String> {
 /// Returns a structured detail when the markers are absent or ambiguous —
 /// an unattributable dir is a surfaced defect, never a guessed format.
 fn detect_source(log_dir: &Path) -> Result<TranscriptSource, String> {
-    let claude = log_dir.join("claude-mcp-config.json").is_file()
-        || log_dir.join("claude-hook-settings.json").is_file()
-        || log_dir.join("claude-debug.log").is_file();
-    let codex_app_server = log_dir.join("codex-app-server-runner.ps1").is_file()
-        || log_dir.join("codex-control.json").is_file()
-        || log_dir.join("codex-app-server-events.jsonl").is_file();
-    let codex = !codex_app_server && log_dir.join("codex-notify.ps1").is_file();
-    let local = log_dir.join("local-model-runner.json").is_file();
+    let marker_exists = |name: &str| -> Result<bool, String> {
+        let path = log_dir.join(name);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(format!(
+                "TRANSCRIPT_SOURCE_MARKER_INVALID: path={} is not a regular file; remediation=restore the spawn artifact as a regular file",
+                path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "TRANSCRIPT_SOURCE_MARKER_STAT_FAILED: path={}: {error}; remediation=restore metadata/read access to the spawn directory",
+                path.display()
+            )),
+        }
+    };
+    let claude_mcp = marker_exists("claude-mcp-config.json")?;
+    let claude_hooks = marker_exists("claude-hook-settings.json")?;
+    let claude_debug = marker_exists("claude-debug.log")?;
+    let claude = claude_mcp || claude_hooks || claude_debug;
+    let codex_runner = marker_exists("codex-app-server-runner.ps1")?;
+    let codex_control = marker_exists("codex-control.json")?;
+    let codex_events = marker_exists("codex-app-server-events.jsonl")?;
+    let codex_app_server = codex_runner || codex_control || codex_events;
+    let codex = !codex_app_server && marker_exists("codex-notify.ps1")?;
+    let local = marker_exists("local-model-runner.json")?;
     let mut matches = Vec::new();
     if claude {
         matches.push(TranscriptSource::ClaudeStreamJson);
@@ -299,17 +1268,38 @@ struct SpawnManifestSeed {
 /// `model` is the authoritative model seed for Codex spawns, whose stream may
 /// omit the model id (#949). `created_unix_ms` is the stable timestamp seed used
 /// only when an individual transcript line has no timestamp/UUIDv7 time anchor.
-/// A missing/malformed manifest is not fatal: the parser still derives time
-/// from source events where possible and falls back to a deterministic source
-/// key seed rather than the wall clock.
-fn read_spawn_manifest_seed(log_dir: &Path) -> SpawnManifestSeed {
+/// Missing, unreadable, or malformed launch metadata is fatal and parked on
+/// the cursor. Ingestion must not silently substitute guessed identity/time
+/// seeds when the spawn owner promised an authoritative manifest.
+fn read_spawn_manifest_seed(log_dir: &Path) -> Result<SpawnManifestSeed, String> {
     let path = log_dir.join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
-    let Some(manifest) = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-    else {
-        return SpawnManifestSeed::default();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "TRANSCRIPT_SPAWN_MANIFEST_MISSING: path={}; remediation=restore the launch-time spawn manifest before ingesting the transcript",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "TRANSCRIPT_SPAWN_MANIFEST_READ_FAILED: path={}: {error}; remediation=restore read access to the spawn manifest before ingesting the source",
+                path.display()
+            ));
+        }
     };
+    let manifest = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+        format!(
+            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={}: {error}; remediation=repair the manifest JSON from the spawn launch SoT before ingesting the source",
+            path.display()
+        )
+    })?;
+    let object = manifest.as_object().ok_or_else(|| {
+        format!(
+            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} root must be a JSON object; remediation=repair the manifest from the spawn launch SoT",
+            path.display()
+        )
+    })?;
     let model = manifest
         .get("model")
         .and_then(Value::as_str)
@@ -317,33 +1307,154 @@ fn read_spawn_manifest_seed(log_dir: &Path) -> SpawnManifestSeed {
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned);
     let created_unix_ms = manifest.get("created_unix_ms").and_then(Value::as_u64);
-    SpawnManifestSeed {
+    if object.contains_key("model") && model.is_none() {
+        return Err(format!(
+            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} model must be a non-empty string when present; remediation=repair the manifest from the spawn launch SoT",
+            path.display()
+        ));
+    }
+    if object.contains_key("created_unix_ms") && created_unix_ms.is_none() {
+        return Err(format!(
+            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} created_unix_ms must be an unsigned integer when present; remediation=repair the manifest from the spawn launch SoT",
+            path.display()
+        ));
+    }
+    Ok(SpawnManifestSeed {
         model,
         created_unix_ms,
-    }
+    })
 }
 
-fn load_cursor(db: &Db, spawn_id: &str) -> Result<Option<TranscriptCursor>, String> {
+#[derive(Debug)]
+struct LoadedTranscriptCursor {
+    cursor: Option<TranscriptCursor>,
+    revision_sha256: Option<[u8; 32]>,
+}
+
+fn load_cursor(db: &Db, spawn_id: &str) -> Result<LoadedTranscriptCursor, String> {
     let key = cursor_kv_key(spawn_id);
-    db.get_cf(cf::CF_KV, &key)
-        .map_err(|error| format!("TRANSCRIPT_CURSOR_READ_FAILED: {error}"))?
-        .map(|value| {
-            decode_json(&value).map_err(|error| format!("TRANSCRIPT_CURSOR_DECODE_FAILED: {error}"))
-        })
-        .transpose()
+    let Some(revisioned) = db.get_cf_revisioned(cf::CF_KV, &key).map_err(|error| {
+        format!(
+            "TRANSCRIPT_CURSOR_READ_FAILED: spawn_id={spawn_id} key={CURSOR_KV_PREFIX}{spawn_id}: {error}; remediation=repair the exact Calyx cursor point-read before ingesting source bytes"
+        )
+    })? else {
+        return Ok(LoadedTranscriptCursor {
+            cursor: None,
+            revision_sha256: None,
+        });
+    };
+    let value = revisioned.value.ok_or_else(|| {
+        format!(
+            "TRANSCRIPT_CURSOR_EXPIRED: spawn_id={spawn_id} key={CURSOR_KV_PREFIX}{spawn_id}; remediation=restore the non-expiring cursor row or reconcile all physical transcript rows before rebuilding it"
+        )
+    })?;
+    let cursor: TranscriptCursor = decode_json(&value).map_err(|error| {
+        format!(
+            "TRANSCRIPT_CURSOR_DECODE_FAILED: spawn_id={spawn_id} key={CURSOR_KV_PREFIX}{spawn_id}: {error}; remediation=repair the cursor bytes from the physical source/transcript SoTs"
+        )
+    })?;
+    if cursor.record_version != TRANSCRIPT_CURSOR_VERSION
+        || cursor.spawn_id != spawn_id
+        || cursor.source_path.trim().is_empty()
+    {
+        return Err(format!(
+            "TRANSCRIPT_CURSOR_IDENTITY_INVALID: requested_spawn_id={spawn_id} stored_spawn_id={} record_version={} expected_version={TRANSCRIPT_CURSOR_VERSION} source_path={:?}; remediation=repair the cursor identity from the physical source/transcript SoTs",
+            cursor.spawn_id, cursor.record_version, cursor.source_path
+        ));
+    }
+    Ok(LoadedTranscriptCursor {
+        cursor: Some(cursor),
+        revision_sha256: Some(revisioned.revision_sha256),
+    })
 }
 
-fn store_cursor(db: &Db, cursor: &TranscriptCursor) -> Result<(), String> {
+fn store_cursor(
+    db: &Db,
+    cursor: &TranscriptCursor,
+    expected_revision_sha256: &mut Option<[u8; 32]>,
+) -> Result<(), String> {
+    let key = cursor_kv_key(&cursor.spawn_id);
     let encoded =
         encode_json(cursor).map_err(|error| format!("TRANSCRIPT_CURSOR_ENCODE_FAILED: {error}"))?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(cursor_kv_key(&cursor.spawn_id), encoded)])
-        .map_err(|error| format!("TRANSCRIPT_CURSOR_WRITE_FAILED: {error}"))
+    let outcome = db
+        .put_batch_if_revision_pressure_bypass(
+            cf::CF_KV,
+            &key,
+            *expected_revision_sha256,
+            [(key.clone(), encoded.clone())],
+        )
+        .map_err(|error| {
+            format!(
+                "TRANSCRIPT_CURSOR_WRITE_FAILED: spawn_id={} source_path={} offset_bytes={}: {error}; remediation=repair the guarded Calyx cursor write and retry from the last persisted cursor",
+                cursor.spawn_id, cursor.source_path, cursor.offset_bytes
+            )
+        })?;
+    if !outcome.applied {
+        return Err(format!(
+            "TRANSCRIPT_CURSOR_REVISION_CONFLICT: spawn_id={} source_path={} offset_bytes={} expected_revision_sha256={} actual_revision_sha256={}; remediation=discard this stale ingest pass and reload the authoritative cursor",
+            cursor.spawn_id,
+            cursor.source_path,
+            cursor.offset_bytes,
+            (*expected_revision_sha256).map_or_else(
+                || "absent".to_owned(),
+                |value| synapse_storage::constellations::hex_encode(&value),
+            ),
+            outcome.previous_revision_sha256.map_or_else(
+                || "absent".to_owned(),
+                |value| { synapse_storage::constellations::hex_encode(&value) }
+            )
+        ));
+    }
+    let committed_revision = outcome.committed_revision_sha256.ok_or_else(|| {
+        format!(
+            "TRANSCRIPT_CURSOR_WRITE_OUTCOME_INVALID: spawn_id={} offset_bytes={} applied write omitted committed revision; remediation=repair the Calyx guarded-write outcome contract",
+            cursor.spawn_id, cursor.offset_bytes
+        )
+    })?;
+    let readback = db
+        .get_cf_revisioned(cf::CF_KV, &key)
+        .map_err(|error| {
+            format!(
+                "TRANSCRIPT_CURSOR_READBACK_FAILED: spawn_id={} source_path={} offset_bytes={}: {error}; remediation=repair the Calyx point-read path and reconcile the committed cursor",
+                cursor.spawn_id, cursor.source_path, cursor.offset_bytes
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "TRANSCRIPT_CURSOR_READBACK_MISSING: spawn_id={} source_path={} offset_bytes={}; remediation=repair the missing committed cursor before ingest resumes",
+                cursor.spawn_id, cursor.source_path, cursor.offset_bytes
+            )
+        })?;
+    if readback.revision_sha256 != committed_revision
+        || readback.value.as_deref() != Some(encoded.as_slice())
+    {
+        return Err(format!(
+            "TRANSCRIPT_CURSOR_READBACK_MISMATCH: spawn_id={} source_path={} offset_bytes={} expected_value_sha256={} actual_value_sha256={} expected_revision_sha256={} actual_revision_sha256={}; remediation=quarantine and repair the divergent cursor before ingest resumes",
+            cursor.spawn_id,
+            cursor.source_path,
+            cursor.offset_bytes,
+            sha256_hex(&encoded),
+            readback
+                .value
+                .as_deref()
+                .map_or_else(|| "absent_or_expired".to_owned(), sha256_hex),
+            synapse_storage::constellations::hex_encode(&committed_revision),
+            synapse_storage::constellations::hex_encode(&readback.revision_sha256)
+        ));
+    }
+    *expected_revision_sha256 = Some(committed_revision);
+    Ok(())
 }
 
 /// Marks a spawn's cursor with a sticky error and persists it. The error is
 /// logged once here (with full context) and the spawn is skipped by later
 /// cycles until the cursor row is cleared.
-fn stick_cursor_error(db: &Db, cursor: &mut TranscriptCursor, detail: String) -> String {
+fn stick_cursor_error(
+    db: &Db,
+    cursor: &mut TranscriptCursor,
+    cursor_revision_sha256: &mut Option<[u8; 32]>,
+    detail: String,
+) -> String {
     INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
     tracing::error!(
         code = "TRANSCRIPT_INGEST_ERROR",
@@ -356,7 +1467,7 @@ fn stick_cursor_error(db: &Db, cursor: &mut TranscriptCursor, detail: String) ->
     );
     cursor.error = Some(detail.clone());
     cursor.updated_ts_ns = unix_time_ns_now();
-    if let Err(store_error) = store_cursor(db, cursor) {
+    if let Err(store_error) = store_cursor(db, cursor, cursor_revision_sha256) {
         tracing::error!(
             code = "TRANSCRIPT_INGEST_ERROR",
             spawn_id = %cursor.spawn_id,
@@ -368,20 +1479,31 @@ fn stick_cursor_error(db: &Db, cursor: &mut TranscriptCursor, detail: String) ->
 }
 
 /// True when `completion-status.json` exists with a terminal status.
-fn completion_is_terminal(log_dir: &Path) -> bool {
+fn completion_is_terminal(log_dir: &Path) -> Result<bool, String> {
     let path = log_dir.join("completion-status.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "TRANSCRIPT_COMPLETION_STATUS_READ_FAILED: path={}: {error}; remediation=restore read access to the completion artifact before deciding source finality",
+                path.display()
+            ));
+        }
     };
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|status| {
-            status
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|value| value != "running")
-        })
-        .unwrap_or(false)
+    let status: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "TRANSCRIPT_COMPLETION_STATUS_INVALID: path={}: {error}; remediation=repair the completion artifact JSON before deciding source finality",
+            path.display()
+        )
+    })?;
+    let value = status.get("status").and_then(Value::as_str).ok_or_else(|| {
+        format!(
+            "TRANSCRIPT_COMPLETION_STATUS_INVALID: path={} missing string status; remediation=repair the completion artifact from the session lifecycle SoT",
+            path.display()
+        )
+    })?;
+    Ok(value != "running")
 }
 
 /// Ingests new source bytes for one spawn dir. `finalize` forces the tail
@@ -413,10 +1535,48 @@ fn ingest_spawn_dir_once_with_cancel(
     validate_spawn_id_shape(spawn_id)?;
     let stdout_path = log_dir.join("stdout.jsonl");
 
-    let mut cursor = match load_cursor(db, spawn_id)? {
+    let loaded = load_cursor(db, spawn_id)?;
+    let mut cursor_revision_sha256 = loaded.revision_sha256;
+    let mut cursor = match loaded.cursor {
         Some(cursor) => cursor,
         None => {
-            let manifest_seed = read_spawn_manifest_seed(log_dir);
+            let manifest_seed = match read_spawn_manifest_seed(log_dir) {
+                Ok(seed) => seed,
+                Err(detail) => {
+                    let mut cursor = TranscriptCursor {
+                        record_version: TRANSCRIPT_CURSOR_VERSION,
+                        spawn_id: spawn_id.to_owned(),
+                        source: TranscriptSource::ClaudeStreamJson,
+                        source_path: stdout_path.display().to_string(),
+                        offset_bytes: 0,
+                        lines_ingested: 0,
+                        parsed_rows: 0,
+                        invalid_rows: 0,
+                        turn_index: 0,
+                        last_assistant_message_id: None,
+                        conversation_id: None,
+                        model: None,
+                        source_epoch_unix_ms: None,
+                        source_fingerprint_bytes: None,
+                        source_fingerprint_sha256: None,
+                        source_boundary_start_offset_bytes: None,
+                        source_boundary_bytes: None,
+                        source_boundary_sha256: None,
+                        source_complete: false,
+                        completed_reason: None,
+                        end_state_anchor_outcome: None,
+                        end_state_anchor_rows: None,
+                        error: None,
+                        updated_ts_ns: unix_time_ns_now(),
+                    };
+                    return Err(stick_cursor_error(
+                        db,
+                        &mut cursor,
+                        &mut cursor_revision_sha256,
+                        detail,
+                    ));
+                }
+            };
             let source = match detect_source(log_dir) {
                 Ok(source) => source,
                 Err(detail) => {
@@ -436,6 +1596,11 @@ fn ingest_spawn_dir_once_with_cancel(
                         conversation_id: None,
                         model: None,
                         source_epoch_unix_ms: manifest_seed.created_unix_ms,
+                        source_fingerprint_bytes: None,
+                        source_fingerprint_sha256: None,
+                        source_boundary_start_offset_bytes: None,
+                        source_boundary_bytes: None,
+                        source_boundary_sha256: None,
                         source_complete: false,
                         completed_reason: None,
                         end_state_anchor_outcome: None,
@@ -443,7 +1608,12 @@ fn ingest_spawn_dir_once_with_cancel(
                         error: None,
                         updated_ts_ns: unix_time_ns_now(),
                     };
-                    return Err(stick_cursor_error(db, &mut cursor, detail));
+                    return Err(stick_cursor_error(
+                        db,
+                        &mut cursor,
+                        &mut cursor_revision_sha256,
+                        detail,
+                    ));
                 }
             };
             TranscriptCursor {
@@ -462,6 +1632,11 @@ fn ingest_spawn_dir_once_with_cancel(
                 // source; for Claude the stream supersedes it (#949).
                 model: manifest_seed.model,
                 source_epoch_unix_ms: manifest_seed.created_unix_ms,
+                source_fingerprint_bytes: None,
+                source_fingerprint_sha256: None,
+                source_boundary_start_offset_bytes: None,
+                source_boundary_bytes: None,
+                source_boundary_sha256: None,
                 source_complete: false,
                 completed_reason: None,
                 end_state_anchor_outcome: None,
@@ -472,6 +1647,20 @@ fn ingest_spawn_dir_once_with_cancel(
         }
     };
     let lines_ingested_before_cycle = cursor.lines_ingested;
+
+    if Path::new(&cursor.source_path) != stdout_path {
+        let detail = format!(
+            "TRANSCRIPT_CURSOR_SOURCE_PATH_MISMATCH: cursor_path={} discovered_path={}; remediation=restore the original source path or reconcile and rebuild the cursor without reusing its identity",
+            cursor.source_path,
+            stdout_path.display()
+        );
+        return Err(stick_cursor_error(
+            db,
+            &mut cursor,
+            &mut cursor_revision_sha256,
+            detail,
+        ));
+    }
 
     if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Ok(SpawnIngestOutcome {
@@ -498,23 +1687,94 @@ fn ingest_spawn_dir_once_with_cancel(
     let metadata = match std::fs::metadata(&stdout_path) {
         Ok(metadata) => metadata,
         Err(error) => {
+            let offset_bytes = cursor.offset_bytes;
             return Err(stick_cursor_error(
                 db,
                 &mut cursor,
+                &mut cursor_revision_sha256,
                 format!(
-                    "TRANSCRIPT_SOURCE_MISSING: cannot stat {}: {error}",
-                    stdout_path.display()
+                    "TRANSCRIPT_SOURCE_STAT_FAILED: path={} offset_bytes={}: {error}; remediation=restore the exact append-only source and metadata access before clearing the sticky cursor",
+                    stdout_path.display(),
+                    offset_bytes
                 ),
             ));
         }
     };
+    if !metadata.is_file() {
+        let detail = format!(
+            "TRANSCRIPT_SOURCE_NOT_FILE: path={} offset_bytes={}; remediation=restore stdout.jsonl as the regular append-only file created by the spawn owner",
+            stdout_path.display(),
+            cursor.offset_bytes
+        );
+        return Err(stick_cursor_error(
+            db,
+            &mut cursor,
+            &mut cursor_revision_sha256,
+            detail,
+        ));
+    }
     let file_size = metadata.len();
     if file_size < cursor.offset_bytes {
         let detail = format!(
-            "TRANSCRIPT_SOURCE_TRUNCATED: file is {file_size} bytes but the cursor consumed {} — the source shrank underneath the tail",
+            "TRANSCRIPT_SOURCE_TRUNCATED: path={} file_size_bytes={file_size} cursor_offset_bytes={}; remediation=restore the original append-only source bytes or reconcile all durable transcript rows before clearing the cursor",
+            stdout_path.display(),
             cursor.offset_bytes
         );
-        return Err(stick_cursor_error(db, &mut cursor, detail));
+        return Err(stick_cursor_error(
+            db,
+            &mut cursor,
+            &mut cursor_revision_sha256,
+            detail,
+        ));
+    }
+
+    let fingerprint_migrated = match ensure_transcript_source_fingerprint(
+        db,
+        spawn_id,
+        &stdout_path,
+        file_size,
+        cursor.offset_bytes,
+        &mut cursor.source_fingerprint_bytes,
+        &mut cursor.source_fingerprint_sha256,
+        "TRANSCRIPT",
+    ) {
+        Ok(migrated) => migrated,
+        Err(detail) => {
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
+        }
+    };
+    let boundary_migrated = match ensure_transcript_source_boundary(
+        db,
+        spawn_id,
+        &stdout_path,
+        file_size,
+        TranscriptSourceBoundaryState {
+            cursor_offset_bytes: cursor.offset_bytes,
+            lines_ingested: cursor.lines_ingested,
+            start_offset_bytes: &mut cursor.source_boundary_start_offset_bytes,
+            bytes: &mut cursor.source_boundary_bytes,
+            sha256: &mut cursor.source_boundary_sha256,
+        },
+        "TRANSCRIPT",
+    ) {
+        Ok(migrated) => migrated,
+        Err(detail) => {
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
+        }
+    };
+    if fingerprint_migrated || boundary_migrated {
+        cursor.updated_ts_ns = unix_time_ns_now();
+        store_cursor(db, &cursor, &mut cursor_revision_sha256)?;
     }
 
     if cursor.source_complete {
@@ -531,6 +1791,8 @@ fn ingest_spawn_dir_once_with_cancel(
             cursor.completed_reason = None;
             cursor.end_state_anchor_outcome = None;
             cursor.end_state_anchor_rows = None;
+            cursor.updated_ts_ns = unix_time_ns_now();
+            store_cursor(db, &cursor, &mut cursor_revision_sha256)?;
         } else {
             if cancel.is_some_and(CancellationToken::is_cancelled) {
                 return Ok(SpawnIngestOutcome {
@@ -540,7 +1802,11 @@ fn ingest_spawn_dir_once_with_cancel(
                     ..SpawnIngestOutcome::default()
                 });
             }
-            ensure_completed_spawn_end_state_anchored(db, &mut cursor)?;
+            ensure_completed_spawn_end_state_anchored(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+            )?;
             return Ok(SpawnIngestOutcome {
                 lines_ingested_total: cursor.lines_ingested,
                 source_complete: true,
@@ -550,57 +1816,29 @@ fn ingest_spawn_dir_once_with_cancel(
         }
     }
 
-    let finalize = finalize || completion_is_terminal(log_dir);
-    let mut new_bytes = Vec::new();
-    if file_size > cursor.offset_bytes {
-        let mut file = std::fs::File::open(&stdout_path).map_err(|error| {
-            format!(
-                "TRANSCRIPT_SOURCE_OPEN_FAILED: {}: {error}",
-                stdout_path.display()
-            )
-        })?;
-        file.seek(SeekFrom::Start(cursor.offset_bytes))
-            .map_err(|error| format!("TRANSCRIPT_SOURCE_SEEK_FAILED: {error}"))?;
-        file.read_to_end(&mut new_bytes)
-            .map_err(|error| format!("TRANSCRIPT_SOURCE_READ_FAILED: {error}"))?;
-    }
-
-    // Split into complete lines; a trailing chunk without a newline is left
-    // for the next cycle unless this pass finalizes the source. A single
-    // trailing CR is part of the line terminator (the spawn wrapper writes
-    // CRLF on Windows), so it is excluded from the recorded bytes and hash —
-    // hashes stay reproducible from the logical line text regardless of the
-    // producer's line-ending convention.
-    fn trim_line_terminator(line: &[u8]) -> &[u8] {
-        line.strip_suffix(b"\r").unwrap_or(line)
-    }
-    let mut lines: Vec<(&[u8], usize)> = Vec::new();
-    let mut start = 0_usize;
-    for (index, byte) in new_bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            lines.push((trim_line_terminator(&new_bytes[start..index]), index + 1));
-            start = index + 1;
+    let completion_terminal = match completion_is_terminal(log_dir) {
+        Ok(value) => value,
+        Err(detail) => {
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
         }
-    }
-    if finalize && start < new_bytes.len() {
-        lines.push((trim_line_terminator(&new_bytes[start..]), new_bytes.len()));
-    }
-
-    if lines.is_empty() && !finalize {
-        return Ok(SpawnIngestOutcome {
-            lines_ingested_total: cursor.lines_ingested,
-            ..SpawnIngestOutcome::default()
-        });
-    }
+    };
+    let finalize = finalize || completion_terminal;
 
     // Explicit pressure gate: rows below ride a bypass write, so this check
-    // is the single authority on whether this cycle may write at all.
-    if !db.pressure_permits_write(cf::CF_AGENT_TRANSCRIPTS) {
+    // is the single authority on whether this pass may write transcript rows.
+    if file_size > cursor.offset_bytes && !db.pressure_permits_write(cf::CF_AGENT_TRANSCRIPTS) {
         PRESSURE_DEFERRALS_TOTAL.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             code = "TRANSCRIPT_INGEST_PRESSURE_DEFERRED",
             spawn_id,
-            pending_lines = lines.len(),
+            source_path = %stdout_path.display(),
+            cursor_offset_bytes = cursor.offset_bytes,
+            snapshot_size_bytes = file_size,
             "disk pressure defers transcript ingestion; cursor not advanced"
         );
         return Ok(SpawnIngestOutcome {
@@ -610,180 +1848,376 @@ fn ingest_spawn_dir_once_with_cancel(
         });
     }
 
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
-    let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
-    let mut constellation_rows: Vec<(Vec<u8>, Vec<u8>, AgentTranscriptRecord)> =
-        Vec::with_capacity(lines.len());
-    let mut new_parsed = 0_u64;
-    let mut new_invalid = 0_u64;
-    let mut processed_consumed_bytes = 0_usize;
-    let mut cancelled = false;
-    for (raw_line, line_consumed_bytes) in &lines {
-        if cancel.is_some_and(CancellationToken::is_cancelled) {
-            cancelled = true;
-            tracing::info!(
-                code = "TRANSCRIPT_INGEST_CYCLE_CANCELLED",
-                spawn_id,
-                processed_lines = rows.len(),
-                pending_lines = lines.len().saturating_sub(rows.len()),
-                "daemon shutdown cancelled transcript ingestion between source lines"
-            );
-            break;
-        }
-        let line_no = cursor.lines_ingested + 1;
-        let record = parse_line(raw_line, line_no, &mut cursor);
-        match record.status {
-            TranscriptParseStatus::Parsed => new_parsed += 1,
-            TranscriptParseStatus::Invalid => {
-                new_invalid += 1;
-                tracing::error!(
-                    code = "TRANSCRIPT_LINE_INVALID",
-                    spawn_id,
-                    line_no,
-                    offset_bytes = cursor.offset_bytes,
-                    raw_line_bytes = record.raw_line_bytes,
-                    detail = record.parse_error.as_deref().unwrap_or("unknown"),
-                    "source line refused by the version-pinned parser; invalid row written"
-                );
-            }
-        }
-        record
-            .validate()
-            .map_err(|detail| stick_cursor_error(db, &mut cursor, detail))?;
-        let encoded = encode_json(&record)
-            .map_err(|error| format!("TRANSCRIPT_ROW_ENCODE_FAILED: {error}"))?;
-        if encoded.len() > MAX_AGENT_TRANSCRIPT_VALUE_BYTES {
+    let mut reader = match BoundedTranscriptTailReader::open(
+        &stdout_path,
+        cursor.offset_bytes,
+        file_size,
+        "TRANSCRIPT",
+    ) {
+        Ok(reader) => reader,
+        Err(detail) => {
             return Err(stick_cursor_error(
                 db,
                 &mut cursor,
-                format!(
-                    "TRANSCRIPT_ROW_OVERSIZED: line {line_no} encoded to {} bytes, cap is {MAX_AGENT_TRANSCRIPT_VALUE_BYTES}; the per-field bounds failed",
-                    encoded.len()
-                ),
+                &mut cursor_revision_sha256,
+                detail,
             ));
         }
-        let transcript_key = agent_transcript_key(spawn_id, line_no);
-        ts_index_rows.push((
-            agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
-            transcript_key.clone(),
-        ));
-        constellation_rows.push((transcript_key.clone(), encoded.clone(), record.clone()));
-        rows.push((transcript_key, encoded));
-        cursor.lines_ingested = line_no;
-        processed_consumed_bytes = *line_consumed_bytes;
-    }
+    };
+    let mut new_parsed = 0_u64;
+    let mut new_invalid = 0_u64;
+    let mut pass_rows = 0_usize;
+    let mut pass_source_bytes = 0_u64;
+    let mut reached_snapshot_eof = false;
+    let mut cancelled = false;
 
-    if !rows.is_empty() {
-        if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return Ok(SpawnIngestOutcome {
-                lines_ingested_total: lines_ingested_before_cycle,
-                cancelled: true,
-                ..SpawnIngestOutcome::default()
-            });
+    'pass: while pass_rows < MAX_AGENT_TRANSCRIPT_ROWS_PER_PASS
+        && pass_source_bytes < MAX_AGENT_TRANSCRIPT_SOURCE_BYTES_PER_PASS
+    {
+        let mut working_cursor = cursor.clone();
+        let mut chunk = Vec::with_capacity(MAX_AGENT_TRANSCRIPT_COMMIT_ROWS);
+        let mut chunk_parsed = 0_u64;
+        let mut chunk_invalid = 0_u64;
+        let mut pending_error: Option<String> = None;
+        let mut incomplete_tail = false;
+
+        while chunk.len() < MAX_AGENT_TRANSCRIPT_COMMIT_ROWS
+            && pass_rows + chunk.len() < MAX_AGENT_TRANSCRIPT_ROWS_PER_PASS
+        {
+            match reader.next_line(finalize, cancel) {
+                Ok(BoundedTailRead::Line {
+                    bytes,
+                    consumed_bytes,
+                    source_offset_bytes,
+                }) => {
+                    let Some(line_no) = working_cursor.lines_ingested.checked_add(1) else {
+                        pending_error = Some(format!(
+                            "TRANSCRIPT_LINE_NUMBER_OVERFLOW: path={} source_offset_bytes={source_offset_bytes}; remediation=quarantine the impossible-size source and reconcile its cursor",
+                            stdout_path.display()
+                        ));
+                        break;
+                    };
+                    let cursor_before_line = working_cursor.clone();
+                    let record = parse_line(&bytes, line_no, &mut working_cursor);
+                    if let Err(detail) = record.validate() {
+                        working_cursor = cursor_before_line;
+                        pending_error = Some(format!(
+                            "TRANSCRIPT_ROW_VALIDATION_FAILED: path={} line_no={line_no} source_offset_bytes={source_offset_bytes}: {detail}; remediation=repair the parser/record invariant before clearing the cursor",
+                            stdout_path.display()
+                        ));
+                        break;
+                    }
+                    let encoded = match encode_json(&record) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            working_cursor = cursor_before_line;
+                            pending_error = Some(format!(
+                                "TRANSCRIPT_ROW_ENCODE_FAILED: path={} line_no={line_no} source_offset_bytes={source_offset_bytes}: {error}; remediation=repair transcript row serialization before clearing the cursor",
+                                stdout_path.display()
+                            ));
+                            break;
+                        }
+                    };
+                    if encoded.len() > MAX_AGENT_TRANSCRIPT_VALUE_BYTES {
+                        working_cursor = cursor_before_line;
+                        pending_error = Some(format!(
+                            "TRANSCRIPT_ROW_OVERSIZED: path={} line_no={line_no} source_offset_bytes={source_offset_bytes} encoded_bytes={} max_encoded_bytes={MAX_AGENT_TRANSCRIPT_VALUE_BYTES}; remediation=repair the per-field normalization bounds before clearing the cursor",
+                            stdout_path.display(),
+                            encoded.len()
+                        ));
+                        break;
+                    }
+                    match record.status {
+                        TranscriptParseStatus::Parsed => chunk_parsed += 1,
+                        TranscriptParseStatus::Invalid => {
+                            chunk_invalid += 1;
+                            tracing::error!(
+                                code = "TRANSCRIPT_LINE_INVALID",
+                                spawn_id,
+                                source_path = %stdout_path.display(),
+                                line_no,
+                                source_offset_bytes,
+                                raw_line_bytes = record.raw_line_bytes,
+                                raw_line_sha256 = %record.raw_line_sha256,
+                                detail = record.parse_error.as_deref().unwrap_or("unknown"),
+                                remediation = "repair the producer's UTF-8 JSONL record; the invalid evidence row remains durable and is never silently skipped",
+                                "source line refused by the version-pinned parser; invalid row will be written"
+                            );
+                        }
+                    }
+                    let source_key = agent_transcript_key(spawn_id, line_no);
+                    let ts_index_key = agent_transcript_ts_index_key(record.ts_ns, &source_key);
+                    chunk.push(PreparedTranscriptRow {
+                        source_key,
+                        encoded,
+                        ts_index_key,
+                        record,
+                        source_offset_bytes,
+                        consumed_bytes,
+                    });
+                    working_cursor.lines_ingested = line_no;
+                    pass_source_bytes = pass_source_bytes.saturating_add(consumed_bytes);
+                    if pass_source_bytes >= MAX_AGENT_TRANSCRIPT_SOURCE_BYTES_PER_PASS {
+                        break;
+                    }
+                }
+                Ok(BoundedTailRead::SnapshotEof) => {
+                    reached_snapshot_eof = true;
+                    break;
+                }
+                Ok(BoundedTailRead::IncompleteTail {
+                    source_offset_bytes,
+                    buffered_bytes,
+                }) => {
+                    incomplete_tail = true;
+                    tracing::debug!(
+                        code = "TRANSCRIPT_INCOMPLETE_TAIL_DEFERRED",
+                        spawn_id,
+                        source_path = %stdout_path.display(),
+                        source_offset_bytes,
+                        buffered_bytes,
+                        max_line_bytes = MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES,
+                        "unterminated live JSONL record remains behind the durable cursor"
+                    );
+                    break;
+                }
+                Ok(BoundedTailRead::Cancelled) => {
+                    cancelled = true;
+                    break;
+                }
+                Err(detail) => {
+                    pending_error = Some(detail);
+                    break;
+                }
+            }
         }
-        db.put_cf_batches_pressure_bypass(vec![
-            (cf::CF_AGENT_TRANSCRIPTS, rows),
-            (cf::CF_KV, ts_index_rows),
-        ])
-        .map_err(|error| {
+
+        if cancelled {
+            tracing::info!(
+                code = "TRANSCRIPT_INGEST_CYCLE_CANCELLED",
+                spawn_id,
+                source_path = %stdout_path.display(),
+                committed_rows = pass_rows,
+                discarded_prepared_rows = chunk.len(),
+                cursor_offset_bytes = cursor.offset_bytes,
+                "daemon shutdown cancelled transcript ingestion before the next bounded commit"
+            );
+            break 'pass;
+        }
+
+        if chunk.is_empty() {
+            if let Some(detail) = pending_error {
+                return Err(stick_cursor_error(
+                    db,
+                    &mut cursor,
+                    &mut cursor_revision_sha256,
+                    detail,
+                ));
+            }
+            break 'pass;
+        }
+
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break 'pass;
+        }
+        if let Err(detail) =
+            commit_transcript_chunk(db, "TRANSCRIPT", spawn_id, &stdout_path, &chunk)
+        {
+            tracing::error!(
+                code = "TRANSCRIPT_CHUNK_COMMIT_FAILED",
+                spawn_id,
+                source_path = %stdout_path.display(),
+                cursor_offset_bytes = cursor.offset_bytes,
+                rows = chunk.len(),
+                detail = %detail,
+                "bounded transcript chunk failed; durable cursor remains unchanged"
+            );
+            return Err(detail);
+        }
+
+        let consumed_bytes = chunk
+            .iter()
+            .try_fold(0_u64, |total, row| total.checked_add(row.consumed_bytes));
+        let Some(consumed_bytes) = consumed_bytes else {
+            let detail = format!(
+                "TRANSCRIPT_SOURCE_OFFSET_OVERFLOW: path={} cursor_offset_bytes={}; remediation=quarantine the impossible-size source and reconcile the cursor",
+                stdout_path.display(),
+                cursor.offset_bytes
+            );
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
+        };
+        working_cursor.offset_bytes = cursor.offset_bytes.checked_add(consumed_bytes).ok_or_else(|| {
             format!(
-                "TRANSCRIPT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines will re-ingest)"
+                "TRANSCRIPT_SOURCE_OFFSET_OVERFLOW: path={} cursor_offset_bytes={} consumed_bytes={consumed_bytes}; remediation=quarantine the impossible-size source and reconcile the cursor",
+                stdout_path.display(), cursor.offset_bytes
             )
         })?;
-        for (source_key, raw_bytes, record) in &constellation_rows {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                // Transcript rows use deterministic keys and are safe to
-                // re-put. Do not advance the cursor until every matching
-                // Calyx constellation measurement is physically present.
-                return Ok(SpawnIngestOutcome {
-                    lines_ingested_total: lines_ingested_before_cycle,
-                    cancelled: true,
-                    ..SpawnIngestOutcome::default()
-                });
-            }
-            db.put_agent_transcript_constellation(source_key, raw_bytes, record)
-                .map_err(|error| {
-                    tracing::error!(
-                        code = "CALYX_AGENT_TRANSCRIPT_CONSTELLATION_MEASUREMENT_FAILED",
-                        spawn_id,
-                        line_no = record.line_no,
-                        source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
-                        detail = %error,
-                        "transcript row was written but native Calyx constellation measurement failed; cursor not advanced"
-                    );
-                    format!(
-                        "TRANSCRIPT_CONSTELLATION_MEASUREMENT_FAILED: {error} (cursor not advanced; lines will re-ingest)"
-                    )
-                })?;
+        working_cursor.parsed_rows = cursor.parsed_rows.checked_add(chunk_parsed).ok_or_else(|| {
+            "TRANSCRIPT_PARSED_COUNTER_OVERFLOW: remediation=reconcile the impossible-size cursor"
+                .to_owned()
+        })?;
+        working_cursor.invalid_rows = cursor
+            .invalid_rows
+            .checked_add(chunk_invalid)
+            .ok_or_else(|| {
+                "TRANSCRIPT_INVALID_COUNTER_OVERFLOW: remediation=reconcile the impossible-size cursor"
+                    .to_owned()
+            })?;
+        if let Err(detail) = ensure_transcript_source_fingerprint(
+            db,
+            spawn_id,
+            &stdout_path,
+            file_size,
+            working_cursor.offset_bytes,
+            &mut working_cursor.source_fingerprint_bytes,
+            &mut working_cursor.source_fingerprint_sha256,
+            "TRANSCRIPT",
+        ) {
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
+        }
+        if let Err(detail) = refresh_transcript_source_boundary(
+            &stdout_path,
+            file_size,
+            TranscriptSourceBoundaryState {
+                cursor_offset_bytes: working_cursor.offset_bytes,
+                lines_ingested: working_cursor.lines_ingested,
+                start_offset_bytes: &mut working_cursor.source_boundary_start_offset_bytes,
+                bytes: &mut working_cursor.source_boundary_bytes,
+                sha256: &mut working_cursor.source_boundary_sha256,
+            },
+            "TRANSCRIPT",
+        ) {
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
+        }
+        working_cursor.updated_ts_ns = unix_time_ns_now();
+        store_cursor(db, &working_cursor, &mut cursor_revision_sha256)?;
+        cursor = working_cursor;
+        pass_rows += chunk.len();
+        new_parsed += chunk_parsed;
+        new_invalid += chunk_invalid;
+        LINES_PARSED_TOTAL.fetch_add(chunk_parsed, Ordering::Relaxed);
+        LINES_INVALID_TOTAL.fetch_add(chunk_invalid, Ordering::Relaxed);
+
+        if let Some(detail) = pending_error {
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
+        }
+        if reached_snapshot_eof || incomplete_tail {
+            break 'pass;
         }
     }
 
-    cursor.offset_bytes += processed_consumed_bytes as u64;
-    cursor.parsed_rows += new_parsed;
-    cursor.invalid_rows += new_invalid;
-    cursor.updated_ts_ns = unix_time_ns_now();
-    LINES_PARSED_TOTAL.fetch_add(new_parsed, Ordering::Relaxed);
-    LINES_INVALID_TOTAL.fetch_add(new_invalid, Ordering::Relaxed);
-    cancelled |= cancel.is_some_and(CancellationToken::is_cancelled);
-
-    if finalize && !cancelled {
-        cursor.source_complete = true;
-        cursor.completed_reason = Some(if completion_is_terminal(log_dir) {
-            "completion_status_terminal".to_owned()
-        } else {
-            "finalized_at_teardown".to_owned()
-        });
-        store_cursor(db, &cursor)?;
-        db.flush()
-            .map_err(|error| format!("TRANSCRIPT_FINAL_FLUSH_FAILED: {error}"))?;
-        // Physical read-back at completion: the row count under the spawn's
-        // key prefix must equal the lines ingested. A mismatch is a defect.
-        let physical_rows = db
-            .scan_cf_prefix(
-                cf::CF_AGENT_TRANSCRIPTS,
-                &agent_transcript_spawn_prefix(spawn_id),
-            )
-            .map_err(|error| format!("TRANSCRIPT_READBACK_FAILED: {error}"))?;
-        if physical_rows.len() as u64 != cursor.lines_ingested {
+    if finalize && reached_snapshot_eof && !cancelled {
+        let final_size = match std::fs::metadata(&stdout_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let detail = format!(
+                    "TRANSCRIPT_SOURCE_FINAL_STAT_FAILED: path={} cursor_offset_bytes={}: {error}; remediation=restore source metadata access before marking it complete",
+                    stdout_path.display(),
+                    cursor.offset_bytes
+                );
+                return Err(stick_cursor_error(
+                    db,
+                    &mut cursor,
+                    &mut cursor_revision_sha256,
+                    detail,
+                ));
+            }
+        };
+        if final_size < cursor.offset_bytes {
             let detail = format!(
-                "TRANSCRIPT_READBACK_MISMATCH: {} physical rows but cursor ingested {} lines",
-                physical_rows.len(),
-                cursor.lines_ingested
+                "TRANSCRIPT_SOURCE_TRUNCATED: path={} final_size_bytes={final_size} cursor_offset_bytes={}; remediation=restore the original append-only source bytes or reconcile all durable transcript rows before clearing the cursor",
+                stdout_path.display(),
+                cursor.offset_bytes
             );
-            return Err(stick_cursor_error(db, &mut cursor, detail));
+            return Err(stick_cursor_error(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+                detail,
+            ));
         }
-        match ensure_completed_spawn_end_state_anchored(db, &mut cursor)? {
-            Some(outcome) => {
-                tracing::info!(
-                    code = "TRANSCRIPT_END_STATE_ANCHORED",
-                    spawn_id,
-                    outcome,
-                    physical_rows = physical_rows.len(),
-                    "completed transcript source rows grounded from durable terminal event"
-                );
+        if final_size > cursor.offset_bytes {
+            tracing::info!(
+                code = "TRANSCRIPT_SOURCE_FINALIZATION_REBASED",
+                spawn_id,
+                source_path = %stdout_path.display(),
+                cursor_offset_bytes = cursor.offset_bytes,
+                final_size_bytes = final_size,
+                "source grew after the read snapshot; completion is deferred to the next bounded pass"
+            );
+        } else {
+            cursor.source_complete = true;
+            cursor.completed_reason = Some(if completion_terminal {
+                "completion_status_terminal".to_owned()
+            } else {
+                "finalized_at_teardown".to_owned()
+            });
+            cursor.updated_ts_ns = unix_time_ns_now();
+            store_cursor(db, &cursor, &mut cursor_revision_sha256)?;
+            if let Err(detail) = verify_transcript_cursor_boundary(db, &cursor) {
+                return Err(stick_cursor_error(
+                    db,
+                    &mut cursor,
+                    &mut cursor_revision_sha256,
+                    detail,
+                ));
             }
-            None => {
-                tracing::warn!(
-                    code = "TRANSCRIPT_END_STATE_ANCHOR_DEFERRED",
-                    spawn_id,
-                    physical_rows = physical_rows.len(),
-                    "completed transcript source has no durable terminal agent event yet; terminal event writer will anchor transcripts when it arrives"
-                );
+            match ensure_completed_spawn_end_state_anchored(
+                db,
+                &mut cursor,
+                &mut cursor_revision_sha256,
+            )? {
+                Some(outcome) => {
+                    tracing::info!(
+                        code = "TRANSCRIPT_END_STATE_ANCHORED",
+                        spawn_id,
+                        outcome,
+                        physical_rows = cursor.lines_ingested,
+                        "completed transcript source rows grounded from durable terminal event"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        code = "TRANSCRIPT_END_STATE_ANCHOR_DEFERRED",
+                        spawn_id,
+                        physical_rows = cursor.lines_ingested,
+                        "completed transcript source has no durable terminal agent event yet; terminal event writer will anchor transcripts when it arrives"
+                    );
+                }
             }
+            SOURCES_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                code = "TRANSCRIPT_SOURCE_COMPLETED",
+                spawn_id,
+                lines = cursor.lines_ingested,
+                parsed_rows = cursor.parsed_rows,
+                invalid_rows = cursor.invalid_rows,
+                physical_rows = cursor.lines_ingested,
+                reason = cursor.completed_reason.as_deref().unwrap_or("unknown"),
+                "readback=exact CF_AGENT_TRANSCRIPTS boundary rows + exact guarded CF_KV cursor edge=source_complete"
+            );
         }
-        SOURCES_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
-            code = "TRANSCRIPT_SOURCE_COMPLETED",
-            spawn_id,
-            lines = cursor.lines_ingested,
-            parsed_rows = cursor.parsed_rows,
-            invalid_rows = cursor.invalid_rows,
-            physical_rows = physical_rows.len(),
-            reason = cursor.completed_reason.as_deref().unwrap_or("unknown"),
-            "readback=CF_AGENT_TRANSCRIPTS edge=source_complete"
-        );
-    } else {
-        store_cursor(db, &cursor)?;
     }
 
     Ok(SpawnIngestOutcome {
@@ -799,7 +2233,16 @@ fn ingest_spawn_dir_once_with_cancel(
 fn ensure_completed_spawn_end_state_anchored(
     db: &Db,
     cursor: &mut TranscriptCursor,
+    cursor_revision_sha256: &mut Option<[u8; 32]>,
 ) -> Result<Option<String>, String> {
+    if let Err(detail) = verify_transcript_cursor_boundary(db, cursor) {
+        return Err(stick_cursor_error(
+            db,
+            cursor,
+            cursor_revision_sha256,
+            detail,
+        ));
+    }
     if cursor
         .end_state_anchor_rows
         .is_some_and(|rows| rows == cursor.lines_ingested)
@@ -808,40 +2251,92 @@ fn ensure_completed_spawn_end_state_anchored(
         return Ok(cursor.end_state_anchor_outcome.clone());
     }
 
-    let physical_rows = db
-        .scan_cf_prefix(
-            cf::CF_AGENT_TRANSCRIPTS,
-            &agent_transcript_spawn_prefix(&cursor.spawn_id),
-        )
-        .map_err(|error| format!("TRANSCRIPT_READBACK_FAILED: {error}"))?;
-    if physical_rows.len() as u64 != cursor.lines_ingested {
-        let detail = format!(
-            "TRANSCRIPT_READBACK_MISMATCH: {} physical rows but cursor ingested {} lines",
-            physical_rows.len(),
-            cursor.lines_ingested
-        );
-        return Err(stick_cursor_error(db, cursor, detail));
-    }
-
-    match anchor_spawn_end_state_from_storage(db, &cursor.spawn_id).map_err(|error| {
-        stick_cursor_error(
-            db,
-            cursor,
-            format!(
-                "TRANSCRIPT_END_STATE_ANCHOR_FAILED: could not ground completed spawn {} from durable terminal event: {error}",
-                cursor.spawn_id
-            ),
-        )
-    })? {
+    let anchor_outcome = match anchor_spawn_end_state_from_storage(db, &cursor.spawn_id) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let detail = format!(
+                "TRANSCRIPT_END_STATE_ANCHOR_FAILED: spawn_id={} source_path={} cursor_offset_bytes={}: {error}; remediation=repair the terminal event/transcript anchor publication and retry from the unchanged completed cursor",
+                cursor.spawn_id, cursor.source_path, cursor.offset_bytes
+            );
+            return Err(stick_cursor_error(
+                db,
+                cursor,
+                cursor_revision_sha256,
+                detail,
+            ));
+        }
+    };
+    match anchor_outcome {
         Some(outcome) => {
             cursor.end_state_anchor_outcome = Some(outcome.to_owned());
-            cursor.end_state_anchor_rows = Some(physical_rows.len() as u64);
+            cursor.end_state_anchor_rows = Some(cursor.lines_ingested);
             cursor.updated_ts_ns = unix_time_ns_now();
-            store_cursor(db, cursor)?;
+            store_cursor(db, cursor, cursor_revision_sha256)?;
             Ok(Some(outcome.to_owned()))
         }
         None => Ok(None),
     }
+}
+
+fn verify_transcript_cursor_boundary(db: &Db, cursor: &TranscriptCursor) -> Result<(), String> {
+    let counted_rows = cursor.parsed_rows.checked_add(cursor.invalid_rows).ok_or_else(|| {
+        format!(
+            "TRANSCRIPT_CURSOR_COUNTER_OVERFLOW: spawn_id={} parsed_rows={} invalid_rows={}; remediation=repair the corrupt cursor from physical transcript rows",
+            cursor.spawn_id, cursor.parsed_rows, cursor.invalid_rows
+        )
+    })?;
+    if counted_rows != cursor.lines_ingested {
+        return Err(format!(
+            "TRANSCRIPT_CURSOR_COUNTER_MISMATCH: spawn_id={} lines_ingested={} parsed_plus_invalid={counted_rows}; remediation=repair the corrupt cursor from physical transcript rows",
+            cursor.spawn_id, cursor.lines_ingested
+        ));
+    }
+    if cursor.lines_ingested == 0 {
+        return Ok(());
+    }
+
+    for line_no in [1, cursor.lines_ingested] {
+        let key = agent_transcript_key(&cursor.spawn_id, line_no);
+        let encoded = db
+            .get_cf(cf::CF_AGENT_TRANSCRIPTS, &key)
+            .map_err(|error| {
+                format!(
+                    "TRANSCRIPT_BOUNDARY_READBACK_FAILED: spawn_id={} source_path={} line_no={line_no} key_hex={}: {error}; remediation=repair the Calyx point-read path before accepting completion",
+                    cursor.spawn_id,
+                    cursor.source_path,
+                    synapse_storage::constellations::hex_encode(&key)
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "TRANSCRIPT_BOUNDARY_READBACK_MISSING: spawn_id={} source_path={} line_no={line_no} key_hex={}; remediation=restore the missing deterministic transcript row before accepting completion",
+                    cursor.spawn_id,
+                    cursor.source_path,
+                    synapse_storage::constellations::hex_encode(&key)
+                )
+            })?;
+        let record: AgentTranscriptRecord = decode_json(&encoded).map_err(|error| {
+            format!(
+                "TRANSCRIPT_BOUNDARY_READBACK_INVALID: spawn_id={} source_path={} line_no={line_no} key_hex={}: {error}; remediation=repair the corrupt transcript row before accepting completion",
+                cursor.spawn_id,
+                cursor.source_path,
+                synapse_storage::constellations::hex_encode(&key)
+            )
+        })?;
+        if record.spawn_id != cursor.spawn_id || record.line_no != line_no {
+            return Err(format!(
+                "TRANSCRIPT_BOUNDARY_IDENTITY_MISMATCH: expected_spawn_id={} actual_spawn_id={} expected_line_no={line_no} actual_line_no={}; remediation=repair the divergent deterministic transcript row before accepting completion",
+                cursor.spawn_id, record.spawn_id, record.line_no
+            ));
+        }
+        record.validate().map_err(|detail| {
+            format!(
+                "TRANSCRIPT_BOUNDARY_RECORD_INVALID: spawn_id={} line_no={line_no}: {detail}; remediation=repair the invalid durable transcript row before accepting completion",
+                cursor.spawn_id
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// One pass over every spawn dir under `root`. Per-spawn errors are sticky
@@ -861,33 +2356,101 @@ fn ingest_all_spawn_dirs_once_with_cancel(
     let mut cancelled = false;
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                code = "TRANSCRIPT_SPAWN_ROOT_ABSENT",
+                root = %root.display(),
+                "spawn root does not exist yet; physical inventory is empty"
+            );
+            return json!({"dirs_seen": 0, "new_rows": 0, "sources_completed": 0, "errors": 0});
+        }
         Err(error) => {
-            // Root absence is normal before the first spawn on a machine.
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::error!(
-                    code = "TRANSCRIPT_INGEST_CYCLE_FAILED",
-                    root = %root.display(),
-                    detail = %error,
-                    "transcript ingest cycle could not list the spawn root"
-                );
-            }
-            return json!({"dirs_seen": 0, "error": error.to_string()});
+            INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                code = "TRANSCRIPT_INGEST_CYCLE_FAILED",
+                root = %root.display(),
+                detail = %error,
+                remediation = "restore directory enumeration access; this cycle is explicitly incomplete",
+                "transcript ingest cycle could not list the spawn root"
+            );
+            return json!({"dirs_seen": 0, "errors": 1, "error": error.to_string()});
         }
     };
-    for entry in entries.flatten() {
+    for entry_result in entries {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             cancelled = true;
             break;
         }
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors += 1;
+                INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    code = "TRANSCRIPT_SPAWN_DIR_ENTRY_FAILED",
+                    root = %root.display(),
+                    detail = %error,
+                    remediation = "repair directory enumeration/permissions; this cycle is explicitly incomplete",
+                    "transcript ingest could not enumerate one spawn-root entry"
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(spawn_id) = name.to_str() else {
+            errors += 1;
+            INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                code = "TRANSCRIPT_SPAWN_DIR_NAME_NOT_UTF8",
+                root = %root.display(),
+                name_bytes = ?name,
+                remediation = "rename or remove the non-UTF-8 entry after reconciling whether it owns a transcript source",
+                "spawn-root entry cannot be represented as a Synapse spawn id"
+            );
             continue;
         };
-        if validate_spawn_id_shape(spawn_id).is_err() {
+        if let Err(detail) = validate_spawn_id_shape(spawn_id) {
+            if spawn_id.starts_with("agent-spawn-") {
+                errors += 1;
+                INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    code = "TRANSCRIPT_SPAWN_ID_INVALID",
+                    root = %root.display(),
+                    entry_name = spawn_id,
+                    detail = %detail,
+                    remediation = "rename/remove the malformed spawn entry only after reconciling whether it owns transcript bytes",
+                    "spawn-root entry looks owned by Synapse but has an invalid identity"
+                );
+            }
             continue;
         }
         let log_dir = entry.path();
-        if !log_dir.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                errors += 1;
+                INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    code = "TRANSCRIPT_SPAWN_DIR_TYPE_FAILED",
+                    spawn_id,
+                    path = %log_dir.display(),
+                    detail = %error,
+                    remediation = "repair metadata access to the spawn entry; this cycle is explicitly incomplete",
+                    "transcript ingest could not determine a spawn entry's type"
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            errors += 1;
+            INGEST_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                code = "TRANSCRIPT_SPAWN_ENTRY_NOT_DIRECTORY",
+                spawn_id,
+                path = %log_dir.display(),
+                remediation = "restore the Synapse spawn entry as its owned directory before ingesting transcript state",
+                "valid spawn identity is not backed by a directory; this cycle is explicitly incomplete"
+            );
             continue;
         }
         dirs_seen += 1;
@@ -905,9 +2468,16 @@ fn ingest_all_spawn_dirs_once_with_cancel(
                     break;
                 }
             }
-            Err(_detail) => {
-                // Already logged with full context by stick_cursor_error.
+            Err(detail) => {
                 errors += 1;
+                tracing::error!(
+                    code = "TRANSCRIPT_SPAWN_INGEST_FAILED",
+                    spawn_id,
+                    source_path = %log_dir.join("stdout.jsonl").display(),
+                    detail = %detail,
+                    remediation = "follow the structured error remediation; the cursor is never advanced past unverified state",
+                    "one spawn transcript failed during this explicitly incomplete cycle"
+                );
             }
         }
     }
@@ -957,13 +2527,26 @@ fn ingest_all_spawn_dirs_once_with_cancel(
 pub(crate) fn finalize_spawn_transcripts(db: &Db, spawn_id: &str, log_dir: &Path) {
     match finalize_spawn_transcripts_result(db, spawn_id, log_dir) {
         Ok(outcome) => {
-            tracing::info!(
-                code = "TRANSCRIPT_TEARDOWN_FLUSH_OK",
-                spawn_id,
-                new_rows = outcome.new_parsed_rows + outcome.new_invalid_rows,
-                lines_total = outcome.lines_ingested_total,
-                "teardown transcript flush completed"
-            );
+            if outcome.source_complete {
+                tracing::info!(
+                    code = "TRANSCRIPT_TEARDOWN_FLUSH_OK",
+                    spawn_id,
+                    new_rows = outcome.new_parsed_rows + outcome.new_invalid_rows,
+                    lines_total = outcome.lines_ingested_total,
+                    "teardown transcript flush reached and verified the physical source boundary"
+                );
+            } else {
+                tracing::info!(
+                    code = "TRANSCRIPT_TEARDOWN_FLUSH_BOUNDED",
+                    spawn_id,
+                    new_rows = outcome.new_parsed_rows + outcome.new_invalid_rows,
+                    lines_total = outcome.lines_ingested_total,
+                    max_rows_per_pass = MAX_AGENT_TRANSCRIPT_ROWS_PER_PASS,
+                    max_source_bytes_per_pass = MAX_AGENT_TRANSCRIPT_SOURCE_BYTES_PER_PASS,
+                    remediation = "the periodic ingester will continue bounded finalization from the exact cursor",
+                    "teardown transcript flush committed bounded progress without claiming source completion"
+                );
+            }
         }
         Err(detail) => {
             // Already logged with context; teardown carries on — the

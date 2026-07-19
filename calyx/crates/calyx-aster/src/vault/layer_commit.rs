@@ -1,4 +1,4 @@
-use super::{AsterVault, durable, encode, ledger_hook};
+use super::{AsterVault, durable, encode, ledger_hook, reject_raw_ledger_rows};
 use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Clock, Result, Seq};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -27,6 +27,7 @@ where
             .into_iter()
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
+        reject_raw_ledger_rows("write_cf_batch_with_ledger_entry", &data_rows)?;
         if data_rows.is_empty() {
             return Ok(self.latest_seq());
         }
@@ -60,9 +61,14 @@ where
             let ledger_ref = staged_ledger_ref(&staged)?;
             attach_ledger_ref_to_base_rows(&mut data_rows, &ledger_ref)?;
             rows.extend(data_rows);
-            let seq = self.commit_rows_locked(&rows)?;
-            ledger_hook::commit_staged(hook, &staged)?;
-            Ok(seq)
+            // A transient hook is reconstructed from the authoritative Ledger
+            // CF for every operation and is discarded when this scope exits.
+            // Advancing that disposable in-memory copy after the rows commit
+            // creates a fallible post-commit mutation with no observable
+            // benefit: an error would make an already-applied operation look
+            // retryable. Staging above performs all required validation; the
+            // committed Ledger rows are the next operation's source of truth.
+            self.commit_rows_locked(&rows)
         })
     }
 
@@ -74,6 +80,7 @@ where
         mut rows: Vec<encode::WriteRow>,
         entries: Vec<CfLedgerEntry>,
     ) -> Result<Seq> {
+        reject_raw_ledger_rows("write_cf_batch_with_ledger_entries_locked", &rows)?;
         if rows.is_empty() && entries.is_empty() {
             return Ok(self.latest_seq());
         }
@@ -109,9 +116,9 @@ where
             key: row.key().to_vec(),
             value: row.value().to_vec(),
         }));
-        let seq = self.commit_rows_locked(&rows)?;
-        ledger_hook::commit_staged(hook, &staged)?;
-        Ok(seq)
+        // See the single-entry path above: this hook is disposable and the
+        // just-committed Ledger CF is the only state the next call observes.
+        self.commit_rows_locked(&rows)
     }
 
     fn transient_ledger_hook(&self) -> Result<ledger_hook::AsterLedgerHook> {

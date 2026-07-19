@@ -54,7 +54,7 @@ use std::{
     fs,
     path::Path,
     sync::{
-        Mutex, OnceLock,
+        Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::UNIX_EPOCH,
@@ -68,7 +68,8 @@ use synapse_reflex::EventBus;
 use synapse_storage::{Db, StorageResult, agent_events::agent_event_scan_start, cf, decode_json};
 
 use super::agent_events::{
-    provider_for_agent_kind, record_agent_events, record_agent_events_unobserved, unix_time_ns_now,
+    AgentEventWriteReadback, TransitionJournalIntent, commit_agent_event_records_with_intents,
+    project_committed_agent_event_artifacts, provider_for_agent_kind, unix_time_ns_now,
 };
 
 /// Payload marker distinguishing machine-emitted `state_changed` rows from
@@ -175,7 +176,7 @@ impl AgentLifecycleState {
         }
     }
 
-    fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "spawning" => Some(Self::Spawning),
             "working" => Some(Self::Working),
@@ -657,7 +658,7 @@ pub(crate) fn liveness_config() -> LivenessConfig {
 /// The in-memory projection. Pure with respect to its inputs so unit tests
 /// drive planted event sequences directly; the daemon uses one process-wide
 /// instance behind [`tracker`].
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AgentStateTracker {
     agents: BTreeMap<String, AgentEntry>,
     session_to_anchor: BTreeMap<String, String>,
@@ -1362,6 +1363,30 @@ fn tracker() -> &'static Mutex<AgentStateTracker> {
     TRACKER.get_or_init(|| Mutex::new(AgentStateTracker::default()))
 }
 
+fn transition_pipeline() -> &'static Mutex<()> {
+    static PIPELINE: OnceLock<Mutex<()>> = OnceLock::new();
+    PIPELINE.get_or_init(|| Mutex::new(()))
+}
+
+/// Exact owner for the global agent-transition linearization boundary. It is
+/// exposed only to side-effect executors that must keep the boundary across an
+/// immediate physical operation on the same thread.
+pub(crate) struct TransitionPipelineGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+pub(crate) fn acquire_transition_pipeline_lock() -> Result<TransitionPipelineGuard, String> {
+    transition_pipeline()
+        .lock()
+        .map(|guard| TransitionPipelineGuard { _guard: guard })
+        .map_err(|poisoned| format!("agent transition pipeline lock poisoned: {poisoned}"))
+}
+
+pub(crate) fn with_transition_pipeline_lock<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
+    let _guard = acquire_transition_pipeline_lock()?;
+    Ok(operation())
+}
+
 static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
 
 /// Installs the SSE event bus so transitions reach live dashboards. Called
@@ -1370,133 +1395,326 @@ pub(crate) fn install_event_bus(bus: EventBus) {
     let _already_installed = EVENT_BUS.set(bus);
 }
 
-/// Feeds journal events into the process-wide tracker and journals any
-/// resulting transitions. Called by the `record_agent_events` choke point
-/// after the primary rows committed, so every writer feeds the machine and
-/// no writer can bypass it.
-pub(crate) fn observe_recorded_events(db: &Db, records: &[AgentEventRecord]) {
-    let transitions = {
-        let mut guard = match tracker().lock() {
-            Ok(guard) => guard,
-            Err(_poisoned) => {
-                tracing::error!(
-                    code = "AGENT_STATE_TRACKER_POISONED",
-                    record_count = records.len(),
-                    "agent state tracker lock poisoned; journal events not projected"
-                );
-                return;
-            }
+/// Atomically journals primary events, all derived state transitions, and the
+/// final per-anchor Pending escalation cursor before publishing any in-memory
+/// state. The tracker is staged on a clone and swapped only after independent
+/// physical readback proves the complete Calyx transaction.
+pub(crate) fn record_agent_events_transactionally(
+    db: &Db,
+    records: &[AgentEventRecord],
+) -> StorageResult<Vec<AgentEventWriteReadback>> {
+    for record in records {
+        let _encoded = super::agent_events::validate_and_encode(record)?;
+    }
+    let pipeline_guard = transition_pipeline().lock().map_err(|poisoned| {
+        synapse_storage::StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "AGENT_STATE_TRANSITION_PIPELINE_POISONED: atomic journal/projection coordinator is unavailable: {poisoned}"
+            ),
+        }
+    })?;
+    let mut live = tracker().lock().map_err(|poisoned| {
+        synapse_storage::StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "AGENT_STATE_TRACKER_POISONED: cannot stage atomic journal projection: {poisoned}"
+            ),
+        }
+    })?;
+    let mut candidate = live.clone();
+    let mut staged_transitions = Vec::<(usize, StateTransition)>::new();
+    for (record_index, record) in records.iter().enumerate() {
+        if !is_state_machine_row(record)
+            && let Some(transition) = candidate.apply_event(record)
+        {
+            staged_transitions.push((record_index, transition));
+        }
+    }
+
+    let now_ns = unix_time_ns_now();
+    let mut per_anchor_floor = BTreeMap::<String, u64>::new();
+    let mut transition_rows = Vec::with_capacity(staged_transitions.len());
+    for (trigger_index, transition) in &staged_transitions {
+        let floor = match per_anchor_floor.get(&transition.anchor).copied() {
+            Some(floor) => floor,
+            None => super::escalation::projection_generation_for_anchor(db, &transition.anchor)
+                .map_err(|error| synapse_storage::StorageError::ReadFailed {
+                    cf_name: cf::CF_KV.to_owned(),
+                    detail: format!(
+                        "AGENT_STATE_PROJECTION_CURSOR_READ_FAILED: anchor={:?} detail={}",
+                        transition.anchor, error.message
+                    ),
+                })?
+                .map(|generation| generation.journal_ts_ns)
+                .unwrap_or_default(),
         };
-        records
-            .iter()
-            .filter(|record| !is_state_machine_row(record))
-            .filter_map(|record| guard.apply_event(record))
-            .collect::<Vec<_>>()
-    };
-    emit_transitions(db, &transitions);
+        let proposed = now_ns.max(records[*trigger_index].ts_ns);
+        let transition_ts_ns = if proposed > floor {
+            proposed
+        } else {
+            floor.checked_add(1).ok_or_else(|| {
+                synapse_storage::StorageError::WriteFailed {
+                    cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                    detail: format!(
+                        "AGENT_STATE_GENERATION_EXHAUSTED: anchor={:?} durable journal timestamp reached u64::MAX",
+                        transition.anchor
+                    ),
+                }
+            })?
+        };
+        per_anchor_floor.insert(transition.anchor.clone(), transition_ts_ns);
+        transition_rows.push(transition_record(transition, transition_ts_ns));
+    }
+
+    let primary_count = records.len();
+    let mut combined_records = records.to_vec();
+    combined_records.extend(transition_rows);
+    let mut final_transition_by_anchor = BTreeMap::<String, (usize, StateTransition)>::new();
+    for (transition_index, (_trigger_index, transition)) in staged_transitions.iter().enumerate() {
+        final_transition_by_anchor.insert(
+            transition.anchor.clone(),
+            (primary_count + transition_index, transition.clone()),
+        );
+    }
+    let intents = final_transition_by_anchor
+        .values()
+        .map(|(record_index, transition)| TransitionJournalIntent {
+            record_index: *record_index,
+            transition: transition.clone(),
+        })
+        .collect::<Vec<_>>();
+    let committed =
+        commit_agent_event_records_with_intents(db, &combined_records, &intents).inspect_err(
+            |error| {
+                tracing::error!(
+                    code = "AGENT_EVENT_WRITE_FAILED",
+                    primary_record_count = records.len(),
+                    transition_count = staged_transitions.len(),
+                    cursor_count = intents.len(),
+                    detail = %error,
+                    "atomic primary-event/state-transition/projection-cursor commit failed; live tracker was not advanced"
+                );
+            },
+        )?;
+    *live = candidate;
+    drop(live);
+    drop(pipeline_guard);
+
+    project_committed_agent_event_artifacts(db, &committed);
+    publish_committed_transitions(
+        db,
+        &staged_transitions,
+        &final_transition_by_anchor,
+        primary_count,
+        &committed.readbacks,
+    );
+    Ok(committed.readbacks[..primary_count].to_vec())
 }
 
 /// One liveness pass over the process-wide tracker: process probes + silence
 /// thresholds. Returns the number of transitions emitted.
 pub(crate) fn liveness_sweep_once(db: &Db, now_unix_ms: u64) -> usize {
     let config = liveness_config();
-    let actions = {
-        let mut guard = match tracker().lock() {
-            Ok(guard) => guard,
-            Err(_poisoned) => {
-                tracing::error!(
-                    code = "AGENT_STATE_TRACKER_POISONED",
-                    "agent state tracker lock poisoned; liveness sweep skipped"
-                );
-                return 0;
-            }
-        };
-        guard.sweep(
-            now_unix_ms,
-            config.stuck_after_ms,
-            config.unprobeable_dead_after_ms,
-            &|pid| crate::m4::process_exists(pid),
-        )
+    let pipeline_guard = match transition_pipeline().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(
+                code = "AGENT_STATE_TRANSITION_PIPELINE_POISONED",
+                detail = %poisoned,
+                "liveness sweep could not acquire the atomic transition pipeline"
+            );
+            return 0;
+        }
     };
-    let mut emitted = 0usize;
-    if !actions.terminal_events.is_empty() {
-        match record_agent_events(db, &actions.terminal_events) {
-            Ok(_readbacks) => {
-                emitted = emitted.saturating_add(actions.terminal_events.len());
-            }
-            Err(error) => {
-                tracing::error!(
-                    code = "AGENT_STATE_TERMINAL_EVENT_WRITE_FAILED",
-                    event_count = actions.terminal_events.len(),
-                    detail = %error,
-                    "process-gone terminal agent events could not be journaled; tracker state was left unchanged so the next liveness pass can retry"
-                );
-            }
+    let mut live = match tracker().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(
+                code = "AGENT_STATE_TRACKER_POISONED",
+                detail = %poisoned,
+                "agent state tracker lock poisoned; liveness sweep skipped"
+            );
+            return 0;
+        }
+    };
+    let mut candidate = live.clone();
+    let actions = candidate.sweep(
+        now_unix_ms,
+        config.stuck_after_ms,
+        config.unprobeable_dead_after_ms,
+        &|pid| crate::m4::process_exists(pid),
+    );
+    let mut transitions = actions.transitions;
+    for event in &actions.terminal_events {
+        if let Some(transition) = candidate.apply_event(event) {
+            transitions.push(transition);
         }
     }
-    emit_transitions(db, &actions.transitions);
-    emitted.saturating_add(actions.transitions.len())
+    if actions.terminal_events.is_empty() && transitions.is_empty() {
+        *live = candidate;
+        return 0;
+    }
+    for record in &actions.terminal_events {
+        if let Err(error) = super::agent_events::validate_and_encode(record) {
+            tracing::error!(
+                code = "AGENT_STATE_TERMINAL_EVENT_WRITE_FAILED",
+                detail = %error,
+                "liveness terminal event failed validation; staged tracker was discarded"
+            );
+            return 0;
+        }
+    }
+
+    let now_ns = now_unix_ms.saturating_mul(1_000_000);
+    let mut per_anchor_floor = BTreeMap::<String, u64>::new();
+    let mut transition_rows = Vec::with_capacity(transitions.len());
+    for transition in &transitions {
+        let floor = match per_anchor_floor.get(&transition.anchor).copied() {
+            Some(floor) => floor,
+            None => {
+                match super::escalation::projection_generation_for_anchor(db, &transition.anchor) {
+                    Ok(generation) => generation
+                        .map(|generation| generation.journal_ts_ns)
+                        .unwrap_or_default(),
+                    Err(error) => {
+                        tracing::error!(
+                            code = "AGENT_STATE_PROJECTION_CURSOR_READ_FAILED",
+                            anchor = %transition.anchor,
+                            detail = %error.message,
+                            "liveness sweep could not stage a durable transition generation"
+                        );
+                        return 0;
+                    }
+                }
+            }
+        };
+        let transition_ts_ns = if now_ns > floor {
+            now_ns
+        } else if let Some(next) = floor.checked_add(1) {
+            next
+        } else {
+            tracing::error!(
+                code = "AGENT_STATE_GENERATION_EXHAUSTED",
+                anchor = %transition.anchor,
+                "liveness transition generation reached u64::MAX"
+            );
+            return 0;
+        };
+        per_anchor_floor.insert(transition.anchor.clone(), transition_ts_ns);
+        transition_rows.push(transition_record(transition, transition_ts_ns));
+    }
+    let primary_count = actions.terminal_events.len();
+    let mut combined_records = actions.terminal_events;
+    combined_records.extend(transition_rows);
+    let mut final_transition_by_anchor = BTreeMap::<String, (usize, StateTransition)>::new();
+    for (transition_index, transition) in transitions.iter().enumerate() {
+        final_transition_by_anchor.insert(
+            transition.anchor.clone(),
+            (primary_count + transition_index, transition.clone()),
+        );
+    }
+    let intents = final_transition_by_anchor
+        .values()
+        .map(|(record_index, transition)| TransitionJournalIntent {
+            record_index: *record_index,
+            transition: transition.clone(),
+        })
+        .collect::<Vec<_>>();
+    let committed = match commit_agent_event_records_with_intents(db, &combined_records, &intents) {
+        Ok(committed) => committed,
+        Err(error) => {
+            tracing::error!(
+                code = "AGENT_STATE_TERMINAL_EVENT_WRITE_FAILED",
+                terminal_event_count = primary_count,
+                transition_count = transitions.len(),
+                detail = %error,
+                "liveness journal/transition/cursor transaction failed; staged tracker was discarded for retry"
+            );
+            return 0;
+        }
+    };
+    *live = candidate;
+    drop(live);
+    drop(pipeline_guard);
+    project_committed_agent_event_artifacts(db, &committed);
+    let staged = transitions
+        .into_iter()
+        .map(|transition| (0_usize, transition))
+        .collect::<Vec<_>>();
+    publish_committed_transitions(
+        db,
+        &staged,
+        &final_transition_by_anchor,
+        primary_count,
+        &committed.readbacks,
+    );
+    primary_count.saturating_add(staged.len())
 }
 
-/// Journals + publishes transitions. A journal failure here is logged loudly
-/// (`AGENT_STATE_ROW_WRITE_FAILED`) but never unwinds the caller: the primary
-/// event rows already committed and the machine state is re-derivable from
-/// them, so refusing the committed write would be dishonest.
-fn emit_transitions(db: &Db, transitions: &[StateTransition]) {
+/// Publishes transition side effects only after the primary rows, derived
+/// transition rows, and final Pending cursors have committed atomically and
+/// been independently read back.
+fn publish_committed_transitions(
+    db: &Db,
+    transitions: &[(usize, StateTransition)],
+    final_transition_by_anchor: &BTreeMap<String, (usize, StateTransition)>,
+    primary_count: usize,
+    readbacks: &[AgentEventWriteReadback],
+) {
     if transitions.is_empty() {
         return;
     }
-    let now_ns = unix_time_ns_now();
-    let rows: Vec<AgentEventRecord> = transitions
-        .iter()
-        .map(|transition| transition_record(transition, now_ns))
-        .collect();
-    match record_agent_events_unobserved(db, &rows) {
-        Ok(readbacks) => {
-            let terminal = transitions
-                .iter()
-                .any(|transition| transition.state_to == AgentLifecycleState::Dead);
-            if terminal && let Err(error) = db.flush() {
-                tracing::error!(
-                    code = "AGENT_STATE_ROW_WRITE_FAILED",
-                    detail = %error,
-                    "terminal state row flush failed; row is batched but not yet crash-durable"
-                );
-            }
-            for (transition, readback) in transitions.iter().zip(&readbacks) {
-                tracing::info!(
-                    code = "AGENT_STATE_CHANGED",
-                    anchor = %transition.anchor,
-                    state_from = transition.state_from.as_str(),
-                    state_to = transition.state_to.as_str(),
-                    reason_code = %transition.reason_code,
-                    runaway = transition.runaway,
-                    ts_ns = readback.ts_ns,
-                    seq = readback.seq,
-                    "readback=CF_AGENT_EVENTS edge=state_machine"
-                );
-            }
-        }
-        Err(error) => {
+    for (transition_index, (_trigger_index, transition)) in transitions.iter().enumerate() {
+        let Some(readback) = readbacks.get(primary_count + transition_index) else {
             tracing::error!(
-                code = "AGENT_STATE_ROW_WRITE_FAILED",
-                transition_count = transitions.len(),
-                detail = %error,
-                "state transition rows could not be journaled; in-memory state advanced and is re-derivable from the primary events"
+                code = "AGENT_STATE_COMMIT_READBACK_INVALID",
+                transition_index,
+                primary_count,
+                readback_count = readbacks.len(),
+                "committed transition has no matching journal readback; projection publication stopped"
             );
-        }
+            return;
+        };
+        tracing::info!(
+            code = "AGENT_STATE_CHANGED",
+            anchor = %transition.anchor,
+            state_from = transition.state_from.as_str(),
+            state_to = transition.state_to.as_str(),
+            reason_code = %transition.reason_code,
+            runaway = transition.runaway,
+            journal_ts_ns = readback.ts_ns,
+            seq = readback.seq,
+            committed_seq = readback.committed_seq,
+            committed_revision = %synapse_storage::constellations::hex_encode(&readback.committed_revision_sha256),
+            journal_key = %synapse_storage::constellations::hex_encode(&readback.key),
+            "readback=CF_AGENT_EVENTS edge=state_machine"
+        );
     }
-    // #948: feed live attention-state transitions to the escalation engine
-    // after the authoritative rows commit. Replayed transitions go through
-    // `apply_event` directly (rebuild_from_journal), never here, so restart
-    // never re-fires historical escalations. A failure inside the engine is
-    // logged loudly there and never unwinds this committed write.
-    let now_unix_ms = now_ns / 1_000_000;
-    for transition in transitions {
-        super::escalation::note_transition(db, transition, now_unix_ms);
+    // Only the final transition for an anchor is externally projected from a
+    // multi-event batch. Every intermediate transition remains in the
+    // append-only journal, while the atomic cursor names the final reality.
+    for (record_index, transition) in final_transition_by_anchor.values() {
+        let Some(readback) = readbacks.get(*record_index) else {
+            tracing::error!(
+                code = "AGENT_STATE_COMMIT_READBACK_INVALID",
+                anchor = %transition.anchor,
+                record_index,
+                readback_count = readbacks.len(),
+                "final transition cursor has no matching journal readback"
+            );
+            continue;
+        };
+        super::escalation::note_transition(
+            db,
+            transition,
+            readback.ts_ns,
+            readback.seq,
+            readback.ts_ns / 1_000_000,
+        );
     }
     if let Some(bus) = EVENT_BUS.get() {
-        for transition in transitions {
+        for (_trigger_index, transition) in transitions {
             let report = bus.publish(Event {
                 seq: NEXT_BUS_EVENT_SEQ.fetch_add(1, Ordering::Relaxed),
                 at: chrono::Utc::now(),
@@ -1536,11 +1754,34 @@ fn transition_record(transition: &StateTransition, ts_ns: u64) -> AgentEventReco
     record.state_to = Some(transition.state_to.as_str().to_owned());
     record.payload = json!({
         "origin": STATE_MACHINE_ORIGIN,
+        "anchor": transition.anchor,
         "waiting_for": transition.waiting_for,
         "runaway": transition.runaway,
         "evidence": transition.evidence,
     });
     record
+}
+
+pub(crate) fn validate_transition_record_identity(
+    record: &AgentEventRecord,
+    transition: &StateTransition,
+) -> StorageResult<()> {
+    let expected = transition_record(transition, record.ts_ns);
+    let actual_bytes = synapse_storage::encode_json(record)?;
+    let expected_bytes = synapse_storage::encode_json(&expected)?;
+    if actual_bytes != expected_bytes {
+        return Err(synapse_storage::StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "AGENT_STATE_TRANSITION_RECORD_MISMATCH: anchor={:?} state_from={} state_to={} reason_code={:?}; refusing to bind a cursor to non-identical journal bytes",
+                transition.anchor,
+                transition.state_from.as_str(),
+                transition.state_to.as_str(),
+                transition.reason_code
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Readback of one journal replay.

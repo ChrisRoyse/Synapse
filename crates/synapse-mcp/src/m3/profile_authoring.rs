@@ -933,19 +933,14 @@ pub(crate) fn load_routine_automation_record(
 ) -> Result<Option<RoutineAutomationRecord>, ErrorData> {
     validate_routine_id_param("routine_inspect", routine_id)?;
     let key = routine_automation_key(routine_id);
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, key.as_bytes())
-        .map_err(|error| {
-            mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!("routine automation storage read failed: {error}"),
-            )
-        })?;
-    match rows
-        .into_iter()
-        .find(|(row_key, _)| row_key == key.as_bytes())
-    {
-        Some((_key, value)) => decode_json::<RoutineAutomationRecord>(&value)
+    let value = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("routine automation storage read failed: {error}"),
+        )
+    })?;
+    match value {
+        Some(value) => decode_json::<RoutineAutomationRecord>(&value)
             .map(Some)
             .map_err(|error| {
                 mcp_error(

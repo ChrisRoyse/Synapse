@@ -407,13 +407,11 @@ impl SynapseService {
         let from_row_exists_after = cf_row_exists(&db, &from_key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let to_row = db
-            .scan_cf_prefix(cf::CF_SESSIONS, &to_key)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?
-            .into_iter()
-            .find(|(row_key, _value)| row_key == &to_key);
+            .get_cf(cf::CF_SESSIONS, &to_key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let to_row_exists_after = to_row.is_some();
         let to_row_session_id = to_row
-            .map(|(_key, value)| {
+            .map(|value| {
                 synapse_storage::decode_json::<PersistedSessionLease>(&value)
                     .map(|lease| lease.session_id)
                     .map_err(|error| {
@@ -598,10 +596,10 @@ impl SynapseService {
     ) -> Result<Option<PersistedSessionTarget>, ErrorData> {
         let key = session_target_key(session_id);
         let db = self.session_continuity_db()?;
-        let rows = db
-            .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        let value = db
+            .get_cf(cf::CF_SESSIONS, &key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
+        let Some(value) = value else {
             return Ok(None);
         };
         let persisted =
@@ -630,10 +628,10 @@ impl SynapseService {
     ) -> Result<Option<PersistedSessionLease>, ErrorData> {
         let key = session_lease_key(session_id);
         let db = self.session_continuity_db()?;
-        let rows = db
-            .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        let value = db
+            .get_cf(cf::CF_SESSIONS, &key)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
+        let Some(value) = value else {
             return Ok(None);
         };
         let persisted =
@@ -744,10 +742,10 @@ fn read_persisted_session_target_from_db(
     session_id: &str,
 ) -> Result<Option<PersistedSessionTarget>, String> {
     let key = session_target_key(session_id);
-    let rows = db
-        .scan_cf_prefix(cf::CF_SESSIONS, &key)
+    let value = db
+        .get_cf(cf::CF_SESSIONS, &key)
         .map_err(|error| error.to_string())?;
-    let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
+    let Some(value) = value else {
         return Ok(None);
     };
     let persisted =
@@ -801,10 +799,8 @@ fn snapshot_persisted_session_lease_row_from_db(
 ) -> Result<PersistedSessionLeaseRowSnapshot, String> {
     let key = session_lease_key(session_id);
     let value = db
-        .scan_cf_prefix(cf::CF_SESSIONS, &key)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find_map(|(row_key, value)| (row_key == key).then_some(value));
+        .get_cf(cf::CF_SESSIONS, &key)
+        .map_err(|error| error.to_string())?;
     Ok(PersistedSessionLeaseRowSnapshot { value })
 }
 
@@ -897,10 +893,7 @@ fn delete_exact_session_row(db: &Db, key: Vec<u8>) -> Result<(), ErrorData> {
 }
 
 fn cf_row_exists(db: &Db, key: &[u8]) -> synapse_storage::StorageResult<bool> {
-    db.scan_cf_prefix(cf::CF_SESSIONS, key).map(|rows| {
-        rows.into_iter()
-            .any(|(row_key, _value)| row_key.as_slice() == key)
-    })
+    db.get_cf(cf::CF_SESSIONS, key).map(|value| value.is_some())
 }
 
 pub(crate) fn delete_persisted_cdp_target_owner_row(

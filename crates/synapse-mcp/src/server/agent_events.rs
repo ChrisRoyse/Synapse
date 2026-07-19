@@ -29,18 +29,19 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use synapse_core::{AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord};
 use synapse_storage::{
-    Db, GroundingAnchor, GroundingAnchorSource, StorageError, StorageResult,
-    agent_events::agent_event_key, agent_transcripts::agent_transcript_spawn_prefix, cf,
-    decode_json, encode_json,
+    CfRevisionGuard, Db, GroundingAnchor, GroundingAnchorSource, RevisionedRawValue, StorageError,
+    StorageResult, agent_events::agent_event_key, agent_transcripts::agent_transcript_spawn_prefix,
+    cf, decode_json, encode_json,
 };
 
 use crate::m3::grounding::{self, SOURCE_AGENT_EVENT};
@@ -56,15 +57,45 @@ pub(crate) const MAX_AGENT_EVENT_VALUE_BYTES: usize = 16 * 1024;
 /// within one clock tick; wraps harmlessly because `ts_ns` dominates the key.
 static NEXT_AGENT_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Calyx uses this code only after a WAL append may already be durable while
+/// the live MVCC view could not be made authoritative. Once an agent-event
+/// commit reaches that unresolved state, this process must never admit another
+/// logical retry: a fresh daemon/vault open is the recovery boundary that
+/// replays the durable WAL into one authoritative live view.
+const CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED: &str =
+    "CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED";
+static AGENT_EVENT_COMMIT_RECONCILIATION_LATCH: AtomicBool = AtomicBool::new(false);
+
+type ReconciledAtomicCommit = (u64, Vec<Option<[u8; 32]>>);
+
 static SESSION_REGISTRY_ACTIVITY_SINK: OnceLock<Mutex<Option<Weak<Mutex<SessionRegistry>>>>> =
     OnceLock::new();
 
 /// Physical readback of one persisted journal row.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentEventWriteReadback {
+    /// Observation timestamp carried by the encoded event value.
+    pub event_ts_ns: u64,
+    /// Durable journal-key timestamp.
     pub ts_ns: u64,
     pub seq: u32,
+    pub key: Vec<u8>,
+    pub committed_seq: u64,
+    pub committed_revision_sha256: [u8; 32],
+    pub value_sha256: [u8; 32],
     pub value_len_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransitionJournalIntent {
+    pub record_index: usize,
+    pub transition: super::agent_state::StateTransition,
+}
+
+pub(crate) struct CommittedAgentEventBatch {
+    pub records: Vec<AgentEventRecord>,
+    pub readbacks: Vec<AgentEventWriteReadback>,
+    source_rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Current unix time in nanoseconds. A clock before the epoch yields 0,
@@ -134,8 +165,7 @@ pub(crate) fn record_agent_events(
     db: &Db,
     records: &[AgentEventRecord],
 ) -> StorageResult<Vec<AgentEventWriteReadback>> {
-    let readbacks = record_agent_events_unobserved(db, records)?;
-    super::agent_state::observe_recorded_events(db, records);
+    let readbacks = super::agent_state::record_agent_events_transactionally(db, records)?;
     refresh_installed_session_registry_activity(records);
     Ok(readbacks)
 }
@@ -223,83 +253,560 @@ fn agent_event_counts_as_session_activity(kind: AgentEventKind) -> bool {
     )
 }
 
+fn ensure_agent_event_commit_reconciliation_clear() -> StorageResult<()> {
+    if AGENT_EVENT_COMMIT_RECONCILIATION_LATCH.load(Ordering::Acquire) {
+        return Err(agent_event_commit_reconciliation_error(
+            "admission_rejected_by_process_latch",
+            "a preceding agent-event transaction has an unresolved durable outcome",
+        ));
+    }
+    Ok(())
+}
+
+fn latch_agent_event_commit_reconciliation(
+    stage: &'static str,
+    detail: impl Into<String>,
+) -> StorageError {
+    let detail = detail.into();
+    let was_latched = AGENT_EVENT_COMMIT_RECONCILIATION_LATCH.swap(true, Ordering::AcqRel);
+    tracing::error!(
+        code = CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+        stage,
+        was_latched,
+        detail,
+        remediation = "stop this daemon, reopen the Calyx vault so the durable WAL is replayed into a fresh MVCC view, inspect the reported physical journal/cursor identities, and do not retry the logical event operation in this process",
+        "agent-event durable commit outcome is unresolved; process-wide event writes are now fail-stop latched"
+    );
+    agent_event_commit_reconciliation_error(stage, detail)
+}
+
+fn agent_event_commit_reconciliation_error(
+    stage: &'static str,
+    detail: impl Into<String>,
+) -> StorageError {
+    StorageError::CalyxWriteFailed {
+        cf_name: "<agent-event-journal-and-projection>".to_owned(),
+        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+        detail: format!(
+            "AGENT_EVENT_COMMIT_FAIL_STOP_LATCHED: stage={stage}; {}; remediation=stop this daemon, reopen the Calyx vault from durable WAL truth, inspect the exact journal/projection rows named by the preceding error, and do not retry the logical operation in this process",
+            detail.into()
+        ),
+        committed_seq: None,
+    }
+}
+
 /// The raw journal write path, without the state-machine projection. Only
 /// the state machine itself uses this directly (its own transition rows must
 /// not re-enter the reducer).
-pub(crate) fn record_agent_events_unobserved(
+pub(crate) fn commit_agent_event_records_with_intents(
     db: &Db,
     records: &[AgentEventRecord],
-) -> StorageResult<Vec<AgentEventWriteReadback>> {
-    let mut rows = Vec::with_capacity(records.len());
-    let mut constellation_rows = Vec::with_capacity(records.len());
-    let mut readbacks = Vec::with_capacity(records.len());
-    for record in records {
-        let encoded = validate_and_encode(record).inspect_err(|error| {
-            tracing::error!(
-                code = "AGENT_EVENT_WRITE_FAILED",
-                kind = ?record.kind,
-                session_id = ?record.session_id,
-                spawn_id = ?record.spawn_id,
-                reason_code = ?record.reason_code,
-                detail = %error,
-                "agent event refused before write"
-            );
-        })?;
-        let seq = NEXT_AGENT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
-        readbacks.push(AgentEventWriteReadback {
-            ts_ns: record.ts_ns,
-            seq,
-            value_len_bytes: encoded.len(),
+    intents: &[TransitionJournalIntent],
+) -> StorageResult<CommittedAgentEventBatch> {
+    const MAX_COMMIT_ATTEMPTS: usize = 16;
+    ensure_agent_event_commit_reconciliation_clear()?;
+    let encoded = records
+        .iter()
+        .map(|record| {
+            validate_and_encode(record).inspect_err(|error| {
+                tracing::error!(
+                    code = "AGENT_EVENT_WRITE_FAILED",
+                    kind = ?record.kind,
+                    session_id = ?record.session_id,
+                    spawn_id = ?record.spawn_id,
+                    reason_code = ?record.reason_code,
+                    detail = %error,
+                    "agent event refused before atomic journal/projection write"
+                );
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    if records.is_empty() {
+        if intents.is_empty() {
+            return Ok(CommittedAgentEventBatch {
+                records: Vec::new(),
+                readbacks: Vec::new(),
+                source_rows: Vec::new(),
+            });
+        }
+        return Err(StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail:
+                "AGENT_EVENT_WRITE_FAILED: transition intents cannot target an empty event batch"
+                    .to_owned(),
         });
-        let key = agent_event_key(record.ts_ns, seq);
-        constellation_rows.push((key.clone(), encoded.clone()));
-        rows.push((key, encoded));
     }
-    if rows.is_empty() {
-        return Ok(readbacks);
-    }
-    db.put_batch(cf::CF_AGENT_EVENTS, rows)
-        .inspect_err(|error| {
-            tracing::error!(
-                code = "AGENT_EVENT_WRITE_FAILED",
-                record_count = records.len(),
-                first_kind = ?records.first().map(|record| record.kind),
-                detail = %error,
-                "agent event batch enqueue failed"
-            );
+    let mut unique_intent_anchors = BTreeSet::new();
+    for intent in intents {
+        let record = records.get(intent.record_index).ok_or_else(|| StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "AGENT_EVENT_WRITE_FAILED: transition intent record_index={} is outside record_count={}",
+                intent.record_index,
+                records.len()
+            ),
         })?;
-    for ((record, readback), (source_key, raw_bytes)) in
-        records.iter().zip(&readbacks).zip(&constellation_rows)
+        super::agent_state::validate_transition_record_identity(record, &intent.transition)?;
+        if !unique_intent_anchors.insert(intent.transition.anchor.as_str()) {
+            return Err(StorageError::WriteFailed {
+                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                detail: format!(
+                    "AGENT_EVENT_WRITE_FAILED: atomic batch has more than one final projection cursor for anchor {:?}",
+                    intent.transition.anchor
+                ),
+            });
+        }
+    }
+
+    for commit_attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        let mut journal_rows = Vec::with_capacity(records.len());
+        let mut unique_keys = BTreeSet::new();
+        for (record, value) in records.iter().zip(&encoded) {
+            let seq = NEXT_AGENT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let key = agent_event_key(record.ts_ns, seq);
+            if !unique_keys.insert(key.clone()) {
+                tracing::warn!(
+                    code = "AGENT_EVENT_KEY_COLLISION_RETRY",
+                    commit_attempt,
+                    ts_ns = record.ts_ns,
+                    seq,
+                    "process-local sequence wrapped inside one batch; replanning all append-only keys"
+                );
+                journal_rows.clear();
+                break;
+            }
+            journal_rows.push((key, value.clone()));
+        }
+        if journal_rows.len() != records.len() {
+            continue;
+        }
+
+        let mut projection_rows = Vec::with_capacity(intents.len().saturating_mul(2));
+        for intent in intents {
+            let (journal_key, journal_value) = &journal_rows[intent.record_index];
+            let (journal_ts_ns, journal_seq) =
+                synapse_storage::agent_events::decode_agent_event_key(journal_key)?;
+            let prepared = super::escalation::prepare_pending_projection_cursor(
+                db,
+                &intent.transition,
+                super::escalation::TransitionGeneration {
+                    journal_ts_ns,
+                    journal_seq,
+                },
+                journal_key,
+                journal_value,
+                unix_time_ms_now(),
+            )
+            .map_err(|error| StorageError::WriteFailed {
+                cf_name: cf::CF_KV.to_owned(),
+                detail: format!(
+                    "AGENT_EVENT_PROJECTION_CURSOR_PREPARE_FAILED: anchor={:?} generation=({journal_ts_ns},{journal_seq}) detail={}",
+                    intent.transition.anchor, error.message
+                ),
+            })?;
+            projection_rows.push((
+                prepared.cursor_key,
+                prepared.cursor_value,
+                prepared.expected_cursor_revision_sha256,
+            ));
+            projection_rows.push((
+                prepared.index_key,
+                prepared.index_value,
+                prepared.expected_index_revision_sha256,
+            ));
+        }
+
+        let mut guards = Vec::with_capacity(journal_rows.len() + projection_rows.len());
+        for (key, _value) in &journal_rows {
+            guards.push(CfRevisionGuard::new(cf::CF_AGENT_EVENTS, key.clone(), None));
+        }
+        for (key, _value, expected_revision) in &projection_rows {
+            guards.push(CfRevisionGuard::new(
+                cf::CF_KV,
+                key.clone(),
+                *expected_revision,
+            ));
+        }
+        let kv_rows = projection_rows
+            .iter()
+            .map(|(key, value, _expected)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let batches = if kv_rows.is_empty() {
+            vec![(cf::CF_AGENT_EVENTS, journal_rows.clone())]
+        } else {
+            vec![
+                (cf::CF_AGENT_EVENTS, journal_rows.clone()),
+                (cf::CF_KV, kv_rows.clone()),
+            ]
+        };
+        let outcome = match db.put_cf_batches_if_revisions_pressure_bypass(guards.clone(), batches)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                match reconcile_failed_atomic_event_commit(
+                    db,
+                    &guards,
+                    &journal_rows,
+                    &kv_rows,
+                    &error,
+                )? {
+                    Some((committed_seq, committed_revisions)) => {
+                        tracing::error!(
+                            code = "AGENT_EVENT_COMMIT_RECONCILED_AFTER_ERROR",
+                            commit_attempt,
+                            committed_seq,
+                            record_count = records.len(),
+                            transition_cursor_count = intents.len(),
+                            projection_row_count = projection_rows.len(),
+                            original_error = %error,
+                            "all atomic journal/projection rows physically matched after the backend returned an error; accepting the committed reality"
+                        );
+                        return exact_committed_event_batch(
+                            db,
+                            records,
+                            &journal_rows,
+                            &kv_rows,
+                            committed_seq,
+                            &committed_revisions,
+                        )
+                        .map_err(|readback_error| {
+                            latch_agent_event_commit_reconciliation(
+                                "reconciled_commit_exact_readback_failed",
+                                format!(
+                                    "atomic rows matched the proposed values after backend_error={error}, but their exact revision/value readback failed: {readback_error}"
+                                ),
+                            )
+                        });
+                    }
+                    None => return Err(error),
+                }
+            }
+        };
+        if !outcome.applied {
+            tracing::warn!(
+                code = "AGENT_EVENT_ATOMIC_REVISION_RETRY",
+                commit_attempt,
+                max_attempts = MAX_COMMIT_ATTEMPTS,
+                conflict_guard_index = outcome
+                    .conflict
+                    .as_ref()
+                    .map(|conflict| conflict.guard_index),
+                conflict_key_len = outcome.conflict.as_ref().map(|conflict| conflict.key.len()),
+                observed_seq = outcome.committed_seq,
+                "append-only journal/projection transaction lost a physical revision race; replanning keys and cursor revisions"
+            );
+            continue;
+        }
+        return exact_committed_event_batch(
+            db,
+            records,
+            &journal_rows,
+            &kv_rows,
+            outcome.committed_seq,
+            &outcome.committed_revisions_sha256,
+        )
+        .map_err(|readback_error| {
+            latch_agent_event_commit_reconciliation(
+                "known_applied_commit_exact_readback_failed",
+                format!(
+                    "backend reported applied=true committed_seq={}, but exact revision/value readback failed: {readback_error}",
+                    outcome.committed_seq
+                ),
+            )
+        });
+    }
+    Err(StorageError::WriteFailed {
+        cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+        detail: format!(
+            "AGENT_EVENT_WRITE_FAILED: atomic journal/projection transaction could not acquire stable journal/cursor/Pending-index revisions after {MAX_COMMIT_ATTEMPTS} attempts"
+        ),
+    })
+}
+
+fn exact_committed_event_batch(
+    db: &Db,
+    records: &[AgentEventRecord],
+    journal_rows: &[(Vec<u8>, Vec<u8>)],
+    cursor_rows: &[(Vec<u8>, Vec<u8>)],
+    committed_seq: u64,
+    committed_revisions: &[Option<[u8; 32]>],
+) -> StorageResult<CommittedAgentEventBatch> {
+    let expected_guard_count = journal_rows.len().saturating_add(cursor_rows.len());
+    if committed_revisions.len() != expected_guard_count {
+        return Err(StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed revision count={} expected={expected_guard_count} committed_seq={committed_seq}",
+                committed_revisions.len()
+            ),
+        });
+    }
+    let mut readbacks = Vec::with_capacity(journal_rows.len());
+    for (index, ((key, expected_value), record)) in journal_rows.iter().zip(records).enumerate() {
+        let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed journal put has no revision: index={index} committed_seq={committed_seq}"
+            ),
+        })?;
+        let physical = exact_revisioned_row(
+            db,
+            cf::CF_AGENT_EVENTS,
+            key,
+            expected_value,
+            revision,
+            "agent journal row",
+        )?;
+        let (ts_ns, seq) = synapse_storage::agent_events::decode_agent_event_key(key)?;
+        readbacks.push(AgentEventWriteReadback {
+            event_ts_ns: record.ts_ns,
+            ts_ns,
+            seq,
+            key: key.clone(),
+            committed_seq,
+            committed_revision_sha256: physical.revision_sha256,
+            value_sha256: Sha256::digest(expected_value).into(),
+            value_len_bytes: expected_value.len(),
+        });
+    }
+    for (offset, (key, expected_value)) in cursor_rows.iter().enumerate() {
+        let index = journal_rows.len() + offset;
+        let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
+            cf_name: cf::CF_KV.to_owned(),
+            detail: format!(
+                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed projection cursor put has no revision: index={index} committed_seq={committed_seq}"
+            ),
+        })?;
+        let _physical = exact_revisioned_row(
+            db,
+            cf::CF_KV,
+            key,
+            expected_value,
+            revision,
+            "transition projection cursor/index row",
+        )?;
+    }
+    Ok(CommittedAgentEventBatch {
+        records: records.to_vec(),
+        readbacks,
+        source_rows: journal_rows.to_vec(),
+    })
+}
+
+fn exact_revisioned_row(
+    db: &Db,
+    cf_name: &str,
+    key: &[u8],
+    expected_value: &[u8],
+    expected_revision: [u8; 32],
+    identity: &str,
+) -> StorageResult<RevisionedRawValue> {
+    let physical = db.get_cf_revisioned(cf_name, key)?.ok_or_else(|| StorageError::ReadFailed {
+        cf_name: cf_name.to_owned(),
+        detail: format!(
+            "AGENT_EVENT_COMMIT_READBACK_MISSING: {identity} is absent immediately after commit key={} key_len={}",
+            synapse_storage::constellations::hex_encode(key),
+            key.len(),
+        ),
+    })?;
+    let actual_value = physical.value.as_deref().ok_or_else(|| StorageError::ReadFailed {
+        cf_name: cf_name.to_owned(),
+        detail: format!(
+            "AGENT_EVENT_COMMIT_READBACK_EXPIRED: {identity} is physically present but logically expired immediately after commit key={} key_len={}",
+            synapse_storage::constellations::hex_encode(key),
+            key.len(),
+        ),
+    })?;
+    if physical.revision_sha256 != expected_revision || actual_value != expected_value {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "AGENT_EVENT_COMMIT_READBACK_MISMATCH: {identity} revision_matches={} bytes_match={} key={} key_len={} expected_len={} actual_len={}",
+                physical.revision_sha256 == expected_revision,
+                actual_value == expected_value,
+                synapse_storage::constellations::hex_encode(key),
+                key.len(),
+                expected_value.len(),
+                actual_value.len()
+            ),
+        });
+    }
+    Ok(physical)
+}
+
+fn reconcile_failed_atomic_event_commit(
+    db: &Db,
+    guards: &[CfRevisionGuard],
+    journal_rows: &[(Vec<u8>, Vec<u8>)],
+    cursor_rows: &[(Vec<u8>, Vec<u8>)],
+    original_error: &StorageError,
+) -> StorageResult<Option<ReconciledAtomicCommit>> {
+    let durable_commit_ambiguous =
+        original_error.code() == CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
+    let planned = journal_rows
+        .iter()
+        .map(|(key, value)| (cf::CF_AGENT_EVENTS, key, value))
+        .chain(
+            cursor_rows
+                .iter()
+                .map(|(key, value)| (cf::CF_KV, key, value)),
+        )
+        .collect::<Vec<_>>();
+    if planned.len() != guards.len() {
+        let detail = format!(
+            "AGENT_EVENT_COMMIT_RECONCILIATION_INVALID: planned_rows={} guards={} original_error={original_error}",
+            planned.len(),
+            guards.len()
+        );
+        return Err(if durable_commit_ambiguous {
+            latch_agent_event_commit_reconciliation("invalid_reconciliation_plan", detail)
+        } else {
+            StorageError::WriteFailed {
+                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                detail,
+            }
+        });
+    }
+    let mut all_new = true;
+    let mut all_old = true;
+    let mut committed_revisions = Vec::with_capacity(planned.len());
+    let mut evidence = Vec::with_capacity(planned.len());
+    for (index, ((cf_name, key, expected_value), guard)) in
+        planned.into_iter().zip(guards).enumerate()
     {
-        let constellation = db
-            .put_agent_event_constellation(source_key, raw_bytes, record)
-            .inspect_err(|error| {
+        let physical = match db.get_cf_revisioned(cf_name, key) {
+            Ok(physical) => physical,
+            Err(read_error) if durable_commit_ambiguous => {
+                return Err(latch_agent_event_commit_reconciliation(
+                    "ambiguous_commit_physical_read_failed",
+                    format!(
+                        "could not classify proposed row index={index} cf={cf_name} key_len={} after original_error={original_error}: {read_error}",
+                        key.len()
+                    ),
+                ));
+            }
+            Err(read_error) => return Err(read_error),
+        };
+        let is_new = physical
+            .as_ref()
+            .and_then(|row| row.value.as_deref())
+            .is_some_and(|value| value == expected_value);
+        let is_old = match (&physical, guard.expected_revision_sha256) {
+            (None, None) => true,
+            (Some(row), Some(expected_revision)) => {
+                row.revision_sha256 == expected_revision && !is_new
+            }
+            _ => false,
+        };
+        all_new &= is_new;
+        all_old &= is_old;
+        committed_revisions.push(if is_new {
+            physical.as_ref().map(|row| row.revision_sha256)
+        } else {
+            None
+        });
+        evidence.push(format!(
+            "index={index}:cf={cf_name}:key_len={}:new={is_new}:old={is_old}:revision_present={}",
+            key.len(),
+            physical.is_some()
+        ));
+    }
+    if all_new {
+        let committed_seq = if durable_commit_ambiguous {
+            original_error.committed_seq().ok_or_else(|| {
+                latch_agent_event_commit_reconciliation(
+                    "ambiguous_commit_missing_wal_sequence",
+                    format!(
+                        "all proposed rows matched physical reality, but the Calyx error did not identify their exact wal_seq; refusing to substitute a potentially unrelated global latest_seq: original_error={original_error}; evidence={}",
+                        evidence.join(",")
+                    ),
+                )
+            })?
+        } else {
+            db.calyx_vault_status()?
+                .latest_seq
+                .ok_or_else(|| StorageError::ReadFailed {
+                    cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                    detail: "AGENT_EVENT_COMMIT_RECONCILIATION_FAILED: Calyx status has no latest_seq after exact committed-row readback".to_owned(),
+                })?
+        };
+        return Ok(Some((committed_seq, committed_revisions)));
+    }
+    if all_old {
+        if durable_commit_ambiguous {
+            return Err(latch_agent_event_commit_reconciliation(
+                "ambiguous_commit_all_old_live_read",
+                format!(
+                    "Calyx reported that the WAL may already contain this transaction, but every live row still matched its pre-commit guard. An all-old MVCC read cannot prove the logical operation uncommitted and must never authorize retry: original_error={original_error}; evidence={}",
+                    evidence.join(",")
+                ),
+            ));
+        }
+        return Ok(None);
+    }
+    Err(latch_agent_event_commit_reconciliation(
+        "mixed_or_divergent_physical_state",
+        format!(
+            "backend error left mixed or divergent physical state; daemon must not retry. original_error={original_error}; evidence={}",
+            evidence.join(",")
+        ),
+    ))
+}
+
+pub(crate) fn project_committed_agent_event_artifacts(
+    db: &Db,
+    committed: &CommittedAgentEventBatch,
+) {
+    for ((record, readback), (source_key, raw_bytes)) in committed
+        .records
+        .iter()
+        .zip(&committed.readbacks)
+        .zip(&committed.source_rows)
+    {
+        match db.put_agent_event_constellation(source_key, raw_bytes, record) {
+            Ok(constellation) => {
+                tracing::debug!(
+                    code = "AGENT_EVENT_RECORDED",
+                    kind = ?record.kind,
+                    event_ts_ns = readback.event_ts_ns,
+                    journal_ts_ns = readback.ts_ns,
+                    seq = readback.seq,
+                    committed_seq = readback.committed_seq,
+                    session_id = ?record.session_id,
+                    spawn_id = ?record.spawn_id,
+                    value_len_bytes = readback.value_len_bytes,
+                    value_sha256 = %synapse_storage::constellations::hex_encode(&readback.value_sha256),
+                    constellation_panel = constellation.panel_name,
+                    constellation_disposition = constellation.disposition.as_str(),
+                    constellation_cx_id = %constellation.cx_id,
+                    "readback=CF_AGENT_EVENTS edge=atomic_journal_projection_commit"
+                );
+            }
+            Err(error) => {
                 tracing::error!(
                     code = "CALYX_AGENT_EVENT_CONSTELLATION_MEASUREMENT_FAILED",
                     kind = ?record.kind,
-                    ts_ns = readback.ts_ns,
+                    journal_ts_ns = readback.ts_ns,
                     seq = readback.seq,
+                    committed_seq = readback.committed_seq,
+                    operation_committed = true,
                     source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
                     detail = %error,
-                    "agent event row was written but native Calyx constellation measurement failed"
+                    "agent event and projection cursor are committed but native Calyx constellation measurement failed; inspect/reconcile the content-addressed projection"
                 );
-            })?;
-        tracing::debug!(
-            code = "AGENT_EVENT_RECORDED",
-            kind = ?record.kind,
-            ts_ns = readback.ts_ns,
-            seq = readback.seq,
-            session_id = ?record.session_id,
-            spawn_id = ?record.spawn_id,
-            value_len_bytes = readback.value_len_bytes,
-            constellation_panel = constellation.panel_name,
-            constellation_disposition = constellation.disposition.as_str(),
-            constellation_cx_id = %constellation.cx_id,
-            "readback=CF_AGENT_EVENTS edge=enqueued"
+            }
+        }
+    }
+    if let Err(error) = anchor_agent_event_outcomes(db, &committed.records, &committed.source_rows)
+    {
+        tracing::error!(
+            code = "AGENT_EVENT_OUTCOME_ANCHOR_FAILED",
+            record_count = committed.records.len(),
+            operation_committed = true,
+            detail = %error,
+            "agent event journal/projection transaction committed but a native Calyx outcome anchor failed; physical journal remains authoritative"
         );
     }
-    anchor_agent_event_outcomes(db, records, &constellation_rows)?;
-    Ok(readbacks)
 }
 
 fn anchor_agent_event_outcomes(
@@ -679,32 +1186,21 @@ fn nonblank_option(value: Option<&str>) -> Option<&str> {
     })
 }
 
-/// [`record_agent_event`] plus an explicit `Db::flush()` so the row is
-/// readable and crash-durable before this returns. Reserved for terminal
-/// lifecycle events (exited, killed, spawn failure, session deleted).
+/// Terminal-event compatibility entry point. The atomic guarded Calyx write
+/// already returns after its WAL/MVCC commit is durable; no second fallible
+/// flush is allowed to turn a known commit into an ambiguous retry signal.
 ///
 /// # Errors
 ///
-/// Returns [`StorageError::WriteFailed`] from the write or the flush.
+/// Returns [`StorageError::WriteFailed`] from the atomic write/readback path.
 pub(crate) fn record_agent_event_durable(
     db: &Db,
     record: &AgentEventRecord,
 ) -> StorageResult<AgentEventWriteReadback> {
-    let readback = record_agent_event(db, record)?;
-    db.flush().inspect_err(|error| {
-        tracing::error!(
-            code = "AGENT_EVENT_WRITE_FAILED",
-            kind = ?record.kind,
-            ts_ns = readback.ts_ns,
-            seq = readback.seq,
-            detail = %error,
-            "agent event terminal flush failed"
-        );
-    })?;
-    Ok(readback)
+    record_agent_event(db, record)
 }
 
-fn validate_and_encode(record: &AgentEventRecord) -> StorageResult<Vec<u8>> {
+pub(crate) fn validate_and_encode(record: &AgentEventRecord) -> StorageResult<Vec<u8>> {
     record
         .validate()
         .map_err(|detail| StorageError::WriteFailed {

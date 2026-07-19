@@ -122,7 +122,7 @@ where
             self.commit_persistent_ledger_staged_locked(
                 guard,
                 &staged,
-                "anchor_with_ledger_entry",
+                "anchors_with_ledger_entry",
             )?;
             Ok(ledger_ref)
         })
@@ -435,18 +435,8 @@ where
     }
 
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {
-        let key = ledger_key(seq);
-        if self
-            .vault
-            .read_cf_at(self.vault.snapshot(), ColumnFamily::Ledger, &key)?
-            .is_some()
-        {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "ledger seq {seq} already exists"
-            )));
-        }
         self.vault
-            .write_raw_ledger_row_without_hook(key, bytes.to_vec())
+            .write_raw_ledger_row_without_hook(seq, bytes)
             .map(|_| ())
     }
 
@@ -463,9 +453,6 @@ where
     }
 
     fn put_head_anchor(&mut self, anchor: &LedgerHeadAnchor) -> Result<()> {
-        if let Some(durable) = &self.vault.durable {
-            crate::ledger_head::write_head_anchor(durable.root(), anchor)?;
-        }
-        Ok(())
+        self.vault.validate_committed_ledger_head_anchor(anchor)
     }
 }

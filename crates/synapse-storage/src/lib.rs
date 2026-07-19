@@ -69,6 +69,34 @@ pub struct RevisionGuard {
     pub expected_revision_sha256: Option<[u8; 32]>,
 }
 
+/// One logical cross-CF revision precondition.
+///
+/// The logical column-family name is part of the guarded identity. This is
+/// used when facts that live in different Synapse collections must share one
+/// physical Calyx WAL/MVCC commit (for example an append-only journal row and
+/// its durable projection intent).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CfRevisionGuard {
+    pub cf_name: String,
+    pub key: Vec<u8>,
+    pub expected_revision_sha256: Option<[u8; 32]>,
+}
+
+impl CfRevisionGuard {
+    #[must_use]
+    pub fn new(
+        cf_name: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        expected_revision_sha256: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            cf_name: cf_name.into(),
+            key: key.into(),
+            expected_revision_sha256,
+        }
+    }
+}
+
 impl RevisionGuard {
     #[must_use]
     pub fn new(key: impl Into<Vec<u8>>, expected_revision_sha256: Option<[u8; 32]>) -> Self {
@@ -118,6 +146,41 @@ pub type CfWriteBatch<'a> = (&'a str, Vec<RawRow>);
 pub(crate) type OwnedCfWriteBatch = (String, Vec<RawRow>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
+/// One candidate-bounded page in a logical column family's physical Calyx
+/// namespace.
+///
+/// `resume_after_physical` is an opaque, exclusive physical Calyx cursor. It
+/// includes tombstoned or retention-expired candidates, so callers must pass
+/// it back unchanged to the next call for the same column family whenever
+/// `more` is true, even when `rows` is empty. It must never be interpreted as
+/// a logical Synapse row key or reused with another column family.
+///
+/// `candidate_rows_examined` counts merged physical-key candidates, including
+/// at most one continuation lookahead; it is not an SST row/file/byte count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalScanPage {
+    pub rows: Vec<RawRow>,
+    pub resume_after_physical: Option<Vec<u8>>,
+    pub more: bool,
+    pub snapshot_seq: Option<u64>,
+    pub candidate_rows_examined: usize,
+    pub expired_rows_skipped: usize,
+}
+
+impl PhysicalScanPage {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            resume_after_physical: None,
+            more: false,
+            snapshot_seq: None,
+            candidate_rows_examined: 0,
+            expired_rows_skipped: 0,
+        }
+    }
+}
+
 /// One candidate-bounded fixed-width scan page.
 ///
 /// `resume_after` is the last logical candidate consumed into this page,
@@ -271,13 +334,43 @@ impl Db {
     /// # Errors
     ///
     /// Returns a storage error when any column family is missing or the
-    /// selected backend rejects the multi-CF batch/flush.
+    /// selected backend rejects the multi-CF batch.
     #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
     pub fn put_cf_batches_pressure_bypass(
         &self,
         batches: Vec<CfWriteBatch<'_>>,
     ) -> StorageResult<()> {
         self.backend.put_cf_batches_pressure_bypass(
+            batches
+                .into_iter()
+                .map(|(cf_name, rows)| (cf_name.to_owned(), rows))
+                .collect(),
+        )
+    }
+
+    /// Atomically writes rows across logical column families when every
+    /// guarded row still has the expected physical Calyx-envelope revision.
+    ///
+    /// Every guard may identify at most one row in `batches`; a guard with no
+    /// matching mutation is an atomic read-only precondition. The complete
+    /// mutation must contain at least one row and fit one physical Calyx WAL
+    /// record; an oversized request is rejected because splitting would
+    /// violate cross-CF atomicity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error for invalid/duplicate identities,
+    /// an oversized atomic batch, or any Calyx admission, WAL, MVCC, or
+    /// durability failure. Revision conflicts are non-error outcomes with
+    /// `applied = false`.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn put_cf_batches_if_revisions_pressure_bypass(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<CfWriteBatch<'_>>,
+    ) -> StorageResult<RevisionGuardedMutationOutcome> {
+        self.backend.put_cf_batches_if_revisions_pressure_bypass(
+            guards,
             batches
                 .into_iter()
                 .map(|(cf_name, rows)| (cf_name.to_owned(), rows))
@@ -317,7 +410,7 @@ impl Db {
     /// # Errors
     ///
     /// Returns a storage error for malformed/oversized batches or any Calyx
-    /// admission, WAL, MVCC, flush, or readback failure. A concurrent revision
+    /// admission, WAL, MVCC, or durability failure. A concurrent revision
     /// conflict is returned as `applied = false`.
     #[tracing::instrument(skip_all, fields(cf_name, guard_key_len = guard_key.len(), backend = self.backend_name()))]
     pub fn put_batch_if_revision_pressure_bypass<I, K, V>(
@@ -346,19 +439,21 @@ impl Db {
     /// guard's exact physical Calyx-envelope revision still matches.
     ///
     /// Guards and guard keys must be non-empty and unique. Mutation keys must
-    /// be unique across `deletes` and `puts`, and every guard key must occur
-    /// exactly once in that combined mutation. The entire physical mutation
-    /// must fit one WAL record; this method rejects batches that would require
-    /// chunk splitting. Calyx encodes puts as retention envelopes and deletes
-    /// as physical MVCC tombstones before performing one guarded commit. It
-    /// flushes only after an applied commit.
+    /// be unique across `deletes` and `puts`; a guard key may occur at most
+    /// once in that combined mutation. A guard without a mutation is an atomic
+    /// read-only precondition whose revision remains unchanged. The entire
+    /// physical mutation must fit one WAL record; this method rejects batches
+    /// that would require chunk splitting. Calyx encodes puts as retention
+    /// envelopes and deletes as physical MVCC tombstones before performing one
+    /// guarded commit. The durable outcome is returned directly; router/SST
+    /// flush is separate maintenance and cannot overwrite an applied result.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::RevisionGuardedMutationFailed`] for malformed
     /// guard/mutation input, oversized atomic batches, or invalid backend
-    /// outcome shape. Calyx read, admission, WAL, MVCC, durability, and flush
-    /// failures retain their structured backend error codes. Revision
+    /// outcome shape. Calyx read, admission, WAL, MVCC, and durability failures
+    /// retain their structured backend error codes. Revision
     /// conflicts are non-error outcomes with `applied = false`.
     #[tracing::instrument(skip_all, fields(cf_name, backend = self.backend_name()))]
     pub fn mutate_batch_if_revisions_pressure_bypass<G, D, DK, P, PK, PV>(
@@ -966,6 +1061,31 @@ impl Db {
         max_rows: usize,
     ) -> StorageResult<ScanWindow> {
         self.backend.scan_cf_from(cf_name, start_key, max_rows)
+    }
+
+    /// Reads one candidate-bounded physical page from a logical column
+    /// family's Calyx namespace without materializing the whole namespace.
+    ///
+    /// `after_physical` is the opaque exclusive cursor returned by the prior
+    /// page's [`PhysicalScanPage::resume_after_physical`]. The backend validates
+    /// that it belongs to `cf_name` and advances strictly. The returned rows
+    /// contain decoded logical Synapse keys/payloads; cursor ordering remains
+    /// physical and must not be used to infer logical-key ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the CF/cursor is invalid, the requested
+    /// page exceeds Calyx's hard candidate ceiling, the backend violates its
+    /// cursor/budget contract, or any physical key/value envelope is corrupt.
+    #[tracing::instrument(skip_all, fields(cf_name, after_physical_len = after_physical.map_or(0, <[u8]>::len), max_rows, backend = self.backend_name()))]
+    pub fn scan_cf_physical_page(
+        &self,
+        cf_name: &str,
+        after_physical: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage> {
+        self.backend
+            .scan_cf_physical_page(cf_name, after_physical, max_rows)
     }
 
     /// Scans up to `max_rows` rows in `[start_key, end_key)`.

@@ -1635,10 +1635,9 @@ fn read_model_row_optional(
 
 fn scan_exact_row(db: &Arc<Db>, row_key: &str) -> Result<Option<RawRow>, ErrorData> {
     let key_bytes = row_key.as_bytes();
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, key_bytes)
-        .map_err(storage_error)?;
-    Ok(rows.into_iter().find(|(key, _value)| key == key_bytes))
+    db.get_cf(cf::CF_KV, key_bytes)
+        .map_err(storage_error)
+        .map(|value| value.map(|value| (key_bytes.to_vec(), value)))
 }
 
 fn decode_model_row(key: &[u8], value: &[u8]) -> Result<LocalModelRegistryRow, String> {

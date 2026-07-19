@@ -200,6 +200,7 @@ where
             commit_lock: Mutex::new(()),
             recurrence_write_lock: Mutex::new(()),
             ledger_state_reconciliation_required: std::sync::atomic::AtomicBool::new(false),
+            post_commit_error_seq: std::sync::atomic::AtomicU64::new(0),
             recovery_report,
             residency,
         })

@@ -2725,12 +2725,9 @@ fn session_store_db(m3_state: &SharedM3State) -> Result<Arc<Db>, String> {
 }
 
 fn session_store_row_exists(db: &Db, key: &[u8]) -> Result<bool, String> {
-    db.scan_cf_prefix(cf::CF_KV, key)
+    db.get_cf(cf::CF_KV, key)
         .map_err(|error| error.to_string())
-        .map(|rows| {
-            rows.into_iter()
-                .any(|(row_key, _value)| row_key.as_slice() == key)
-        })
+        .map(|value| value.is_some())
 }
 
 fn validate_lifecycle_session_id(session_id: &str) -> Result<(), ErrorData> {

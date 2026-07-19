@@ -6,10 +6,7 @@
 //! exact rows returned to the recipient.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
-use synapse_storage::{Db, cf};
+use synapse_storage::{Db, RevisionGuard, cf};
 
 use super::{
     ErrorData, Json, Parameters, SynapseService, mcp_error,
@@ -30,6 +27,9 @@ use super::{
 
 const SCHEMA_VERSION: u32 = 1;
 const MESSAGE_PREFIX: &str = "agent-mailbox/v1/recipient_hex/";
+const MAILBOX_GLOBAL_STATE_KEY: &str = "agent-mailbox/v2/meta/global_state";
+const MAILBOX_STATE_SCHEMA_VERSION: u32 = 1;
+const MAILBOX_MAX_CONFLICT_RETRIES: usize = 64;
 /// CF_KV key prefix for sender-visible receipt rows (#908). Distinct from the
 /// recipient message prefix so receipts never appear in an agent's own inbox.
 const RECEIPT_PREFIX: &str = "agent-mailbox/v1/receipt";
@@ -56,8 +56,6 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
 /// (#905) delivers through this kind; it is filterable via the `kinds` inbox
 /// filter so an agent can poll only its steering channel.
 pub(crate) const STEER_KIND: &str = "steer";
-
-static NEXT_MAILBOX_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +309,39 @@ pub struct AgentInboxResponse {
     pub readback_rows: Vec<MailboxRowReadback>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMailboxRepairParams {
+    pub recipient_session_id: String,
+    /// Operator-observed monotonic lower bound used when global state bytes are
+    /// malformed and therefore cannot safely supply their prior value.
+    pub minimum_last_enqueue_seq: u64,
+    /// Operator-observed monotonic lower bound used when recipient state bytes
+    /// are malformed. The repair never writes a generation below this value.
+    pub minimum_mutation_generation: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMailboxRepairResponse {
+    pub ok: bool,
+    pub recipient_session_id: String,
+    pub observed_global_message_rows: usize,
+    pub observed_global_max_sequence: u64,
+    pub observed_recipient_rows: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_decodable_global_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_decodable_recipient_generation: Option<u64>,
+    pub repaired_global_sequence: u64,
+    pub repaired_recipient_generation: u64,
+    pub repaired_recipient_count: u64,
+    pub committed_seq: u64,
+    pub global_state_readback: MailboxRowReadback,
+    pub recipient_state_readback: MailboxRowReadback,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentWaitResponse {
@@ -324,6 +355,67 @@ struct InboxScan {
     scanned_rows: usize,
     expired_keys: Vec<Vec<u8>>,
     messages: Vec<DecodedMailboxRow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MailboxGlobalState {
+    schema_version: u32,
+    last_enqueue_seq: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MailboxRecipientState {
+    schema_version: u32,
+    recipient_session_id: String,
+    physical_row_count: u64,
+    mutation_generation: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RevisionedMailboxGlobalState {
+    state: MailboxGlobalState,
+    revision_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct RevisionedMailboxRecipientState {
+    state: MailboxRecipientState,
+    revision_sha256: [u8; 32],
+}
+
+struct StableInboxSnapshot {
+    state: RevisionedMailboxRecipientState,
+    scan: InboxScan,
+}
+
+struct MailboxEnqueueCommit {
+    message: AgentMailboxMessage,
+    storage_readback: MailboxRowReadback,
+    queue_depth_before: usize,
+    queue_depth_after: usize,
+    expired_rows_deleted_before: usize,
+}
+
+struct MailboxEnqueueRequest<'a> {
+    from_session: &'a str,
+    to_session: &'a str,
+    kind: &'a str,
+    payload: &'a Value,
+    artifact_handle: Option<&'a str>,
+    ttl_ms: u64,
+    request_receipt: bool,
+}
+
+enum MailboxEnqueueOutcome {
+    Committed(Box<MailboxEnqueueCommit>),
+    Full {
+        queue_depth: usize,
+        expired_rows_deleted_before: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -547,13 +639,10 @@ impl SynapseService {
         validate_session_id(from_session)?;
         validate_send_params(&params)?;
         let db = self.mailbox_db()?;
-        let expired_rows_deleted_before = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
         let resolution = self.recipient_live_read(from_session, &params.to_session, now_unix_ms)?;
         let to_session = resolution.resolved_to_session.clone();
-        let depth_before = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
-        if depth_before >= MAX_INBOX_ROWS_PER_RECIPIENT {
-            return Err(mailbox_full_error(from_session, &to_session, depth_before));
-        }
+        let observed = stable_inbox_snapshot(&db, &to_session, now_unix_ms)?;
+        let observed_live_depth = observed.scan.messages.len();
         let command_payload = json!({
             "requested_to_session": &resolution.requested_to_session,
             "to_session": &to_session,
@@ -568,8 +657,10 @@ impl SynapseService {
             "recipient_lifecycle": &resolution.recipient.lifecycle,
             "recipient_session_id": &resolution.recipient.session_id,
             "replaced_recipient": &resolution.replaced_recipient,
-            "queue_depth_before": depth_before,
-            "expired_rows_deleted_before": expired_rows_deleted_before,
+            "observed_live_queue_depth_before": observed_live_depth,
+            "observed_physical_rows_before": observed.scan.scanned_rows,
+            "observed_expired_rows_before": observed.scan.expired_keys.len(),
+            "recipient_counter_generation": observed.state.state.mutation_generation,
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "agent_send",
@@ -581,35 +672,81 @@ impl SynapseService {
             Value::Null,
             "pending",
         ))?;
-
-        let seq = NEXT_MAILBOX_SEQ.fetch_add(1, Ordering::Relaxed);
-        let message_id = format!("agentmsg-{now_unix_ms:020}-{seq:020}");
-        let row_key = mailbox_row_key(&to_session, now_unix_ms, seq, &message_id);
-        let message = AgentMailboxMessage {
-            schema_version: SCHEMA_VERSION,
-            message_id: message_id.clone(),
-            row_key: row_key.clone(),
-            from_session: from_session.to_owned(),
-            to_session: to_session.clone(),
-            kind: params.kind.trim().to_owned(),
-            payload: params.payload,
-            artifact_handle: params.artifact_handle.map(|value| value.trim().to_owned()),
-            sent_at_unix_ms: now_unix_ms,
-            ttl_ms: params.ttl_ms,
-            expires_at_unix_ms: now_unix_ms.saturating_add(params.ttl_ms),
-            delivery_attempts: 0,
-            request_receipt: params.request_receipt,
+        let enqueue = enqueue_mailbox_message(
+            &db,
+            MailboxEnqueueRequest {
+                from_session,
+                to_session: &to_session,
+                kind: &params.kind,
+                payload: &params.payload,
+                artifact_handle: params.artifact_handle.as_deref(),
+                ttl_ms: params.ttl_ms,
+                request_receipt: params.request_receipt,
+            },
+            now_unix_ms,
+        );
+        let enqueue = match enqueue {
+            Ok(enqueue) => enqueue,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "agent_send",
+                        "steer",
+                        Some(from_session.to_owned()),
+                        Some(to_session),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": cf::CF_KV,
+                            "mutation_commit_proven": false,
+                            "remediation": "inspect the exact mailbox global/recipient state and message rows named by the structured error before retrying",
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
         };
-        let encoded = encode_mailbox_message(&message)?;
-        db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("write agent mailbox row {row_key}: {error}"),
-                )
-            })?;
-        let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
-        let queue_depth_after = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
+        let enqueue = match enqueue {
+            MailboxEnqueueOutcome::Committed(enqueue) => *enqueue,
+            MailboxEnqueueOutcome::Full {
+                queue_depth,
+                expired_rows_deleted_before,
+            } => {
+                let error = mailbox_full_error(from_session, &to_session, queue_depth);
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "agent_send",
+                        "steer",
+                        Some(from_session.to_owned()),
+                        Some(to_session),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": cf::CF_KV,
+                            "queue_depth": queue_depth,
+                            "max_rows": MAX_INBOX_ROWS_PER_RECIPIENT,
+                            "expired_rows_deleted_before": expired_rows_deleted_before,
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+        let message = enqueue.message;
+        let message_id = message.message_id.clone();
+        let row_key = message.row_key.clone();
+        let storage_readback = enqueue.storage_readback;
+        let queue_depth_before = enqueue.queue_depth_before;
+        let queue_depth_after = enqueue.queue_depth_after;
+        let expired_rows_deleted_before = enqueue.expired_rows_deleted_before;
 
         // Journal the delivery fact (#897). The mailbox row is already
         // committed, so a journal failure is surfaced with that context.
@@ -628,6 +765,8 @@ impl SynapseService {
             "payload_bytes": storage_readback.value_len_bytes,
             "value_sha256": &storage_readback.value_sha256,
             "expires_at_unix_ms": message.expires_at_unix_ms,
+            "queue_depth_before": queue_depth_before,
+            "queue_depth_after": queue_depth_after,
         });
         if let Err(error) = super::agent_events::record_agent_event(&db, &journal_record) {
             let tool_error =
@@ -668,6 +807,7 @@ impl SynapseService {
             kind = %message.kind,
             is_steer = message.kind == STEER_KIND,
             request_receipt = message.request_receipt,
+            queue_depth_before,
             queue_depth_after,
             expired_rows_deleted_before,
             value_sha256 = %storage_readback.value_sha256,
@@ -698,6 +838,7 @@ impl SynapseService {
                 "source_of_truth": cf::CF_KV,
                 "message_id": &response.message_id,
                 "row_key": &response.row_key,
+                "queue_depth_before": queue_depth_before,
                 "queue_depth_after": response.queue_depth_after,
                 "storage_readback": &response.storage_readback,
                 "request_receipt": response.request_receipt,
@@ -725,16 +866,13 @@ impl SynapseService {
         validate_kind_filter(&params.kinds)?;
         validate_session_id(session_id)?;
         let db = self.mailbox_db()?;
-        let mut scan = scan_inbox(&db, session_id, now_unix_ms)?;
-        if !scan.expired_keys.is_empty() {
-            db.delete_batch(cf::CF_KV, scan.expired_keys.clone())
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("delete expired mailbox rows for {session_id}: {error}"),
-                    )
-                })?;
-        }
+        // Sequence migration must complete before any legacy message can be
+        // deleted, otherwise the highest historical allocation could vanish
+        // while the durable high-watermark is being derived.
+        initialize_mailbox_global_state(&db, now_unix_ms)?;
+        let snapshot = stable_inbox_snapshot(&db, session_id, now_unix_ms)?;
+        let guarded_state = snapshot.state;
+        let mut scan = snapshot.scan;
 
         // Server-side kind filter (#908): keep only matching kinds, so a drain
         // never deletes messages the caller did not ask for.
@@ -800,16 +938,32 @@ impl SynapseService {
         if params.drain {
             write_read_receipts(&db, session_id, &scan.messages, now_unix_ms)?;
         }
-        if !delete_keys.is_empty() {
-            db.delete_batch(cf::CF_KV, delete_keys.clone())
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("delete drained mailbox rows for {session_id}: {error}"),
-                    )
-                })?;
-        }
-        let queue_depth_after = queue_depth_for_recipient(&db, session_id, now_unix_ms)?;
+        let mut all_delete_keys = scan.expired_keys.clone();
+        all_delete_keys.extend(delete_keys.iter().cloned());
+        delete_mailbox_rows_guarded(
+            &db,
+            session_id,
+            &guarded_state,
+            all_delete_keys,
+            now_unix_ms,
+            if params.drain {
+                "agent_inbox_drain"
+            } else {
+                "agent_inbox_expiry_cleanup"
+            },
+        )?;
+        let queue_depth_after = usize::try_from(
+            stable_inbox_snapshot(&db, session_id, now_unix_ms)?
+                .state
+                .state
+                .physical_row_count,
+        )
+        .map_err(|_error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!("mailbox counter overflows usize for {session_id:?}"),
+            )
+        })?;
         let messages = scan
             .messages
             .into_iter()
@@ -1080,7 +1234,6 @@ impl SynapseService {
         let resolved_recipients = recipients.len();
         let expires_at_unix_ms = now_unix_ms.saturating_add(params.ttl_ms);
         let db = self.mailbox_db()?;
-        let expired_rows_deleted_before = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
 
         let target_selector = if params.to.all {
             json!({ "all": true })
@@ -1101,7 +1254,7 @@ impl SynapseService {
             "source_of_truth": cf::CF_KV,
             "resolved_recipients": resolved_recipients,
             "expires_at_unix_ms": expires_at_unix_ms,
-            "expired_rows_deleted_before": expired_rows_deleted_before,
+            "capacity_source_of_truth": "per-recipient durable counter plus physical row audit",
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "agent_send_broadcast",
@@ -1117,8 +1270,20 @@ impl SynapseService {
         outcomes.reserve(recipients.len());
         let mut delivered_count = 0_usize;
         for to_session in recipients {
-            let depth = match queue_depth_for_recipient(&db, &to_session, now_unix_ms) {
-                Ok(depth) => depth,
+            let enqueue = match enqueue_mailbox_message(
+                &db,
+                MailboxEnqueueRequest {
+                    from_session,
+                    to_session: &to_session,
+                    kind: &params.kind,
+                    payload: &params.payload,
+                    artifact_handle: params.artifact_handle.as_deref(),
+                    ttl_ms: params.ttl_ms,
+                    request_receipt: params.request_receipt,
+                },
+                now_unix_ms,
+            ) {
+                Ok(enqueue) => enqueue,
                 Err(error) => {
                     self.command_audit_final(
                         super::command_audit::CommandAuditInput::mcp(
@@ -1144,126 +1309,34 @@ impl SynapseService {
                     return Err(error);
                 }
             };
-            if depth >= MAX_INBOX_ROWS_PER_RECIPIENT {
-                skipped_count += 1;
-                outcomes.push(RecipientOutcome {
-                    to_session,
-                    status: "skipped".to_owned(),
-                    message_id: None,
-                    row_key: None,
-                    storage_readback: None,
-                    skip_reason: Some(format!("recipient mailbox full ({depth} rows)")),
-                });
-                continue;
-            }
-            let seq = NEXT_MAILBOX_SEQ.fetch_add(1, Ordering::Relaxed);
-            let message_id = format!("agentmsg-{now_unix_ms:020}-{seq:020}");
-            let row_key = mailbox_row_key(&to_session, now_unix_ms, seq, &message_id);
-            let message = AgentMailboxMessage {
-                schema_version: SCHEMA_VERSION,
-                message_id: message_id.clone(),
-                row_key: row_key.clone(),
-                from_session: from_session.to_owned(),
-                to_session: to_session.clone(),
-                kind: params.kind.trim().to_owned(),
-                payload: params.payload.clone(),
-                artifact_handle: params.artifact_handle.clone().map(|v| v.trim().to_owned()),
-                sent_at_unix_ms: now_unix_ms,
-                ttl_ms: params.ttl_ms,
-                expires_at_unix_ms,
-                delivery_attempts: 0,
-                request_receipt: params.request_receipt,
-            };
-            let encoded = match encode_mailbox_message(&message) {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    self.command_audit_final(
-                        super::command_audit::CommandAuditInput::mcp(
-                            "agent_send_broadcast",
-                            "broadcast",
-                            Some(from_session.to_owned()),
-                            None,
-                            command_payload,
-                            command_before,
-                            json!({
-                                "source_of_truth": cf::CF_KV,
-                                "to_session": &to_session,
-                                "delivered_count": delivered_count,
-                                "skipped_count": skipped_count,
-                                "partial_recipients": outcomes,
-                            }),
-                            "error",
-                        )
-                        .with_error(
-                            super::command_audit::command_audit_error_from_error_data(&error),
-                        ),
-                    )?;
-                    return Err(error);
-                }
-            };
-            if let Err(error) =
-                db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
-            {
-                let error = mcp_error(
-                    error.code(),
-                    format!("write broadcast row {row_key}: {error}"),
-                );
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "agent_send_broadcast",
-                        "broadcast",
-                        Some(from_session.to_owned()),
-                        None,
-                        command_payload,
-                        command_before,
-                        json!({
-                            "source_of_truth": cf::CF_KV,
-                            "delivered_count": delivered_count,
-                            "skipped_count": skipped_count,
-                            "partial_recipients": outcomes,
-                        }),
-                        "error",
-                    )
-                    .with_error(
-                        super::command_audit::command_audit_error_from_error_data(&error),
-                    ),
-                )?;
-                return Err(error);
-            }
-            let storage_readback = match readback_exact_mailbox_row(&db, &row_key) {
-                Ok(readback) => readback,
-                Err(error) => {
-                    self.command_audit_final(
-                        super::command_audit::CommandAuditInput::mcp(
-                            "agent_send_broadcast",
-                            "broadcast",
-                            Some(from_session.to_owned()),
-                            None,
-                            command_payload,
-                            command_before,
-                            json!({
-                                "source_of_truth": cf::CF_KV,
-                                "row_key": &row_key,
-                                "delivered_count": delivered_count,
-                                "skipped_count": skipped_count,
-                                "partial_recipients": outcomes,
-                            }),
-                            "error",
-                        )
-                        .with_error(
-                            super::command_audit::command_audit_error_from_error_data(&error),
-                        ),
-                    )?;
-                    return Err(error);
+            let enqueue = match enqueue {
+                MailboxEnqueueOutcome::Committed(enqueue) => *enqueue,
+                MailboxEnqueueOutcome::Full {
+                    queue_depth,
+                    expired_rows_deleted_before,
+                } => {
+                    skipped_count += 1;
+                    outcomes.push(RecipientOutcome {
+                        to_session,
+                        status: "skipped".to_owned(),
+                        message_id: None,
+                        row_key: None,
+                        storage_readback: None,
+                        skip_reason: Some(format!(
+                            "recipient mailbox full ({queue_depth} rows); \
+                             expired_rows_deleted_before={expired_rows_deleted_before}"
+                        )),
+                    });
+                    continue;
                 }
             };
             delivered_count += 1;
             outcomes.push(RecipientOutcome {
                 to_session,
                 status: "delivered".to_owned(),
-                message_id: Some(message_id),
-                row_key: Some(row_key),
-                storage_readback: Some(storage_readback),
+                message_id: Some(enqueue.message.message_id),
+                row_key: Some(enqueue.message.row_key),
+                storage_readback: Some(enqueue.storage_readback),
                 skip_reason: None,
             });
         }
@@ -1417,6 +1490,263 @@ impl SynapseService {
             receipts,
         })
     }
+
+    pub(crate) fn mailbox_repair_state_impl(
+        &self,
+        params: AgentMailboxRepairParams,
+    ) -> Result<AgentMailboxRepairResponse, ErrorData> {
+        validate_session_id(&params.recipient_session_id)?;
+        if params.reason.trim().is_empty() {
+            return Err(params_error(
+                "mailbox state repair requires a non-empty audit reason",
+            ));
+        }
+        if params.reason.chars().count() > MAX_ARTIFACT_HANDLE_CHARS {
+            return Err(params_error(format!(
+                "mailbox state repair reason must be <= {MAX_ARTIFACT_HANDLE_CHARS} characters"
+            )));
+        }
+        let db = self.mailbox_db()?;
+        let now_unix_ms = unix_time_ms_now();
+        let recipient_state_key = mailbox_recipient_state_key(&params.recipient_session_id);
+        for retry in 0..MAILBOX_MAX_CONFLICT_RETRIES {
+            let raw_global = db
+                .get_cf_revisioned(cf::CF_KV, MAILBOX_GLOBAL_STATE_KEY.as_bytes())
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("read raw mailbox global state for repair: {error}"),
+                    )
+                })?;
+            let raw_recipient = db
+                .get_cf_revisioned(cf::CF_KV, recipient_state_key.as_bytes())
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("read raw mailbox recipient state for repair: {error}"),
+                    )
+                })?;
+            let previous_global = raw_global
+                .as_ref()
+                .and_then(|row| row.value.as_deref())
+                .and_then(|value| synapse_storage::decode_json::<MailboxGlobalState>(value).ok())
+                .filter(|state| state.schema_version == MAILBOX_STATE_SCHEMA_VERSION);
+            let previous_recipient = raw_recipient
+                .as_ref()
+                .and_then(|row| row.value.as_deref())
+                .and_then(|value| synapse_storage::decode_json::<MailboxRecipientState>(value).ok())
+                .filter(|state| {
+                    state.schema_version == MAILBOX_STATE_SCHEMA_VERSION
+                        && state.recipient_session_id == params.recipient_session_id
+                });
+            if raw_global.is_some()
+                && previous_global.is_none()
+                && params.minimum_last_enqueue_seq == 0
+            {
+                return Err(params_error(
+                    "mailbox repair found undecodable global state; \
+                     minimum_last_enqueue_seq must be the non-zero last known-good physical \
+                     sequence so repair cannot reuse an unknown allocation",
+                ));
+            }
+            if raw_recipient.is_some()
+                && previous_recipient.is_none()
+                && params.minimum_mutation_generation == 0
+            {
+                return Err(params_error(
+                    "mailbox repair found undecodable recipient state; \
+                     minimum_mutation_generation must be the non-zero last known-good physical \
+                     generation so repair cannot introduce an ABA revision",
+                ));
+            }
+
+            let all_rows = db
+                .scan_cf_prefix(cf::CF_KV, MESSAGE_PREFIX.as_bytes())
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("scan physical mailbox rows for explicit state repair: {error}"),
+                    )
+                })?;
+            let observed_global_message_rows = all_rows.len();
+            let mut observed_global_max_sequence = 0_u64;
+            for (key, encoded) in &all_rows {
+                decode_mailbox_row(key, encoded)?;
+                observed_global_max_sequence =
+                    observed_global_max_sequence.max(mailbox_sequence_from_row_key(key)?);
+            }
+            let recipient_scan = scan_inbox(&db, &params.recipient_session_id, now_unix_ms)?;
+            let repaired_recipient_count =
+                u64::try_from(recipient_scan.scanned_rows).map_err(|_error| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        "recipient mailbox row count overflows u64 during repair",
+                    )
+                })?;
+            let previous_decodable_global_sequence =
+                previous_global.as_ref().map(|state| state.last_enqueue_seq);
+            let previous_decodable_recipient_generation = previous_recipient
+                .as_ref()
+                .map(|state| state.mutation_generation);
+            let repaired_global_sequence = params
+                .minimum_last_enqueue_seq
+                .max(observed_global_max_sequence)
+                .max(previous_decodable_global_sequence.unwrap_or(0));
+            let generation_after_previous = previous_decodable_recipient_generation
+                .map(|generation| {
+                    generation.checked_add(1).ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            "mailbox recipient mutation generation is exhausted at u64::MAX",
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let repaired_recipient_generation = params
+                .minimum_mutation_generation
+                .max(generation_after_previous);
+            let repaired_global = MailboxGlobalState {
+                schema_version: MAILBOX_STATE_SCHEMA_VERSION,
+                last_enqueue_seq: repaired_global_sequence,
+                updated_unix_ms: now_unix_ms,
+            };
+            let repaired_recipient = MailboxRecipientState {
+                schema_version: MAILBOX_STATE_SCHEMA_VERSION,
+                recipient_session_id: params.recipient_session_id.clone(),
+                physical_row_count: repaired_recipient_count,
+                mutation_generation: repaired_recipient_generation,
+                updated_unix_ms: now_unix_ms,
+            };
+            let encoded_global = encode_mailbox_global_state(&repaired_global)?;
+            let encoded_recipient = encode_mailbox_recipient_state(&repaired_recipient)?;
+            let outcome = db
+                .mutate_batch_if_revisions_pressure_bypass(
+                    cf::CF_KV,
+                    [
+                        RevisionGuard::new(
+                            MAILBOX_GLOBAL_STATE_KEY.as_bytes(),
+                            raw_global
+                                .as_ref()
+                                .map(|revisioned| revisioned.revision_sha256),
+                        ),
+                        RevisionGuard::new(
+                            recipient_state_key.as_bytes(),
+                            raw_recipient
+                                .as_ref()
+                                .map(|revisioned| revisioned.revision_sha256),
+                        ),
+                    ],
+                    std::iter::empty::<Vec<u8>>(),
+                    [
+                        (
+                            MAILBOX_GLOBAL_STATE_KEY.as_bytes().to_vec(),
+                            encoded_global.clone(),
+                        ),
+                        (
+                            recipient_state_key.as_bytes().to_vec(),
+                            encoded_recipient.clone(),
+                        ),
+                    ],
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "AGENT_MAILBOX_REPAIR_COMMIT_FAILED: recipient={:?} guarded repair \
+                             failed: {error}",
+                            params.recipient_session_id
+                        ),
+                    )
+                })?;
+            if !outcome.applied {
+                tracing::warn!(
+                    code = "AGENT_MAILBOX_REPAIR_CONFLICT",
+                    recipient_session_id = %params.recipient_session_id,
+                    retry,
+                    "mailbox state changed during explicit repair; rereading every repair SoT"
+                );
+                continue;
+            }
+            let global_readback = read_mailbox_global_state_revisioned(&db)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    "AGENT_MAILBOX_REPAIR_GLOBAL_READBACK_MISSING",
+                )
+            })?;
+            let recipient_readback =
+                read_mailbox_recipient_state_revisioned(&db, &params.recipient_session_id)?
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            "AGENT_MAILBOX_REPAIR_RECIPIENT_READBACK_MISSING",
+                        )
+                    })?;
+            if global_readback.state != repaired_global
+                || recipient_readback.state != repaired_recipient
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_MAILBOX_REPAIR_READBACK_DRIFT: committed_seq={} \
+                         global_matches={} recipient_matches={}",
+                        outcome.committed_seq,
+                        global_readback.state == repaired_global,
+                        recipient_readback.state == repaired_recipient
+                    ),
+                ));
+            }
+            stable_inbox_snapshot(&db, &params.recipient_session_id, now_unix_ms)?;
+            tracing::warn!(
+                code = "AGENT_MAILBOX_STATE_REPAIRED",
+                recipient_session_id = %params.recipient_session_id,
+                reason = %params.reason,
+                observed_global_message_rows,
+                observed_global_max_sequence,
+                observed_recipient_rows = recipient_scan.scanned_rows,
+                previous_decodable_global_sequence,
+                previous_decodable_recipient_generation,
+                repaired_global_sequence,
+                repaired_recipient_generation,
+                repaired_recipient_count,
+                committed_seq = outcome.committed_seq,
+                "explicit guarded mailbox-state repair completed with separate physical readback"
+            );
+            return Ok(AgentMailboxRepairResponse {
+                ok: true,
+                recipient_session_id: params.recipient_session_id,
+                observed_global_message_rows,
+                observed_global_max_sequence,
+                observed_recipient_rows: recipient_scan.scanned_rows,
+                previous_decodable_global_sequence,
+                previous_decodable_recipient_generation,
+                repaired_global_sequence,
+                repaired_recipient_generation,
+                repaired_recipient_count,
+                committed_seq: outcome.committed_seq,
+                global_state_readback: MailboxRowReadback {
+                    cf_name: cf::CF_KV.to_owned(),
+                    row_key: MAILBOX_GLOBAL_STATE_KEY.to_owned(),
+                    value_len_bytes: encoded_global.len() as u64,
+                    value_sha256: hash_bytes(&encoded_global),
+                },
+                recipient_state_readback: MailboxRowReadback {
+                    cf_name: cf::CF_KV.to_owned(),
+                    row_key: recipient_state_key,
+                    value_len_bytes: encoded_recipient.len() as u64,
+                    value_sha256: hash_bytes(&encoded_recipient),
+                },
+            });
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_MAILBOX_REPAIR_CONTENTION: repair for {:?} conflicted \
+                 {MAILBOX_MAX_CONFLICT_RETRIES} times",
+                params.recipient_session_id
+            ),
+        ))
+    }
 }
 
 impl From<&AgentWaitParams> for AgentInboxParams {
@@ -1442,6 +1772,955 @@ fn wait_response(
     }
 }
 
+fn encode_mailbox_global_state(state: &MailboxGlobalState) -> Result<Vec<u8>, ErrorData> {
+    synapse_storage::encode_json(state).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!("encode durable mailbox global state: {error}"),
+        )
+    })
+}
+
+fn encode_mailbox_recipient_state(state: &MailboxRecipientState) -> Result<Vec<u8>, ErrorData> {
+    synapse_storage::encode_json(state).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "encode durable mailbox state for recipient {:?}: {error}",
+                state.recipient_session_id
+            ),
+        )
+    })
+}
+
+fn read_mailbox_global_state_revisioned(
+    db: &Db,
+) -> Result<Option<RevisionedMailboxGlobalState>, ErrorData> {
+    let revisioned = db
+        .get_cf_revisioned(cf::CF_KV, MAILBOX_GLOBAL_STATE_KEY.as_bytes())
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("read revisioned durable mailbox global state: {error}"),
+            )
+        })?;
+    let Some(revisioned) = revisioned else {
+        return Ok(None);
+    };
+    let value = revisioned.value.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_GLOBAL_STATE_EXPIRED: {MAILBOX_GLOBAL_STATE_KEY} has a physical \
+                 expired envelope; all mailbox enqueue operations are disabled"
+            ),
+        )
+    })?;
+    let state: MailboxGlobalState = synapse_storage::decode_json(&value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_GLOBAL_STATE_CORRUPTED: decode {MAILBOX_GLOBAL_STATE_KEY}: {error}; \
+                 all mailbox enqueue operations are disabled"
+            ),
+        )
+    })?;
+    if state.schema_version != MAILBOX_STATE_SCHEMA_VERSION {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_GLOBAL_STATE_VERSION_INVALID: {MAILBOX_GLOBAL_STATE_KEY} has \
+                 schema_version={}, expected {MAILBOX_STATE_SCHEMA_VERSION}",
+                state.schema_version
+            ),
+        ));
+    }
+    Ok(Some(RevisionedMailboxGlobalState {
+        state,
+        revision_sha256: revisioned.revision_sha256,
+    }))
+}
+
+fn read_mailbox_recipient_state_revisioned(
+    db: &Db,
+    session_id: &str,
+) -> Result<Option<RevisionedMailboxRecipientState>, ErrorData> {
+    let key = mailbox_recipient_state_key(session_id);
+    let revisioned = db
+        .get_cf_revisioned(cf::CF_KV, key.as_bytes())
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("read revisioned durable mailbox recipient state {key}: {error}"),
+            )
+        })?;
+    let Some(revisioned) = revisioned else {
+        return Ok(None);
+    };
+    let value = revisioned.value.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_RECIPIENT_STATE_EXPIRED: {key} has a physical expired envelope; \
+                 mailbox mutations for {session_id:?} are disabled"
+            ),
+        )
+    })?;
+    let state: MailboxRecipientState = synapse_storage::decode_json(&value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_RECIPIENT_STATE_CORRUPTED: decode {key}: {error}; mailbox \
+                     mutations for {session_id:?} are disabled"
+            ),
+        )
+    })?;
+    if state.schema_version != MAILBOX_STATE_SCHEMA_VERSION
+        || state.recipient_session_id != session_id
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_RECIPIENT_STATE_IDENTITY_INVALID: key={key} schema_version={} \
+                 expected_schema={MAILBOX_STATE_SCHEMA_VERSION} stored_recipient={:?} \
+                 expected_recipient={session_id:?}",
+                state.schema_version, state.recipient_session_id
+            ),
+        ));
+    }
+    Ok(Some(RevisionedMailboxRecipientState {
+        state,
+        revision_sha256: revisioned.revision_sha256,
+    }))
+}
+
+fn decode_mailbox_row(key: &[u8], encoded: &[u8]) -> Result<AgentMailboxMessage, ErrorData> {
+    let key_text = std::str::from_utf8(key).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("agent mailbox row key is not UTF-8: {error}"),
+        )
+    })?;
+    let message: AgentMailboxMessage = synapse_storage::decode_json(encoded).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("decode agent mailbox row {key_text}: {error}"),
+        )
+    })?;
+    if message.schema_version != SCHEMA_VERSION || message.row_key != key_text {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_ROW_IDENTITY_INVALID: key={key_text} schema_version={} \
+                 expected_schema={SCHEMA_VERSION} embedded_row_key={:?}",
+                message.schema_version, message.row_key
+            ),
+        ));
+    }
+    Ok(message)
+}
+
+fn mailbox_sequence_from_row_key(key: &[u8]) -> Result<u64, ErrorData> {
+    let key_text = std::str::from_utf8(key).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("agent mailbox row key is not UTF-8: {error}"),
+        )
+    })?;
+    let sequence_text = key_text.rsplit('/').nth(1).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("AGENT_MAILBOX_ROW_KEY_INVALID: missing sequence component in {key_text}"),
+        )
+    })?;
+    sequence_text.parse::<u64>().map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_ROW_KEY_INVALID: sequence {sequence_text:?} in {key_text} is not \
+                 a u64: {error}"
+            ),
+        )
+    })
+}
+
+fn initialize_mailbox_global_state(
+    db: &Db,
+    now_unix_ms: u64,
+) -> Result<RevisionedMailboxGlobalState, ErrorData> {
+    for retry in 0..MAILBOX_MAX_CONFLICT_RETRIES {
+        if let Some(state) = read_mailbox_global_state_revisioned(db)? {
+            return Ok(state);
+        }
+        let rows = db
+            .scan_cf_prefix(cf::CF_KV, MESSAGE_PREFIX.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("scan legacy mailbox rows while initializing sequence state: {error}"),
+                )
+            })?;
+        let mut max_sequence = 0_u64;
+        for (key, encoded) in rows {
+            decode_mailbox_row(&key, &encoded)?;
+            max_sequence = max_sequence.max(mailbox_sequence_from_row_key(&key)?);
+        }
+        let state = MailboxGlobalState {
+            schema_version: MAILBOX_STATE_SCHEMA_VERSION,
+            last_enqueue_seq: max_sequence,
+            updated_unix_ms: now_unix_ms,
+        };
+        let encoded = encode_mailbox_global_state(&state)?;
+        let outcome = db
+            .mutate_batch_if_revisions_pressure_bypass(
+                cf::CF_KV,
+                [RevisionGuard::new(
+                    MAILBOX_GLOBAL_STATE_KEY.as_bytes(),
+                    None,
+                )],
+                std::iter::empty::<Vec<u8>>(),
+                [(MAILBOX_GLOBAL_STATE_KEY.as_bytes().to_vec(), encoded)],
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("initialize guarded mailbox global sequence state: {error}"),
+                )
+            })?;
+        if !outcome.applied {
+            tracing::warn!(
+                code = "AGENT_MAILBOX_GLOBAL_STATE_INIT_CONFLICT",
+                retry,
+                "mailbox global-state initialization conflicted; rereading physical state"
+            );
+            continue;
+        }
+        let readback = read_mailbox_global_state_revisioned(db)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_GLOBAL_STATE_READBACK_MISSING: committed_seq={} but \
+                     {MAILBOX_GLOBAL_STATE_KEY} is absent",
+                    outcome.committed_seq
+                ),
+            )
+        })?;
+        if readback.state != state {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_GLOBAL_STATE_READBACK_DRIFT: committed_seq={} \
+                     expected_last_enqueue_seq={max_sequence} actual_last_enqueue_seq={}",
+                    outcome.committed_seq, readback.state.last_enqueue_seq
+                ),
+            ));
+        }
+        return Ok(readback);
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "AGENT_MAILBOX_GLOBAL_STATE_CONTENTION: initialization conflicted \
+             {MAILBOX_MAX_CONFLICT_RETRIES} times"
+        ),
+    ))
+}
+
+fn initialize_mailbox_recipient_state(
+    db: &Db,
+    session_id: &str,
+    now_unix_ms: u64,
+) -> Result<RevisionedMailboxRecipientState, ErrorData> {
+    let state_key = mailbox_recipient_state_key(session_id);
+    for retry in 0..MAILBOX_MAX_CONFLICT_RETRIES {
+        if let Some(state) = read_mailbox_recipient_state_revisioned(db, session_id)? {
+            return Ok(state);
+        }
+        let scan = scan_inbox(db, session_id, now_unix_ms)?;
+        let physical_row_count = u64::try_from(scan.scanned_rows).map_err(|_error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!("mailbox physical row count overflows u64 for {session_id:?}"),
+            )
+        })?;
+        let state = MailboxRecipientState {
+            schema_version: MAILBOX_STATE_SCHEMA_VERSION,
+            recipient_session_id: session_id.to_owned(),
+            physical_row_count,
+            mutation_generation: 0,
+            updated_unix_ms: now_unix_ms,
+        };
+        let encoded = encode_mailbox_recipient_state(&state)?;
+        let outcome = db
+            .mutate_batch_if_revisions_pressure_bypass(
+                cf::CF_KV,
+                [RevisionGuard::new(state_key.as_bytes(), None)],
+                std::iter::empty::<Vec<u8>>(),
+                [(state_key.as_bytes().to_vec(), encoded)],
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("initialize guarded mailbox recipient state {state_key}: {error}"),
+                )
+            })?;
+        if !outcome.applied {
+            tracing::warn!(
+                code = "AGENT_MAILBOX_RECIPIENT_STATE_INIT_CONFLICT",
+                session_id,
+                retry,
+                "mailbox recipient-state initialization conflicted; rereading physical state"
+            );
+            continue;
+        }
+        let readback =
+            read_mailbox_recipient_state_revisioned(db, session_id)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_MAILBOX_RECIPIENT_STATE_READBACK_MISSING: committed_seq={} but \
+                     {state_key} is absent",
+                        outcome.committed_seq
+                    ),
+                )
+            })?;
+        if readback.state != state {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_RECIPIENT_STATE_READBACK_DRIFT: committed_seq={} \
+                     expected_count={physical_row_count} actual_count={}",
+                    outcome.committed_seq, readback.state.physical_row_count
+                ),
+            ));
+        }
+        return Ok(readback);
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "AGENT_MAILBOX_RECIPIENT_STATE_CONTENTION: initialization for {session_id:?} \
+             conflicted {MAILBOX_MAX_CONFLICT_RETRIES} times"
+        ),
+    ))
+}
+
+fn stable_inbox_snapshot(
+    db: &Db,
+    session_id: &str,
+    now_unix_ms: u64,
+) -> Result<StableInboxSnapshot, ErrorData> {
+    for retry in 0..MAILBOX_MAX_CONFLICT_RETRIES {
+        let before = initialize_mailbox_recipient_state(db, session_id, now_unix_ms)?;
+        let scan = scan_inbox(db, session_id, now_unix_ms)?;
+        let after = read_mailbox_recipient_state_revisioned(db, session_id)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_RECIPIENT_STATE_MISSING: durable state for {session_id:?} \
+                     disappeared during a physical queue audit"
+                ),
+            )
+        })?;
+        if before.revision_sha256 != after.revision_sha256 {
+            tracing::debug!(
+                code = "AGENT_MAILBOX_SNAPSHOT_CONFLICT",
+                session_id,
+                retry,
+                "mailbox state changed during physical row scan; rereading both SoTs"
+            );
+            continue;
+        }
+        let physical_row_count = u64::try_from(scan.scanned_rows).map_err(|_error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!("mailbox physical row count overflows u64 for {session_id:?}"),
+            )
+        })?;
+        if after.state.physical_row_count != physical_row_count {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_COUNTER_DRIFT: recipient={session_id:?} durable_count={} \
+                     physical_count={physical_row_count} generation={}; mailbox mutations are \
+                     disabled until the counter is explicitly repaired from physical rows",
+                    after.state.physical_row_count, after.state.mutation_generation
+                ),
+            ));
+        }
+        return Ok(StableInboxSnapshot { state: after, scan });
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "AGENT_MAILBOX_SNAPSHOT_CONTENTION: recipient {session_id:?} changed during \
+             {MAILBOX_MAX_CONFLICT_RETRIES} consecutive physical queue audits"
+        ),
+    ))
+}
+
+fn next_recipient_state(
+    current: &MailboxRecipientState,
+    physical_row_count: u64,
+    now_unix_ms: u64,
+) -> Result<MailboxRecipientState, ErrorData> {
+    let mutation_generation = current.mutation_generation.checked_add(1).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_GENERATION_EXHAUSTED: recipient {:?} reached u64::MAX",
+                current.recipient_session_id
+            ),
+        )
+    })?;
+    Ok(MailboxRecipientState {
+        schema_version: MAILBOX_STATE_SCHEMA_VERSION,
+        recipient_session_id: current.recipient_session_id.clone(),
+        physical_row_count,
+        mutation_generation,
+        updated_unix_ms: now_unix_ms,
+    })
+}
+
+fn cleanup_expired_recipient_rows(
+    db: &Db,
+    session_id: &str,
+    now_unix_ms: u64,
+) -> Result<usize, ErrorData> {
+    let state_key = mailbox_recipient_state_key(session_id);
+    for retry in 0..MAILBOX_MAX_CONFLICT_RETRIES {
+        let snapshot = stable_inbox_snapshot(db, session_id, now_unix_ms)?;
+        if snapshot.scan.expired_keys.is_empty() {
+            return Ok(0);
+        }
+        let deleted = u64::try_from(snapshot.scan.expired_keys.len()).map_err(|_error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                "expired mailbox key count overflows u64",
+            )
+        })?;
+        let physical_row_count = snapshot
+            .state
+            .state
+            .physical_row_count
+            .checked_sub(deleted)
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_MAILBOX_COUNTER_UNDERFLOW: recipient={session_id:?} durable_count={} \
+                         expired_rows={deleted}",
+                        snapshot.state.state.physical_row_count
+                    ),
+                )
+            })?;
+        let next_state =
+            next_recipient_state(&snapshot.state.state, physical_row_count, now_unix_ms)?;
+        let encoded_state = encode_mailbox_recipient_state(&next_state)?;
+        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [RevisionGuard::new(
+                state_key.as_bytes(),
+                Some(snapshot.state.revision_sha256),
+            )],
+            snapshot.scan.expired_keys.clone(),
+            [(state_key.as_bytes().to_vec(), encoded_state)],
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let readback = stable_inbox_snapshot(db, session_id, now_unix_ms)?;
+                let mut all_absent = true;
+                for key in &snapshot.scan.expired_keys {
+                    let value = db.get_cf(cf::CF_KV, key).map_err(|read_error| {
+                        mcp_error(
+                            read_error.code(),
+                            format!(
+                                "AGENT_MAILBOX_EXPIRY_COMMIT_AMBIGUOUS: cleanup failed ({error}) \
+                                 and exact row readback failed for {}: {read_error}",
+                                String::from_utf8_lossy(key)
+                            ),
+                        )
+                    })?;
+                    all_absent &= value.is_none();
+                }
+                if all_absent
+                    && readback.state.state.mutation_generation >= next_state.mutation_generation
+                {
+                    tracing::warn!(
+                        code = "AGENT_MAILBOX_EXPIRY_AMBIGUOUS_COMMIT_RECONCILED",
+                        session_id,
+                        deleted,
+                        "separate physical row/counter readback proved expiry cleanup committed"
+                    );
+                    return usize::try_from(deleted).map_err(|_error| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            "deleted count overflows usize",
+                        )
+                    });
+                }
+                return Err(mcp_error(
+                    error.code(),
+                    format!(
+                        "AGENT_MAILBOX_EXPIRY_COMMIT_AMBIGUOUS: guarded expiry cleanup for \
+                         {session_id:?} failed ({error}); exact row/counter readback did not prove \
+                         the intended delete committed"
+                    ),
+                ));
+            }
+        };
+        if !outcome.applied {
+            tracing::warn!(
+                code = "AGENT_MAILBOX_EXPIRY_REVISION_CONFLICT",
+                session_id,
+                retry,
+                "guarded expiry cleanup conflicted; rereading queue state and rows"
+            );
+            continue;
+        }
+        stable_inbox_snapshot(db, session_id, now_unix_ms)?;
+        return usize::try_from(deleted).map_err(|_error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                "deleted count overflows usize",
+            )
+        });
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "AGENT_MAILBOX_EXPIRY_CONTENTION: cleanup for {session_id:?} conflicted \
+             {MAILBOX_MAX_CONFLICT_RETRIES} times"
+        ),
+    ))
+}
+
+fn delete_mailbox_rows_guarded(
+    db: &Db,
+    session_id: &str,
+    current: &RevisionedMailboxRecipientState,
+    mut delete_keys: Vec<Vec<u8>>,
+    now_unix_ms: u64,
+    context: &str,
+) -> Result<usize, ErrorData> {
+    delete_keys.sort();
+    delete_keys.dedup();
+    if delete_keys.is_empty() {
+        return Ok(0);
+    }
+    let delete_count = u64::try_from(delete_keys.len()).map_err(|_error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("{context} delete count overflows u64"),
+        )
+    })?;
+    let physical_row_count = current
+        .state
+        .physical_row_count
+        .checked_sub(delete_count)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_COUNTER_UNDERFLOW: context={context} recipient={session_id:?} \
+                     durable_count={} delete_count={delete_count}",
+                    current.state.physical_row_count
+                ),
+            )
+        })?;
+    let next_state = next_recipient_state(&current.state, physical_row_count, now_unix_ms)?;
+    let state_key = mailbox_recipient_state_key(session_id);
+    let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+        cf::CF_KV,
+        [RevisionGuard::new(
+            state_key.as_bytes(),
+            Some(current.revision_sha256),
+        )],
+        delete_keys.clone(),
+        [(
+            state_key.as_bytes().to_vec(),
+            encode_mailbox_recipient_state(&next_state)?,
+        )],
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let mut all_absent = true;
+            for key in &delete_keys {
+                let value = db.get_cf(cf::CF_KV, key).map_err(|read_error| {
+                    mcp_error(
+                        read_error.code(),
+                        format!(
+                            "AGENT_MAILBOX_DELETE_COMMIT_AMBIGUOUS: context={context} guarded \
+                             delete failed ({error}) and exact row readback failed for {}: \
+                             {read_error}",
+                            String::from_utf8_lossy(key)
+                        ),
+                    )
+                })?;
+                all_absent &= value.is_none();
+            }
+            let state_readback = read_mailbox_recipient_state_revisioned(db, session_id)?;
+            if all_absent
+                && state_readback.as_ref().is_some_and(|readback| {
+                    readback.state.mutation_generation >= next_state.mutation_generation
+                })
+            {
+                stable_inbox_snapshot(db, session_id, now_unix_ms)?;
+                tracing::warn!(
+                    code = "AGENT_MAILBOX_DELETE_AMBIGUOUS_COMMIT_RECONCILED",
+                    context,
+                    session_id,
+                    delete_count,
+                    "separate physical row/counter readback proved guarded deletion committed"
+                );
+                return Ok(delete_keys.len());
+            }
+            return Err(mcp_error(
+                error.code(),
+                format!(
+                    "AGENT_MAILBOX_DELETE_NOT_COMMITTED: context={context} recipient={session_id:?} \
+                     guarded delete failed: {error}; exact row/counter readback did not prove commit"
+                ),
+            ));
+        }
+    };
+    if !outcome.applied {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_MAILBOX_DELETE_CONFLICT: context={context} recipient={session_id:?} \
+                 counter generation changed before the guarded delete boundary; no row or counter \
+                 was mutated and the caller must reread the inbox"
+            ),
+        ));
+    }
+    let state_readback =
+        read_mailbox_recipient_state_revisioned(db, session_id)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_DELETE_STATE_MISSING: context={context} committed_seq={} \
+                 recipient={session_id:?}",
+                    outcome.committed_seq
+                ),
+            )
+        })?;
+    if state_readback.state.mutation_generation < next_state.mutation_generation {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_MAILBOX_DELETE_STATE_DRIFT: context={context} committed_seq={} \
+                 expected_generation={} actual_generation={}",
+                outcome.committed_seq,
+                next_state.mutation_generation,
+                state_readback.state.mutation_generation
+            ),
+        ));
+    }
+    for key in &delete_keys {
+        if db
+            .get_cf(cf::CF_KV, key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .is_some()
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_DELETE_READBACK_PRESENT: context={context} committed_seq={} \
+                     row={} remains physically present",
+                    outcome.committed_seq,
+                    String::from_utf8_lossy(key)
+                ),
+            ));
+        }
+    }
+    stable_inbox_snapshot(db, session_id, now_unix_ms)?;
+    Ok(delete_keys.len())
+}
+
+fn enqueue_mailbox_message(
+    db: &Db,
+    request: MailboxEnqueueRequest<'_>,
+    now_unix_ms: u64,
+) -> Result<MailboxEnqueueOutcome, ErrorData> {
+    let MailboxEnqueueRequest {
+        from_session,
+        to_session,
+        kind,
+        payload,
+        artifact_handle,
+        ttl_ms,
+        request_receipt,
+    } = request;
+    // Establish the durable historical high-watermark before expiry cleanup is
+    // allowed to delete any legacy row that may contain the maximum sequence.
+    initialize_mailbox_global_state(db, now_unix_ms)?;
+    let mut expired_rows_deleted_before =
+        cleanup_expired_recipient_rows(db, to_session, now_unix_ms)?;
+    let recipient_state_key = mailbox_recipient_state_key(to_session);
+    for retry in 0..MAILBOX_MAX_CONFLICT_RETRIES {
+        let snapshot = stable_inbox_snapshot(db, to_session, now_unix_ms)?;
+        if !snapshot.scan.expired_keys.is_empty() {
+            let deleted = cleanup_expired_recipient_rows(db, to_session, now_unix_ms)?;
+            expired_rows_deleted_before = expired_rows_deleted_before
+                .checked_add(deleted)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "expired mailbox cleanup count overflow for recipient {to_session:?}"
+                        ),
+                    )
+                })?;
+            continue;
+        }
+        let queue_depth_before =
+            usize::try_from(snapshot.state.state.physical_row_count).map_err(|_error| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!("mailbox counter overflows usize for {to_session:?}"),
+                )
+            })?;
+        if queue_depth_before > MAX_INBOX_ROWS_PER_RECIPIENT {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_CAPACITY_INVARIANT_VIOLATED: recipient={to_session:?} \
+                     durable_and_physical_count={queue_depth_before} exceeds \
+                     hard_cap={MAX_INBOX_ROWS_PER_RECIPIENT}; \
+                     enqueue is disabled until existing rows are drained or expired",
+                ),
+            ));
+        }
+        if queue_depth_before >= MAX_INBOX_ROWS_PER_RECIPIENT {
+            return Ok(MailboxEnqueueOutcome::Full {
+                queue_depth: queue_depth_before,
+                expired_rows_deleted_before,
+            });
+        }
+        let global = initialize_mailbox_global_state(db, now_unix_ms)?;
+        let next_sequence = global
+            .state
+            .last_enqueue_seq
+            .checked_add(1)
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    "AGENT_MAILBOX_SEQUENCE_EXHAUSTED: global mailbox sequence reached u64::MAX",
+                )
+            })?;
+        let message_id = format!("agentmsg-{now_unix_ms:020}-{next_sequence:020}");
+        let row_key = mailbox_row_key(to_session, now_unix_ms, next_sequence, &message_id);
+        let message = AgentMailboxMessage {
+            schema_version: SCHEMA_VERSION,
+            message_id,
+            row_key: row_key.clone(),
+            from_session: from_session.to_owned(),
+            to_session: to_session.to_owned(),
+            kind: kind.trim().to_owned(),
+            payload: payload.clone(),
+            artifact_handle: artifact_handle.map(str::trim).map(ToOwned::to_owned),
+            sent_at_unix_ms: now_unix_ms,
+            ttl_ms,
+            expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms),
+            delivery_attempts: 0,
+            request_receipt,
+        };
+        let encoded_message = encode_mailbox_message(&message)?;
+        let next_global = MailboxGlobalState {
+            schema_version: MAILBOX_STATE_SCHEMA_VERSION,
+            last_enqueue_seq: next_sequence,
+            updated_unix_ms: now_unix_ms,
+        };
+        let next_recipient = next_recipient_state(
+            &snapshot.state.state,
+            snapshot
+                .state
+                .state
+                .physical_row_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!("mailbox counter overflow for {to_session:?}"),
+                    )
+                })?,
+            now_unix_ms,
+        )?;
+        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [
+                RevisionGuard::new(
+                    MAILBOX_GLOBAL_STATE_KEY.as_bytes(),
+                    Some(global.revision_sha256),
+                ),
+                RevisionGuard::new(
+                    recipient_state_key.as_bytes(),
+                    Some(snapshot.state.revision_sha256),
+                ),
+                RevisionGuard::new(row_key.as_bytes(), None),
+            ],
+            std::iter::empty::<Vec<u8>>(),
+            [
+                (
+                    MAILBOX_GLOBAL_STATE_KEY.as_bytes().to_vec(),
+                    encode_mailbox_global_state(&next_global)?,
+                ),
+                (
+                    recipient_state_key.as_bytes().to_vec(),
+                    encode_mailbox_recipient_state(&next_recipient)?,
+                ),
+                (row_key.as_bytes().to_vec(), encoded_message.clone()),
+            ],
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let stored_message = db.get_cf(cf::CF_KV, row_key.as_bytes()).map_err(
+                    |read_error| {
+                        mcp_error(
+                            read_error.code(),
+                            format!(
+                                "AGENT_MAILBOX_ENQUEUE_COMMIT_AMBIGUOUS: enqueue of {row_key} \
+                                 failed ({error}) and exact message readback failed \
+                                 ({read_error}); inspect message/global/recipient state before retry"
+                            ),
+                        )
+                    },
+                )?;
+                let global_readback = read_mailbox_global_state_revisioned(db)?;
+                // A generation read alone cannot prove that the durable counter
+                // still describes the physical queue. Reconcile an ambiguous
+                // commit only after a stable state/row audit proves those two
+                // Sources of Truth are coherent.
+                let recipient_readback = stable_inbox_snapshot(db, to_session, now_unix_ms)?;
+                if stored_message.as_deref() == Some(encoded_message.as_slice())
+                    && global_readback
+                        .as_ref()
+                        .is_some_and(|readback| readback.state.last_enqueue_seq >= next_sequence)
+                    && recipient_readback.state.state.mutation_generation
+                        >= next_recipient.mutation_generation
+                {
+                    tracing::warn!(
+                        code = "AGENT_MAILBOX_ENQUEUE_AMBIGUOUS_COMMIT_RECONCILED",
+                        from_session,
+                        to_session,
+                        message_id = %message.message_id,
+                        durable_physical_count = recipient_readback.state.state.physical_row_count,
+                        queue_depth_after = queue_depth_before + 1,
+                        "separate physical message/counter readback proved enqueue committed"
+                    );
+                    return Ok(MailboxEnqueueOutcome::Committed(Box::new(
+                        MailboxEnqueueCommit {
+                            message,
+                            storage_readback: MailboxRowReadback {
+                                cf_name: cf::CF_KV.to_owned(),
+                                row_key,
+                                value_len_bytes: encoded_message.len() as u64,
+                                value_sha256: hash_bytes(&encoded_message),
+                            },
+                            queue_depth_before,
+                            queue_depth_after: queue_depth_before + 1,
+                            expired_rows_deleted_before,
+                        },
+                    )));
+                }
+                return Err(mcp_error(
+                    error.code(),
+                    format!(
+                        "AGENT_MAILBOX_ENQUEUE_NOT_COMMITTED: guarded enqueue of {row_key} \
+                         failed: {error}; exact message/counter readback did not prove commit, so \
+                         no stale counter or sequence was retried"
+                    ),
+                ));
+            }
+        };
+        if !outcome.applied {
+            tracing::warn!(
+                code = "AGENT_MAILBOX_ENQUEUE_REVISION_CONFLICT",
+                from_session,
+                to_session,
+                retry,
+                conflict_guard_index = outcome
+                    .conflict
+                    .as_ref()
+                    .map(|conflict| conflict.guard_index),
+                "guarded mailbox enqueue conflicted; rereading all queue SoTs before recomputing"
+            );
+            continue;
+        }
+        let storage_readback = readback_exact_mailbox_row(db, &row_key)?;
+        let stored_message = db
+            .get_cf(cf::CF_KV, row_key.as_bytes())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_MAILBOX_ENQUEUE_READBACK_MISSING: committed_seq={} row={row_key}",
+                        outcome.committed_seq
+                    ),
+                )
+            })?;
+        let global_readback = read_mailbox_global_state_revisioned(db)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_GLOBAL_STATE_MISSING_AFTER_ENQUEUE: committed_seq={}",
+                    outcome.committed_seq
+                ),
+            )
+        })?;
+        let recipient_readback = read_mailbox_recipient_state_revisioned(db, to_session)?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_MAILBOX_RECIPIENT_STATE_MISSING_AFTER_ENQUEUE: committed_seq={} \
+                         recipient={to_session:?}",
+                        outcome.committed_seq
+                    ),
+                )
+            })?;
+        if stored_message != encoded_message
+            || global_readback.state.last_enqueue_seq < next_sequence
+            || recipient_readback.state.mutation_generation < next_recipient.mutation_generation
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_MAILBOX_ENQUEUE_READBACK_DRIFT: committed_seq={} message_bytes_match={} \
+                     expected_sequence={next_sequence} actual_sequence={} \
+                     expected_recipient_generation={} actual_recipient_generation={}",
+                    outcome.committed_seq,
+                    stored_message == encoded_message,
+                    global_readback.state.last_enqueue_seq,
+                    next_recipient.mutation_generation,
+                    recipient_readback.state.mutation_generation
+                ),
+            ));
+        }
+        return Ok(MailboxEnqueueOutcome::Committed(Box::new(
+            MailboxEnqueueCommit {
+                message,
+                storage_readback,
+                queue_depth_before,
+                queue_depth_after: queue_depth_before + 1,
+                expired_rows_deleted_before,
+            },
+        )));
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "AGENT_MAILBOX_ENQUEUE_CONTENTION: enqueue to {to_session:?} conflicted \
+             {MAILBOX_MAX_CONFLICT_RETRIES} times"
+        ),
+    ))
+}
+
 fn scan_inbox(db: &Db, session_id: &str, now_unix_ms: u64) -> Result<InboxScan, ErrorData> {
     let prefix = mailbox_recipient_prefix(session_id);
     let rows = db
@@ -1451,23 +2730,15 @@ fn scan_inbox(db: &Db, session_id: &str, now_unix_ms: u64) -> Result<InboxScan, 
     let mut expired_keys = Vec::new();
     let mut messages = Vec::new();
     for (key, encoded) in rows {
-        let message: AgentMailboxMessage =
-            synapse_storage::decode_json(&encoded).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "decode agent mailbox row {}: {error}",
-                        String::from_utf8_lossy(&key)
-                    ),
-                )
-            })?;
-        if message.schema_version != SCHEMA_VERSION {
+        let message = decode_mailbox_row(&key, &encoded)?;
+        if message.to_session != session_id {
             return Err(mcp_error(
                 error_codes::STORAGE_CORRUPTED,
                 format!(
-                    "agent mailbox row {} has schema_version {}, expected {SCHEMA_VERSION}",
+                    "AGENT_MAILBOX_RECIPIENT_IDENTITY_DRIFT: row={} embedded_recipient={:?} \
+                     expected_recipient={session_id:?}",
                     String::from_utf8_lossy(&key),
-                    message.schema_version
+                    message.to_session
                 ),
             ));
         }
@@ -1488,63 +2759,10 @@ fn scan_inbox(db: &Db, session_id: &str, now_unix_ms: u64) -> Result<InboxScan, 
     })
 }
 
-fn cleanup_expired_mailbox_rows(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, MESSAGE_PREFIX.as_bytes())
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let mut expired_keys = Vec::new();
-    for (key, encoded) in rows {
-        let message: AgentMailboxMessage =
-            synapse_storage::decode_json(&encoded).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "decode agent mailbox row {} during cleanup: {error}",
-                        String::from_utf8_lossy(&key)
-                    ),
-                )
-            })?;
-        if message.schema_version != SCHEMA_VERSION {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "agent mailbox row {} has schema_version {}, expected {SCHEMA_VERSION}",
-                    String::from_utf8_lossy(&key),
-                    message.schema_version
-                ),
-            ));
-        }
-        if message.expires_at_unix_ms <= now_unix_ms {
-            expired_keys.push(key);
-        }
-    }
-    if expired_keys.is_empty() {
-        return Ok(0);
-    }
-    let count = expired_keys.len();
-    db.delete_batch(cf::CF_KV, expired_keys).map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!("delete expired agent mailbox rows: {error}"),
-        )
-    })?;
-    Ok(count)
-}
-
-fn queue_depth_for_recipient(
-    db: &Db,
-    session_id: &str,
-    now_unix_ms: u64,
-) -> Result<usize, ErrorData> {
-    Ok(scan_inbox(db, session_id, now_unix_ms)?.messages.len())
-}
-
 fn readback_exact_mailbox_row(db: &Db, row_key: &str) -> Result<MailboxRowReadback, ErrorData> {
     let stored = db
-        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+        .get_cf(cf::CF_KV, row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
-        .into_iter()
-        .find_map(|(key, value)| (key == row_key.as_bytes()).then_some(value))
         .ok_or_else(|| {
             mcp_error(
                 error_codes::STORAGE_READ_FAILED,
@@ -1960,6 +3178,13 @@ fn require_mailbox_session_id(
 
 fn mailbox_recipient_prefix(session_id: &str) -> String {
     format!("{MESSAGE_PREFIX}{}/msg/", hex_bytes(session_id.as_bytes()))
+}
+
+fn mailbox_recipient_state_key(session_id: &str) -> String {
+    format!(
+        "agent-mailbox/v2/recipient_hex/{}/queue_state",
+        hex_bytes(session_id.as_bytes())
+    )
 }
 
 fn mailbox_row_key(session_id: &str, sent_at_unix_ms: u64, seq: u64, message_id: &str) -> String {
