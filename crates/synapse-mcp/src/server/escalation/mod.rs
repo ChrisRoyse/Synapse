@@ -10678,8 +10678,10 @@ fn claim_tier0_toast_locked(
             }
             _ => unreachable!("Tier-0 claim states were filtered above"),
         };
-        if matches!(item.tier0_delivery, Tier0ToastDelivery::StartedUnknown { .. })
-            && live_claim_for_started.is_none()
+        if matches!(
+            item.tier0_delivery,
+            Tier0ToastDelivery::StartedUnknown { .. }
+        ) && live_claim_for_started.is_none()
         {
             return Err(mcp_error(
                 error_codes::STORAGE_CORRUPTED,
@@ -11331,6 +11333,17 @@ fn classify_tier0_history_locked(
             && readback.expiration_unix_ms.first() == Some(&expected_expiration_unix_ms);
         let physical_identity_matches = payload_matches && expiration_matches;
         let classified_at = now_unix_ms.max(current.item.updated_at_unix_ms);
+        let legacy_compatibility_delivery_proven = current.item.tier0_delivery
+            == Tier0ToastDelivery::LegacyUnclassified
+            && current.item.tier0_fired;
+        let legacy_compatibility_verified_at = current.item.updated_at_unix_ms;
+        let delivery_proof_source = if send_verified {
+            "current send exact Action Center readback"
+        } else if legacy_compatibility_delivery_proven {
+            "legacy tier0_fired compatibility proof"
+        } else {
+            "none"
+        };
         let mut item = current.item;
         let delivery_proven;
         let event = if physical_identity_matches {
@@ -11343,18 +11356,26 @@ fn classify_tier0_history_locked(
             };
             delivery_proven = true;
             "tier0_verified_present"
-        } else if send_verified && !readback.present {
+        } else if (send_verified || legacy_compatibility_delivery_proven) && !readback.present {
             item.tier0_fired = true;
             item.tier0_delivery = Tier0ToastDelivery::VerifiedDismissed {
                 tag: readback.tag.clone(),
                 projection_generation: generation,
                 history_count_at_delivery: 1,
                 dismissed_readback: readback.clone(),
-                verified_at_unix_ms: classified_at,
+                verified_at_unix_ms: if send_verified {
+                    classified_at
+                } else {
+                    legacy_compatibility_verified_at
+                },
                 dismissed_at_unix_ms: classified_at,
             };
             delivery_proven = true;
-            "tier0_verified_then_dismissed"
+            if send_verified {
+                "tier0_verified_then_dismissed"
+            } else {
+                "tier0_legacy_verified_then_dismissed"
+            }
         } else {
             let error_code = send_error.map_or_else(
                 || error_codes::NOTIFY_DELIVERY_UNVERIFIED.to_owned(),
@@ -11372,12 +11393,13 @@ fn classify_tier0_history_locked(
                 || physical_detail.clone(),
                 |error| format!("{}; {physical_detail}", error.message),
             );
-            item.tier0_fired = false;
+            let delivery_proven_before_failure = item.tier0_fired;
             item.tier0_delivery = Tier0ToastDelivery::Failed {
                 tag: readback.tag.clone(),
                 projection_generation: Some(generation),
                 error_code,
                 error_message,
+                delivery_proven_before_failure,
                 side_effect_possible: true,
                 history_readback: Some(readback.clone()),
                 failed_at_unix_ms: classified_at,
@@ -11400,6 +11422,8 @@ fn classify_tier0_history_locked(
                 "expected_expiration_unix_ms": expected_expiration_unix_ms,
                 "actual_expiration_unix_ms": readback.expiration_unix_ms,
                 "send_verified_before_separate_read": send_verified,
+                "delivery_proof_before_classification": item.tier0_fired,
+                "delivery_proof_source": delivery_proof_source,
                 "send_error_code": send_error.map(error_data_symbol),
                 "send_error_message": send_error.map(|error| error.message.to_string()),
                 "source_of_truth": "Windows Action Center history",
