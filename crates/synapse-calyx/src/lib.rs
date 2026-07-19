@@ -22,6 +22,7 @@ use calyx_aster::vault::{
 use calyx_core::{
     Anchor, AnchorKind, CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId,
 };
+use calyx_forge::HostGpuReservationSnapshot;
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ pub use async_vault::{
 };
 pub use math::{
     SynapseCalyxMathBackendStatus, SynapseCalyxMathProbeReport, SynapseCalyxMathProbeTopKEntry,
-    SynapseCalyxMathRuntime, math_backend,
+    SynapseCalyxMathRuntime, SynapseCalyxVramDispatchStatus, math_backend,
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -304,11 +305,6 @@ impl SynapseCalyxTuningConfig {
         )?;
         if self.vram_budget_bytes == 0 {
             return Err(invalid_config("vram_budget_bytes must be positive"));
-        }
-        if matches!(self.math_backend, SynapseCalyxMathBackend::Cuda) {
-            return Err(invalid_config(
-                "math_backend = \"cuda\" is not a supported Synapse override; use \"auto\" to prefer CUDA with CPU fallback or \"cpu\" to force CPU",
-            ));
         }
         match (self.clock_mode, self.fixed_clock_unix_ms) {
             (SynapseCalyxClockMode::System, Some(_)) => {
@@ -675,6 +671,7 @@ pub struct SynapseCalyxVaultCloseReadback {
     pub pid_sidecar_present_after_close: Option<bool>,
     pub re_lock_probe_succeeded: Option<bool>,
     pub latest_seq: Option<u64>,
+    pub gpu_reservation_release: Option<HostGpuReservationSnapshot>,
 }
 
 impl SynapseCalyxVaultCloseReadback {
@@ -691,6 +688,7 @@ impl SynapseCalyxVaultCloseReadback {
             pid_sidecar_present_after_close: None,
             re_lock_probe_succeeded: None,
             latest_seq: None,
+            gpu_reservation_release: None,
         }
     }
 
@@ -707,6 +705,7 @@ impl SynapseCalyxVaultCloseReadback {
             pid_sidecar_present_after_close: None,
             re_lock_probe_succeeded: None,
             latest_seq: None,
+            gpu_reservation_release: None,
         }
     }
 }
@@ -874,6 +873,53 @@ impl SynapseCalyxReadOnlyVault {
                     })
             }
         }
+    }
+
+    /// Reads one raw CF row from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn read_cf_latest(
+        &self,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.vault
+            .read_cf_latest(cf, key)
+            .map_err(|error| SynapseCalyxError::from_calyx("read latest Calyx CF row", &error))
+    }
+
+    /// Scans visible raw CF rows from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if a row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn scan_cf_latest(
+        &self,
+        cf: ColumnFamily,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.vault
+            .scan_cf_latest(cf)
+            .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF", &error))
+    }
+
+    /// Scans a raw CF range from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if a row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn scan_cf_range_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.vault
+            .scan_cf_range_latest(cf, range)
+            .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF range", &error))
     }
 
     /// Reads one raw CF row at a numeric snapshot.
@@ -1152,12 +1198,18 @@ impl SynapseCalyxVault {
 
     #[must_use]
     pub fn status(&self) -> SynapseCalyxVaultStatus {
-        status_from_vault(
-            &self.config,
-            &self.vault,
-            self.math_runtime.status(),
-            self.open_mode,
-        )
+        let math_status = self.math_runtime.status_snapshot();
+        let mut status = status_from_vault(&self.config, &self.vault, &math_status, self.open_mode);
+        if let Some(code) = math_status.runtime_readback_code {
+            "error".clone_into(&mut status.phase);
+            status.last_error_code = Some(code);
+            status.last_error = math_status.runtime_readback_error;
+            status.remediation = Some(
+                "repair the named process-local/host-wide GPU Source of Truth; never infer safety from a stale startup snapshot"
+                    .to_owned(),
+            );
+        }
+        status
     }
 
     /// Returns the same millisecond clock source used by this opened vault.
@@ -1477,6 +1529,37 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("write Calyx CF batch", &error))
     }
 
+    /// Reads one raw CF row from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn read_cf_latest(
+        &self,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.vault
+            .read_cf_latest(cf, key)
+            .map_err(|error| SynapseCalyxError::from_calyx("read latest Calyx CF row", &error))
+    }
+
+    /// Reads raw CF rows from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if any row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn read_cf_batch_latest(
+        &self,
+        reads: &[calyx_aster::mvcc::CfRead],
+    ) -> Result<Vec<Option<Vec<u8>>>, SynapseCalyxError> {
+        self.vault.read_cf_batch_latest(reads).map_err(|error| {
+            SynapseCalyxError::from_calyx("read latest Calyx CF row batch", &error)
+        })
+    }
+
     /// Reads one raw CF row at a numeric snapshot.
     ///
     /// # Errors
@@ -1545,6 +1628,21 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Scans visible raw CF rows from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if a row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn scan_cf_latest(
+        &self,
+        cf: ColumnFamily,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.vault
+            .scan_cf_latest(cf)
+            .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF", &error))
+    }
+
     /// Scans visible raw CF rows in a key range at a numeric snapshot.
     ///
     /// # Errors
@@ -1580,6 +1678,22 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("scan Calyx CF range from pinned snapshot", &error)
             })
+    }
+
+    /// Scans visible raw CF rows in a range from one atomic latest committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if a row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn scan_cf_range_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.vault
+            .scan_cf_range_latest(cf, range)
+            .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF range", &error))
     }
 
     /// Decodes the physical `Anchors` CF rows currently visible for one
@@ -1664,7 +1778,7 @@ impl SynapseCalyxVault {
             config,
             vault,
             lock,
-            math_runtime: _,
+            math_runtime,
             open_mode: _,
         } = self;
         let latest_seq = vault.latest_seq();
@@ -1679,6 +1793,20 @@ impl SynapseCalyxVault {
             "flushed durable Calyx Aster vault before shutdown"
         );
         drop(vault);
+        let gpu_reservation_release = match math_runtime.close() {
+            Ok(readback) => readback,
+            Err(error) => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_CLOSE_FAILED",
+                    reason,
+                    vault_dir = %config.vault_dir.display(),
+                    error = %error,
+                    "retaining the Calyx vault lock and PID sidecar until process exit because the GPU reservation did not reach a verified terminal release"
+                );
+                std::mem::forget(lock);
+                return Err(error);
+            }
+        };
         let lock_readback = lock.close(reason)?;
         let readback = SynapseCalyxVaultCloseReadback {
             enabled: true,
@@ -1691,6 +1819,7 @@ impl SynapseCalyxVault {
             pid_sidecar_present_after_close: Some(lock_readback.pid_sidecar_present_after_close),
             re_lock_probe_succeeded: Some(lock_readback.re_lock_probe_succeeded),
             latest_seq: Some(latest_seq),
+            gpu_reservation_release,
         };
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_CLOSED",
@@ -1699,6 +1828,7 @@ impl SynapseCalyxVault {
             safe_to_unlock = readback.safe_to_unlock,
             pid_sidecar_present_after_close = readback.pid_sidecar_present_after_close,
             re_lock_probe_succeeded = readback.re_lock_probe_succeeded,
+            gpu_reservation_release = ?readback.gpu_reservation_release,
             latest_seq,
             "closed durable Calyx Aster vault"
         );
@@ -2136,7 +2266,7 @@ fn scan_anchors_for_cx_from_vault<C: Clock>(
 ) -> Result<Vec<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
     let range = anchor_prefix_range(cx_id);
     let rows = vault
-        .scan_cf_range_at(vault.latest_seq(), ColumnFamily::Anchors, &range)
+        .scan_cf_range_latest(ColumnFamily::Anchors, &range)
         .map_err(|error| SynapseCalyxError::from_calyx("scan Calyx Anchors CF", &error))?;
     rows.into_iter()
         .map(|(key, value)| {
@@ -2155,7 +2285,7 @@ fn read_anchor_exact_from_vault<C: Clock>(
 ) -> Result<Option<SynapseCalyxAnchorReadback>, SynapseCalyxError> {
     let key = anchor_key(cx_id, kind);
     let value = vault
-        .read_cf_at(vault.latest_seq(), ColumnFamily::Anchors, &key)
+        .read_cf_latest(ColumnFamily::Anchors, &key)
         .map_err(|error| {
             SynapseCalyxError::from_calyx("read exact Calyx Anchors CF row", &error)
         })?;

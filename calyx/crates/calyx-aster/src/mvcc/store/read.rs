@@ -3,6 +3,55 @@ use super::*;
 mod latest;
 
 impl VersionedCfStore {
+    /// Reads one CF/key from one atomic view of the latest committed state.
+    ///
+    /// Unlike composing [`Self::current_seq`] with [`Self::read_at`], this
+    /// method holds the same row/router read-side synchronization boundary
+    /// that excludes a concurrent commit while the latest sequence and both
+    /// serving layers are resolved. That distinction is required for
+    /// latest-only recovered routers, which intentionally cannot serve a
+    /// sequence that becomes historical between two separate calls.
+    pub fn read_latest(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.with_latest_view(|seq, table, router, barriers| {
+            ensure_view_key_unbarriered(barriers, cf, key)?;
+            latest_value_from_view(seq, table, router, cf, key)
+        })
+    }
+
+    /// Resolves all requested CF/key rows from one atomic latest view.
+    pub fn read_batch_latest(&self, reads: &[CfRead]) -> Result<Vec<Option<Vec<u8>>>> {
+        if reads.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_latest_view(|seq, table, router, barriers| {
+            reads
+                .iter()
+                .map(|read| {
+                    ensure_view_key_unbarriered(barriers, read.cf, &read.key)?;
+                    latest_value_from_view(seq, table, router, read.cf, &read.key)
+                })
+                .collect()
+        })
+    }
+
+    /// Scans one CF from one atomic view of the latest committed state.
+    pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.with_latest_view(|seq, table, router, barriers| {
+            latest_rows_from_view(seq, table, router, cf, None, barriers)
+        })
+    }
+
+    /// Scans one CF range from one atomic view of the latest committed state.
+    pub fn scan_cf_range_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.with_latest_view(|seq, table, router, barriers| {
+            latest_rows_from_view(seq, table, router, cf, Some(range), barriers)
+        })
+    }
+
     /// Reads one CF/key at the pinned sequence.
     pub fn read_at(
         &self,
@@ -99,8 +148,8 @@ impl VersionedCfStore {
             return Ok(values);
         }
 
-        self.ensure_router_latest_snapshot(snapshot)?;
         let router = self.router.read().expect("mvcc router poisoned");
+        self.ensure_router_latest_snapshot(snapshot)?;
         if let Some(router) = router.as_ref() {
             for index in router_misses {
                 let read = &reads[index];
@@ -243,17 +292,20 @@ impl VersionedCfStore {
         clock: &dyn Clock,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.ensure_snapshot_live(snapshot, clock)?;
-        let router = if self.router_latest_readback.load(Ordering::Acquire) {
+        let barriers = self
+            .read_barriers
+            .read()
+            .expect("mvcc read barriers poisoned");
+        let table = self.rows.read().expect("mvcc row table poisoned");
+        let router = self.router.read().expect("mvcc router poisoned");
+        if self.router_latest_readback.load(Ordering::Acquire) {
             self.ensure_router_latest_snapshot(snapshot)?;
-            self.router.read().expect("mvcc router poisoned")
-        } else {
-            self.router.read().expect("mvcc router poisoned")
-        };
+        }
         let mut upper = upper.to_vec();
         let mut inclusive = true;
         loop {
             let table_candidate =
-                self.table_predecessor_state(snapshot, cf, start, &upper, inclusive);
+                table_predecessor_state_from_view(&table, snapshot, cf, start, &upper, inclusive);
             let router_candidate = if self.router_latest_readback.load(Ordering::Acquire) {
                 router
                     .as_ref()
@@ -266,11 +318,11 @@ impl VersionedCfStore {
             match (table_candidate, router_candidate) {
                 (None, None) => return Ok(None),
                 (None, Some(row)) => {
-                    self.ensure_unbarriered(cf, &row.key)?;
+                    ensure_view_key_unbarriered(&barriers, cf, &row.key)?;
                     return Ok(Some((row.key, row.value)));
                 }
                 (Some((key, VisibleValue::Live(value))), None) => {
-                    self.ensure_unbarriered(cf, &key)?;
+                    ensure_view_key_unbarriered(&barriers, cf, &key)?;
                     return Ok(Some((key, value)));
                 }
                 (Some((key, VisibleValue::Tombstone)), None) => {
@@ -279,12 +331,12 @@ impl VersionedCfStore {
                 }
                 (Some((key, state)), Some(router_row)) => {
                     if router_row.key > key {
-                        self.ensure_unbarriered(cf, &router_row.key)?;
+                        ensure_view_key_unbarriered(&barriers, cf, &router_row.key)?;
                         return Ok(Some((router_row.key, router_row.value)));
                     }
                     match state {
                         VisibleValue::Live(value) => {
-                            self.ensure_unbarriered(cf, &key)?;
+                            ensure_view_key_unbarriered(&barriers, cf, &key)?;
                             return Ok(Some((key, value)));
                         }
                         VisibleValue::Tombstone => {
@@ -297,30 +349,6 @@ impl VersionedCfStore {
         }
     }
 
-    fn table_predecessor_state(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        start: &[u8],
-        upper: &[u8],
-        inclusive: bool,
-    ) -> Option<(Vec<u8>, VisibleValue)> {
-        let lower = Bound::Included(start);
-        let upper = if inclusive {
-            Bound::Included(upper)
-        } else {
-            Bound::Excluded(upper)
-        };
-        let table = self.rows.read().expect("mvcc row table poisoned");
-        table
-            .get(&cf)?
-            .range::<[u8], _>((lower, upper))
-            .rev()
-            .find_map(|(key, versions)| {
-                visible_value_state(versions, snapshot.seq()).map(|state| (key.clone(), state))
-            })
-    }
-
     pub(super) fn ensure_unbarriered(&self, cf: ColumnFamily, key: &[u8]) -> Result<()> {
         let barriers = self
             .read_barriers
@@ -331,6 +359,125 @@ impl VersionedCfStore {
         }
         Ok(())
     }
+
+    fn with_latest_view<T>(
+        &self,
+        read: impl FnOnce(Seq, &RowTable, Option<&CfRouter>, &[ReadBarrier]) -> Result<T>,
+    ) -> Result<T> {
+        // Lock order is deliberately identical to every multi-layer reader:
+        // barriers -> rows -> router. Commits acquire rows -> router. Holding
+        // the rows guard prevents sequence allocation, and holding the router
+        // guard prevents a physical serving-view refresh, so `current_seq`
+        // and both sources below describe one atomic latest view.
+        let barriers = self
+            .read_barriers
+            .read()
+            .expect("mvcc read barriers poisoned");
+        let table = self.rows.read().expect("mvcc row table poisoned");
+        let router = self.router.read().expect("mvcc router poisoned");
+        let seq = self.current_seq();
+        read(seq, &table, router.as_ref(), &barriers)
+    }
+}
+
+fn table_predecessor_state_from_view(
+    table: &RowTable,
+    snapshot: Snapshot,
+    cf: ColumnFamily,
+    start: &[u8],
+    upper: &[u8],
+    inclusive: bool,
+) -> Option<(Vec<u8>, VisibleValue)> {
+    let lower = Bound::Included(start);
+    let upper = if inclusive {
+        Bound::Included(upper)
+    } else {
+        Bound::Excluded(upper)
+    };
+    table
+        .get(&cf)?
+        .range::<[u8], _>((lower, upper))
+        .rev()
+        .find_map(|(key, versions)| {
+            visible_value_state(versions, snapshot.seq()).map(|state| (key.clone(), state))
+        })
+}
+
+fn ensure_view_key_unbarriered(
+    barriers: &[ReadBarrier],
+    cf: ColumnFamily,
+    key: &[u8],
+) -> Result<()> {
+    if let Some(error) = first_blocking(barriers, cf, key) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn latest_value_from_view(
+    seq: Seq,
+    table: &RowTable,
+    router: Option<&CfRouter>,
+    cf: ColumnFamily,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if let Some(state) = table
+        .get(&cf)
+        .and_then(|rows| rows.get(key))
+        .and_then(|versions| visible_value_state(versions, seq))
+    {
+        return Ok(state.into_option());
+    }
+    router
+        .map(|router| router.get(cf, key))
+        .transpose()
+        .map(|value| value.flatten().filter(|value| !is_tombstone_value(value)))
+}
+
+fn latest_rows_from_view(
+    seq: Seq,
+    table: &RowTable,
+    router: Option<&CfRouter>,
+    cf: ColumnFamily,
+    range: Option<&KeyRange>,
+    barriers: &[ReadBarrier],
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut rows = match (router, range) {
+        (Some(router), Some(range)) => match range.end.as_deref() {
+            Some(end) => router.range(cf, &range.start, end)?,
+            None => router
+                .iter_cf(cf)?
+                .into_iter()
+                .filter(|row| row.key.as_slice() >= range.start.as_slice())
+                .collect(),
+        },
+        (Some(router), None) => router.iter_cf(cf)?,
+        (None, _) => Vec::new(),
+    }
+    .into_iter()
+    .filter_map(|row| (!is_tombstone_value(&row.value)).then_some((row.key, row.value)))
+    .collect::<BTreeMap<_, _>>();
+
+    if let Some(cf_rows) = table.get(&cf) {
+        for (key, versions) in cf_rows {
+            if range.is_some_and(|range| !range.contains(key)) {
+                continue;
+            }
+            match visible_value_state(versions, seq) {
+                Some(VisibleValue::Live(value)) => {
+                    rows.insert(key.clone(), value);
+                }
+                Some(VisibleValue::Tombstone) => {
+                    rows.remove(key);
+                }
+                None => {}
+            }
+        }
+    }
+    for key in rows.keys() {
+        ensure_view_key_unbarriered(barriers, cf, key)?;
+    }
+    Ok(rows.into_iter().collect())
 }
 
 fn visible_value(versions: &[VersionedValue], seq: Seq) -> Option<Vec<u8>> {

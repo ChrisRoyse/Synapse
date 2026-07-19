@@ -325,17 +325,12 @@ fn read_spawn_manifest_seed(log_dir: &Path) -> SpawnManifestSeed {
 
 fn load_cursor(db: &Db, spawn_id: &str) -> Result<Option<TranscriptCursor>, String> {
     let key = cursor_kv_key(spawn_id);
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, &key)
-        .map_err(|error| format!("TRANSCRIPT_CURSOR_READ_FAILED: {error}"))?;
-    for (row_key, value) in rows {
-        if row_key == key {
-            let cursor: TranscriptCursor = decode_json(&value)
-                .map_err(|error| format!("TRANSCRIPT_CURSOR_DECODE_FAILED: {error}"))?;
-            return Ok(Some(cursor));
-        }
-    }
-    Ok(None)
+    db.get_cf(cf::CF_KV, &key)
+        .map_err(|error| format!("TRANSCRIPT_CURSOR_READ_FAILED: {error}"))?
+        .map(|value| {
+            decode_json(&value).map_err(|error| format!("TRANSCRIPT_CURSOR_DECODE_FAILED: {error}"))
+        })
+        .transpose()
 }
 
 fn store_cursor(db: &Db, cursor: &TranscriptCursor) -> Result<(), String> {
@@ -476,6 +471,15 @@ fn ingest_spawn_dir_once_with_cancel(
             }
         }
     };
+    let lines_ingested_before_cycle = cursor.lines_ingested;
+
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(SpawnIngestOutcome {
+            lines_ingested_total: lines_ingested_before_cycle,
+            cancelled: true,
+            ..SpawnIngestOutcome::default()
+        });
+    }
 
     if let Some(error) = &cursor.error {
         tracing::debug!(
@@ -528,6 +532,14 @@ fn ingest_spawn_dir_once_with_cancel(
             cursor.end_state_anchor_outcome = None;
             cursor.end_state_anchor_rows = None;
         } else {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(SpawnIngestOutcome {
+                    lines_ingested_total: lines_ingested_before_cycle,
+                    source_complete: true,
+                    cancelled: true,
+                    ..SpawnIngestOutcome::default()
+                });
+            }
             ensure_completed_spawn_end_state_anchored(db, &mut cursor)?;
             return Ok(SpawnIngestOutcome {
                 lines_ingested_total: cursor.lines_ingested,
@@ -662,6 +674,13 @@ fn ingest_spawn_dir_once_with_cancel(
     }
 
     if !rows.is_empty() {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(SpawnIngestOutcome {
+                lines_ingested_total: lines_ingested_before_cycle,
+                cancelled: true,
+                ..SpawnIngestOutcome::default()
+            });
+        }
         db.put_cf_batches_pressure_bypass(vec![
             (cf::CF_AGENT_TRANSCRIPTS, rows),
             (cf::CF_KV, ts_index_rows),
@@ -672,6 +691,16 @@ fn ingest_spawn_dir_once_with_cancel(
             )
         })?;
         for (source_key, raw_bytes, record) in &constellation_rows {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                // Transcript rows use deterministic keys and are safe to
+                // re-put. Do not advance the cursor until every matching
+                // Calyx constellation measurement is physically present.
+                return Ok(SpawnIngestOutcome {
+                    lines_ingested_total: lines_ingested_before_cycle,
+                    cancelled: true,
+                    ..SpawnIngestOutcome::default()
+                });
+            }
             db.put_agent_transcript_constellation(source_key, raw_bytes, record)
                 .map_err(|error| {
                     tracing::error!(
@@ -695,6 +724,7 @@ fn ingest_spawn_dir_once_with_cancel(
     cursor.updated_ts_ns = unix_time_ns_now();
     LINES_PARSED_TOTAL.fetch_add(new_parsed, Ordering::Relaxed);
     LINES_INVALID_TOTAL.fetch_add(new_invalid, Ordering::Relaxed);
+    cancelled |= cancel.is_some_and(CancellationToken::is_cancelled);
 
     if finalize && !cancelled {
         cursor.source_complete = true;
@@ -1003,18 +1033,30 @@ pub(crate) fn spawn_periodic_transcript_ingest(
         db_path = %db_path.display(),
         "periodic transcript ingestion scheduled"
     );
-    let handle = tokio::spawn(async move {
+    // Every cycle performs synchronous filesystem and Calyx storage work. Run
+    // the exact owned task on Tokio's blocking pool so a long physical scan
+    // cannot starve cancellation, recorder shutdown, or the MCP dispatcher.
+    //
+    // Returning the spawn_blocking JoinHandle directly is intentional:
+    // aborting a blocking task does not make it disappear once it has started,
+    // so the HTTP owner ledger continues to reflect the physical worker until
+    // its cooperative cancellation checks actually reach a terminal join.
+    let runtime = tokio::runtime::Handle::current();
+    let handle = tokio::task::spawn_blocking(move || {
         let mut delay = std::time::Duration::from_secs(startup_delay_secs);
         loop {
-            tokio::select! {
-                () = cancel.cancelled() => {
-                    tracing::info!(
-                        code = "TRANSCRIPT_INGEST_PERIODIC_STOPPED",
-                        "periodic transcript ingestion stopped by daemon shutdown"
-                    );
-                    return;
+            let cancelled = runtime.block_on(async {
+                tokio::select! {
+                    () = cancel.cancelled() => true,
+                    () = tokio::time::sleep(delay) => false,
                 }
-                () = tokio::time::sleep(delay) => {}
+            });
+            if cancelled {
+                tracing::info!(
+                    code = "TRANSCRIPT_INGEST_PERIODIC_STOPPED",
+                    "periodic transcript ingestion stopped by daemon shutdown"
+                );
+                return;
             }
             run_cycle(&m3_state, &root, &cancel);
             delay = std::time::Duration::from_secs(interval_secs);

@@ -8,7 +8,7 @@ use std::{
 
 use calyx_aster::{
     cf::{ColumnFamily, KeyRange, prefix_range},
-    mvcc::tombstone_value,
+    mvcc::{CfRead, tombstone_value},
     wal,
 };
 use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId};
@@ -784,10 +784,11 @@ impl StorageBackend for CalyxBackend {
         self.with_vault(cf_name, "read Calyx KV row", false, |vault| {
             let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
             let key = encode_calyx_key_for_read(cf_name, collection_id, key)?;
-            let snapshot = latest_calyx_seq(vault);
             let value = vault
-                .read_cf_at(snapshot, ColumnFamily::Kv, &key)
-                .map_err(|source| calyx_read_failed(cf_name, "read Calyx CF row", &source))?;
+                .read_cf_latest(ColumnFamily::Kv, &key)
+                .map_err(|source| {
+                    calyx_read_failed(cf_name, "read latest Calyx CF row", &source)
+                })?;
             let now_ms = calyx_clock_now_for_read(vault, cf_name)?;
             value.map_or(Ok(None), |bytes| {
                 decode_calyx_value_for_read(cf_name, &bytes, now_ms)
@@ -2415,10 +2416,9 @@ trait CalyxVaultKvRead {
     fn vault_id_string(&self) -> String;
     fn latest_seq_value(&self) -> u64;
     fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError>;
-    fn read_kv_at(&self, snapshot: u64, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError>;
-    fn scan_kv_range_at(
+    fn read_kv_latest(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError>;
+    fn scan_kv_range_latest(
         &self,
-        snapshot: u64,
         range: &calyx_aster::cf::KeyRange,
     ) -> Result<SynapseCalyxCfRows, SynapseCalyxError>;
 }
@@ -2436,16 +2436,15 @@ impl CalyxVaultKvRead for SynapseCalyxVault {
         self.clock_now_ms()
     }
 
-    fn read_kv_at(&self, snapshot: u64, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
-        self.read_cf_at(snapshot, ColumnFamily::Kv, key)
+    fn read_kv_latest(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.read_cf_latest(ColumnFamily::Kv, key)
     }
 
-    fn scan_kv_range_at(
+    fn scan_kv_range_latest(
         &self,
-        snapshot: u64,
         range: &calyx_aster::cf::KeyRange,
     ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
-        self.scan_cf_range_at(snapshot, ColumnFamily::Kv, range)
+        self.scan_cf_range_latest(ColumnFamily::Kv, range)
     }
 }
 
@@ -2462,16 +2461,15 @@ impl CalyxVaultKvRead for SynapseCalyxReadOnlyVault {
         self.clock_now_ms()
     }
 
-    fn read_kv_at(&self, snapshot: u64, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
-        self.read_cf_at(snapshot, ColumnFamily::Kv, key)
+    fn read_kv_latest(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError> {
+        self.read_cf_latest(ColumnFamily::Kv, key)
     }
 
-    fn scan_kv_range_at(
+    fn scan_kv_range_latest(
         &self,
-        snapshot: u64,
         range: &calyx_aster::cf::KeyRange,
     ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
-        self.scan_cf_range_at(snapshot, ColumnFamily::Kv, range)
+        self.scan_cf_range_latest(ColumnFamily::Kv, range)
     }
 }
 
@@ -2492,7 +2490,7 @@ fn inspect_calyx_vault_with_schema(
         .clock_now_ms()
         .map_err(|source| calyx_read_failed("<calyx-vault>", "read Calyx vault clock", &source))?;
     let rows = vault
-        .scan_kv_range_at(vault.latest_seq_value(), &prefix_range(&[CALYX_KV_DISC]))
+        .scan_kv_range_latest(&prefix_range(&[CALYX_KV_DISC]))
         .map_err(|source| {
             calyx_read_failed(
                 "<calyx-vault>",
@@ -2901,16 +2899,31 @@ fn verify_mcp_usage_source_readback(
     source_key: &[u8],
     raw_bytes: &[u8],
 ) -> StorageResult<VerifiedMcpUsageSourceReadback> {
-    let snapshot = vault.latest_seq();
     let collection_id = calyx_collection_id_for_cf_write(cf::CF_KV)?;
     let requested_physical_key = encode_calyx_key_for_write(cf::CF_KV, collection_id, source_key)?;
     let mut requested_readback = None;
-    for expected in expected_source_rows {
-        let actual = vault
-            .read_cf_at(snapshot, ColumnFamily::Kv, &expected.key)
-            .map_err(|source| {
-                calyx_read_failed(cf::CF_KV, "read back atomic MCP usage source row", &source)
-            })?;
+    let reads = expected_source_rows
+        .iter()
+        .map(|expected| CfRead::new(ColumnFamily::Kv, expected.key.clone()))
+        .collect::<Vec<_>>();
+    let actual_rows = vault.read_cf_batch_latest(&reads).map_err(|source| {
+        calyx_read_failed(
+            cf::CF_KV,
+            "read back atomic MCP usage source row batch from one latest view",
+            &source,
+        )
+    })?;
+    if actual_rows.len() != expected_source_rows.len() {
+        return Err(calyx_write_failed_detail(
+            "calyx_mcp_usage_publication",
+            format!(
+                "atomic MCP usage physical source readback returned {} rows for {} requested keys",
+                actual_rows.len(),
+                expected_source_rows.len()
+            ),
+        ));
+    }
+    for (expected, actual) in expected_source_rows.iter().zip(actual_rows) {
         let Some(actual) = actual else {
             return Err(calyx_write_failed_detail(
                 "calyx_mcp_usage_publication",
@@ -3371,9 +3384,8 @@ fn verify_calyx_schema_version(
 ) -> StorageResult<()> {
     let key = encode_calyx_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
         .map_err(|detail| calyx_open_failed_detail(path, detail))?;
-    let snapshot = latest_calyx_seq(vault);
     let existing = vault
-        .read_cf_at(snapshot, ColumnFamily::Kv, &key)
+        .read_cf_latest(ColumnFamily::Kv, &key)
         .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?;
     match existing {
         None => {
@@ -3413,7 +3425,7 @@ fn verify_calyx_schema_version_existing(
     let key = encode_calyx_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
         .map_err(|detail| calyx_open_failed_detail(path, detail))?;
     let Some(value) = vault
-        .read_kv_at(vault.latest_seq_value(), &key)
+        .read_kv_latest(&key)
         .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?
     else {
         return Err(calyx_open_failed_detail(
@@ -3459,9 +3471,8 @@ fn read_all_rows_from_vault_filtered(
 ) -> StorageResult<Vec<RawRow>> {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
-    let snapshot = vault.latest_seq_value();
     let rows = vault
-        .scan_kv_range_at(snapshot, &range)
+        .scan_kv_range_latest(&range)
         .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV namespace", &source))?;
     let mut decoded = Vec::with_capacity(rows.len());
     let now_ms = vault
@@ -3535,7 +3546,7 @@ fn read_fixed_width_rows_from_vault_range(
         end: Some(encode_calyx_key_for_read(cf_name, collection_id, end_key)?),
     };
     let rows = vault
-        .scan_kv_range_at(vault.latest_seq_value(), &range)
+        .scan_kv_range_latest(&range)
         .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV fixed-key range", &source))?;
     let now_ms = vault
         .clock_now_ms()
@@ -3632,10 +3643,6 @@ fn episode_constellation_reports(
             })
         })
         .collect())
-}
-
-fn latest_calyx_seq(vault: &SynapseCalyxVault) -> u64 {
-    vault.latest_seq()
 }
 
 fn commit_calyx_rows_to_vault(
@@ -4295,7 +4302,7 @@ fn collect_calyx_retention_state(
 ) -> StorageResult<CalyxRetentionState> {
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let rows = vault
-        .scan_cf_range_at(latest_calyx_seq(vault), ColumnFamily::Kv, &range)
+        .scan_cf_range_latest(ColumnFamily::Kv, &range)
         .map_err(|source| {
             calyx_write_failed(
                 cf_name,

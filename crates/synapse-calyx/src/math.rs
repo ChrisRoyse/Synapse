@@ -1,13 +1,24 @@
 use std::fmt;
 
+use calyx_forge::{
+    Backend, CUDA_COMPILED, CpuBackend, DeviceInfo, ForgeError, HostGpuReservation,
+    HostGpuReservationRequest, HostGpuReservationSnapshot, HostGpuReservationStore, VramStats,
+};
 #[cfg(feature = "calyx-cuda")]
-use calyx_forge::CudaBackend;
-use calyx_forge::{Backend, CUDA_COMPILED, CpuBackend, DeviceInfo, ForgeError};
+use calyx_forge::{CudaBackend, VramBudgetedCudaBackend};
 use serde::Serialize;
 
-use crate::{SynapseCalyxError, SynapseCalyxMathBackend, SynapseCalyxTuningConfig, invalid_config};
+use crate::{SynapseCalyxError, SynapseCalyxMathBackend, SynapseCalyxTuningConfig};
 
 const MATH_BACKEND_REMEDIATION: &str = "inspect the SYNAPSE_CALYX_MATH_* structured events, health payload, CUDA driver state, and Calyx Forge error; use math_backend=\"cpu\" only when intentionally forcing CPU";
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+// CUDA context/module initialization is not routed through Forge's dispatch
+// allocator, so it needs a conservative, declared host-wide envelope while
+// its retained footprint is measured. This is intentionally independent from
+// the maximum runtime dispatch budget: reserving that entire ceiling makes a
+// candidate-before-handoff install impossible while a healthy daemon retains
+// its measured baseline.
+const CUDA_STARTUP_ENVELOPE_MIB: u64 = 4 * 1024;
 const PROBE_TOLERANCE: f32 = 0.0001;
 const PROBE_DIM: usize = 3;
 const PROBE_QUERY: [f32; PROBE_DIM] = [1.0, 0.0, 0.0];
@@ -33,6 +44,12 @@ pub struct SynapseCalyxMathBackendStatus {
     pub cpu_avx512_available: bool,
     pub cpu_simd_path: String,
     pub vram_budget_bytes: u64,
+    pub vram_dispatch: Option<SynapseCalyxVramDispatchStatus>,
+    pub host_reservation_basis: Option<String>,
+    pub host_reservation_id: Option<String>,
+    pub host_reservation: Option<HostGpuReservationSnapshot>,
+    pub runtime_readback_code: Option<String>,
+    pub runtime_readback_error: Option<String>,
     pub fallback_code: Option<String>,
     pub fallback_source_code: Option<String>,
     pub fallback_error: Option<String>,
@@ -42,8 +59,15 @@ pub struct SynapseCalyxMathBackendStatus {
 impl SynapseCalyxMathBackendStatus {
     #[must_use]
     pub fn detail(&self) -> String {
+        let reservation = self.host_reservation.as_ref().and_then(|snapshot| {
+            let reservation_id = self.host_reservation_id.as_deref()?;
+            snapshot
+                .reservations
+                .iter()
+                .find(|row| row.reservation_id == reservation_id)
+        });
         format!(
-            "requested_backend={} selected_backend={} cuda_compiled={} device_name={} device_vram_mib={:?} device_avx512={} cpu_avx512_available={} cpu_simd_path={} vram_budget_bytes={} fallback_code={} fallback_source_code={} probe_status={} probe_detail={}",
+            "requested_backend={} selected_backend={} cuda_compiled={} device_name={} device_vram_mib={:?} device_avx512={} cpu_avx512_available={} cpu_simd_path={} vram_budget_bytes={} vram_budget_enforced={} dispatch_soft_cap_bytes={:?} dispatch_allocated_bytes={:?} dispatch_device_free_bytes={:?} host_reservation_basis={} host_reservation_state_path={} host_reservation_sha256={} host_reservation_id={} host_reservation_pid={:?} host_reservation_requested_mib={:?} runtime_readback_code={} runtime_readback_error={} fallback_code={} fallback_source_code={} probe_status={} probe_detail={}",
             self.requested_backend.as_str(),
             self.selected_backend,
             self.cuda_compiled,
@@ -53,12 +77,43 @@ impl SynapseCalyxMathBackendStatus {
             self.cpu_avx512_available,
             self.cpu_simd_path,
             self.vram_budget_bytes,
+            self.vram_dispatch.is_some(),
+            self.vram_dispatch
+                .as_ref()
+                .map(|status| status.soft_cap_bytes),
+            self.vram_dispatch
+                .as_ref()
+                .map(|status| status.allocated_bytes),
+            self.vram_dispatch
+                .as_ref()
+                .map(|status| status.device_free_bytes),
+            self.host_reservation_basis.as_deref().unwrap_or("none"),
+            self.host_reservation
+                .as_ref()
+                .map_or("none", |snapshot| snapshot.state_path.as_str()),
+            self.host_reservation
+                .as_ref()
+                .map_or("none", |snapshot| snapshot.state_sha256.as_str()),
+            reservation.map_or("none", |reservation| reservation.reservation_id.as_str()),
+            reservation.map(|reservation| reservation.pid),
+            reservation.map(|reservation| reservation.requested_mib),
+            self.runtime_readback_code.as_deref().unwrap_or("none"),
+            self.runtime_readback_error.as_deref().unwrap_or("none"),
             self.fallback_code.as_deref().unwrap_or("none"),
             self.fallback_source_code.as_deref().unwrap_or("none"),
             self.probe.status,
             self.probe.detail,
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxVramDispatchStatus {
+    pub soft_cap_bytes: u64,
+    pub allocated_bytes: u64,
+    pub serving_allocated_bytes: u64,
+    pub anneal_allocated_bytes: u64,
+    pub device_free_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -79,8 +134,9 @@ pub struct SynapseCalyxMathProbeTopKEntry {
 }
 
 pub struct SynapseCalyxMathRuntime {
-    backend: Box<dyn Backend>,
+    backend: Box<dyn SynapseMathBackend>,
     status: SynapseCalyxMathBackendStatus,
+    host_reservation: Option<HostGpuReservation>,
 }
 
 impl fmt::Debug for SynapseCalyxMathRuntime {
@@ -102,16 +158,83 @@ impl SynapseCalyxMathRuntime {
     pub const fn status(&self) -> &SynapseCalyxMathBackendStatus {
         &self.status
     }
+
+    #[must_use]
+    pub fn status_snapshot(&self) -> SynapseCalyxMathBackendStatus {
+        let mut status = self.status.clone();
+        match self.backend.strict_vram_status() {
+            Ok(vram_dispatch) => status.vram_dispatch = vram_dispatch,
+            Err(error) => {
+                status.runtime_readback_code = Some(error.code().to_owned());
+                status.runtime_readback_error =
+                    Some(format!("process-local CUDA VRAM readback failed: {error}"));
+            }
+        }
+        if let Some(reservation) = self.host_reservation.as_ref() {
+            match reservation.readback() {
+                Ok(snapshot) => {
+                    let reservation_id = reservation.reservation_id();
+                    let own_row = snapshot
+                        .reservations
+                        .iter()
+                        .find(|row| row.reservation_id == reservation_id);
+                    if own_row.is_some_and(|row| row.pid == std::process::id()) {
+                        status.host_reservation = Some(snapshot);
+                    } else {
+                        status.runtime_readback_code =
+                            Some("SYNAPSE_CALYX_MATH_HOST_RESERVATION_MISSING".to_owned());
+                        status.runtime_readback_error = Some(format!(
+                            "live host ledger does not contain reservation_id={reservation_id} pid={}",
+                            std::process::id()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    status.runtime_readback_code = Some(error.code().to_owned());
+                    status.runtime_readback_error =
+                        Some(format!("live host reservation readback failed: {error}"));
+                }
+            }
+        }
+        status
+    }
+
+    /// Drops the CUDA backend/context first, then explicitly removes and
+    /// rereads the host reservation row before shutdown may release the vault
+    /// lifetime lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Forge-derived error if the persisted reservation
+    /// cannot be removed, reread, unlocked, or physically deleted.
+    pub fn close(self) -> Result<Option<HostGpuReservationSnapshot>, SynapseCalyxError> {
+        let Self {
+            backend,
+            status: _,
+            host_reservation,
+        } = self;
+        drop(backend);
+        host_reservation
+            .map(HostGpuReservation::release)
+            .transpose()
+            .map_err(|error| {
+                forge_error(
+                    "SYNAPSE_CALYX_MATH_HOST_RESERVATION_RELEASE_FAILED",
+                    "release and read back Calyx host GPU reservation",
+                    &error,
+                )
+            })
+    }
 }
 
 /// Builds the single Calyx Forge math backend for this Synapse process.
 ///
 /// # Errors
 ///
-/// Returns a structured error when config is invalid or when both the selected
-/// runtime path and the CPU safety path fail the startup probe. In `auto`, CUDA
-/// init/probe failures are surfaced in the returned status and CPU is selected
-/// so a missing or unusable GPU does not take down the daemon.
+/// Returns a structured error when config is invalid or the selected runtime
+/// cannot initialize, reserve its physical GPU capacity, or pass the startup
+/// probe. `auto` is strict when CUDA is compiled: it selects CUDA and never
+/// degrades to CPU. CPU execution requires the explicit `cpu` selection.
 pub fn math_backend(
     config: &SynapseCalyxTuningConfig,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
@@ -120,25 +243,11 @@ pub fn math_backend(
     let cpu_readback = CpuReadback::from_backend(&cpu_reference);
     match config.math_backend {
         SynapseCalyxMathBackend::Cpu => {
-            runtime_from_backend(config, cpu_reference, cpu_readback, None)
+            runtime_from_backend(config, cpu_reference, cpu_readback, None, None)
         }
-        SynapseCalyxMathBackend::Auto => {
-            match cuda_runtime_candidate(config, cpu_readback.clone()) {
-                Ok(runtime) => Ok(runtime),
-                Err(error) => {
-                    tracing::warn!(
-                        code = error.code,
-                        source_code = error.source_code.unwrap_or("none"),
-                        error = %error,
-                        "Calyx CUDA backend unavailable in auto mode; selecting CPU backend"
-                    );
-                    runtime_from_backend(config, cpu_reference, cpu_readback, Some(error))
-                }
-            }
+        SynapseCalyxMathBackend::Auto | SynapseCalyxMathBackend::Cuda => {
+            cuda_runtime_candidate(config, cpu_readback)
         }
-        SynapseCalyxMathBackend::Cuda => Err(invalid_config(
-            "math_backend = \"cuda\" is not a supported Synapse override; use \"auto\" to prefer CUDA with CPU fallback or \"cpu\" to force CPU",
-        )),
     }
 }
 
@@ -157,19 +266,222 @@ impl CpuReadback {
     }
 }
 
+trait SynapseMathBackend: Backend {
+    fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError>;
+}
+
+impl SynapseMathBackend for CpuBackend {
+    fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError> {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "calyx-cuda")]
+impl SynapseMathBackend for VramBudgetedCudaBackend {
+    fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError> {
+        self.stats_strict()
+            .map(SynapseCalyxVramDispatchStatus::from)
+            .map(Some)
+    }
+}
+
+impl From<VramStats> for SynapseCalyxVramDispatchStatus {
+    fn from(stats: VramStats) -> Self {
+        Self {
+            soft_cap_bytes: stats.soft_cap_bytes as u64,
+            allocated_bytes: stats.allocated_bytes as u64,
+            serving_allocated_bytes: stats.serving_allocated_bytes as u64,
+            anneal_allocated_bytes: stats.anneal_allocated_bytes as u64,
+            device_free_bytes: stats.device_free_bytes as u64,
+        }
+    }
+}
+
 #[cfg(feature = "calyx-cuda")]
 fn cuda_runtime_candidate(
     config: &SynapseCalyxTuningConfig,
     cpu_readback: CpuReadback,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
-    let backend = CudaBackend::new().map_err(|error| {
+    let reservation_store = HostGpuReservationStore::from_env(0).map_err(|error| {
         forge_error(
-            "SYNAPSE_CALYX_MATH_CUDA_UNAVAILABLE",
-            "initialize Calyx CUDA backend",
+            "SYNAPSE_CALYX_MATH_HOST_RESERVATION_OPEN_FAILED",
+            "open the device-0 host GPU reservation Source of Truth",
             &error,
         )
     })?;
-    runtime_from_backend(config, backend, cpu_readback, None)
+    let runtime_ceiling_mib = config.vram_budget_bytes.div_ceil(BYTES_PER_MIB);
+    let startup_envelope_mib = runtime_ceiling_mib.min(CUDA_STARTUP_ENVELOPE_MIB);
+    let mut reservation = reservation_store
+        .acquire(HostGpuReservationRequest::new(
+            "synapse-mcp",
+            format!("synapse-daemon-pid-{}", std::process::id()),
+            format!(
+                "synapse-mcp temporary CUDA startup envelope; envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; atomically resized after retained-footprint measurement"
+            ),
+            startup_envelope_mib,
+        ))
+        .map_err(|error| {
+            forge_error(
+                "SYNAPSE_CALYX_MATH_HOST_RESERVATION_REFUSED",
+                "atomically admit the embedded Synapse CUDA startup envelope",
+                &error,
+            )
+        })?;
+    let backend = match CudaBackend::new() {
+        Ok(backend) => backend,
+        Err(error) => {
+            return Err(cleanup_host_reservation_after_startup_failure(
+                reservation,
+                forge_error(
+                    "SYNAPSE_CALYX_MATH_CUDA_UNAVAILABLE",
+                    "initialize Calyx CUDA backend",
+                    &error,
+                ),
+            ));
+        }
+    };
+    let backend = match VramBudgetedCudaBackend::new(backend, config.vram_budget_bytes) {
+        Ok(backend) => backend,
+        Err(error) => {
+            return Err(cleanup_host_reservation_after_startup_failure(
+                reservation,
+                forge_error(
+                    "SYNAPSE_CALYX_MATH_VRAM_BUDGET_INIT_FAILED",
+                    "construct the measured per-dispatch Forge VRAM budget gate",
+                    &error,
+                ),
+            ));
+        }
+    };
+    let baseline_basis = match warm_and_measure_cuda_baseline(
+        &backend,
+        &mut reservation,
+        startup_envelope_mib,
+        runtime_ceiling_mib,
+    ) {
+        Ok(basis) => basis,
+        Err(error) => {
+            return Err(cleanup_host_reservation_after_startup_failure(
+                reservation,
+                error,
+            ));
+        }
+    };
+    let backend = match backend.with_host_dispatch_reservations(
+        reservation_store,
+        "synapse-mcp/forge-dispatch",
+        format!("synapse-daemon-pid-{}-dispatch", std::process::id()),
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            return Err(cleanup_host_reservation_after_startup_failure(
+                reservation,
+                forge_error(
+                    "SYNAPSE_CALYX_MATH_HOST_DISPATCH_INIT_FAILED",
+                    "enable measured host-wide reservation for every Forge CUDA dispatch",
+                    &error,
+                ),
+            ));
+        }
+    };
+    runtime_from_backend(
+        config,
+        backend,
+        cpu_readback,
+        Some(reservation),
+        Some(baseline_basis),
+    )
+}
+
+#[cfg(feature = "calyx-cuda")]
+fn warm_and_measure_cuda_baseline(
+    backend: &VramBudgetedCudaBackend,
+    reservation: &mut HostGpuReservation,
+    startup_envelope_mib: u64,
+    runtime_ceiling_mib: u64,
+) -> Result<String, SynapseCalyxError> {
+    run_startup_probe(backend)?;
+    let free_before_cuda_mib = reservation.admitted_snapshot().last_physical_free_mib;
+    let measured_snapshot = reservation.readback().map_err(|error| {
+        forge_error(
+            "SYNAPSE_CALYX_MATH_BASELINE_MEASUREMENT_FAILED",
+            "reread physical GPU memory after the warm CUDA probe",
+            &error,
+        )
+    })?;
+    let free_after_warmup_mib = measured_snapshot.last_physical_free_mib;
+    if free_after_warmup_mib > free_before_cuda_mib {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_BASELINE_MEASUREMENT_DRIFT",
+            format!(
+                "physical free VRAM increased during the exclusive participating-process startup guard: before_mib={free_before_cuda_mib} after_mib={free_after_warmup_mib}; retained CUDA footprint is not provable"
+            ),
+            MATH_BACKEND_REMEDIATION,
+        ));
+    }
+    let retained_cuda_mib = free_before_cuda_mib
+        .saturating_sub(free_after_warmup_mib)
+        .max(1);
+    if retained_cuda_mib > startup_envelope_mib {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_STARTUP_ENVELOPE_EXCEEDED",
+            format!(
+                "measured retained CUDA startup footprint exceeds its admitted envelope: retained_mib={retained_cuda_mib} startup_envelope_mib={startup_envelope_mib} runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; refusing a runtime whose context allocation was not fully covered by the declared host claim"
+            ),
+            MATH_BACKEND_REMEDIATION,
+        ));
+    }
+    let basis = format!(
+        "admitted_startup_envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; nvml_free_delta_after_cuda_context_and_warm_probe_rounded_up_to_mib_with_minimum_1mib_resolution; free_before_mib={free_before_cuda_mib}; free_after_mib={free_after_warmup_mib}; retained_mib={retained_cuda_mib}; measured_retained_within_startup_envelope=true; every dispatch separately reserves its exact device-buffer shape"
+    );
+    let command = format!("synapse-mcp retained CUDA baseline; {basis}");
+    reservation
+        .resize(retained_cuda_mib, &command)
+        .map_err(|error| {
+            forge_error(
+                "SYNAPSE_CALYX_MATH_BASELINE_RESIZE_FAILED",
+                "atomically resize the startup guard to the measured retained CUDA footprint",
+                &error,
+            )
+        })?;
+    Ok(basis)
+}
+
+fn cleanup_host_reservation_after_startup_failure(
+    reservation: HostGpuReservation,
+    primary: SynapseCalyxError,
+) -> SynapseCalyxError {
+    match reservation.release() {
+        Ok(snapshot) => {
+            tracing::info!(
+                code = "SYNAPSE_CALYX_MATH_STARTUP_RESERVATION_RELEASED",
+                primary_code = primary.code,
+                state_path = snapshot.state_path,
+                state_sha256 = snapshot.state_sha256,
+                reserved_mib = snapshot.reserved_mib,
+                "released host GPU reservation after math startup failure"
+            );
+            primary
+        }
+        Err(cleanup_error) => SynapseCalyxError {
+            code: "SYNAPSE_CALYX_MATH_STARTUP_RESERVATION_CLEANUP_FAILED",
+            message: format!(
+                "math startup failed and the exact host reservation could not be explicitly released: primary={primary}; cleanup={cleanup_error}"
+            ),
+            remediation: MATH_BACKEND_REMEDIATION,
+            source_code: Some(cleanup_error.code()),
+        },
+    }
+}
+
+fn cleanup_optional_host_reservation_after_startup_failure(
+    reservation: Option<HostGpuReservation>,
+    primary: SynapseCalyxError,
+) -> SynapseCalyxError {
+    match reservation {
+        Some(reservation) => cleanup_host_reservation_after_startup_failure(reservation, primary),
+        None => primary,
+    }
 }
 
 #[cfg(not(feature = "calyx-cuda"))]
@@ -179,7 +491,7 @@ fn cuda_runtime_candidate(
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
     Err(SynapseCalyxError::new(
         "SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED",
-        "synapse-calyx was built without the calyx-cuda feature, so auto mode cannot initialize CUDA",
+        "the selected auto/cuda path requires a CUDA-enabled synapse-calyx build; CPU execution is available only through the explicit math_backend=\"cpu\" selection",
         MATH_BACKEND_REMEDIATION,
     ))
 }
@@ -188,14 +500,64 @@ fn runtime_from_backend<B>(
     config: &SynapseCalyxTuningConfig,
     backend: B,
     cpu_readback: CpuReadback,
-    fallback: Option<SynapseCalyxError>,
+    host_reservation: Option<HostGpuReservation>,
+    host_reservation_basis: Option<String>,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError>
 where
-    B: Backend + 'static,
+    B: SynapseMathBackend + 'static,
 {
     let device_info = backend.device_info();
-    let probe = run_startup_probe(&backend)?;
-    let status = status_from_device_info(config, &device_info, cpu_readback, fallback, probe);
+    let probe = match run_startup_probe(&backend) {
+        Ok(probe) => probe,
+        Err(error) => {
+            return Err(cleanup_optional_host_reservation_after_startup_failure(
+                host_reservation,
+                error,
+            ));
+        }
+    };
+    let vram_dispatch = match backend.strict_vram_status() {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(cleanup_optional_host_reservation_after_startup_failure(
+                host_reservation,
+                forge_error(
+                    "SYNAPSE_CALYX_MATH_VRAM_READBACK_FAILED",
+                    "read process-local VRAM budget and physical CUDA free memory after probe",
+                    &error,
+                ),
+            ));
+        }
+    };
+    let host_reservation_snapshot = match host_reservation
+        .as_ref()
+        .map(HostGpuReservation::readback)
+        .transpose()
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(cleanup_optional_host_reservation_after_startup_failure(
+                host_reservation,
+                forge_error(
+                    "SYNAPSE_CALYX_MATH_HOST_RESERVATION_READBACK_FAILED",
+                    "reread the measured retained CUDA reservation after the host-admitted probe",
+                    &error,
+                ),
+            ));
+        }
+    };
+    let status = status_from_device_info(
+        config,
+        &device_info,
+        MathStatusInputs {
+            cpu_readback,
+            vram_dispatch,
+            host_reservation: host_reservation.as_ref(),
+            host_reservation_snapshot,
+            host_reservation_basis,
+            probe,
+        },
+    );
     tracing::info!(
         code = "SYNAPSE_CALYX_MATH_BACKEND_SELECTED",
         requested_backend = status.requested_backend.as_str(),
@@ -207,6 +569,10 @@ where
         cpu_avx512_available = status.cpu_avx512_available,
         cpu_simd_path = status.cpu_simd_path.as_str(),
         vram_budget_bytes = status.vram_budget_bytes,
+        vram_budget_enforced = status.vram_dispatch.is_some(),
+        vram_dispatch = ?status.vram_dispatch,
+        host_reservation_basis = status.host_reservation_basis.as_deref().unwrap_or("none"),
+        host_reservation = ?status.host_reservation,
         fallback_code = status.fallback_code.as_deref().unwrap_or("none"),
         fallback_source_code = status.fallback_source_code.as_deref().unwrap_or("none"),
         probe_status = status.probe.status.as_str(),
@@ -214,29 +580,37 @@ where
         probe_cosine = ?status.probe.cosine,
         probe_l2_squared = ?status.probe.l2_squared,
         probe_topk = ?status.probe.topk,
-        "selected Calyx Forge math backend"
+        "selected fail-closed Calyx Forge math backend"
     );
     Ok(SynapseCalyxMathRuntime {
         backend: Box::new(backend),
         status,
+        host_reservation,
     })
+}
+
+struct MathStatusInputs<'a> {
+    cpu_readback: CpuReadback,
+    vram_dispatch: Option<SynapseCalyxVramDispatchStatus>,
+    host_reservation: Option<&'a HostGpuReservation>,
+    host_reservation_snapshot: Option<HostGpuReservationSnapshot>,
+    host_reservation_basis: Option<String>,
+    probe: SynapseCalyxMathProbeReport,
 }
 
 fn status_from_device_info(
     config: &SynapseCalyxTuningConfig,
     info: &DeviceInfo,
-    cpu_readback: CpuReadback,
-    fallback: Option<SynapseCalyxError>,
-    probe: SynapseCalyxMathProbeReport,
+    inputs: MathStatusInputs<'_>,
 ) -> SynapseCalyxMathBackendStatus {
-    let (fallback_code, fallback_source_code, fallback_error) =
-        fallback.map_or((None, None, None), |error| {
-            (
-                Some(error.code.to_owned()),
-                error.source_code.map(str::to_owned),
-                Some(error.to_string()),
-            )
-        });
+    let MathStatusInputs {
+        cpu_readback,
+        vram_dispatch,
+        host_reservation,
+        host_reservation_snapshot,
+        host_reservation_basis,
+        probe,
+    } = inputs;
     SynapseCalyxMathBackendStatus {
         requested_backend: config.math_backend,
         selected_backend: info.kind.to_string(),
@@ -247,9 +621,16 @@ fn status_from_device_info(
         cpu_avx512_available: cpu_readback.avx512_available,
         cpu_simd_path: cpu_readback.simd_path,
         vram_budget_bytes: config.vram_budget_bytes,
-        fallback_code,
-        fallback_source_code,
-        fallback_error,
+        vram_dispatch,
+        host_reservation_basis,
+        host_reservation_id: host_reservation
+            .map(|reservation| reservation.reservation_id().to_owned()),
+        host_reservation: host_reservation_snapshot,
+        runtime_readback_code: None,
+        runtime_readback_error: None,
+        fallback_code: None,
+        fallback_source_code: None,
+        fallback_error: None,
         probe,
     }
 }

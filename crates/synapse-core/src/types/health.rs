@@ -135,6 +135,72 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vram_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_budget_enforced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_dispatch_soft_cap_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_dispatch_allocated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_dispatch_serving_allocated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_dispatch_anneal_allocated_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vram_dispatch_device_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_state_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_state_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_device_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_device_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_device_total_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_host_cap_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_required_free_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_headroom_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_last_physical_free_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_reserved_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_available_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_admitted_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_rejected_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_stale_reaped_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_requested_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_acquired_unix_ms: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_lease_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_reservation_last_rejection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_runtime_readback_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_gpu_runtime_readback_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_backend_requested: Option<String>,

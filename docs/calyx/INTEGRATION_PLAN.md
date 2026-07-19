@@ -2,7 +2,7 @@
 
 **Status:** Proposed · 2026-07-15
 **Scope:** Run Synapse on Calyx as its storage layer, then unlock every Calyx capability (associations, bits, kernel, guard, oracle, provenance, self-optimization) over everything Synapse captures.
-**Doctrine:** `BUILDING_ON_CALYX.md` is the build handbook. Encoders only — **no learned embedders**. GPU preferred, CPU fallback. Manual FSV (AGENTS.md D1) gates every step.
+**Doctrine:** `BUILDING_ON_CALYX.md` is the build handbook. Encoders only — **no learned embedders**. CUDA is fail-closed when selected; CPU is explicit, never a fallback. Manual FSV (AGENTS.md D1) gates every step.
 
 ---
 
@@ -66,7 +66,7 @@ Rust 2024 workspace, **compiles clean on Windows** (verified 2026-07-15: `cargo 
 3. **Keep the `Db` facade, replace its guts.** `synapse-storage` keeps its exact public API. All 17 CFs are **Kv-family collections** in the vault — keys byte-identical to the original codecs, values stay JSON (ADR-0001 inspectability preserved). TTL maps to Kv `expires_at`; caps map to aster retention/GC; pressure levels map to aster pressure.
 4. **Raw row + constellation, dual representation.** The verbatim JSON row remains the replay/audit source of truth. Alongside it, each intelligence-bearing record is *measured* into a constellation (slots + exact `scalars` + verbatim `metadata` + anchors + provenance) with content-addressed ids (idempotent re-ingest). This is the handbook's Phase 2 "no side store" satisfied in one engine: both live in the same vault.
 5. **Encoders only — never embed the explicit.** Every lens is a frozen deterministic `AlgorithmicEncoder`-style instrument (the `Gdelt*` family in `calyx-registry` is the template for adding a `Syn*` family). No candle/onnx/tei lens is ever registered. Structured meaning is measured in **bits**, not cosine-over-embeddings.
-6. **GPU preferred, CPU fallback, measured parity.** Build `calyx-forge` with the `cuda` feature (dynamic-linking — no hard CUDA install dependency). At startup: try `CudaBackend::new()`, on error fall back to `CpuBackend::new()`; log the choice, surface it in the `health` tool, enforce CPU↔GPU bit-parity via the forge parity checks.
+6. **Fail-closed CUDA, explicit CPU, measured parity.** The production build enables `calyx-forge/cuda`. `math_backend = "auto"` and `"cuda"` both require a working CUDA/NVML path and fail startup on unknown, corrupt, or contended GPU state; `"cpu"` is the only CPU selection. A conservative 4 GiB bootstrap envelope (bounded by a smaller configured runtime ceiling) covers CUDA initialization, the measured retained context footprint must fit that admitted envelope, the same lease is atomically resized to the measurement, and every Forge dispatch separately reserves its concrete device-buffer shape through both the process-local budget and `%ProgramData%\Calyx\gpu-reservations\device-0`. The runtime ceiling is not held while idle, so candidate-before-handoff validation remains possible. The live ledger, exact owner/command/PID/MiB row, counters, SHA-256, physical free VRAM, and startup parity probe are exposed in `health`.
 7. **Manual FSV at every step (AGENTS.md D1).** Every issue's acceptance is a manual FSV: real repo-built daemon, real MCP `tools/call` trigger, then a direct read of the physical SoT (vault bytes / ledger chain / assay rows), with evidence under `docs/fsv/`. The repository carries no automated tests, benchmarks, or FSV harnesses.
 
 ## 2.5 Adaptation gap analysis — Calyx is not integration-ready as absorbed
@@ -179,7 +179,7 @@ Every issue ends with manual FSV (never automated, AGENTS.md D1): daemon PID/bin
 
 ## 7. Issue graph (filed 2026-07-15, extended same day — epic #1684)
 
-- **Phase 0 — Foundation & absorption:** #1652 absorb Calyx fork-and-own (landed in tree) → #1653 `synapse-calyx` vault crate → #1654 GPU-preferred/CPU-fallback math runtime.
+- **Phase 0 — Foundation & absorption:** #1652 absorb Calyx fork-and-own (landed in tree) → #1653 `synapse-calyx` vault crate → #1654 initial math runtime → #1753 fail-closed measured process/host VRAM admission.
 - **Phase 0.5 — Calyx adaptation (new code — §2.5):** #1692 async vault facade + WAL-synced batcher → #1693 Windows durability hardening + crash soak → #1694 structured-record measurement pipeline → #1695 deferred forge GPU ops (profile-driven) → #1696 error/config/clock bridges.
 - **Phase 1 — Parity swap:** #1655 backend seam → #1656 Kv backend (byte-identical Db API; needs #1692) → #1657 retention/TTL, #1658 disk pressure, #1659 GC, #1660 inspect/dump → #1661 migration (byte-exact verified) → #1662 Calyx-only cutover.
 - **Phase 2 — Measure:** #1663 `Syn*` encoder family (new calyx-registry code; needs #1694) → #1664 timeline/episode panels, #1665 agent panels, #1666 action/reflex/process/observation panels → #1667 temporal lenses + recurrence → #1668 panel lifecycle/backfill/admission gate → #1685 graph-structural + hierarchy lenses.

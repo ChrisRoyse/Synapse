@@ -1362,16 +1362,20 @@ async fn fail_http_startup_after_service(
             .map_err(anyhow::Error::new),
     );
 
+    // Stop every independent storage producer before asking the activity
+    // recorder to commit the final session_end boundary. Otherwise transcript
+    // ingestion can retain and mutate the shared Db while the recorder is
+    // trying to establish the terminal ordering boundary.
+    let background_task_drain = drain_http_background_tasks(background_tasks).await;
+    let background_tasks_quiescent = background_task_drain.owners_quiescent();
+    failures.inspect_result("background_task_drain", background_task_drain.verdict());
+
     let activity_drain =
         drain_http_activity_owners(&m3_state, recorder_expected, a11y_expected).await;
     let activity_owners_quiescent = activity_drain.safe_to_unlock();
     let win_event_shutdown_history_quiescent =
         activity_drain.win_event_shutdown_history.owners_quiescent();
     failures.inspect_result("activity_owner_drain", activity_drain.verdict());
-
-    let background_task_drain = drain_http_background_tasks(background_tasks).await;
-    let background_tasks_quiescent = background_task_drain.owners_quiescent();
-    failures.inspect_result("background_task_drain", background_task_drain.verdict());
 
     let m2_emitter_drain =
         drain_m2_emitter_owner(Some(m2_emitter_owner), "http", "http_startup_failure").await;
@@ -2623,18 +2627,14 @@ pub(super) async fn serve(
         "readback=local_session_manager edge=http_server_stopped after_cleanup"
     );
     shutdown_failures.inspect_final_session_ids(&final_session_ids);
-    // Stop the WinEvent source before the recorder so session_end is the final
-    // timeline row, then require terminal readback from all Tokio/OS owners.
-    let activity_drain = drain_http_activity_owners(&m3_state_for_recorder, true, true).await;
-    let activity_owners_quiescent = activity_drain.safe_to_unlock();
-    let win_event_shutdown_history_quiescent =
-        activity_drain.win_event_shutdown_history.owners_quiescent();
-    shutdown_failures.inspect_result("activity_owner_drain", activity_drain.verdict());
-
     let m2_emitter_drain =
         drain_m2_emitter_owner(Some(m2_emitter_owner), "http", shutdown_source).await;
     let m2_emitter_safe = m2_emitter_drain.safe_to_unlock();
     shutdown_failures.inspect_result("m2_emitter_owner_join", m2_emitter_drain.verdict());
+    // Stop every independent storage producer before asking the activity
+    // recorder to commit the final session_end boundary. The recorder itself
+    // stops its WinEvent/idle/cadence producers before that write, preserving
+    // the invariant that session_end is the last timeline row.
     background_tasks.append(&mut runtime.background_tasks);
     let background_task_drain = drain_http_background_tasks(background_tasks).await;
     let background_tasks_quiescent = background_task_drain.owners_quiescent();
@@ -2651,6 +2651,12 @@ pub(super) async fn serve(
             .verdict()
             .context("drain HTTP daemon background tasks before releasing lifetime locks"),
     );
+
+    let activity_drain = drain_http_activity_owners(&m3_state_for_recorder, true, true).await;
+    let activity_owners_quiescent = activity_drain.safe_to_unlock();
+    let win_event_shutdown_history_quiescent =
+        activity_drain.win_event_shutdown_history.owners_quiescent();
+    shutdown_failures.inspect_result("activity_owner_drain", activity_drain.verdict());
 
     let (calyx_vault_closed, calyx_vault_close) =
         close_http_calyx_vault(&m3_state_for_recorder, shutdown_source, true);

@@ -86,11 +86,16 @@ pub use vram::CudaStream;
 pub use vram::CudaVramProbe;
 #[cfg(feature = "cuda")]
 pub use vram::RawCudaMalloc;
+#[cfg(feature = "cuda")]
+pub use vram::VramBudgetedCudaBackend;
 pub use vram::{
     ANNEAL_VRAM_BUDGET_ENV, AdmissionController, AdmissionOutput, AdmitDecision, BlockDeallocator,
     BlockId, BlockKind, Category, CudaAllocError, CudaMalloc, DEFAULT_ANNEAL_THROTTLE_SLEEP,
-    DEFAULT_ANNEAL_VRAM_CAP_BYTES, DEFAULT_OOM_MAX_RETRIES, DEFAULT_POWER_BACKOFF_THRESHOLD_W,
-    DEFAULT_SOFT_CAP_BYTES, DevicePtr, GpuBlockRegistry, GpuBlockStats,
+    DEFAULT_ANNEAL_VRAM_CAP_BYTES, DEFAULT_HOST_CAP_MIB, DEFAULT_HOST_HEADROOM_MIB,
+    DEFAULT_OOM_MAX_RETRIES, DEFAULT_POWER_BACKOFF_THRESHOLD_W, DEFAULT_REQUIRED_FREE_MIB,
+    DEFAULT_SOFT_CAP_BYTES, DevicePtr, GpuBlockRegistry, GpuBlockStats, HOST_CAP_MIB_ENV,
+    HOST_RESERVATION_ROOT_ENV, HostGpuReservation, HostGpuReservationRequest,
+    HostGpuReservationSnapshot, HostGpuReservationStore, HostGpuReservationView,
     LENS_VRAM_BUDGET_REMEDIATION, LensAdmission, LensAdmissionPlacement, LensAdmissionRequest,
     NvmlPowerProbe, OomGuard, OomGuardStats, PowerProbe, QueuedDispatch, RESERVED_HEADROOM_BYTES,
     VRAM_BUDGET_ENV, VRAM_BUDGET_REMEDIATION, VramBudgeter, VramGuard, VramProbe, VramStats,

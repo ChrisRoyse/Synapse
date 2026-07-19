@@ -59,6 +59,15 @@ pub enum ForgeError {
         detail: String,
         remediation: String,
     },
+    /// A host-wide GPU reservation could not be admitted atomically.
+    ///
+    /// Unlike [`Self::VramBudget`], this is explicitly cross-process and maps
+    /// to the universal back-pressure code so an orchestrator can retry the
+    /// same immutable job after another reservation releases.
+    HostVramBackpressure {
+        detail: String,
+        remediation: String,
+    },
     LensVramBudget {
         detail: String,
         remediation: String,
@@ -82,6 +91,7 @@ impl ForgeError {
             Self::CacheError { .. } => "CALYX_FORGE_CACHE_ERROR",
             Self::LedgerError { .. } => "CALYX_FORGE_LEDGER_ERROR",
             Self::VramBudget { .. } => "CALYX_FORGE_VRAM_BUDGET",
+            Self::HostVramBackpressure { .. } => "CALYX_BACKPRESSURE",
             Self::LensVramBudget { .. } => "CALYX_VRAM_BUDGET_EXCEEDED",
             Self::SeedVersionMismatch { .. } => "CALYX_FORGE_QUANT_SEED_VERSION",
         }
@@ -99,6 +109,7 @@ impl ForgeError {
             | Self::CacheError { remediation, .. }
             | Self::LedgerError { remediation, .. }
             | Self::VramBudget { remediation, .. }
+            | Self::HostVramBackpressure { remediation, .. }
             | Self::LensVramBudget { remediation, .. } => remediation,
             Self::SeedVersionMismatch { .. } => SEED_VERSION_REMEDIATION,
         }
@@ -142,6 +153,9 @@ impl fmt::Display for ForgeError {
                 format!("{} op={} detail={}", self.code(), op, detail)
             }
             Self::VramBudget { detail, .. } => {
+                format!("{} detail={}", self.code(), detail)
+            }
+            Self::HostVramBackpressure { detail, .. } => {
                 format!("{} detail={}", self.code(), detail)
             }
             Self::LensVramBudget { detail, .. } => {

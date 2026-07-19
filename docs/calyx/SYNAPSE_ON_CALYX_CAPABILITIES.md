@@ -3,7 +3,7 @@
 **Status:** Target state · 2026-07-15 · realized when the `[CALYX]` issue graph is closed
 **Companion:** `docs/calyx/INTEGRATION_PLAN.md` (how) · this document (what it makes possible)
 
-Synapse is a Windows-native perception/action/autonomy daemon that *captures* everything — operator activity timeline, derived episodes, mined routines, agent journals and transcripts, emitted actions, reflex audits, observations, process history — and stores it in a Calyx **association-native database** where the relationships between everything it captures are first-class, measured, grounded, and queryable. No learned embedders anywhere: every measurement is a deterministic encoder, every insight is information-theoretic (bits), every claim is anchored to a real outcome or explicitly tagged provisional. All math runs GPU-first with automatic CPU fallback.
+Synapse is a Windows-native perception/action/autonomy daemon that *captures* everything — operator activity timeline, derived episodes, mined routines, agent journals and transcripts, emitted actions, reflex audits, observations, process history — and stores it in a Calyx **association-native database** where the relationships between everything it captures are first-class, measured, grounded, and queryable. No learned embedders anywhere: every measurement is a deterministic encoder, every insight is information-theoretic (bits), every claim is anchored to a real outcome or explicitly tagged provisional. CUDA math is fail-closed when selected; CPU execution is an explicit operator choice, never an automatic degradation.
 
 ---
 
@@ -98,7 +98,7 @@ The substrate doesn't just answer questions — it drives decisions, under a str
 
 ## 10. Hardware posture
 
-- **GPU-first, CPU-always** — all vector/association math (cosine, GEMM, top-k, MI estimation support) runs on CUDA when a GPU is present (VRAM-budgeted, bit-parity-checked against CPU), and falls back automatically to AVX-512-aware SIMD CPU kernels when it isn't. The daemon never fails for lack of a GPU; `health` reports which backend is live.
+- **Measured CUDA admission, explicit CPU** — `auto`/`cuda` run vector and association math through CUDA only after an NVML-measured retained-footprint reservation and an exact per-dispatch device-buffer reservation are admitted in both process-local and host-wide ledgers. Contention, corrupt state, missing CUDA/NVML, or unprovable free memory fails with a structured code before output mutation. `cpu` deliberately selects the AVX-512-aware SIMD backend. `health` rereads and reports the physical ledger, current free memory, reservation identity, counters, and parity probe.
 - **Lightweight by design** — encoders are weightless (no model downloads, no inference servers); the only heavy math is linear algebra the host already does; the ONNX/candle embedder runtimes that ship with Calyx stay dormant.
 
 ## 11. Trust properties, end to end

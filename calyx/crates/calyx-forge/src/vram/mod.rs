@@ -20,6 +20,9 @@
 
 pub mod admission;
 pub mod budget;
+#[cfg(feature = "cuda")]
+pub mod budgeted_backend;
+pub mod host_reservation;
 pub mod lru_evict;
 pub mod oom_guard;
 pub mod yield_policy;
@@ -31,6 +34,13 @@ pub use admission::{
 pub use budget::{
     Category, DEFAULT_SOFT_CAP_BYTES, RESERVED_HEADROOM_BYTES, VRAM_BUDGET_ENV,
     VRAM_BUDGET_REMEDIATION, VramBudgeter, VramGuard,
+};
+#[cfg(feature = "cuda")]
+pub use budgeted_backend::VramBudgetedCudaBackend;
+pub use host_reservation::{
+    DEFAULT_HOST_CAP_MIB, DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
+    HOST_RESERVATION_ROOT_ENV, HostGpuReservation, HostGpuReservationRequest,
+    HostGpuReservationSnapshot, HostGpuReservationStore, HostGpuReservationView,
 };
 pub use lru_evict::{
     BlockDeallocator, BlockId, BlockKind, DevicePtr, GpuBlockRegistry, GpuBlockStats,

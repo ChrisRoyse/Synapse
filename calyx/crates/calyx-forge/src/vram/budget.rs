@@ -199,6 +199,20 @@ impl<P: VramProbe> VramBudgeter<P> {
                 0
             }
         };
+        self.stats_with_device_free(device_free_bytes)
+    }
+
+    /// Snapshot accounting with a fail-closed live device read.
+    ///
+    /// Unlike [`Self::stats`], this method never substitutes a sentinel for an
+    /// unknown physical state. Runtime health/admission gates should use this
+    /// strict form whenever the readback itself is part of the verdict.
+    pub fn stats_strict(&self) -> Result<VramStats> {
+        let device_free_bytes = self.device_free_vram()?;
+        Ok(self.stats_with_device_free(device_free_bytes))
+    }
+
+    fn stats_with_device_free(&self, device_free_bytes: usize) -> VramStats {
         VramStats {
             soft_cap_bytes: self.soft_cap_bytes,
             allocated_bytes: self.allocated_bytes.load(Ordering::Acquire),

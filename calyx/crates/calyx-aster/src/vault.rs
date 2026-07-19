@@ -263,6 +263,19 @@ where
         &self.dedup_policy
     }
 
+    /// Reads one raw CF row from one atomic view of the latest committed state.
+    pub fn read_cf_latest(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.rows.read_latest(cf, key)
+    }
+
+    /// Reads raw CF rows from one atomic view of the latest committed state.
+    pub fn read_cf_batch_latest(
+        &self,
+        reads: &[crate::mvcc::CfRead],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.rows.read_batch_latest(reads)
+    }
+
     /// Reads one raw CF row at `snapshot`.
     pub fn read_cf_at(
         &self,
@@ -319,6 +332,11 @@ where
         self.rows.scan_cf_at(snapshot, cf, &self.clock)
     }
 
+    /// Scans visible raw CF rows from one atomic latest committed view.
+    pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.rows.scan_cf_latest(cf)
+    }
+
     /// Scans visible raw CF rows in a key range at `snapshot`.
     pub fn scan_cf_range_at(
         &self,
@@ -339,6 +357,15 @@ where
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.rows.scan_cf_range_at(snapshot, cf, range, &self.clock)
+    }
+
+    /// Scans visible raw CF rows in a range from one atomic latest committed view.
+    pub fn scan_cf_range_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.rows.scan_cf_range_latest(cf, range)
     }
 
     /// Scans visible raw CF row keys in a key range at `snapshot`.

@@ -10,8 +10,12 @@ impl VersionedCfStore {
         if !self.router_latest_readback.load(Ordering::Acquire) {
             return Ok(None);
         }
-        self.ensure_router_latest_snapshot(snapshot)?;
         let router = self.router.read().expect("mvcc router poisoned");
+        // Keep the router read guard across the latest-sequence check and
+        // lookup. Commits take the router write guard before publishing their
+        // sequence, so a snapshot cannot pass validation and then observe a
+        // newer physical serving view.
+        self.ensure_router_latest_snapshot(snapshot)?;
         let Some(router) = router.as_ref() else {
             return Ok(None);
         };
@@ -29,8 +33,8 @@ impl VersionedCfStore {
         if !self.router_latest_readback.load(Ordering::Acquire) {
             return Ok(BTreeMap::new());
         }
-        self.ensure_router_latest_snapshot(snapshot)?;
         let router = self.router.read().expect("mvcc router poisoned");
+        self.ensure_router_latest_snapshot(snapshot)?;
         let Some(router) = router.as_ref() else {
             return Ok(BTreeMap::new());
         };
@@ -60,8 +64,8 @@ impl VersionedCfStore {
         if !self.router_latest_readback.load(Ordering::Acquire) {
             return Ok(BTreeMap::new());
         }
-        self.ensure_router_latest_snapshot(snapshot)?;
         let router = self.router.read().expect("mvcc router poisoned");
+        self.ensure_router_latest_snapshot(snapshot)?;
         let Some(router) = router.as_ref() else {
             return Ok(BTreeMap::new());
         };

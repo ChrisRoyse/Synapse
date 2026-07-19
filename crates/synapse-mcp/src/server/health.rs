@@ -254,15 +254,26 @@ impl SynapseService {
         };
         let health_status = if !status.enabled {
             "disabled"
-        } else if status.open {
-            "ok"
         } else if status.last_error_code.is_some() {
             "error"
+        } else if status.open {
+            "ok"
         } else {
             "starting"
         };
         let tuning = status.tuning;
         let math_backend = status.math_backend;
+        let gpu_reservation_snapshot = math_backend
+            .as_ref()
+            .and_then(|math| math.host_reservation.as_ref());
+        let gpu_reservation = math_backend.as_ref().and_then(|math| {
+            let reservation_id = math.host_reservation_id.as_deref()?;
+            math.host_reservation
+                .as_ref()?
+                .reservations
+                .iter()
+                .find(|row| row.reservation_id == reservation_id)
+        });
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
@@ -317,6 +328,97 @@ impl SynapseService {
             calyx_temporal_boost_min: tuning.map(|config| config.temporal_boost_min),
             calyx_temporal_boost_max: tuning.map(|config| config.temporal_boost_max),
             calyx_vram_budget_bytes: tuning.map(|config| config.vram_budget_bytes),
+            calyx_vram_budget_enforced: math_backend
+                .as_ref()
+                .map(|math| math.vram_dispatch.is_some()),
+            calyx_vram_dispatch_soft_cap_bytes: math_backend
+                .as_ref()
+                .and_then(|math| math.vram_dispatch.as_ref())
+                .map(|dispatch| dispatch.soft_cap_bytes),
+            calyx_vram_dispatch_allocated_bytes: math_backend
+                .as_ref()
+                .and_then(|math| math.vram_dispatch.as_ref())
+                .map(|dispatch| dispatch.allocated_bytes),
+            calyx_vram_dispatch_serving_allocated_bytes: math_backend
+                .as_ref()
+                .and_then(|math| math.vram_dispatch.as_ref())
+                .map(|dispatch| dispatch.serving_allocated_bytes),
+            calyx_vram_dispatch_anneal_allocated_bytes: math_backend
+                .as_ref()
+                .and_then(|math| math.vram_dispatch.as_ref())
+                .map(|dispatch| dispatch.anneal_allocated_bytes),
+            calyx_vram_dispatch_device_free_bytes: math_backend
+                .as_ref()
+                .and_then(|math| math.vram_dispatch.as_ref())
+                .map(|dispatch| dispatch.device_free_bytes),
+            calyx_gpu_reservation_basis: math_backend
+                .as_ref()
+                .and_then(|math| math.host_reservation_basis.clone()),
+            calyx_gpu_reservation_state_path: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.state_path.clone()),
+            calyx_gpu_reservation_state_sha256: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.state_sha256.clone()),
+            calyx_gpu_reservation_device_index: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.device_index),
+            calyx_gpu_reservation_device_uuid: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.device_uuid.clone()),
+            calyx_gpu_reservation_device_name: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.device_name.clone()),
+            calyx_gpu_reservation_device_total_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.device_total_mib),
+            calyx_gpu_reservation_host_cap_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.host_cap_mib),
+            calyx_gpu_reservation_required_free_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.required_free_mib),
+            calyx_gpu_reservation_headroom_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.headroom_mib),
+            calyx_gpu_reservation_last_physical_free_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.last_physical_free_mib),
+            calyx_gpu_reservation_reserved_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.reserved_mib),
+            calyx_gpu_reservation_available_mib: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.available_reservation_mib),
+            calyx_gpu_reservation_admitted_total: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.admitted_total),
+            calyx_gpu_reservation_rejected_total: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.rejected_total),
+            calyx_gpu_reservation_stale_reaped_total: gpu_reservation_snapshot
+                .map(|snapshot| snapshot.stale_reaped_total),
+            calyx_gpu_reservation_id: gpu_reservation
+                .map(|reservation| reservation.reservation_id.clone()),
+            calyx_gpu_reservation_owner: gpu_reservation
+                .map(|reservation| reservation.owner.clone()),
+            calyx_gpu_reservation_job_id: gpu_reservation
+                .map(|reservation| reservation.job_id.clone()),
+            calyx_gpu_reservation_command: gpu_reservation
+                .map(|reservation| reservation.command.clone()),
+            calyx_gpu_reservation_pid: gpu_reservation.map(|reservation| reservation.pid),
+            calyx_gpu_reservation_requested_mib: gpu_reservation
+                .map(|reservation| reservation.requested_mib),
+            calyx_gpu_reservation_acquired_unix_ms: gpu_reservation
+                .map(|reservation| reservation.acquired_unix_ms.to_string()),
+            calyx_gpu_reservation_lease_file: gpu_reservation
+                .map(|reservation| reservation.lease_file.clone()),
+            calyx_gpu_reservation_last_rejection: gpu_reservation_snapshot
+                .and_then(|snapshot| snapshot.last_rejection.as_ref())
+                .map(|rejection| {
+                    format!(
+                        "owner={} job_id={} command={} pid={} requested_mib={} at_unix_ms={} reason={}",
+                        rejection.owner,
+                        rejection.job_id,
+                        rejection.command,
+                        rejection.pid,
+                        rejection.requested_mib,
+                        rejection.at_unix_ms,
+                        rejection.reason
+                    )
+                }),
+            calyx_gpu_runtime_readback_code: math_backend
+                .as_ref()
+                .and_then(|math| math.runtime_readback_code.clone()),
+            calyx_gpu_runtime_readback_error: math_backend
+                .as_ref()
+                .and_then(|math| math.runtime_readback_error.clone()),
             calyx_math_backend: math_backend
                 .as_ref()
                 .map(|math| math.selected_backend.clone()),
