@@ -39,6 +39,143 @@ pub use math::{
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// One raw Calyx value plus SHA-256 of its exact plaintext physical bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynapseCalyxRevisionedValue {
+    pub value: Vec<u8>,
+    pub revision_sha256: [u8; 32],
+}
+
+/// One physical Calyx CF revision precondition.
+///
+/// `expected_revision_sha256` is `None` only when the physical row must be
+/// absent. Guards are evaluated in input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynapseCalyxRevisionGuard {
+    pub cf: ColumnFamily,
+    pub key: Vec<u8>,
+    pub expected_revision_sha256: Option<[u8; 32]>,
+}
+
+impl SynapseCalyxRevisionGuard {
+    #[must_use]
+    pub fn new(
+        cf: ColumnFamily,
+        key: impl Into<Vec<u8>>,
+        expected_revision_sha256: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            cf,
+            key: key.into(),
+            expected_revision_sha256,
+        }
+    }
+}
+
+impl From<SynapseCalyxRevisionGuard> for calyx_aster::vault::CfRevisionGuard {
+    fn from(guard: SynapseCalyxRevisionGuard) -> Self {
+        Self::new(guard.cf, guard.key, guard.expected_revision_sha256)
+    }
+}
+
+/// The first ordered Calyx revision guard that conflicted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynapseCalyxConditionalWriteConflict {
+    pub guard_index: usize,
+    pub cf: ColumnFamily,
+    pub key: Vec<u8>,
+    pub expected_revision_sha256: Option<[u8; 32]>,
+    pub actual_revision_sha256: Option<[u8; 32]>,
+}
+
+impl From<calyx_aster::vault::ConditionalCfWriteConflict> for SynapseCalyxConditionalWriteConflict {
+    fn from(conflict: calyx_aster::vault::ConditionalCfWriteConflict) -> Self {
+        Self {
+            guard_index: conflict.guard_index,
+            cf: conflict.cf,
+            key: conflict.key,
+            expected_revision_sha256: conflict.expected_revision,
+            actual_revision_sha256: conflict.actual_revision,
+        }
+    }
+}
+
+/// Outcome of one atomic multi-key Calyx conditional mutation.
+///
+/// `actual_revisions_sha256` always follows guard-input order. On success,
+/// `committed_revisions_sha256` has the same length; a deleted guard is
+/// represented by `None`. On conflict, no row is mutated,
+/// `committed_revisions_sha256` is empty, and `conflict` identifies the first
+/// mismatching guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynapseCalyxMultiConditionalWriteOutcome {
+    pub applied: bool,
+    pub committed_seq: Seq,
+    pub actual_revisions_sha256: Vec<Option<[u8; 32]>>,
+    pub committed_revisions_sha256: Vec<Option<[u8; 32]>>,
+    pub conflict: Option<SynapseCalyxConditionalWriteConflict>,
+}
+
+impl From<calyx_aster::vault::MultiConditionalCfWriteOutcome>
+    for SynapseCalyxMultiConditionalWriteOutcome
+{
+    fn from(outcome: calyx_aster::vault::MultiConditionalCfWriteOutcome) -> Self {
+        Self {
+            applied: outcome.applied,
+            committed_seq: outcome.seq,
+            actual_revisions_sha256: outcome.actual_revisions,
+            committed_revisions_sha256: outcome.committed_revisions,
+            conflict: outcome.conflict.map(Into::into),
+        }
+    }
+}
+
+/// Compatibility outcome for a single-key Calyx conditional mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SynapseCalyxConditionalWriteOutcome {
+    pub applied: bool,
+    pub committed_seq: Seq,
+    pub previous_revision_sha256: Option<[u8; 32]>,
+    pub committed_revision_sha256: Option<[u8; 32]>,
+}
+
+impl From<calyx_aster::vault::ConditionalCfWriteOutcome> for SynapseCalyxConditionalWriteOutcome {
+    fn from(outcome: calyx_aster::vault::ConditionalCfWriteOutcome) -> Self {
+        Self {
+            applied: outcome.applied,
+            committed_seq: outcome.seq,
+            previous_revision_sha256: outcome.previous_revision,
+            committed_revision_sha256: outcome.committed_revision,
+        }
+    }
+}
+
+/// One candidate-bounded page from a single atomic latest Calyx view.
+///
+/// `examined_rows` counts logical candidates merged across serving layers,
+/// including at most one lookahead used to compute `more`; it is not a count
+/// of physical SST rows, files, or bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynapseCalyxCfRangePage {
+    pub snapshot_seq: Seq,
+    pub rows: SynapseCalyxCfRows,
+    pub resume_after: Option<Vec<u8>>,
+    pub more: bool,
+    pub examined_rows: usize,
+}
+
+impl From<calyx_aster::mvcc::LatestCfRangePage> for SynapseCalyxCfRangePage {
+    fn from(page: calyx_aster::mvcc::LatestCfRangePage) -> Self {
+        Self {
+            snapshot_seq: page.snapshot_seq,
+            rows: page.rows,
+            resume_after: page.resume_after,
+            more: page.more,
+            examined_rows: page.examined_rows,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SynapseCalyxPutDisposition {
@@ -811,7 +948,11 @@ impl SynapseCalyxReadOnlyVault {
         let options = VaultOptions {
             read_only: true,
             restore_mvcc_rows: false,
-            eager_router_lookup_on_open: false,
+            // The public read-only handle exposes candidate-bounded paging for
+            // every selected native CF, so all selected SST indexes must be
+            // validated and retained at open. There is no page-time fallback
+            // to whole-file scanning.
+            eager_router_lookup_on_open: true,
             restore_ledger_hook: false,
             selected_cfs,
             ..VaultOptions::default()
@@ -920,6 +1061,27 @@ impl SynapseCalyxReadOnlyVault {
         self.vault
             .scan_cf_range_latest(cf, range)
             .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF range", &error))
+    }
+
+    /// Reads one candidate-bounded raw CF page from an atomic latest view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error for an invalid range/cursor,
+    /// blocked row, or unreadable physical serving view.
+    pub fn scan_cf_range_page_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
+        self.vault
+            .scan_cf_range_page_latest(cf, range, after_key, limit)
+            .map(SynapseCalyxCfRangePage::from)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("scan latest Calyx CF range page", &error)
+            })
     }
 
     /// Reads one raw CF row at a numeric snapshot.
@@ -1529,6 +1691,66 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("write Calyx CF batch", &error))
     }
 
+    /// Commits one raw CF batch only when every physical revision guard still
+    /// matches.
+    ///
+    /// Guards must be non-empty and unique, every guard key must be non-empty,
+    /// and every guarded `(cf, key)` must occur exactly once in `rows`.
+    /// Comparison and the single WAL/MVCC commit share Aster's process and
+    /// cross-process commit boundary. A conflict is a non-mutating outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error for malformed guards or rows,
+    /// read barriers, read-only state, admission, WAL, MVCC, or durability
+    /// failure.
+    pub fn write_cf_batch_if_revisions(
+        &self,
+        guards: Vec<SynapseCalyxRevisionGuard>,
+        rows: Vec<SynapseCalyxCfWrite>,
+    ) -> Result<SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxError> {
+        self.vault
+            .write_cf_batch_if_revisions(
+                guards.into_iter().map(Into::into),
+                rows.into_iter().map(|row| (row.cf, row.key, row.value)),
+            )
+            .map(SynapseCalyxMultiConditionalWriteOutcome::from)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "write multi-key revision-guarded Calyx CF batch",
+                    &error,
+                )
+            })
+    }
+
+    /// Commits a raw CF batch only when one guarded value still has the
+    /// expected physical revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the guarded mutation is
+    /// malformed or admission, WAL, MVCC, or readback fails. A revision
+    /// conflict is returned as `applied = false`.
+    pub fn write_cf_batch_if_revision(
+        &self,
+        guard_cf: ColumnFamily,
+        guard_key: &[u8],
+        expected_revision_sha256: Option<[u8; 32]>,
+        rows: Vec<SynapseCalyxCfWrite>,
+    ) -> Result<SynapseCalyxConditionalWriteOutcome, SynapseCalyxError> {
+        self.vault
+            .write_cf_batch_if_revision(
+                guard_cf,
+                guard_key,
+                expected_revision_sha256,
+                rows.into_iter().map(|row| (row.cf, row.key, row.value)),
+            )
+            .map(SynapseCalyxConditionalWriteOutcome::from)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("write revision-guarded Calyx CF batch", &error)
+            })
+    }
+
     /// Reads one raw CF row from one atomic latest committed view.
     ///
     /// # Errors
@@ -1543,6 +1765,31 @@ impl SynapseCalyxVault {
         self.vault
             .read_cf_latest(cf, key)
             .map_err(|error| SynapseCalyxError::from_calyx("read latest Calyx CF row", &error))
+    }
+
+    /// Reads one raw CF row and physical-value revision from one atomic latest
+    /// committed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the row is blocked or the
+    /// serving view cannot be read.
+    pub fn read_cf_latest_revisioned(
+        &self,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<SynapseCalyxRevisionedValue>, SynapseCalyxError> {
+        self.vault
+            .read_cf_latest_revisioned(cf, key)
+            .map(|value| {
+                value.map(|(value, revision_sha256)| SynapseCalyxRevisionedValue {
+                    value,
+                    revision_sha256,
+                })
+            })
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("read latest revisioned Calyx CF row", &error)
+            })
     }
 
     /// Reads raw CF rows from one atomic latest committed view.
@@ -1694,6 +1941,27 @@ impl SynapseCalyxVault {
         self.vault
             .scan_cf_range_latest(cf, range)
             .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF range", &error))
+    }
+
+    /// Reads one candidate-bounded raw CF page from an atomic latest view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error for an invalid range/cursor,
+    /// blocked row, or unreadable physical serving view.
+    pub fn scan_cf_range_page_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
+        self.vault
+            .scan_cf_range_page_latest(cf, range, after_key, limit)
+            .map(SynapseCalyxCfRangePage::from)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("scan latest Calyx CF range page", &error)
+            })
     }
 
     /// Decodes the physical `Anchors` CF rows currently visible for one

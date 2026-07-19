@@ -17,7 +17,7 @@ use calyx_core::{CalyxError, Result};
 use std::path::{Path, PathBuf};
 
 use io_helpers::{record_crc, section_crc};
-pub(crate) use point_read::{SstPointReader, SstStreamingReader};
+pub(crate) use point_read::{SstPageReader, SstPointReader, SstStreamingReader};
 
 const MAGIC: &[u8; 4] = b"CXS1";
 const LEGACY_VERSION: u32 = 1;
@@ -75,6 +75,42 @@ impl SstLookupMetadata {
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &[u8]> {
         self.index.iter().map(|entry| entry.key.as_slice())
+    }
+
+    pub(crate) fn lower_bound(&self, key: &[u8], exclusive: bool) -> usize {
+        if exclusive {
+            self.index
+                .partition_point(|entry| entry.key.as_slice() <= key)
+        } else {
+            self.index
+                .partition_point(|entry| entry.key.as_slice() < key)
+        }
+    }
+
+    pub(crate) fn key_at(&self, position: usize) -> Option<&[u8]> {
+        self.index.get(position).map(|entry| entry.key.as_slice())
+    }
+
+    pub(crate) fn entry_at(&self, position: usize) -> Option<(&[u8], u64)> {
+        self.index
+            .get(position)
+            .map(|entry| (entry.key.as_slice(), entry.offset))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.index
+            .capacity()
+            .saturating_mul(std::mem::size_of::<IndexEntry>())
+            .saturating_add(self.index.iter().fold(0_usize, |bytes, entry| {
+                bytes.saturating_add(entry.key.capacity())
+            }))
+            .saturating_add(self.first_key.capacity())
+            .saturating_add(self.last_key.capacity())
+            .saturating_add(self.bloom.estimated_heap_bytes())
     }
 }
 
@@ -278,6 +314,15 @@ impl SstReader {
             bloom: self.bloom.clone(),
             index: self.index.clone(),
         })
+    }
+
+    /// Clones the index from an already whole-file-validated reader.
+    ///
+    /// Unlike [`Self::lookup_metadata`], an empty vector is a valid result for
+    /// an empty SST. Streaming compaction must distinguish that state from a
+    /// missing or unvalidated index.
+    fn validated_index(&self) -> Vec<IndexEntry> {
+        self.index.clone()
     }
 }
 

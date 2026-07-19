@@ -118,8 +118,12 @@ where
             stored.validate_schema()?;
             rows.push(base_row(id, &stored)?);
             self.commit_rows_locked(&rows)?;
-            if let Some(hook) = hook_guard.as_deref_mut() {
-                ledger_hook::commit_staged(hook, &staged)?;
+            if let Some(hook) = hook_guard.take() {
+                self.commit_persistent_ledger_staged_locked(
+                    hook,
+                    &staged,
+                    "input_pointer_backfill",
+                )?;
             }
             Ok(InputPointerBackfill::Backfilled { ledger_ref })
         })

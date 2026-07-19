@@ -27,6 +27,10 @@ impl BloomFilter {
         (0..self.hash_count).all(|round| self.bit_is_set(self.bit_index(key, round)))
     }
 
+    pub(super) fn estimated_heap_bytes(&self) -> usize {
+        self.bits.capacity()
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.bit_count.to_le_bytes());
         out.extend_from_slice(&self.hash_count.to_le_bytes());

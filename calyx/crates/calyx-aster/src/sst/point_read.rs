@@ -5,51 +5,42 @@ use std::path::{Path, PathBuf};
 use calyx_core::{CalyxError, Result};
 
 use super::{
-    HEADER_LEN, IndexEntry, LEGACY_VERSION, MAGIC, RECORD_HEADER_LEN, SstEntry, SstReader, VERSION,
-    record_crc,
+    HEADER_LEN, IndexEntry, LEGACY_VERSION, MAGIC, RECORD_HEADER_LEN, SstEntry, SstLookupMetadata,
+    VERSION, record_crc,
 };
 
-/// Fully validates an immutable SST once, retains only its small sorted index,
-/// and performs subsequent row reads with exact file I/O. Unlike `SstReader`,
-/// this type does not retain an mmap of the SST value section for the lifetime
-/// of a range/compaction cursor.
+/// Uses an already whole-file-validated immutable SST index and performs
+/// bounded row reads with one retained file handle.
 #[derive(Debug)]
 pub(crate) struct SstStreamingReader {
     path: PathBuf,
     index: Vec<IndexEntry>,
+    point_reader: SstPointReader,
 }
 
 impl SstStreamingReader {
+    /// Opens a one-pass streaming cursor after validating the immutable SST.
+    ///
+    /// Candidate paging uses [`SstPageReader`] instead so it never repeats the
+    /// whole-file validation pass or clones a retained index. This constructor
+    /// remains for compaction, whose one-pass input open is the boundary.
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let reader = SstReader::open(path)?;
-        let SstReader {
-            column,
+        let path = path.as_ref();
+        let index = super::shared_reader(path)?.validated_index();
+        let path = path.to_path_buf();
+        let point_reader = SstPointReader::open(&path)?;
+        Ok(Self {
+            path,
             index,
-            bloom: _,
-        } = reader;
-        let path = column.path().to_path_buf();
-        // `SstReader::open` has already verified the whole-file body CRC and
-        // decoded the index. Drop the mmap before this reader can escape so
-        // scanning many SSTs cannot retain every visited value page in RSS.
-        drop(column);
-        Ok(Self { path, index })
-    }
-
-    pub(crate) fn lower_bound(&self, key: &[u8], exclusive: bool) -> usize {
-        if exclusive {
-            self.index
-                .partition_point(|entry| entry.key.as_slice() <= key)
-        } else {
-            self.index
-                .partition_point(|entry| entry.key.as_slice() < key)
-        }
+            point_reader,
+        })
     }
 
     pub(crate) fn key_at(&self, position: usize) -> Option<&[u8]> {
         self.index.get(position).map(|entry| entry.key.as_slice())
     }
 
-    pub(crate) fn entry_at(&self, position: usize) -> Result<SstEntry> {
+    pub(crate) fn entry_at(&mut self, position: usize) -> Result<SstEntry> {
         let indexed = self.index.get(position).ok_or_else(|| {
             CalyxError::aster_corrupt_shard(format!(
                 "SST streaming row position {position} is outside index length {} in {}",
@@ -57,8 +48,7 @@ impl SstStreamingReader {
                 self.path.display()
             ))
         })?;
-        let mut reader = SstPointReader::open(&self.path)?;
-        let value = reader.read_value(indexed.offset, &indexed.key)?;
+        let value = self.point_reader.read_value(indexed.offset, &indexed.key)?;
         Ok(SstEntry {
             key: indexed.key.clone(),
             value,
@@ -66,6 +56,51 @@ impl SstStreamingReader {
     }
 }
 
+/// Candidate-page reader borrowing a retained, whole-file-validated lookup.
+///
+/// Opening performs only bounded header/file-handle work. It never clones the
+/// full index and never rechecks the full SST body.
+#[derive(Debug)]
+pub(crate) struct SstPageReader<'a> {
+    path: &'a Path,
+    lookup: &'a SstLookupMetadata,
+    point_reader: SstPointReader,
+}
+
+impl<'a> SstPageReader<'a> {
+    pub(crate) fn open(path: &'a Path, lookup: &'a SstLookupMetadata) -> Result<Self> {
+        Ok(Self {
+            path,
+            lookup,
+            point_reader: SstPointReader::open(path)?,
+        })
+    }
+
+    pub(crate) fn lower_bound(&self, key: &[u8], exclusive: bool) -> usize {
+        self.lookup.lower_bound(key, exclusive)
+    }
+
+    pub(crate) fn key_at(&self, position: usize) -> Option<&[u8]> {
+        self.lookup.key_at(position)
+    }
+
+    pub(crate) fn entry_at(&mut self, position: usize) -> Result<SstEntry> {
+        let (key, offset) = self.lookup.entry_at(position).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "SST page row position {position} is outside retained index length {} in {}",
+                self.lookup.len(),
+                self.path.display()
+            ))
+        })?;
+        let value = self.point_reader.read_value(offset, key)?;
+        Ok(SstEntry {
+            key: key.to_vec(),
+            value,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SstPointReader {
     file: File,
     path: PathBuf,

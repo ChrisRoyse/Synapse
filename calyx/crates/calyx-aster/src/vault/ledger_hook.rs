@@ -663,6 +663,109 @@ pub(super) fn lock_hook(hook: &AsterLedgerHook) -> Result<AsterLedgerHookGuard<'
         .map_err(|_| CalyxError::ledger_group_commit_failed("ledger hook lock poisoned"))
 }
 
+pub(super) fn ensure_recovered_ledger_sidecars(
+    vault_dir: &Path,
+    recovery: &RecoveredBatches,
+    repair: bool,
+) -> Result<()> {
+    if recovery.router_latest_readback {
+        // restore_mvcc_rows=false intentionally omits manifested batches and
+        // carries only the WAL tail. That partial set cannot prove an exact
+        // Ledger head/checkpoint, so comparing it with a real sidecar would
+        // falsely classify older manifested truth as stale-ahead. Sidecars are
+        // irrelevant to this router-latest read-only handle; writer/full
+        // recovery and runtime reconciliation always use complete coverage.
+        tracing::debug!(
+            code = "CALYX_ASTER_LEDGER_SIDECAR_CHECK_SKIPPED_PARTIAL_RECOVERY",
+            vault_dir = %vault_dir.display(),
+            "skipped exact Ledger sidecar comparison because recovery intentionally omitted manifested batches"
+        );
+        return Ok(());
+    }
+    let mut newest_head = None;
+    let mut newest_checkpoint = None;
+    for batch in &recovery.batches {
+        if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(&batch.rows)?
+            && newest_head
+                .as_ref()
+                .is_none_or(|current: &LedgerHeadAnchor| anchor.height > current.height)
+        {
+            newest_head = Some(anchor);
+        }
+        if let Some(anchor) = crate::ledger_head::newest_checkpoint_from_rows(&batch.rows)?
+            && newest_checkpoint.as_ref().is_none_or(
+                |current: &crate::ledger_head::LedgerCheckpointAnchor| anchor.seq > current.seq,
+            )
+        {
+            newest_checkpoint = Some(anchor);
+        }
+    }
+    let current_head = crate::ledger_head::read_head_anchor(vault_dir)?;
+    if current_head != newest_head {
+        let current_height = current_head
+            .as_ref()
+            .map_or_else(|| "absent".to_owned(), |anchor| anchor.height.to_string());
+        let recovered_height = newest_head
+            .as_ref()
+            .map_or_else(|| "absent".to_owned(), |anchor| anchor.height.to_string());
+        if !repair {
+            return Err(CalyxError {
+                code: super::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                message: format!(
+                    "read-only open found Ledger head sidecar divergent from recovered physical truth: current_height={current_height} recovered_height={recovered_height}"
+                ),
+                remediation: "open the vault with a write-capable owner so it can replace the derived Ledger head with exact recovered WAL truth",
+            });
+        }
+        crate::ledger_head::replace_head_anchor_from_recovery(vault_dir, newest_head.as_ref())?;
+        tracing::warn!(
+            code = "CALYX_ASTER_LEDGER_HEAD_SIDECAR_REPAIRED",
+            current_height,
+            recovered_height,
+            "replaced divergent Ledger head sidecar with exact recovered physical truth"
+        );
+    }
+    let current_checkpoint = crate::ledger_head::read_checkpoint_anchor(vault_dir)?;
+    if current_checkpoint != newest_checkpoint {
+        let current_seq = current_checkpoint
+            .as_ref()
+            .map_or_else(|| "absent".to_owned(), |anchor| anchor.seq.to_string());
+        let recovered_seq = newest_checkpoint
+            .as_ref()
+            .map_or_else(|| "absent".to_owned(), |anchor| anchor.seq.to_string());
+        if !repair {
+            return Err(CalyxError {
+                code: super::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                message: format!(
+                    "read-only open found Ledger checkpoint sidecar divergent from recovered physical truth: current_seq={current_seq} recovered_seq={recovered_seq}"
+                ),
+                remediation: "open the vault with a write-capable owner so it can replace the derived Ledger checkpoint with exact recovered WAL truth",
+            });
+        }
+        crate::ledger_head::replace_checkpoint_anchor_from_recovery(
+            vault_dir,
+            newest_checkpoint.as_ref(),
+        )?;
+        tracing::warn!(
+            code = "CALYX_ASTER_LEDGER_CHECKPOINT_SIDECAR_REPAIRED",
+            current_seq,
+            recovered_seq,
+            "replaced divergent Ledger checkpoint sidecar with exact recovered physical truth"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_recovered_ledger_sidecars_with_commit_lock(
+    vault_dir: &Path,
+    recovery: &RecoveredBatches,
+    repair: bool,
+) -> Result<()> {
+    let _commit_guard =
+        crate::file_lock::FileLockGuard::acquire(&durable_commit_lock_path(vault_dir))?;
+    ensure_recovered_ledger_sidecars(vault_dir, recovery, repair)
+}
+
 pub(super) fn refresh_hook(
     hook: &AsterLedgerHook,
     vault_dir: &Path,

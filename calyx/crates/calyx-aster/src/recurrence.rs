@@ -149,7 +149,7 @@ where
         })?;
         let append = build_append(vault, base, t_k, context, observed_at, retention)?;
         let occurrence_id = append.occurrence_id;
-        vault.commit_recurrence_batch(append.recurrence_rows, Some(append.updated_base))?;
+        vault.commit_recurrence_batch_locked(append.recurrence_rows, Some(append.updated_base))?;
         Ok(occurrence_id)
     })
 }

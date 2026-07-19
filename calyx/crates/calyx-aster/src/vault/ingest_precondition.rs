@@ -158,7 +158,7 @@ where
             self.commit_rows_locked(&rows)?;
             return Ok(ledger_ref);
         };
-        let mut guard = ledger_hook::lock_hook(hook)?;
+        let guard = ledger_hook::lock_hook(hook)?;
         let staged = guard.stage_with_checkpoints(EntryKind::Ingest, subject, payload, actor)?;
         let ledger_ref = staged
             .first()
@@ -173,9 +173,11 @@ where
             })
             .collect::<Vec<_>>();
         self.commit_rows_locked(&rows)?;
-        for row in &staged {
-            guard.commit_staged(row)?;
-        }
+        self.commit_persistent_ledger_staged_locked(
+            guard,
+            &staged,
+            "commit_ingest_precondition_claim",
+        )?;
         Ok(ledger_ref)
     }
 }

@@ -26,7 +26,9 @@ where
             retention_horizon: std::sync::Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,
             read_only: false,
+            commit_lock: std::sync::Mutex::new(()),
             recurrence_write_lock: std::sync::Mutex::new(()),
+            ledger_state_reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,

@@ -200,7 +200,7 @@ where
     let restored = restored.into_iter().collect::<Vec<_>>();
     let payload = undo_payload(token, &restored)?;
     let subject = token_subject(token)?;
-    vault.commit_dedup_undo(
+    vault.commit_dedup_undo_locked(
         restored_cx,
         updated_bases,
         recurrence_rows,

@@ -100,7 +100,7 @@ where
                 return Ok(ledger_ref);
             };
 
-            let mut guard = ledger_hook::lock_hook(hook)?;
+            let guard = ledger_hook::lock_hook(hook)?;
             let staged = guard.stage_with_checkpoints(
                 entry.kind,
                 entry.subject,
@@ -119,9 +119,11 @@ where
                 value: row.value().to_vec(),
             }));
             self.commit_rows_locked(&rows)?;
-            for row in &staged {
-                guard.commit_staged(row)?;
-            }
+            self.commit_persistent_ledger_staged_locked(
+                guard,
+                &staged,
+                "anchor_with_ledger_entry",
+            )?;
             Ok(ledger_ref)
         })
     }
@@ -199,7 +201,7 @@ where
                 });
             };
 
-            let mut guard = ledger_hook::lock_hook(hook)?;
+            let guard = ledger_hook::lock_hook(hook)?;
             let staged = guard.stage_with_checkpoints(
                 entry.kind,
                 entry.subject,
@@ -217,9 +219,11 @@ where
                 value: row.value().to_vec(),
             }));
             self.commit_rows_locked(&rows)?;
-            for row in &staged {
-                guard.commit_staged(row)?;
-            }
+            self.commit_persistent_ledger_staged_locked(
+                guard,
+                &staged,
+                "anchors_for_many_with_ledger_entry",
+            )?;
             let written_anchor_count = requested_anchor_count.saturating_sub(existing_anchor_count);
             Ok(MultiCxAnchorBatchOutcome {
                 ledger_ref: Some(ledger_ref),
@@ -442,7 +446,7 @@ where
             )));
         }
         self.vault
-            .write_cf(ColumnFamily::Ledger, key, bytes.to_vec())
+            .write_raw_ledger_row_without_hook(key, bytes.to_vec())
             .map(|_| ())
     }
 

@@ -360,8 +360,8 @@ where
             )?;
         }
         self.commit_rows_locked(&rows)?;
-        if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref()) {
-            ledger_hook::commit_staged(hook, staged)?;
+        if let (Some(hook), Some(staged)) = (hook_guard.take(), staged_ledger.as_ref()) {
+            self.commit_persistent_ledger_staged_locked(hook, staged, "batch_ingest")?;
         }
         Ok(BatchIngestCommit {
             outcomes,

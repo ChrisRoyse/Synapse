@@ -77,7 +77,11 @@ impl CfRouter {
         let mut sst_files_loaded = 0_usize;
         for (cf, files) in by_cf {
             let file_count = files.len();
-            self.load_cf_level(cf, files, eager_lookup_on_open)?;
+            self.load_cf_level(
+                cf,
+                files,
+                should_build_eager_lookup_on_open(cf, eager_lookup_on_open),
+            )?;
             cfs_loaded += 1;
             sst_files_loaded = sst_files_loaded.saturating_add(file_count);
             tracing::info!(
@@ -152,7 +156,11 @@ impl CfRouter {
         for cf in cfs {
             let files = by_cf.remove(cf).unwrap_or_default();
             let file_count = files.len();
-            self.load_cf_level(*cf, files, eager_lookup_on_open)?;
+            // A selected-CF open with eager lookup explicitly requests that
+            // every selected surface be pageable. The full-vault policy below
+            // remains selective to avoid retaining every low-volume index.
+            let retain_lookup = *cf == ColumnFamily::Kv || eager_lookup_on_open;
+            self.load_cf_level(*cf, files, retain_lookup)?;
             cfs_loaded += 1;
             sst_files_loaded = sst_files_loaded.saturating_add(file_count);
             tracing::info!(
@@ -187,7 +195,7 @@ impl CfRouter {
         &mut self,
         cf: ColumnFamily,
         mut files: Vec<PathBuf>,
-        eager_lookup_on_open: bool,
+        retain_lookup: bool,
     ) -> Result<()> {
         sort_ssts_by_sequence(&mut files)?;
         files.dedup();
@@ -205,26 +213,26 @@ impl CfRouter {
             .unwrap_or(0)
             + 1;
         self.ensure_cf(cf)?;
-        self.levels
-            .insert(cf, load_level_for_cf(cf, files, eager_lookup_on_open)?);
+        self.levels.insert(
+            cf,
+            if retain_lookup {
+                SstLevel::from_oldest_first_with_lookup(files)?
+            } else {
+                SstLevel::from_oldest_first(files)
+            },
+        );
         self.next_file.insert(cf, next);
         Ok(())
     }
 }
 
-fn load_level_for_cf(
-    cf: ColumnFamily,
-    files: Vec<PathBuf>,
-    eager_lookup_on_open: bool,
-) -> Result<SstLevel> {
-    if should_build_eager_lookup_on_open(cf, eager_lookup_on_open) {
-        SstLevel::from_oldest_first_with_lookup(files)
-    } else {
-        Ok(SstLevel::from_oldest_first(files))
-    }
-}
-
 fn should_build_eager_lookup_on_open(cf: ColumnFamily, eager_lookup_on_open: bool) -> bool {
+    // Candidate-bounded paging is a hard contract for the shared Synapse KV
+    // namespace. Its page path must never reopen and whole-file CRC-scan SSTs,
+    // so retain validated key/offset metadata even in latest-readback mode.
+    if cf == ColumnFamily::Kv {
+        return true;
+    }
     if !eager_lookup_on_open {
         return false;
     }

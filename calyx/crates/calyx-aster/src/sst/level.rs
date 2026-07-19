@@ -1,6 +1,6 @@
 use super::page;
 use super::shared_reader;
-use super::{SstEntry, SstKeyState, SstLookupMetadata, SstPointReader};
+use super::{SstEntry, SstKeyState, SstLookupMetadata, SstPageReader, SstPointReader};
 use calyx_core::Result;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -19,21 +19,30 @@ pub struct SstLevel {
 pub(super) struct LevelFile {
     pub(super) path: PathBuf,
     lookup: Option<SstLookupMetadata>,
+    lookup_retained: bool,
 }
 
 impl LevelFile {
     fn without_lookup(path: PathBuf) -> Self {
-        Self { path, lookup: None }
+        Self {
+            path,
+            lookup: None,
+            lookup_retained: false,
+        }
     }
 
     fn with_lookup(path: PathBuf) -> Result<Self> {
         let lookup = shared_reader(&path)?.lookup_metadata();
-        Ok(Self { path, lookup })
+        Ok(Self {
+            path,
+            lookup,
+            lookup_retained: true,
+        })
     }
 
     fn may_contain(&self, key: &[u8]) -> bool {
         let Some(lookup) = &self.lookup else {
-            return true;
+            return !self.lookup_retained;
         };
         key >= lookup.first_key.as_slice()
             && key <= lookup.last_key.as_slice()
@@ -45,10 +54,25 @@ impl LevelFile {
             return false;
         }
         let Some(lookup) = &self.lookup else {
-            return true;
+            return !self.lookup_retained;
         };
         lookup.last_key.as_slice() >= start
             && end.is_none_or(|end| lookup.first_key.as_slice() < end)
+    }
+
+    pub(super) fn open_page_reader(&self) -> Result<Option<SstPageReader<'_>>> {
+        match (&self.lookup, self.lookup_retained) {
+            (Some(lookup), _) => SstPageReader::open(&self.path, lookup).map(Some),
+            (None, true) => Ok(None),
+            (None, false) => Err(calyx_core::CalyxError {
+                code: "CALYX_ASTER_SST_PAGE_INDEX_MISSING",
+                message: format!(
+                    "candidate-bounded SST paging requires a retained validated lookup index for {}",
+                    self.path.display()
+                ),
+                remediation: "reopen the vault with the required paged-CF lookup policy; do not fall back to a whole-file scan",
+            }),
+        }
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -93,8 +117,23 @@ impl SstLevel {
             );
         }
         let mut files = Vec::new();
+        let mut retained_lookup_files = 0_usize;
+        let mut retained_empty_lookup_files = 0_usize;
+        let mut retained_index_entries = 0_usize;
+        let mut retained_lookup_estimated_heap_bytes = 0_usize;
         for (index, path) in paths.into_iter().enumerate() {
-            files.push(LevelFile::with_lookup(path)?);
+            let file = LevelFile::with_lookup(path)?;
+            if file.lookup_retained {
+                retained_lookup_files = retained_lookup_files.saturating_add(1);
+            }
+            if let Some(lookup) = file.lookup.as_ref() {
+                retained_index_entries = retained_index_entries.saturating_add(lookup.len());
+                retained_lookup_estimated_heap_bytes = retained_lookup_estimated_heap_bytes
+                    .saturating_add(lookup.estimated_heap_bytes());
+            } else {
+                retained_empty_lookup_files = retained_empty_lookup_files.saturating_add(1);
+            }
+            files.push(file);
             let files_opened = index + 1;
             if file_count >= SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL
                 && files_opened % SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL == 0
@@ -109,14 +148,16 @@ impl SstLevel {
             }
         }
         files.reverse();
-        if file_count >= SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL {
-            tracing::info!(
-                code = "CALYX_ASTER_SST_LOOKUP_BUILD_DONE",
-                file_count,
-                elapsed_ms = started_at.elapsed().as_millis(),
-                "completed eager SST lookup metadata build"
-            );
-        }
+        tracing::info!(
+            code = "CALYX_ASTER_SST_LOOKUP_BUILD_DONE",
+            file_count,
+            retained_lookup_files,
+            retained_empty_lookup_files,
+            retained_index_entries,
+            retained_lookup_estimated_heap_bytes,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "completed eager SST lookup metadata build"
+        );
         Ok(Self { files })
     }
 
@@ -298,6 +339,16 @@ impl SstLevel {
         limit: usize,
     ) -> Result<Vec<SstEntry>> {
         self.range_page_with_overlay(start, end, after_key, limit, Vec::new())
+    }
+
+    pub(crate) fn range_candidate_page_until(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<SstEntry>> {
+        page::range_candidate_page(self, start, end, after_key, limit)
     }
 
     pub(crate) fn range_page_with_overlay(

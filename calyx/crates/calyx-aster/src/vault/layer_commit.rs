@@ -33,7 +33,7 @@ where
 
         self.with_durable_commit_lock(|| {
             if let Some(hook) = &self.ledger_hook {
-                let mut hook = ledger_hook::lock_hook(hook)?;
+                let hook = ledger_hook::lock_hook(hook)?;
                 let mut rows = Vec::with_capacity(data_rows.len() + 2);
                 let staged = ledger_hook::stage_entry_payload(
                     &hook, &mut rows, kind, subject, payload, actor,
@@ -42,7 +42,11 @@ where
                 attach_ledger_ref_to_base_rows(&mut data_rows, &ledger_ref)?;
                 rows.extend(data_rows);
                 let seq = self.commit_rows_locked(&rows)?;
-                ledger_hook::commit_staged(&mut hook, &staged)?;
+                self.commit_persistent_ledger_staged_locked(
+                    hook,
+                    &staged,
+                    "write_cf_batch_with_ledger_entry",
+                )?;
                 return Ok(seq);
             }
 
@@ -79,7 +83,7 @@ where
             .collect::<Vec<_>>();
 
         if let Some(hook) = &self.ledger_hook {
-            let mut hook = ledger_hook::lock_hook(hook)?;
+            let hook = ledger_hook::lock_hook(hook)?;
             let staged = hook.stage_many_with_checkpoints(drafts)?;
             rows.extend(staged.iter().map(|row| encode::WriteRow {
                 cf: ColumnFamily::Ledger,
@@ -87,7 +91,11 @@ where
                 value: row.value().to_vec(),
             }));
             let seq = self.commit_rows_locked(&rows)?;
-            ledger_hook::commit_staged(&mut hook, &staged)?;
+            self.commit_persistent_ledger_staged_locked(
+                hook,
+                &staged,
+                "write_cf_batch_with_ledger_entries",
+            )?;
             return Ok(seq);
         }
 

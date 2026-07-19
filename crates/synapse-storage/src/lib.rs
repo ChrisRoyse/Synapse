@@ -34,17 +34,120 @@ pub use constellations::{
     SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
     SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
-pub use error::{StorageError, StorageResult};
+pub use error::{
+    STORAGE_REVISION_GUARD_INVALID, STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
+    STORAGE_REVISION_GUARDED_OUTCOME_INVALID, StorageError, StorageResult,
+};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
 pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
 
 /// One raw storage row: key bytes and value bytes.
 pub type RawRow = (Vec<u8>, Vec<u8>);
+
+/// One physical Calyx envelope revision and its logical payload state.
+///
+/// The outer `Option` returned by [`Db::get_cf_revisioned`] is `None` only
+/// when the physical row is absent/tombstoned. `value` is `None` when the
+/// physical retention envelope exists but is logically expired, allowing a
+/// caller to guard or delete that exact stale revision without exposing it as
+/// a live logical value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionedRawValue {
+    pub value: Option<Vec<u8>>,
+    pub revision_sha256: [u8; 32],
+}
+
+/// One logical same-CF revision precondition.
+///
+/// `expected_revision_sha256` is SHA-256 over the exact physical Calyx value
+/// envelope returned by [`Db::get_cf_revisioned`], including an expired
+/// envelope whose logical `value` is `None`, or `None` when the physical row
+/// must be absent. Guards are evaluated in input order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionGuard {
+    pub key: Vec<u8>,
+    pub expected_revision_sha256: Option<[u8; 32]>,
+}
+
+impl RevisionGuard {
+    #[must_use]
+    pub fn new(key: impl Into<Vec<u8>>, expected_revision_sha256: Option<[u8; 32]>) -> Self {
+        Self {
+            key: key.into(),
+            expected_revision_sha256,
+        }
+    }
+}
+
+/// The first ordered logical revision guard that conflicted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionGuardConflict {
+    pub guard_index: usize,
+    pub key: Vec<u8>,
+    pub expected_revision_sha256: Option<[u8; 32]>,
+    pub actual_revision_sha256: Option<[u8; 32]>,
+}
+
+/// Outcome of one atomic same-CF guarded mutation containing puts and deletes.
+///
+/// `actual_revisions_sha256` always follows guard-input order. On success,
+/// `committed_revisions_sha256` has the same length and uses `None` for a
+/// deleted guard. On conflict, no logical or physical row is mutated,
+/// `committed_revisions_sha256` is empty, and `conflict` identifies the first
+/// mismatching guard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionGuardedMutationOutcome {
+    pub applied: bool,
+    pub committed_seq: u64,
+    pub actual_revisions_sha256: Vec<Option<[u8; 32]>>,
+    pub committed_revisions_sha256: Vec<Option<[u8; 32]>>,
+    pub conflict: Option<RevisionGuardConflict>,
+}
+
+/// Compatibility outcome of one single-key revision-guarded logical CF batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RevisionGuardedWriteOutcome {
+    pub applied: bool,
+    pub committed_seq: u64,
+    pub previous_revision_sha256: Option<[u8; 32]>,
+    pub committed_revision_sha256: Option<[u8; 32]>,
+}
+
 /// One column-family batch: CF name plus raw rows.
 pub type CfWriteBatch<'a> = (&'a str, Vec<RawRow>);
 pub(crate) type OwnedCfWriteBatch = (String, Vec<RawRow>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
+/// One candidate-bounded fixed-width scan page.
+///
+/// `resume_after` is the last logical candidate consumed into this page,
+/// including a tombstoned or expired row. Use it as an exclusive cursor
+/// whenever `more` is true, even when `rows` is empty.
+/// `candidate_rows_examined` counts merged logical candidates, including at
+/// most one continuation lookahead; it is not a physical SST row/byte count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedWidthScanPage {
+    pub rows: Vec<RawRow>,
+    pub resume_after: Option<Vec<u8>>,
+    pub more: bool,
+    pub snapshot_seq: Option<u64>,
+    pub candidate_rows_examined: usize,
+    pub expired_rows_skipped: usize,
+}
+
+impl FixedWidthScanPage {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            resume_after: None,
+            more: false,
+            snapshot_seq: None,
+            candidate_rows_examined: 0,
+            expired_rows_skipped: 0,
+        }
+    }
+}
 /// Per-CF integer storage metrics plus CFs whose backend estimate was absent.
 pub type CfEstimateMap = (std::collections::BTreeMap<String, u64>, Vec<String>);
 
@@ -191,6 +294,96 @@ impl Db {
     #[tracing::instrument(skip_all, fields(cf_name, key_len = key.len(), backend = self.backend_name()))]
     pub fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.backend.get_cf(cf_name, key)
+    }
+
+    /// Reads one logical value and its exact physical Calyx-envelope revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family, point read, envelope, or
+    /// clock readback is invalid.
+    #[tracing::instrument(skip_all, fields(cf_name, key_len = key.len(), backend = self.backend_name()))]
+    pub fn get_cf_revisioned(
+        &self,
+        cf_name: &str,
+        key: &[u8],
+    ) -> StorageResult<Option<RevisionedRawValue>> {
+        self.backend.get_cf_revisioned(cf_name, key)
+    }
+
+    /// Commits one logical CF batch only when the guarded row's physical
+    /// revision still matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error for malformed/oversized batches or any Calyx
+    /// admission, WAL, MVCC, flush, or readback failure. A concurrent revision
+    /// conflict is returned as `applied = false`.
+    #[tracing::instrument(skip_all, fields(cf_name, guard_key_len = guard_key.len(), backend = self.backend_name()))]
+    pub fn put_batch_if_revision_pressure_bypass<I, K, V>(
+        &self,
+        cf_name: &str,
+        guard_key: &[u8],
+        expected_revision_sha256: Option<[u8; 32]>,
+        rows: I,
+    ) -> StorageResult<RevisionGuardedWriteOutcome>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        self.backend.put_batch_if_revision_pressure_bypass(
+            cf_name,
+            guard_key,
+            expected_revision_sha256,
+            rows.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        )
+    }
+
+    /// Atomically applies same-CF deletes and puts only when every logical
+    /// guard's exact physical Calyx-envelope revision still matches.
+    ///
+    /// Guards and guard keys must be non-empty and unique. Mutation keys must
+    /// be unique across `deletes` and `puts`, and every guard key must occur
+    /// exactly once in that combined mutation. The entire physical mutation
+    /// must fit one WAL record; this method rejects batches that would require
+    /// chunk splitting. Calyx encodes puts as retention envelopes and deletes
+    /// as physical MVCC tombstones before performing one guarded commit. It
+    /// flushes only after an applied commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::RevisionGuardedMutationFailed`] for malformed
+    /// guard/mutation input, oversized atomic batches, or invalid backend
+    /// outcome shape. Calyx read, admission, WAL, MVCC, durability, and flush
+    /// failures retain their structured backend error codes. Revision
+    /// conflicts are non-error outcomes with `applied = false`.
+    #[tracing::instrument(skip_all, fields(cf_name, backend = self.backend_name()))]
+    pub fn mutate_batch_if_revisions_pressure_bypass<G, D, DK, P, PK, PV>(
+        &self,
+        cf_name: &str,
+        guards: G,
+        deletes: D,
+        puts: P,
+    ) -> StorageResult<RevisionGuardedMutationOutcome>
+    where
+        G: IntoIterator<Item = RevisionGuard>,
+        D: IntoIterator<Item = DK>,
+        DK: Into<Vec<u8>>,
+        P: IntoIterator<Item = (PK, PV)>,
+        PK: Into<Vec<u8>>,
+        PV: Into<Vec<u8>>,
+    {
+        self.backend.mutate_batch_if_revisions_pressure_bypass(
+            cf_name,
+            guards.into_iter().collect(),
+            deletes.into_iter().map(Into::into).collect(),
+            puts.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        )
     }
 
     /// Applies key deletes and key/value writes to one column family atomically.
@@ -791,6 +984,36 @@ impl Db {
     ) -> StorageResult<ScanWindow> {
         self.backend
             .scan_cf_range(cf_name, start_key, end_key, max_rows)
+    }
+
+    /// Scans one candidate-bounded page in `[start_key, end_key)` for one
+    /// explicitly fixed user-key width.
+    ///
+    /// This is distinct from [`Self::scan_cf_range`]: it permits a
+    /// variable-width logical column family only when both bounds name the
+    /// same exact width partition. Calyx physically prefixes Synapse user keys
+    /// with their length, so this contract gives the backend an honest
+    /// physical range without implying that keys of other widths were
+    /// searched. `after_key` is an exclusive cursor. The returned
+    /// [`FixedWidthScanPage::resume_after`] includes tombstoned/expired keys,
+    /// so callers can make progress even when `rows` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the bounds differ in width, are reversed,
+    /// exceed Calyx's physical key-width/page-row ceilings, conflict with a
+    /// schema-fixed column-family key width, or cannot be read.
+    #[tracing::instrument(skip_all, fields(cf_name, start_key_len = start_key.len(), end_key_len = end_key.len(), after_key_len = after_key.map_or(0, <[u8]>::len), max_rows, backend = self.backend_name()))]
+    pub fn scan_cf_fixed_width_range_page(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        after_key: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<FixedWidthScanPage> {
+        self.backend
+            .scan_cf_fixed_width_range_page(cf_name, start_key, end_key, after_key, max_rows)
     }
 
     /// Scans up to `max_rows` rows from the end of one column family.

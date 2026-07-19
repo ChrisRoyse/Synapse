@@ -4,8 +4,9 @@ use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
     ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow,
-    QueryId, ReproduceInputResolver, ReproduceLensRegistry, ReproduceResult, SubjectId,
-    reproduce_payload_bytes, reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
+    QueryId, ReproduceInputResolver, ReproduceLensRegistry, ReproduceResult, StagedLedgerRow,
+    SubjectId, reproduce_payload_bytes, reproduce_verdict_with_input_resolver,
+    reproduce_with_input_resolver,
 };
 
 struct LedgerEntryInput {
@@ -19,6 +20,59 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Advances the persistent in-memory ledger hook after its exact rows have
+    /// durably committed. If hook advancement fails, the guard is released and
+    /// the hook is rebuilt from the authoritative physical Ledger CF while the
+    /// caller still owns the durable commit boundary.
+    ///
+    /// The method always returns a reconciliation-required error after a hook
+    /// failure—even when rebuild succeeds—because the data commit already
+    /// happened and blindly retrying would duplicate the logical operation.
+    pub(crate) fn commit_persistent_ledger_staged_locked(
+        &self,
+        mut guard: ledger_hook::AsterLedgerHookGuard<'_>,
+        staged: &[StagedLedgerRow],
+        operation: &'static str,
+    ) -> Result<LedgerRef> {
+        match ledger_hook::commit_staged(&mut guard, staged) {
+            Ok(ledger_ref) => Ok(ledger_ref),
+            Err(hook_error) => {
+                drop(guard);
+                self.ledger_state_reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let reconciliation = self.reconcile_ledger_state_from_durable_locked();
+                if reconciliation.is_ok() {
+                    self.ledger_state_reconciliation_required
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+                tracing::error!(
+                    code = super::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                    operation,
+                    hook_error_code = hook_error.code,
+                    hook_error = %hook_error,
+                    reconciliation_ok = reconciliation.is_ok(),
+                    reconciliation_error = reconciliation.as_ref().err().map(ToString::to_string),
+                    "durable Ledger rows committed but persistent hook advancement failed; rebuilt hook from physical truth before releasing commit boundary"
+                );
+                Err(CalyxError {
+                    code: super::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                    message: format!(
+                        "{operation}: durable Ledger rows committed but hook advancement failed: hook=error[{}]: {}; reconciliation={}",
+                        hook_error.code,
+                        hook_error.message,
+                        reconciliation
+                            .as_ref()
+                            .map(|()| "ok".to_owned())
+                            .unwrap_or_else(|error| {
+                                format!("error[{}]: {}", error.code, error.message)
+                            })
+                    ),
+                    remediation: "treat the durable operation as committed; use its idempotency/readback identity before retrying, and inspect the hook-reconciliation diagnostics",
+                })
+            }
+        }
+    }
+
     pub(crate) fn stage_raw_ledger_entry_locked(
         &self,
         rows: &mut Vec<encode::WriteRow>,
@@ -79,7 +133,7 @@ where
             let Some(hook) = &self.ledger_hook else {
                 return self.anchor_with_raw_ledger_entry(id, &mut constellation, anchor, entry);
             };
-            let mut guard = ledger_hook::lock_hook(hook)?;
+            let guard = ledger_hook::lock_hook(hook)?;
             let staged = guard.stage_with_checkpoints(
                 entry.kind,
                 entry.subject,
@@ -98,9 +152,11 @@ where
                 value: row.value().to_vec(),
             }));
             self.commit_rows_locked(&rows)?;
-            for row in &staged {
-                guard.commit_staged(row)?;
-            }
+            self.commit_persistent_ledger_staged_locked(
+                guard,
+                &staged,
+                "anchor_with_ledger_entry",
+            )?;
             Ok(ledger_ref)
         })
     }
@@ -117,7 +173,7 @@ where
             let Some(hook) = &self.ledger_hook else {
                 return self.append_ledger_entry_without_hook(kind, subject, payload, actor);
             };
-            let mut guard = ledger_hook::lock_hook(hook)?;
+            let guard = ledger_hook::lock_hook(hook)?;
             let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
             let ledger_ref = staged
                 .first()
@@ -132,9 +188,7 @@ where
                 })
                 .collect::<Vec<_>>();
             self.commit_rows_locked(&rows)?;
-            for row in &staged {
-                guard.commit_staged(row)?;
-            }
+            self.commit_persistent_ledger_staged_locked(guard, &staged, "append_ledger_entry")?;
             Ok(ledger_ref)
         })
     }
@@ -173,8 +227,16 @@ where
         actor: ActorId,
     ) -> Result<LedgerRef> {
         let store = AsterRawLedgerStore { vault: self };
-        let mut appender = LedgerAppender::open(store, SystemClock)?;
-        appender.append(kind, subject, payload, actor)
+        let appender = LedgerAppender::open(store, SystemClock)?;
+        let prepared = appender.prepare(kind, subject, payload, actor)?;
+        let ledger_ref = prepared.ledger_ref();
+        let rows = [encode::WriteRow {
+            cf: ColumnFamily::Ledger,
+            key: ledger_key(prepared.seq()),
+            value: prepared.bytes().to_vec(),
+        }];
+        self.commit_rows_locked(&rows)?;
+        Ok(ledger_ref)
     }
 
     /// Appends a ledger row prepared by an external adapter while keeping the
@@ -196,22 +258,59 @@ where
                 value: bytes.to_vec(),
             }];
             self.commit_rows_locked(&rows)?;
-            self.refresh_ledger_hook_after_external_append_locked()
+            self.ledger_state_reconciliation_required
+                .store(true, std::sync::atomic::Ordering::Release);
+            match self.reconcile_ledger_state_from_durable_locked() {
+                Ok(()) => {
+                    self.ledger_state_reconciliation_required
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                }
+                Err(error) => Err(CalyxError {
+                    code: super::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+                    message: format!(
+                        "append_external_ledger_row: durable Ledger row committed but hook rebuild failed: error[{}]: {}",
+                        error.code, error.message
+                    ),
+                    remediation: "treat the external Ledger row as committed; the next durable operation will retry physical hook reconstruction before admitting new work",
+                }),
+            }
         })
     }
 
-    fn refresh_ledger_hook_after_external_append_locked(&self) -> Result<()> {
-        let (Some(hook), Some(durable)) = (&self.ledger_hook, &self.durable) else {
-            return Ok(());
+    pub(crate) fn reconcile_ledger_state_from_durable_locked(&self) -> Result<()> {
+        let Some(durable) = &self.durable else {
+            return Err(CalyxError::ledger_group_commit_failed(
+                "Ledger state reconciliation requires a durable vault",
+            ));
         };
         let recovered = durable.recover_current_batches()?;
+        self.reconcile_ledger_state_from_recovery_locked(&recovered)
+    }
+
+    pub(super) fn reconcile_ledger_state_from_recovery_locked(
+        &self,
+        recovered: &super::durable::RecoveredBatches,
+    ) -> Result<()> {
+        let Some(durable) = &self.durable else {
+            return Err(CalyxError::ledger_group_commit_failed(
+                "Ledger state reconciliation requires a durable vault",
+            ));
+        };
+        // A prior process may have failed after WAL durability but before
+        // updating these derived sidecars. Repair them before optimized
+        // physical hook hydration trusts the head boundary.
+        ledger_hook::ensure_recovered_ledger_sidecars(durable.root(), recovered, !self.read_only)?;
+        let Some(hook) = &self.ledger_hook else {
+            return Ok(());
+        };
         if durable.value_crypto_enabled() {
-            ledger_hook::refresh_hook_from_recovery(hook, &recovered, durable.ledger_checkpoint())
+            ledger_hook::refresh_hook_from_recovery(hook, recovered, durable.ledger_checkpoint())
         } else {
             ledger_hook::refresh_hook(
                 hook,
                 durable.root(),
-                &recovered,
+                recovered,
                 durable.ledger_checkpoint(),
                 durable.tiering_policy(),
             )
@@ -288,7 +387,7 @@ where
             return self
                 .commit_rows_with_raw_ledger_entry(rows, kind, subject, payload, actor, erasure);
         };
-        let mut guard = ledger_hook::lock_hook(hook)?;
+        let guard = ledger_hook::lock_hook(hook)?;
         let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
         let ledger_ref = staged
             .first()
@@ -304,9 +403,11 @@ where
         } else {
             self.commit_rows_locked(&rows)?;
         }
-        for row in &staged {
-            guard.commit_staged(row)?;
-        }
+        self.commit_persistent_ledger_staged_locked(
+            guard,
+            &staged,
+            "commit_rows_with_ledger_entry",
+        )?;
         Ok(ledger_ref)
     }
 
@@ -391,7 +492,7 @@ where
             )));
         }
         self.vault
-            .write_cf(ColumnFamily::Ledger, key, bytes.to_vec())
+            .write_raw_ledger_row_without_hook(key, bytes.to_vec())
             .map(|_| ())
     }
 

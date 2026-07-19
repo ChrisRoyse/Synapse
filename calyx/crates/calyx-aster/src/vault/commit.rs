@@ -1,4 +1,4 @@
-use super::{AsterVault, encode, ledger_hook};
+use super::{AsterVault, encode};
 use calyx_core::{CalyxError, Clock, Result, Seq};
 
 /// The WAL append is durable, but the live MVCC/router apply failed and the
@@ -11,12 +11,56 @@ where
     C: Clock,
 {
     pub(crate) fn with_durable_commit_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _process_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| CalyxError::backpressure("vault commit lock poisoned"))?;
         let Some(durable) = &self.durable else {
+            if self
+                .ledger_state_reconciliation_required
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(CalyxError::ledger_group_commit_failed(
+                    "Ledger state reconciliation is required but the vault has no durable physical source of truth",
+                ));
+            }
             return f();
         };
         let _commit_guard = crate::file_lock::FileLockGuard::acquire(&durable.commit_lock_path())?;
-        if durable.durable_tip_seq()? > self.latest_seq() {
-            self.refresh_from_durable()?;
+        if self
+            .ledger_state_reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.reconcile_ledger_state_from_durable_locked()?;
+            self.ledger_state_reconciliation_required
+                .store(false, std::sync::atomic::Ordering::Release);
+            tracing::info!(
+                code = "CALYX_ASTER_LEDGER_STATE_RECONCILIATION_CLEARED",
+                "repaired Ledger sidecars and the configured persistent hook from physical truth before admitting the next durable operation"
+            );
+        }
+        let durable_tip = durable.durable_tip_seq()?;
+        let live_tip = self.latest_seq();
+        match durable_tip.cmp(&live_tip) {
+            std::cmp::Ordering::Greater => {
+                self.refresh_from_durable()?;
+                let refreshed_live_tip = self.latest_seq();
+                if refreshed_live_tip != durable_tip {
+                    return Err(durable_live_sequence_divergence(
+                        durable_tip,
+                        refreshed_live_tip,
+                        "foreign WAL refresh did not converge the live MVCC sequence",
+                    ));
+                }
+            }
+            std::cmp::Ordering::Less => {
+                return Err(durable_live_sequence_divergence(
+                    durable_tip,
+                    live_tip,
+                    "live MVCC sequence is ahead of durable WAL truth",
+                ));
+            }
+            std::cmp::Ordering::Equal => {}
         }
         f()
     }
@@ -33,16 +77,12 @@ where
                 crate::file_lock::FileLockGuard::acquire(&durable.recurrence_lock_path())
             })
             .transpose()?;
-        if self
-            .durable
-            .as_ref()
-            .map(|durable| durable.durable_tip_seq())
-            .transpose()?
-            .is_some_and(|tip| tip > self.latest_seq())
-        {
-            self.refresh_from_durable()?;
-        }
-        f()
+        // Recurrence operations are read/modify/write transactions. Acquire
+        // the normal process + cross-process commit boundary before refreshing
+        // or invoking the operation so its derived decision and commit share
+        // one authoritative view. Callbacks must use `*_locked` commit helpers
+        // and must not recursively acquire the non-reentrant commit lock.
+        self.with_durable_commit_lock(f)
     }
 
     fn refresh_from_durable(&self) -> Result<()> {
@@ -51,23 +91,7 @@ where
         };
         let current = self.latest_seq();
         let recovered = durable.recover_current_batches()?;
-        if let Some(hook) = &self.ledger_hook {
-            if durable.value_crypto_enabled() {
-                ledger_hook::refresh_hook_from_recovery(
-                    hook,
-                    &recovered,
-                    durable.ledger_checkpoint(),
-                )?;
-            } else {
-                ledger_hook::refresh_hook(
-                    hook,
-                    durable.root(),
-                    &recovered,
-                    durable.ledger_checkpoint(),
-                    durable.tiering_policy(),
-                )?;
-            }
-        }
+        self.reconcile_ledger_state_from_recovery_locked(&recovered)?;
         self.replace_retention_horizon(recovered.retention_horizon.clone())?;
         self.rows
             .advance_derived_content_seq_to_at_least(recovered.derived_content_floor_seq);
@@ -83,17 +107,22 @@ where
                 .map(|batch| (batch.seq, batch.rows.clone()))
                 .collect(),
         )?;
-        for batch in &recovered.batches {
-            if batch.seq <= current {
-                continue;
-            }
-            let rows_at_seq = batch
-                .rows
+        self.rows.restore_batches_and_advance(
+            recovered
+                .batches
                 .iter()
-                .map(|row| (row.cf, row.key.clone(), row.value.clone()));
-            self.rows.restore_batch(batch.seq, rows_at_seq)?;
-        }
-        self.rows.advance_to_at_least(recovered.last_recovered_seq);
+                .filter(|batch| batch.seq > current)
+                .map(|batch| {
+                    (
+                        batch.seq,
+                        batch
+                            .rows
+                            .iter()
+                            .map(|row| (row.cf, row.key.clone(), row.value.clone())),
+                    )
+                }),
+            recovered.last_recovered_seq,
+        )?;
         Ok(())
     }
 
@@ -133,7 +162,7 @@ where
     fn commit_rows_locked_inner(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
-            return self.commit_prepared_rows(rows);
+            return Ok(self.latest_seq());
         }
         // Time-travel (PH72 T04): stamp this group-commit with one time-index
         // entry in the SAME batch as the data, so the (millis -> seqno) mapping
@@ -167,33 +196,59 @@ where
         };
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
+        // Validate and derive Ledger sidecars before the irreversible WAL
+        // append. After append succeeds, every failure is a committed-outcome
+        // reconciliation event, never an ordinary retryable write error.
+        let head_anchor = crate::ledger_head::newest_anchor_from_rows(rows)?;
+        let checkpoint_anchor = crate::ledger_head::newest_checkpoint_from_rows(rows)?;
         let durable_seq = durable.append_batch(rows)?;
-        if let Some(anchor) = crate::ledger_head::newest_anchor_from_rows(rows)? {
-            crate::ledger_head::write_head_anchor(durable.root(), &anchor)?;
-        }
-        if let Some(anchor) = crate::ledger_head::newest_checkpoint_from_rows(rows)? {
-            crate::ledger_head::write_checkpoint_anchor(durable.root(), &anchor)?;
-        }
-        let mvcc_seq = match self.commit_rows_to_mvcc(rows) {
-            Ok(seq) => seq,
-            Err(mvcc_error) => {
-                let restore = self.restore_committed_rows(durable_seq, rows);
-                let checkpoint = durable.checkpoint_batch(durable_seq, rows);
-                return Err(post_wal_commit_error(
-                    durable_seq,
-                    &mvcc_error,
-                    &restore,
-                    &checkpoint,
-                ));
+
+        let publish = (|| -> Result<Seq> {
+            if let Some(anchor) = &head_anchor {
+                crate::ledger_head::write_head_anchor(durable.root(), anchor)?;
             }
-        };
-        if mvcc_seq != durable_seq {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "durable WAL seq {durable_seq} diverged from MVCC seq {mvcc_seq}"
-            )));
+            if let Some(anchor) = &checkpoint_anchor {
+                crate::ledger_head::write_checkpoint_anchor(durable.root(), anchor)?;
+            }
+            let mvcc_seq = self.commit_rows_to_mvcc(rows)?;
+            if mvcc_seq != durable_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "durable WAL seq {durable_seq} diverged from MVCC seq {mvcc_seq}"
+                )));
+            }
+            durable.stage_checkpoint_batch(durable_seq, rows)?;
+            Ok(mvcc_seq)
+        })();
+
+        match publish {
+            Ok(seq) => Ok(seq),
+            Err(post_wal_error) => {
+                let restore = self.restore_committed_rows(durable_seq, rows);
+                let head_repair = head_anchor.as_ref().map_or(Ok(()), |anchor| {
+                    crate::ledger_head::write_head_anchor(durable.root(), anchor)
+                });
+                let checkpoint_anchor_repair =
+                    checkpoint_anchor.as_ref().map_or(Ok(()), |anchor| {
+                        crate::ledger_head::write_checkpoint_anchor(durable.root(), anchor)
+                    });
+                let checkpoint = durable.checkpoint_committed_batch_with_pending(durable_seq, rows);
+                if rows
+                    .iter()
+                    .any(|row| row.cf == crate::cf::ColumnFamily::Ledger)
+                {
+                    self.ledger_state_reconciliation_required
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(post_wal_commit_error(
+                    durable_seq,
+                    &post_wal_error,
+                    &restore,
+                    &head_repair,
+                    &checkpoint_anchor_repair,
+                    &checkpoint,
+                ))
+            }
         }
-        durable.stage_checkpoint_batch(durable_seq, rows)?;
-        Ok(mvcc_seq)
     }
 
     fn commit_rows_to_mvcc(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
@@ -204,33 +259,53 @@ where
     }
 
     fn restore_committed_rows(&self, seq: Seq, rows: &[encode::WriteRow]) -> Result<()> {
-        self.rows.restore_batch(
+        self.rows.restore_batches_and_advance(
+            [(
+                seq,
+                rows.iter()
+                    .map(|row| (row.cf, row.key.clone(), row.value.clone())),
+            )],
             seq,
-            rows.iter()
-                .map(|row| (row.cf, row.key.clone(), row.value.clone())),
         )?;
-        self.rows.advance_to_at_least(seq);
         Ok(())
     }
 }
 
 fn post_wal_commit_error(
     durable_seq: Seq,
-    mvcc_error: &CalyxError,
+    post_wal_error: &CalyxError,
     restore: &Result<()>,
+    head_repair: &Result<()>,
+    checkpoint_anchor_repair: &Result<()>,
     checkpoint: &Result<()>,
 ) -> CalyxError {
     CalyxError {
         code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
         message: format!(
-            "WAL commit is durable but live MVCC/router application failed; wal_seq={durable_seq} \
-             mvcc=error[{}]: {} restore={} checkpoint={}",
-            mvcc_error.code,
-            mvcc_error.message,
+            "WAL commit is durable but post-WAL publication failed; wal_seq={durable_seq} \
+             post_wal=error[{}]: {} restore={} head_repair={} checkpoint_anchor_repair={} checkpoint={}",
+            post_wal_error.code,
+            post_wal_error.message,
             reconciliation_outcome(restore),
+            reconciliation_outcome(head_repair),
+            reconciliation_outcome(checkpoint_anchor_repair),
             reconciliation_outcome(checkpoint),
         ),
-        remediation: "treat wal_seq as durably committed; reconcile by idempotency/readback or reopen the vault before retrying",
+        remediation: "treat wal_seq as durably committed; reconcile by idempotency/readback before retrying, and allow the next durable boundary to rebuild any latched Ledger sidecar/hook state from physical truth",
+    }
+}
+
+fn durable_live_sequence_divergence(
+    durable_tip: Seq,
+    live_tip: Seq,
+    context: &'static str,
+) -> CalyxError {
+    CalyxError {
+        code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
+        message: format!(
+            "{context}; durable_wal_tip={durable_tip} live_mvcc_tip={live_tip}; refusing to admit another durable write"
+        ),
+        remediation: "close and reopen this vault from durable physical truth, inspect the preceding post-WAL failure, and do not retry the rejected logical operation without idempotency/readback",
     }
 }
 

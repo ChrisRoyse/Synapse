@@ -38,14 +38,20 @@ mod store;
 mod temporal_xterm;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange};
 use crate::dedup::DedupPolicy;
-use crate::mvcc::{Freshness, ReadBarrier, Snapshot, VersionedCfStore};
+use crate::mvcc::{CfRead, Freshness, ReadBarrier, Snapshot, VersionedCfStore, is_tombstone_value};
 use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
 use crate::timetravel::RetentionHorizon;
 use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
 use crate::wal::{TornTail, WalRecycleReport};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, SystemClock, VaultId};
-use std::{path::Path, sync::Mutex};
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Mutex,
+    sync::atomic::AtomicBool,
+};
 
 pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
@@ -89,7 +95,9 @@ pub struct AsterVault<C = SystemClock> {
     retention_horizon: Mutex<RetentionHorizon>,
     ledger_hook: Option<AsterLedgerHook>,
     read_only: bool,
+    commit_lock: Mutex<()>,
     recurrence_write_lock: Mutex<()>,
+    ledger_state_reconciliation_required: AtomicBool,
     recovery_report: VaultRecoveryReport,
     residency: Option<crate::residency::Residency>,
 }
@@ -98,6 +106,185 @@ pub struct AsterVault<C = SystemClock> {
 pub struct VaultRecoveryReport {
     pub last_recovered_seq: Seq,
     pub torn_tail: Option<TornTail>,
+}
+
+/// Stable error code for an invalid revision-guarded CF mutation.
+pub const CALYX_ASTER_CONDITIONAL_WRITE_INVALID: &str = "CALYX_ASTER_CONDITIONAL_WRITE_INVALID";
+/// Stable error code for attempts to bypass the append-only Ledger API and its
+/// persistent-hook reconciliation contract.
+pub const CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN: &str = "CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN";
+
+/// One physical CF revision precondition.
+///
+/// `expected_revision` is SHA-256 over the exact latest plaintext value, or
+/// `None` when the key must be physically absent. Guards are evaluated in
+/// input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfRevisionGuard {
+    pub cf: ColumnFamily,
+    pub key: Vec<u8>,
+    pub expected_revision: Option<[u8; 32]>,
+}
+
+impl CfRevisionGuard {
+    #[must_use]
+    pub fn new(
+        cf: ColumnFamily,
+        key: impl Into<Vec<u8>>,
+        expected_revision: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            cf,
+            key: key.into(),
+            expected_revision,
+        }
+    }
+}
+
+/// The first ordered guard whose expected revision did not match reality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalCfWriteConflict {
+    pub guard_index: usize,
+    pub cf: ColumnFamily,
+    pub key: Vec<u8>,
+    pub expected_revision: Option<[u8; 32]>,
+    pub actual_revision: Option<[u8; 32]>,
+}
+
+/// Result of one durable multi-key revision-guarded CF batch.
+///
+/// `actual_revisions` always contains one pre-commit revision per guard in
+/// guard-input order. On success, `committed_revisions` has the same length;
+/// a deleted guard is represented by `None`. On conflict, no mutation occurs,
+/// `committed_revisions` is empty, and `conflict` identifies the first
+/// mismatching guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiConditionalCfWriteOutcome {
+    pub applied: bool,
+    pub seq: Seq,
+    pub actual_revisions: Vec<Option<[u8; 32]>>,
+    pub committed_revisions: Vec<Option<[u8; 32]>>,
+    pub conflict: Option<ConditionalCfWriteConflict>,
+}
+
+/// Compatibility result for one durable revision-guarded CF batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionalCfWriteOutcome {
+    pub applied: bool,
+    pub seq: Seq,
+    pub previous_revision: Option<[u8; 32]>,
+    pub committed_revision: Option<[u8; 32]>,
+}
+
+fn value_revision(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
+}
+
+fn invalid_conditional_write(message: String) -> CalyxError {
+    CalyxError {
+        code: CALYX_ASTER_CONDITIONAL_WRITE_INVALID,
+        message,
+        remediation: "supply a non-empty unique guard set and exactly one mutation for every guarded CF/key",
+    }
+}
+
+fn raw_ledger_write_forbidden(operation: &str, detail: String) -> CalyxError {
+    CalyxError {
+        code: CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN,
+        message: format!("{operation}: {detail}"),
+        remediation: "write Ledger entries through append_ledger_entry, append_external_ledger_row, or a ledger-stamped vault operation so append-only validation, sidecars, and the persistent hook advance together",
+    }
+}
+
+fn reject_raw_ledger_rows(operation: &str, rows: &[encode::WriteRow]) -> Result<()> {
+    if let Some((row_index, row)) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.cf == ColumnFamily::Ledger)
+    {
+        return Err(raw_ledger_write_forbidden(
+            operation,
+            format!(
+                "raw Ledger mutation is reserved: row_index={row_index} key_len={} value_len={}",
+                row.key.len(),
+                row.value.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_raw_ledger_guards(operation: &str, guards: &[CfRevisionGuard]) -> Result<()> {
+    if let Some((guard_index, guard)) = guards
+        .iter()
+        .enumerate()
+        .find(|(_, guard)| guard.cf == ColumnFamily::Ledger)
+    {
+        return Err(raw_ledger_write_forbidden(
+            operation,
+            format!(
+                "raw Ledger revision guard is reserved: guard_index={guard_index} key_len={}",
+                guard.key.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn guarded_row_indices(
+    guards: &[CfRevisionGuard],
+    rows: &[encode::WriteRow],
+) -> Result<Vec<usize>> {
+    if guards.is_empty() {
+        return Err(invalid_conditional_write(
+            "conditional CF write requires at least one revision guard".to_owned(),
+        ));
+    }
+
+    let mut seen_guards = BTreeSet::new();
+    for (guard_index, guard) in guards.iter().enumerate() {
+        if guard.key.is_empty() {
+            return Err(invalid_conditional_write(format!(
+                "conditional CF write guard key must be non-empty: guard_index={guard_index} guard_cf={:?}",
+                guard.cf
+            )));
+        }
+        if !seen_guards.insert((guard.cf, guard.key.as_slice())) {
+            return Err(invalid_conditional_write(format!(
+                "conditional CF write guard keys must be unique: guard_index={guard_index} guard_cf={:?} guard_key_len={}",
+                guard.cf,
+                guard.key.len()
+            )));
+        }
+    }
+
+    let mut row_occurrences = BTreeMap::<(ColumnFamily, &[u8]), (usize, usize)>::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        row_occurrences
+            .entry((row.cf, row.key.as_slice()))
+            .and_modify(|(_, count)| *count += 1)
+            .or_insert((row_index, 1));
+    }
+
+    guards
+        .iter()
+        .enumerate()
+        .map(|(guard_index, guard)| {
+            let (row_index, matching_rows) = row_occurrences
+                .get(&(guard.cf, guard.key.as_slice()))
+                .copied()
+                .unwrap_or((0, 0));
+            if matching_rows != 1 {
+                return Err(invalid_conditional_write(format!(
+                    "conditional CF write requires exactly one mutation for every guard: guard_index={guard_index} guard_cf={:?} guard_key_len={} matching_rows={matching_rows} total_rows={}",
+                    guard.cf,
+                    guard.key.len(),
+                    rows.len()
+                )));
+            }
+            Ok(row_index)
+        })
+        .collect()
 }
 
 impl AsterVault<SystemClock> {
@@ -156,7 +343,9 @@ where
             retention_horizon: Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,
             read_only: false,
+            commit_lock: Mutex::new(()),
             recurrence_write_lock: Mutex::new(()),
+            ledger_state_reconciliation_required: AtomicBool::new(false),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,
@@ -268,6 +457,25 @@ where
         self.rows.read_latest(cf, key)
     }
 
+    /// Reads one raw CF row and its physical-value revision from one atomic
+    /// latest committed view.
+    ///
+    /// The revision is SHA-256 over the exact plaintext CF value returned by
+    /// Aster. It can be supplied to [`Self::write_cf_batch_if_revision`] as an
+    /// optimistic concurrency precondition.
+    pub fn read_cf_latest_revisioned(
+        &self,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<(Vec<u8>, [u8; 32])>> {
+        self.rows.read_latest(cf, key).map(|value| {
+            value.map(|value| {
+                let revision = value_revision(&value);
+                (value, revision)
+            })
+        })
+    }
+
     /// Reads raw CF rows from one atomic view of the latest committed state.
     pub fn read_cf_batch_latest(
         &self,
@@ -306,15 +514,161 @@ where
             .into_iter()
             .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
             .collect::<Vec<_>>();
+        reject_raw_ledger_rows("write_cf_batch", &rows)?;
         if rows.is_empty() {
             return Ok(self.latest_seq());
         }
         self.commit_rows(&rows)
     }
 
+    /// Atomically compares all latest CF value revisions and commits one batch.
+    ///
+    /// The guard list and every guard key must be non-empty, guards must be
+    /// unique by `(cf, key)`, and each guarded key must occur exactly once in
+    /// `rows`. Validation happens before lock acquisition. Revision comparison,
+    /// the single WAL/MVCC commit, and outcome construction share the same
+    /// process and cross-process commit boundary.
+    ///
+    /// A conflict returns the first mismatching guard in input order plus the
+    /// actual revisions of every guard. It does not append to the WAL, advance
+    /// MVCC sequence state, or mutate any row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CALYX_ASTER_CONDITIONAL_WRITE_INVALID`] for malformed guards
+    /// or mutations. Other structured errors report read barriers, read-only
+    /// handles, admission, WAL, MVCC, or durability failures.
+    pub fn write_cf_batch_if_revisions(
+        &self,
+        guards: impl IntoIterator<Item = CfRevisionGuard>,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> Result<MultiConditionalCfWriteOutcome> {
+        let guards = guards.into_iter().collect::<Vec<_>>();
+        let rows = rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        reject_raw_ledger_guards("write_cf_batch_if_revisions", &guards)?;
+        reject_raw_ledger_rows("write_cf_batch_if_revisions", &rows)?;
+        let guard_row_indices = guarded_row_indices(&guards, &rows)?;
+        self.ensure_writeable("revision-guarded CF batch")?;
+
+        self.with_durable_commit_lock(|| {
+            let reads = guards
+                .iter()
+                .map(|guard| CfRead::new(guard.cf, guard.key.clone()))
+                .collect::<Vec<_>>();
+            let actual_revisions = self
+                .rows
+                .read_batch_latest(&reads)?
+                .iter()
+                .map(|value| value.as_deref().map(value_revision))
+                .collect::<Vec<_>>();
+
+            if let Some(guard_index) = guards
+                .iter()
+                .zip(&actual_revisions)
+                .position(|(guard, actual)| guard.expected_revision != *actual)
+            {
+                let guard = &guards[guard_index];
+                return Ok(MultiConditionalCfWriteOutcome {
+                    applied: false,
+                    seq: self.latest_seq(),
+                    conflict: Some(ConditionalCfWriteConflict {
+                        guard_index,
+                        cf: guard.cf,
+                        key: guard.key.clone(),
+                        expected_revision: guard.expected_revision,
+                        actual_revision: actual_revisions[guard_index],
+                    }),
+                    actual_revisions,
+                    committed_revisions: Vec::new(),
+                });
+            }
+
+            let seq = self.commit_rows_locked(&rows)?;
+            let committed_revisions = guard_row_indices
+                .iter()
+                .map(|row_index| {
+                    let value = &rows[*row_index].value;
+                    (!is_tombstone_value(value)).then(|| value_revision(value))
+                })
+                .collect();
+            Ok(MultiConditionalCfWriteOutcome {
+                applied: true,
+                seq,
+                actual_revisions,
+                committed_revisions,
+                conflict: None,
+            })
+        })
+    }
+
+    /// Atomically compares one latest CF value revision and commits a batch.
+    ///
+    /// This compatibility wrapper delegates to
+    /// [`Self::write_cf_batch_if_revisions`].
+    pub fn write_cf_batch_if_revision(
+        &self,
+        guard_cf: ColumnFamily,
+        guard_key: &[u8],
+        expected_revision: Option<[u8; 32]>,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> Result<ConditionalCfWriteOutcome> {
+        let outcome = self.write_cf_batch_if_revisions(
+            [CfRevisionGuard::new(guard_cf, guard_key, expected_revision)],
+            rows,
+        )?;
+        let previous_revision = outcome.actual_revisions.first().copied().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "single-key conditional write returned no actual guard revision",
+            )
+        })?;
+        let committed_revision = if outcome.applied {
+            outcome
+                .committed_revisions
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(
+                        "applied single-key conditional write returned no committed guard revision",
+                    )
+                })?
+        } else {
+            None
+        };
+        Ok(ConditionalCfWriteOutcome {
+            applied: outcome.applied,
+            seq: outcome.seq,
+            previous_revision,
+            committed_revision,
+        })
+    }
+
     /// Writes one raw CF row through the WAL-backed batch path.
     pub fn write_cf(&self, cf: ColumnFamily, key: Vec<u8>, value: Vec<u8>) -> Result<Seq> {
         self.write_cf_batch([(cf, key, value)])
+    }
+
+    /// Internal compatibility path for a `LedgerCfStore` operating on a vault
+    /// that has no persistent in-memory Ledger hook. Public raw CF APIs reserve
+    /// Ledger so a caller cannot make a configured hook stale.
+    fn write_raw_ledger_row_without_hook(&self, key: Vec<u8>, value: Vec<u8>) -> Result<Seq> {
+        if self.ledger_hook.is_some() {
+            return Err(raw_ledger_write_forbidden(
+                "write_raw_ledger_row_without_hook",
+                format!(
+                    "trusted no-hook path was invoked while a persistent Ledger hook is configured: key_len={} value_len={}",
+                    key.len(),
+                    value.len()
+                ),
+            ));
+        }
+        self.commit_rows(&[encode::WriteRow {
+            cf: ColumnFamily::Ledger,
+            key,
+            value,
+        }])
     }
 
     /// Scans visible raw CF rows at `snapshot`; use `scan_cf_pages_at` for large data CFs.
@@ -366,6 +720,18 @@ where
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.rows.scan_cf_range_latest(cf, range)
+    }
+
+    /// Reads one candidate-bounded page from an atomic latest committed view.
+    pub fn scan_cf_range_page_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<crate::mvcc::LatestCfRangePage> {
+        self.rows
+            .scan_cf_range_page_latest(cf, range, after_key, limit)
     }
 
     /// Scans visible raw CF row keys in a key range at `snapshot`.

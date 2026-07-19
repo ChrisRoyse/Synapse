@@ -21,6 +21,14 @@ use std::sync::{Arc, RwLock};
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
 
+/// Hard row-request ceiling for one atomic latest-range page.
+///
+/// The implementation merges one bounded lookahead candidate in addition to
+/// the requested rows. Keeping this ceiling explicit prevents caller-supplied
+/// capacities from turning a read into an allocation panic or unbounded
+/// synchronous work.
+pub const LATEST_CF_RANGE_PAGE_MAX_ROWS: usize = 65_536;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VersionedValue {
     seq: Seq,
@@ -44,6 +52,23 @@ impl CfRead {
             key: key.into(),
         }
     }
+}
+
+/// One candidate-bounded page from an atomic latest committed view.
+///
+/// `resume_after` is the last emitted candidate key, including tombstones.
+/// Callers must use it as an exclusive cursor when `more` is true, even when
+/// `rows` is empty. `examined_rows` counts logical candidates merged across
+/// the latest row/router view, including at most one lookahead candidate
+/// beyond `resume_after`; it is not a count of physical SST rows or bytes.
+/// `more` is exact from that bounded lookahead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestCfRangePage {
+    pub snapshot_seq: Seq,
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub resume_after: Option<Vec<u8>>,
+    pub more: bool,
+    pub examined_rows: usize,
 }
 
 pub fn tombstone_value() -> Vec<u8> {
@@ -365,7 +390,11 @@ impl VersionedCfStore {
             return Ok(self.current_seq());
         }
 
-        let mut table = self.rows.write().expect("mvcc row table poisoned");
+        let mut table = self.rows.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC row-table lock was poisoned during atomic commit",
+            )
+        })?;
         if let Some(router) = self.router.write().expect("mvcc router poisoned").as_mut() {
             // Rows written here belong to the seq allocated below (current + 1,
             // exact because all allocations happen under the row write lock
@@ -413,7 +442,11 @@ impl VersionedCfStore {
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
-        let mut table = self.rows.write().expect("mvcc row table poisoned");
+        let mut table = self.rows.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC row-table lock was poisoned during atomic recovery restore",
+            )
+        })?;
         if rows
             .iter()
             .any(|(cf, _, _)| cf.feeds_persistent_search_index())
@@ -428,6 +461,62 @@ impl VersionedCfStore {
                 .or_default()
                 .push(VersionedValue { seq, value });
         }
+        Ok(())
+    }
+
+    /// Publishes recovered foreign-process batches and their final sequence as
+    /// one atomic latest-view transition.
+    ///
+    /// Keeping the row write lock until `final_seq` is visible prevents a
+    /// latest reader from observing restored version chains whose sequence is
+    /// still in the future relative to [`Self::current_seq`].
+    pub(crate) fn restore_batches_and_advance<I, R>(&self, batches: I, final_seq: Seq) -> Result<()>
+    where
+        I: IntoIterator<Item = (Seq, R)>,
+        R: IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    {
+        let batches = batches
+            .into_iter()
+            .map(|(seq, rows)| (seq, rows.into_iter().collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        if batches.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || batches.iter().any(|(seq, _rows)| *seq > final_seq)
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "recovered MVCC batches must have strictly increasing sequences at or below final sequence {final_seq}"
+            )));
+        }
+        let mut table = self.rows.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC row-table lock was poisoned during atomic recovery restore",
+            )
+        })?;
+        let published_seq = self.current_seq();
+        if final_seq < published_seq {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "recovered MVCC final sequence {final_seq} regresses published sequence {published_seq}"
+            )));
+        }
+        for (seq, rows) in batches
+            .into_iter()
+            .filter(|(seq, _rows)| *seq > published_seq)
+        {
+            if rows
+                .iter()
+                .any(|(cf, _, _)| cf.feeds_persistent_search_index())
+            {
+                self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
+            }
+            for (cf, key, value) in rows {
+                table
+                    .entry(cf)
+                    .or_default()
+                    .entry(key)
+                    .or_default()
+                    .push(VersionedValue { seq, value });
+            }
+        }
+        self.seqs.advance_to_at_least(final_seq);
         Ok(())
     }
 

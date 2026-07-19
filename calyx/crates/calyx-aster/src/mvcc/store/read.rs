@@ -52,6 +52,45 @@ impl VersionedCfStore {
         })
     }
 
+    /// Reads one candidate-bounded page from an atomic latest committed view.
+    ///
+    /// The exclusive `after_key` cursor and `resume_after` result include
+    /// tombstoned keys. This guarantees forward progress even when a physical
+    /// range contains no currently live rows. `limit` must not exceed
+    /// [`LATEST_CF_RANGE_PAGE_MAX_ROWS`].
+    pub fn scan_cf_range_page_latest(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<LatestCfRangePage> {
+        validate_latest_page_request(range, after_key, limit)?;
+        if limit == 0 {
+            return Ok(LatestCfRangePage {
+                snapshot_seq: self.current_seq(),
+                rows: Vec::new(),
+                resume_after: None,
+                more: false,
+                examined_rows: 0,
+            });
+        }
+        self.with_latest_view(|seq, table, router, barriers| {
+            latest_range_page_from_view(
+                seq,
+                table,
+                router,
+                barriers,
+                LatestRangePageRequest {
+                    cf,
+                    range,
+                    after_key,
+                    limit,
+                },
+            )
+        })
+    }
+
     /// Reads one CF/key at the pinned sequence.
     pub fn read_at(
         &self,
@@ -480,10 +519,214 @@ fn latest_rows_from_view(
     Ok(rows.into_iter().collect())
 }
 
+struct LatestRangePageRequest<'a> {
+    cf: ColumnFamily,
+    range: &'a KeyRange,
+    after_key: Option<&'a [u8]>,
+    limit: usize,
+}
+
+fn latest_range_page_from_view(
+    seq: Seq,
+    table: &RowTable,
+    router: Option<&CfRouter>,
+    barriers: &[ReadBarrier],
+    request: LatestRangePageRequest<'_>,
+) -> Result<LatestCfRangePage> {
+    let LatestRangePageRequest {
+        cf,
+        range,
+        after_key,
+        limit,
+    } = request;
+    let candidate_limit = limit + 1;
+    let router_rows = router
+        .map(|router| {
+            router.range_candidate_page_until(
+                cf,
+                &range.start,
+                range.end.as_deref(),
+                after_key,
+                candidate_limit,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let table_rows =
+        table_candidate_page_from_view(table, seq, cf, range, after_key, candidate_limit)?;
+
+    let mut router_index = 0;
+    let mut table_index = 0;
+    let mut candidates = Vec::with_capacity(candidate_limit);
+    while candidates.len() < candidate_limit
+        && (router_index < router_rows.len() || table_index < table_rows.len())
+    {
+        let (key, state) = match (router_rows.get(router_index), table_rows.get(table_index)) {
+            (Some(router), Some((table_key, table_state))) => match router.key.cmp(table_key) {
+                std::cmp::Ordering::Less => {
+                    router_index += 1;
+                    (
+                        router.key.clone(),
+                        visible_state_from_router_value(&router.value),
+                    )
+                }
+                std::cmp::Ordering::Greater => {
+                    table_index += 1;
+                    (table_key.clone(), table_state.clone())
+                }
+                std::cmp::Ordering::Equal => {
+                    router_index += 1;
+                    table_index += 1;
+                    (table_key.clone(), table_state.clone())
+                }
+            },
+            (Some(router), None) => {
+                router_index += 1;
+                (
+                    router.key.clone(),
+                    visible_state_from_router_value(&router.value),
+                )
+            }
+            (None, Some((table_key, table_state))) => {
+                table_index += 1;
+                (table_key.clone(), table_state.clone())
+            }
+            (None, None) => break,
+        };
+        candidates.push((key, state));
+    }
+
+    let examined_rows = candidates.len();
+    let more = examined_rows > limit;
+    // The lookahead candidate is part of the read. Validate its barrier before
+    // revealing `more=true`; otherwise paging would leak the existence of a
+    // blocked live row even though the row itself is not emitted yet.
+    for (key, state) in &candidates {
+        if matches!(state, VisibleValue::Live(_)) {
+            ensure_view_key_unbarriered(barriers, cf, key)?;
+        }
+    }
+    let mut resume_after = None;
+    let mut rows = Vec::with_capacity(limit);
+    for (key, state) in candidates.into_iter().take(limit) {
+        resume_after = Some(key.clone());
+        if let VisibleValue::Live(value) = state {
+            rows.push((key, value));
+        }
+    }
+
+    Ok(LatestCfRangePage {
+        snapshot_seq: seq,
+        rows,
+        resume_after,
+        more,
+        examined_rows,
+    })
+}
+
+fn table_candidate_page_from_view(
+    table: &RowTable,
+    seq: Seq,
+    cf: ColumnFamily,
+    range: &KeyRange,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, VisibleValue)>> {
+    let Some(cf_rows) = table.get(&cf) else {
+        return Ok(Vec::new());
+    };
+    let lower = after_key
+        .map(|key| Bound::Excluded(key.to_vec()))
+        .unwrap_or_else(|| Bound::Included(range.start.clone()));
+    let upper = range
+        .end
+        .as_ref()
+        .map(|key| Bound::Excluded(key.clone()))
+        .unwrap_or(Bound::Unbounded);
+    cf_rows
+        .range((lower, upper))
+        .map(|(key, versions)| {
+            visible_value_state(versions, seq)
+                .map(|state| (key.clone(), state))
+                .ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "latest {} row {} has no version visible at sequence {seq}",
+                        cf.name(),
+                        hex_prefix(key)
+                    ))
+                })
+        })
+        .take(limit)
+        .collect()
+}
+
+fn visible_state_from_router_value(value: &[u8]) -> VisibleValue {
+    if is_tombstone_value(value) {
+        VisibleValue::Tombstone
+    } else {
+        VisibleValue::Live(value.to_vec())
+    }
+}
+
+fn validate_latest_page_request(
+    range: &KeyRange,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<()> {
+    if limit > LATEST_CF_RANGE_PAGE_MAX_ROWS {
+        return Err(invalid_latest_page(format!(
+            "latest range page limit {limit} exceeds the hard maximum {LATEST_CF_RANGE_PAGE_MAX_ROWS}"
+        )));
+    }
+    if range
+        .end
+        .as_ref()
+        .is_some_and(|end| end.as_slice() <= range.start.as_slice())
+    {
+        return Err(invalid_latest_page(format!(
+            "latest range page requires end > start; start={} end={}",
+            hex_prefix(&range.start),
+            range
+                .end
+                .as_deref()
+                .map(hex_prefix)
+                .unwrap_or_else(|| "<unbounded>".to_owned())
+        )));
+    }
+    if let Some(after_key) = after_key
+        && (after_key < range.start.as_slice()
+            || range
+                .end
+                .as_ref()
+                .is_some_and(|end| after_key >= end.as_slice()))
+    {
+        return Err(invalid_latest_page(format!(
+            "latest range page cursor {} is outside [{}, {})",
+            hex_prefix(after_key),
+            hex_prefix(&range.start),
+            range
+                .end
+                .as_deref()
+                .map(hex_prefix)
+                .unwrap_or_else(|| "+inf".to_owned())
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_latest_page(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_RANGE_PAGE_INVALID",
+        message: message.into(),
+        remediation: "supply an ordered range, an exclusive cursor inside that range, and a page limit at or below LATEST_CF_RANGE_PAGE_MAX_ROWS",
+    }
+}
+
 fn visible_value(versions: &[VersionedValue], seq: Seq) -> Option<Vec<u8>> {
     visible_value_state(versions, seq).and_then(VisibleValue::into_option)
 }
 
+#[derive(Clone)]
 enum VisibleValue {
     Live(Vec<u8>),
     Tombstone,

@@ -213,7 +213,7 @@ impl SstCursor {
         self.reader.key_at(self.position)
     }
 
-    fn entry_at_current(&self) -> Result<crate::sst::SstEntry> {
+    fn entry_at_current(&mut self) -> Result<crate::sst::SstEntry> {
         self.reader.entry_at(self.position)
     }
 

@@ -15,6 +15,15 @@ where
         DurableVault::validate_options(&options)?;
         let vault_root = vault_dir.as_ref().to_path_buf();
         let mut recovery = DurableVault::recover_batches(vault_dir.as_ref(), &options)?;
+        // Ledger head/checkpoint files are derived acceleration state for every
+        // durable vault, not just vaults that opt into the in-process hook.
+        // Always compare them with recovered WAL truth before any appender can
+        // trust a sidecar boundary.
+        ledger_hook::ensure_recovered_ledger_sidecars_with_commit_lock(
+            vault_dir.as_ref(),
+            &recovery,
+            !options.read_only,
+        )?;
         let ledger_hook = if options.restore_ledger_hook && options.value_crypto.is_some() {
             Some(ledger_hook::recover_hook(
                 &recovery,
@@ -188,7 +197,9 @@ where
             retention_horizon: Mutex::new(retention_horizon),
             ledger_hook,
             read_only: options.read_only,
+            commit_lock: Mutex::new(()),
             recurrence_write_lock: Mutex::new(()),
+            ledger_state_reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             recovery_report,
             residency,
         })

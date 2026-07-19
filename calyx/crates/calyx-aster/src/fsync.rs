@@ -107,6 +107,32 @@ pub(crate) fn sync_parent(path: &Path, label: &str) -> Result<()> {
     sync_dir(parent, label)
 }
 
+/// Removes one durable file and synchronizes its parent directory.
+///
+/// Missing is idempotent success. Other failures retain the same bounded
+/// Windows sharing retry and structured diagnostics as durable publication.
+pub(crate) fn remove_file_durable(path: &Path, label: &str) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(CalyxError::disk_pressure(format!(
+            "{label} path has no parent"
+        )));
+    };
+    if !parent.exists() {
+        return Ok(());
+    }
+    retry_sharing(
+        label,
+        "remove durable file",
+        path,
+        || match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    )?;
+    sync_dir(parent, label)
+}
+
 #[cfg(unix)]
 pub(crate) fn sync_dir(dir: &Path, label: &str) -> Result<()> {
     use std::fs::File;

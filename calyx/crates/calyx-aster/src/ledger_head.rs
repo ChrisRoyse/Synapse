@@ -95,6 +95,24 @@ pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Resu
     crate::fsync::write_atomic_replace(&path, &bytes, "Aster ledger head")
 }
 
+/// Replaces the derived head sidecar with exact recovered physical truth.
+///
+/// This deliberately bypasses append-only sidecar checks: recovery is the
+/// authority used to repair a stale-ahead or otherwise divergent accelerator.
+pub(crate) fn replace_head_anchor_from_recovery(
+    vault: &Path,
+    anchor: Option<&LedgerHeadAnchor>,
+) -> Result<()> {
+    let path = head_anchor_path(vault);
+    let Some(anchor) = anchor else {
+        return crate::fsync::remove_file_durable(&path, "Aster recovered ledger head");
+    };
+    let bytes = serde_json::to_vec(anchor).map_err(|error| {
+        CalyxError::ledger_corrupt(format!("encode recovered Aster ledger head: {error}"))
+    })?;
+    crate::fsync::write_atomic_replace(&path, &bytes, "Aster recovered ledger head")
+}
+
 pub(crate) fn read_checkpoint_anchor(vault: &Path) -> Result<Option<LedgerCheckpointAnchor>> {
     let path = checkpoint_anchor_path(vault);
     if !path.exists() {
@@ -133,6 +151,28 @@ pub(crate) fn write_checkpoint_anchor(vault: &Path, anchor: &LedgerCheckpointAnc
         CalyxError::ledger_corrupt(format!("encode Aster ledger checkpoint pointer: {error}"))
     })?;
     crate::fsync::write_atomic_replace(&path, &bytes, "Aster ledger checkpoint pointer")
+}
+
+/// Replaces the derived checkpoint sidecar with exact recovered physical
+/// truth, including removal when no physical checkpoint exists.
+pub(crate) fn replace_checkpoint_anchor_from_recovery(
+    vault: &Path,
+    anchor: Option<&LedgerCheckpointAnchor>,
+) -> Result<()> {
+    let path = checkpoint_anchor_path(vault);
+    let Some(anchor) = anchor else {
+        return crate::fsync::remove_file_durable(
+            &path,
+            "Aster recovered ledger checkpoint pointer",
+        );
+    };
+    anchor.validate()?;
+    let bytes = serde_json::to_vec(anchor).map_err(|error| {
+        CalyxError::ledger_corrupt(format!(
+            "encode recovered Aster ledger checkpoint pointer: {error}"
+        ))
+    })?;
+    crate::fsync::write_atomic_replace(&path, &bytes, "Aster recovered ledger checkpoint pointer")
 }
 
 pub(crate) fn newest_anchor_from_rows(rows: &[WriteRow]) -> Result<Option<LedgerHeadAnchor>> {

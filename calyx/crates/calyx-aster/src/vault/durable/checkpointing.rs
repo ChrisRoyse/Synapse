@@ -20,10 +20,17 @@ use std::collections::BTreeMap;
 use std::fs;
 
 impl DurableVault {
-    pub(in crate::vault) fn checkpoint_batch(&self, seq: u64, rows: &[WriteRow]) -> Result<()> {
-        self.write_rows(seq, rows)?;
-        self.advance_checkpointed_derived_content(seq, rows);
-        self.write_manifest(seq)
+    /// Checkpoints a WAL-committed batch without allowing the manifest replay
+    /// floor to jump past older staged batches. This is the post-WAL recovery
+    /// path: stage the current committed batch alongside every predecessor,
+    /// write the complete ordered set, then advance the manifest once.
+    pub(in crate::vault) fn checkpoint_committed_batch_with_pending(
+        &self,
+        seq: u64,
+        rows: &[WriteRow],
+    ) -> Result<()> {
+        self.stage_recovered_wal_batches(vec![(seq, rows.to_vec())])?;
+        self.flush_pending_checkpoints()
     }
 
     pub(in crate::vault) fn stage_checkpoint_batch(
@@ -53,7 +60,14 @@ impl DurableVault {
             .lock()
             .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
         for (seq, rows) in batches {
-            if pending.iter().any(|(staged, _)| *staged == seq) {
+            if let Some((_, staged_rows)) = pending.iter().find(|(staged, _)| *staged == seq) {
+                if staged_rows != &rows {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "checkpoint seq {seq} was staged twice with different rows: existing_rows={} incoming_rows={}",
+                        staged_rows.len(),
+                        rows.len()
+                    )));
+                }
                 continue;
             }
             pending.push((seq, rows));

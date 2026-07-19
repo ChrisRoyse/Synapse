@@ -135,9 +135,8 @@ where
             };
             prepared::stage_validated_constellation_rows(&mut rows, &constellation, prepared)?;
             self.commit_rows_locked(&rows)?;
-            if let (Some(hook), Some(staged)) = (hook_guard.as_deref_mut(), staged_ledger.as_ref())
-            {
-                ledger_hook::commit_staged(hook, staged)?;
+            if let (Some(hook), Some(staged)) = (hook_guard.take(), staged_ledger.as_ref()) {
+                self.commit_persistent_ledger_staged_locked(hook, staged, "put_constellation")?;
             }
             Ok(PutOutcome {
                 cx_id: id,
@@ -300,7 +299,7 @@ where
                 .into_iter()
                 .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
                 .collect::<Vec<_>>();
-            self.commit_rows(&rows)?;
+            self.commit_rows_locked(&rows)?;
             Ok(())
         })
     }

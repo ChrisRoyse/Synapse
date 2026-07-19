@@ -33,7 +33,7 @@
 //! leaves its attention state auto-resolves the escalation.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, Timelike};
 use rmcp::schemars::JsonSchema;
@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use synapse_core::{SCHEMA_VERSION, error_codes};
-use synapse_storage::{Db, cf, decode_json, encode_json};
+use synapse_storage::{Db, RevisionGuard, RevisionedRawValue, cf, decode_json, encode_json};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -62,11 +62,32 @@ use crate::m3::grounding::{self, SOURCE_ESCALATION};
 type CfKvRow = (Vec<u8>, Vec<u8>);
 type CfKvRows = Vec<CfKvRow>;
 
+#[derive(Clone, Debug, Default)]
+struct GuardedExtraRows {
+    rows: CfKvRows,
+    guards: Vec<RevisionGuard>,
+}
+
+impl GuardedExtraRows {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.rows.extend(other.rows);
+        self.guards.extend(other.guards);
+    }
+}
+
 const CONFIG_KEY: &str = "escalation/v1/config";
 const ITEM_PREFIX: &str = "escalation/v1/item/";
 const AUDIT_PREFIX: &str = "escalation/v1/audit/";
+const OPEN_INDEX_PREFIX: &str = "escalation/v1/open/";
 const ORPHAN_TOAST_AUDIT_PREFIX: &str = "escalation/v1/toast_orphan_cleanup/";
 const ESCALATION_ID_PREFIX: &str = "esc1-";
+const ESCALATION_ID_HEX_LEN: usize = 32;
+const ESCALATION_ID_LEN: usize = ESCALATION_ID_PREFIX.len() + ESCALATION_ID_HEX_LEN;
+const ITEM_KEY_LEN: usize = ITEM_PREFIX.len() + ESCALATION_ID_LEN;
 const APPROVAL_ITEM_PREFIX: &str = "approval/v1/item/";
 const APPROVAL_AUDIT_PREFIX: &str = "approval/v1/audit/";
 
@@ -79,6 +100,8 @@ const DEFAULT_TTL_ORDINARY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_TTL_SENSITIVE_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_SCAN_ROWS: usize = 20_000;
 const SCAN_CHUNK_ROWS: usize = 4_096;
+const WORKER_COOPERATIVE_YIELD_ROWS: usize = 32;
+const WORKER_SLOW_SCAN_LOG_MS: u128 = 500;
 const TERMINAL_ITEM_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const TERMINAL_ITEM_RETAIN_ROWS: usize = 5_000;
 const DELETE_BATCH_ROWS: usize = 512;
@@ -91,6 +114,8 @@ const WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL: u32 = 3;
 const WEBHOOK_RETRY_BASE_BACKOFF_MS: u64 = 30_000;
 const WEBHOOK_RETRY_MAX_BACKOFF_MS: u64 = DEFAULT_ACK_WINDOW_MS;
 const WORKER_TICK_MS: u64 = 1_000;
+const ACK_REVISION_MAX_ATTEMPTS: usize = 16;
+const DELETE_REVISION_MAX_ATTEMPTS: usize = 16;
 const AMBIENT_SILENT_TIMEOUT_SUPPRESSED: &str = "ambient_unprobeable_silent_timeout";
 
 // ---------------------------------------------------------------------------
@@ -406,6 +431,24 @@ fn audit_key(escalation_id: &str, at_unix_ms: u64, event_id: &str) -> Vec<u8> {
     format!("{AUDIT_PREFIX}{escalation_id}/{at_unix_ms:020}-{event_id}").into_bytes()
 }
 
+fn open_index_key(anchor: &str, attention_state: &str) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(b"synapse.escalation.open-index.v1\0");
+    digest.update(
+        u64::try_from(anchor.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(anchor.as_bytes());
+    digest.update(
+        u64::try_from(attention_state.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(attention_state.as_bytes());
+    format!("{OPEN_INDEX_PREFIX}{}", hex_bytes(&digest.finalize())).into_bytes()
+}
+
 fn orphan_toast_audit_key(at_unix_ms: u64, event_id: &str) -> Vec<u8> {
     format!("{ORPHAN_TOAST_AUDIT_PREFIX}{at_unix_ms:020}-{event_id}").into_bytes()
 }
@@ -414,7 +457,206 @@ fn storage_error(error: synapse_storage::StorageError) -> ErrorData {
     mcp_error(error.code(), error.to_string())
 }
 
+fn live_revisioned_value<'a>(
+    row: &'a RevisionedRawValue,
+    identity: &str,
+) -> Result<&'a [u8], ErrorData> {
+    row.value.as_deref().ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{identity} has a physical Calyx revision but its retention envelope is expired; refusing to treat stale control-plane bytes as live"
+            ),
+        )
+    })
+}
+
+fn validate_open_index_record(
+    key: &[u8],
+    record: &OpenEscalationIndexRecord,
+) -> Result<(), ErrorData> {
+    validate_escalation_id(&record.escalation_id)?;
+    if record.schema_version != SCHEMA_VERSION {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "open escalation index has schema_version={} instead of {}: escalation_id={}",
+                record.schema_version, SCHEMA_VERSION, record.escalation_id
+            ),
+        ));
+    }
+    let expected_key = open_index_key(&record.anchor, &record.attention_state);
+    if key != expected_key {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "open escalation index key/payload identity mismatch: stored_key={} expected_key={} escalation_id={}",
+                hex_bytes(key),
+                hex_bytes(&expected_key),
+                record.escalation_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_open_index(
+    db: &Db,
+    anchor: &str,
+    attention_state: &str,
+) -> Result<Option<RevisionedOpenEscalationIndex>, ErrorData> {
+    let key = open_index_key(anchor, attention_state);
+    db.get_cf_revisioned(cf::CF_KV, &key)
+        .map_err(storage_error)?
+        .map(|revisioned| {
+            let record = decode_json::<OpenEscalationIndexRecord>(live_revisioned_value(
+                &revisioned,
+                &format!("open escalation index {}", hex_bytes(&key)),
+            )?)
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "open escalation index decode failed for key {}: {error}",
+                        hex_bytes(&key)
+                    ),
+                )
+            })?;
+            validate_open_index_record(&key, &record)?;
+            if record.anchor != anchor || record.attention_state != attention_state {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "open escalation index digest collision or identity mismatch: requested_anchor={anchor:?} requested_state={attention_state:?} stored_anchor={:?} stored_state={:?}",
+                        record.anchor, record.attention_state
+                    ),
+                ));
+            }
+            Ok(RevisionedOpenEscalationIndex {
+                record,
+                revision_sha256: revisioned.revision_sha256,
+            })
+        })
+        .transpose()
+}
+
+fn open_index_row(
+    item: &EscalationItem,
+    is_open: bool,
+    expected_revision_sha256: Option<[u8; 32]>,
+) -> Result<GuardedExtraRows, ErrorData> {
+    let key = open_index_key(&item.anchor, &item.attention_state);
+    let record = OpenEscalationIndexRecord {
+        schema_version: SCHEMA_VERSION,
+        anchor: item.anchor.clone(),
+        attention_state: item.attention_state.clone(),
+        escalation_id: item.escalation_id.clone(),
+        is_open,
+        updated_at_unix_ms: item.updated_at_unix_ms,
+    };
+    validate_open_index_record(&key, &record)?;
+    let value = encode_json(&record).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "open escalation index encode failed for {}: {error}",
+                item.escalation_id
+            ),
+        )
+    })?;
+    Ok(GuardedExtraRows {
+        rows: vec![(key.clone(), value)],
+        guards: vec![RevisionGuard::new(key, expected_revision_sha256)],
+    })
+}
+
+fn indexed_open_item(
+    db: &Db,
+    index: &RevisionedOpenEscalationIndex,
+) -> Result<EscalationItem, ErrorData> {
+    if !index.record.is_open {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "terminal escalation index was requested as open: escalation_id={}",
+                index.record.escalation_id
+            ),
+        ));
+    }
+    let item = read_item(db, &index.record.escalation_id)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "open escalation index points to a missing item: escalation_id={}",
+                index.record.escalation_id
+            ),
+        )
+    })?;
+    if !item.status.is_open()
+        || item.anchor != index.record.anchor
+        || item.attention_state != index.record.attention_state
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "open escalation index points to a non-open or mismatched item: escalation_id={} item_status={} item_anchor={:?} index_anchor={:?} item_state={:?} index_state={:?}",
+                item.escalation_id,
+                item.status.as_str(),
+                item.anchor,
+                index.record.anchor,
+                item.attention_state,
+                index.record.attention_state
+            ),
+        ));
+    }
+    Ok(item)
+}
+
+fn terminal_open_index_row(db: &Db, item: &EscalationItem) -> Result<GuardedExtraRows, ErrorData> {
+    let current = read_open_index(db, &item.anchor, &item.attention_state)?;
+    match current {
+        None => open_index_row(item, false, None),
+        Some(current) if current.record.escalation_id == item.escalation_id => {
+            if current.record.is_open {
+                open_index_row(item, false, Some(current.revision_sha256))
+            } else {
+                Ok(GuardedExtraRows::default())
+            }
+        }
+        Some(current) => {
+            // A later generation may already own this deterministic slot while
+            // a worker is revisiting an older terminal item. Validate any open
+            // owner, then leave its generation untouched.
+            if current.record.is_open {
+                indexed_open_item(db, &current)?;
+            }
+            Ok(GuardedExtraRows::default())
+        }
+    }
+}
+
+fn validate_escalation_id(escalation_id: &str) -> Result<(), ErrorData> {
+    escalation_id
+        .strip_prefix(ESCALATION_ID_PREFIX)
+        .filter(|hex| {
+            hex.len() == ESCALATION_ID_HEX_LEN
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .map(|_hex| ())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "escalation id {escalation_id:?} is not canonical {ESCALATION_ID_PREFIX}<32 lowercase hex>"
+                ),
+            )
+        })
+}
+
 fn encode_item(item: &EscalationItem) -> Result<Vec<u8>, ErrorData> {
+    validate_escalation_id(&item.escalation_id)?;
     encode_json(item).map_err(|error| {
         mcp_error(
             error.code(),
@@ -426,28 +668,122 @@ fn encode_item(item: &EscalationItem) -> Result<Vec<u8>, ErrorData> {
     })
 }
 
-/// Writes the escalation item plus one append-only audit row in a single
-/// pressure-bypass batch, then reads both rows back to prove the write landed.
-fn write_item_and_audit(
-    db: &Db,
-    item: &EscalationItem,
-    event: &str,
-    detail: Value,
-) -> Result<(), ErrorData> {
-    write_item_and_audit_with_extra_rows(db, item, event, detail, Vec::new())
+#[derive(Clone, Debug)]
+struct RevisionedEscalationItem {
+    item: EscalationItem,
+    revision_sha256: [u8; 32],
 }
 
-fn write_item_and_audit_with_extra_rows(
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenEscalationIndexRecord {
+    schema_version: u32,
+    anchor: String,
+    attention_state: String,
+    escalation_id: String,
+    is_open: bool,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RevisionedOpenEscalationIndex {
+    record: OpenEscalationIndexRecord,
+    revision_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ItemWriteGuard {
+    Absent,
+    Revision([u8; 32]),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ItemWriteOutcome {
+    Applied {
+        revision_sha256: [u8; 32],
+        committed_seq: u64,
+    },
+    Conflict {
+        actual_revision_sha256: Option<[u8; 32]>,
+        observed_seq: u64,
+    },
+}
+
+fn accept_applied_item_revision(
+    outcome: ItemWriteOutcome,
+    revision_sha256: &mut [u8; 32],
+) -> Option<u64> {
+    match outcome {
+        ItemWriteOutcome::Applied {
+            revision_sha256: committed_revision,
+            committed_seq,
+        } => {
+            *revision_sha256 = committed_revision;
+            Some(committed_seq)
+        }
+        ItemWriteOutcome::Conflict { .. } => None,
+    }
+}
+
+/// Creates an absent escalation item plus its append-only audit row in one
+/// revision-guarded pressure-bypass batch.
+fn create_item_and_audit_with_extra_rows(
     db: &Db,
     item: &EscalationItem,
     event: &str,
     detail: Value,
-    extra_rows: CfKvRows,
-) -> Result<(), ErrorData> {
-    let extra_keys = extra_rows
-        .iter()
-        .map(|(key, _value)| key.clone())
-        .collect::<Vec<_>>();
+    extra_rows: GuardedExtraRows,
+) -> Result<ItemWriteOutcome, ErrorData> {
+    write_item_and_audit_guarded(db, item, event, detail, extra_rows, ItemWriteGuard::Absent)
+}
+
+fn write_item_and_audit_if_revision(
+    db: &Db,
+    item: &EscalationItem,
+    event: &str,
+    detail: Value,
+    expected_revision_sha256: [u8; 32],
+) -> Result<ItemWriteOutcome, ErrorData> {
+    write_item_and_audit_with_extra_rows_if_revision(
+        db,
+        item,
+        event,
+        detail,
+        GuardedExtraRows::default(),
+        expected_revision_sha256,
+    )
+}
+
+fn write_item_and_audit_with_extra_rows_if_revision(
+    db: &Db,
+    item: &EscalationItem,
+    event: &str,
+    detail: Value,
+    extra_rows: GuardedExtraRows,
+    expected_revision_sha256: [u8; 32],
+) -> Result<ItemWriteOutcome, ErrorData> {
+    write_item_and_audit_guarded(
+        db,
+        item,
+        event,
+        detail,
+        extra_rows,
+        ItemWriteGuard::Revision(expected_revision_sha256),
+    )
+}
+
+fn write_item_and_audit_guarded(
+    db: &Db,
+    item: &EscalationItem,
+    event: &str,
+    detail: Value,
+    extra_rows: GuardedExtraRows,
+    guard: ItemWriteGuard,
+) -> Result<ItemWriteOutcome, ErrorData> {
+    let GuardedExtraRows {
+        rows: extra_rows,
+        guards: extra_guards,
+    } = extra_rows;
     let item_key = item_key(&item.escalation_id);
     let item_value = encode_item(item)?;
     let event_id = Uuid::now_v7().simple().to_string();
@@ -475,22 +811,122 @@ fn write_item_and_audit_with_extra_rows(
         )
     })?;
     let mut rows = vec![
-        (item_key.clone(), item_value),
-        (audit_key.clone(), audit_value),
+        (item_key.clone(), item_value.clone()),
+        (audit_key.clone(), audit_value.clone()),
     ];
-    rows.extend(extra_rows);
-    db.put_batch_pressure_bypass(cf::CF_KV, rows)
+    rows.extend(extra_rows.iter().cloned());
+    let expected_revision_sha256 = match guard {
+        ItemWriteGuard::Absent => None,
+        ItemWriteGuard::Revision(revision) => Some(revision),
+    };
+    let mut revision_guards = Vec::with_capacity(1 + extra_guards.len());
+    revision_guards.push(RevisionGuard::new(
+        item_key.clone(),
+        expected_revision_sha256,
+    ));
+    revision_guards.extend(extra_guards);
+    let outcome = db
+        .mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            revision_guards.clone(),
+            std::iter::empty::<Vec<u8>>(),
+            rows,
+        )
         .map_err(storage_error)?;
-    // Physical write-readback guard: prove both rows are present immediately.
-    read_exact_row(db, &item_key)?.ok_or_else(|| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
+    if !outcome.applied {
+        let conflict = outcome.conflict.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "multi-key escalation mutation reported applied=false without conflict detail: escalation_id={} event={} observed_seq={}",
+                    item.escalation_id, event, outcome.committed_seq
+                ),
+            )
+        })?;
+        tracing::warn!(
+            code = "ESCALATION_MUTATION_REVISION_CONFLICT",
+            escalation_id = %item.escalation_id,
+            event,
+            observed_seq = outcome.committed_seq,
+            conflict_guard_index = conflict.guard_index,
+            conflict_guard_key = %hex_bytes(&conflict.key),
+            expected_revision = conflict.expected_revision_sha256
+                .as_ref()
+                .map_or_else(|| "absent".to_owned(), |revision| hex_bytes(revision)),
+            actual_revision = conflict
+                .actual_revision_sha256
+                .as_ref()
+                .map_or_else(|| "absent".to_owned(), |revision| hex_bytes(revision)),
+            "multi-key revision-guarded escalation mutation was not applied; caller must reread authoritative item and approval state"
+        );
+        return Ok(ItemWriteOutcome::Conflict {
+            actual_revision_sha256: conflict.actual_revision_sha256,
+            observed_seq: outcome.committed_seq,
+        });
+    }
+    if outcome.committed_revisions_sha256.len() != revision_guards.len() {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
             format!(
-                "escalation item row absent immediately after write for {}",
-                item.escalation_id
+                "multi-key escalation mutation returned invalid committed revision shape: escalation_id={} event={} guards={} revisions={} committed_seq={}",
+                item.escalation_id,
+                event,
+                revision_guards.len(),
+                outcome.committed_revisions_sha256.len(),
+                outcome.committed_seq
+            ),
+        ));
+    }
+    let committed_revision_sha256 = outcome.committed_revisions_sha256[0].ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "revision-guarded escalation write committed without guarded-row revision readback: escalation_id={} event={} committed_seq={}",
+                item.escalation_id, event, outcome.committed_seq
             ),
         )
     })?;
+    // Physical write-readback guard: prove both rows are present immediately.
+    let item_readback = db
+        .get_cf_revisioned(cf::CF_KV, &item_key)
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "escalation item row absent immediately after write for {}",
+                    item.escalation_id
+                ),
+            )
+        })?;
+    let item_readback_value = live_revisioned_value(
+        &item_readback,
+        &format!("escalation item {}", item.escalation_id),
+    )?;
+    if item_readback.revision_sha256 == committed_revision_sha256
+        && item_readback_value != item_value
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "escalation item revision readback matched committed revision but bytes differed: escalation_id={} event={} committed_seq={}",
+                item.escalation_id, event, outcome.committed_seq
+            ),
+        ));
+    }
+    if item_readback.revision_sha256 != committed_revision_sha256 {
+        let superseding_item = decode_item(&item.escalation_id, item_readback_value)?;
+        tracing::info!(
+            code = "ESCALATION_ITEM_READBACK_SUPERSEDED",
+            escalation_id = %item.escalation_id,
+            event,
+            committed_seq = outcome.committed_seq,
+            committed_revision = %hex_bytes(&committed_revision_sha256),
+            latest_revision = %hex_bytes(&item_readback.revision_sha256),
+            latest_status = superseding_item.status.as_str(),
+            "separate latest readback decoded and identity-validated a newer item revision after the guarded commit"
+        );
+    }
     let audit_readback_value = read_exact_row(db, &audit_key)?.ok_or_else(|| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
@@ -500,16 +936,109 @@ fn write_item_and_audit_with_extra_rows(
             ),
         )
     })?;
-    for key in extra_keys {
-        read_exact_row(db, &key)?.ok_or_else(|| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "linked approval row absent immediately after write for key {}",
-                    String::from_utf8_lossy(&key)
+    if audit_readback_value != audit_value {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "escalation audit row bytes differed immediately after write: escalation_id={} event={} key={} committed_seq={}",
+                item.escalation_id,
+                event,
+                hex_bytes(&audit_key),
+                outcome.committed_seq
+            ),
+        ));
+    }
+    for (key, expected_value) in &extra_rows {
+        let guard_index = revision_guards.iter().position(|guard| guard.key == *key);
+        if let Some(guard_index) = guard_index {
+            let committed_revision = outcome.committed_revisions_sha256[guard_index].ok_or_else(
+                || {
+                    mcp_error(
+                        error_codes::STORAGE_WRITE_FAILED,
+                        format!(
+                            "guarded linked row committed as absent despite a put: escalation_id={} event={} guard_index={} key={} committed_seq={}",
+                            item.escalation_id,
+                            event,
+                            guard_index,
+                            hex_bytes(key),
+                            outcome.committed_seq
+                        ),
+                    )
+                },
+            )?;
+            let readback = db
+                .get_cf_revisioned(cf::CF_KV, key)
+                .map_err(storage_error)?
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "guarded linked row absent immediately after write: escalation_id={} event={} key={}",
+                            item.escalation_id,
+                            event,
+                            hex_bytes(key)
+                        ),
+                    )
+                })?;
+            let readback_value = live_revisioned_value(
+                &readback,
+                &format!(
+                    "linked escalation row {} for {}",
+                    hex_bytes(key),
+                    item.escalation_id
                 ),
-            )
-        })?;
+            )?;
+            if readback.revision_sha256 == committed_revision {
+                if readback_value != expected_value.as_slice() {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "guarded linked row revision matched but bytes differed: escalation_id={} event={} key={} committed_seq={}",
+                            item.escalation_id,
+                            event,
+                            hex_bytes(key),
+                            outcome.committed_seq
+                        ),
+                    ));
+                }
+            } else {
+                validate_guarded_extra_row_identity(key, readback_value)?;
+                tracing::info!(
+                    code = "ESCALATION_GUARDED_EXTRA_READBACK_SUPERSEDED",
+                    escalation_id = %item.escalation_id,
+                    event,
+                    committed_seq = outcome.committed_seq,
+                    key = %hex_bytes(key),
+                    committed_revision = %hex_bytes(&committed_revision),
+                    latest_revision = %hex_bytes(&readback.revision_sha256),
+                    "separate latest readback decoded and identity-validated a newer guarded extra-row revision"
+                );
+            }
+        } else {
+            let readback = read_exact_row(db, key)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "linked audit row absent immediately after write: escalation_id={} event={} key={}",
+                        item.escalation_id,
+                        event,
+                        hex_bytes(key)
+                    ),
+                )
+            })?;
+            if readback != *expected_value {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "linked audit row bytes differed immediately after write: escalation_id={} event={} key={} committed_seq={}",
+                        item.escalation_id,
+                        event,
+                        hex_bytes(key),
+                        outcome.committed_seq
+                    ),
+                ));
+            }
+        }
     }
     let audit_readback: Value = decode_json(&audit_readback_value).map_err(|error| {
         mcp_error(
@@ -539,7 +1068,10 @@ fn write_item_and_audit_with_extra_rows(
         ledger_seq = report.ledger_seq,
         "escalation audit outcome grounded on CF_KV audit constellation"
     );
-    Ok(())
+    Ok(ItemWriteOutcome::Applied {
+        revision_sha256: committed_revision_sha256,
+        committed_seq: outcome.committed_seq,
+    })
 }
 
 fn approval_item_key(approval_id: &str) -> Vec<u8> {
@@ -550,26 +1082,173 @@ fn approval_audit_key(approval_id: &str, at_unix_ms: u64, event_id: &str) -> Vec
     format!("{APPROVAL_AUDIT_PREFIX}{approval_id}/{at_unix_ms:020}-{event_id}").into_bytes()
 }
 
+fn validate_linked_approval_item_identity(
+    key: &[u8],
+    value: &[u8],
+) -> Result<ApprovalItemRecord, ErrorData> {
+    let key_text = std::str::from_utf8(key).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "linked approval item key is not UTF-8: key={} error={error}",
+                hex_bytes(key)
+            ),
+        )
+    })?;
+    let approval_id = key_text
+        .strip_prefix(APPROVAL_ITEM_PREFIX)
+        .filter(|approval_id| !approval_id.is_empty())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "guarded linked row is not a canonical approval item key: key={}",
+                    hex_bytes(key)
+                ),
+            )
+        })?;
+    let approval = decode_json::<ApprovalItemRecord>(value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "linked approval item decode failed during revision readback: approval_id={approval_id} error={error}"
+            ),
+        )
+    })?;
+    if approval.approval_id != approval_id || approval.kind != ApprovalKind::AgentEscalation {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "linked approval row/payload identity mismatch: row_approval_id={approval_id:?} payload_approval_id={:?} payload_kind={:?}",
+                approval.approval_id, approval.kind
+            ),
+        ));
+    }
+    Ok(approval)
+}
+
+fn validate_linked_approval_for_escalation(
+    item: &EscalationItem,
+    approval: &ApprovalItemRecord,
+) -> Result<(), ErrorData> {
+    let payload_json = approval.payload_json.as_deref().ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "linked approval {} for escalation {} has no payload_json",
+                approval.approval_id, item.escalation_id
+            ),
+        )
+    })?;
+    let payload = serde_json::from_str::<Value>(payload_json).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "linked approval {} payload_json is invalid for escalation {}: {error}",
+                approval.approval_id, item.escalation_id
+            ),
+        )
+    })?;
+    let payload_escalation_id = payload.get("escalation_id").and_then(Value::as_str);
+    let payload_anchor = payload.get("anchor").and_then(Value::as_str);
+    let payload_attention_state = payload.get("attention_state").and_then(Value::as_str);
+    if approval.approval_id != item.approval_id
+        || approval.kind != ApprovalKind::AgentEscalation
+        || payload_escalation_id != Some(item.escalation_id.as_str())
+        || payload_anchor != Some(item.anchor.as_str())
+        || payload_attention_state != Some(item.attention_state.as_str())
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "linked approval/escalation identity mismatch: item_escalation_id={:?} item_approval_id={:?} item_anchor={:?} item_state={:?} approval_id={:?} approval_kind={:?} payload_escalation_id={payload_escalation_id:?} payload_anchor={payload_anchor:?} payload_state={payload_attention_state:?}",
+                item.escalation_id,
+                item.approval_id,
+                item.anchor,
+                item.attention_state,
+                approval.approval_id,
+                approval.kind
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_guarded_extra_row_identity(key: &[u8], value: &[u8]) -> Result<(), ErrorData> {
+    if key.starts_with(APPROVAL_ITEM_PREFIX.as_bytes()) {
+        validate_linked_approval_item_identity(key, value)?;
+        return Ok(());
+    }
+    if key.starts_with(OPEN_INDEX_PREFIX.as_bytes()) {
+        let record = decode_json::<OpenEscalationIndexRecord>(value).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "open escalation index decode failed during revision readback: key={} error={error}",
+                    hex_bytes(key)
+                ),
+            )
+        })?;
+        return validate_open_index_record(key, &record);
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_CORRUPTED,
+        format!(
+            "guarded escalation extra row has no registered identity validator: key={}",
+            hex_bytes(key)
+        ),
+    ))
+}
+
 fn read_exact_row(db: &Db, key: &[u8]) -> Result<Option<Vec<u8>>, ErrorData> {
-    let rows = db.scan_cf_prefix(cf::CF_KV, key).map_err(storage_error)?;
-    Ok(rows.into_iter().find(|(k, _)| k == key).map(|(_, v)| v))
+    db.get_cf(cf::CF_KV, key).map_err(storage_error)
 }
 
 fn read_item(db: &Db, escalation_id: &str) -> Result<Option<EscalationItem>, ErrorData> {
+    read_item_revisioned(db, escalation_id).map(|item| item.map(|revisioned| revisioned.item))
+}
+
+fn read_item_revisioned(
+    db: &Db,
+    escalation_id: &str,
+) -> Result<Option<RevisionedEscalationItem>, ErrorData> {
+    validate_escalation_id(escalation_id)?;
     let key = item_key(escalation_id);
-    match read_exact_row(db, &key)? {
-        Some(value) => Ok(Some(decode_item(escalation_id, &value)?)),
-        None => Ok(None),
-    }
+    db.get_cf_revisioned(cf::CF_KV, &key)
+        .map_err(storage_error)?
+        .map(|revisioned| {
+            Ok(RevisionedEscalationItem {
+                item: decode_item(
+                    escalation_id,
+                    live_revisioned_value(
+                        &revisioned,
+                        &format!("escalation item {escalation_id}"),
+                    )?,
+                )?,
+                revision_sha256: revisioned.revision_sha256,
+            })
+        })
+        .transpose()
 }
 
 fn decode_item(escalation_id: &str, value: &[u8]) -> Result<EscalationItem, ErrorData> {
-    decode_json::<EscalationItem>(value).map_err(|error| {
+    validate_escalation_id(escalation_id)?;
+    let item = decode_json::<EscalationItem>(value).map_err(|error| {
         mcp_error(
             error.code(),
             format!("escalation item decode failed for {escalation_id}: {error}"),
         )
-    })
+    })?;
+    if item.escalation_id != escalation_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "escalation item row/payload identity mismatch: row={escalation_id:?} payload={:?}",
+                item.escalation_id
+            ),
+        ));
+    }
+    Ok(item)
 }
 
 #[derive(Clone, Debug)]
@@ -578,82 +1257,541 @@ struct EscalationItemRow {
     item: EscalationItem,
 }
 
-fn key_after(key: &[u8]) -> Vec<u8> {
-    let mut next = key.to_vec();
-    next.push(0);
-    next
+fn item_scan_bounds() -> (Vec<u8>, Vec<u8>) {
+    let mut start = ITEM_PREFIX.as_bytes().to_vec();
+    start.resize(ITEM_KEY_LEN, 0);
+    let mut end = ITEM_PREFIX.as_bytes().to_vec();
+    for byte in end.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            end.resize(ITEM_KEY_LEN, 0);
+            return (start, end);
+        }
+        *byte = 0;
+    }
+    unreachable!("ASCII escalation item prefix always has a lexicographic successor")
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+fn scan_item_page(
+    db: &Db,
+    start: &[u8],
+    end: &[u8],
+    after_key: Option<&[u8]>,
+) -> Result<synapse_storage::FixedWidthScanPage, ErrorData> {
+    db.scan_cf_fixed_width_range_page(cf::CF_KV, start, end, after_key, SCAN_CHUNK_ROWS)
+        .map_err(storage_error)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ItemPageSnapshotTelemetry {
+    first: Option<u64>,
+    last: Option<u64>,
+    changes: usize,
+}
+
+impl ItemPageSnapshotTelemetry {
+    fn observe(&mut self, actual: Option<u64>) -> Result<(), ErrorData> {
+        let actual = actual.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                "escalation fixed-width page omitted its atomic Calyx snapshot sequence",
+            )
+        })?;
+        if self.last.is_some_and(|previous| previous != actual) {
+            self.changes = self.changes.saturating_add(1);
+        }
+        self.first.get_or_insert(actual);
+        self.last = Some(actual);
+        Ok(())
+    }
+}
+
+fn decode_item_page(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Vec<EscalationItemRow>, ErrorData> {
+    let mut decoded = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        if key.len() != ITEM_KEY_LEN || !key.starts_with(ITEM_PREFIX.as_bytes()) {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "fixed-width escalation range returned an out-of-contract row: expected {ITEM_KEY_LEN} bytes beginning with {ITEM_PREFIX:?}, got len={} key_hex={}",
+                    key.len(),
+                    hex_bytes(&key)
+                ),
+            ));
+        }
+        let key_text = std::str::from_utf8(&key).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "fixed-width escalation row key is not UTF-8: key_hex={} error={error}",
+                    hex_bytes(&key)
+                ),
+            )
+        })?;
+        let id = key_text.strip_prefix(ITEM_PREFIX).ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "fixed-width escalation row key lost required prefix {ITEM_PREFIX:?}: key_hex={}",
+                    hex_bytes(&key)
+                ),
+            )
+        })?;
+        let item = decode_item(id, &value)?;
+        decoded.push(EscalationItemRow { key, item });
+    }
+    Ok(decoded)
+}
+
+fn next_item_page_cursor(
+    page: &synapse_storage::FixedWidthScanPage,
+    previous: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, ErrorData> {
+    if !page.more {
+        return Ok(None);
+    }
+    let cursor = page.resume_after.clone().ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            "escalation fixed-width page reported more candidates without a resume cursor",
+        )
+    })?;
+    if previous.is_some_and(|previous| cursor.as_slice() <= previous) {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "escalation fixed-width page returned a non-progressing cursor: previous={} current={}",
+                previous.map_or_else(|| "none".to_owned(), hex_bytes),
+                hex_bytes(&cursor)
+            ),
+        ));
+    }
+    Ok(Some(cursor))
 }
 
 fn scan_item_rows(db: &Db) -> Result<Vec<EscalationItemRow>, ErrorData> {
-    let mut start = ITEM_PREFIX.as_bytes().to_vec();
+    let (start, end) = item_scan_bounds();
+    let mut after_key = None;
+    let mut snapshot_telemetry = ItemPageSnapshotTelemetry::default();
     let mut out = Vec::new();
+    let mut pages = 0usize;
     loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
-            .map_err(storage_error)?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut stop = false;
-        let mut last_key = None;
-        for (key, value) in rows {
-            if !key.starts_with(ITEM_PREFIX.as_bytes()) {
-                stop = true;
-                break;
-            }
-            let id = String::from_utf8_lossy(&key);
-            let id = id.strip_prefix(ITEM_PREFIX).unwrap_or(&id);
-            out.push(EscalationItemRow {
-                key: key.clone(),
-                item: decode_item(id, &value)?,
-            });
-            last_key = Some(key);
-        }
-        if stop || !more {
-            break;
-        }
-        let Some(key) = last_key else {
+        let page = scan_item_page(db, &start, &end, after_key.as_deref())?;
+        pages = pages.saturating_add(1);
+        snapshot_telemetry.observe(page.snapshot_seq)?;
+        let next = next_item_page_cursor(&page, after_key.as_deref())?;
+        out.extend(decode_item_page(page.rows)?);
+        let Some(cursor) = next else {
             break;
         };
-        start = key_after(&key);
+        after_key = Some(cursor);
     }
+    tracing::debug!(
+        code = "ESCALATION_ITEM_SCAN_PAGE_SNAPSHOTS",
+        scan_mode = "synchronous",
+        scan_pages = pages,
+        first_snapshot_seq = snapshot_telemetry.first,
+        last_snapshot_seq = snapshot_telemetry.last,
+        snapshot_seq_changes = snapshot_telemetry.changes,
+        "completed ordered escalation item paging across per-page atomic snapshots"
+    );
     Ok(out)
 }
 
-fn delete_keys(db: &Db, mut keys: Vec<Vec<u8>>, context: &str) -> Result<usize, ErrorData> {
-    keys.sort();
-    keys.dedup();
-    let deleted = keys.len();
-    for chunk in keys.chunks(DELETE_BATCH_ROWS) {
-        db.delete_batch(cf::CF_KV, chunk.iter().cloned())
+struct CancellableItemScan {
+    rows: Vec<EscalationItemRow>,
+    pages: usize,
+    candidate_rows_examined: usize,
+    expired_rows_skipped: usize,
+    first_snapshot_seq: Option<u64>,
+    last_snapshot_seq: Option<u64>,
+    snapshot_seq_changes: usize,
+    elapsed_ms: u128,
+}
+
+async fn scan_item_rows_cancellable(
+    db: &Db,
+    shutdown: &CancellationToken,
+) -> Result<Option<CancellableItemScan>, ErrorData> {
+    let started = Instant::now();
+    let (start, end) = item_scan_bounds();
+    let mut after_key = None;
+    let mut snapshot_telemetry = ItemPageSnapshotTelemetry::default();
+    let mut rows = Vec::new();
+    let mut pages = 0usize;
+    let mut candidate_rows_examined = 0usize;
+    let mut expired_rows_skipped = 0usize;
+    loop {
+        if shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let page_started = Instant::now();
+        let page = scan_item_page(db, &start, &end, after_key.as_deref())?;
+        pages = pages.saturating_add(1);
+        candidate_rows_examined =
+            candidate_rows_examined.saturating_add(page.candidate_rows_examined);
+        expired_rows_skipped = expired_rows_skipped.saturating_add(page.expired_rows_skipped);
+        snapshot_telemetry.observe(page.snapshot_seq)?;
+        let next = next_item_page_cursor(&page, after_key.as_deref())?;
+        rows.extend(decode_item_page(page.rows)?);
+        let page_elapsed_ms = page_started.elapsed().as_millis();
+        if page_elapsed_ms >= WORKER_SLOW_SCAN_LOG_MS {
+            tracing::warn!(
+                code = "ESCALATION_ITEM_PAGE_SLOW",
+                page_elapsed_ms,
+                page_number = pages,
+                candidate_rows_examined = page.candidate_rows_examined,
+                expired_rows_skipped = page.expired_rows_skipped,
+                page_more = page.more,
+                page_snapshot_seq = page.snapshot_seq,
+                first_snapshot_seq = snapshot_telemetry.first,
+                snapshot_seq_changes = snapshot_telemetry.changes,
+                requested_candidate_rows = SCAN_CHUNK_ROWS,
+                item_key_len = ITEM_KEY_LEN,
+                "candidate-bounded escalation item page exceeded the latency budget"
+            );
+        }
+        if shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(cursor) = next else {
+            break;
+        };
+        after_key = Some(cursor);
+        tokio::task::yield_now().await;
+    }
+    tracing::debug!(
+        code = "ESCALATION_ITEM_SCAN_PAGE_SNAPSHOTS",
+        scan_mode = "cancellable",
+        scan_pages = pages,
+        first_snapshot_seq = snapshot_telemetry.first,
+        last_snapshot_seq = snapshot_telemetry.last,
+        snapshot_seq_changes = snapshot_telemetry.changes,
+        "completed ordered escalation item paging across per-page atomic snapshots"
+    );
+    Ok(Some(CancellableItemScan {
+        rows,
+        pages,
+        candidate_rows_examined,
+        expired_rows_skipped,
+        first_snapshot_seq: snapshot_telemetry.first,
+        last_snapshot_seq: snapshot_telemetry.last,
+        snapshot_seq_changes: snapshot_telemetry.changes,
+        elapsed_ms: started.elapsed().as_millis(),
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct TerminalItemDeleteCandidate {
+    key: Vec<u8>,
+    escalation_id: String,
+    scanned_updated_at_unix_ms: u64,
+}
+
+fn current_terminal_delete_guard(
+    db: &Db,
+    candidate: &TerminalItemDeleteCandidate,
+) -> Result<Option<RevisionGuard>, ErrorData> {
+    let Some(revisioned) = db
+        .get_cf_revisioned(cf::CF_KV, &candidate.key)
+        .map_err(storage_error)?
+    else {
+        return Ok(None);
+    };
+    let mut item = decode_item(
+        &candidate.escalation_id,
+        live_revisioned_value(
+            &revisioned,
+            &format!("terminal escalation item {}", candidate.escalation_id),
+        )?,
+    )?;
+    if item.status.is_open() || item.updated_at_unix_ms != candidate.scanned_updated_at_unix_ms {
+        tracing::info!(
+            code = "ESCALATION_RETENTION_CANDIDATE_SUPERSEDED",
+            escalation_id = %candidate.escalation_id,
+            scanned_updated_at_unix_ms = candidate.scanned_updated_at_unix_ms,
+            latest_updated_at_unix_ms = item.updated_at_unix_ms,
+            latest_status = item.status.as_str(),
+            "terminal retention candidate changed before its guarded delete boundary and was not deleted"
+        );
+        return Ok(None);
+    }
+    item.updated_at_unix_ms = unix_time_ms_now();
+    let mut prerequisite_rows = linked_approval_terminal_rows(
+        db,
+        &item,
+        "linked_escalation_retention_prerequisite",
+        format!(
+            "linked escalation {} must have a terminal approval before item retention deletion",
+            item.escalation_id
+        ),
+    )?;
+    let approval_repaired = !prerequisite_rows.is_empty();
+    prerequisite_rows.extend(terminal_open_index_row(db, &item)?);
+    if !prerequisite_rows.is_empty() {
+        let outcome = write_item_and_audit_with_extra_rows_if_revision(
+            db,
+            &item,
+            "retention_prerequisite_repaired",
+            json!({
+                "approval_repaired": approval_repaired,
+                "open_index_repaired": true,
+            }),
+            prerequisite_rows,
+            revisioned.revision_sha256,
+        )?;
+        match outcome {
+            ItemWriteOutcome::Applied { committed_seq, .. } => {
+                tracing::info!(
+                    code = "ESCALATION_RETENTION_PREREQUISITE_REPAIRED",
+                    escalation_id = %item.escalation_id,
+                    approval_repaired,
+                    committed_seq,
+                    "terminal escalation retained for another sweep after atomically repairing linked approval/open-index prerequisites"
+                );
+            }
+            ItemWriteOutcome::Conflict { observed_seq, .. } => {
+                tracing::info!(
+                    code = "ESCALATION_RETENTION_PREREQUISITE_CONFLICT",
+                    escalation_id = %item.escalation_id,
+                    observed_seq,
+                    "terminal escalation changed while repairing deletion prerequisites and was not deleted"
+                );
+            }
+        }
+        return Ok(None);
+    }
+    Ok(Some(RevisionGuard::new(
+        candidate.key.clone(),
+        Some(revisioned.revision_sha256),
+    )))
+}
+
+fn delete_terminal_candidate_chunk(
+    db: &Db,
+    candidates: &[TerminalItemDeleteCandidate],
+    context: &str,
+    shutdown: Option<&CancellationToken>,
+) -> Result<Option<usize>, ErrorData> {
+    if shutdown.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
+    let mut pending = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(guard) = current_terminal_delete_guard(db, candidate)? {
+            pending.push((candidate.clone(), guard));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(Some(0));
+    }
+
+    for attempt in 1..=DELETE_REVISION_MAX_ATTEMPTS {
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(None);
+        }
+        let guards = pending
+            .iter()
+            .map(|(_candidate, guard)| guard.clone())
+            .collect::<Vec<_>>();
+        let keys = pending
+            .iter()
+            .map(|(candidate, _guard)| candidate.key.clone())
+            .collect::<Vec<_>>();
+        let outcome = db
+            .mutate_batch_if_revisions_pressure_bypass(
+                cf::CF_KV,
+                guards,
+                keys.iter().cloned(),
+                std::iter::empty::<(Vec<u8>, Vec<u8>)>(),
+            )
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("{context} failed to delete terminal rows: {error}"),
+                    format!("{context} failed to revision-guard terminal row deletion: {error}"),
                 )
             })?;
+        if outcome.applied {
+            if outcome.committed_revisions_sha256.len() != keys.len()
+                || outcome
+                    .committed_revisions_sha256
+                    .iter()
+                    .any(Option::is_some)
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "{context} returned invalid delete revision readback: keys={} revisions={} non_absent={}",
+                        keys.len(),
+                        outcome.committed_revisions_sha256.len(),
+                        outcome
+                            .committed_revisions_sha256
+                            .iter()
+                            .filter(|revision| revision.is_some())
+                            .count()
+                    ),
+                ));
+            }
+            for key in &keys {
+                if read_exact_row(db, key)?.is_some() {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "{context} guarded delete read back a live row: key={} committed_seq={}",
+                            hex_bytes(key),
+                            outcome.committed_seq
+                        ),
+                    ));
+                }
+            }
+            tracing::info!(
+                code = "ESCALATION_TERMINAL_DELETE_READBACK",
+                context,
+                committed_seq = outcome.committed_seq,
+                deleted_rows = keys.len(),
+                first_key = %keys.first().map_or_else(|| "none".to_owned(), |key| hex_bytes(key)),
+                last_key = %keys.last().map_or_else(|| "none".to_owned(), |key| hex_bytes(key)),
+                "readback=CF_KV every revision-guarded terminal row is absent"
+            );
+            return Ok(Some(keys.len()));
+        }
+
+        let conflict = outcome.conflict.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "{context} returned applied=false without revision conflict detail at attempt {attempt}"
+                ),
+            )
+        })?;
+        if conflict.guard_index >= pending.len()
+            || pending[conflict.guard_index].0.key != conflict.key
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "{context} returned out-of-contract conflict: guard_index={} pending={} conflict_key={}",
+                    conflict.guard_index,
+                    pending.len(),
+                    hex_bytes(&conflict.key)
+                ),
+            ));
+        }
+        let (candidate, _stale_guard) = pending.remove(conflict.guard_index);
+        if let Some(refreshed_guard) = current_terminal_delete_guard(db, &candidate)? {
+            pending.insert(conflict.guard_index, (candidate, refreshed_guard));
+        }
+        tracing::info!(
+            code = "ESCALATION_TERMINAL_DELETE_REVISION_RETRY",
+            context,
+            attempt,
+            max_attempts = DELETE_REVISION_MAX_ATTEMPTS,
+            conflict_guard_index = conflict.guard_index,
+            conflict_key = %hex_bytes(&conflict.key),
+            remaining_candidates = pending.len(),
+            "terminal retention lost a revision race; no row was deleted and the authoritative candidate set was refreshed"
+        );
+        if pending.is_empty() {
+            return Ok(Some(0));
+        }
+    }
+
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "{context} could not acquire a stable terminal-row revision set after {DELETE_REVISION_MAX_ATTEMPTS} attempts; inspect ESCALATION_TERMINAL_DELETE_REVISION_RETRY"
+        ),
+    ))
+}
+
+fn delete_terminal_candidates(
+    db: &Db,
+    candidates: &[TerminalItemDeleteCandidate],
+    context: &str,
+) -> Result<usize, ErrorData> {
+    let mut deleted = 0usize;
+    for chunk in candidates.chunks(DELETE_BATCH_ROWS) {
+        let chunk_deleted =
+            delete_terminal_candidate_chunk(db, chunk, context, None)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{context} non-cancellable delete returned cancellation"),
+                )
+            })?;
+        deleted = deleted.saturating_add(chunk_deleted);
     }
     Ok(deleted)
 }
 
-fn prune_terminal_item_rows(
+async fn delete_terminal_candidates_cancellable(
     db: &Db,
+    candidates: &[TerminalItemDeleteCandidate],
+    context: &str,
+    shutdown: &CancellationToken,
+) -> Result<Option<usize>, ErrorData> {
+    if shutdown.is_cancelled() {
+        return Ok(None);
+    }
+    let mut deleted = 0usize;
+    for (chunk_index, chunk) in candidates.chunks(DELETE_BATCH_ROWS).enumerate() {
+        let Some(chunk_deleted) =
+            delete_terminal_candidate_chunk(db, chunk, context, Some(shutdown))?
+        else {
+            tracing::info!(
+                code = "ESCALATION_DELETE_BATCHES_CANCELLED",
+                context,
+                deleted_rows = deleted,
+                pending_rows = candidates
+                    .len()
+                    .saturating_sub(chunk_index * DELETE_BATCH_ROWS),
+                delete_batch_rows = DELETE_BATCH_ROWS,
+                "stopping revision-guarded escalation row deletion between batches"
+            );
+            return Ok(None);
+        };
+        deleted = deleted.saturating_add(chunk_deleted);
+        if (chunk_index + 1) * DELETE_BATCH_ROWS < candidates.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(Some(deleted))
+}
+
+fn terminal_item_delete_keys(
     now_unix_ms: u64,
     rows: &[EscalationItemRow],
-) -> Result<usize, ErrorData> {
+) -> (Vec<TerminalItemDeleteCandidate>, usize) {
     let mut terminal = rows
         .iter()
         .filter(|row| !row.item.status.is_open())
-        .map(|row| (row.item.updated_at_unix_ms, row.key.clone()))
+        .map(|row| {
+            (
+                row.item.updated_at_unix_ms,
+                TerminalItemDeleteCandidate {
+                    key: row.key.clone(),
+                    escalation_id: row.item.escalation_id.clone(),
+                    scanned_updated_at_unix_ms: row.item.updated_at_unix_ms,
+                },
+            )
+        })
         .collect::<Vec<_>>();
-    terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.key.cmp(&b.1.key)));
 
     let mut delete = terminal
         .iter()
-        .filter(|(updated_at, _key)| {
+        .filter(|(updated_at, _candidate)| {
             updated_at.saturating_add(TERMINAL_ITEM_RETENTION_MS) <= now_unix_ms
         })
-        .map(|(_updated_at, key)| key.clone())
+        .map(|(_updated_at, candidate)| candidate.clone())
         .collect::<Vec<_>>();
 
     if terminal.len() > TERMINAL_ITEM_RETAIN_ROWS {
@@ -662,16 +1800,20 @@ fn prune_terminal_item_rows(
             terminal
                 .iter()
                 .take(over_cap)
-                .map(|(_updated_at, key)| key.clone()),
+                .map(|(_updated_at, candidate)| candidate.clone()),
         );
     }
+    delete.sort_by(|left, right| left.key.cmp(&right.key));
+    delete.dedup_by(|left, right| left.key == right.key);
+    (delete, terminal.len())
+}
 
-    let deleted = delete_keys(db, delete, "escalation terminal retention")?;
+fn log_terminal_item_prune(rows: &[EscalationItemRow], terminal_rows: usize, deleted: usize) {
     if deleted > 0 {
         tracing::info!(
             code = "ESCALATION_ITEM_RETENTION_PRUNED",
             scanned_rows = rows.len(),
-            terminal_rows = terminal.len(),
+            terminal_rows,
             deleted_rows = deleted,
             retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
             retention_ms = TERMINAL_ITEM_RETENTION_MS,
@@ -681,12 +1823,43 @@ fn prune_terminal_item_rows(
         tracing::warn!(
             code = "ESCALATION_ITEM_QUEUE_LARGE",
             scanned_rows = rows.len(),
-            terminal_rows = terminal.len(),
+            terminal_rows,
             retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
             "escalation item scan exceeded historical hard limit but continued"
         );
     }
+}
+
+fn prune_terminal_item_rows(
+    db: &Db,
+    now_unix_ms: u64,
+    rows: &[EscalationItemRow],
+) -> Result<usize, ErrorData> {
+    let (delete, terminal_rows) = terminal_item_delete_keys(now_unix_ms, rows);
+    let deleted = delete_terminal_candidates(db, &delete, "escalation terminal retention")?;
+    log_terminal_item_prune(rows, terminal_rows, deleted);
     Ok(deleted)
+}
+
+async fn prune_terminal_item_rows_cancellable(
+    db: &Db,
+    now_unix_ms: u64,
+    rows: &[EscalationItemRow],
+    shutdown: &CancellationToken,
+) -> Result<Option<usize>, ErrorData> {
+    let (delete, terminal_rows) = terminal_item_delete_keys(now_unix_ms, rows);
+    let Some(deleted) = delete_terminal_candidates_cancellable(
+        db,
+        &delete,
+        "escalation terminal retention",
+        shutdown,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    log_terminal_item_prune(rows, terminal_rows, deleted);
+    Ok(Some(deleted))
 }
 
 fn prune_terminal_items(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
@@ -770,40 +1943,130 @@ fn write_orphan_toast_cleanup_audit(
 // Policy storage
 // ---------------------------------------------------------------------------
 
-fn load_policy(db: &Db) -> Result<EscalationPolicy, ErrorData> {
-    match read_exact_row(db, CONFIG_KEY.as_bytes())? {
-        Some(value) => decode_json::<EscalationPolicy>(&value).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("escalation policy decode failed: {error}"),
-            )
-        }),
-        None => Ok(EscalationPolicy::default()),
-    }
+#[derive(Clone, Debug)]
+struct RevisionedEscalationPolicy {
+    policy: EscalationPolicy,
+    revision_sha256: Option<[u8; 32]>,
 }
 
-fn store_policy(db: &Db, policy: &EscalationPolicy) -> Result<(), ErrorData> {
+fn load_policy_revisioned(db: &Db) -> Result<RevisionedEscalationPolicy, ErrorData> {
+    let key = CONFIG_KEY.as_bytes();
+    let Some(revisioned) = db
+        .get_cf_revisioned(cf::CF_KV, key)
+        .map_err(storage_error)?
+    else {
+        return Ok(RevisionedEscalationPolicy {
+            policy: EscalationPolicy::default(),
+            revision_sha256: None,
+        });
+    };
+    let value = live_revisioned_value(&revisioned, "escalation policy")?;
+    let policy = decode_json::<EscalationPolicy>(value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("escalation policy decode failed: {error}"),
+        )
+    })?;
+    Ok(RevisionedEscalationPolicy {
+        policy,
+        revision_sha256: Some(revisioned.revision_sha256),
+    })
+}
+
+fn load_policy(db: &Db) -> Result<EscalationPolicy, ErrorData> {
+    load_policy_revisioned(db).map(|revisioned| revisioned.policy)
+}
+
+fn store_policy(
+    db: &Db,
+    policy: &EscalationPolicy,
+    expected_revision_sha256: Option<[u8; 32]>,
+) -> Result<EscalationPolicy, ErrorData> {
     let value = encode_json(policy).map_err(|error| {
         mcp_error(
             error.code(),
             format!("escalation policy encode failed: {error}"),
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(CONFIG_KEY.as_bytes().to_vec(), value)])
+    let key = CONFIG_KEY.as_bytes().to_vec();
+    let outcome = db
+        .mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [RevisionGuard::new(key.clone(), expected_revision_sha256)],
+            std::iter::empty::<Vec<u8>>(),
+            [(key.clone(), value.clone())],
+        )
         .map_err(storage_error)?;
-    read_exact_row(db, CONFIG_KEY.as_bytes())?.ok_or_else(|| {
+    if !outcome.applied {
+        let conflict = outcome.conflict.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                "escalation policy CAS reported applied=false without conflict detail",
+            )
+        })?;
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "escalation policy changed concurrently and was not overwritten: observed_seq={} expected_revision={} actual_revision={}; reread escalation_config_get and retry the intended update",
+                outcome.committed_seq,
+                expected_revision_sha256
+                    .as_ref()
+                    .map_or_else(|| "absent".to_owned(), |revision| hex_bytes(revision)),
+                conflict
+                    .actual_revision_sha256
+                    .as_ref()
+                    .map_or_else(|| "absent".to_owned(), |revision| hex_bytes(revision))
+            ),
+        ));
+    }
+    let committed_revision = outcome.committed_revisions_sha256[0].ok_or_else(|| {
         mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "escalation policy row absent immediately after write",
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "escalation policy CAS committed without a row revision: committed_seq={}",
+                outcome.committed_seq
+            ),
         )
     })?;
-    Ok(())
+    let readback = db
+        .get_cf_revisioned(cf::CF_KV, &key)
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "escalation policy row absent immediately after guarded write",
+            )
+        })?;
+    let readback_value = live_revisioned_value(&readback, "escalation policy readback")?;
+    if readback.revision_sha256 == committed_revision && readback_value != value.as_slice() {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            "escalation policy revision matched but bytes differed immediately after write",
+        ));
+    }
+    let authoritative_policy =
+        decode_json::<EscalationPolicy>(readback_value).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("authoritative escalation policy readback decode failed: {error}"),
+            )
+        })?;
+    if readback.revision_sha256 != committed_revision {
+        tracing::info!(
+            code = "ESCALATION_POLICY_READBACK_SUPERSEDED",
+            committed_seq = outcome.committed_seq,
+            committed_revision = %hex_bytes(&committed_revision),
+            latest_revision = %hex_bytes(&readback.revision_sha256),
+            "separate policy readback decoded a newer valid policy revision; returning authoritative state"
+        );
+    }
+    Ok(authoritative_policy)
 }
 
 fn approval_rows_for_opened_escalation(
     item: &EscalationItem,
     now_unix_ms: u64,
-) -> Result<CfKvRows, ErrorData> {
+) -> Result<GuardedExtraRows, ErrorData> {
     let payload = json!({
         "schema": "synapse.escalation.approval.v1",
         "escalation_id": item.escalation_id,
@@ -895,13 +2158,17 @@ fn approval_rows_for_opened_escalation(
             ),
         )
     })?;
-    Ok(vec![
-        (approval_item_key(&item.approval_id), approval_item_value),
-        (
-            approval_audit_key(&item.approval_id, now_unix_ms, &approval_event_id),
-            approval_audit_value,
-        ),
-    ])
+    let approval_key = approval_item_key(&item.approval_id);
+    Ok(GuardedExtraRows {
+        guards: vec![RevisionGuard::new(approval_key.clone(), None)],
+        rows: vec![
+            (approval_key, approval_item_value),
+            (
+                approval_audit_key(&item.approval_id, now_unix_ms, &approval_event_id),
+                approval_audit_value,
+            ),
+        ],
+    })
 }
 
 fn approval_status_is_terminal(status: ApprovalStatus) -> bool {
@@ -916,24 +2183,33 @@ fn linked_approval_terminal_rows(
     item: &EscalationItem,
     event: &str,
     note: String,
-) -> Result<CfKvRows, ErrorData> {
+) -> Result<GuardedExtraRows, ErrorData> {
     let approval_key = approval_item_key(&item.approval_id);
-    let Some(value) = read_exact_row(db, &approval_key)? else {
-        return Ok(Vec::new());
-    };
-    let mut approval = decode_json::<ApprovalItemRecord>(&value).map_err(|error| {
-        mcp_error(
-            error.code(),
+    let Some(revisioned) = db
+        .get_cf_revisioned(cf::CF_KV, &approval_key)
+        .map_err(storage_error)?
+    else {
+        if item.approval_suppressed_reason.is_some() {
+            return Ok(GuardedExtraRows::default());
+        }
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
             format!(
-                "linked approval item decode failed for escalation {} approval {}: {error}",
-                item.escalation_id, item.approval_id
+                "linked approval row is physically absent for escalation {}: approval_id={} key={}",
+                item.escalation_id,
+                item.approval_id,
+                hex_bytes(&approval_key)
             ),
-        )
-    })?;
-    if approval.kind != ApprovalKind::AgentEscalation
-        || approval_status_is_terminal(approval.status)
-    {
-        return Ok(Vec::new());
+        ));
+    };
+    let approval_value = live_revisioned_value(
+        &revisioned,
+        &format!("linked approval {}", item.approval_id),
+    )?;
+    let mut approval = validate_linked_approval_item_identity(&approval_key, approval_value)?;
+    validate_linked_approval_for_escalation(item, &approval)?;
+    if approval_status_is_terminal(approval.status) {
+        return Ok(GuardedExtraRows::default());
     }
     let before_status = approval.status;
     approval.status = ApprovalStatus::Ignored;
@@ -978,10 +2254,13 @@ fn linked_approval_terminal_rows(
             ),
         )
     })?;
-    Ok(vec![
-        (approval_key, approval_value),
-        (audit_key, audit_value),
-    ])
+    Ok(GuardedExtraRows {
+        guards: vec![RevisionGuard::new(
+            approval_key.clone(),
+            Some(revisioned.revision_sha256),
+        )],
+        rows: vec![(approval_key, approval_value), (audit_key, audit_value)],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,38 +2321,80 @@ fn note_transition_inner(
     //    differs from the new state. Leaving the attention state (resume/finish)
     //    or transitioning to a different attention state supersedes the old one.
     let mut superseded = false;
-    for mut item in open_items_for_anchor(db, &transition.anchor)? {
-        if item.attention_state == new_state {
-            continue;
+    for scanned_item in open_items_for_anchor(db, &transition.anchor)? {
+        let mut resolved_or_superseded = false;
+        for attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
+            let Some(mut current) = read_item_revisioned(db, &scanned_item.escalation_id)? else {
+                resolved_or_superseded = true;
+                break;
+            };
+            if !current.item.status.is_open()
+                || current.item.anchor != transition.anchor
+                || current.item.attention_state == new_state
+            {
+                resolved_or_superseded = true;
+                break;
+            }
+            let item = &mut current.item;
+            item.status = EscalationStatus::Resolved;
+            item.updated_at_unix_ms = now_unix_ms;
+            item.next_escalate_at_unix_ms = None;
+            item.closed_reason = Some(format!("state_change:{new_state}"));
+            let mut approval_rows = linked_approval_terminal_rows(
+                db,
+                item,
+                "linked_escalation_resolved",
+                format!(
+                    "linked escalation {} resolved by state_change:{new_state}",
+                    item.escalation_id
+                ),
+            )?;
+            approval_rows.extend(terminal_open_index_row(db, item)?);
+            match write_item_and_audit_with_extra_rows_if_revision(
+                db,
+                item,
+                "resolved",
+                json!({ "reason": "state_change", "new_state": new_state }),
+                approval_rows,
+                current.revision_sha256,
+            )? {
+                ItemWriteOutcome::Applied { committed_seq, .. } => {
+                    resolved_or_superseded = true;
+                    superseded = true;
+                    tracing::info!(
+                        code = "ESCALATION_RESOLVED",
+                        escalation_id = %item.escalation_id,
+                        anchor = %item.anchor,
+                        new_state,
+                        committed_seq,
+                        revision_attempt = attempt,
+                        "readback=CF_KV escalation resolved by state change"
+                    );
+                    break;
+                }
+                ItemWriteOutcome::Conflict { observed_seq, .. } => {
+                    tracing::info!(
+                        code = "ESCALATION_TRANSITION_REVISION_RETRY",
+                        escalation_id = %item.escalation_id,
+                        anchor = %item.anchor,
+                        new_state,
+                        attempt,
+                        max_attempts = ACK_REVISION_MAX_ATTEMPTS,
+                        observed_seq,
+                        "state-transition resolution lost a revision race; rereading authoritative escalation and linked approval"
+                    );
+                }
+            }
         }
-        item.status = EscalationStatus::Resolved;
-        item.updated_at_unix_ms = now_unix_ms;
-        item.next_escalate_at_unix_ms = None;
-        item.closed_reason = Some(format!("state_change:{new_state}"));
-        let approval_rows = linked_approval_terminal_rows(
-            db,
-            &item,
-            "linked_escalation_resolved",
-            format!(
-                "linked escalation {} resolved by state_change:{new_state}",
-                item.escalation_id
-            ),
-        )?;
-        write_item_and_audit_with_extra_rows(
-            db,
-            &item,
-            "resolved",
-            json!({ "reason": "state_change", "new_state": new_state }),
-            approval_rows,
-        )?;
-        superseded = true;
-        tracing::info!(
-            code = "ESCALATION_RESOLVED",
-            escalation_id = %item.escalation_id,
-            anchor = %item.anchor,
-            new_state,
-            "readback=CF_KV escalation resolved by state change"
-        );
+        if !resolved_or_superseded {
+            return Err(mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "escalation {} remained open for obsolete state after {ACK_REVISION_MAX_ATTEMPTS} revision attempts; inspect ESCALATION_TRANSITION_REVISION_RETRY and competing writers",
+                    scanned_item.escalation_id
+                ),
+            ));
+        }
     }
 
     // 2. Open a new escalation when the new state is attention-worthy and no
@@ -1117,6 +2438,13 @@ fn open_escalation(
     policy: &EscalationPolicy,
     now_unix_ms: u64,
 ) -> Result<EscalationItem, ErrorData> {
+    let prior_index = read_open_index(db, &transition.anchor, transition.state_to.as_str())?;
+    if let Some(index) = &prior_index
+        && index.record.is_open
+    {
+        return indexed_open_item(db, index);
+    }
+    let expected_index_revision = prior_index.as_ref().map(|index| index.revision_sha256);
     let escalation_id = format!("{ESCALATION_ID_PREFIX}{}", Uuid::now_v7().simple());
     let approval_id = format!("apr1-{}", Uuid::now_v7().simple());
     let in_quiet = quiet_now(policy, current_local_minute_of_day());
@@ -1167,12 +2495,14 @@ fn open_escalation(
             .map(|reason| format!("policy:{reason}")),
         closed_reason: None,
     };
-    let approval_rows = if item.approval_suppressed_reason.is_some() {
-        Vec::new()
+    let mut extra_rows = if item.approval_suppressed_reason.is_some() {
+        GuardedExtraRows::default()
     } else {
         approval_rows_for_opened_escalation(&item, now_unix_ms)?
     };
-    write_item_and_audit_with_extra_rows(
+    let approval_row_written = !extra_rows.is_empty();
+    extra_rows.extend(open_index_row(&item, true, expected_index_revision)?);
+    let create_outcome = create_item_and_audit_with_extra_rows(
         db,
         &item,
         "opened",
@@ -1183,10 +2513,45 @@ fn open_escalation(
             "policy_suppressed_reason": policy_suppressed_reason,
             "configured_webhooks": policy.webhooks.len(),
             "approval_id": item.approval_id,
-            "approval_row_written": !approval_rows.is_empty(),
+            "approval_row_written": approval_row_written,
         }),
-        approval_rows,
+        extra_rows,
     )?;
+    if let ItemWriteOutcome::Conflict {
+        observed_seq,
+        actual_revision_sha256,
+    } = create_outcome
+    {
+        let winner = read_open_index(
+            db,
+            &transition.anchor,
+            transition.state_to.as_str(),
+        )?
+        .filter(|index| index.record.is_open)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "escalation create conflicted but no authoritative open-index winner exists: candidate_escalation_id={} observed_seq={observed_seq} actual_revision={}",
+                    item.escalation_id,
+                    actual_revision_sha256
+                        .as_ref()
+                        .map_or_else(|| "absent".to_owned(), |revision| hex_bytes(revision))
+                ),
+            )
+        })?;
+        let winner = indexed_open_item(db, &winner)?;
+        tracing::info!(
+            code = "ESCALATION_OPEN_RACE_COALESCED",
+            candidate_escalation_id = %item.escalation_id,
+            winner_escalation_id = %winner.escalation_id,
+            anchor = %winner.anchor,
+            attention_state = %winner.attention_state,
+            observed_seq,
+            "deterministic open-index CAS prevented a duplicate escalation"
+        );
+        return Ok(winner);
+    }
     tracing::info!(
         code = "ESCALATION_OPENED",
         escalation_id = %item.escalation_id,
@@ -1263,6 +2628,12 @@ fn build_context(
 // Acknowledgment
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+struct AckEscalationOutcome {
+    escalation: EscalationItem,
+    newly_acked: bool,
+}
+
 /// Acknowledges an escalation from any surface, stopping the off-machine ladder
 /// while leaving the escalation open until the agent leaves the attention
 /// state. Idempotent: acking an already-acked/closed escalation reports the
@@ -1273,30 +2644,83 @@ fn ack_escalation(
     via: &str,
     note: Option<&str>,
     now_unix_ms: u64,
-) -> Result<EscalationItem, ErrorData> {
-    let mut item = read_item(db, escalation_id)?.ok_or_else(|| {
-        mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("escalation {escalation_id} not found"),
-        )
-    })?;
-    if item.status != EscalationStatus::Pending {
-        // Already acked/resolved/expired — honest idempotent report, no re-fire.
-        return Ok(item);
+) -> Result<AckEscalationOutcome, ErrorData> {
+    for attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
+        let mut current = read_item_revisioned(db, escalation_id)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("escalation {escalation_id} not found"),
+            )
+        })?;
+        if current.item.status != EscalationStatus::Pending {
+            // Already acked/resolved/expired — honest idempotent report.
+            return Ok(AckEscalationOutcome {
+                escalation: current.item,
+                newly_acked: false,
+            });
+        }
+        current.item.status = EscalationStatus::Acked;
+        current.item.updated_at_unix_ms = now_unix_ms;
+        current.item.acked_at_unix_ms = Some(now_unix_ms);
+        current.item.acked_via = Some(via.to_owned());
+        current.item.next_escalate_at_unix_ms = None;
+        match write_item_and_audit_if_revision(
+            db,
+            &current.item,
+            "acked",
+            json!({ "via": via, "note": note }),
+            current.revision_sha256,
+        )? {
+            ItemWriteOutcome::Applied { committed_seq, .. } => {
+                let readback = read_item(db, escalation_id)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "acknowledged escalation {escalation_id} disappeared after committed_seq={committed_seq}"
+                        ),
+                    )
+                })?;
+                if readback.status == EscalationStatus::Pending {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "acknowledged escalation {escalation_id} read back pending after committed_seq={committed_seq}"
+                        ),
+                    ));
+                }
+                tracing::info!(
+                    code = "ESCALATION_ACKED",
+                    escalation_id,
+                    via,
+                    committed_seq,
+                    ack_revision_attempt = attempt,
+                    readback_status = readback.status.as_str(),
+                    "readback=CF_KV escalation acknowledged; ladder stopped"
+                );
+                return Ok(AckEscalationOutcome {
+                    escalation: readback,
+                    newly_acked: true,
+                });
+            }
+            ItemWriteOutcome::Conflict { observed_seq, .. } => {
+                tracing::info!(
+                    code = "ESCALATION_ACK_REVISION_RETRY",
+                    escalation_id,
+                    via,
+                    attempt,
+                    max_attempts = ACK_REVISION_MAX_ATTEMPTS,
+                    observed_seq,
+                    "acknowledgment lost an optimistic revision race; rereading authoritative item state"
+                );
+            }
+        }
     }
-    item.status = EscalationStatus::Acked;
-    item.updated_at_unix_ms = now_unix_ms;
-    item.acked_at_unix_ms = Some(now_unix_ms);
-    item.acked_via = Some(via.to_owned());
-    item.next_escalate_at_unix_ms = None;
-    write_item_and_audit(db, &item, "acked", json!({ "via": via, "note": note }))?;
-    tracing::info!(
-        code = "ESCALATION_ACKED",
-        escalation_id = %item.escalation_id,
-        via,
-        "readback=CF_KV escalation acknowledged; ladder stopped"
-    );
-    Ok(item)
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "escalation {escalation_id} acknowledgment could not acquire a stable revision after {ACK_REVISION_MAX_ATTEMPTS} attempts; inspect ESCALATION_ACK_REVISION_RETRY and competing item writers"
+        ),
+    ))
 }
 
 /// Bridges the durable approval queue (#867) back to the escalation ladder. Any
@@ -1343,24 +2767,35 @@ pub(crate) fn ack_from_approval_item_decision(
                 ),
             )
         })?;
+    let linked_item = read_item(db, escalation_id)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "agent escalation approval {} points to missing escalation {}",
+                approval.approval_id, escalation_id
+            ),
+        )
+    })?;
+    validate_linked_approval_for_escalation(&linked_item, approval)?;
     let via = format!("approval_decide:{decision}");
-    let item = ack_escalation(db, escalation_id, &via, note, now_unix_ms)?;
+    let outcome = ack_escalation(db, escalation_id, &via, note, now_unix_ms)?;
     tracing::info!(
         code = "ESCALATION_ACKED_FROM_APPROVAL",
         escalation_id,
         approval_id = %approval.approval_id,
         decision,
         by_session,
+        newly_acked = outcome.newly_acked,
         "approval decision acknowledged escalation and stopped the ladder"
     );
-    Ok(Some(item))
+    Ok(Some(outcome.escalation))
 }
 
 // ---------------------------------------------------------------------------
 // Worker: Tier 0 toast + Tier 1 webhook ladder + TTL expiry (async)
 // ---------------------------------------------------------------------------
 
-/// Outcome of one [`process_pending`] sweep, for worker logs and tests.
+/// Outcome of one [`process_pending`] sweep for structured worker readback.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProcessReport {
     pub tier0_fired: usize,
@@ -1381,23 +2816,129 @@ pub(crate) struct ProcessReport {
 pub(crate) async fn process_pending(
     db: &Arc<Db>,
     now_unix_ms: u64,
-) -> Result<ProcessReport, ErrorData> {
+    shutdown: &CancellationToken,
+) -> Result<Option<ProcessReport>, ErrorData> {
+    if shutdown.is_cancelled() {
+        return Ok(None);
+    }
+    let sweep_started = Instant::now();
     let mut report = ProcessReport::default();
-    let rows = scan_item_rows(db)?;
-    let pruned = prune_terminal_item_rows(db, now_unix_ms, &rows)?;
-    let items = if pruned > 0 {
-        scan_items(db)?
+    let Some(scan) = scan_item_rows_cancellable(db, shutdown).await? else {
+        tracing::info!(
+            code = "ESCALATION_WORKER_STOPPED",
+            stage = "during_item_scan",
+            elapsed_ms = sweep_started.elapsed().as_millis(),
+            "stopping escalation worker at candidate-page cancellation checkpoint"
+        );
+        return Ok(None);
+    };
+    if scan.elapsed_ms >= WORKER_SLOW_SCAN_LOG_MS {
+        tracing::warn!(
+            code = "ESCALATION_ITEM_SCAN_SLOW",
+            scan_elapsed_ms = scan.elapsed_ms,
+            scan_rows = scan.rows.len(),
+            scan_pages = scan.pages,
+            candidate_rows_examined = scan.candidate_rows_examined,
+            expired_rows_skipped = scan.expired_rows_skipped,
+            first_snapshot_seq = scan.first_snapshot_seq,
+            last_snapshot_seq = scan.last_snapshot_seq,
+            snapshot_seq_changes = scan.snapshot_seq_changes,
+            requested_candidate_rows = SCAN_CHUNK_ROWS,
+            item_key_len = ITEM_KEY_LEN,
+            "candidate-bounded escalation item scan exceeded the latency budget"
+        );
+    }
+    let rows = scan.rows;
+    if shutdown.is_cancelled() {
+        tracing::info!(
+            code = "ESCALATION_WORKER_STOPPED",
+            stage = "after_item_scan",
+            scan_rows = rows.len(),
+            elapsed_ms = sweep_started.elapsed().as_millis(),
+            "stopping escalation worker at cooperative cancellation checkpoint"
+        );
+        return Ok(None);
+    }
+    let Some(pruned) =
+        prune_terminal_item_rows_cancellable(db, now_unix_ms, &rows, shutdown).await?
+    else {
+        tracing::info!(
+            code = "ESCALATION_WORKER_STOPPED",
+            stage = "during_terminal_prune",
+            scan_rows = rows.len(),
+            elapsed_ms = sweep_started.elapsed().as_millis(),
+            "stopping escalation worker at terminal-prune batch cancellation checkpoint"
+        );
+        return Ok(None);
+    };
+    if shutdown.is_cancelled() {
+        tracing::info!(
+            code = "ESCALATION_WORKER_STOPPED",
+            stage = "after_terminal_prune",
+            scan_rows = rows.len(),
+            pruned_rows = pruned,
+            elapsed_ms = sweep_started.elapsed().as_millis(),
+            "stopping escalation worker at cooperative cancellation checkpoint"
+        );
+        return Ok(None);
+    }
+    let items: Vec<EscalationItem> = if pruned > 0 {
+        let Some(rescan) = scan_item_rows_cancellable(db, shutdown).await? else {
+            tracing::info!(
+                code = "ESCALATION_WORKER_STOPPED",
+                stage = "during_post_prune_rescan",
+                pruned_rows = pruned,
+                elapsed_ms = sweep_started.elapsed().as_millis(),
+                "stopping escalation worker at post-prune page cancellation checkpoint"
+            );
+            return Ok(None);
+        };
+        rescan.rows.into_iter().map(|row| row.item).collect()
     } else {
         rows.into_iter().map(|row| row.item).collect()
     };
-    let terminal_agent_reads: Vec<AgentStateRead> = super::agent_state::reads(now_unix_ms)
-        .into_iter()
-        .filter(|read| read.state == AgentLifecycleState::Dead)
-        .collect();
+    if shutdown.is_cancelled() {
+        tracing::info!(
+            code = "ESCALATION_WORKER_STOPPED",
+            stage = "after_item_materialization",
+            scan_rows = items.len(),
+            elapsed_ms = sweep_started.elapsed().as_millis(),
+            "stopping escalation worker at cooperative cancellation checkpoint"
+        );
+        return Ok(None);
+    }
+    let authoritative_agent_reads = super::agent_state::reads(now_unix_ms);
     report.scanned = items.len();
-    for mut item in items {
+    for (item_index, scanned_item) in items.into_iter().enumerate() {
+        if item_index % WORKER_COOPERATIVE_YIELD_ROWS == 0 {
+            tokio::task::yield_now().await;
+        }
+        if shutdown.is_cancelled() {
+            tracing::info!(
+                code = "ESCALATION_WORKER_STOPPED",
+                stage = "before_item",
+                item_index,
+                scan_rows = report.scanned,
+                elapsed_ms = sweep_started.elapsed().as_millis(),
+                "stopping escalation worker at cooperative cancellation checkpoint"
+            );
+            return Ok(None);
+        }
+        let Some(current) = read_item_revisioned(db, &scanned_item.escalation_id)? else {
+            tracing::debug!(
+                code = "ESCALATION_WORKER_ITEM_DISAPPEARED",
+                escalation_id = %scanned_item.escalation_id,
+                item_index,
+                "scanned escalation item was removed before its point-read processing boundary"
+            );
+            continue;
+        };
+        let RevisionedEscalationItem {
+            mut item,
+            revision_sha256: mut item_revision_sha256,
+        } = current;
         if !item.status.is_open() {
-            if remove_tier0_if_terminal(db, &mut item).await? {
+            if remove_tier0_if_terminal(db, &mut item, &mut item_revision_sha256).await? {
                 report.tier0_removed += 1;
             } else if tier0_removal_failed(&item) {
                 report.tier0_remove_failed += 1;
@@ -1406,7 +2947,7 @@ pub(crate) async fn process_pending(
                 item.status,
                 EscalationStatus::Resolved | EscalationStatus::Expired
             ) {
-                let approval_rows = linked_approval_terminal_rows(
+                let mut terminal_rows = linked_approval_terminal_rows(
                     db,
                     &item,
                     "linked_escalation_already_closed",
@@ -1416,9 +2957,11 @@ pub(crate) async fn process_pending(
                         item.status.as_str()
                     ),
                 )?;
-                if !approval_rows.is_empty() {
+                let approval_closed = !terminal_rows.is_empty();
+                terminal_rows.extend(terminal_open_index_row(db, &item)?);
+                if !terminal_rows.is_empty() {
                     item.updated_at_unix_ms = now_unix_ms;
-                    write_item_and_audit_with_extra_rows(
+                    let outcome = write_item_and_audit_with_extra_rows_if_revision(
                         db,
                         &item,
                         "linked_approval_closed",
@@ -1427,58 +2970,84 @@ pub(crate) async fn process_pending(
                             "status": item.status.as_str(),
                             "approval_id": &item.approval_id,
                         }),
-                        approval_rows,
+                        terminal_rows,
+                        item_revision_sha256,
                     )?;
-                    report.linked_approvals_closed += 1;
+                    if accept_applied_item_revision(outcome, &mut item_revision_sha256).is_none() {
+                        continue;
+                    }
+                    if approval_closed {
+                        report.linked_approvals_closed += 1;
+                    }
                 }
             }
             continue;
         }
-        if item.status == EscalationStatus::Acked {
-            if remove_tier0_if_terminal(db, &mut item).await? {
+        if let Some(agent_state) =
+            authoritative_agent_read_for_item(&authoritative_agent_reads, &item)
+            && (agent_state.state == AgentLifecycleState::Dead
+                || agent_state.state.as_str() != item.attention_state)
+        {
+            item.status = EscalationStatus::Resolved;
+            item.updated_at_unix_ms = now_unix_ms;
+            item.next_escalate_at_unix_ms = None;
+            let authoritative_state = agent_state.state.as_str();
+            let reason = agent_state
+                .reason_code
+                .as_deref()
+                .unwrap_or("state_changed");
+            item.closed_reason = Some(format!(
+                "authoritative_agent_state:{authoritative_state}:{reason}"
+            ));
+            let mut approval_rows = linked_approval_terminal_rows(
+                db,
+                &item,
+                "linked_escalation_resolved",
+                format!(
+                    "linked escalation {} resolved because authoritative agent state is {authoritative_state}:{reason}",
+                    item.escalation_id,
+                ),
+            )?;
+            let approval_closed = !approval_rows.is_empty();
+            approval_rows.extend(terminal_open_index_row(db, &item)?);
+            let outcome = write_item_and_audit_with_extra_rows_if_revision(
+                db,
+                &item,
+                "resolved",
+                json!({
+                    "reason": "authoritative_agent_state",
+                    "agent_state": agent_state,
+                }),
+                approval_rows,
+                item_revision_sha256,
+            )?;
+            let Some(committed_seq) =
+                accept_applied_item_revision(outcome, &mut item_revision_sha256)
+            else {
+                continue;
+            };
+            if approval_closed {
+                report.linked_approvals_closed += 1;
+            }
+            report.terminal_resolved += 1;
+            tracing::info!(
+                code = "ESCALATION_RESOLVED",
+                escalation_id = %item.escalation_id,
+                anchor = %item.anchor,
+                authoritative_state,
+                reason,
+                committed_seq,
+                "readback=CF_KV escalation resolved because its attention state is no longer authoritative"
+            );
+            if remove_tier0_if_terminal(db, &mut item, &mut item_revision_sha256).await? {
                 report.tier0_removed += 1;
             } else if tier0_removal_failed(&item) {
                 report.tier0_remove_failed += 1;
             }
             continue;
         }
-        if let Some(agent_state) = terminal_agent_read_for_item(&terminal_agent_reads, &item) {
-            item.status = EscalationStatus::Resolved;
-            item.updated_at_unix_ms = now_unix_ms;
-            item.next_escalate_at_unix_ms = None;
-            let reason = agent_state.reason_code.as_deref().unwrap_or("dead");
-            item.closed_reason = Some(format!("terminal_agent_state:dead:{reason}"));
-            let approval_rows = linked_approval_terminal_rows(
-                db,
-                &item,
-                "linked_escalation_resolved",
-                format!(
-                    "linked escalation {} resolved because anchor is terminal dead:{reason}",
-                    item.escalation_id
-                ),
-            )?;
-            if !approval_rows.is_empty() {
-                report.linked_approvals_closed += 1;
-            }
-            write_item_and_audit_with_extra_rows(
-                db,
-                &item,
-                "resolved",
-                json!({
-                    "reason": "terminal_agent_state",
-                    "agent_state": agent_state,
-                }),
-                approval_rows,
-            )?;
-            report.terminal_resolved += 1;
-            tracing::info!(
-                code = "ESCALATION_RESOLVED",
-                escalation_id = %item.escalation_id,
-                anchor = %item.anchor,
-                reason,
-                "readback=CF_KV escalation resolved because anchor is terminal"
-            );
-            if remove_tier0_if_terminal(db, &mut item).await? {
+        if item.status == EscalationStatus::Acked {
+            if remove_tier0_if_terminal(db, &mut item, &mut item_revision_sha256).await? {
                 report.tier0_removed += 1;
             } else if tier0_removal_failed(&item) {
                 report.tier0_remove_failed += 1;
@@ -1491,29 +3060,38 @@ pub(crate) async fn process_pending(
             item.updated_at_unix_ms = now_unix_ms;
             item.next_escalate_at_unix_ms = None;
             item.closed_reason = Some("ttl_expired".to_owned());
-            let approval_rows = linked_approval_terminal_rows(
+            let mut approval_rows = linked_approval_terminal_rows(
                 db,
                 &item,
                 "linked_escalation_expired",
                 format!("linked escalation {} expired by ttl", item.escalation_id),
             )?;
-            if !approval_rows.is_empty() {
-                report.linked_approvals_closed += 1;
-            }
-            write_item_and_audit_with_extra_rows(
+            let approval_closed = !approval_rows.is_empty();
+            approval_rows.extend(terminal_open_index_row(db, &item)?);
+            let outcome = write_item_and_audit_with_extra_rows_if_revision(
                 db,
                 &item,
                 "expired",
                 json!({ "ttl_ms": item.expires_at_unix_ms }),
                 approval_rows,
+                item_revision_sha256,
             )?;
+            let Some(committed_seq) =
+                accept_applied_item_revision(outcome, &mut item_revision_sha256)
+            else {
+                continue;
+            };
+            if approval_closed {
+                report.linked_approvals_closed += 1;
+            }
             report.expired += 1;
             tracing::warn!(
                 code = "ESCALATION_EXPIRED",
                 escalation_id = %item.escalation_id,
+                committed_seq,
                 "readback=CF_KV escalation expired with no acknowledgment"
             );
-            if remove_tier0_if_terminal(db, &mut item).await? {
+            if remove_tier0_if_terminal(db, &mut item, &mut item_revision_sha256).await? {
                 report.tier0_removed += 1;
             } else if tier0_removal_failed(&item) {
                 report.tier0_remove_failed += 1;
@@ -1529,12 +3107,21 @@ pub(crate) async fn process_pending(
                 Ok(()) => {
                     item.tier0_fired = true;
                     item.updated_at_unix_ms = now_unix_ms;
-                    write_item_and_audit(
+                    let outcome = write_item_and_audit_if_revision(
                         db,
                         &item,
                         "tier0_toast_fired",
                         json!({ "suppress_popup": item.tier0_quiet_digest }),
+                        item_revision_sha256,
                     )?;
+                    if accept_applied_item_revision(outcome, &mut item_revision_sha256).is_none() {
+                        tracing::warn!(
+                            code = "ESCALATION_TIER0_RESULT_REVISION_CONFLICT",
+                            escalation_id = %item.escalation_id,
+                            "toast completed after authoritative item state changed; stale state was not written and the next sweep will reconcile removal"
+                        );
+                        continue;
+                    }
                     report.tier0_fired += 1;
                     dirty = false; // already persisted
                 }
@@ -1557,6 +3144,19 @@ pub(crate) async fn process_pending(
             && let Some(due_at) = item.next_escalate_at_unix_ms
             && now_unix_ms >= due_at
         {
+            let Some(latest) = read_item_revisioned(db, &item.escalation_id)? else {
+                continue;
+            };
+            item = latest.item;
+            item_revision_sha256 = latest.revision_sha256;
+            if item.status != EscalationStatus::Pending
+                || !item.tier1_eligible
+                || item
+                    .next_escalate_at_unix_ms
+                    .is_none_or(|due_at| now_unix_ms < due_at)
+            {
+                continue;
+            }
             let policy = load_policy(db)?;
             let index = item.ladder_index as usize;
             if let Some(channel) = policy.webhooks.get(index).cloned() {
@@ -1565,11 +3165,7 @@ pub(crate) async fn process_pending(
                 let attempt =
                     deliver_webhook(&channel, &item, ladder_index, attempt_number, now_unix_ms)
                         .await;
-                if attempt.ok {
-                    report.tier1_fired += 1;
-                } else {
-                    report.tier1_failed += 1;
-                }
+                let attempt_ok = attempt.ok;
                 let policy_window_ms = policy.window_for(item.severity);
                 let retry_backoff_ms = (!attempt.ok
                     && attempt_number < WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL)
@@ -1601,7 +3197,29 @@ pub(crate) async fn process_pending(
                         ((item.ladder_index as usize) < policy.webhooks.len())
                             .then_some(now_unix_ms.saturating_add(policy_window_ms))
                     });
-                write_item_and_audit(db, &item, "tier1_channel_attempt", event_detail)?;
+                let outcome = write_item_and_audit_if_revision(
+                    db,
+                    &item,
+                    "tier1_channel_attempt",
+                    event_detail,
+                    item_revision_sha256,
+                )?;
+                if accept_applied_item_revision(outcome, &mut item_revision_sha256).is_none() {
+                    tracing::error!(
+                        code = "ESCALATION_WEBHOOK_RESULT_REVISION_CONFLICT",
+                        escalation_id = %item.escalation_id,
+                        ladder_index,
+                        attempt_number,
+                        issue = 1757,
+                        "webhook returned after authoritative item state changed; stale state was not written, but the remote outcome requires durable-outbox reconciliation"
+                    );
+                    continue;
+                }
+                if attempt_ok {
+                    report.tier1_fired += 1;
+                } else {
+                    report.tier1_failed += 1;
+                }
                 dirty = false;
             } else {
                 // No channel at this index (config shrank): stop the ladder.
@@ -1612,13 +3230,24 @@ pub(crate) async fn process_pending(
 
         if dirty {
             item.updated_at_unix_ms = now_unix_ms;
-            write_item_and_audit(db, &item, "updated", json!({}))?;
+            let outcome = write_item_and_audit_if_revision(
+                db,
+                &item,
+                "updated",
+                json!({}),
+                item_revision_sha256,
+            )?;
+            let _ = accept_applied_item_revision(outcome, &mut item_revision_sha256);
         }
     }
-    Ok(report)
+    Ok(Some(report))
 }
 
-async fn remove_tier0_if_terminal(db: &Db, item: &mut EscalationItem) -> Result<bool, ErrorData> {
+async fn remove_tier0_if_terminal(
+    db: &Db,
+    item: &mut EscalationItem,
+    item_revision_sha256: &mut [u8; 32],
+) -> Result<bool, ErrorData> {
     if !item.tier0_fired || item.tier0_toast_removed.is_some() {
         return Ok(false);
     }
@@ -1627,14 +3256,27 @@ async fn remove_tier0_if_terminal(db: &Db, item: &mut EscalationItem) -> Result<
     let removed =
         outcome.removed || outcome.already_absent || outcome.status == "unsupported_platform";
     item.tier0_toast_removed = Some(outcome.clone());
-    write_item_and_audit(
+    let write_outcome = write_item_and_audit_if_revision(
         db,
         item,
         "tier0_toast_removed",
         json!({
-            "toast_removal": outcome,
+            "toast_removal": &outcome,
         }),
+        *item_revision_sha256,
     )?;
+    if accept_applied_item_revision(write_outcome, item_revision_sha256).is_none() {
+        tracing::warn!(
+            code = "ESCALATION_TIER0_REMOVAL_REVISION_CONFLICT",
+            escalation_id = %item.escalation_id,
+            "Action Center removal completed after the authoritative item changed; stale item state was not written"
+        );
+        if let Some(latest) = read_item_revisioned(db, &item.escalation_id)? {
+            *item = latest.item;
+            *item_revision_sha256 = latest.revision_sha256;
+        }
+        return Ok(false);
+    }
     tracing::info!(
         code = "ESCALATION_TIER0_TOAST_REMOVED",
         escalation_id = %item.escalation_id,
@@ -1654,11 +3296,11 @@ fn tier0_removal_failed(item: &EscalationItem) -> bool {
     })
 }
 
-fn terminal_agent_read_for_item(
-    terminal_agent_reads: &[AgentStateRead],
+fn authoritative_agent_read_for_item(
+    authoritative_agent_reads: &[AgentStateRead],
     item: &EscalationItem,
 ) -> Option<AgentStateRead> {
-    terminal_agent_reads
+    authoritative_agent_reads
         .iter()
         .find(|read| escalation_item_matches_agent_read(item, read))
         .cloned()
@@ -1886,15 +3528,16 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    tracing::debug!(code = "ESCALATION_WORKER_STOPPED", "stopping escalation worker");
+                    tracing::info!(code = "ESCALATION_WORKER_STOPPED", stage = "idle_wait", "stopping escalation worker");
                     break;
                 }
                 _ = signal.notified() => {}
                 _ = interval.tick() => {}
             }
             if shutdown.is_cancelled() {
-                tracing::debug!(
+                tracing::info!(
                     code = "ESCALATION_WORKER_STOPPED",
+                    stage = "before_sweep",
                     "stopping escalation worker before starting a sweep"
                 );
                 break;
@@ -1902,16 +3545,17 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
             let now_unix_ms = unix_time_ms_now();
             let sweep_result = tokio::select! {
                 _ = shutdown.cancelled() => {
-                    tracing::debug!(
+                    tracing::info!(
                         code = "ESCALATION_WORKER_STOPPED",
+                        stage = "during_pending_sweep",
                         "stopping escalation worker during pending sweep"
                     );
                     break;
                 }
-                result = process_pending(&db, now_unix_ms) => result,
+                result = process_pending(&db, now_unix_ms, &shutdown) => result,
             };
             match sweep_result {
-                Ok(report)
+                Ok(Some(report))
                     if report.tier0_fired
                         + report.tier0_removed
                         + report.tier0_remove_failed
@@ -1934,7 +3578,15 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                         "escalation sweep delivered"
                     );
                 }
-                Ok(_quiet) => {}
+                Ok(Some(_quiet)) => {}
+                Ok(None) => {
+                    tracing::info!(
+                        code = "ESCALATION_WORKER_STOPPED",
+                        stage = "cooperative_checkpoint",
+                        "stopping escalation worker after cooperative cancellation checkpoint"
+                    );
+                    break;
+                }
                 Err(error) => {
                     tracing::error!(
                         code = "ESCALATION_SWEEP_FAILED",
@@ -1944,8 +3596,9 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                 }
             }
             if shutdown.is_cancelled() {
-                tracing::debug!(
+                tracing::info!(
                     code = "ESCALATION_WORKER_STOPPED",
+                    stage = "before_orphan_cleanup",
                     "stopping escalation worker before orphan toast cleanup"
                 );
                 break;
@@ -1965,8 +3618,9 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                 };
                 let report = tokio::select! {
                     _ = shutdown.cancelled() => {
-                        tracing::debug!(
+                        tracing::info!(
                             code = "ESCALATION_WORKER_STOPPED",
+                            stage = "during_orphan_cleanup",
                             "stopping escalation worker during orphan toast cleanup"
                         );
                         break;
@@ -2219,7 +3873,8 @@ impl SynapseService {
         );
         validate_config(&params)?;
         let db = self.m3_storage()?;
-        let mut policy = load_policy(&db)?;
+        let revisioned_policy = load_policy_revisioned(&db)?;
+        let mut policy = revisioned_policy.policy;
         if let Some(webhooks) = params.webhooks {
             policy.webhooks = webhooks;
         }
@@ -2236,8 +3891,10 @@ impl SynapseService {
             policy.quiet_hours = params.quiet_hours;
         }
         policy.updated_at_unix_ms = unix_time_ms_now();
-        store_policy(&db, &policy)?;
-        Ok(Json(EscalationConfigResponse::from_policy(&policy)))
+        let authoritative_policy = store_policy(&db, &policy, revisioned_policy.revision_sha256)?;
+        Ok(Json(EscalationConfigResponse::from_policy(
+            &authoritative_policy,
+        )))
     }
 
     #[tool(
@@ -2300,10 +3957,7 @@ impl SynapseService {
             "tool.invocation kind=escalation_ack"
         );
         let db = self.m3_storage()?;
-        let was_pending = read_item(&db, &params.escalation_id)?
-            .map(|item| item.status == EscalationStatus::Pending)
-            .unwrap_or(false);
-        let escalation = ack_escalation(
+        let outcome = ack_escalation(
             &db,
             &params.escalation_id,
             "escalation_ack_tool",
@@ -2311,8 +3965,8 @@ impl SynapseService {
             unix_time_ms_now(),
         )?;
         Ok(Json(EscalationAckResponse {
-            newly_acked: was_pending && escalation.status == EscalationStatus::Acked,
-            escalation,
+            escalation: outcome.escalation,
+            newly_acked: outcome.newly_acked,
         }))
     }
 }

@@ -1,10 +1,17 @@
 use super::level::SstLevel;
-use super::{SstEntry, SstStreamingReader};
+use super::{SstEntry, SstPageReader};
 use crate::mvcc::is_tombstone_value;
-use calyx_core::Result;
+use calyx_core::{CalyxError, Result};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+
+/// Hard ceiling on immutable SST sources participating in one candidate page.
+///
+/// A flat newest-wins level must inspect one lower-bound key per intersecting
+/// file. Failing above this ceiling keeps cursor initialization bounded and
+/// makes compaction debt explicit instead of silently expanding read latency.
+const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
 
 pub(super) fn range_page(
     level: &SstLevel,
@@ -17,8 +24,42 @@ pub(super) fn range_page(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let mut cursor = open_page_cursor(level, start, end, after_key, overlay)?;
+    let mut cursor = open_page_cursor(level, start, end, after_key, overlay, None)?;
     next_page(&mut cursor, limit)
+}
+
+/// Returns at most `limit` newest raw key states, retaining tombstones.
+///
+/// This is the bounded building block for higher-layer latest-view merges.
+/// Counting candidates rather than only live rows prevents a tombstone-dense
+/// range from turning one nominal page into an unbounded logical-key
+/// traversal. Immutable source fan-in has a separate hard ceiling.
+pub(super) fn range_candidate_page(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<SstEntry>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cursor = open_page_cursor(
+        level,
+        start,
+        end,
+        after_key,
+        Vec::new(),
+        Some(MAX_INTERSECTING_SST_PAGE_SOURCES),
+    )?;
+    let mut rows = Vec::with_capacity(limit);
+    while rows.len() < limit {
+        let Some(entry) = next_latest_entry(&mut cursor)? else {
+            break;
+        };
+        rows.push(entry);
+    }
+    Ok(rows)
 }
 
 pub(super) fn range_pages<F, E>(
@@ -37,7 +78,8 @@ where
     if limit == 0 {
         return Ok(());
     }
-    let mut cursor = open_page_cursor(level, start, end, after_key, overlay).map_err(E::from)?;
+    let mut cursor =
+        open_page_cursor(level, start, end, after_key, overlay, None).map_err(E::from)?;
     loop {
         let page = next_page(&mut cursor, limit).map_err(E::from)?;
         if page.is_empty() {
@@ -48,19 +90,19 @@ where
     Ok(())
 }
 
-struct PageCursor {
-    sources: Vec<PageSource>,
+struct PageCursor<'a> {
+    sources: Vec<PageSource<'a>>,
     heap: BinaryHeap<HeapItem>,
     end: Option<Vec<u8>>,
 }
 
-enum PageSource {
+enum PageSource<'a> {
     Overlay {
         rows: Vec<SstEntry>,
         pos: usize,
     },
     Sst {
-        reader: SstStreamingReader,
+        reader: SstPageReader<'a>,
         pos: usize,
     },
 }
@@ -86,7 +128,7 @@ impl PartialOrd for HeapItem {
     }
 }
 
-impl PageSource {
+impl PageSource<'_> {
     fn current_key(&self, end: Option<&[u8]>) -> Option<&[u8]> {
         let key = match self {
             Self::Overlay { rows, pos } => rows.get(*pos).map(|row| row.key.as_slice()),
@@ -99,7 +141,7 @@ impl PageSource {
         }
     }
 
-    fn read_current(&self) -> Result<SstEntry> {
+    fn read_current(&mut self) -> Result<SstEntry> {
         match self {
             Self::Overlay { rows, pos } => Ok(rows[*pos].clone()),
             Self::Sst { reader, pos } => reader.entry_at(*pos),
@@ -125,15 +167,38 @@ impl PageSource {
     }
 }
 
-fn open_page_cursor(
-    level: &SstLevel,
+fn open_page_cursor<'a>(
+    level: &'a SstLevel,
     start: &[u8],
     end: Option<&[u8]>,
     after_key: Option<&[u8]>,
     overlay: Vec<SstEntry>,
-) -> Result<PageCursor> {
+    max_intersecting_sst_sources: Option<usize>,
+) -> Result<PageCursor<'a>> {
     let lower = after_key.unwrap_or(start);
     let exclusive = after_key.is_some();
+    if let Some(max_sources) = max_intersecting_sst_sources {
+        let intersecting_sources = level
+            .files
+            .iter()
+            .filter(|file| file.may_intersect(lower, end))
+            .count();
+        if intersecting_sources > max_sources {
+            tracing::error!(
+                code = "CALYX_ASTER_SST_PAGE_SOURCE_LIMIT_EXCEEDED",
+                intersecting_sources,
+                max_sources,
+                "candidate-bounded SST page rejected excessive immutable source fan-in"
+            );
+            return Err(CalyxError {
+                code: "CALYX_ASTER_SST_PAGE_SOURCE_LIMIT_EXCEEDED",
+                message: format!(
+                    "candidate-bounded SST page intersects {intersecting_sources} immutable sources, above the hard maximum {max_sources}"
+                ),
+                remediation: "compact the affected column family below the candidate-page source ceiling, verify the retained lookup state, and retry; do not fall back to a whole-file scan",
+            });
+        }
+    }
     let mut sources = Vec::new();
     let overlay = overlay_page_rows(overlay, start, end, lower, exclusive);
     if !overlay.is_empty() {
@@ -147,7 +212,9 @@ fn open_page_cursor(
         .par_iter()
         .filter(|file| file.may_intersect(lower, end))
         .map(|file| {
-            let reader = SstStreamingReader::open(&file.path)?;
+            let Some(reader) = file.open_page_reader()? else {
+                return Ok(None);
+            };
             let mut pos = reader.lower_bound(lower, exclusive);
             while reader.key_at(pos).is_some_and(|key| key < start) {
                 pos += 1;
@@ -174,7 +241,7 @@ fn open_page_cursor(
     Ok(cursor)
 }
 
-impl PageCursor {
+impl PageCursor<'_> {
     fn push_current(&mut self, source: usize) {
         if let Some(key) = self.sources[source].current_key(self.end.as_deref()) {
             self.heap.push(HeapItem {
@@ -185,7 +252,7 @@ impl PageCursor {
     }
 }
 
-fn next_page(cursor: &mut PageCursor, limit: usize) -> Result<Vec<SstEntry>> {
+fn next_page(cursor: &mut PageCursor<'_>, limit: usize) -> Result<Vec<SstEntry>> {
     let mut out = Vec::with_capacity(limit);
     while out.len() < limit {
         let Some(entry) = next_latest_entry(cursor)? else {
@@ -198,7 +265,7 @@ fn next_page(cursor: &mut PageCursor, limit: usize) -> Result<Vec<SstEntry>> {
     Ok(out)
 }
 
-fn next_latest_entry(cursor: &mut PageCursor) -> Result<Option<SstEntry>> {
+fn next_latest_entry(cursor: &mut PageCursor<'_>) -> Result<Option<SstEntry>> {
     let Some(first) = cursor.heap.pop() else {
         return Ok(None);
     };

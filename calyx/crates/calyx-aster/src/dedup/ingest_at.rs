@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use calyx_core::{
     CalyxError, Clock, Constellation, CxId, GuardTauProfile, Result, SlotId, VaultStore,
 };
@@ -11,8 +13,8 @@ use super::ingest_ledger::{
 use super::signature::{SignatureResult, detect_recurrence_signature};
 use super::{
     AnchorConflictResult, CALYX_DEDUP_INVALID_EVENT_TIME, ContestedWith, DedupAction,
-    DedupDecision, DedupPolicy, DedupResult, EpochSecs, IngestInput, OccurrenceId, TctCosineConfig,
-    check_anchor_conflict, contested_with_key, dedup_error, encode_contested_with,
+    DedupDecision, DedupPolicy, DedupResult, EpochSecs, IngestInput, OccurrenceId, TauStrategy,
+    TctCosineConfig, check_anchor_conflict, contested_with_key, dedup_error, encode_contested_with,
     is_recurrence_series_policy,
 };
 use crate::cf::ColumnFamily;
@@ -43,6 +45,14 @@ where
 {
     recurrence_retention.validate()?;
     let policy = vault.dedup_policy().clone();
+    // GuardTauProfile is a caller-controlled trait object and has no
+    // non-reentrancy contract. Materialize every value this policy can ask for
+    // before taking the vault's process/cross-process transaction locks. The
+    // owned map also makes repeated recurrence checks deterministic.
+    let guard_profile = snapshot_guard_tau_profile(&policy, guard_profile);
+    let guard_profile = guard_profile
+        .as_ref()
+        .map(|profile| profile as &dyn GuardTauProfile);
     if is_recurrence_series_policy(&policy) {
         return vault.with_recurrence_write_lock(|| {
             ingest_at_with_policy(
@@ -55,13 +65,38 @@ where
             )
         });
     }
-    ingest_at_with_policy(
-        vault,
-        input,
-        at,
-        guard_profile,
-        &policy,
-        recurrence_retention,
+    vault.with_durable_commit_lock(|| {
+        ingest_at_with_policy(
+            vault,
+            input,
+            at,
+            guard_profile,
+            &policy,
+            recurrence_retention,
+        )
+    })
+}
+
+fn snapshot_guard_tau_profile(
+    policy: &DedupPolicy,
+    guard_profile: Option<&dyn GuardTauProfile>,
+) -> Option<BTreeMap<SlotId, f32>> {
+    let DedupPolicy::TctCosine(config) = policy else {
+        return None;
+    };
+    if !matches!(config.tau, TauStrategy::Calibrated) {
+        return None;
+    }
+    let profile = guard_profile?;
+    Some(
+        config
+            .required_slots
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|slot| profile.tau_for(&slot).map(|tau| (slot, tau)))
+            .collect(),
     )
 }
 
@@ -221,7 +256,7 @@ where
         restore: None,
     })?;
     let id = new_cx.cx_id;
-    vault.commit_dedup_ingest(
+    vault.commit_dedup_ingest_locked(
         Some(new_cx),
         None,
         online_rows,
@@ -254,7 +289,7 @@ where
         recurrence_signature: None,
         restore: None,
     })?;
-    vault.commit_dedup_ingest(None, None, Vec::new(), Vec::new(), existing, payload)?;
+    vault.commit_dedup_ingest_locked(None, None, Vec::new(), Vec::new(), existing, payload)?;
     Ok(DedupResult::ExactDuplicate(existing))
 }
 
@@ -315,7 +350,7 @@ where
     })?;
     let candidate = (matched.action == DedupAction::Link).then_some(matched.new_cx);
     let subject = candidate.as_ref().map_or(matched.existing, |cx| cx.cx_id);
-    vault.commit_dedup_ingest(
+    vault.commit_dedup_ingest_locked(
         candidate,
         updated_base,
         online_rows,

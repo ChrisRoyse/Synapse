@@ -5,6 +5,15 @@ use thiserror::Error;
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// A guarded mutation has an empty, duplicate, or unmutated logical guard.
+pub const STORAGE_REVISION_GUARD_INVALID: &str = "STORAGE_REVISION_GUARD_INVALID";
+/// A guarded mutation cannot fit in one atomic Calyx WAL record.
+pub const STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE: &str =
+    "STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE";
+/// Calyx returned a guarded-mutation outcome that violated the bridge contract.
+pub const STORAGE_REVISION_GUARDED_OUTCOME_INVALID: &str =
+    "STORAGE_REVISION_GUARDED_OUTCOME_INVALID";
+
 /// Storage failures with stable Synapse error codes.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -28,6 +37,12 @@ pub enum StorageError {
     },
     #[error("storage write failed in {cf_name}: {detail}")]
     WriteFailed { cf_name: String, detail: String },
+    #[error("revision-guarded storage mutation failed in {cf_name} [{code}]: {detail}")]
+    RevisionGuardedMutationFailed {
+        cf_name: String,
+        code: &'static str,
+        detail: String,
+    },
     #[error("Calyx storage write failed in {cf_name}: {detail}")]
     CalyxWriteFailed {
         cf_name: String,
@@ -65,7 +80,9 @@ impl StorageError {
             Self::EncodeJson { .. } | Self::WriteFailed { .. } | Self::WriteShed { .. } => {
                 error_codes::STORAGE_WRITE_FAILED
             }
-            Self::CalyxWriteFailed { code, .. } | Self::CalyxReadFailed { code, .. } => code,
+            Self::RevisionGuardedMutationFailed { code, .. }
+            | Self::CalyxWriteFailed { code, .. }
+            | Self::CalyxReadFailed { code, .. } => code,
             Self::UnsafeGcEvictionRefused { .. } => error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED,
             Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,

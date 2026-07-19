@@ -106,6 +106,82 @@ impl CfRouter {
         self.open_entries(cf, rows)
     }
 
+    /// Returns at most `limit` newest raw key states after `after_key`.
+    ///
+    /// The page retains tombstones so the MVCC row overlay can merge one
+    /// bounded ordered candidate stream without losing deletion precedence.
+    /// Both immutable and mutable sources contribute at most `limit` rows;
+    /// the two-way merge emits only the first `limit` keys in their union.
+    pub(crate) fn range_candidate_page_until(
+        &self,
+        cf: ColumnFamily,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<SstEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let immutable = self
+            .levels
+            .get(&cf)
+            .map(|level| level.range_candidate_page_until(start, end, after_key, limit))
+            .transpose()?
+            .unwrap_or_default();
+        // Mutable router rows are plaintext until flush; immutable SST rows
+        // may be sealed. Open only the immutable source before merging so an
+        // encrypted vault never tries to decrypt a plaintext memtable winner.
+        let immutable = self.open_entries(cf, immutable)?;
+        let mutable = self
+            .memtables
+            .get(&cf)
+            .map(|table| {
+                table
+                    .range_candidate_page_until(start, end, after_key, limit)
+                    .into_iter()
+                    .map(|(key, value)| SstEntry { key, value })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut immutable_index = 0;
+        let mut mutable_index = 0;
+        let mut rows = Vec::with_capacity(limit);
+        while rows.len() < limit
+            && (immutable_index < immutable.len() || mutable_index < mutable.len())
+        {
+            let next = match (immutable.get(immutable_index), mutable.get(mutable_index)) {
+                (Some(immutable), Some(mutable)) => match immutable.key.cmp(&mutable.key) {
+                    std::cmp::Ordering::Less => {
+                        immutable_index += 1;
+                        immutable.clone()
+                    }
+                    std::cmp::Ordering::Greater => {
+                        mutable_index += 1;
+                        mutable.clone()
+                    }
+                    std::cmp::Ordering::Equal => {
+                        immutable_index += 1;
+                        mutable_index += 1;
+                        mutable.clone()
+                    }
+                },
+                (Some(immutable), None) => {
+                    immutable_index += 1;
+                    immutable.clone()
+                }
+                (None, Some(mutable)) => {
+                    mutable_index += 1;
+                    mutable.clone()
+                }
+                (None, None) => break,
+            };
+            rows.push(next);
+        }
+        Ok(rows)
+    }
+
     pub fn range_keys(&self, cf: ColumnFamily, start: &[u8], end: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.range_keys_until(cf, start, Some(end))
     }

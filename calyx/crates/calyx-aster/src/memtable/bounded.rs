@@ -179,6 +179,38 @@ impl BoundedMemtable {
         }
     }
 
+    /// Returns at most `limit` raw entries in key order after `after_key`.
+    ///
+    /// Tombstones are intentionally retained: the caller must merge this
+    /// newest mutable layer with older immutable rows before deciding whether
+    /// a key is live.
+    pub(crate) fn range_candidate_page_until(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lower = after_key
+            .map(|key| Bound::Excluded(key.to_vec()))
+            .unwrap_or_else(|| Bound::Included(start.to_vec()));
+        let upper = end
+            .map(|key| Bound::Excluded(key.to_vec()))
+            .unwrap_or(Bound::Unbounded);
+        entries
+            .range((lower, upper))
+            .take(limit)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     /// Returns the greatest entry in `[start, upper]` (or `[start, upper)`).
     pub(crate) fn predecessor(
         &self,
