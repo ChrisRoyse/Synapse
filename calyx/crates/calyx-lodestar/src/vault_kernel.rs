@@ -12,15 +12,14 @@ use std::collections::BTreeMap;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId, SlotId, SlotVector, VaultStore};
+use calyx_core::{Clock, CxId, PanelSlotId, SlotVector, VaultStore};
 use calyx_paths::AssocGraph;
 use calyx_sextant::{HnswIndex, SextantIndex};
 
 use crate::error::{LodestarError, Result};
 use crate::{
-    AnnIndex, GroundednessReport, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelParams,
-    RecallEvalParams, RecallQuery, RecallReport, build_kernel_index, build_kernel_pipeline,
-    measure_kernel_recall,
+    AnnIndex, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelParams, RecallEvalParams,
+    RecallQuery, RecallReport, build_kernel_index, build_kernel_pipeline, measure_kernel_recall,
 };
 
 /// A real kernel plus its MEASURED kernel-only recall, both computed from the
@@ -32,14 +31,6 @@ pub struct MeasuredVaultKernel {
     pub corpus_size: usize,
     /// Number of concepts visible in the vault Base CF at the measurement snapshot.
     pub vault_corpus_size: usize,
-    /// Number of visible concepts skipped because `content_slot` had no dense vector.
-    pub skipped_unembedded: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VaultKernelMode {
-    Strict,
-    WebPartial,
 }
 
 const VAULT_GRAPH_EXACT_MAX_ROWS: usize = 4_096;
@@ -54,20 +45,14 @@ const VAULT_GRAPH_INDEX_SEED: u64 = 0xCA1A_4A77_10DE_57A9;
 /// concepts, no anchored concepts, or a concept missing the content-slot vector.
 pub fn measured_kernel_from_vault<C: Clock>(
     vault: &AsterVault<C>,
-    content_slot: SlotId,
+    content_slot: PanelSlotId,
     kernel_params: &KernelParams,
     recall_params: &RecallEvalParams,
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<MeasuredVaultKernel> {
-    let inputs = build_vault_kernel_inputs(
-        vault,
-        content_slot,
-        kernel_params,
-        knn,
-        edge_cos_threshold,
-        VaultKernelMode::Strict,
-    )?;
+    let inputs =
+        build_vault_kernel_inputs(vault, content_slot, kernel_params, knn, edge_cos_threshold)?;
     let kernel_index = build_kernel_index(&inputs.kernel, &inputs.embeddings)?;
     let recall = measure_kernel_recall(&kernel_index, &inputs.full, &inputs.corpus, recall_params)?;
     Ok(MeasuredVaultKernel {
@@ -75,7 +60,6 @@ pub fn measured_kernel_from_vault<C: Clock>(
         recall,
         corpus_size: inputs.corpus_size,
         vault_corpus_size: inputs.vault_corpus_size,
-        skipped_unembedded: inputs.skipped_unembedded,
     })
 }
 
@@ -93,47 +77,14 @@ pub fn measured_kernel_from_vault<C: Clock>(
 /// to evaluate). NOT fabricated — every value is a real `measure_kernel_recall`.
 pub fn measured_kernel_with_contributions_from_vault<C: Clock>(
     vault: &AsterVault<C>,
-    content_slot: SlotId,
+    content_slot: PanelSlotId,
     kernel_params: &KernelParams,
     recall_params: &RecallEvalParams,
     knn: usize,
     edge_cos_threshold: f32,
 ) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
-    let inputs = build_vault_kernel_inputs(
-        vault,
-        content_slot,
-        kernel_params,
-        knn,
-        edge_cos_threshold,
-        VaultKernelMode::Strict,
-    )?;
-    measured_kernel_with_contributions_from_inputs(inputs, recall_params)
-}
-
-/// Build the measured kernel for a website-facing vault snapshot while honestly
-/// tolerating operationally incomplete historical coverage.
-///
-/// Unlike the strict functions above, this skips rows missing `content_slot`
-/// dense vectors and permits an unanchored vault. The returned kernel carries
-/// explicit `warnings`, `groundedFraction`, `vault_corpus_size`, and
-/// `skipped_unembedded`; callers must surface those instead of pretending the
-/// artifact is fully grounded.
-pub fn measured_kernel_with_contributions_from_vault_allow_partial<C: Clock>(
-    vault: &AsterVault<C>,
-    content_slot: SlotId,
-    kernel_params: &KernelParams,
-    recall_params: &RecallEvalParams,
-    knn: usize,
-    edge_cos_threshold: f32,
-) -> Result<(MeasuredVaultKernel, Vec<(CxId, f32)>)> {
-    let inputs = build_vault_kernel_inputs(
-        vault,
-        content_slot,
-        kernel_params,
-        knn,
-        edge_cos_threshold,
-        VaultKernelMode::WebPartial,
-    )?;
+    let inputs =
+        build_vault_kernel_inputs(vault, content_slot, kernel_params, knn, edge_cos_threshold)?;
     measured_kernel_with_contributions_from_inputs(inputs, recall_params)
 }
 
@@ -168,7 +119,6 @@ fn measured_kernel_with_contributions_from_inputs(
             recall,
             corpus_size: inputs.corpus_size,
             vault_corpus_size: inputs.vault_corpus_size,
-            skipped_unembedded: inputs.skipped_unembedded,
         },
         contributions,
     ))
@@ -185,7 +135,6 @@ struct VaultKernelInputs {
     corpus: InMemoryCorpus,
     corpus_size: usize,
     vault_corpus_size: usize,
-    skipped_unembedded: usize,
 }
 
 /// Scan the vault's content-slot embeddings, build the embedding k-NN
@@ -194,19 +143,24 @@ struct VaultKernelInputs {
 /// too-small / unanchored / unembedded vault.
 fn build_vault_kernel_inputs<C: Clock>(
     vault: &AsterVault<C>,
-    content_slot: SlotId,
+    content_slot: PanelSlotId,
     kernel_params: &KernelParams,
     knn: usize,
     edge_cos_threshold: f32,
-    mode: VaultKernelMode,
 ) -> Result<VaultKernelInputs> {
+    if kernel_params.panel_version != content_slot.panel_version() {
+        return Err(LodestarError::KernelInvalidParams {
+            detail: format!(
+                "kernel panel {} does not match content {content_slot}",
+                kernel_params.panel_version
+            ),
+        });
+    }
     let snapshot = vault.snapshot();
     let mut rows: Vec<RecallQuery> = Vec::new();
     let mut anchors: Vec<CxId> = Vec::new();
     let mut vault_corpus_size = 0usize;
-    let mut skipped_unembedded = 0usize;
     for (key, _) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        vault_corpus_size += 1;
         let bytes: [u8; 16] =
             key.as_slice()
                 .try_into()
@@ -215,25 +169,21 @@ fn build_vault_kernel_inputs<C: Clock>(
                 })?;
         let cx_id = CxId::from_bytes(bytes);
         let cx = vault.get(cx_id, snapshot)?;
+        if cx.panel_version != content_slot.panel_version() {
+            continue;
+        }
+        vault_corpus_size += 1;
         let Some(dense) = cx
             .slots
-            .get(&content_slot)
+            .get(&content_slot.slot_id())
             .and_then(|vector| vector.as_dense())
         else {
-            match mode {
-                VaultKernelMode::Strict => {
-                    return Err(LodestarError::KernelInvalidParams {
-                        detail: format!(
-                            "constellation {cx_id} has no dense vector in content slot {content_slot}; \
-                             the kernel needs a per-concept embedding"
-                        ),
-                    });
-                }
-                VaultKernelMode::WebPartial => {
-                    skipped_unembedded += 1;
-                    continue;
-                }
-            }
+            return Err(LodestarError::KernelInvalidParams {
+                detail: format!(
+                    "constellation {cx_id} has no dense vector in {content_slot}; \
+                     the kernel needs a per-concept embedding"
+                ),
+            });
         };
         rows.push(RecallQuery {
             cx_id,
@@ -251,7 +201,7 @@ fn build_vault_kernel_inputs<C: Clock>(
             ),
         });
     }
-    if anchors.is_empty() && mode == VaultKernelMode::Strict {
+    if anchors.is_empty() {
         return Err(LodestarError::KernelInvalidParams {
             detail: "vault has no anchored concepts; anchor at least one before building a kernel"
                 .to_string(),
@@ -292,40 +242,11 @@ fn build_vault_kernel_inputs<C: Clock>(
     }
     let graph = builder.build();
 
-    let mut kernel = build_kernel_pipeline(&graph, &anchors, kernel_params)?;
+    let kernel = build_kernel_pipeline(&graph, &anchors, kernel_params)?;
     // Injecting fallback members fabricates recall and invalidates the kernel identity.
     if kernel.members.is_empty() {
         return Err(LodestarError::KernelEmptyResult);
     }
-    if anchors.is_empty() {
-        kernel.groundedness = GroundednessReport {
-            reached_anchor: 0.0,
-            unanchored_members: kernel.members.clone(),
-        };
-        if !kernel
-            .warnings
-            .iter()
-            .any(|warning| warning.starts_with("CALYX_KERNEL_UNGROUNDED"))
-        {
-            kernel
-                .warnings
-                .push("CALYX_KERNEL_UNGROUNDED: all kernel members are provisional".to_string());
-        }
-        kernel.estimator_provenance = format!("{}; trust=provisional", kernel.estimator_provenance);
-    }
-    if skipped_unembedded > 0 {
-        let warning = format!(
-            "CALYX_KERNEL_PARTIAL_COVERAGE: content_slot={}; embedded={}; vault_total={vault_corpus_size}; skipped_unembedded={skipped_unembedded}",
-            content_slot.get(),
-            rows.len()
-        );
-        kernel.warnings.push(warning.clone());
-        kernel.estimator_provenance = format!(
-            "{}; partial_coverage={warning}",
-            kernel.estimator_provenance
-        );
-    }
-
     let embeddings: BTreeMap<CxId, Vec<f32>> = rows
         .iter()
         .map(|row| (row.cx_id, row.vector.clone()))
@@ -340,11 +261,13 @@ fn build_vault_kernel_inputs<C: Clock>(
         corpus,
         corpus_size,
         vault_corpus_size,
-        skipped_unembedded,
     })
 }
 
-fn build_vault_graph_ann_index(rows: &[RecallQuery], content_slot: SlotId) -> Result<HnswIndex> {
+fn build_vault_graph_ann_index(
+    rows: &[RecallQuery],
+    content_slot: PanelSlotId,
+) -> Result<HnswIndex> {
     let dim = rows.first().map(|row| row.vector.len()).ok_or_else(|| {
         LodestarError::KernelInvalidParams {
             detail: "vault graph ANN index requires at least one embedded row".to_string(),
@@ -353,7 +276,7 @@ fn build_vault_graph_ann_index(rows: &[RecallQuery], content_slot: SlotId) -> Re
     let dim = u32::try_from(dim).map_err(|_| LodestarError::KernelIndexBuild {
         detail: format!("vault graph ANN dimension {dim} exceeds u32::MAX"),
     })?;
-    let mut index = HnswIndex::new(content_slot, dim, VAULT_GRAPH_INDEX_SEED);
+    let mut index = HnswIndex::new(content_slot.slot_id(), dim, VAULT_GRAPH_INDEX_SEED);
     for (seq, row) in rows.iter().enumerate() {
         SextantIndex::insert(
             &mut index,

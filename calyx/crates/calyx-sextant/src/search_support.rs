@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use calyx_core::{Anchor, Constellation, SlotId, SlotVector};
+use calyx_core::{Anchor, Constellation, Panel, Result, SlotId, SlotVector};
 
 use crate::fusion::FusionStrategy;
 use crate::index::tokenizer::{TEXT_SPARSE_DIM, text_sparse_entries};
@@ -46,12 +46,15 @@ pub(crate) fn default_strategy(slots: &[SlotId]) -> FusionStrategy {
     }
 }
 
-pub(crate) fn strategy_weights(strategy: &FusionStrategy) -> BTreeMap<SlotId, f32> {
+pub(crate) fn strategy_weights(
+    strategy: &FusionStrategy,
+    panel: &Panel,
+) -> Result<BTreeMap<SlotId, f32>> {
     match strategy {
-        FusionStrategy::WeightedRrf { profile } => crate::fusion::profiles::lookup(*profile)
-            .map(|profile| profile.weights)
-            .unwrap_or_default(),
-        _ => BTreeMap::new(),
+        FusionStrategy::WeightedRrf { profile } => {
+            Ok(crate::fusion::profiles::lookup(*profile, panel)?.weights)
+        }
+        _ => Ok(BTreeMap::new()),
     }
 }
 

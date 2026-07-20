@@ -17,8 +17,6 @@ pub mod multi;
 pub mod partitioned;
 pub mod quant_config;
 pub mod spann;
-#[doc(hidden)]
-pub mod testutil;
 pub mod tokenizer;
 pub mod vecfile;
 
@@ -68,7 +66,6 @@ pub use spann::{
     PostingListReader, PostingListWriter, PostingMember, SPANN_CENTROID_MAGIC, SpannCentroidIndex,
     SpannSearch, build_centroids,
 };
-pub use testutil::{SyntheticVault, build_synthetic_vault, synthetic_dense_rows};
 pub use vecfile::{DenseVectorFile, FbinVectors, I8BinVectors, I32BinMatrix, VEC_MAGIC};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

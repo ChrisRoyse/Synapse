@@ -42,7 +42,7 @@ pub(super) fn resolve_guard(
     vault: &AsterVault,
     guard: GuardChoice,
     guard_tau: Option<f32>,
-    guard_panel_version: Option<u64>,
+    guard_panel_version: Option<u32>,
 ) -> CliResult<ResolvedGuard> {
     match (guard, guard_tau) {
         (GuardChoice::Off, None) => Ok(ResolvedGuard::Off),
@@ -71,7 +71,7 @@ pub(super) fn resolve_guard(
 /// masquerade as a missing profile (#1094).
 fn load_default_guard_profile(
     vault: &AsterVault,
-    guard_panel_version: Option<u64>,
+    guard_panel_version: Option<u32>,
 ) -> CliResult<GuardProfile> {
     let Some(bytes) = vault.read_cf_at(
         vault.snapshot(),
@@ -168,7 +168,7 @@ fn prefilter_best_score(hit: &Hit, query_vectors: &[(SlotId, SlotVector)]) -> Op
         .filter_map(|item| {
             let has_dense_query = query_vectors
                 .iter()
-                .any(|(slot, vector)| *slot == item.slot && vector.as_dense().is_some());
+                .any(|(slot, vector)| *slot == item.slot.slot_id() && vector.as_dense().is_some());
             (has_dense_query && item.raw_score.is_finite()).then_some(item.raw_score)
         })
         .max_by(f32::total_cmp)

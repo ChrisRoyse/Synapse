@@ -154,7 +154,7 @@ pub fn derive_required_profile(
         profile.tau.entry(*slot).or_insert(config.cold_start_tau);
     }
     profile.required_slots = required_slots;
-    profile.panel_version = u64::from(panel.version);
+    profile.panel_version = panel.version;
     Ok(profile)
 }
 

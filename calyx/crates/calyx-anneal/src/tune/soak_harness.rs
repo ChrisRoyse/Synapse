@@ -4,7 +4,7 @@ mod types;
 use std::time::Instant;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Clock, LensId, Result, SlotId};
+use calyx_core::{CalyxError, Clock, LensId, PanelSlotId, Result, SlotId};
 use calyx_forge::AutotuneCache;
 
 pub use storage::{
@@ -27,7 +27,7 @@ use crate::{
 
 const INCUMBENT_ARM: usize = 0;
 const CANDIDATE_ARM: usize = 1;
-const SOAK_SLOT: SlotId = SlotId::new(0);
+const SOAK_SLOT: PanelSlotId = PanelSlotId::new(0, SlotId::new(0));
 
 pub struct SoakHarness<S = NoopSoakStorage, W = NoopABLedgerWriter, B = NoopABBudget>
 where

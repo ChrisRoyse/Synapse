@@ -1,10 +1,10 @@
 //! Top-level search engine wiring SlotIndexMap to fusion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_core::{
-    CalyxError, Constellation, CxId, METADATA_TEMPORAL_LANE_STATE, Result, SlotId, SlotState,
-    SlotVector, TEMPORAL_LANE_INACTIVE,
+    CalyxError, Constellation, CxId, METADATA_TEMPORAL_LANE_STATE, Panel, Result, SlotId,
+    SlotState, SlotVector, TEMPORAL_LANE_INACTIVE,
 };
 
 use crate::fusion::{self, FusionContext, FusionStrategy};
@@ -30,22 +30,78 @@ struct SearchOutcome {
     pre_policy_candidates: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SearchEngine {
     pub indexes: SlotIndexMap,
+    panel: Panel,
+    retrieval_only_slots: BTreeSet<SlotId>,
     docs: BTreeMap<CxId, Constellation>,
     query_admission: QueryAdmissionController,
     assoc_graph: Option<calyx_paths::AssocGraph>,
 }
 
 impl SearchEngine {
-    pub fn new(indexes: SlotIndexMap) -> Self {
-        Self {
+    pub fn new(indexes: SlotIndexMap, panel: &Panel) -> Result<Self> {
+        if indexes.panel_version() != panel.version {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                format!(
+                    "index map panel {} does not match search panel {}",
+                    indexes.panel_version(),
+                    panel.version
+                ),
+            ));
+        }
+        let mut declared = BTreeSet::new();
+        let mut retrieval_only_slots = BTreeSet::new();
+        for slot in &panel.slots {
+            if !declared.insert(slot.slot_id) {
+                return Err(crate::error::sextant_error(
+                    crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                    format!(
+                        "panel {} declares local slot {} more than once",
+                        panel.version, slot.slot_id
+                    ),
+                ));
+            }
+            if slot.retrieval_only {
+                retrieval_only_slots.insert(slot.slot_id);
+            }
+        }
+        for slot in indexes.registered_slots() {
+            let declaration = panel
+                .slots
+                .iter()
+                .find(|candidate| candidate.slot_id == slot)
+                .ok_or_else(|| {
+                    crate::error::sextant_error(
+                        crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                        format!(
+                            "registered slot {slot} has no declaration in panel {}",
+                            panel.version
+                        ),
+                    )
+                })?;
+            if indexes.slot_state(slot)? != declaration.state {
+                return Err(crate::error::sextant_error(
+                    crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                    format!(
+                        "registered slot {slot} state {:?} does not match panel {} state {:?}",
+                        indexes.slot_state(slot)?,
+                        panel.version,
+                        declaration.state
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
             indexes,
+            panel: panel.clone(),
+            retrieval_only_slots,
             docs: BTreeMap::new(),
             query_admission: QueryAdmissionController::default(),
             assoc_graph: None,
-        }
+        })
     }
 
     pub fn set_query_admission_config(&mut self, config: QueryAdmissionConfig) {
@@ -60,8 +116,26 @@ impl SearchEngine {
         self.query_admission.metrics_text()
     }
 
-    pub fn put_constellation(&mut self, constellation: Constellation) {
+    pub fn put_constellation(&mut self, constellation: Constellation) -> Result<()> {
+        if constellation.panel_version != self.panel.version {
+            return Err(crate::error::sextant_error(
+                crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                format!(
+                    "search engine panel {} rejected constellation {} from panel {}",
+                    self.panel.version, constellation.cx_id, constellation.panel_version
+                ),
+            ));
+        }
         self.docs.insert(constellation.cx_id, constellation);
+        Ok(())
+    }
+
+    pub fn panel(&self) -> &Panel {
+        &self.panel
+    }
+
+    pub fn is_retrieval_only_slot(&self, slot: SlotId) -> bool {
+        self.retrieval_only_slots.contains(&slot)
     }
 
     pub fn constellation(&self, cx_id: CxId) -> Option<&Constellation> {
@@ -172,7 +246,7 @@ impl SearchEngine {
             };
             per_slot.insert(*slot, hits);
         }
-        let weights = strategy_weights(&strategy);
+        let weights = strategy_weights(&strategy, &self.panel)?;
         let stage1_slots: Vec<SlotId> = slots
             .iter()
             .filter(|slot| {
@@ -183,13 +257,24 @@ impl SearchEngine {
             .copied()
             .collect();
         let context = FusionContext {
+            panel_version: self.panel.version,
             k: search_k,
             explain: query.explain,
             strategy: strategy.clone(),
             weights,
             stage1_slots: stage1_slots.clone(),
         };
-        let mut hits = fusion::fuse(&per_slot, &context);
+        let mut hits = fusion::fuse(&per_slot, &context, &|cx_id| {
+            self.docs
+                .get(&cx_id)
+                .map(|cx| cx.provenance.clone())
+                .ok_or_else(|| {
+                    crate::error::sextant_error(
+                        crate::error::CALYX_SEXTANT_PROVENANCE_MISSING,
+                        format!("stored constellation missing for hit {cx_id}"),
+                    )
+                })
+        })?;
         let pre_policy_candidates = hits.len();
         self.apply_filters(&mut hits, &query.filters);
         if let Some(reranker) = reranker {

@@ -1,4 +1,4 @@
-use calyx_core::{CalyxError, SlotId, SlotShape};
+use calyx_core::{CalyxError, PanelSlotId, SlotId, SlotShape};
 use serde::Serialize;
 
 use super::{PersistedSearchIndexes, SearchIndexEntry};
@@ -7,6 +7,7 @@ use crate::error::CliResult;
 /// Public, path-free identity for one immutable persisted search generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PersistedSearchGeneration {
+    pub panel_version: u32,
     pub base_seq: u64,
     pub manifest_sha256: String,
     pub diskann_build_backend: Option<String>,
@@ -18,7 +19,7 @@ pub struct PersistedSearchGeneration {
 /// Search-relevant manifest data for one persisted slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PersistedSearchSlot {
-    pub slot: SlotId,
+    pub panel_slot: PanelSlotId,
     pub kind: String,
     pub shape: SlotShape,
     pub len: usize,
@@ -34,9 +35,10 @@ impl PersistedSearchIndexes {
             .manifest
             .slots
             .iter()
-            .map(PersistedSearchSlot::try_from)
+            .map(|entry| PersistedSearchSlot::from_entry(self.manifest.panel_version, entry))
             .collect::<CliResult<Vec<_>>>()?;
         Ok(PersistedSearchGeneration {
+            panel_version: self.manifest.panel_version,
             base_seq: self.manifest.base_seq,
             manifest_sha256: self.manifest_sha256.clone(),
             diskann_build_backend: self.manifest.diskann_build_backend.clone(),
@@ -47,10 +49,8 @@ impl PersistedSearchIndexes {
     }
 }
 
-impl TryFrom<&SearchIndexEntry> for PersistedSearchSlot {
-    type Error = crate::error::SearchError;
-
-    fn try_from(entry: &SearchIndexEntry) -> Result<Self, Self::Error> {
+impl PersistedSearchSlot {
+    fn from_entry(panel_version: u32, entry: &SearchIndexEntry) -> CliResult<Self> {
         let shape = match entry.kind.as_str() {
             "diskann" | "flat_dense" => SlotShape::Dense(required_dim(entry)?),
             "sparse_inverted" => SlotShape::Sparse(required_dim(entry)?),
@@ -68,7 +68,7 @@ impl TryFrom<&SearchIndexEntry> for PersistedSearchSlot {
             }
         };
         Ok(Self {
-            slot: SlotId::new(entry.slot),
+            panel_slot: PanelSlotId::new(panel_version, SlotId::new(entry.slot)),
             kind: entry.kind.clone(),
             shape,
             len: entry.len,

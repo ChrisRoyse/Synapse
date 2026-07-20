@@ -229,6 +229,7 @@ where
             OccurrenceContext::new(Vec::new())?,
             at,
             recurrence_retention,
+            None,
         )?;
         let occurrence = append.occurrence_id;
         new_cx = append.updated_base;
@@ -312,6 +313,7 @@ where
             OccurrenceContext::new(Vec::new())?,
             matched.at,
             matched.retention,
+            None,
         )?;
         updated_base = Some(append.updated_base);
         recurrence_rows = append.recurrence_rows;

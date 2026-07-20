@@ -8,14 +8,14 @@ pub use types::{
 use crate::mmap_col::MmapColumn;
 use crate::sst::arrow::{ArrowColumnView, decode_column_shape};
 use crate::vault::{AsterVault, SlotColumnManifest};
-use calyx_core::{CalyxError, Clock, Result, Seq, SlotId};
+use calyx_core::{CalyxError, Clock, PanelSlotId, Result, Seq};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MANIFEST_MAGIC: &str = "CXSC1";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_MAGIC: &str = "CXSC2";
+const MANIFEST_VERSION: u32 = 2;
 const CHUNK_FILE: &str = "slot-column.cxa1";
 
 impl<C> AsterVault<C>
@@ -25,11 +25,11 @@ where
     pub fn olap_scan_aggregate_slot_at(
         &self,
         snapshot: Seq,
-        slot: SlotId,
+        panel_slot: PanelSlotId,
         output_dir: impl AsRef<Path>,
         plan: OlapScanPlan,
     ) -> Result<OlapScanResult> {
-        let materialized = self.materialize_slot_column_at(snapshot, slot, output_dir)?;
+        let materialized = self.materialize_slot_column_at(snapshot, panel_slot, output_dir)?;
         scan_materialized_slot_column_aggregate(&materialized.manifest_path, plan)
     }
 }

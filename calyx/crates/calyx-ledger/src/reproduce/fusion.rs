@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use calyx_core::{CalyxError, CxId, Result, SlotId, SlotVector};
+use calyx_core::{CalyxError, CxId, PanelSlotId, Result, SlotVector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -31,7 +31,7 @@ pub enum FusionMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SlotWeight {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub weight: f32,
 }
 
@@ -43,7 +43,7 @@ pub struct FusionWeights {
     #[serde(default)]
     pub weights: Vec<SlotWeight>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub single_slot: Option<SlotId>,
+    pub single_slot: Option<PanelSlotId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,19 +70,19 @@ pub fn rerun_fusion(
     let weights = weight_map(&fusion_weights.weights);
     let mut fused = BTreeMap::<CxId, f32>::new();
     for slot in remeasured {
-        if !slot_participates(slot.slot_id, fusion_weights) {
+        if !slot_participates(slot.panel_slot, fusion_weights) {
             continue;
         }
         let dense = dense_scores(&slot.vector)?;
         if dense.len() != fusion_weights.candidates.len() {
             return Err(CalyxError::ledger_corrupt(format!(
                 "slot {} replay scores {} != candidates {}",
-                slot.slot_id,
+                slot.panel_slot,
                 dense.len(),
                 fusion_weights.candidates.len()
             )));
         }
-        let weight = slot_weight(slot.slot_id, fusion_weights, &weights);
+        let weight = slot_weight(slot.panel_slot, fusion_weights, &weights);
         if weight <= 0.0 {
             continue;
         }
@@ -265,14 +265,14 @@ fn fusion_weights(payload: &Value) -> Result<FusionWeights> {
         .map_err(|error| CalyxError::ledger_corrupt(format!("decode fusion_weights: {error}")))
 }
 
-fn weight_map(weights: &[SlotWeight]) -> BTreeMap<SlotId, f32> {
+fn weight_map(weights: &[SlotWeight]) -> BTreeMap<PanelSlotId, f32> {
     weights
         .iter()
-        .map(|weight| (weight.slot_id, weight.weight))
+        .map(|weight| (weight.panel_slot, weight.weight))
         .collect()
 }
 
-fn slot_participates(slot: SlotId, fusion_weights: &FusionWeights) -> bool {
+fn slot_participates(slot: PanelSlotId, fusion_weights: &FusionWeights) -> bool {
     match fusion_weights.mode {
         FusionMode::SingleLens => fusion_weights.single_slot == Some(slot),
         FusionMode::Rrf | FusionMode::WeightedRrf => true,
@@ -280,9 +280,9 @@ fn slot_participates(slot: SlotId, fusion_weights: &FusionWeights) -> bool {
 }
 
 fn slot_weight(
-    slot: SlotId,
+    slot: PanelSlotId,
     fusion_weights: &FusionWeights,
-    weights: &BTreeMap<SlotId, f32>,
+    weights: &BTreeMap<PanelSlotId, f32>,
 ) -> f32 {
     match fusion_weights.mode {
         FusionMode::SingleLens | FusionMode::Rrf => 1.0,

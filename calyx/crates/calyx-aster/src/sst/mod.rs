@@ -11,6 +11,12 @@ mod reader_cache;
 
 pub use reader_cache::{invalidate_reader, shared_reader};
 
+/// Hard ceiling on immutable SST sources participating in one range page.
+///
+/// Compaction admission imports this same constant so write-side maintenance
+/// cannot drift from the read-side bound it must protect.
+pub const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
+
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;
 use calyx_core::{CalyxError, Result};

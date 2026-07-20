@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
-use calyx_core::{CxId, Result, SlotId, SlotState, SlotVector};
+use calyx_core::{CxId, Panel, Result, SlotId, SlotState, SlotVector};
 
 use crate::error::{
     CALYX_SEXTANT_SLOT_ALREADY_REGISTERED, CALYX_SEXTANT_SLOT_INACTIVE, CALYX_SEXTANT_SLOT_MISSING,
@@ -13,15 +13,38 @@ use crate::index::{IndexSearchHit, IndexStats, SextantIndex};
 
 type SharedIndex = Arc<RwLock<Box<dyn SextantIndex>>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SlotIndexMap {
+    panel_version: u32,
+    declared_states: Arc<BTreeMap<SlotId, SlotState>>,
     indexes: Arc<RwLock<BTreeMap<SlotId, SharedIndex>>>,
     states: Arc<RwLock<BTreeMap<SlotId, SlotState>>>,
 }
 
 impl SlotIndexMap {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(panel: &Panel) -> Result<Self> {
+        let mut declared_states = BTreeMap::new();
+        for slot in &panel.slots {
+            if declared_states.insert(slot.slot_id, slot.state).is_some() {
+                return Err(sextant_error(
+                    crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                    format!(
+                        "panel {} declares local slot {} more than once",
+                        panel.version, slot.slot_id
+                    ),
+                ));
+            }
+        }
+        Ok(Self {
+            panel_version: panel.version,
+            declared_states: Arc::new(declared_states),
+            indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            states: Arc::new(RwLock::new(BTreeMap::new())),
+        })
+    }
+
+    pub const fn panel_version(&self) -> u32 {
+        self.panel_version
     }
 
     pub fn register<I>(&self, index: I) -> Result<()>
@@ -29,6 +52,15 @@ impl SlotIndexMap {
         I: SextantIndex + 'static,
     {
         let slot = index.slot();
+        let state = self.declared_states.get(&slot).copied().ok_or_else(|| {
+            sextant_error(
+                crate::error::CALYX_SEXTANT_PANEL_SCOPE_MISMATCH,
+                format!(
+                    "index slot {slot} is not declared by panel {}",
+                    self.panel_version
+                ),
+            )
+        })?;
         let mut indexes = self.indexes.write().expect("slot map poisoned");
         if indexes.contains_key(&slot) {
             return Err(sextant_error(
@@ -40,7 +72,7 @@ impl SlotIndexMap {
         self.states
             .write()
             .expect("slot state map poisoned")
-            .insert(slot, SlotState::Active);
+            .insert(slot, state);
         Ok(())
     }
 
@@ -159,7 +191,7 @@ impl SlotIndexMap {
     pub fn missing_slot_error(slot: SlotId) -> calyx_core::CalyxError {
         sextant_error(
             CALYX_SEXTANT_SLOT_MISSING,
-            format!("slot {slot} is not registered"),
+            format!("slot {slot} is not registered in the panel-bound index map"),
         )
     }
 

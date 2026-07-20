@@ -138,7 +138,7 @@ fn clock_ts_i64(clock: &dyn Clock) -> i64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GuardProfile {
     pub guard_id: GuardId,
-    pub panel_version: u64,
+    pub panel_version: u32,
     pub domain: String,
     pub tau: BTreeMap<SlotId, f32>,
     pub required_slots: Vec<SlotId>,

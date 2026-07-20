@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use calyx_core::{CxId, SlotId};
+use calyx_core::{CxId, LedgerRef, PanelSlotId, Result, SlotId};
 
 use super::FusionContext;
 use crate::hit::{FreshnessTag, Hit, PerLensContribution, ProvenanceSource};
 use crate::index::IndexSearchHit;
-use crate::util::stub_ledger;
 
 const RRF_K: f32 = 60.0;
 
@@ -17,16 +16,18 @@ pub fn rrf_contribution(weight: f32, rank: usize) -> f32 {
 pub fn rrf_fuse(
     results: &BTreeMap<SlotId, Vec<IndexSearchHit>>,
     context: &FusionContext,
-) -> Vec<Hit> {
+    provenance: &dyn Fn(CxId) -> Result<LedgerRef>,
+) -> Result<Vec<Hit>> {
     let weights = results.keys().map(|slot| (*slot, 1.0)).collect();
-    fuse_with_weights(results, context, &weights, 1.0)
+    fuse_with_weights(results, context, &weights, 1.0, provenance)
 }
 
 pub fn rrf_fuse_restricted(
     results: &BTreeMap<SlotId, Vec<IndexSearchHit>>,
     context: &FusionContext,
     candidates: &BTreeSet<CxId>,
-) -> Vec<Hit> {
+    provenance: &dyn Fn(CxId) -> Result<LedgerRef>,
+) -> Result<Vec<Hit>> {
     let filtered = results
         .iter()
         .map(|(slot, hits)| {
@@ -39,14 +40,15 @@ pub fn rrf_fuse_restricted(
             )
         })
         .collect();
-    rrf_fuse(&filtered, context)
+    rrf_fuse(&filtered, context, provenance)
 }
 
 pub fn weighted_rrf_fuse(
     results: &BTreeMap<SlotId, Vec<IndexSearchHit>>,
     context: &FusionContext,
-) -> Vec<Hit> {
-    fuse_with_weights(results, context, &context.weights, 0.0)
+    provenance: &dyn Fn(CxId) -> Result<LedgerRef>,
+) -> Result<Vec<Hit>> {
+    fuse_with_weights(results, context, &context.weights, 0.0, provenance)
 }
 
 fn fuse_with_weights(
@@ -54,7 +56,8 @@ fn fuse_with_weights(
     context: &FusionContext,
     weights: &BTreeMap<SlotId, f32>,
     default_weight: f32,
-) -> Vec<Hit> {
+    provenance: &dyn Fn(CxId) -> Result<LedgerRef>,
+) -> Result<Vec<Hit>> {
     let mut fused = BTreeMap::<CxId, (f32, Vec<PerLensContribution>)>::new();
     for (slot, hits) in results {
         let weight = *weights.get(slot).unwrap_or(&default_weight);
@@ -66,7 +69,7 @@ fn fuse_with_weights(
             let entry = fused.entry(hit.cx_id).or_default();
             entry.0 += contribution;
             entry.1.push(PerLensContribution {
-                slot: *slot,
+                slot: PanelSlotId::new(context.panel_version, *slot),
                 rank: hit.rank,
                 raw_score: hit.score,
                 weight,
@@ -95,15 +98,15 @@ fn fuse_with_weights(
                 per_lens,
                 cross_terms_used: false,
                 guard: None,
-                provenance: stub_ledger(cx_id, idx as u64 + 1),
-                provenance_source: ProvenanceSource::Stub,
+                provenance: provenance(cx_id)?,
+                provenance_source: ProvenanceSource::Stored,
                 freshness: FreshnessTag::fresh(0),
                 explain: None,
             };
             if context.explain {
                 hit = hit.with_explain(context.strategy.name());
             }
-            hit
+            Ok(hit)
         })
         .collect()
 }

@@ -241,6 +241,46 @@ impl FromStr for SlotId {
     }
 }
 
+/// Canonical identity of one panel-local slot.
+///
+/// [`SlotId`] is deliberately compact and local to a [`crate::Panel`].  Any
+/// persisted artifact or cross-panel runtime map must therefore use this
+/// qualified identity instead of treating the local ordinal as globally
+/// meaningful.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PanelSlotId {
+    /// Version of the panel that defines the slot's meaning and shape.
+    pub panel_version: u32,
+    /// Compact slot ordinal within that panel version.
+    pub slot_id: SlotId,
+}
+
+impl PanelSlotId {
+    /// Qualifies a panel-local slot ordinal with its defining panel version.
+    pub const fn new(panel_version: u32, slot_id: SlotId) -> Self {
+        Self {
+            panel_version,
+            slot_id,
+        }
+    }
+
+    /// Returns the defining panel version.
+    pub const fn panel_version(self) -> u32 {
+        self.panel_version
+    }
+
+    /// Returns the local slot ordinal.
+    pub const fn slot_id(self) -> SlotId {
+        self.slot_id
+    }
+}
+
+impl fmt::Display for PanelSlotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "panel_{}/slot_{}", self.panel_version, self.slot_id)
+    }
+}
+
 /// A stable slot key paired with its compact panel index.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SlotKey {

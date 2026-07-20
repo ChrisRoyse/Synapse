@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CalyxError, CxId, LensId, Result, SlotId};
+use calyx_core::{CalyxError, CxId, LensId, PanelSlotId, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ impl BackfillPriority {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackfillRequest {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub lens_id: LensId,
     pub priority: BackfillPriority,
     pub candidates: Vec<CxId>,
@@ -55,7 +55,7 @@ impl Default for BackfillConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackfillBatch {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub lens_id: LensId,
     pub candidates: Vec<CxId>,
     pub throttled: bool,
@@ -63,7 +63,7 @@ pub struct BackfillBatch {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackfillWatermark {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub lens_id: LensId,
     pub priority: BackfillPriority,
     pub processed: usize,
@@ -129,7 +129,7 @@ impl BackfillScheduler {
 
     pub fn enqueue(&mut self, request: BackfillRequest) -> Result<()> {
         self.mutate_and_persist(|state| {
-            let key = request_key(request.slot_id, request.lens_id);
+            let key = request_key(request.panel_slot, request.lens_id);
             match state.requests.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(RequestState {
@@ -169,7 +169,7 @@ impl BackfillScheduler {
             }
             state.in_flight = state.request.candidates[start..end].to_vec();
             Ok(Some(BackfillBatch {
-                slot_id: state.request.slot_id,
+                panel_slot: state.request.panel_slot,
                 lens_id: state.request.lens_id,
                 candidates: state.in_flight.clone(),
                 throttled: false,
@@ -177,9 +177,14 @@ impl BackfillScheduler {
         })
     }
 
-    pub fn complete_batch(&mut self, slot_id: SlotId, lens_id: LensId, now_ms: u64) -> Result<()> {
+    pub fn complete_batch(
+        &mut self,
+        panel_slot: PanelSlotId,
+        lens_id: LensId,
+        now_ms: u64,
+    ) -> Result<()> {
         self.mutate_and_persist(|state| {
-            let key = request_key(slot_id, lens_id);
+            let key = request_key(panel_slot, lens_id);
             let request = state.requests.get_mut(&key).ok_or_else(|| {
                 CalyxError::stale_derived(format!("backfill request {key} missing"))
             })?;
@@ -204,7 +209,7 @@ impl BackfillScheduler {
             .map(|state| {
                 let total = state.request.candidates.len();
                 BackfillWatermark {
-                    slot_id: state.request.slot_id,
+                    panel_slot: state.request.panel_slot,
                     lens_id: state.request.lens_id,
                     priority: state.request.priority,
                     processed: state.next_index,
@@ -303,8 +308,8 @@ fn merge_request(existing: &mut RequestState, request: BackfillRequest) {
     }
 }
 
-fn request_key(slot_id: SlotId, lens_id: LensId) -> String {
-    format!("{slot_id}:{lens_id}")
+fn request_key(panel_slot: PanelSlotId, lens_id: LensId) -> String {
+    format!("{panel_slot}:{lens_id}")
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {

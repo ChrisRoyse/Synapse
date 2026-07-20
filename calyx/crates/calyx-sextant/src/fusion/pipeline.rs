@@ -2,8 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use calyx_core::CxId;
-use calyx_core::SlotId;
+use calyx_core::{CxId, LedgerRef, Result, SlotId};
 
 use super::FusionContext;
 use super::rrf::rrf_fuse_restricted;
@@ -21,24 +20,26 @@ pub struct PipelineOutput {
 pub fn pipeline_fuse(
     results: &BTreeMap<SlotId, Vec<IndexSearchHit>>,
     context: &FusionContext,
-) -> Vec<Hit> {
+    provenance: &dyn Fn(CxId) -> Result<LedgerRef>,
+) -> Result<Vec<Hit>> {
     if context.stage1_slots.is_empty() {
-        return Vec::new();
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_SEXTANT_RERANKER_NO_CANDIDATES,
+            "pipeline fusion requires at least one declared stage-1 slot",
+        ));
     }
     let candidates = stage1_candidates(results, &context.stage1_slots);
     if candidates.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let scoring_results = non_stage1_results(results, &context.stage1_slots);
     if scoring_results.is_empty() {
-        return rrf_fuse_restricted(results, context, &candidates);
+        return Err(crate::error::sextant_error(
+            crate::error::CALYX_SEXTANT_RERANKER_NO_CANDIDATES,
+            "pipeline fusion has no non-stage-1 scoring index",
+        ));
     }
-    let scored = rrf_fuse_restricted(&scoring_results, context, &candidates);
-    if scored.is_empty() {
-        rrf_fuse_restricted(results, context, &candidates)
-    } else {
-        scored
-    }
+    rrf_fuse_restricted(&scoring_results, context, &candidates, provenance)
 }
 
 pub fn summarize_pipeline(stage1: &[CxId], final_ids: &[CxId]) -> PipelineOutput {

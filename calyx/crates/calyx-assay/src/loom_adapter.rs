@@ -1,11 +1,12 @@
 //! Aster-backed Assay adapter for Loom materialization planning.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use calyx_core::{
-    Anchor, AnchorKind, AnchorValue, CalyxError, CxId, Result, Seq, SlotId, SlotVector, VaultStore,
+    Anchor, AnchorKind, AnchorValue, CalyxError, CxId, Panel, PanelSlotId, Result, Seq, SlotId,
+    SlotState, SlotVector, VaultStore,
 };
 use calyx_loom::{MaterializationPlan, plan_cross_terms_checked};
 
@@ -18,6 +19,8 @@ pub struct AsterAssayMaterializationGate<'a, S: VaultStore + ?Sized> {
     store: &'a S,
     snapshot: Seq,
     cx_ids: Vec<CxId>,
+    panel_version: u32,
+    active_slots: BTreeSet<SlotId>,
     anchor_kind: AnchorKind,
     assay: AssayGate,
     last_error: Mutex<Option<CalyxError>>,
@@ -28,13 +31,14 @@ impl<'a, S> AsterAssayMaterializationGate<'a, S>
 where
     S: VaultStore + ?Sized,
 {
-    pub fn new(store: &'a S, cx_ids: Vec<CxId>, anchor_kind: AnchorKind) -> Self {
-        Self::at_snapshot(store, store.snapshot(), cx_ids, anchor_kind)
+    pub fn new(store: &'a S, panel: &Panel, cx_ids: Vec<CxId>, anchor_kind: AnchorKind) -> Self {
+        Self::at_snapshot(store, store.snapshot(), panel, cx_ids, anchor_kind)
     }
 
     pub fn at_snapshot(
         store: &'a S,
         snapshot: Seq,
+        panel: &Panel,
         cx_ids: Vec<CxId>,
         anchor_kind: AnchorKind,
     ) -> Self {
@@ -42,6 +46,13 @@ where
             store,
             snapshot,
             cx_ids,
+            panel_version: panel.version,
+            active_slots: panel
+                .slots
+                .iter()
+                .filter(|slot| slot.state == SlotState::Active)
+                .map(|slot| slot.slot_id)
+                .collect(),
             anchor_kind,
             assay: AssayGate::default(),
             last_error: Mutex::new(None),
@@ -54,30 +65,32 @@ where
         self
     }
 
-    pub fn pair_gain(&self, a: SlotId, b: SlotId) -> Result<PairGain> {
+    pub fn pair_gain(&self, a: PanelSlotId, b: PanelSlotId) -> Result<PairGain> {
+        let a = self.local_slot(a)?;
+        let b = self.local_slot(b)?;
         let (left, right, labels) = self.load_pair_samples(a, b)?;
         self.assay.pair_gain(&left, &right, &labels)
     }
 
-    pub fn materialization_plan(&self, slots: &[SlotId]) -> Result<MaterializationPlan> {
+    pub fn materialization_plan(&self, slots: &[PanelSlotId]) -> Result<MaterializationPlan> {
         self.materialization_plan_cached(slots)
             .inspect_err(|error| self.record_error(error.clone()))
-    }
-
-    pub fn materialization_plan_fail_safe_lazy(&self, slots: &[SlotId]) -> MaterializationPlan {
-        match self.materialization_plan(slots) {
-            Ok(plan) => plan,
-            Err(_) => plan_cross_terms_checked(slots, |_a, _b| Ok(0.0))
-                .expect("fail-safe lazy materialization planner is infallible"),
-        }
     }
 
     pub fn error_count(&self) -> u64 {
         self.error_count.load(Ordering::Relaxed)
     }
 
-    fn materialization_plan_cached(&self, slots: &[SlotId]) -> Result<MaterializationPlan> {
-        let samples = self.load_slot_samples(slots)?;
+    fn materialization_plan_cached(
+        &self,
+        panel_slots: &[PanelSlotId],
+    ) -> Result<MaterializationPlan> {
+        let slots = panel_slots
+            .iter()
+            .copied()
+            .map(|slot| self.local_slot(slot))
+            .collect::<Result<Vec<_>>>()?;
+        let samples = self.load_slot_samples(&slots)?;
         let solo = samples
             .slots
             .iter()
@@ -87,7 +100,7 @@ where
                     .map(|signal| (*slot, signal.estimate))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        plan_cross_terms_checked(slots, |a, b| {
+        plan_cross_terms_checked(&slots, |a, b| {
             let combined = combine_samples(&samples.slots[&a], &samples.slots[&b]);
             let pair = self.assay.lens_signal(&combined, &samples.labels)?.estimate;
             Ok(pair_gain_from_estimates(&solo[&a], &solo[&b], &pair).gain_bits)
@@ -103,6 +116,12 @@ where
         let mut labels = Vec::with_capacity(self.cx_ids.len());
         for cx_id in &self.cx_ids {
             let cx = self.store.get(*cx_id, self.snapshot)?;
+            if cx.panel_version != self.panel_version {
+                return Err(CalyxError::stale_derived(format!(
+                    "assay panel {} rejected constellation {cx_id} from panel {}",
+                    self.panel_version, cx.panel_version
+                )));
+            }
             for slot in slots {
                 let vector = cx.slots.get(slot).ok_or_else(|| {
                     CalyxError::stale_derived(format!("slot {} missing for {cx_id}", slot.get()))
@@ -129,16 +148,6 @@ where
             labels,
         })
     }
-    pub fn pair_gain_bits_fail_safe_lazy(&self, a: SlotId, b: SlotId) -> f32 {
-        match self.pair_gain(a, b) {
-            Ok(gain) => gain.gain_bits,
-            Err(error) => {
-                self.record_error(error);
-                0.0
-            }
-        }
-    }
-
     pub fn last_error(&self) -> Option<CalyxError> {
         self.last_error
             .lock()
@@ -160,6 +169,12 @@ where
         let mut labels = Vec::with_capacity(self.cx_ids.len());
         for cx_id in &self.cx_ids {
             let cx = self.store.get(*cx_id, self.snapshot)?;
+            if cx.panel_version != self.panel_version {
+                return Err(CalyxError::stale_derived(format!(
+                    "assay panel {} rejected constellation {cx_id} from panel {}",
+                    self.panel_version, cx.panel_version
+                )));
+            }
             let left_vector = cx.slots.get(&a).ok_or_else(|| {
                 CalyxError::stale_derived(format!("slot {} missing for {cx_id}", a.get()))
             })?;
@@ -181,6 +196,18 @@ where
             labels.push(anchor_bool(anchor)?);
         }
         Ok((left, right, labels))
+    }
+
+    fn local_slot(&self, panel_slot: PanelSlotId) -> Result<SlotId> {
+        if panel_slot.panel_version() != self.panel_version
+            || !self.active_slots.contains(&panel_slot.slot_id())
+        {
+            return Err(CalyxError::stale_derived(format!(
+                "assay gate for panel {} rejected inactive or mismatched {panel_slot}",
+                self.panel_version
+            )));
+        }
+        Ok(panel_slot.slot_id())
     }
 }
 

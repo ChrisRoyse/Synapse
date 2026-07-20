@@ -2,21 +2,21 @@ use super::{AsterVault, encode};
 use crate::cf::ColumnFamily;
 use crate::mmap_col::MmapColumn;
 use crate::sst::arrow::{decode_column_chunk, encode_column_chunk};
-use calyx_core::{CalyxError, Clock, CxId, Result, Seq, SlotId, SlotVector};
+use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, Seq, SlotVector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const MANIFEST_MAGIC: &str = "CXSC1";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_MAGIC: &str = "CXSC2";
+const MANIFEST_VERSION: u32 = 2;
 const CHUNK_FILE: &str = "slot-column.cxa1";
 const MANIFEST_FILE: &str = "slot-column-manifest.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotColumnMaterialization {
-    pub slot: SlotId,
+    pub panel_slot: PanelSlotId,
     pub snapshot: Seq,
     pub rows: usize,
     pub dim: u32,
@@ -31,7 +31,7 @@ pub struct SlotColumnMaterialization {
 pub struct SlotColumnManifest {
     pub magic: String,
     pub version: u32,
-    pub slot: SlotId,
+    pub panel_slot: PanelSlotId,
     pub snapshot: Seq,
     pub rows: usize,
     pub dim: u32,
@@ -61,10 +61,10 @@ where
     pub fn materialize_slot_column_at(
         &self,
         snapshot: Seq,
-        slot: SlotId,
+        panel_slot: PanelSlotId,
         output_dir: impl AsRef<Path>,
     ) -> Result<SlotColumnMaterialization> {
-        let rows = self.dense_slot_rows_at(snapshot, slot)?;
+        let rows = self.dense_slot_rows_at(snapshot, panel_slot)?;
         let output_dir = output_dir.as_ref();
         fs::create_dir_all(output_dir)
             .map_err(|error| storage_error("create slot-column output dir", error))?;
@@ -86,7 +86,7 @@ where
         let manifest = SlotColumnManifest {
             magic: MANIFEST_MAGIC.to_string(),
             version: MANIFEST_VERSION,
-            slot,
+            panel_slot,
             snapshot,
             rows: rows.len(),
             dim,
@@ -100,7 +100,7 @@ where
         write_atomic(&manifest_path, &manifest_bytes)?;
 
         Ok(SlotColumnMaterialization {
-            slot,
+            panel_slot,
             snapshot,
             rows: manifest.rows,
             dim,
@@ -112,32 +112,62 @@ where
         })
     }
 
-    fn dense_slot_rows_at(&self, snapshot: Seq, slot: SlotId) -> Result<Vec<SlotColumnRow>> {
+    fn dense_slot_rows_at(
+        &self,
+        snapshot: Seq,
+        panel_slot: PanelSlotId,
+    ) -> Result<Vec<SlotColumnRow>> {
         let snapshot = self.snapshot_handle(snapshot);
-        let rows =
+        let mut expected_ids = Vec::new();
+        for (key, value) in
             self.rows
-                .scan_cf_at(snapshot.snapshot(), ColumnFamily::slot(slot), &self.clock)?;
-        if rows.is_empty() {
+                .scan_cf_at(snapshot.snapshot(), ColumnFamily::Base, &self.clock)?
+        {
+            let cx_id = cx_id_from_key(&key)?;
+            let constellation = encode::decode_constellation_base(&value)?;
+            if constellation.cx_id != cx_id {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "Base row key {cx_id} contains constellation {} while materializing {panel_slot}",
+                    constellation.cx_id
+                )));
+            }
+            if constellation.panel_version == panel_slot.panel_version()
+                && constellation.slots.contains_key(&panel_slot.slot_id())
+            {
+                expected_ids.push(cx_id);
+            }
+        }
+        if expected_ids.is_empty() {
             return Err(CalyxError::stale_derived(format!(
-                "slot {slot} has no rows to materialize"
+                "{panel_slot} has no Base memberships to materialize"
             )));
         }
 
-        let mut out = Vec::with_capacity(rows.len());
+        let values = self.read_slot_cf_batch_snapshot(
+            snapshot.snapshot(),
+            panel_slot.slot_id(),
+            &expected_ids,
+        )?;
+
+        let mut out = Vec::with_capacity(expected_ids.len());
         let mut dim = None;
-        for (key, value) in rows {
-            let cx_id = cx_id_from_key(&key)?;
+        for (cx_id, value) in expected_ids.into_iter().zip(values) {
+            let value = value.ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "physical slot row missing for {panel_slot} cx_id {cx_id}"
+                ))
+            })?;
             let vector = encode::decode_slot_vector(&value)?;
             let SlotVector::Dense { dim: row_dim, data } = vector else {
-                return Err(CalyxError::stale_derived(
-                    "slot column materialization requires dense slot vectors",
-                ));
+                return Err(CalyxError::stale_derived(format!(
+                    "{panel_slot} contains a non-dense row at cx_id {cx_id}; rebuild from the exact panel contract"
+                )));
             };
             if let Some(expected) = dim {
                 if expected != row_dim {
-                    return Err(CalyxError::aster_corrupt_shard(
-                        "slot column dense dimensions differ",
-                    ));
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "{panel_slot} dense dimensions differ: expected {expected}, found {row_dim} at cx_id {cx_id}"
+                    )));
                 }
             } else {
                 dim = Some(row_dim);

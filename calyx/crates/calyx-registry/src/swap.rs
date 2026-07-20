@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use calyx_core::{
-    Asymmetry, CalyxError, CxId, LensId, Modality, Panel, QuantPolicy, Result, Slot, SlotId,
-    SlotKey, SlotShape, SlotState, Ts,
+    Asymmetry, CalyxError, CxId, LensId, Modality, Panel, PanelSlotId, QuantPolicy, Result, Slot,
+    SlotId, SlotKey, SlotShape, SlotState, Ts,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +71,7 @@ pub struct BackfillTaskId(u64);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackfillTask {
     pub id: BackfillTaskId,
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub lens_id: LensId,
     pub cx_id: CxId,
     pub priority: u32,
@@ -184,9 +184,11 @@ impl SwapController {
             added_at_panel_version: version,
         };
         self.panel.slots.push(slot.clone());
-        let queued = self
-            .queue
-            .enqueue_many(slot.slot_id, slot.lens_id, candidates);
+        let queued = self.queue.enqueue_many(
+            PanelSlotId::new(version, slot.slot_id),
+            slot.lens_id,
+            candidates,
+        );
         Ok(AddLensOutcome {
             slot,
             panel_version: version,
@@ -221,7 +223,7 @@ impl SwapController {
             return Ok(outcome);
         }
         let request = BackfillRequest {
-            slot_id: outcome.slot.slot_id,
+            panel_slot: PanelSlotId::new(outcome.panel_version, outcome.slot.slot_id),
             lens_id: outcome.slot.lens_id,
             priority,
             candidates: candidates.iter().map(|candidate| candidate.cx_id).collect(),
@@ -268,10 +270,12 @@ impl SwapController {
                 "slot {slot_id} is retired and cannot transition to {state:?}"
             )));
         }
+        let prior_version = self.panel.version;
         let version = self.bump_panel(now)?;
         self.panel.slots[index].state = state;
         if state != SlotState::Active {
-            self.queue.cancel_slot(slot_id);
+            self.queue
+                .cancel_slot(PanelSlotId::new(prior_version, slot_id));
         }
         Ok(LifecycleOutcome {
             slot_id,
@@ -303,13 +307,18 @@ impl SwapController {
 }
 
 impl BackfillQueue {
-    pub fn enqueue_many<I>(&mut self, slot_id: SlotId, lens_id: LensId, candidates: I) -> usize
+    pub fn enqueue_many<I>(
+        &mut self,
+        panel_slot: PanelSlotId,
+        lens_id: LensId,
+        candidates: I,
+    ) -> usize
     where
         I: IntoIterator<Item = BackfillCandidate>,
     {
         let mut count = 0;
         for candidate in candidates {
-            self.enqueue(slot_id, lens_id, candidate);
+            self.enqueue(panel_slot, lens_id, candidate);
             count += 1;
         }
         count
@@ -317,7 +326,7 @@ impl BackfillQueue {
 
     pub fn enqueue(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         lens_id: LensId,
         candidate: BackfillCandidate,
     ) -> BackfillTaskId {
@@ -327,7 +336,7 @@ impl BackfillQueue {
             id,
             BackfillTask {
                 id,
-                slot_id,
+                panel_slot,
                 lens_id,
                 cx_id: candidate.cx_id,
                 priority: candidate.priority,
@@ -371,10 +380,11 @@ impl BackfillQueue {
         self.count_state(BackfillState::Complete)
     }
 
-    pub fn cancel_slot(&mut self, slot_id: SlotId) -> usize {
+    pub fn cancel_slot(&mut self, panel_slot: PanelSlotId) -> usize {
         let before = self.tasks.len();
-        self.tasks
-            .retain(|_, task| task.slot_id != slot_id || task.state == BackfillState::Complete);
+        self.tasks.retain(|_, task| {
+            task.panel_slot != panel_slot || task.state == BackfillState::Complete
+        });
         before - self.tasks.len()
     }
 

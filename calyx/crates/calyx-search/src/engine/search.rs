@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, SlotId, SlotVector};
+use calyx_core::{CalyxError, Panel, SlotId, SlotVector, VaultStore};
 use calyx_sextant::FusionContext;
 use calyx_sextant::{apply_in_region_guard_to_hits, fusion};
 
@@ -33,7 +33,7 @@ pub(super) fn search_outcome_with_measured_slots(
     fusion: FusionChoice,
     guard: GuardChoice,
     guard_tau: Option<f32>,
-    guard_panel_version: Option<u64>,
+    panel: &Panel,
     filter: Option<&str>,
     explain: bool,
     allowed_slots: Option<&BTreeSet<SlotId>>,
@@ -46,7 +46,7 @@ pub(super) fn search_outcome_with_measured_slots(
     // expensive slot search: an uncalibrated vault must fail closed with
     // CALYX_GUARD_PROVISIONAL in milliseconds, not after seconds of recall
     // (the #1103 lesson applied to #1094).
-    let resolved_guard = resolve_guard(vault, guard, guard_tau, guard_panel_version)?;
+    let resolved_guard = resolve_guard(vault, guard, guard_tau, Some(panel.version))?;
     let mut noop_trace;
     let trace = match trace {
         Some(trace) => trace,
@@ -65,11 +65,11 @@ pub(super) fn search_outcome_with_measured_slots(
         None,
         Some(vault_dir.display().to_string()),
     );
-    let indexes = match PersistedSearchIndexes::open(vault_dir) {
+    let indexes = match PersistedSearchIndexes::open(vault_dir, panel.version) {
         Ok(indexes) => indexes,
         Err(error) if is_stale_derived(&error) => {
             let read = SearchReadSnapshot::pin(vault);
-            if vault_base_count_at(vault, read.snapshot())? == 0 {
+            if vault_base_count_at(vault, read.snapshot(), panel.version)? == 0 {
                 return Ok(SearchOutcome::empty());
             }
             return Err(error);
@@ -137,10 +137,11 @@ pub(super) fn search_outcome_with_measured_slots(
     }
     let strategy = fusion.to_strategy(&slots)?;
     let context = FusionContext {
+        panel_version: panel.version,
         k: k.max(64),
         explain,
         strategy: strategy.clone(),
-        weights: weights_for(&strategy, &slots),
+        weights: weights_for(&strategy, panel, &slots)?,
         stage1_slots: stage1_slots(&strategy, query_vectors, &slots),
     };
     trace.emit_detail(
@@ -149,7 +150,16 @@ pub(super) fn search_outcome_with_measured_slots(
         Some(per_slot.values().map(Vec::len).sum()),
         Some(format!("{strategy:?}")),
     );
-    let mut hits = fusion::fuse(&per_slot, &context);
+    let mut hits = fusion::fuse(&per_slot, &context, &|cx_id| {
+        let cx = vault.get(cx_id, generation.base_seq)?;
+        if cx.panel_version != panel.version {
+            return Err(CalyxError::stale_derived(format!(
+                "search generation panel {} produced hit {cx_id} from panel {}",
+                panel.version, cx.panel_version
+            )));
+        }
+        Ok(cx.provenance)
+    })?;
     trace.emit("fusion.done", None, Some(hits.len()));
     if guard != GuardChoice::InRegion {
         trace.emit("fusion.truncate.start", None, Some(hits.len()));

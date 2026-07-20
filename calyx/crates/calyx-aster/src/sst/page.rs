@@ -1,5 +1,5 @@
 use super::level::SstLevel;
-use super::{SstEntry, SstPageReader};
+use super::{MAX_INTERSECTING_SST_PAGE_SOURCES, SstEntry, SstPageReader};
 use crate::mvcc::is_tombstone_value;
 use calyx_core::{CalyxError, Result};
 use rayon::prelude::*;
@@ -11,8 +11,6 @@ use std::collections::BinaryHeap;
 /// A flat newest-wins level must inspect one lower-bound key per intersecting
 /// file. Failing above this ceiling keeps cursor initialization bounded and
 /// makes compaction debt explicit instead of silently expanding read latency.
-const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
-
 pub(super) fn range_page(
     level: &SstLevel,
     start: &[u8],

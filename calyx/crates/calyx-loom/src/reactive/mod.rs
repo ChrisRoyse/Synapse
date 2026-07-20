@@ -18,7 +18,7 @@
 
 use std::collections::VecDeque;
 
-use calyx_core::{CxId, LedgerRef, Result, SlotId, Ts};
+use calyx_core::{CxId, LedgerRef, PanelSlotId, Result, Ts};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -75,7 +75,7 @@ pub enum TriggerCondition {
     /// evaluation meets or exceeds `drift_threshold`.
     DriftDetected {
         /// The panel slot whose agreement cosine is watched.
-        slot: SlotId,
+        slot: PanelSlotId,
         /// Absolute `|Δcosine|` at or above which the trigger fires.
         drift_threshold: f32,
     },
@@ -310,7 +310,7 @@ pub enum NoveltyVerdict {
 /// The data source the engine queries to evaluate trigger conditions against the
 /// post-ingest state. Abstracted so the engine never hard-depends on Ward, the
 /// recurrence store, or the agreement graph directly — each condition is backed
-/// by an injectable source (and unit tests inject deterministic stand-ins).
+/// by an injectable source.
 ///
 /// Implementors must **fail closed**: a source that cannot evaluate a condition
 /// returns an error (e.g. [`crate::CALYX_REACTIVE_SIGNAL_UNAVAILABLE`]) rather
@@ -325,7 +325,7 @@ pub trait ReactiveSignals {
 
     /// Absolute cosine drift `|Δcosine|` for `slot` since the previous
     /// evaluation. Errors propagate (fail closed).
-    fn slot_drift(&self, slot: SlotId) -> Result<f32>;
+    fn slot_drift(&self, slot: PanelSlotId) -> Result<f32>;
 }
 
 pub(crate) fn queue_full_error(dropped: &TriggerFired) -> calyx_core::CalyxError {

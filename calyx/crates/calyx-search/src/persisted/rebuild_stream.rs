@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use calyx_core::SlotId;
+use calyx_core::{PanelSlotId, SlotId};
 
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
@@ -46,24 +46,32 @@ pub(super) fn rebuild_for_vault_with_progress<F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
-    rebuild_for_vault_with_slot_filter(vault_dir, vault, None, progress)
+    rebuild_for_vault_with_slot_filter(vault_dir, vault, None, None, progress)
 }
 
 pub(super) fn rebuild_for_vault_with_active_slots_progress<F>(
     vault_dir: &Path,
     vault: &AsterVault,
+    panel_version: u32,
     active_slots: &BTreeSet<SlotId>,
     progress: F,
 ) -> CliResult
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
-    rebuild_for_vault_with_slot_filter(vault_dir, vault, Some(active_slots), progress)
+    rebuild_for_vault_with_slot_filter(
+        vault_dir,
+        vault,
+        Some(panel_version),
+        Some(active_slots),
+        progress,
+    )
 }
 
 fn rebuild_for_vault_with_slot_filter<F>(
     vault_dir: &Path,
     vault: &AsterVault,
+    requested_panel_version: Option<u32>,
     active_slots: Option<&BTreeSet<SlotId>>,
     mut progress: F,
 ) -> CliResult
@@ -77,25 +85,32 @@ where
     );
     let guard = PinnedReadGuard::new(vault, snapshot);
     let base_seq = guard.snapshot().seq();
-    // Stake the write-ahead rebuild intent before any index work so a kill at
-    // any later point leaves a durable, structured record. A pre-existing
-    // marker (from the mutation that made this rebuild necessary) is kept —
-    // its commit context is richer than a generic rebuild record.
-    match marker::read_rebuild_required_marker(vault_dir)? {
+    progress(RebuildProgress::phase("load_docs_start"))?;
+    let page_rows = configured_rebuild_scan_page_rows()?;
+    let base_docs = load_base_docs_at(
+        vault,
+        guard.snapshot(),
+        page_rows,
+        requested_panel_version,
+        &mut progress,
+    )?;
+    let panel_version = base_docs.panel_version();
+    // Stake the write-ahead rebuild intent before creating any derived index
+    // artifact. Base discovery above is read-only and establishes the exact
+    // panel namespace the marker must protect.
+    match marker::read_rebuild_required_marker(vault_dir, panel_version)? {
         Some(_) => progress(RebuildProgress::phase("rebuild_marker_preserved"))?,
         None => {
             let mut intent = marker::RebuildRequiredMarker::new(
+                panel_version,
                 "search_index_rebuild",
-                "full search-index rebuild in progress; derived indexes are unproven until the manifest is republished",
+                "panel-scoped search-index rebuild in progress; derived indexes are unproven until the manifest is republished",
             )?;
             intent.required_base_seq = Some(base_seq);
             marker::write_rebuild_required_marker(vault_dir, &intent)?;
             progress(RebuildProgress::phase("rebuild_marker_written"))?;
         }
     }
-    progress(RebuildProgress::phase("load_docs_start"))?;
-    let page_rows = configured_rebuild_scan_page_rows()?;
-    let base_docs = load_base_docs_at(vault, guard.snapshot(), page_rows, &mut progress)?;
     let retained_slot_payloads = base_docs.retained_slot_payloads();
     if retained_slot_payloads != 0 {
         return Err(stale(format!(
@@ -119,6 +134,7 @@ where
         &base_docs,
         RebuildOptions {
             page_rows,
+            panel_version,
             active_slots,
             build_policy,
         },
@@ -137,6 +153,7 @@ where
 #[derive(Clone, Copy)]
 struct RebuildOptions<'a> {
     page_rows: usize,
+    panel_version: u32,
     active_slots: Option<&'a BTreeSet<SlotId>>,
     build_policy: DiskAnnBuildPolicy,
 }
@@ -154,17 +171,19 @@ where
 {
     let RebuildOptions {
         page_rows,
+        panel_version,
         active_slots,
         build_policy,
     } = options;
-    let root = vault_dir.join(INDEX_ROOT);
+    let root = panel_index_root(vault_dir, panel_version);
     fs::create_dir_all(&root)?;
     let base_seq = snapshot.seq();
     progress(RebuildProgress::phase("previous_manifest_start"))?;
-    let previous_manifest = previous_manifest(vault_dir)?;
+    let previous_manifest = previous_manifest(vault_dir, panel_version)?;
     progress(RebuildProgress::phase("previous_manifest_ok"))?;
 
     let plans = slot_build_plans(
+        panel_version,
         &base_docs.ids_by_slot,
         previous_manifest.as_ref(),
         active_slots,
@@ -192,6 +211,7 @@ where
         for plan in chunk {
             progress(RebuildProgress::slot(
                 "slot_build_start",
+                panel_version,
                 plan.slot,
                 Some(plan.expected_ids.len()),
                 Some(base_seq),
@@ -219,6 +239,7 @@ where
             total_rows += built.row_count;
             progress(RebuildProgress::slot(
                 built.ok_phase(),
+                panel_version,
                 SlotId::new(built.entry.slot()),
                 Some(built.row_count),
                 Some(base_seq),
@@ -259,6 +280,7 @@ where
     let (backend, backend_source, cuvs_compiled) = manifest_backend(build_policy);
     let manifest = SearchIndexManifest {
         format: MANIFEST_FORMAT.to_string(),
+        panel_version,
         base_seq,
         diskann_build_backend: Some(backend),
         diskann_build_backend_source: Some(backend_source),
@@ -277,7 +299,7 @@ where
         base_seq: Some(base_seq),
         ..RebuildProgress::phase("manifest_validate_ok")
     })?;
-    let manifest_path = manifest_path(vault_dir);
+    let manifest_path = manifest_path(vault_dir, panel_version);
     progress(RebuildProgress::manifest(
         "manifest_write_start",
         &manifest_path,
@@ -296,7 +318,7 @@ where
     progress(RebuildProgress::phase("prune_start"))?;
     prune_stale_index_artifacts(vault_dir, &root, &manifest)?;
     progress(RebuildProgress::phase("prune_ok"))?;
-    let cleared = marker::clear_rebuild_required_marker(vault_dir, base_seq)?;
+    let cleared = marker::clear_rebuild_required_marker(vault_dir, panel_version, base_seq)?;
     progress(RebuildProgress::phase(match cleared {
         marker::MarkerClearOutcome::Cleared => "rebuild_marker_cleared",
         marker::MarkerClearOutcome::Absent => "rebuild_marker_absent",
@@ -318,7 +340,9 @@ pub(super) fn validate_staged_manifest_artifacts(
     for entry in &manifest.slots {
         let slot = SlotId::new(entry.slot);
         match entry.kind.as_str() {
-            "diskann" | "flat_dense" => dense::validate_entry(vault_dir, entry, slot)?,
+            "diskann" | "flat_dense" => {
+                dense::validate_entry(vault_dir, entry, manifest.panel_version, slot)?
+            }
             "sparse_inverted" => sparse::validate_entry(vault_dir, entry, manifest.base_seq, slot)?,
             "multi_maxsim" | "multi_maxsim_segments" => {
                 multi::validate_entry(vault_dir, entry, manifest.base_seq, slot)?
@@ -354,6 +378,7 @@ where
                 progress,
                 RebuildProgress::slot(
                     "slot_reuse_ok",
+                    plan.panel_version,
                     plan.slot,
                     Some(built.row_count),
                     Some(base_seq),
@@ -367,6 +392,7 @@ where
             progress,
             RebuildProgress::slot(
                 "slot_index_write_start",
+                plan.panel_version,
                 plan.slot,
                 Some(plan.expected_ids.len()),
                 Some(base_seq),
@@ -381,6 +407,7 @@ where
             progress,
             RebuildProgress::slot(
                 "slot_rows_loaded",
+                plan.panel_version,
                 plan.slot,
                 Some(row_count),
                 Some(base_seq),
@@ -391,7 +418,7 @@ where
         ScannedSlotRows::Dense(rows) => OptionalSearchIndexEntry::Some(dense::write_with_progress(
             vault_dir,
             root,
-            plan.slot,
+            PanelSlotId::new(plan.panel_version, plan.slot),
             rows,
             base_seq,
             build_policy,
@@ -414,6 +441,7 @@ where
             progress,
             RebuildProgress::slot(
                 "slot_index_write_ok",
+                plan.panel_version,
                 plan.slot,
                 Some(row_count),
                 Some(base_seq),

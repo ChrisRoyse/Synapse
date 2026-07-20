@@ -117,7 +117,7 @@ pub struct KernelHealth {
     pub tau_star_estimate: usize,
     pub tau_star_exact: bool,
     pub built_at_millis: u64,
-    pub panel_version: u64,
+    pub panel_version: u32,
     pub anchor_kind: Option<String>,
     pub corpus_shard_hash: String,
     pub trust: KernelTrust,

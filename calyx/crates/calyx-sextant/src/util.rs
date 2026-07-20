@@ -1,4 +1,4 @@
-use calyx_core::{CxId, LedgerRef, SlotVector};
+use calyx_core::{CxId, SlotVector};
 
 use crate::error::{CALYX_SEXTANT_VECTOR_SHAPE, sextant_error};
 
@@ -34,15 +34,6 @@ pub fn top_k(mut scored: Vec<(CxId, f32)>, k: usize) -> Vec<(CxId, f32)> {
     });
     scored.truncate(k);
     scored
-}
-
-pub fn stub_ledger(cx: CxId, seq: u64) -> LedgerRef {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(cx.as_bytes());
-    hasher.update(&seq.to_be_bytes());
-    let mut hash = [0_u8; 32];
-    hash.copy_from_slice(hasher.finalize().as_bytes());
-    LedgerRef { seq, hash }
 }
 
 pub fn event_time_secs_from_ts(ts: u64) -> Option<i64> {

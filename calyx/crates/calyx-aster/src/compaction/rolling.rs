@@ -27,7 +27,7 @@ pub(super) fn compact_shards_with_target(
     output_target_bytes: u64,
 ) -> Result<CompactionResult> {
     let debt_before = CompactionDebt::measure(inputs, DEFAULT_COMPACTION_TARGET_BYTES);
-    if inputs.len() < 2 {
+    if inputs.is_empty() || (inputs.len() < 2 && throttle.max_input_bytes.is_some()) {
         return Ok(CompactionResult::Skipped { debt: debt_before });
     }
     if let Some(max) = throttle.max_input_bytes

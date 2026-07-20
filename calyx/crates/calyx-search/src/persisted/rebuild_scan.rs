@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use calyx_aster::cf::{ColumnFamily, KeyRange};
@@ -12,7 +12,9 @@ use rayon::prelude::*;
 
 use super::super::rebuild::RebuildProgress;
 use super::super::rebuild_plan::SlotBuildPlan;
-use super::super::{CliResult, SearchIndexEntry, dense, multi, sparse, stale};
+use super::super::{
+    CALYX_SEARCH_PANEL_SCOPE_REQUIRED, CliResult, SearchIndexEntry, dense, multi, sparse, stale,
+};
 use super::{SharedRebuildProgress, emit_shared_progress};
 
 // An encoded multi-vector row may approach the 64 MiB segment ceiling.  Keep
@@ -24,6 +26,7 @@ pub(super) fn load_base_docs_at<F>(
     vault: &AsterVault,
     snapshot: Snapshot,
     page_rows: usize,
+    requested_panel_version: Option<u32>,
     progress: &mut F,
 ) -> CliResult<LoadedBaseDocs>
 where
@@ -32,6 +35,7 @@ where
     let range = all_rows();
     let mut docs = BTreeMap::new();
     let mut ids_by_slot = BTreeMap::<SlotId, Vec<CxId>>::new();
+    let mut observed_panel_versions = BTreeSet::new();
     vault.scan_cf_range_pages_snapshot(
         snapshot,
         ColumnFamily::Base,
@@ -43,6 +47,23 @@ where
                 .map(|(key, bytes)| decode_base_row(key, bytes))
                 .collect::<calyx_core::Result<Vec<_>>>()?;
             for (cx_id, mut cx) in decoded {
+                observed_panel_versions.insert(cx.panel_version);
+                if requested_panel_version.is_none() && observed_panel_versions.len() > 1 {
+                    return Err(CalyxError {
+                        code: CALYX_SEARCH_PANEL_SCOPE_REQUIRED,
+                        message: format!(
+                            "vault snapshot {} contains multiple panel versions {:?}; a bare SlotId rebuild is ambiguous",
+                            snapshot.seq(),
+                            observed_panel_versions
+                        ),
+                        remediation: "supply the exact panel version and rebuild only that panel generation",
+                    });
+                }
+                if requested_panel_version
+                    .is_some_and(|panel_version| cx.panel_version != panel_version)
+                {
+                    continue;
+                }
                 // Base rows contain a second copy of every slot payload. The
                 // rebuild plan needs only slot membership, while the index
                 // writers deliberately reread authoritative payloads from
@@ -54,7 +75,9 @@ where
                 }
                 cx.slots.clear();
                 if docs.insert(cx_id, cx).is_some() {
-                    return Err(stale(format!("base CF repeats row for cx_id {cx_id}")));
+                    return Err(
+                        stale(format!("base CF repeats row for cx_id {cx_id}")).into(),
+                    );
                 }
             }
             progress(RebuildProgress {
@@ -65,15 +88,38 @@ where
             Ok(())
         },
     )?;
-    Ok(LoadedBaseDocs { docs, ids_by_slot })
+    let panel_version = match requested_panel_version {
+        Some(panel_version) => panel_version,
+        None => observed_panel_versions
+            .first()
+            .copied()
+            .ok_or_else(|| CalyxError {
+                code: CALYX_SEARCH_PANEL_SCOPE_REQUIRED,
+                message: format!(
+                    "vault snapshot {} is empty; no panel version can be inferred for a derived index generation",
+                    snapshot.seq()
+                ),
+                remediation: "supply the exact panel version from the active panel contract",
+            })?,
+    };
+    Ok(LoadedBaseDocs {
+        panel_version,
+        docs,
+        ids_by_slot,
+    })
 }
 
 pub(super) struct LoadedBaseDocs {
+    panel_version: u32,
     pub(super) docs: BTreeMap<CxId, Constellation>,
     pub(super) ids_by_slot: BTreeMap<SlotId, Vec<CxId>>,
 }
 
 impl LoadedBaseDocs {
+    pub(super) fn panel_version(&self) -> u32 {
+        self.panel_version
+    }
+
     pub(super) fn len(&self) -> usize {
         self.docs.len()
     }
@@ -224,6 +270,7 @@ where
                     progress,
                     RebuildProgress::slot(
                         "slot_point_read_page",
+                        plan.panel_version,
                         plan.slot,
                         Some(found),
                         Some(snapshot.seq()),
@@ -394,6 +441,7 @@ where
                 )),
                 ..RebuildProgress::slot(
                     "multi_segment_write_ok",
+                    plan.panel_version,
                     plan.slot,
                     Some(flushed.total_rows),
                     Some(base_seq),

@@ -4,8 +4,8 @@ use crate::cf::ColumnFamily;
 use crate::compaction::{
     CompactionCatalog, CompactionResult, CompactionScheduler, CompactionSchedulerOptions,
     CompactionThrottle, DEFAULT_COMPACTION_TARGET_BYTES, DEFAULT_COMPACTION_TARGET_FILES,
-    RollingSstWriter, catalog_from_vault_tiers, catalog_from_vault_tiers_through_seq,
-    commit_domain_output_path, durable_compaction_slot_path,
+    RollingSstWriter, catalog_from_vault_tiers_through_seq, commit_domain_output_path,
+    durable_compaction_slot_path,
 };
 use crate::mvcc::is_tombstone_value;
 use crate::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
@@ -29,12 +29,10 @@ pub const LIVE_COMPACTION_MAX_INPUT_FILES: usize = 32_768;
 /// checksum I/O and logical merge memory while the independent file bound
 /// protects metadata/heap growth for extremely small SSTs.
 pub const LIVE_COMPACTION_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-/// Maximum native CF batches one owned maintenance pass may compact.
-///
-/// A single bounded CF rewrite is the response-deadline unit. Repeating the
-/// unit is owned by the periodic scheduler; one caller never monopolizes I/O
-/// for multiple units.
-pub const LIVE_COMPACTION_MAX_CFS_PER_PASS: usize = 1;
+/// Proactive native-CF fan-out trigger. This intentionally leaves 25% of the
+/// range-page source budget as headroom for concurrent memtable flushes.
+pub const LIVE_COMPACTION_TRIGGER_FILES: usize =
+    crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES * 3 / 4;
 
 #[derive(Debug)]
 pub struct VaultCompactionScheduler {
@@ -61,7 +59,7 @@ where
             return Ok(None);
         };
         let durable_seq = self.with_durable_commit_lock(|| {
-            self.flush_locked()?;
+            self.checkpoint_locked()?;
             self.verified_durable_coverage_seq(durable)
         })?;
         Ok(Some(Arc::new(catalog_from_vault_tiers_through_seq(
@@ -91,7 +89,7 @@ where
         let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
         let commit_lock_started = std::time::Instant::now();
         let durable_seq = self.with_durable_commit_lock(|| {
-            self.flush_locked()?;
+            self.checkpoint_locked()?;
             self.verified_durable_coverage_seq(durable)
         })?;
         let commit_lock_hold_us = commit_lock_started.elapsed().as_micros();
@@ -113,11 +111,14 @@ where
             .map(Some)
     }
 
-    /// Runs one owned, bounded native-CF fan-out maintenance pass.
+    /// Runs one owned native-CF fan-out maintenance pass.
     ///
-    /// Admission is based on reclaimable file fan-out. Total CF bytes are
-    /// telemetry, not debt: this flat immutable-file layer cannot reduce a
-    /// healthy large dataset merely by rewriting it.
+    /// Each physical rewrite remains independently file/byte bounded. The
+    /// pass drains every CF at or above the proactive source trigger because
+    /// servicing only one globally largest CF provides no readiness guarantee
+    /// to the others. One lower-debt CF may also receive routine maintenance.
+    /// Total CF bytes are telemetry, not debt: this flat immutable-file layer
+    /// cannot reduce a healthy large dataset merely by rewriting it.
     pub fn compact_native_fanout_once(&self) -> Result<Vec<CompactionResult>> {
         let Some(durable) = &self.durable else {
             return Ok(Vec::new());
@@ -125,7 +126,7 @@ where
         let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
         let commit_lock_started = std::time::Instant::now();
         let durable_seq = self.with_durable_commit_lock(|| {
-            self.flush_locked()?;
+            self.checkpoint_locked()?;
             self.verified_durable_coverage_seq(durable)
         })?;
         let commit_lock_hold_us = commit_lock_started.elapsed().as_micros();
@@ -150,9 +151,16 @@ where
                 .then_with(|| right.1.pending_files.cmp(&left.1.pending_files))
                 .then_with(|| left.0.name().cmp(&right.0.name()))
         });
+        let first_routine = candidates
+            .iter()
+            .find(|(_cf, debt)| debt.pending_files < LIVE_COMPACTION_TRIGGER_FILES)
+            .map(|(cf, _debt)| *cf);
         let selected = candidates
             .into_iter()
-            .take(LIVE_COMPACTION_MAX_CFS_PER_PASS)
+            .filter(|(cf, debt)| {
+                debt.pending_files >= LIVE_COMPACTION_TRIGGER_FILES
+                    || first_routine.is_some_and(|routine| routine == *cf)
+            })
             .collect::<Vec<_>>();
         tracing::info!(
             code = "CALYX_ASTER_NATIVE_FANOUT_MAINTENANCE_START",
@@ -160,10 +168,11 @@ where
             commit_lock_hold_us,
             catalog_scan_ms,
             selected_cfs = selected.len(),
-            max_cfs = LIVE_COMPACTION_MAX_CFS_PER_PASS,
             max_input_files_per_cf = LIVE_COMPACTION_MAX_INPUT_FILES,
             max_input_bytes_per_cf = LIVE_COMPACTION_MAX_INPUT_BYTES,
             target_files_per_cf = DEFAULT_COMPACTION_TARGET_FILES,
+            proactive_trigger_files = LIVE_COMPACTION_TRIGGER_FILES,
+            hard_page_source_limit = crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
             selected = ?selected
                 .iter()
                 .map(|(cf, debt)| (cf.name(), debt.pending_files, debt.pending_bytes, debt.score_milli))
@@ -171,15 +180,68 @@ where
             "starting bounded native-CF fan-out maintenance without retaining the durable commit lock"
         );
         let started = std::time::Instant::now();
-        let mut results = Vec::with_capacity(selected.len());
-        for (cf, _debt) in selected {
-            results.push(self.compact_catalog_cf_batch_locked(
-                durable,
-                &catalog,
-                durable_seq,
-                cf,
-                LIVE_COMPACTION_MAX_INPUT_FILES,
-            )?);
+        let mut results = Vec::new();
+        for (cf, initial_debt) in selected {
+            let readiness_required = initial_debt.pending_files >= LIVE_COMPACTION_TRIGGER_FILES;
+            loop {
+                let before = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
+                if readiness_required && before.pending_files <= DEFAULT_COMPACTION_TARGET_FILES {
+                    break;
+                }
+                let result = self.compact_catalog_cf_batch_locked(
+                    durable,
+                    &catalog,
+                    durable_seq,
+                    cf,
+                    LIVE_COMPACTION_MAX_INPUT_FILES,
+                )?;
+                let after = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
+                let made_progress = after.pending_files < before.pending_files;
+                results.push(result);
+                if !readiness_required || made_progress {
+                    if !readiness_required {
+                        break;
+                    }
+                    continue;
+                }
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_NATIVE_FANOUT_READINESS_NO_PROGRESS",
+                    message: format!(
+                        "native-CF readiness compaction for {} made no file-count progress: before_files={} after_files={} target_files={} proactive_trigger_files={} hard_page_source_limit={}",
+                        cf.name(),
+                        before.pending_files,
+                        after.pending_files,
+                        DEFAULT_COMPACTION_TARGET_FILES,
+                        LIVE_COMPACTION_TRIGGER_FILES,
+                        crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
+                    ),
+                    remediation: "inspect SST size distribution and the bounded productive-window decision; do not raise the page-source ceiling or bypass candidate paging",
+                });
+            }
+        }
+        let unsafe_cfs = catalog
+            .column_families()
+            .into_iter()
+            .filter_map(|cf| {
+                let files = catalog
+                    .debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES)
+                    .pending_files;
+                (files > crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES).then_some((cf, files))
+            })
+            .collect::<Vec<_>>();
+        if !unsafe_cfs.is_empty() {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_NATIVE_FANOUT_READINESS_UNSAFE",
+                message: format!(
+                    "native-CF maintenance ended above the range-page source limit {}: {:?}",
+                    crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
+                    unsafe_cfs
+                        .iter()
+                        .map(|(cf, files)| (cf.name(), *files))
+                        .collect::<Vec<_>>()
+                ),
+                remediation: "preserve the vault and inspect compaction logs/SST distribution; do not start range-serving workloads until every listed CF is physically below the shared source limit",
+            });
         }
         tracing::info!(
             code = "CALYX_ASTER_NATIVE_FANOUT_MAINTENANCE_DONE",
@@ -342,15 +404,22 @@ where
     /// Compacts the listed column families, prunes MVCC tombstone rows from the
     /// compacted SST, and reclaims superseded input SSTs for durable vaults.
     pub fn purge_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
-        self.with_durable_commit_lock(|| self.purge_tombstoned_cfs_locked(cfs))
+        self.with_native_compaction_guard(|| {
+            self.with_durable_commit_lock(|| self.purge_tombstoned_cfs_locked(cfs))
+        })
     }
 
     pub(crate) fn purge_tombstoned_cfs_locked(&self, cfs: &[ColumnFamily]) -> Result<()> {
         let Some(durable) = &self.durable else {
             return Ok(());
         };
-        self.flush_locked()?;
+        self.checkpoint_locked()?;
         let durable_seq = self.verified_durable_coverage_seq(durable)?;
+        let catalog = catalog_from_vault_tiers_through_seq(
+            durable.root(),
+            durable.tiering_policy(),
+            durable_seq,
+        )?;
         let mut unique = Vec::new();
         for cf in cfs {
             if !unique.contains(cf) {
@@ -358,12 +427,35 @@ where
             }
         }
         for cf in unique {
-            let Some(report) = prepare_tombstoned_cf_compaction(
-                durable.root(),
-                durable.tiering_policy(),
-                cf,
-                durable_seq,
-            )?
+            loop {
+                let before = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
+                if before.pending_files <= DEFAULT_COMPACTION_TARGET_FILES {
+                    break;
+                }
+                let result = self.compact_catalog_cf_batch_locked(
+                    durable,
+                    &catalog,
+                    durable_seq,
+                    cf,
+                    LIVE_COMPACTION_MAX_INPUT_FILES,
+                )?;
+                let after = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
+                if after.pending_files >= before.pending_files {
+                    return Err(CalyxError {
+                        code: "CALYX_ASTER_TOMBSTONE_PURGE_FANOUT_NO_PROGRESS",
+                        message: format!(
+                            "tombstone purge could not reduce {} to a bounded complete-compaction input: before_files={} after_files={} target_files={} result={result:?}",
+                            cf.name(),
+                            before.pending_files,
+                            after.pending_files,
+                            DEFAULT_COMPACTION_TARGET_FILES,
+                        ),
+                        remediation: "preserve the vault and inspect SST size/order distribution; do not prune tombstones from only a partial oldest prefix",
+                    });
+                }
+            }
+            let Some(report) =
+                prepare_tombstoned_cf_compaction(durable, &catalog, cf, durable_seq)?
             else {
                 continue;
             };
@@ -381,6 +473,17 @@ where
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn with_native_compaction_guard<T>(
+        &self,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(durable) = &self.durable else {
+            return f();
+        };
+        let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+        f()
     }
 
     pub fn start_compaction_scheduler(
@@ -431,62 +534,57 @@ fn try_acquire_native_compaction_guard(
 }
 
 fn prepare_tombstoned_cf_compaction(
-    root: &Path,
-    tiering_policy: Option<&crate::compaction::TieringPolicy>,
+    durable: &DurableVault,
+    catalog: &CompactionCatalog,
     cf: ColumnFamily,
     seq: u64,
 ) -> Result<Option<crate::compaction::CompactionReport>> {
-    let catalog = catalog_from_vault_tiers(root, tiering_policy)?;
-    let output_dir = tiering_policy.map_or_else(
-        || root.join("cf").join(cf.name()),
+    let output_dir = durable.tiering_policy().map_or_else(
+        || durable.root().join("cf").join(cf.name()),
         |policy| policy.place_current_cf(cf).absolute_dir(),
     );
     let all_inputs = catalog.shards_for_cf(cf);
-    let selected_len = bounded_oldest_prefix_len(
-        &all_inputs,
-        LIVE_COMPACTION_MAX_INPUT_FILES,
-        LIVE_COMPACTION_MAX_INPUT_BYTES,
-    );
-    let selected_inputs = all_inputs
-        .into_iter()
-        .take(selected_len)
-        .collect::<Vec<_>>();
-    if selected_inputs.len() < 2 {
+    if all_inputs.is_empty() {
         return Ok(None);
     }
-    let output = commit_domain_output_path(&output_dir, &selected_inputs)?;
-    let mut result = catalog.compact_cf_oldest_files(
-        cf,
-        output,
-        CompactionThrottle::max_input_bytes(LIVE_COMPACTION_MAX_INPUT_BYTES),
-        selected_inputs.len(),
-    )?;
+    if all_inputs.len() > DEFAULT_COMPACTION_TARGET_FILES {
+        return Err(CalyxError {
+            code: "CALYX_ASTER_TOMBSTONE_PURGE_INPUT_UNBOUNDED",
+            message: format!(
+                "complete tombstone purge for {} still has {} SST inputs after fan-out reduction; maximum complete-compaction inputs={}",
+                cf.name(),
+                all_inputs.len(),
+                DEFAULT_COMPACTION_TARGET_FILES,
+            ),
+            remediation: "inspect the preceding fan-out maintenance telemetry; never prune a tombstone without every older overlapping source",
+        });
+    }
+    let output = commit_domain_output_path(&output_dir, &all_inputs)?;
+    tracing::info!(
+        code = "CALYX_ASTER_TOMBSTONE_PURGE_FULL_COMPACTION_START",
+        cf = cf.name(),
+        input_files = all_inputs.len(),
+        input_bytes = all_inputs.iter().map(|input| input.bytes).sum::<u64>(),
+        output = %output.display(),
+        "starting complete streaming CF compaction before physical tombstone removal"
+    );
+    let mut result = catalog.compact_cf(cf, output, CompactionThrottle::unlimited())?;
     let CompactionResult::Compacted(report) = &mut result else {
         return Ok(None);
     };
-    prune_mvcc_tombstones(report)?;
+    let pruned_tombstones = prune_mvcc_tombstones(report)?;
     ensure_reclaim_outputs_manifest_bounded(&report.output_paths, seq)?;
+    tracing::info!(
+        code = "CALYX_ASTER_TOMBSTONE_PURGE_FULL_COMPACTION_DONE",
+        cf = cf.name(),
+        input_files = report.input_files,
+        input_bytes = report.input_bytes,
+        output_files = report.output_paths.len(),
+        output_bytes = report.output_bytes,
+        pruned_tombstones,
+        "completed full-CF merge and removed physical MVCC tombstones before input reclaim"
+    );
     Ok(Some((**report).clone()))
-}
-
-fn bounded_oldest_prefix_len(
-    inputs: &[crate::compaction::SstShard],
-    max_input_files: usize,
-    max_input_bytes: u64,
-) -> usize {
-    let mut selected = 0usize;
-    let mut bytes = 0u64;
-    for input in inputs.iter().take(max_input_files) {
-        let Some(projected) = bytes.checked_add(input.bytes) else {
-            break;
-        };
-        if projected > max_input_bytes {
-            break;
-        }
-        bytes = projected;
-        selected += 1;
-    }
-    selected
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,7 +783,7 @@ fn canonical_output_paths(
         .collect()
 }
 
-fn prune_mvcc_tombstones(report: &mut crate::compaction::CompactionReport) -> Result<()> {
+fn prune_mvcc_tombstones(report: &mut crate::compaction::CompactionReport) -> Result<u64> {
     rewrite_compacted_without(
         report,
         |value| Ok(is_tombstone_value(value)),
@@ -693,7 +791,7 @@ fn prune_mvcc_tombstones(report: &mut crate::compaction::CompactionReport) -> Re
     )
 }
 
-fn prune_recurrence_tombstones(report: &mut crate::compaction::CompactionReport) -> Result<()> {
+fn prune_recurrence_tombstones(report: &mut crate::compaction::CompactionReport) -> Result<u64> {
     rewrite_compacted_without(
         report,
         |value| {
@@ -710,7 +808,7 @@ fn rewrite_compacted_without(
     report: &mut crate::compaction::CompactionReport,
     should_prune: impl Fn(&[u8]) -> Result<bool>,
     reason: &str,
-) -> Result<()> {
+) -> Result<u64> {
     let mut pruned = 0_u64;
     let original_outputs = report.output_paths.clone();
     for output_path in &original_outputs {
@@ -721,7 +819,7 @@ fn rewrite_compacted_without(
         }
     }
     if pruned == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
     let seq = compaction_output_seq(&report.output_path)?;
@@ -778,7 +876,7 @@ fn rewrite_compacted_without(
             .collect::<Vec<_>>(),
         DEFAULT_COMPACTION_TARGET_BYTES,
     );
-    Ok(())
+    Ok(pruned)
 }
 
 fn compaction_output_seq(path: &Path) -> Result<u64> {

@@ -41,21 +41,22 @@ pub use marker::{
     read_rebuild_required_marker, rebuild_required_marker_path, write_rebuild_required_marker,
 };
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
-pub(crate) use rebuild::load_docs_at;
 pub use rebuild::{
     RebuildProgress, load_docs, rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
     rebuild_for_vault_with_panel_state, rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
 };
 
-const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v1";
-const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v1";
+const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v2";
+const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v2";
 const INDEX_ROOT: &str = "idx/search";
 const MANIFEST_NAME: &str = "manifest.json";
+pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_REQUIRED";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SearchIndexManifest {
     format: String,
+    panel_version: u32,
     base_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diskann_build_backend: Option<String>,
@@ -93,6 +94,7 @@ pub(crate) struct SearchIndexEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SlotIdMap {
     format: String,
+    panel_version: u32,
     slot: u16,
     ids: Vec<CxId>,
 }
@@ -120,13 +122,21 @@ pub struct PersistedSearchIndexes {
 }
 
 impl PersistedSearchIndexes {
-    pub fn open(vault_dir: &Path) -> CliResult<Self> {
-        let manifest_path = manifest_path(vault_dir);
+    pub fn open(vault_dir: &Path, panel_version: u32) -> CliResult<Self> {
+        let manifest_path = manifest_path(vault_dir, panel_version);
         if !manifest_path.is_file() {
+            let legacy = legacy_manifest_path(vault_dir);
+            if legacy.is_file() {
+                return Err(stale(format!(
+                    "legacy bare-slot search manifest exists at {} but panel {panel_version} requires {}; rebuild from Base into a panel-scoped v2 generation",
+                    legacy.display(),
+                    manifest_path.display()
+                )));
+            }
             return Err(stale(format!(
                 "persistent search index manifest missing at {}; ingest or rebuild the vault before search{}",
                 manifest_path.display(),
-                marker::marker_error_context(vault_dir)
+                marker::marker_error_context(vault_dir, panel_version)
             )));
         }
         let manifest_bytes = fs::read(&manifest_path)?;
@@ -137,6 +147,13 @@ impl PersistedSearchIndexes {
                 "persistent search index manifest {} has format {}; expected {MANIFEST_FORMAT}",
                 manifest_path.display(),
                 manifest.format
+            )));
+        }
+        if manifest.panel_version != panel_version {
+            return Err(stale(format!(
+                "persistent search index manifest {} declares panel {} but panel {panel_version} was requested; rebuild the exact panel generation",
+                manifest_path.display(),
+                manifest.panel_version
             )));
         }
         Ok(Self {
@@ -154,7 +171,14 @@ impl PersistedSearchIndexes {
     ) -> CliResult<Vec<IndexSearchHit>> {
         let entry = self.require_entry(slot)?;
         match query {
-            SlotVector::Dense { .. } => dense::search(&self.vault_dir, entry, slot, query, k),
+            SlotVector::Dense { .. } => dense::search(
+                &self.vault_dir,
+                entry,
+                self.manifest.panel_version,
+                slot,
+                query,
+                k,
+            ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
                 entry,
@@ -191,9 +215,15 @@ impl PersistedSearchIndexes {
         }
         let entry = self.require_entry(slot)?;
         match query {
-            SlotVector::Dense { .. } => {
-                dense::search_filtered(&self.vault_dir, entry, slot, query, k, candidates)
-            }
+            SlotVector::Dense { .. } => dense::search_filtered(
+                &self.vault_dir,
+                entry,
+                self.manifest.panel_version,
+                slot,
+                query,
+                k,
+                candidates,
+            ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
                 entry,
@@ -445,8 +475,18 @@ impl SearchIndexEntry {
     }
 }
 
-fn manifest_path(vault_dir: &Path) -> PathBuf {
+fn panel_index_root(vault_dir: &Path, panel_version: u32) -> PathBuf {
+    vault_dir
+        .join(INDEX_ROOT)
+        .join(format!("panel_{panel_version:010}"))
+}
+
+fn legacy_manifest_path(vault_dir: &Path) -> PathBuf {
     vault_dir.join(INDEX_ROOT).join(MANIFEST_NAME)
+}
+
+fn manifest_path(vault_dir: &Path, panel_version: u32) -> PathBuf {
+    panel_index_root(vault_dir, panel_version).join(MANIFEST_NAME)
 }
 
 #[path = "persisted/io.rs"]

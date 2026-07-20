@@ -5,9 +5,11 @@ use crate::dedup::{EpochSecs, OccurrenceId};
 use crate::vault::{AsterVault, encode};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, VaultStore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 pub const CALYX_RECURRENCE_CONTEXT_TOO_LARGE: &str = "CALYX_RECURRENCE_CONTEXT_TOO_LARGE";
 pub const CALYX_RECURRENCE_INVALID_RETENTION: &str = "CALYX_RECURRENCE_INVALID_RETENTION";
+pub const CALYX_RECURRENCE_OCCURRENCE_CONFLICT: &str = "CALYX_RECURRENCE_OCCURRENCE_CONFLICT";
 pub const MAX_CONTEXT_BYTES: usize = 256;
 pub const DEFAULT_MAX_OCCURRENCES: usize = 10_000;
 pub const DEFAULT_MAX_AGE_SECS: u64 = 365 * 86_400;
@@ -41,6 +43,23 @@ pub struct Occurrence {
     pub id: OccurrenceId,
     pub t_k: EpochSecs,
     pub context: OccurrenceContext,
+    /// Caller-stable identity for idempotent event projection. `None` is
+    /// reserved for legacy/unkeyed Calyx callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecurrenceAppendDisposition {
+    Inserted,
+    ExistingIdentical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrenceAppendOutcome {
+    pub occurrence_id: OccurrenceId,
+    pub disposition: RecurrenceAppendDisposition,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -118,7 +137,12 @@ pub enum StoredRecurrenceRow {
     RollupSummary(RollupSummary),
     RolledOccurrence {
         id: OccurrenceId,
-        rolled_into: OccurrenceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedup_key_sha256: Option<[u8; 32]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        t_k: Option<EpochSecs>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_sha256: Option<[u8; 32]>,
     },
     Tombstone {
         id: OccurrenceId,
@@ -147,10 +171,66 @@ where
         let base = read_base(vault, cx_id)?.ok_or_else(|| {
             CalyxError::stale_derived("recurrence append requires an existing constellation")
         })?;
-        let append = build_append(vault, base, t_k, context, observed_at, retention)?;
+        let append = build_append(vault, base, t_k, context, observed_at, retention, None)?;
         let occurrence_id = append.occurrence_id;
         vault.commit_recurrence_batch_locked(append.recurrence_rows, Some(append.updated_base))?;
         Ok(occurrence_id)
+    })
+}
+
+/// Appends one occurrence exactly once for a caller-stable identity.
+///
+/// A retry with the same identity, timestamp, and context is an idempotent
+/// read. Reusing an identity for different evidence fails closed before any
+/// row is committed. The identity survives active-row rollup, so replaying old
+/// source events cannot inflate frequency after retention compaction.
+pub fn append_occurrence_once<C>(
+    vault: &AsterVault<C>,
+    cx_id: CxId,
+    t_k: EpochSecs,
+    context: OccurrenceContext,
+    observed_at: EpochSecs,
+    retention: RetentionPolicy,
+    dedup_key_sha256: [u8; 32],
+) -> Result<RecurrenceAppendOutcome>
+where
+    C: Clock,
+{
+    vault.with_recurrence_write_lock(|| {
+        let base = read_base(vault, cx_id)?.ok_or_else(|| {
+            CalyxError::stale_derived("recurrence append requires an existing constellation")
+        })?;
+        let existing = read_rows(vault, cx_id)?;
+        if let Some(existing) = existing.dedup_evidence(dedup_key_sha256) {
+            if existing.matches(t_k, &context) {
+                return Ok(RecurrenceAppendOutcome {
+                    occurrence_id: existing.id,
+                    disposition: RecurrenceAppendDisposition::ExistingIdentical,
+                });
+            }
+            return Err(recurrence_error(
+                CALYX_RECURRENCE_OCCURRENCE_CONFLICT,
+                format!(
+                    "recurrence occurrence identity {} for {cx_id} was reused with different timestamp or context",
+                    hex32(dedup_key_sha256)
+                ),
+            ));
+        }
+        let append = build_append(
+            vault,
+            base,
+            t_k,
+            context,
+            observed_at,
+            retention,
+            Some(dedup_key_sha256),
+        )?;
+        let occurrence_id = append.occurrence_id;
+        vault.commit_recurrence_batch_locked(append.recurrence_rows, Some(append.updated_base))?;
+        Ok(RecurrenceAppendOutcome {
+            occurrence_id,
+            disposition: RecurrenceAppendDisposition::Inserted,
+        })
     })
 }
 
@@ -161,6 +241,7 @@ pub(crate) fn build_append<C>(
     context: OccurrenceContext,
     observed_at: EpochSecs,
     retention: RetentionPolicy,
+    dedup_key_sha256: Option<[u8; 32]>,
 ) -> Result<RecurrenceAppend>
 where
     C: Clock,
@@ -180,6 +261,7 @@ where
         id: occurrence_id,
         t_k,
         context,
+        dedup_key_sha256,
     };
 
     let mut active = existing.occurrences;
@@ -195,7 +277,12 @@ where
     for occurrence in &rolled {
         recurrence_rows.push((
             recurrence_key(base.cx_id, occurrence.id.0),
-            encode_recurrence_row(&StoredRecurrenceRow::Tombstone { id: occurrence.id })?,
+            encode_recurrence_row(&StoredRecurrenceRow::RolledOccurrence {
+                id: occurrence.id,
+                dedup_key_sha256: occurrence.dedup_key_sha256,
+                t_k: Some(occurrence.t_k),
+                context_sha256: Some(sha256(&occurrence.context.bytes)),
+            })?,
         ));
     }
     if let Some(summary) = &summary {
@@ -295,6 +382,7 @@ fn read_rows_with_stats<C: Clock>(
 ) -> Result<(SeriesRows, RecurrenceReadStats)> {
     let range = recurrence_prefix_range(cx_id);
     let mut occurrences = Vec::new();
+    let mut rolled_occurrences = Vec::new();
     let mut rollup_summary = None;
     let mut has_tombstone = false;
     let mut stats = RecurrenceReadStats::default();
@@ -311,7 +399,22 @@ fn read_rows_with_stats<C: Clock>(
                 stats.rollup_summary_rows += 1;
                 rollup_summary = Some(summary);
             }
-            StoredRecurrenceRow::RolledOccurrence { .. } => stats.rolled_occurrence_rows += 1,
+            StoredRecurrenceRow::RolledOccurrence {
+                id,
+                dedup_key_sha256,
+                t_k,
+                context_sha256,
+            } => {
+                stats.rolled_occurrence_rows += 1;
+                if let Some(dedup_key_sha256) = dedup_key_sha256 {
+                    rolled_occurrences.push(RolledOccurrenceEvidence {
+                        id,
+                        dedup_key_sha256,
+                        t_k,
+                        context_sha256,
+                    });
+                }
+            }
             StoredRecurrenceRow::Tombstone { .. } => {
                 stats.tombstone_rows += 1;
                 has_tombstone = true;
@@ -322,6 +425,7 @@ fn read_rows_with_stats<C: Clock>(
     Ok((
         SeriesRows {
             occurrences,
+            rolled_occurrences,
             rollup_summary,
             has_tombstone,
         },
@@ -332,8 +436,30 @@ fn read_rows_with_stats<C: Clock>(
 #[derive(Debug)]
 struct SeriesRows {
     occurrences: Vec<Occurrence>,
+    rolled_occurrences: Vec<RolledOccurrenceEvidence>,
     rollup_summary: Option<RollupSummary>,
     has_tombstone: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RolledOccurrenceEvidence {
+    id: OccurrenceId,
+    dedup_key_sha256: [u8; 32],
+    t_k: Option<EpochSecs>,
+    context_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExistingOccurrenceEvidence {
+    id: OccurrenceId,
+    t_k: Option<EpochSecs>,
+    context_sha256: Option<[u8; 32]>,
+}
+
+impl ExistingOccurrenceEvidence {
+    fn matches(self, t_k: EpochSecs, context: &OccurrenceContext) -> bool {
+        self.t_k == Some(t_k) && self.context_sha256 == Some(sha256(&context.bytes))
+    }
 }
 
 impl SeriesRows {
@@ -344,6 +470,35 @@ impl SeriesRows {
                 .as_ref()
                 .map_or(0, |summary| summary.count_rolled)
     }
+
+    fn dedup_evidence(&self, key: [u8; 32]) -> Option<ExistingOccurrenceEvidence> {
+        self.occurrences
+            .iter()
+            .find(|occurrence| occurrence.dedup_key_sha256 == Some(key))
+            .map(|occurrence| ExistingOccurrenceEvidence {
+                id: occurrence.id,
+                t_k: Some(occurrence.t_k),
+                context_sha256: Some(sha256(&occurrence.context.bytes)),
+            })
+            .or_else(|| {
+                self.rolled_occurrences
+                    .iter()
+                    .find(|occurrence| occurrence.dedup_key_sha256 == key)
+                    .map(|occurrence| ExistingOccurrenceEvidence {
+                        id: occurrence.id,
+                        t_k: occurrence.t_k,
+                        context_sha256: occurrence.context_sha256,
+                    })
+            })
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn hex32(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn frequency_from_base(cx: &Constellation) -> Result<Option<u64>> {
@@ -435,6 +590,9 @@ fn recurrence_error(code: &'static str, message: impl Into<String>) -> CalyxErro
     let remediation = match code {
         CALYX_RECURRENCE_CONTEXT_TOO_LARGE => "store only a bounded recurrence context blob",
         CALYX_RECURRENCE_INVALID_RETENTION => "use a positive recurrence max_occurrences value",
+        CALYX_RECURRENCE_OCCURRENCE_CONFLICT => {
+            "reuse an occurrence identity only for byte-identical event evidence"
+        }
         _ => "inspect recurrence series inputs",
     };
     CalyxError {

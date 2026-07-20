@@ -48,21 +48,21 @@ pub enum LodestarError {
     #[error("CALYX_KERNEL_LOOM_SLOT_MAPPING_MISSING: no CxId mapping for {xterm_cx}/{slot}")]
     KernelLoomSlotMappingMissing {
         xterm_cx: calyx_core::CxId,
-        slot: calyx_core::SlotId,
+        slot: calyx_core::PanelSlotId,
     },
     #[error(
         "CALYX_KERNEL_LOOM_DIRECTIONAL_CONFIDENCE_MISSING: no directional confidence for {xterm_cx}/{a}->{b}"
     )]
     KernelLoomDirectionalConfidenceMissing {
         xterm_cx: calyx_core::CxId,
-        a: calyx_core::SlotId,
-        b: calyx_core::SlotId,
+        a: calyx_core::PanelSlotId,
+        b: calyx_core::PanelSlotId,
     },
     #[error("CALYX_KERNEL_LOOM_AGREEMENT_MISSING: no agreement xterm for {xterm_cx}/{a}<->{b}")]
     KernelLoomAgreementMissing {
         xterm_cx: calyx_core::CxId,
-        a: calyx_core::SlotId,
-        b: calyx_core::SlotId,
+        a: calyx_core::PanelSlotId,
+        b: calyx_core::PanelSlotId,
     },
     #[error("CALYX_KERNEL_LOOM_AGREEMENT_INVALID: {detail}")]
     KernelLoomAgreementInvalid { detail: String },

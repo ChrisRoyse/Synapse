@@ -28,7 +28,7 @@ pub use consent::{
 pub use cosine::{GuardTauProfile, dense_cosine};
 pub use enums::{AbsentReason, AnchorKind, Asymmetry, Modality, QuantPolicy, SlotShape, SlotState};
 pub use error::{CALYX_ERROR_CODES, CalyxError, CalyxErrorCode, CalyxWarning, Result};
-pub use ids::{CxId, LensId, ParseIdError, SlotId, SlotKey, VaultId, content_address};
+pub use ids::{CxId, LensId, PanelSlotId, ParseIdError, SlotId, SlotKey, VaultId, content_address};
 pub use media::{
     CALYX_MEDIA_ARTIFACT_COLLISION, CALYX_MEDIA_ARTIFACT_INVALID, CALYX_MEDIA_DERIVED_TEXT_FAILED,
     CALYX_MEDIA_DERIVED_TEXT_INVALID, CALYX_MEDIA_DERIVED_TEXT_RUNTIME_MISSING,

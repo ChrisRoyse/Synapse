@@ -4,21 +4,21 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CxId, Result, SlotId};
+use calyx_core::{CxId, PanelSlotId, Result, SlotId};
 
 use super::{DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams};
 use crate::error::{
     CALYX_INDEX_DIM_MISMATCH, CALYX_INDEX_INVALID_PARAMS, CALYX_INDEX_IO, sextant_error,
 };
 
-const KEYS_MAGIC: [u8; 8] = *b"CLXXTRM1";
-const KEYS_FORMAT_VERSION: u32 = 1;
+const KEYS_MAGIC: [u8; 8] = *b"CLXXTRM2";
+const KEYS_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConcatCrossTermKey {
     pub cx_id: CxId,
-    pub a: SlotId,
-    pub b: SlotId,
+    pub a: PanelSlotId,
+    pub b: PanelSlotId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +29,7 @@ pub struct ConcatCrossTermHit {
 
 #[derive(Debug)]
 pub struct ConcatCrossTermDiskAnn {
+    panel_version: u32,
     dim: u32,
     root: PathBuf,
     graph: DiskAnnSearch,
@@ -43,7 +44,7 @@ impl ConcatCrossTermDiskAnn {
         build_params: DiskAnnBuildParams,
         default_search: DiskAnnSearchParams,
     ) -> Result<Self> {
-        validate_rows(rows, build_params.dim)?;
+        let panel_version = validate_rows(rows, build_params.dim)?;
         let root = root.into();
         fs::create_dir_all(&root).map_err(|e| io("create concat index dir", e))?;
         let graph_rows: Vec<_> = rows
@@ -61,6 +62,7 @@ impl ConcatCrossTermDiskAnn {
         let keys: Vec<_> = rows.iter().map(|(key, _)| *key).collect();
         write_keys(&keys_path(&root), build_params.dim as u32, &keys)?;
         Ok(Self {
+            panel_version,
             dim: build_params.dim as u32,
             root,
             graph,
@@ -72,6 +74,7 @@ impl ConcatCrossTermDiskAnn {
     pub fn open(root: impl Into<PathBuf>, default_search: DiskAnnSearchParams) -> Result<Self> {
         let root = root.into();
         let (dim, keys) = read_keys(&keys_path(&root))?;
+        let panel_version = validate_key_panels(&keys)?;
         let graph = DiskAnnSearch::open(
             SlotId::new(0),
             graph_path(&root),
@@ -80,6 +83,7 @@ impl ConcatCrossTermDiskAnn {
             default_search,
         )?;
         Ok(Self {
+            panel_version,
             dim,
             root,
             graph,
@@ -90,6 +94,10 @@ impl ConcatCrossTermDiskAnn {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub const fn panel_version(&self) -> u32 {
+        self.panel_version
     }
 
     pub fn graph_path(&self) -> PathBuf {
@@ -130,12 +138,13 @@ impl ConcatCrossTermDiskAnn {
     }
 }
 
-fn validate_rows(rows: &[(ConcatCrossTermKey, Vec<f32>)], dim: usize) -> Result<()> {
+fn validate_rows(rows: &[(ConcatCrossTermKey, Vec<f32>)], dim: usize) -> Result<u32> {
     if rows.is_empty() {
         return Err(invalid(
             "empty input: at least one concat cross-term is required",
         ));
     }
+    let panel_version = validate_key_panels(&rows.iter().map(|(key, _)| *key).collect::<Vec<_>>())?;
     for (idx, (_, vector)) in rows.iter().enumerate() {
         if vector.len() != dim {
             return Err(sextant_error(
@@ -149,7 +158,23 @@ fn validate_rows(rows: &[(ConcatCrossTermKey, Vec<f32>)], dim: usize) -> Result<
             )));
         }
     }
-    Ok(())
+    Ok(panel_version)
+}
+
+fn validate_key_panels(keys: &[ConcatCrossTermKey]) -> Result<u32> {
+    let first = keys
+        .first()
+        .ok_or_else(|| invalid("empty concat cross-term key set"))?;
+    let panel_version = first.a.panel_version();
+    for key in keys {
+        if key.a.panel_version() != panel_version || key.b.panel_version() != panel_version {
+            return Err(invalid(format!(
+                "concat xterm index mixes {} and {} with required panel {panel_version}",
+                key.a, key.b
+            )));
+        }
+    }
+    Ok(panel_version)
 }
 
 fn write_keys(path: &Path, dim: u32, keys: &[ConcatCrossTermKey]) -> Result<()> {
@@ -165,9 +190,13 @@ fn write_keys(path: &Path, dim: u32, keys: &[ConcatCrossTermKey]) -> Result<()> 
     for key in keys {
         out.write_all(key.cx_id.as_bytes())
             .map_err(|e| io("write key cx", e))?;
-        out.write_all(&key.a.get().to_le_bytes())
+        out.write_all(&key.a.panel_version().to_le_bytes())
+            .map_err(|e| io("write key panel a", e))?;
+        out.write_all(&key.a.slot_id().get().to_le_bytes())
             .map_err(|e| io("write key slot a", e))?;
-        out.write_all(&key.b.get().to_le_bytes())
+        out.write_all(&key.b.panel_version().to_le_bytes())
+            .map_err(|e| io("write key panel b", e))?;
+        out.write_all(&key.b.slot_id().get().to_le_bytes())
             .map_err(|e| io("write key slot b", e))?;
     }
     out.into_inner()
@@ -187,7 +216,7 @@ fn read_keys(path: &Path) -> Result<(u32, Vec<ConcatCrossTermKey>)> {
     }
     let dim = u32::from_le_bytes(bytes[12..16].try_into().expect("4B"));
     let count = u64::from_le_bytes(bytes[16..24].try_into().expect("8B")) as usize;
-    let expected = 24 + count * 20;
+    let expected = 24 + count * 28;
     if bytes.len() != expected {
         return Err(invalid(format!(
             "concat key sidecar len {} != {expected}",
@@ -195,13 +224,19 @@ fn read_keys(path: &Path) -> Result<(u32, Vec<ConcatCrossTermKey>)> {
         )));
     }
     let mut keys = Vec::with_capacity(count);
-    for chunk in bytes[24..].chunks_exact(20) {
+    for chunk in bytes[24..].chunks_exact(28) {
         let mut id = [0_u8; 16];
         id.copy_from_slice(&chunk[..16]);
         keys.push(ConcatCrossTermKey {
             cx_id: CxId::from_bytes(id),
-            a: SlotId::new(u16::from_le_bytes(chunk[16..18].try_into().expect("2B"))),
-            b: SlotId::new(u16::from_le_bytes(chunk[18..20].try_into().expect("2B"))),
+            a: PanelSlotId::new(
+                u32::from_le_bytes(chunk[16..20].try_into().expect("4B")),
+                SlotId::new(u16::from_le_bytes(chunk[20..22].try_into().expect("2B"))),
+            ),
+            b: PanelSlotId::new(
+                u32::from_le_bytes(chunk[22..26].try_into().expect("4B")),
+                SlotId::new(u16::from_le_bytes(chunk[26..28].try_into().expect("2B"))),
+            ),
         });
     }
     Ok((dim, keys))

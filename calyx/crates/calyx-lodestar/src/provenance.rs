@@ -1,7 +1,7 @@
 //! Ledger-backed Lodestar provenance writers.
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Clock, CxId, LedgerRef, SlotId};
+use calyx_core::{Clock, CxId, LedgerRef, PanelSlotId};
 use calyx_ledger::{
     ActorId, EntryKind, LedgerAppender, LedgerCfStore, PayloadBuilder, RedactionPolicy, SubjectId,
 };
@@ -25,7 +25,7 @@ pub struct KernelAnswerRecordContext {
     pub query_input_sha256: [u8; 32],
     pub query_input_pointer: String,
     pub kernel_manifest_sha256: [u8; 32],
-    pub embedding_slot: SlotId,
+    pub embedding_slot: PanelSlotId,
     pub nearest_similarity: f32,
     pub admission_threshold: f32,
     pub resident_addr: String,
@@ -357,7 +357,10 @@ fn kernel_answer_complete_payload(
     );
     object.insert(
         "embedding_slot".to_string(),
-        json!(context.embedding_slot.get()),
+        json!({
+            "panel_version": context.embedding_slot.panel_version(),
+            "slot_id": context.embedding_slot.slot_id().get(),
+        }),
     );
     object.insert(
         "nearest_similarity".to_string(),

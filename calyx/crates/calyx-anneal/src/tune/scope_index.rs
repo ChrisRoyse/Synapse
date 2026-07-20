@@ -4,7 +4,7 @@ mod writer;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use calyx_core::{CalyxError, Result, SlotId};
+use calyx_core::{CalyxError, PanelSlotId, Result};
 use calyx_forge::AutotuneCache;
 
 use crate::{
@@ -41,14 +41,14 @@ struct PromotionMetrics {
 }
 
 pub trait IndexSlotHealth {
-    fn is_slot_parked(&self, slot_id: SlotId) -> bool;
+    fn is_slot_parked(&self, panel_slot: PanelSlotId) -> bool;
 }
 
 #[derive(Clone, Copy, Default)]
 pub struct NoopIndexSlotHealth;
 
 impl IndexSlotHealth for NoopIndexSlotHealth {
-    fn is_slot_parked(&self, _slot_id: SlotId) -> bool {
+    fn is_slot_parked(&self, _panel_slot: PanelSlotId) -> bool {
         false
     }
 }
@@ -57,9 +57,9 @@ impl<S> IndexSlotHealth for DegradeRegistry<S>
 where
     S: HealthStorage,
 {
-    fn is_slot_parked(&self, slot_id: SlotId) -> bool {
+    fn is_slot_parked(&self, panel_slot: PanelSlotId) -> bool {
         matches!(
-            self.health(&ComponentKind::ann_index(slot_id)),
+            self.health(&ComponentKind::ann_index(panel_slot)),
             ComponentHealth::Parked { .. }
         )
     }
@@ -69,8 +69,8 @@ impl<T> IndexSlotHealth for &T
 where
     T: IndexSlotHealth + ?Sized,
 {
-    fn is_slot_parked(&self, slot_id: SlotId) -> bool {
-        (**self).is_slot_parked(slot_id)
+    fn is_slot_parked(&self, panel_slot: PanelSlotId) -> bool {
+        (**self).is_slot_parked(panel_slot)
     }
 }
 
@@ -92,16 +92,16 @@ pub struct IndexScopeTuner<
     B: IndexBanditPersistence,
     H: IndexSlotHealth,
 {
-    pub bandits: HashMap<SlotId, ConfigBandit>,
+    pub bandits: HashMap<PanelSlotId, ConfigBandit>,
     pub assay: Arc<dyn AssayMetrics>,
     pub cache: Arc<Mutex<AutotuneCache>>,
     promotion_writer: W,
     bandit_store: B,
     health: H,
-    pending_arms: HashMap<SlotId, usize>,
-    incumbent_latency_ns: HashMap<SlotId, u64>,
-    incumbent_recall: HashMap<SlotId, f64>,
-    incumbent_bits: HashMap<SlotId, f64>,
+    pending_arms: HashMap<PanelSlotId, usize>,
+    incumbent_latency_ns: HashMap<PanelSlotId, u64>,
+    incumbent_recall: HashMap<PanelSlotId, f64>,
+    incumbent_bits: HashMap<PanelSlotId, f64>,
     recall_target: f32,
     next_change_id: u64,
     promotions: Vec<IndexPromotionRecord>,
@@ -165,32 +165,32 @@ where
 
     pub fn on_search(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         p99_ns: u64,
         recall_k: f64,
         bits_per_anchor: f64,
     ) -> Result<IndexTuneDecision> {
-        if self.health.is_slot_parked(slot_id) {
-            return self.parked_decision(slot_id);
+        if self.health.is_slot_parked(panel_slot) {
+            return self.parked_decision(panel_slot);
         }
-        self.ensure_bandit(slot_id)?;
+        self.ensure_bandit(panel_slot)?;
         let arm = self
             .pending_arms
-            .remove(&slot_id)
-            .unwrap_or(self.bandits[&slot_id].incumbent_idx);
-        self.on_search_for_arm(slot_id, arm, p99_ns, recall_k, bits_per_anchor)
+            .remove(&panel_slot)
+            .unwrap_or(self.bandits[&panel_slot].incumbent_idx);
+        self.on_search_for_arm(panel_slot, arm, p99_ns, recall_k, bits_per_anchor)
     }
 
     pub fn on_search_for_arm(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         arm_idx: usize,
         p99_ns: u64,
         recall_k: f64,
         bits_per_anchor: f64,
     ) -> Result<IndexTuneDecision> {
         self.on_search_for_arm_with_quant_evidence(
-            slot_id,
+            panel_slot,
             arm_idx,
             p99_ns,
             recall_k,
@@ -201,21 +201,21 @@ where
 
     pub fn on_search_for_arm_with_quant_evidence(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         arm_idx: usize,
         p99_ns: u64,
         recall_k: f64,
         bits_per_anchor: f64,
         quant_evidence: Option<QuantPromotionEvidence>,
     ) -> Result<IndexTuneDecision> {
-        if self.health.is_slot_parked(slot_id) {
-            return self.parked_decision(slot_id);
+        if self.health.is_slot_parked(panel_slot) {
+            return self.parked_decision(panel_slot);
         }
-        self.ensure_bandit(slot_id)?;
-        let prior_idx = self.bandits[&slot_id].incumbent_idx;
-        let prior_config = self.config_for_arm(slot_id, prior_idx)?;
+        self.ensure_bandit(panel_slot)?;
+        let prior_idx = self.bandits[&panel_slot].incumbent_idx;
+        let prior_config = self.config_for_arm(panel_slot, prior_idx)?;
         let won = self.arm_won(
-            slot_id,
+            panel_slot,
             arm_idx,
             p99_ns,
             recall_k,
@@ -223,58 +223,58 @@ where
             quant_evidence.as_ref(),
         )?;
         self.bandits
-            .get_mut(&slot_id)
+            .get_mut(&panel_slot)
             .expect("bandit ensured")
             .record_result(arm_idx, won)?;
 
-        let new_idx = self.bandits[&slot_id].incumbent_idx;
+        let new_idx = self.bandits[&panel_slot].incumbent_idx;
         let promoted = if new_idx != prior_idx {
-            let new_config = self.config_for_arm(slot_id, new_idx)?;
+            let new_config = self.config_for_arm(panel_slot, new_idx)?;
             let metrics = PromotionMetrics {
                 latency_before_ns: self
                     .incumbent_latency_ns
-                    .get(&slot_id)
+                    .get(&panel_slot)
                     .copied()
                     .unwrap_or(p99_ns),
                 latency_after_ns: p99_ns,
                 recall_before: self
                     .incumbent_recall
-                    .get(&slot_id)
+                    .get(&panel_slot)
                     .copied()
                     .unwrap_or(recall_k),
                 recall_after: recall_k,
                 bits_before: self
                     .incumbent_bits
-                    .get(&slot_id)
+                    .get(&panel_slot)
                     .copied()
                     .unwrap_or(bits_per_anchor),
                 bits_after: bits_per_anchor,
                 quant_evidence,
             };
-            self.record_incumbent_metrics(slot_id, p99_ns, recall_k, bits_per_anchor);
-            Some(self.promote_with_metrics(slot_id, prior_config, new_config, metrics)?)
+            self.record_incumbent_metrics(panel_slot, p99_ns, recall_k, bits_per_anchor);
+            Some(self.promote_with_metrics(panel_slot, prior_config, new_config, metrics)?)
         } else {
             if arm_idx == prior_idx && metrics_are_valid(recall_k, bits_per_anchor) {
-                self.record_incumbent_metrics(slot_id, p99_ns, recall_k, bits_per_anchor);
+                self.record_incumbent_metrics(panel_slot, p99_ns, recall_k, bits_per_anchor);
             }
             None
         };
 
-        self.save_bandit(slot_id)?;
+        self.save_bandit(panel_slot)?;
         let shadow_arm = self
             .bandits
-            .get_mut(&slot_id)
+            .get_mut(&panel_slot)
             .expect("bandit ensured")
             .select_arm()?;
-        self.pending_arms.insert(slot_id, shadow_arm);
+        self.pending_arms.insert(panel_slot, shadow_arm);
         let shadow_candidate = (shadow_arm != new_idx)
-            .then(|| self.config_for_arm(slot_id, shadow_arm))
+            .then(|| self.config_for_arm(panel_slot, shadow_arm))
             .transpose()?;
 
         Ok(IndexTuneDecision {
             evaluated_arm: arm_idx,
             won,
-            incumbent: self.get_incumbent_config(slot_id)?,
+            incumbent: self.get_incumbent_config(panel_slot)?,
             promoted,
             shadow_arm: Some(shadow_arm),
             shadow_candidate,
@@ -282,25 +282,30 @@ where
         })
     }
 
-    pub fn install_candidates(&mut self, slot_id: SlotId, configs: Vec<IndexConfig>) -> Result<()> {
+    pub fn install_candidates(
+        &mut self,
+        panel_slot: PanelSlotId,
+        configs: Vec<IndexConfig>,
+    ) -> Result<()> {
         if configs.is_empty() || configs.len() > MAX_INDEX_CANDIDATES {
             return Err(invalid_config(
                 "Index candidate set must contain 1..=8 configs",
             ));
         }
-        let mut bandit = ConfigBandit::new(BanditPolicy::Thompson, types::seed_for_slot(slot_id));
+        let mut bandit =
+            ConfigBandit::new(BanditPolicy::Thompson, types::seed_for_slot(panel_slot));
         for config in configs {
             validate_index_config(&config)?;
             bandit.add_arm(encode_index_config(&config)?);
         }
-        let key_hash = shape_key_hash(&index_slot_label(slot_id));
+        let key_hash = shape_key_hash(&index_slot_label(panel_slot));
         self.bandit_store.save_bandit(key_hash, &bandit)?;
-        self.bandits.insert(slot_id, bandit);
+        self.bandits.insert(panel_slot, bandit);
         Ok(())
     }
 
-    pub fn get_incumbent_config(&self, slot_id: SlotId) -> Result<IndexConfig> {
-        if let Some(bandit) = self.bandits.get(&slot_id)
+    pub fn get_incumbent_config(&self, panel_slot: PanelSlotId) -> Result<IndexConfig> {
+        if let Some(bandit) = self.bandits.get(&panel_slot)
             && !bandit.arms.is_empty()
         {
             return decode_index_config(&bandit.incumbent()?.config);
@@ -309,7 +314,7 @@ where
             .cache
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
-        match cache.get(&slot_autotune_key(slot_id, self.recall_target)) {
+        match cache.get(&slot_autotune_key(panel_slot, self.recall_target)) {
             Some(config) => IndexConfig::from_best_config(config),
             None => Ok(IndexConfig::default()),
         }
@@ -319,11 +324,11 @@ where
         &self.promotions
     }
 
-    fn parked_decision(&self, slot_id: SlotId) -> Result<IndexTuneDecision> {
+    fn parked_decision(&self, panel_slot: PanelSlotId) -> Result<IndexTuneDecision> {
         Ok(IndexTuneDecision {
-            evaluated_arm: self.pending_arms.get(&slot_id).copied().unwrap_or(0),
+            evaluated_arm: self.pending_arms.get(&panel_slot).copied().unwrap_or(0),
             won: false,
-            incumbent: self.get_incumbent_config(slot_id)?,
+            incumbent: self.get_incumbent_config(panel_slot)?,
             promoted: None,
             shadow_arm: None,
             shadow_candidate: None,
@@ -331,30 +336,30 @@ where
         })
     }
 
-    fn ensure_bandit(&mut self, slot_id: SlotId) -> Result<()> {
-        if self.bandits.contains_key(&slot_id) {
+    fn ensure_bandit(&mut self, panel_slot: PanelSlotId) -> Result<()> {
+        if self.bandits.contains_key(&panel_slot) {
             return Ok(());
         }
-        let key_hash = shape_key_hash(&index_slot_label(slot_id));
+        let key_hash = shape_key_hash(&index_slot_label(panel_slot));
         let bandit = match self.bandit_store.load_bandit(key_hash)? {
             Some(bandit) => bandit,
             None => {
                 let mut bandit =
-                    ConfigBandit::new(BanditPolicy::Thompson, types::seed_for_slot(slot_id));
-                for config in candidate_configs(slot_id)? {
+                    ConfigBandit::new(BanditPolicy::Thompson, types::seed_for_slot(panel_slot));
+                for config in candidate_configs(panel_slot)? {
                     bandit.add_arm(encode_index_config(&config)?);
                 }
                 self.bandit_store.save_bandit(key_hash, &bandit)?;
                 bandit
             }
         };
-        self.bandits.insert(slot_id, bandit);
+        self.bandits.insert(panel_slot, bandit);
         Ok(())
     }
 
     fn arm_won(
         &self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         arm_idx: usize,
         p99_ns: u64,
         recall_k: f64,
@@ -364,27 +369,27 @@ where
         if !metrics_are_valid(recall_k, bits_per_anchor) {
             return Ok(false);
         }
-        let Some(bandit) = self.bandits.get(&slot_id) else {
+        let Some(bandit) = self.bandits.get(&panel_slot) else {
             return Ok(false);
         };
         if arm_idx == bandit.incumbent_idx {
             return Ok(true);
         }
-        let candidate = self.config_for_arm(slot_id, arm_idx)?;
-        let incumbent = self.config_for_arm(slot_id, bandit.incumbent_idx)?;
+        let candidate = self.config_for_arm(panel_slot, arm_idx)?;
+        let incumbent = self.config_for_arm(panel_slot, bandit.incumbent_idx)?;
         let baseline_latency = self
             .incumbent_latency_ns
-            .get(&slot_id)
+            .get(&panel_slot)
             .copied()
             .unwrap_or(p99_ns);
         let baseline_recall = self
             .incumbent_recall
-            .get(&slot_id)
+            .get(&panel_slot)
             .copied()
             .unwrap_or(recall_k);
         let baseline_bits = self
             .incumbent_bits
-            .get(&slot_id)
+            .get(&panel_slot)
             .copied()
             .unwrap_or(bits_per_anchor);
         let latency_ok = p99_ns < baseline_latency;
@@ -403,7 +408,7 @@ where
 
     fn promote_with_metrics(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         old_config: IndexConfig,
         new_config: IndexConfig,
         metrics: PromotionMetrics,
@@ -413,7 +418,7 @@ where
         let old_bytes = encode_index_config(&old_config)?;
         let new_bytes = encode_index_config(&new_config)?;
         let record = IndexPromotionRecord {
-            slot_id,
+            panel_slot,
             change_id,
             old_config,
             new_config,
@@ -423,7 +428,7 @@ where
             recall_after: metrics.recall_after,
             bits_before: metrics.bits_before,
             bits_after: metrics.bits_after,
-            slot_key_hash: shape_key_hash(&index_slot_label(slot_id)),
+            slot_key_hash: shape_key_hash(&index_slot_label(panel_slot)),
             old_config_hash: *blake3::hash(&old_bytes).as_bytes(),
             new_config_hash: *blake3::hash(&new_bytes).as_bytes(),
             quant_evidence: metrics.quant_evidence,
@@ -440,22 +445,22 @@ where
             .lock()
             .map_err(|_| invalid_config("autotune cache lock poisoned"))?;
         cache.insert(
-            slot_autotune_key(record.slot_id, self.recall_target),
-            record.new_config.to_best_config(record.slot_id),
+            slot_autotune_key(record.panel_slot, self.recall_target),
+            record.new_config.to_best_config(record.panel_slot),
         );
         cache.persist().map_err(cache_write_fail)
     }
 
-    fn save_bandit(&self, slot_id: SlotId) -> Result<()> {
-        let key_hash = shape_key_hash(&index_slot_label(slot_id));
+    fn save_bandit(&self, panel_slot: PanelSlotId) -> Result<()> {
+        let key_hash = shape_key_hash(&index_slot_label(panel_slot));
         self.bandit_store
-            .save_bandit(key_hash, &self.bandits[&slot_id])
+            .save_bandit(key_hash, &self.bandits[&panel_slot])
     }
 
-    fn config_for_arm(&self, slot_id: SlotId, arm_idx: usize) -> Result<IndexConfig> {
+    fn config_for_arm(&self, panel_slot: PanelSlotId, arm_idx: usize) -> Result<IndexConfig> {
         let bandit = self
             .bandits
-            .get(&slot_id)
+            .get(&panel_slot)
             .ok_or_else(|| invalid_config("missing Index bandit"))?;
         let arm = bandit
             .arms
@@ -466,18 +471,18 @@ where
 
     fn record_incumbent_metrics(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         p99_ns: u64,
         recall_k: f64,
         bits_per_anchor: f64,
     ) {
         self.incumbent_latency_ns
-            .entry(slot_id)
+            .entry(panel_slot)
             .and_modify(|value| *value = (*value).min(p99_ns))
             .or_insert(p99_ns);
-        self.incumbent_recall.entry(slot_id).or_insert(recall_k);
+        self.incumbent_recall.entry(panel_slot).or_insert(recall_k);
         self.incumbent_bits
-            .entry(slot_id)
+            .entry(panel_slot)
             .or_insert(bits_per_anchor);
     }
 }

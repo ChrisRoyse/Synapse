@@ -1,17 +1,18 @@
 use std::collections::BTreeMap;
 
-use calyx_core::{CxId, SlotId};
-use calyx_sextant::{RrfProfile, weighted_profiles};
+use calyx_core::{CxId, Panel, PanelSlotId, SlotState};
+use calyx_sextant::{RrfProfile, lookup};
 use serde::{Deserialize, Serialize};
 
 use crate::{LodestarError, Result};
 
-pub const PROBE_MATRIX_SCHEMA_VERSION: u32 = 1;
+pub const PROBE_MATRIX_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProbeMatrixSpec {
     pub frontier: String,
-    pub active_slots: Vec<SlotId>,
+    pub panel_version: u32,
+    pub active_slots: Vec<PanelSlotId>,
     pub weighted_profiles: Vec<RrfProfile>,
     pub phrasings: Vec<ProbePhrasing>,
     pub lengths: Vec<ProbeLength>,
@@ -19,18 +20,33 @@ pub struct ProbeMatrixSpec {
 }
 
 impl ProbeMatrixSpec {
-    pub fn new(frontier: impl Into<String>, active_slots: Vec<SlotId>) -> Self {
-        Self {
+    pub fn new(
+        frontier: impl Into<String>,
+        panel: &Panel,
+        weighted_profiles: Vec<RrfProfile>,
+    ) -> Result<Self> {
+        for profile in &weighted_profiles {
+            lookup(*profile, panel).map_err(|error| LodestarError::KernelInvalidParams {
+                detail: format!(
+                    "probe profile {profile:?} is not bound to panel {}: {}",
+                    panel.version, error.message
+                ),
+            })?;
+        }
+        Ok(Self {
             frontier: frontier.into(),
-            active_slots,
-            weighted_profiles: weighted_profiles()
-                .into_iter()
-                .map(|profile| profile.profile)
+            panel_version: panel.version,
+            active_slots: panel
+                .slots
+                .iter()
+                .filter(|slot| slot.state == SlotState::Active && !slot.retrieval_only)
+                .map(|slot| PanelSlotId::new(panel.version, slot.slot_id))
                 .collect(),
+            weighted_profiles,
             phrasings: ProbePhrasing::all(),
             lengths: ProbeLength::all(),
             top_k: 20,
-        }
+        })
     }
 }
 
@@ -85,7 +101,7 @@ pub enum ProbeFusionMode {
 pub enum ProbeLensEmphasis {
     Balanced,
     WeightedProfile(RrfProfile),
-    Slot(SlotId),
+    Slot(PanelSlotId),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -319,6 +335,16 @@ fn validate_spec(spec: &ProbeMatrixSpec) -> Result<()> {
     }
     if spec.active_slots.is_empty() {
         return invalid_params("active_slots must include at least one slot");
+    }
+    if let Some(slot) = spec
+        .active_slots
+        .iter()
+        .find(|slot| slot.panel_version() != spec.panel_version)
+    {
+        return invalid_params(format!(
+            "active slot {slot} does not belong to probe panel {}",
+            spec.panel_version
+        ));
     }
     if spec.weighted_profiles.is_empty() {
         return invalid_params("weighted_profiles must not be empty");

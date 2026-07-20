@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use calyx_core::SlotId;
+use calyx_core::{CxId, LedgerRef, Result, SlotId};
 use serde::{Deserialize, Serialize};
 
 use crate::hit::Hit;
@@ -14,7 +14,7 @@ pub mod rrf;
 pub mod single;
 
 pub use pipeline::pipeline_fuse;
-pub use profiles::{RrfProfile, WeightedProfile, weighted_profiles};
+pub use profiles::{RrfProfile, WeightedProfile, lookup, weighted_profiles};
 pub use rrf::{rrf_fuse, weighted_rrf_fuse};
 pub use single::single_lens_fuse;
 
@@ -40,6 +40,7 @@ impl FusionStrategy {
 
 #[derive(Clone, Debug)]
 pub struct FusionContext {
+    pub panel_version: u32,
     pub k: usize,
     pub explain: bool,
     pub strategy: FusionStrategy,
@@ -47,11 +48,17 @@ pub struct FusionContext {
     pub stage1_slots: Vec<SlotId>,
 }
 
-pub fn fuse(results: &BTreeMap<SlotId, Vec<IndexSearchHit>>, context: &FusionContext) -> Vec<Hit> {
+pub fn fuse(
+    results: &BTreeMap<SlotId, Vec<IndexSearchHit>>,
+    context: &FusionContext,
+    provenance: &dyn Fn(CxId) -> Result<LedgerRef>,
+) -> Result<Vec<Hit>> {
     match &context.strategy {
-        FusionStrategy::SingleLens { slot } => single_lens_fuse(*slot, results, context),
-        FusionStrategy::Rrf => rrf_fuse(results, context),
-        FusionStrategy::WeightedRrf { .. } => weighted_rrf_fuse(results, context),
-        FusionStrategy::Pipeline => pipeline_fuse(results, context),
+        FusionStrategy::SingleLens { slot } => {
+            single_lens_fuse(*slot, results, context, provenance)
+        }
+        FusionStrategy::Rrf => rrf_fuse(results, context, provenance),
+        FusionStrategy::WeightedRrf { .. } => weighted_rrf_fuse(results, context, provenance),
+        FusionStrategy::Pipeline => pipeline_fuse(results, context, provenance),
     }
 }

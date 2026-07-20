@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use calyx_core::{Result, SlotId};
+use calyx_core::{PanelSlotId, Result};
 use calyx_forge::{AutotuneKey, BackendKind, BestConfig};
 use serde::{Deserialize, Serialize};
 
@@ -37,8 +37,8 @@ impl Default for IndexConfig {
 }
 
 impl IndexConfig {
-    pub fn to_best_config(&self, slot_id: SlotId) -> BestConfig {
-        let slot = index_slot_label(slot_id);
+    pub fn to_best_config(&self, panel_slot: PanelSlotId) -> BestConfig {
+        let slot = index_slot_label(panel_slot);
         BestConfig {
             backend: BackendKind::Cpu,
             tile_m: self.hnsw_ef as usize,
@@ -46,7 +46,11 @@ impl IndexConfig {
             tile_k: self.diskann_beamwidth as usize,
             extra: HashMap::from([
                 ("scope".to_string(), "index".to_string()),
-                ("slot".to_string(), slot_id.get().to_string()),
+                (
+                    "panel_version".to_string(),
+                    panel_slot.panel_version().to_string(),
+                ),
+                ("slot".to_string(), panel_slot.slot_id().get().to_string()),
                 ("slot_key".to_string(), slot),
                 ("hnsw_ef".to_string(), self.hnsw_ef.to_string()),
                 ("hnsw_m".to_string(), self.hnsw_m.to_string()),
@@ -77,7 +81,7 @@ impl IndexConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexPromotionRecord {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub change_id: crate::ChangeId,
     pub old_config: IndexConfig,
     pub new_config: IndexConfig,
@@ -119,7 +123,7 @@ pub struct IndexTuneDecision {
     pub skipped: Option<IndexTuneSkip>,
 }
 
-pub fn candidate_configs(slot_id: SlotId) -> Result<Vec<IndexConfig>> {
+pub fn candidate_configs(panel_slot: PanelSlotId) -> Result<Vec<IndexConfig>> {
     let base = IndexConfig::default();
     let candidates = [
         base.clone(),
@@ -159,7 +163,7 @@ pub fn candidate_configs(slot_id: SlotId) -> Result<Vec<IndexConfig>> {
     let mut configs = Vec::with_capacity(MAX_INDEX_CANDIDATES);
     for config in candidates {
         validate_index_config(&config)?;
-        if estimate_vram_bytes(slot_id, &config) <= DEFAULT_INDEX_VRAM_BUDGET_BYTES {
+        if estimate_vram_bytes(panel_slot, &config) <= DEFAULT_INDEX_VRAM_BUDGET_BYTES {
             push_unique(&mut configs, config);
         }
     }
@@ -245,27 +249,34 @@ pub fn decode_index_config(bytes: &[u8]) -> Result<IndexConfig> {
     Ok(config)
 }
 
-pub fn slot_autotune_key(slot_id: SlotId, recall_target: f32) -> AutotuneKey {
+pub fn slot_autotune_key(panel_slot: PanelSlotId, recall_target: f32) -> AutotuneKey {
     AutotuneKey {
         op: "index".to_string(),
-        shape: vec![slot_id.get() as usize],
+        shape: vec![
+            panel_slot.panel_version() as usize,
+            panel_slot.slot_id().get() as usize,
+        ],
         dtype: "ann".to_string(),
-        device: index_slot_label(slot_id),
+        device: index_slot_label(panel_slot),
         recall_tgt: recall_target,
     }
 }
 
-pub fn index_slot_label(slot_id: SlotId) -> String {
-    format!("index:slot_{:04}", slot_id.get())
+pub fn index_slot_label(panel_slot: PanelSlotId) -> String {
+    format!(
+        "index:panel_{:010}:slot_{:04}",
+        panel_slot.panel_version(),
+        panel_slot.slot_id().get()
+    )
 }
 
-pub(super) fn seed_for_slot(slot_id: SlotId) -> u64 {
-    let hash = shape_key_hash(&index_slot_label(slot_id));
+pub(super) fn seed_for_slot(panel_slot: PanelSlotId) -> u64 {
+    let hash = shape_key_hash(&index_slot_label(panel_slot));
     u64::from_le_bytes(hash[0..8].try_into().expect("hash slice has 8 bytes"))
 }
 
-fn estimate_vram_bytes(slot_id: SlotId, config: &IndexConfig) -> u64 {
-    let slot_factor = u64::from(slot_id.get()) + 1;
+fn estimate_vram_bytes(panel_slot: PanelSlotId, config: &IndexConfig) -> u64 {
+    let slot_factor = u64::from(panel_slot.slot_id().get()) + 1;
     let graph_bytes = u64::from(config.hnsw_ef) * u64::from(config.hnsw_m) * 16;
     let diskann_bytes = u64::from(config.diskann_beamwidth) * 4096;
     let spann_bytes = u64::from(config.spann_cutoff) * 8;

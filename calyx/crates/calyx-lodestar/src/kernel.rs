@@ -64,7 +64,7 @@ impl Default for RecallReport {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Kernel {
     pub kernel_id: CxId,
-    pub panel_version: u64,
+    pub panel_version: u32,
     pub anchor_kind: Option<String>,
     pub corpus_shard_hash: [u8; 32],
     pub members: Vec<CxId>,
@@ -78,7 +78,7 @@ pub struct Kernel {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KernelParams {
-    pub panel_version: u64,
+    pub panel_version: u32,
     pub anchor_kind: Option<String>,
     pub corpus_shard_hash: [u8; 32],
     pub built_at_millis: u64,

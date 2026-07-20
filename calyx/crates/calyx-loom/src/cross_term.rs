@@ -1,6 +1,6 @@
 //! Cross-term value types and CPU/GPU-parity math kernels.
 
-use calyx_core::{CxId, Result, SlotId};
+use calyx_core::{CxId, PanelSlotId, Result, SlotId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
@@ -27,8 +27,8 @@ pub enum SignalProvenanceTag {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CrossTermKey {
     pub cx_id: CxId,
-    pub a: SlotId,
-    pub b: SlotId,
+    pub a: PanelSlotId,
+    pub b: PanelSlotId,
     pub kind: CrossTermKind,
 }
 

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use calyx_core::{Result, SlotId};
+use calyx_core::{PanelSlotId, Result};
 use serde::{Deserialize, Serialize};
 
 use super::types::{
@@ -14,7 +14,7 @@ const UNMEASURED_ERROR_RATE: f64 = 1.0;
 
 pub struct FileWardTauStore {
     path: PathBuf,
-    rows: BTreeMap<SlotId, WardTauReadback>,
+    rows: BTreeMap<PanelSlotId, WardTauReadback>,
 }
 
 impl FileWardTauStore {
@@ -36,30 +36,30 @@ impl FileWardTauStore {
         let mut rows = BTreeMap::new();
         for row in file.slots {
             validate_tau(row.tau)?;
-            rows.insert(row.slot_id, row);
+            rows.insert(row.panel_slot, row);
         }
         Ok(Self { path, rows })
     }
 
     pub fn upsert_current(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         tau: f32,
         updated_at: LogicalTime,
     ) -> Result<()> {
         validate_tau(tau)?;
         self.rows.insert(
-            slot_id,
+            panel_slot,
             WardTauReadback {
-                slot_id,
+                panel_slot,
                 tau,
                 far: self
                     .rows
-                    .get(&slot_id)
+                    .get(&panel_slot)
                     .map_or(UNMEASURED_ERROR_RATE, |row| row.far),
                 frr: self
                     .rows
-                    .get(&slot_id)
+                    .get(&panel_slot)
                     .map_or(UNMEASURED_ERROR_RATE, |row| row.frr),
                 updated_at,
             },
@@ -87,23 +87,25 @@ impl FileWardTauStore {
 }
 
 impl WardTauStore for FileWardTauStore {
-    fn current_tau(&self, slot_id: SlotId) -> Result<Option<f32>> {
-        Ok(self.rows.get(&slot_id).map(|row| row.tau))
+    fn current_tau(&self, panel_slot: PanelSlotId) -> Result<Option<f32>> {
+        Ok(self.rows.get(&panel_slot).map(|row| row.tau))
     }
 
     fn set_live_tau(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         tau: &NewTau,
         updated_at: LogicalTime,
     ) -> Result<()> {
-        if tau.slot_id != slot_id {
-            return Err(invalid_tau("new tau slot_id does not match target slot"));
+        if tau.panel_slot != panel_slot {
+            return Err(invalid_tau(
+                "new tau panel_slot does not match target panel slot",
+            ));
         }
         self.rows.insert(
-            slot_id,
+            panel_slot,
             WardTauReadback {
-                slot_id,
+                panel_slot,
                 tau: tau.tau,
                 far: tau.far,
                 frr: tau.frr,

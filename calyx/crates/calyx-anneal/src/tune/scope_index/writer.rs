@@ -82,7 +82,7 @@ where
         self.write_outcome_event_with_details(
             AnnealLedgerAction::AutotunePromote,
             event.change_id,
-            index_slot_label(event.slot_id),
+            index_slot_label(event.panel_slot),
             event.new_config_hash,
             promotion_description(event),
             quant_promotion_details(event),
@@ -94,7 +94,7 @@ fn autotune_ledger_entry(event: &IndexPromotionRecord) -> AnnealLedgerEntry {
     AnnealLedgerEntry {
         action: AnnealLedgerAction::AutotunePromote,
         change_id: event.change_id,
-        artifact_id: index_slot_label(event.slot_id),
+        artifact_id: index_slot_label(event.panel_slot),
         prior_ptr_hash: event.old_config_hash,
         candidate_ptr_hash: event.new_config_hash,
         metrics: MetricSnapshot {
@@ -127,7 +127,8 @@ fn quant_promotion_details(event: &IndexPromotionRecord) -> Option<Value> {
     Some(json!({
         "tag": "quant_compression_promotion_v1",
         "scope": "index",
-        "slot": event.slot_id.get(),
+        "panel_version": event.panel_slot.panel_version(),
+        "slot": event.panel_slot.slot_id().get(),
         "slot_hash_bytes": event.slot_key_hash,
         "level_before_bits": event.old_config.quant_bits,
         "level_after_bits": event.new_config.quant_bits,
@@ -144,7 +145,7 @@ fn quant_promotion_details(event: &IndexPromotionRecord) -> Option<Value> {
 fn promotion_description(event: &IndexPromotionRecord) -> String {
     format!(
         "index autotune promote {} latency {} -> {} recall {:.6} -> {:.6} bits {:.6} -> {:.6} quant {} -> {}",
-        index_slot_label(event.slot_id),
+        index_slot_label(event.panel_slot),
         event.latency_before_ns,
         event.latency_after_ns,
         event.recall_before,

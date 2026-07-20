@@ -22,6 +22,8 @@ pub const CALYX_SEXTANT_EF_TOO_SMALL: &str = "CALYX_SEXTANT_EF_TOO_SMALL";
 pub const CALYX_SEXTANT_DIM_MISMATCH: &str = "CALYX_SEXTANT_DIM_MISMATCH";
 pub const CALYX_SEXTANT_VECTOR_SHAPE: &str = "CALYX_SEXTANT_VECTOR_SHAPE";
 pub const CALYX_SEXTANT_QUERY_SHAPE: &str = "CALYX_SEXTANT_QUERY_SHAPE";
+pub const CALYX_SEXTANT_PANEL_SCOPE_MISMATCH: &str = "CALYX_SEXTANT_PANEL_SCOPE_MISMATCH";
+pub const CALYX_SEXTANT_PROFILE_UNBOUND: &str = "CALYX_SEXTANT_PROFILE_UNBOUND";
 pub const CALYX_INVALID_ARGUMENT: &str = "CALYX_INVALID_ARGUMENT";
 pub const CALYX_ANSWER_UNGROUNDED: &str = "CALYX_ANSWER_UNGROUNDED";
 pub const CALYX_ANSWER_SYNTHESIS_UNAVAILABLE: &str = "CALYX_ANSWER_SYNTHESIS_UNAVAILABLE";
@@ -83,6 +85,12 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         CALYX_SEXTANT_VECTOR_SHAPE => "submit a vector matching the slot index shape",
         CALYX_SEXTANT_QUERY_SHAPE => {
             "submit a query with finite vectors, valid limits, and non-conflicting predicates"
+        }
+        CALYX_SEXTANT_PANEL_SCOPE_MISMATCH => {
+            "bind the engine, indexes, documents, and query to the same exact panel version"
+        }
+        CALYX_SEXTANT_PROFILE_UNBOUND => {
+            "declare matching slot axes/shapes in the active panel or choose a profile that the panel supports"
         }
         CALYX_INVALID_ARGUMENT => "submit a non-empty ASK question and valid query arguments",
         CALYX_ANSWER_UNGROUNDED => {

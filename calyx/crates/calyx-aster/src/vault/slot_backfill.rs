@@ -1,6 +1,6 @@
 use super::{AsterVault, encode};
 use crate::cf::{ColumnFamily, base_key, slot_key};
-use calyx_core::{CalyxError, Clock, CxId, Result, Seq, SlotId, SlotVector};
+use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, Seq, SlotId, SlotVector};
 
 impl<C> AsterVault<C>
 where
@@ -9,12 +9,13 @@ where
     pub fn put_slot_vector(
         &self,
         cx_id: CxId,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         vector: &SlotVector,
     ) -> Result<Seq> {
-        self.ensure_base_exists(cx_id)?;
+        self.ensure_base_declares_slot(cx_id, panel_slot)?;
+        vector.validate_schema()?;
         let row = encode::WriteRow {
-            cf: ColumnFamily::slot(slot_id),
+            cf: ColumnFamily::slot(panel_slot.slot_id()),
             key: slot_key(cx_id),
             value: encode::encode_slot_vector(vector)?,
         };
@@ -32,15 +33,32 @@ where
             .transpose()
     }
 
-    fn ensure_base_exists(&self, cx_id: CxId) -> Result<()> {
-        if self
+    fn ensure_base_declares_slot(&self, cx_id: CxId, panel_slot: PanelSlotId) -> Result<()> {
+        let bytes = self
             .read_cf_at(self.latest_seq(), ColumnFamily::Base, &base_key(cx_id))?
-            .is_some()
-        {
-            return Ok(());
+            .ok_or_else(|| {
+                CalyxError::stale_derived(format!(
+                    "constellation {cx_id} missing for qualified slot write {panel_slot}"
+                ))
+            })?;
+        let constellation = encode::decode_constellation_base(&bytes)?;
+        if constellation.cx_id != cx_id {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "Base row key {cx_id} contains constellation {} during qualified slot write",
+                constellation.cx_id
+            )));
         }
-        Err(CalyxError::stale_derived(format!(
-            "constellation {cx_id} missing for slot backfill"
-        )))
+        if constellation.panel_version != panel_slot.panel_version() {
+            return Err(CalyxError::stale_derived(format!(
+                "qualified slot write {panel_slot} cannot attach to constellation {cx_id} from panel {}",
+                constellation.panel_version
+            )));
+        }
+        if !constellation.slots.contains_key(&panel_slot.slot_id()) {
+            return Err(CalyxError::stale_derived(format!(
+                "qualified slot write {panel_slot} is absent from constellation {cx_id} Base membership; re-measure the authoritative input into a new panel generation and CxId"
+            )));
+        }
+        Ok(())
     }
 }

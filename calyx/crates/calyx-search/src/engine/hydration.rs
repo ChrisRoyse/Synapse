@@ -134,7 +134,7 @@ fn hit_slots_key(hit: &Hit) -> String {
         .collect::<BTreeSet<_>>();
     slots
         .iter()
-        .map(|slot| slot.get().to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",")
 }

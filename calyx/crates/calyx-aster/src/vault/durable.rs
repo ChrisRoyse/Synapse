@@ -425,8 +425,12 @@ impl DurableVault {
             .fetch_max(seq, Ordering::AcqRel);
     }
 
+    pub(super) fn sync_wal(&self) -> Result<()> {
+        self.batcher.flush_sync()
+    }
+
     pub(super) fn flush(&self) -> Result<()> {
-        self.batcher.flush_sync()?;
+        self.sync_wal()?;
         self.flush_pending_checkpoints()
     }
 

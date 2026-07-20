@@ -186,11 +186,12 @@ pub(super) fn reuse_staged_slot_entry(
         "diskann" => validate_staged_diskann(
             vault_dir,
             &entry,
+            plan.panel_version,
             plan.slot,
             staged.graph_sha256.as_deref(),
             staged.id_map_sha256.as_deref(),
         ),
-        "flat_dense" => dense::validate_entry(vault_dir, &entry, plan.slot),
+        "flat_dense" => dense::validate_entry(vault_dir, &entry, plan.panel_version, plan.slot),
         "sparse_inverted" => sparse::validate_entry(vault_dir, &entry, base_seq, plan.slot),
         "multi_maxsim" | "multi_maxsim_segments" => {
             multi::validate_entry(vault_dir, &entry, base_seq, plan.slot)
@@ -210,6 +211,7 @@ pub(super) fn reuse_staged_slot_entry(
 fn validate_staged_diskann(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
+    panel_version: u32,
     slot: SlotId,
     graph_sha256: Option<&str>,
     id_map_sha256: Option<&str>,
@@ -219,7 +221,7 @@ fn validate_staged_diskann(
             "staged diskann slot {slot} record is missing artifact hashes"
         )));
     };
-    dense::validate_entry(vault_dir, entry, slot)?;
+    dense::validate_entry(vault_dir, entry, panel_version, slot)?;
     let actual_graph = sha256_of_rel(vault_dir, entry.require_graph_rel(slot)?)?;
     if actual_graph != expected_graph {
         return Err(stale(format!(

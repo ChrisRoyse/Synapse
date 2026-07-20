@@ -145,74 +145,81 @@ where
             "erase VaultContext belongs to another vault",
         ));
     }
-    vault.with_durable_commit_lock(|| {
-        let snapshot = vault.latest_seq();
-        let real_ledger = vault.has_real_ledger_hook();
-        if real_ledger && let Some(tombstone) = ledger::existing_tombstone(vault, &scope, snapshot)?
-        {
+    vault.with_native_compaction_guard(|| {
+        vault.with_durable_commit_lock(|| {
+            let snapshot = vault.latest_seq();
+            let real_ledger = vault.has_real_ledger_hook();
+            if real_ledger
+                && let Some(tombstone) = ledger::existing_tombstone(vault, &scope, snapshot)?
+            {
+                if let Some(ctx) = vault_ctx.as_mut()
+                    && (scope == EraseScope::Vault || tombstone.records_deleted > 0)
+                {
+                    vault.flush_locked()?;
+                    ctx.shred_key_for_erasure();
+                }
+                return Err(CalyxError::erase_already_tombstoned(format!(
+                    "erase scope already has ledger tombstone at seq {}",
+                    tombstone.seq
+                )));
+            }
+            let targets = collect_targets(vault, &scope, snapshot)?;
+            registry.run_all(&scope, vault.vault_id())?;
+            let rows_tombstoned = targets.rows.len();
+            if scope != EraseScope::Vault && rows_tombstoned == 0 {
+                return Ok(EraseResult {
+                    scope,
+                    records_deleted: targets.records_deleted,
+                    shredded_at: vault.clock_now(),
+                    tombstone: None,
+                });
+            }
+            let affected = affected_cfs(&targets.rows);
+            let row_tombstone = tombstone_value();
+            let rows = targets
+                .rows
+                .iter()
+                .map(|target| encode::WriteRow {
+                    cf: target.cf,
+                    key: target.key.clone(),
+                    value: row_tombstone.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut ledger_tombstone = None;
+            if real_ledger {
+                let tombstone = ledger::tombstone_for(
+                    vault,
+                    &scope,
+                    targets.records_deleted,
+                    vault.clock_now(),
+                )?;
+                let ledger_ref = vault.commit_erasure_rows_with_ledger_entry_locked(
+                    rows,
+                    EntryKind::Erase,
+                    ledger::tombstone_subject(&tombstone),
+                    tombstone.as_ledger_payload(),
+                    tombstone.actor.clone(),
+                )?;
+                debug_assert_eq!(ledger_ref.seq, tombstone.seq);
+                ledger_tombstone = Some(tombstone);
+            } else {
+                vault.commit_erasure_rows_locked(&rows)?;
+            }
+            if rows_tombstoned > 0 {
+                vault.purge_tombstoned_cfs_locked(&affected)?;
+            }
             if let Some(ctx) = vault_ctx.as_mut()
-                && (scope == EraseScope::Vault || tombstone.records_deleted > 0)
+                && (scope == EraseScope::Vault || rows_tombstoned > 0)
             {
                 vault.flush_locked()?;
                 ctx.shred_key_for_erasure();
             }
-            return Err(CalyxError::erase_already_tombstoned(format!(
-                "erase scope already has ledger tombstone at seq {}",
-                tombstone.seq
-            )));
-        }
-        let targets = collect_targets(vault, &scope, snapshot)?;
-        registry.run_all(&scope, vault.vault_id())?;
-        let rows_tombstoned = targets.rows.len();
-        if scope != EraseScope::Vault && rows_tombstoned == 0 {
-            return Ok(EraseResult {
+            Ok(EraseResult {
                 scope,
                 records_deleted: targets.records_deleted,
                 shredded_at: vault.clock_now(),
-                tombstone: None,
-            });
-        }
-        let affected = affected_cfs(&targets.rows);
-        let row_tombstone = tombstone_value();
-        let rows = targets
-            .rows
-            .iter()
-            .map(|target| encode::WriteRow {
-                cf: target.cf,
-                key: target.key.clone(),
-                value: row_tombstone.clone(),
+                tombstone: ledger_tombstone,
             })
-            .collect::<Vec<_>>();
-        let mut ledger_tombstone = None;
-        if real_ledger {
-            let tombstone =
-                ledger::tombstone_for(vault, &scope, targets.records_deleted, vault.clock_now())?;
-            let ledger_ref = vault.commit_erasure_rows_with_ledger_entry_locked(
-                rows,
-                EntryKind::Erase,
-                ledger::tombstone_subject(&tombstone),
-                tombstone.as_ledger_payload(),
-                tombstone.actor.clone(),
-            )?;
-            debug_assert_eq!(ledger_ref.seq, tombstone.seq);
-            ledger_tombstone = Some(tombstone);
-        } else {
-            vault.commit_erasure_rows_locked(&rows)?;
-        }
-        if rows_tombstoned > 0 {
-            vault.purge_tombstoned_cfs_locked(&affected)?;
-        }
-        if let Some(ctx) = vault_ctx.as_mut()
-            && (scope == EraseScope::Vault || rows_tombstoned > 0)
-        {
-            vault.flush_locked()?;
-            ctx.shred_key_for_erasure();
-        }
-        Ok(EraseResult {
-            scope,
-            records_deleted: targets.records_deleted,
-            shredded_at: vault.clock_now(),
-            tombstone: ledger_tombstone,
         })
     })
 }
@@ -244,31 +251,33 @@ where
             "erase VaultContext belongs to another vault",
         ));
     }
-    vault.with_durable_commit_lock(|| {
-        let snapshot = vault.latest_seq();
-        let targets = collect_targets(vault, scope, snapshot)?;
-        if let Some(registry) = registry {
-            registry.run_all(scope, vault.vault_id())?;
-        }
-        if targets.rows.is_empty() {
-            return Ok(EraseWriteSummary {
+    vault.with_native_compaction_guard(|| {
+        vault.with_durable_commit_lock(|| {
+            let snapshot = vault.latest_seq();
+            let targets = collect_targets(vault, scope, snapshot)?;
+            if let Some(registry) = registry {
+                registry.run_all(scope, vault.vault_id())?;
+            }
+            if targets.rows.is_empty() {
+                return Ok(EraseWriteSummary {
+                    records_deleted: targets.records_deleted,
+                });
+            }
+            let tombstone = tombstone_value();
+            let rows = targets
+                .rows
+                .iter()
+                .map(|target| encode::WriteRow {
+                    cf: target.cf,
+                    key: target.key.clone(),
+                    value: tombstone.clone(),
+                })
+                .collect::<Vec<_>>();
+            vault.commit_erasure_rows_locked(&rows)?;
+            vault.purge_tombstoned_cfs_locked(&affected_cfs(&targets.rows))?;
+            Ok(EraseWriteSummary {
                 records_deleted: targets.records_deleted,
-            });
-        }
-        let tombstone = tombstone_value();
-        let rows = targets
-            .rows
-            .iter()
-            .map(|target| encode::WriteRow {
-                cf: target.cf,
-                key: target.key.clone(),
-                value: tombstone.clone(),
             })
-            .collect::<Vec<_>>();
-        vault.commit_erasure_rows_locked(&rows)?;
-        vault.purge_tombstoned_cfs_locked(&affected_cfs(&targets.rows))?;
-        Ok(EraseWriteSummary {
-            records_deleted: targets.records_deleted,
         })
     })
 }

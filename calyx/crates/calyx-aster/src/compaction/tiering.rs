@@ -146,6 +146,7 @@ impl TieringPolicy {
                 | ColumnFamily::AnnealReport
                 | ColumnFamily::AnnealGrowth
                 | ColumnFamily::AnnealOperators
+                | ColumnFamily::Registry
         ) {
             return false;
         }

@@ -1,6 +1,6 @@
 //! Provenanced search hit types.
 
-use calyx_core::{CxId, LedgerRef, SlotId};
+use calyx_core::{CxId, LedgerRef, PanelSlotId};
 use calyx_ward::GuardVerdict;
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,7 @@ use crate::util::hex32;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PerLensContribution {
-    pub slot: SlotId,
+    pub slot: PanelSlotId,
     pub rank: usize,
     pub raw_score: f32,
     pub weight: f32,
@@ -79,7 +79,6 @@ pub struct DroppedGuardHit {
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceSource {
     Stored,
-    Stub,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

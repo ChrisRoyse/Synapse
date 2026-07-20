@@ -56,6 +56,7 @@ use std::{
 
 pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
+pub(crate) use compaction_bridge::LIVE_COMPACTION_TRIGGER_FILES;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use grounded_observation::GroundedObservationCommit;
@@ -987,11 +988,47 @@ where
         self.with_durable_commit_lock(|| self.flush_locked())
     }
 
-    pub(crate) fn flush_locked(&self) -> Result<()> {
-        self.ensure_writeable("flush")?;
+    /// Synchronizes the WAL batcher and materializes pending durable
+    /// checkpoints without evicting router memtables.
+    ///
+    /// Durable checkpoint SSTs are the manifest/WAL-recycling authority. A
+    /// router memtable is a serving cache over the same committed rows and is
+    /// independently flushed by its byte cap. Keeping these boundaries
+    /// separate prevents a caller requesting durability from creating one
+    /// tiny router SST per logical flush.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.with_durable_commit_lock(|| self.checkpoint_locked())
+    }
+
+    /// Waits until every submitted group-commit WAL append has reached its
+    /// fsynced acknowledgement boundary without materializing checkpoint SSTs.
+    ///
+    /// Each acknowledged write is already durable in the WAL. This barrier is
+    /// therefore the correct implementation for callers that ask only to sync
+    /// pending writes; checkpoint SST publication remains owned by maintenance,
+    /// WAL recycling, and deterministic close.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.with_durable_commit_lock(|| self.sync_wal_locked())
+    }
+
+    pub(crate) fn sync_wal_locked(&self) -> Result<()> {
+        self.ensure_writeable("sync WAL")?;
+        if let Some(durable) = &self.durable {
+            durable.sync_wal()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint_locked(&self) -> Result<()> {
+        self.ensure_writeable("checkpoint")?;
         if let Some(durable) = &self.durable {
             durable.flush()?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn flush_locked(&self) -> Result<()> {
+        self.checkpoint_locked()?;
         self.rows.flush_all_cfs()?;
         Ok(())
     }
@@ -1010,7 +1047,7 @@ where
             ));
         }
         self.with_durable_commit_lock(|| {
-            self.flush_locked()?;
+            self.checkpoint_locked()?;
             let Some(durable) = &self.durable else {
                 return Ok(WalRecycleReport::default());
             };

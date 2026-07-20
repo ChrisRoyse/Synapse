@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use calyx_core::{CxId, SlotId};
-use calyx_loom::{CrossTermKind, CrossTermValue, LoomStore, cross_term::canonical_pair};
+use calyx_core::{CxId, PanelSlotId};
+use calyx_loom::{CrossTermKind, CrossTermValue, LoomStore};
 use calyx_mincut::{AgreementEdge, build_assoc_graph};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
@@ -11,15 +11,15 @@ use crate::{LodestarError, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LoomSlotNode {
     pub xterm_cx: CxId,
-    pub slot: SlotId,
+    pub slot: PanelSlotId,
     pub node: CxId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoomDirectionalConfidence {
     pub xterm_cx: CxId,
-    pub src_slot: SlotId,
-    pub dst_slot: SlotId,
+    pub src_slot: PanelSlotId,
+    pub dst_slot: PanelSlotId,
     pub confidence: f32,
 }
 
@@ -32,8 +32,8 @@ pub struct LoomAssocGraphInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoomAssocEdgeProvenance {
     pub xterm_cx: CxId,
-    pub src_slot: SlotId,
-    pub dst_slot: SlotId,
+    pub src_slot: PanelSlotId,
+    pub dst_slot: PanelSlotId,
     pub src_cx: CxId,
     pub dst_cx: CxId,
     pub raw_agreement: f32,
@@ -55,7 +55,15 @@ pub fn loom_assoc_graph_input(
     let mut provenance = Vec::new();
 
     for (key, confidence) in confidence_map {
-        let (a, b) = canonical_pair(key.src_slot, key.dst_slot);
+        if key.src_slot.panel_version() != key.dst_slot.panel_version() {
+            return Err(LodestarError::KernelLoomAgreementInvalid {
+                detail: format!(
+                    "directional confidence spans panels {} and {}",
+                    key.src_slot, key.dst_slot
+                ),
+            });
+        }
+        let (a, b) = canonical_panel_pair(key.src_slot, key.dst_slot);
         let pair_key = LoomPairKey {
             xterm_cx: key.xterm_cx,
             a,
@@ -119,7 +127,7 @@ pub fn build_assoc_graph_from_loom(
     Ok((graph, input.provenance))
 }
 
-fn slot_node_map(slot_nodes: &[LoomSlotNode]) -> BTreeMap<(CxId, SlotId), CxId> {
+fn slot_node_map(slot_nodes: &[LoomSlotNode]) -> BTreeMap<(CxId, PanelSlotId), CxId> {
     slot_nodes
         .iter()
         .map(|node| ((node.xterm_cx, node.slot), node.node))
@@ -127,9 +135,9 @@ fn slot_node_map(slot_nodes: &[LoomSlotNode]) -> BTreeMap<(CxId, SlotId), CxId> 
 }
 
 fn mapped_node(
-    node_map: &BTreeMap<(CxId, SlotId), CxId>,
+    node_map: &BTreeMap<(CxId, PanelSlotId), CxId>,
     xterm_cx: CxId,
-    slot: SlotId,
+    slot: PanelSlotId,
 ) -> Result<CxId> {
     node_map
         .get(&(xterm_cx, slot))
@@ -204,13 +212,17 @@ fn agreement_weight(raw: f32) -> Result<f32> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct LoomPairKey {
     xterm_cx: CxId,
-    a: SlotId,
-    b: SlotId,
+    a: PanelSlotId,
+    b: PanelSlotId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct LoomConfidenceKey {
     xterm_cx: CxId,
-    src_slot: SlotId,
-    dst_slot: SlotId,
+    src_slot: PanelSlotId,
+    dst_slot: PanelSlotId,
+}
+
+fn canonical_panel_pair(a: PanelSlotId, b: PanelSlotId) -> (PanelSlotId, PanelSlotId) {
+    if a <= b { (a, b) } else { (b, a) }
 }

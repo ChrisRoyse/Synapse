@@ -14,6 +14,7 @@ pub mod frozen;
 pub mod ingest_microbatch;
 pub mod lens;
 pub mod measure;
+mod panel_generation;
 pub mod panel_ops;
 pub mod panels;
 pub mod persistence;
@@ -26,6 +27,7 @@ pub mod spec;
 pub mod structured_record;
 pub mod swap;
 pub mod temporal;
+mod temporal_panel_catalog;
 
 pub use backfill::{
     BackfillBatch, BackfillConfig, BackfillPriority, BackfillRequest, BackfillScheduler,
@@ -59,6 +61,12 @@ pub use ingest_microbatch::{
 pub use lens::{
     DeterminismProof, DualMeasurement, FrozenLensSnapshot, Registry, RegistryLensSnapshot,
     ensure_input_modality, ensure_vector_shape,
+};
+pub use panel_generation::{
+    CALYX_PANEL_GENERATION_CONFLICT, CALYX_PANEL_GENERATION_EXHAUSTED,
+    CALYX_PANEL_GENERATION_INVALID, PanelGenerationAllocation, PanelGenerationAllocatorReadback,
+    allocate_vault_panel_generation, read_vault_panel_generation_allocator,
+    reserve_vault_panel_generations,
 };
 pub use panel_ops::{
     AppliedPanelTemplate, CALYX_PANEL_LENS_MISSING, PanelCapabilityGateOutcome, PanelDiff,
@@ -146,4 +154,10 @@ pub use temporal::{
     DecayFunction, E2RecencyConfig, E2RecencyLens, E3PeriodicConfig, E3PeriodicLens,
     E4PositionalConfig, E4PositionalLens, MultiAnchorMode, PeriodicOptions, SequenceDirection,
     SequenceOptions, TEMPORAL_FLAGS, TemporalLensFlags,
+};
+pub use temporal_panel_catalog::{
+    CALYX_TEMPORAL_PANEL_CONFLICT, CALYX_TEMPORAL_PANEL_INVALID, CALYX_TEMPORAL_PANEL_MISSING,
+    TemporalPanelRegistrationDisposition, VaultTemporalPanelRegistration,
+    VaultTemporalPanelRegistrationWrite, list_vault_temporal_panels, read_vault_temporal_panel,
+    register_vault_temporal_panel,
 };

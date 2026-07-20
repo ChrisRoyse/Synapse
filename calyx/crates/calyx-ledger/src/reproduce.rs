@@ -5,7 +5,7 @@ mod fusion;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use calyx_core::{CalyxError, CxId, Input, LensId, Result, SlotId, SlotVector};
+use calyx_core::{CalyxError, CxId, Input, LensId, PanelSlotId, Result, SlotId, SlotVector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -57,7 +57,7 @@ pub struct ReproduceContext {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedSlot {
     pub cx_id: CxId,
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub lens_id: LensId,
     pub weights_sha256: [u8; HASH_BYTES],
     pub input_hash: [u8; HASH_BYTES],
@@ -72,7 +72,7 @@ pub struct RecordedSlot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RemeasuredSlot {
     pub cx_id: CxId,
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub lens_id: LensId,
     pub input_hash: [u8; HASH_BYTES],
     pub forge_seed: u64,
@@ -87,7 +87,7 @@ impl ReproduceInputResolver for InlineInputResolver {
         slot.input.clone().ok_or_else(|| {
             CalyxError::ledger_corrupt(format!(
                 "recorded slot {}:{} has no resolved input",
-                slot.cx_id, slot.slot_id
+                slot.cx_id, slot.panel_slot
             ))
         })
     }
@@ -176,7 +176,7 @@ pub fn remeasure_slots_with_input_resolver(
         let vector = registry.measure_frozen(slot.lens_id, &input)?;
         out.push(RemeasuredSlot {
             cx_id: slot.cx_id,
-            slot_id: slot.slot_id,
+            panel_slot: slot.panel_slot,
             lens_id: slot.lens_id,
             input_hash: slot.input_hash,
             forge_seed: slot.forge_seed,
@@ -234,7 +234,7 @@ fn measure_refs(value: &Value) -> Result<Vec<u64>> {
 fn recorded_slot_from_value(value: &Value) -> Result<RecordedSlot> {
     Ok(RecordedSlot {
         cx_id: parse_id(value, "cx_id")?,
-        slot_id: parse_slot_id(value)?,
+        panel_slot: parse_panel_slot(value)?,
         lens_id: parse_id(value, "lens_id")?,
         weights_sha256: parse_hash_field(value, "weights_sha256")?,
         input_hash: parse_hash_field(value, "input_hash")?,
@@ -268,6 +268,16 @@ fn parse_slot_id(value: &Value) -> Result<SlotId> {
         .ok_or_else(|| CalyxError::ledger_corrupt("slot_id must be u16 or string"))?;
     text.parse::<SlotId>()
         .map_err(|error| CalyxError::ledger_corrupt(format!("parse slot_id: {error}")))
+}
+
+fn parse_panel_slot(value: &Value) -> Result<PanelSlotId> {
+    let panel_version = required(value, "panel_version")?
+        .as_u64()
+        .ok_or_else(|| CalyxError::ledger_corrupt("panel_version must be u32"))
+        .and_then(|raw| {
+            u32::try_from(raw).map_err(|_| CalyxError::ledger_corrupt("panel_version exceeds u32"))
+        })?;
+    Ok(PanelSlotId::new(panel_version, parse_slot_id(value)?))
 }
 
 fn parse_hash_field(value: &Value, field: &'static str) -> Result<[u8; HASH_BYTES]> {
@@ -325,7 +335,7 @@ fn verify_input_hash(slot: &RecordedSlot, input: &Input) -> Result<()> {
     } else {
         Err(CalyxError::ledger_corrupt(format!(
             "resolved input hash mismatch for {}:{}",
-            slot.cx_id, slot.slot_id
+            slot.cx_id, slot.panel_slot
         )))
     }
 }

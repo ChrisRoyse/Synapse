@@ -214,6 +214,7 @@ impl CfRouter {
         commit_watermark: u64,
     ) -> Result<()> {
         self.ensure_cf(cf)?;
+        self.ensure_cf_write_fanout_admitted(cf)?;
         let mut counted_backpressure = false;
         let ack = match self.memtable_mut(cf).write(key, value, 0) {
             Ok(ack) => ack,
@@ -254,6 +255,7 @@ impl CfRouter {
         V: AsRef<[u8]>,
     {
         for (cf, key, value) in rows {
+            self.ensure_cf_write_fanout_admitted(cf)?;
             let row_bytes = Memtable::entry_size(key.as_ref(), value.as_ref());
             if row_bytes > self.memtable_byte_cap {
                 self.resource_counters.record_memtable_rejected();
@@ -266,6 +268,25 @@ impl CfRouter {
             }
         }
         Ok(())
+    }
+
+    fn ensure_cf_write_fanout_admitted(&self, cf: ColumnFamily) -> Result<()> {
+        let current_files = self.level_file_count(cf);
+        if current_files < crate::vault::LIVE_COMPACTION_TRIGGER_FILES {
+            return Ok(());
+        }
+        self.resource_counters.record_memtable_rejected();
+        Err(CalyxError {
+            code: "CALYX_ASTER_SST_FANOUT_WRITE_STALL",
+            message: format!(
+                "stopped {} writes because its live router has {} immutable SST sources; proactive_compaction_trigger={} hard_page_source_limit={}",
+                cf.name(),
+                current_files,
+                crate::vault::LIVE_COMPACTION_TRIGGER_FILES,
+                crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES,
+            ),
+            remediation: "allow the owned native fan-out maintenance pass to compact this CF and inspect CALYX_ASTER_NATIVE_CF_COMPACTION_* telemetry before retrying",
+        })
     }
 
     /// Shares the backpressure counters this router increments.

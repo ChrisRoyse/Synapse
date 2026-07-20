@@ -18,13 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
-pub const REBUILD_REQUIRED_SCHEMA: &str = "calyx-search-rebuild-required-v1";
+pub const REBUILD_REQUIRED_SCHEMA: &str = "calyx-search-rebuild-required-v2";
 const REBUILD_REQUIRED_NAME: &str = "rebuild-required.json";
 pub const REBUILD_REQUIRED_REMEDIATION: &str = "run `calyx rebuild-search-index <vault>`; the rebuild reuses staged slot artifacts from an interrupted run and clears this marker after the manifest is durably republished";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RebuildRequiredMarker {
     pub schema: String,
+    /// Exact panel generation whose derived indexes are stale.
+    pub panel_version: u32,
     /// Which mutation path staked the intent (`batch_ingest`, `text_ingest`,
     /// `anchor_command`, `search_index_rebuild`, ...).
     pub source: String,
@@ -44,9 +46,10 @@ pub struct RebuildRequiredMarker {
 }
 
 impl RebuildRequiredMarker {
-    pub fn new(source: &str, detail: impl Into<String>) -> CliResult<Self> {
+    pub fn new(panel_version: u32, source: &str, detail: impl Into<String>) -> CliResult<Self> {
         Ok(Self {
             schema: REBUILD_REQUIRED_SCHEMA.to_string(),
+            panel_version,
             source: source.to_string(),
             detail: detail.into(),
             required_base_seq: None,
@@ -66,8 +69,8 @@ pub enum MarkerClearOutcome {
     Absent,
 }
 
-pub fn rebuild_required_marker_path(vault_dir: &Path) -> PathBuf {
-    vault_dir.join(INDEX_ROOT).join(REBUILD_REQUIRED_NAME)
+pub fn rebuild_required_marker_path(vault_dir: &Path, panel_version: u32) -> PathBuf {
+    panel_index_root(vault_dir, panel_version).join(REBUILD_REQUIRED_NAME)
 }
 
 /// Durably publish the marker (atomic rename + parent dir fsync), then read it
@@ -83,14 +86,15 @@ pub fn write_rebuild_required_marker(
             marker.schema
         )));
     }
-    let path = rebuild_required_marker_path(vault_dir);
+    let path = rebuild_required_marker_path(vault_dir, marker.panel_version);
     fs_io::write_json_atomic_durable(&path, marker)?;
-    let readback = read_rebuild_required_marker(vault_dir)?.ok_or_else(|| {
-        stale(format!(
-            "rebuild-required marker {} missing immediately after durable write",
-            path.display()
-        ))
-    })?;
+    let readback =
+        read_rebuild_required_marker(vault_dir, marker.panel_version)?.ok_or_else(|| {
+            stale(format!(
+                "rebuild-required marker {} missing immediately after durable write",
+                path.display()
+            ))
+        })?;
     if &readback != marker {
         return Err(stale(format!(
             "rebuild-required marker {} readback does not match written intent (source={} vs {})",
@@ -105,8 +109,11 @@ pub fn write_rebuild_required_marker(
 /// `Ok(None)` when no marker exists. An unreadable or wrong-schema marker is a
 /// hard error: the file's presence means a mutation staked intent, so guessing
 /// its content would hide exactly the state it exists to expose.
-pub fn read_rebuild_required_marker(vault_dir: &Path) -> CliResult<Option<RebuildRequiredMarker>> {
-    let path = rebuild_required_marker_path(vault_dir);
+pub fn read_rebuild_required_marker(
+    vault_dir: &Path,
+    panel_version: u32,
+) -> CliResult<Option<RebuildRequiredMarker>> {
+    let path = rebuild_required_marker_path(vault_dir, panel_version);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -130,6 +137,13 @@ pub fn read_rebuild_required_marker(vault_dir: &Path) -> CliResult<Option<Rebuil
             marker.schema
         )));
     }
+    if marker.panel_version != panel_version {
+        return Err(stale(format!(
+            "rebuild-required marker {} declares panel {} but panel {panel_version} was requested",
+            path.display(),
+            marker.panel_version
+        )));
+    }
     Ok(Some(marker))
 }
 
@@ -138,9 +152,10 @@ pub fn read_rebuild_required_marker(vault_dir: &Path) -> CliResult<Option<Rebuil
 /// seq than the manifest provides — that would mask real staleness.
 pub fn clear_rebuild_required_marker(
     vault_dir: &Path,
+    panel_version: u32,
     manifest_base_seq: u64,
 ) -> CliResult<MarkerClearOutcome> {
-    let Some(marker) = read_rebuild_required_marker(vault_dir)? else {
+    let Some(marker) = read_rebuild_required_marker(vault_dir, panel_version)? else {
         return Ok(MarkerClearOutcome::Absent);
     };
     if let Some(required) = marker.required_base_seq
@@ -148,34 +163,37 @@ pub fn clear_rebuild_required_marker(
     {
         return Err(stale(format!(
             "refusing to clear rebuild-required marker {}: it requires base seq {required} but the manifest was rebuilt at {manifest_base_seq}; a newer commit still lacks derived indexes",
-            rebuild_required_marker_path(vault_dir).display()
+            rebuild_required_marker_path(vault_dir, panel_version).display()
         )));
     }
-    fs_io::remove_file_durable(&rebuild_required_marker_path(vault_dir))?;
+    fs_io::remove_file_durable(&rebuild_required_marker_path(vault_dir, panel_version))?;
     Ok(MarkerClearOutcome::Cleared)
 }
 
 /// Clear a marker only if this process wrote it. Used by the ingest skip path
 /// (no new constellations, rebuild not needed) so an interrupted earlier run's
 /// marker is never silently discarded by a later replay-only batch.
-pub fn clear_rebuild_required_marker_if_owned(vault_dir: &Path) -> CliResult<MarkerClearOutcome> {
-    let Some(marker) = read_rebuild_required_marker(vault_dir)? else {
+pub fn clear_rebuild_required_marker_if_owned(
+    vault_dir: &Path,
+    panel_version: u32,
+) -> CliResult<MarkerClearOutcome> {
+    let Some(marker) = read_rebuild_required_marker(vault_dir, panel_version)? else {
         return Ok(MarkerClearOutcome::Absent);
     };
     if marker.process_id != std::process::id() {
         return Ok(MarkerClearOutcome::Absent);
     }
-    fs_io::remove_file_durable(&rebuild_required_marker_path(vault_dir))?;
+    fs_io::remove_file_durable(&rebuild_required_marker_path(vault_dir, panel_version))?;
     Ok(MarkerClearOutcome::Cleared)
 }
 
 /// One-line diagnostic used to enrich stale-derived errors so the operator sees
 /// the recorded commit context, not just a seq mismatch.
-pub(super) fn marker_error_context(vault_dir: &Path) -> String {
-    match read_rebuild_required_marker(vault_dir) {
+pub(super) fn marker_error_context(vault_dir: &Path, panel_version: u32) -> String {
+    match read_rebuild_required_marker(vault_dir, panel_version) {
         Ok(Some(marker)) => format!(
             "; rebuild-required marker present at {} (source={}, required_base_seq={}, session_id={}, batch_path={}, process_id={}, written_at_unix_ms={}): {}",
-            rebuild_required_marker_path(vault_dir).display(),
+            rebuild_required_marker_path(vault_dir, panel_version).display(),
             marker.source,
             marker
                 .required_base_seq

@@ -68,6 +68,8 @@ pub struct AnnealFaultLedgerDetails {
     pub component_kind: String,
     pub component_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_id: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lens_id: Option<String>,
@@ -80,8 +82,16 @@ pub struct AnnealFaultLedgerDetails {
 impl AnnealFaultLedgerDetails {
     pub fn component_label(&self) -> String {
         match self.component_kind.as_str() {
-            "ann_index" => format!("AnnIndex(slot_{})", self.slot_id.unwrap_or_default()),
-            "guard_profile" => format!("GuardProfile(slot_{})", self.slot_id.unwrap_or_default()),
+            "ann_index" => format!(
+                "AnnIndex(panel_{}/slot_{})",
+                self.panel_version.unwrap_or_default(),
+                self.slot_id.unwrap_or_default()
+            ),
+            "guard_profile" => format!(
+                "GuardProfile(panel_{}/slot_{})",
+                self.panel_version.unwrap_or_default(),
+                self.slot_id.unwrap_or_default()
+            ),
             "lens_endpoint" => self
                 .lens_id
                 .as_ref()

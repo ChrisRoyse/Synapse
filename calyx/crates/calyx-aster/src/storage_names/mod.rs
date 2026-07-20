@@ -220,6 +220,7 @@ pub fn parse_cf_dir_name(value: &str) -> Result<ColumnFamily> {
         "kernel" => ColumnFamily::Kernel,
         "guard" => ColumnFamily::Guard,
         "leapable" => ColumnFamily::Leapable,
+        "registry" => ColumnFamily::Registry,
         "recurrence" => ColumnFamily::Recurrence,
         "graph" => ColumnFamily::Graph,
         "online" => ColumnFamily::Online,

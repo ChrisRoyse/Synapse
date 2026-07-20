@@ -1,19 +1,37 @@
 use std::collections::BTreeMap;
 
-use calyx_core::{SlotId, SlotVector};
+use calyx_core::{CalyxError, Panel, SlotId, SlotVector};
 use calyx_sextant::{FusionStrategy, RrfProfile, fusion};
 
-pub(crate) fn weights_for(strategy: &FusionStrategy, slots: &[SlotId]) -> BTreeMap<SlotId, f32> {
+use crate::error::CliResult;
+
+pub(crate) fn weights_for(
+    strategy: &FusionStrategy,
+    panel: &Panel,
+    slots: &[SlotId],
+) -> CliResult<BTreeMap<SlotId, f32>> {
     let Some(profile) = weighted_profile(strategy) else {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     };
-    let profile_weights = fusion::profiles::lookup(profile)
-        .map(|profile| profile.weights)
-        .unwrap_or_default();
-    slots
+    let profile_weights = fusion::profiles::lookup(profile, panel)?.weights;
+    let missing = slots
         .iter()
-        .map(|slot| (*slot, profile_weights.get(slot).copied().unwrap_or(1.0)))
-        .collect()
+        .find(|slot| !profile_weights.contains_key(slot));
+    if let Some(slot) = missing {
+        return Err(CalyxError {
+            code: calyx_sextant::error::CALYX_SEXTANT_PROFILE_UNBOUND,
+            message: format!(
+                "RRF profile {profile:?} for panel {} has no declared weight for searched slot {slot}",
+                panel.version
+            ),
+            remediation: "restrict the query to slots bound by the selected profile or declare a matching slot axis in the exact panel contract",
+        }
+        .into());
+    }
+    Ok(slots
+        .iter()
+        .map(|slot| (*slot, profile_weights[slot]))
+        .collect())
 }
 
 pub(crate) fn stage1_slots(

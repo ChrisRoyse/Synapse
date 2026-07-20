@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Clock, LedgerRef, LensId, Result, Seq, SlotId};
+use calyx_core::{CalyxError, Clock, LedgerRef, LensId, PanelSlotId, Result, Seq};
 use calyx_ledger::LedgerCfStore;
 use serde::{Deserialize, Serialize};
 
@@ -104,16 +104,16 @@ impl fmt::Display for ComponentHealth {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentKind {
-    AnnIndex { slot_id: SlotId },
+    AnnIndex { panel_slot: PanelSlotId },
     KernelIndex { scope: ScopeId },
-    GuardProfile { slot_id: SlotId },
+    GuardProfile { panel_slot: PanelSlotId },
     LensEndpoint { lens_id: LensId },
     BaseShard { shard_id: String },
 }
 
 impl ComponentKind {
-    pub fn ann_index(slot_id: SlotId) -> Self {
-        Self::AnnIndex { slot_id }
+    pub fn ann_index(panel_slot: PanelSlotId) -> Self {
+        Self::AnnIndex { panel_slot }
     }
 
     pub fn lens_endpoint(lens_id: LensId) -> Self {
@@ -128,9 +128,17 @@ impl ComponentKind {
 
     pub(crate) fn storage_key(&self) -> Vec<u8> {
         match self {
-            Self::AnnIndex { slot_id } => format!("ann_index/slot_{:04}", slot_id.get()),
+            Self::AnnIndex { panel_slot } => format!(
+                "ann_index/panel_{:010}/slot_{:04}",
+                panel_slot.panel_version(),
+                panel_slot.slot_id().get()
+            ),
             Self::KernelIndex { scope } => format!("kernel_index/{scope}"),
-            Self::GuardProfile { slot_id } => format!("guard_profile/slot_{:04}", slot_id.get()),
+            Self::GuardProfile { panel_slot } => format!(
+                "guard_profile/panel_{:010}/slot_{:04}",
+                panel_slot.panel_version(),
+                panel_slot.slot_id().get()
+            ),
             Self::LensEndpoint { lens_id } => format!("lens_endpoint/{lens_id}"),
             Self::BaseShard { shard_id } => format!("base_shard/{shard_id}"),
         }
@@ -141,9 +149,9 @@ impl ComponentKind {
 impl fmt::Display for ComponentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AnnIndex { slot_id } => write!(f, "AnnIndex(slot_{})", slot_id.get()),
+            Self::AnnIndex { panel_slot } => write!(f, "AnnIndex({panel_slot})"),
             Self::KernelIndex { scope } => write!(f, "KernelIndex({scope})"),
-            Self::GuardProfile { slot_id } => write!(f, "GuardProfile(slot_{})", slot_id.get()),
+            Self::GuardProfile { panel_slot } => write!(f, "GuardProfile({panel_slot})"),
             Self::LensEndpoint { lens_id } => write!(f, "LensEndpoint({lens_id})"),
             Self::BaseShard { shard_id } => write!(f, "BaseShard({shard_id})"),
         }

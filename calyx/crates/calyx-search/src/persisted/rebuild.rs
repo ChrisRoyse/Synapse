@@ -1,7 +1,7 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
-use calyx_core::{CalyxError, CxId, SlotId, SlotState};
+use calyx_core::{CalyxError, CxId, PanelSlotId, SlotId, SlotState};
 use rayon::prelude::*;
 
 use super::*;
@@ -9,7 +9,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildProgress<'a> {
     pub phase: &'static str,
-    pub slot: Option<SlotId>,
+    pub panel_slot: Option<PanelSlotId>,
     pub rows: Option<usize>,
     pub base_seq: Option<u64>,
     pub manifest_path: Option<&'a Path>,
@@ -22,7 +22,7 @@ impl<'a> RebuildProgress<'a> {
     pub(super) fn phase(phase: &'static str) -> Self {
         Self {
             phase,
-            slot: None,
+            panel_slot: None,
             rows: None,
             base_seq: None,
             manifest_path: None,
@@ -32,13 +32,14 @@ impl<'a> RebuildProgress<'a> {
 
     pub(super) fn slot(
         phase: &'static str,
+        panel_version: u32,
         slot: SlotId,
         rows: Option<usize>,
         base_seq: Option<u64>,
     ) -> Self {
         Self {
             phase,
-            slot: Some(slot),
+            panel_slot: Some(PanelSlotId::new(panel_version, slot)),
             rows,
             base_seq,
             manifest_path: None,
@@ -49,7 +50,7 @@ impl<'a> RebuildProgress<'a> {
     pub(super) fn manifest(phase: &'static str, manifest_path: &'a Path, base_seq: u64) -> Self {
         Self {
             phase,
-            slot: None,
+            panel_slot: None,
             rows: None,
             base_seq: Some(base_seq),
             manifest_path: Some(manifest_path),
@@ -123,6 +124,7 @@ where
     super::rebuild_stream::rebuild_for_vault_with_active_slots_progress(
         vault_dir,
         vault,
+        state.panel.version,
         &active_slots,
         progress,
     )
@@ -138,8 +140,11 @@ fn active_panel_slots(state: &calyx_registry::VaultPanelState) -> BTreeSet<SlotI
         .collect()
 }
 
-pub(super) fn previous_manifest(vault_dir: &Path) -> CliResult<Option<SearchIndexManifest>> {
-    let path = manifest_path(vault_dir);
+pub(super) fn previous_manifest(
+    vault_dir: &Path,
+    panel_version: u32,
+) -> CliResult<Option<SearchIndexManifest>> {
+    let path = manifest_path(vault_dir, panel_version);
     if !path.exists() {
         return Ok(None);
     }
@@ -157,6 +162,13 @@ pub(super) fn previous_manifest(vault_dir: &Path) -> CliResult<Option<SearchInde
             manifest.format
         )));
     }
+    if manifest.panel_version != panel_version {
+        return Err(stale(format!(
+            "persistent search index manifest {} declares panel {} but panel {panel_version} was requested",
+            path.display(),
+            manifest.panel_version
+        )));
+    }
     Ok(Some(manifest))
 }
 
@@ -169,6 +181,14 @@ pub fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>>
 pub fn load_docs_at(
     vault: &AsterVault,
     snapshot: Snapshot,
+) -> CliResult<BTreeMap<CxId, Constellation>> {
+    load_docs_for_panel_at(vault, snapshot, None)
+}
+
+pub(crate) fn load_docs_for_panel_at(
+    vault: &AsterVault,
+    snapshot: Snapshot,
+    requested_panel_version: Option<u32>,
 ) -> CliResult<BTreeMap<CxId, Constellation>> {
     let base_rows = vault.scan_cf_snapshot(snapshot, ColumnFamily::Base)?;
     let decoded_base = base_rows
@@ -185,7 +205,34 @@ pub fn load_docs_at(
             Ok((cx_id, cx))
         })
         .collect::<calyx_core::Result<Vec<_>>>()?;
-    let mut docs = decoded_base.into_iter().collect::<BTreeMap<_, _>>();
+    let panel_versions = decoded_base
+        .iter()
+        .map(|(_, cx)| cx.panel_version)
+        .collect::<BTreeSet<_>>();
+    let panel_version = match requested_panel_version {
+        Some(panel_version) => panel_version,
+        None if panel_versions.len() == 1 => *panel_versions
+            .first()
+            .expect("one panel version was observed"),
+        None if panel_versions.is_empty() => return Ok(BTreeMap::new()),
+        None => {
+            return Err(CalyxError {
+                code: CALYX_SEARCH_PANEL_SCOPE_REQUIRED,
+                message: format!(
+                    "vault snapshot {} contains {} panel versions {:?}; a bare SlotId is ambiguous",
+                    snapshot.seq(),
+                    panel_versions.len(),
+                    panel_versions
+                ),
+                remediation: "supply the exact panel version and rebuild/search only that panel generation",
+            }
+            .into());
+        }
+    };
+    let mut docs = decoded_base
+        .into_iter()
+        .filter(|(_, cx)| cx.panel_version == panel_version)
+        .collect::<BTreeMap<_, _>>();
     let slots = indexed_slots(&docs);
     for slot in slots {
         load_slot_rows(vault, snapshot, slot, &mut docs)?;
@@ -302,7 +349,7 @@ fn referenced_index_artifacts(
     root: &Path,
     manifest: &SearchIndexManifest,
 ) -> CliResult<Vec<PathBuf>> {
-    let mut keep = vec![manifest_path(vault_dir)];
+    let mut keep = vec![manifest_path(vault_dir, manifest.panel_version)];
     if let Some(filter) = &manifest.filter {
         keep.push(vault_dir.join(&filter.index_rel));
     }

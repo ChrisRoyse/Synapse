@@ -3,10 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use calyx_aster::cf::{ColumnFamily, slot_key};
 use calyx_aster::vault::AsterVault;
-use calyx_aster::vault::encode::decode_slot_vector;
-use calyx_core::{CalyxError, Clock, CxId, Result, SlotId, SlotVector};
+use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, SlotId, SlotVector, VaultStore};
 use calyx_ward::{GuardProfile, NoveltyAction, ProducedSlots, WardError};
 
 use super::{NoveltyVerdict, ReactiveSignals};
@@ -48,7 +46,7 @@ impl<C: Clock> ReactiveSignals for RecurrenceSignals<'_, C> {
         self.store.occurrence_count(series)
     }
 
-    fn slot_drift(&self, _slot: SlotId) -> Result<f32> {
+    fn slot_drift(&self, _slot: PanelSlotId) -> Result<f32> {
         Err(loom_error(
             CALYX_REACTIVE_SIGNAL_UNAVAILABLE,
             "recurrence signal source cannot evaluate a DriftDetected delta",
@@ -86,8 +84,18 @@ impl<'a, C: Clock> WardNoveltySignals<'a, C> {
                 profile.tau.insert(*slot, tau);
             }
         }
-        let produced = slots_for(self.vault, cx_id, &profile.required_slots)?;
-        let matched = slots_for(self.vault, self.matched_cx, &profile.required_slots)?;
+        let produced = slots_for(
+            self.vault,
+            cx_id,
+            profile.panel_version,
+            &profile.required_slots,
+        )?;
+        let matched = slots_for(
+            self.vault,
+            self.matched_cx,
+            profile.panel_version,
+            &profile.required_slots,
+        )?;
         let verdict = calyx_ward::guard(&profile, &produced, &matched, self.high_stakes)
             .map_err(ward_to_calyx)?;
         if verdict.action == Some(NoveltyAction::NewRegion) {
@@ -102,7 +110,7 @@ impl<'a, C: Clock> WardNoveltySignals<'a, C> {
 /// vault snapshots.
 #[derive(Debug, Default)]
 pub struct AgreementDriftTracker {
-    previous: Mutex<BTreeMap<SlotId, Vec<f32>>>,
+    previous: Mutex<BTreeMap<PanelSlotId, Vec<f32>>>,
 }
 
 impl AgreementDriftTracker {
@@ -110,8 +118,13 @@ impl AgreementDriftTracker {
         Self::default()
     }
 
-    fn drift<C: Clock>(&self, vault: &AsterVault<C>, cx_id: CxId, slot: SlotId) -> Result<f32> {
-        let current = dense_slot(vault, cx_id, slot)?;
+    fn drift<C: Clock>(
+        &self,
+        vault: &AsterVault<C>,
+        cx_id: CxId,
+        panel_slot: PanelSlotId,
+    ) -> Result<f32> {
+        let current = dense_slot(vault, cx_id, panel_slot)?;
         let mut previous = self.previous.lock().map_err(|_| {
             loom_error(
                 CALYX_REACTIVE_SIGNAL_UNAVAILABLE,
@@ -119,11 +132,11 @@ impl AgreementDriftTracker {
             )
         })?;
         let drift = previous
-            .get(&slot)
+            .get(&panel_slot)
             .map(|prior| agreement_scalar(&current, prior).map(|cos| (1.0 - cos).abs()))
             .transpose()?
             .unwrap_or(0.0);
-        previous.insert(slot, current);
+        previous.insert(panel_slot, current);
         Ok(drift)
     }
 }
@@ -204,7 +217,7 @@ impl<C: Clock> ReactiveSignals for WardNoveltySignals<'_, C> {
         ))
     }
 
-    fn slot_drift(&self, _slot: SlotId) -> Result<f32> {
+    fn slot_drift(&self, _slot: PanelSlotId) -> Result<f32> {
         Err(unavailable(
             "Ward novelty source cannot evaluate DriftDetected",
         ))
@@ -224,7 +237,7 @@ impl<C: Clock> ReactiveSignals for AgreementDriftSignals<'_, C> {
         ))
     }
 
-    fn slot_drift(&self, slot: SlotId) -> Result<f32> {
+    fn slot_drift(&self, slot: PanelSlotId) -> Result<f32> {
         self.tracker.drift(self.vault, self.current_cx, slot)
     }
 }
@@ -241,7 +254,7 @@ impl<C: Clock> ReactiveSignals for ReactiveSignalSet<'_, C> {
         self.recurrence.occurrence_count(series)
     }
 
-    fn slot_drift(&self, slot: SlotId) -> Result<f32> {
+    fn slot_drift(&self, slot: PanelSlotId) -> Result<f32> {
         self.drift
             .as_ref()
             .ok_or_else(|| unavailable("composite reactive source has no agreement drift adapter"))?
@@ -258,27 +271,42 @@ impl<'a, C: Clock> RecurrenceSignals<'a, C> {
 fn slots_for<C: Clock>(
     vault: &AsterVault<C>,
     cx_id: CxId,
+    panel_version: u32,
     required_slots: &[SlotId],
 ) -> Result<ProducedSlots> {
     let mut out = ProducedSlots::new();
     for slot in required_slots {
-        out.insert(*slot, dense_slot(vault, cx_id, *slot)?);
+        out.insert(
+            *slot,
+            dense_slot(vault, cx_id, PanelSlotId::new(panel_version, *slot))?,
+        );
     }
     Ok(out)
 }
 
-fn dense_slot<C: Clock>(vault: &AsterVault<C>, cx_id: CxId, slot: SlotId) -> Result<Vec<f32>> {
-    let bytes = vault
-        .read_cf_at(
-            vault.latest_seq(),
-            ColumnFamily::slot(slot),
-            &slot_key(cx_id),
-        )?
-        .ok_or_else(|| unavailable(format!("missing dense slot {slot} for {cx_id}")))?;
-    match decode_slot_vector(&bytes)? {
-        SlotVector::Dense { data, .. } => Ok(data),
+fn dense_slot<C: Clock>(
+    vault: &AsterVault<C>,
+    cx_id: CxId,
+    panel_slot: PanelSlotId,
+) -> Result<Vec<f32>> {
+    let cx = vault.get(cx_id, vault.latest_seq())?;
+    if cx.panel_version != panel_slot.panel_version() {
+        return Err(loom_error(
+            crate::error::CALYX_LOOM_PANEL_SCOPE_REQUIRED,
+            format!(
+                "constellation {cx_id} belongs to panel {}, not requested {panel_slot}",
+                cx.panel_version
+            ),
+        ));
+    }
+    let vector = cx
+        .slots
+        .get(&panel_slot.slot_id())
+        .ok_or_else(|| unavailable(format!("missing dense {panel_slot} for {cx_id}")))?;
+    match vector {
+        SlotVector::Dense { data, .. } => Ok(data.clone()),
         other => Err(unavailable(format!(
-            "slot {slot} for {cx_id} is not dense: {other:?}"
+            "{panel_slot} for {cx_id} is not dense: {other:?}"
         ))),
     }
 }

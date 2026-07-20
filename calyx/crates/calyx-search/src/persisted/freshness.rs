@@ -16,7 +16,7 @@ impl PersistedSearchIndexes {
         if derived_content_seq > pinned_seq {
             return Err(CalyxError::stale_derived(format!(
                 "derived content seq {derived_content_seq} exceeds pinned vault seq {pinned_seq}; snapshot watermark was not clamped at pin time — refusing to reason about freshness{}",
-                marker::marker_error_context(&self.vault_dir)
+                marker::marker_error_context(&self.vault_dir, self.manifest.panel_version)
             ))
             .into());
         }
@@ -24,7 +24,7 @@ impl PersistedSearchIndexes {
             return Err(CalyxError::stale_derived(format!(
                 "persistent search manifest base seq {} is ahead of pinned vault seq {pinned_seq}; the manifest was built after this snapshot — rebuild the vault search indexes or retry against the latest vault seq{}",
                 self.manifest.base_seq,
-                marker::marker_error_context(&self.vault_dir)
+                marker::marker_error_context(&self.vault_dir, self.manifest.panel_version)
             ))
             .into());
         }
@@ -32,7 +32,7 @@ impl PersistedSearchIndexes {
             return Err(CalyxError::stale_derived(format!(
                 "persistent search manifest base seq {} is behind derived content seq {derived_content_seq} (pinned vault seq {pinned_seq}); a commit after the manifest was built changed search inputs; rebuild the vault search indexes before search{}",
                 self.manifest.base_seq,
-                marker::marker_error_context(&self.vault_dir)
+                marker::marker_error_context(&self.vault_dir, self.manifest.panel_version)
             ))
             .into());
         }

@@ -30,6 +30,7 @@ const SPARSE_ROW_MEMORY_ESTIMATE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(super) struct SlotBuildPlan {
+    pub(super) panel_version: u32,
     pub(super) slot: SlotId,
     pub(super) expected_ids: Vec<CxId>,
     pub(super) estimated_bytes: usize,
@@ -191,6 +192,7 @@ pub(super) fn manifest_backend(policy: DiskAnnBuildPolicy) -> (String, String, b
 }
 
 pub(super) fn slot_build_plans(
+    panel_version: u32,
     ids_by_slot: &BTreeMap<SlotId, Vec<CxId>>,
     previous_manifest: Option<&SearchIndexManifest>,
     active_slots: Option<&BTreeSet<SlotId>>,
@@ -204,6 +206,7 @@ pub(super) fn slot_build_plans(
             expected_ids.dedup();
             let estimated_bytes = estimate_slot_bytes(*slot, expected_ids.len(), previous_manifest);
             SlotBuildPlan {
+                panel_version,
                 slot: *slot,
                 expected_ids,
                 estimated_bytes,

@@ -9,7 +9,7 @@ use crate::{ArtifactPtr, BudgetHandle, CALYX_ANNEAL_BUDGET_EXHAUSTED};
 
 use super::{CALYX_ANNEAL_REBUILD_IO, MvccSnapshot, RebuildTarget};
 
-type RawSourceRows = Vec<(Vec<u8>, Vec<u8>)>;
+pub(super) type RawSourceRows = Vec<(Vec<u8>, Vec<u8>)>;
 type SourceRowSetInput = (&'static str, RawSourceRows);
 
 #[derive(Serialize)]
@@ -104,17 +104,19 @@ pub(super) fn write_artifact(
 pub(super) fn target_hash(target: &RebuildTarget) -> [u8; 32] {
     let mut bytes = Vec::new();
     match target {
-        RebuildTarget::AnnIndex { slot_id } => {
+        RebuildTarget::AnnIndex { panel_slot } => {
             bytes.extend_from_slice(b"ann_index\0");
-            bytes.extend_from_slice(&slot_id.0.to_be_bytes());
+            bytes.extend_from_slice(&panel_slot.panel_version().to_be_bytes());
+            bytes.extend_from_slice(&panel_slot.slot_id().get().to_be_bytes());
         }
         RebuildTarget::KernelIndex { scope } => {
             bytes.extend_from_slice(b"kernel_index\0");
             bytes.extend_from_slice(scope.to_string().as_bytes());
         }
-        RebuildTarget::GuardProfile { slot_id } => {
+        RebuildTarget::GuardProfile { panel_slot } => {
             bytes.extend_from_slice(b"guard_profile\0");
-            bytes.extend_from_slice(&slot_id.0.to_be_bytes());
+            bytes.extend_from_slice(&panel_slot.panel_version().to_be_bytes());
+            bytes.extend_from_slice(&panel_slot.slot_id().get().to_be_bytes());
         }
     }
     full_content_hash([bytes.as_slice()])

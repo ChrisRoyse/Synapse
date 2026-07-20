@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use calyx_core::{CalyxError, CxId, SlotId, SlotVector};
+use calyx_core::{CalyxError, CxId, PanelSlotId, SlotId, SlotVector};
 use calyx_sextant::index::{
     DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, IndexSearchHit, SextantIndex, ranked,
 };
@@ -30,7 +30,7 @@ impl DenseSlotRows {
 pub(super) fn write_with_progress<F>(
     vault_dir: &Path,
     root: &Path,
-    slot: SlotId,
+    panel_slot: PanelSlotId,
     rows: DenseSlotRows,
     base_seq: u64,
     build_policy: DiskAnnBuildPolicy,
@@ -39,6 +39,8 @@ pub(super) fn write_with_progress<F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult,
 {
+    let slot = panel_slot.slot_id();
+    let panel_version = panel_slot.panel_version();
     if should_use_flat_dense_index(rows.rows.len()) {
         return flat::write(vault_dir, root, slot, rows, base_seq);
     }
@@ -65,6 +67,7 @@ where
         |event| {
             progress(RebuildProgress::slot(
                 event.phase,
+                panel_version,
                 slot,
                 Some(event.rows),
                 Some(base_seq),
@@ -77,6 +80,7 @@ where
         &id_map_path,
         &SlotIdMap {
             format: super::IDMAP_FORMAT.to_string(),
+            panel_version,
             slot: slot.get(),
             ids: rows.rows.iter().map(|(cx_id, _)| *cx_id).collect(),
         },
@@ -94,6 +98,7 @@ where
 pub(super) fn search(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
+    panel_version: u32,
     slot: SlotId,
     query: &SlotVector,
     k: usize,
@@ -106,7 +111,7 @@ pub(super) fn search(
             "persistent dense search slot {slot} received non-dense query"
         )));
     };
-    open(vault_dir, entry, slot, *dim, k)?
+    open(vault_dir, entry, panel_version, slot, *dim, k)?
         .search(query, want(k, entry.len), Some(want(k, entry.len).max(64)))
         .map_err(Into::into)
 }
@@ -114,6 +119,7 @@ pub(super) fn search(
 pub(super) fn search_filtered(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
+    panel_version: u32,
     slot: SlotId,
     query: &SlotVector,
     k: usize,
@@ -127,13 +133,14 @@ pub(super) fn search_filtered(
             "persistent dense filtered search slot {slot} received non-dense query"
         )));
     };
-    let index = open(vault_dir, entry, slot, *dim, k)?;
+    let index = open(vault_dir, entry, panel_version, slot, *dim, k)?;
     exact_filtered_hits(&index, data, k, candidates)
 }
 
 fn open(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
+    panel_version: u32,
     slot: SlotId,
     query_dim: u32,
     k: usize,
@@ -145,7 +152,7 @@ fn open(
             "persistent slot {slot} index dim {dim} != query dim {query_dim}; reingest/backfill the vault"
         )));
     }
-    let ids = read_ids(vault_dir, entry, slot)?;
+    let ids = read_ids(vault_dir, entry, panel_version, slot)?;
     if ids.len() != entry.len {
         return Err(stale(format!(
             "persistent slot {slot} id map len {} != manifest len {}",
@@ -159,7 +166,12 @@ fn open(
     Ok(index)
 }
 
-fn read_ids(vault_dir: &Path, entry: &SearchIndexEntry, slot: SlotId) -> CliResult<Vec<CxId>> {
+fn read_ids(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    panel_version: u32,
+    slot: SlotId,
+) -> CliResult<Vec<CxId>> {
     let path = vault_dir.join(entry.require_id_map_rel(slot)?);
     let map: SlotIdMap = serde_json::from_slice(&fs::read(&path)?)?;
     if map.format != super::IDMAP_FORMAT {
@@ -176,12 +188,19 @@ fn read_ids(vault_dir: &Path, entry: &SearchIndexEntry, slot: SlotId) -> CliResu
             map.slot, entry.slot
         )));
     }
+    if map.panel_version != panel_version {
+        return Err(stale(format!(
+            "persistent id map panel {} != requested panel {panel_version} for slot {slot}",
+            map.panel_version
+        )));
+    }
     Ok(map.ids)
 }
 
 pub(super) fn validate_entry(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
+    panel_version: u32,
     slot: SlotId,
 ) -> CliResult {
     if entry.kind == "flat_dense" {
@@ -202,7 +221,7 @@ pub(super) fn validate_entry(
             graph.display()
         )));
     }
-    let ids = read_ids(vault_dir, entry, slot)?;
+    let ids = read_ids(vault_dir, entry, panel_version, slot)?;
     if ids.len() != entry.len {
         return Err(stale(format!(
             "persistent slot {slot} id map len {} != manifest len {}",

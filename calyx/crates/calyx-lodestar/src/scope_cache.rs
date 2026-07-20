@@ -10,7 +10,7 @@ const DEFAULT_MAX_ENTRIES: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ScopeCacheKey {
     pub scope_hash: [u8; 32],
-    pub panel_version: u64,
+    pub panel_version: u32,
     pub anchor_identity: [u8; 32],
     pub corpus_identity: [u8; 32],
 }
@@ -18,7 +18,7 @@ pub struct ScopeCacheKey {
 impl ScopeCacheKey {
     pub const fn new(
         scope_hash: [u8; 32],
-        panel_version: u64,
+        panel_version: u32,
         anchor_identity: [u8; 32],
         corpus_identity: [u8; 32],
     ) -> Self {
@@ -91,7 +91,7 @@ impl ScopeCache {
         }
     }
 
-    pub fn invalidate_panel_version(&mut self, old_version: u64) -> usize {
+    pub fn invalidate_panel_version(&mut self, old_version: u32) -> usize {
         let keys: Vec<_> = self
             .entries
             .keys()

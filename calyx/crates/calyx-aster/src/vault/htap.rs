@@ -13,14 +13,14 @@ use super::slot_column::read_materialized_slot_column;
 use super::{AsterVault, SlotColumnMaterialization, encode};
 use crate::cf::{ColumnFamily, slot_key};
 use crate::olap::{OlapScanPlan, OlapScanResult, scan_materialized_slot_column_aggregate};
-use calyx_core::{CalyxError, Clock, Result, Seq, SlotId, SlotVector};
+use calyx_core::{CalyxError, Clock, PanelSlotId, Result, Seq, SlotVector};
 
 /// Result of an HTAP dual read: the analytical column path, the transactional
 /// row path, and the identity verdicts between them at one snapshot.
 #[derive(Debug, Clone)]
 pub struct HtapDualRead {
     pub snapshot: Seq,
-    pub slot: SlotId,
+    pub panel_slot: PanelSlotId,
     pub value_column: usize,
     pub row_count: usize,
     pub dim: u32,
@@ -60,12 +60,12 @@ where
     pub fn htap_dual_read_at(
         &self,
         snapshot: Seq,
-        slot: SlotId,
+        panel_slot: PanelSlotId,
         value_column: usize,
         output_dir: impl AsRef<Path>,
     ) -> Result<HtapDualRead> {
         // --- Analytical (column) path ---
-        let column = self.materialize_slot_column_at(snapshot, slot, &output_dir)?;
+        let column = self.materialize_slot_column_at(snapshot, panel_slot, &output_dir)?;
         let plan = OlapScanPlan::new(value_column);
         let olap = scan_materialized_slot_column_aggregate(&column.manifest_path, plan)?;
         let readback = read_materialized_slot_column(&column.manifest_path)?;
@@ -78,7 +78,11 @@ where
         let mut max = 0.0f32;
         for (idx, cx) in column.cx_ids.iter().enumerate() {
             let raw = self
-                .read_cf_at(snapshot, ColumnFamily::slot(slot), &slot_key(*cx))?
+                .read_cf_at(
+                    snapshot,
+                    ColumnFamily::slot(panel_slot.slot_id()),
+                    &slot_key(*cx),
+                )?
                 .ok_or_else(|| {
                     CalyxError::stale_derived(format!(
                         "htap point read missing cx {cx} at snapshot {snapshot}"
@@ -119,7 +123,7 @@ where
 
         Ok(HtapDualRead {
             snapshot,
-            slot,
+            panel_slot,
             value_column,
             row_count: count,
             dim: column.dim,

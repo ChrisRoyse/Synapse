@@ -60,7 +60,9 @@ pub use error::{
     CALYX_TEMPORAL_INVALID_PERIOD, CALYX_TEMPORAL_INVALID_WINDOW, CALYX_TEMPORAL_WEIGHT_SUM,
     CALYX_TEMPORAL_WINDOW_BUDGET_EXHAUSTED, sextant_error,
 };
-pub use fusion::{FusionContext, FusionStrategy, RrfProfile, WeightedProfile, weighted_profiles};
+pub use fusion::{
+    FusionContext, FusionStrategy, RrfProfile, WeightedProfile, lookup, weighted_profiles,
+};
 pub use guarded::{GuardedSearchReport, apply_in_region_guard_to_hits};
 pub use hit::{
     DroppedGuardHit, FreshnessTag, Hit, HitGuardEvidence, HitGuardMode, PerLensContribution,
@@ -73,10 +75,9 @@ pub use index::{
     KernelRegion, KernelRegionAnn, KernelRegionId, LocalCxId, MaxSimIndex, PostingListReader,
     PostingListWriter, PostingMember, QuantConfig, QuantKind, RegionCandidate, RegionId,
     RegionPartitions, SPANN_CENTROID_MAGIC, SextantIndex, SpannCentroidIndex, SpannSearch,
-    SyntheticVault, TuneDirection, TunerAdjustment, TunerAdjustmentKind, TunerConfig,
-    TunerLedgerEntry, TunerObservation, TunerRange, TunerWarning, build_centroids, build_dual,
-    build_dual_with_search, build_synthetic_vault, dual_graph_path, open_dual,
-    register_with_anneal, synthetic_dense_rows,
+    TuneDirection, TunerAdjustment, TunerAdjustmentKind, TunerConfig, TunerLedgerEntry,
+    TunerObservation, TunerRange, TunerWarning, build_centroids, build_dual,
+    build_dual_with_search, dual_graph_path, open_dual, register_with_anneal,
 };
 pub use navigation::{
     ConsensusHit, ConsensusMode, ConsensusReport, LensComparison, MAX_TRAVERSE_HOPS, SkillNode,

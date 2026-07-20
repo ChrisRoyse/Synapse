@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use calyx_core::CxId;
+use calyx_core::{CxId, PanelSlotId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
 
 use crate::{LodestarError, LoomAssocEdgeProvenance, Result, groundedness_distance};
 
-pub const LOOM_WEAVE_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const LOOM_WEAVE_REPORT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_MIN_GROUNDEDNESS_FRACTION: f32 = 0.000_001;
 const DEFAULT_MAX_TOP_EDGES: usize = 16;
 
@@ -48,8 +48,8 @@ pub struct LoomWeaveEdgeReadback {
     pub src: CxId,
     pub dst: CxId,
     pub xterm_cx: CxId,
-    pub src_slot: u16,
-    pub dst_slot: u16,
+    pub src_slot: PanelSlotId,
+    pub dst_slot: PanelSlotId,
     pub raw_agreement: f32,
     pub agreement: f32,
     pub directional_confidence: f32,
@@ -157,8 +157,8 @@ fn top_edges(
             src: entry.src_cx,
             dst: entry.dst_cx,
             xterm_cx: entry.xterm_cx,
-            src_slot: entry.src_slot.get(),
-            dst_slot: entry.dst_slot.get(),
+            src_slot: entry.src_slot,
+            dst_slot: entry.dst_slot,
             raw_agreement: entry.raw_agreement,
             agreement: entry.agreement,
             directional_confidence: entry.directional_confidence,

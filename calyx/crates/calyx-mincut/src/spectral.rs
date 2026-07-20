@@ -25,7 +25,7 @@ pub struct EigenPair {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SpectralCacheKey {
     pub scope: String,
-    pub panel_version: u64,
+    pub panel_version: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

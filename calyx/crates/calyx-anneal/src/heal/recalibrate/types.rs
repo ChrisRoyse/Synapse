@@ -1,5 +1,5 @@
 use calyx_aster::cf::full_content_hash;
-use calyx_core::{CalyxError, LensId, Result, SlotId};
+use calyx_core::{CalyxError, LensId, PanelSlotId, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -7,7 +7,7 @@ use crate::{
     ChangeId, LogicalTime, MvccSnapshot, ReplayQuery, ShadowRevertReason,
 };
 
-pub const WARD_TAU_TAG: &str = "ward_tau_v1";
+pub const WARD_TAU_TAG: &str = "ward_tau_v2";
 pub const SIGNAL_DECAY_FLOOR_BITS: f64 = 0.05;
 pub const CALYX_ANNEAL_PARK_THRESHOLD_NOT_MET: &str = "CALYX_ANNEAL_PARK_THRESHOLD_NOT_MET";
 pub const CALYX_ANNEAL_UNPARK_THRESHOLD_NOT_MET: &str = "CALYX_ANNEAL_UNPARK_THRESHOLD_NOT_MET";
@@ -16,7 +16,7 @@ pub const CALYX_WARD_RECALIBRATE_FAILED: &str = "CALYX_WARD_RECALIBRATE_FAILED";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewTau {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub tau: f32,
     pub far: f64,
     pub frr: f64,
@@ -25,7 +25,7 @@ pub struct NewTau {
 
 impl NewTau {
     pub fn new(
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         tau: f32,
         far: f64,
         frr: f64,
@@ -35,7 +35,7 @@ impl NewTau {
         validate_unit("far", far)?;
         validate_unit("frr", frr)?;
         Ok(Self {
-            slot_id,
+            panel_slot,
             tau,
             far,
             frr,
@@ -46,7 +46,7 @@ impl NewTau {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TauDriftEvent {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub current_tau: f32,
     pub observed_far: f64,
     pub drift_tolerance: f64,
@@ -57,7 +57,7 @@ pub struct TauDriftEvent {
 
 impl TauDriftEvent {
     pub fn new(
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         current_tau: f32,
         observed_far: f64,
         drift_tolerance: f64,
@@ -75,7 +75,7 @@ impl TauDriftEvent {
             ));
         }
         Ok(Self {
-            slot_id,
+            panel_slot,
             current_tau,
             observed_far,
             drift_tolerance,
@@ -89,17 +89,17 @@ impl TauDriftEvent {
 pub trait WardRecalibrate: Send + Sync {
     fn recalibrate(
         &self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         snapshot: MvccSnapshot,
         budget: BudgetHandle,
     ) -> Result<NewTau>;
 }
 
 pub trait WardTauStore {
-    fn current_tau(&self, slot_id: SlotId) -> Result<Option<f32>>;
+    fn current_tau(&self, panel_slot: PanelSlotId) -> Result<Option<f32>>;
     fn set_live_tau(
         &mut self,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         tau: &NewTau,
         updated_at: LogicalTime,
     ) -> Result<()>;
@@ -108,7 +108,7 @@ pub trait WardTauStore {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WardTauReadback {
-    pub slot_id: SlotId,
+    pub panel_slot: PanelSlotId,
     pub tau: f32,
     pub far: f64,
     pub frr: f64,
@@ -120,13 +120,13 @@ pub struct WardTauReadback {
 pub enum RecalibrationOutcome {
     Promoted {
         change_id: ChangeId,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         prior_tau: f32,
         new_tau: f32,
     },
     Reverted {
         change_id: ChangeId,
-        slot_id: SlotId,
+        panel_slot: PanelSlotId,
         prior_tau: f32,
         candidate_tau: f32,
         reason: ShadowRevertReason,
@@ -151,18 +151,19 @@ impl AnnealAction for TauShadowAction {
     }
 }
 
-pub(super) fn tau_artifact_key(slot_id: SlotId) -> ArtifactKey {
-    ArtifactKey::ConfigCache(tau_hash(slot_id, 0.0))
+pub(super) fn tau_artifact_key(panel_slot: PanelSlotId) -> ArtifactKey {
+    ArtifactKey::ConfigCache(tau_hash(panel_slot, 0.0))
 }
 
-pub(super) fn tau_ptr(slot_id: SlotId, tau: f32) -> ArtifactPtr {
-    ArtifactPtr::ConfigCacheKeyHash(tau_hash(slot_id, tau))
+pub(super) fn tau_ptr(panel_slot: PanelSlotId, tau: f32) -> ArtifactPtr {
+    ArtifactPtr::ConfigCacheKeyHash(tau_hash(panel_slot, tau))
 }
 
-pub(super) fn tau_hash(slot_id: SlotId, tau: f32) -> [u8; 32] {
+pub(super) fn tau_hash(panel_slot: PanelSlotId, tau: f32) -> [u8; 32] {
     full_content_hash([
-        b"guard_tau_v1".as_slice(),
-        &slot_id.get().to_be_bytes(),
+        b"guard_tau_v2".as_slice(),
+        &panel_slot.panel_version().to_be_bytes(),
+        &panel_slot.slot_id().get().to_be_bytes(),
         &tau.to_le_bytes(),
     ])
 }
@@ -179,13 +180,14 @@ pub(super) fn lens_hash(lens_id: LensId, bits: f64, label: &[u8]) -> [u8; 32] {
 }
 
 pub(super) fn tau_change_id(
-    slot_id: SlotId,
+    panel_slot: PanelSlotId,
     ts: LogicalTime,
     action: AnnealLedgerAction,
 ) -> ChangeId {
     let hash = full_content_hash([
         b"tau-change".as_slice(),
-        &slot_id.get().to_be_bytes(),
+        &panel_slot.panel_version().to_be_bytes(),
+        &panel_slot.slot_id().get().to_be_bytes(),
         &ts.to_be_bytes(),
         action_label(action).as_bytes(),
     ]);

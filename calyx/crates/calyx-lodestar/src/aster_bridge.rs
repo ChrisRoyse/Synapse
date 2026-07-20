@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use calyx_aster::plain_graph::PlainGraph;
 use calyx_aster::timetravel::TimeTravelSnapshot;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{AnchorKind, CalyxError, Clock, CxId, LedgerRef, Seq, SlotId, Ts};
+use calyx_core::{
+    AnchorKind, CalyxError, Clock, CxId, LedgerRef, PanelSlotId, Seq, Ts, VaultStore,
+};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ use crate::summarize::{
 use crate::{LodestarError, Result, ScopeCache};
 
 pub const DEFAULT_ASTER_ASSOC_COLLECTION: &str = "default";
-pub const ASTER_ASSOC_METADATA_KEY: &str = "lodestar_assoc_v1";
+pub const ASTER_ASSOC_METADATA_KEY: &str = "lodestar_assoc_v2";
 
 mod physical;
 
@@ -27,10 +29,7 @@ pub struct AsterAssocMetadata {
     pub retention_horizon: Option<Ts>,
     /// Dense content slot whose vectors define every node embedding and k-NN edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_slot: Option<SlotId>,
-    /// Frozen panel version used when the graph embeddings were measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub panel_version: Option<u64>,
+    pub embedding_slot: Option<PanelSlotId>,
     /// Last vault sequence incorporated before the graph contract was sealed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_source_seq: Option<Seq>,
@@ -128,10 +127,22 @@ impl<'a, C: Clock> AsterAssocSnapshot<'a, C> {
     pub fn recall_inputs(
         &self,
         params: RecallEvalParams,
-    ) -> std::result::Result<Option<AsterRecallInputs>, CalyxError> {
+    ) -> std::result::Result<AsterRecallInputs, CalyxError> {
+        let panel_slot = self.metadata.embedding_slot.ok_or_else(|| {
+            bridge_error(
+                "CALYX_ASSOC_PANEL_SCOPE_REQUIRED",
+                format!(
+                    "association collection {} has no panel-qualified embedding slot",
+                    self.collection
+                ),
+            )
+        })?;
         let graph = self.full_graph().map_err(to_calyx)?;
         if graph.is_empty() {
-            return Ok(None);
+            return Err(bridge_error(
+                "CALYX_SUMMARIZE_RECALL_EMPTY_GRAPH",
+                format!("association collection {} is empty", self.collection),
+            ));
         }
         let mut rows = Vec::new();
         let mut embeddings = BTreeMap::new();
@@ -143,11 +154,37 @@ impl<'a, C: Clock> AsterAssocSnapshot<'a, C> {
                     format!("node {cx_id} has no embedding in Aster graph props"),
                 )
             })?;
+            let cx = self.vault.get(cx_id, self.snapshot)?;
+            if cx.panel_version != panel_slot.panel_version() {
+                return Err(bridge_error(
+                    "CALYX_ASSOC_PANEL_SCOPE_MISMATCH",
+                    format!(
+                        "graph node {cx_id} belongs to panel {}, expected {panel_slot}",
+                        cx.panel_version
+                    ),
+                ));
+            }
+            let physical = cx
+                .slots
+                .get(&panel_slot.slot_id())
+                .and_then(|slot| slot.as_dense())
+                .ok_or_else(|| {
+                    bridge_error(
+                        "CALYX_SUMMARIZE_RECALL_MISSING_EMBEDDING",
+                        format!("node {cx_id} has no dense physical {panel_slot}"),
+                    )
+                })?;
+            if physical != vector.as_slice() {
+                return Err(bridge_error(
+                    "CALYX_ASSOC_EMBEDDING_DRIFT",
+                    format!("graph embedding for node {cx_id} differs from physical {panel_slot}"),
+                ));
+            }
             embeddings.insert(cx_id, vector.clone());
             rows.push(RecallQuery { cx_id, vector });
         }
         let full_index = InMemoryAnnIndex::new(rows.clone()).map_err(to_calyx)?;
-        Ok(Some(AsterRecallInputs {
+        Ok(AsterRecallInputs {
             embeddings,
             corpus: InMemoryCorpus::new(
                 format!("aster:{}@{}", self.collection, self.snapshot),
@@ -155,7 +192,7 @@ impl<'a, C: Clock> AsterAssocSnapshot<'a, C> {
             ),
             full_index,
             params,
-        }))
+        })
     }
 
     fn from_seq(
@@ -173,7 +210,11 @@ impl<'a, C: Clock> AsterAssocSnapshot<'a, C> {
                 })
             })
             .transpose()?
-            .unwrap_or_default();
+            .ok_or_else(|| LodestarError::KernelIndexCodec {
+                detail: format!(
+                    "missing {ASTER_ASSOC_METADATA_KEY} for association collection {collection}; rebuild from panel-qualified Base rows"
+                ),
+            })?;
         Ok(Self {
             vault,
             collection,
@@ -364,7 +405,7 @@ fn summarize_snapshot<C: Clock>(
     clock: &dyn Clock,
 ) -> std::result::Result<SummarizeResult, CalyxError> {
     let recall_inputs = snapshot.recall_inputs(recall_params)?;
-    let recall = recall_inputs.as_ref().map(AsterRecallInputs::measurement);
+    let recall = Some(recall_inputs.measurement());
     summarize_with_ledger(
         snapshot,
         scope,

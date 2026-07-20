@@ -3,14 +3,17 @@
 use std::collections::BTreeMap;
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
-use calyx_core::{CalyxError, CxId, Result, SlotId};
+use calyx_core::{CalyxError, CxId, PanelSlotId, Result, SlotId};
 use serde::{Deserialize, Serialize};
 
 use crate::cross_term::{
     CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag, agreement_scalar,
     agreement_weight, canonical_pair, concat_vec, delta_vec, interaction_vec,
 };
-use crate::error::{CALYX_LOOM_SLOT_MISSING, loom_error};
+use crate::error::{
+    CALYX_LOOM_PANEL_SCOPE_REQUIRED, CALYX_LOOM_SLOT_MISSING, CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED,
+    loom_error,
+};
 use crate::lru_cache::LruCache;
 use crate::materialization::{MaterializationAction, MaterializationPlan};
 
@@ -23,8 +26,8 @@ pub struct XtermRow {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgreementEdge {
-    pub a: SlotId,
-    pub b: SlotId,
+    pub a: PanelSlotId,
+    pub b: PanelSlotId,
     pub raw_mean_agreement: f32,
     pub mean_agreement: f32,
     pub agreement_weight: f32,
@@ -34,7 +37,7 @@ pub struct AgreementEdge {
 #[derive(Clone, Debug)]
 pub struct LoomStore {
     xterm_cf: BTreeMap<CrossTermKey, XtermRow>,
-    measured_tags: BTreeMap<(CxId, SlotId), SignalProvenanceTag>,
+    measured_tags: BTreeMap<(CxId, PanelSlotId), SignalProvenanceTag>,
     cache: LruCache<CrossTermKey, CrossTermValue>,
 }
 
@@ -47,9 +50,9 @@ impl LoomStore {
         }
     }
 
-    pub fn tag_measured(&mut self, cx: CxId, slot: SlotId) {
+    pub fn tag_measured(&mut self, cx: CxId, panel_slot: PanelSlotId) {
         self.measured_tags
-            .insert((cx, slot), SignalProvenanceTag::Measured);
+            .insert((cx, panel_slot), SignalProvenanceTag::Measured);
     }
 
     pub fn measured_count(&self) -> usize {
@@ -64,10 +67,15 @@ impl LoomStore {
         self.cache.len()
     }
 
-    pub fn weave(&mut self, cx: CxId, slots: &BTreeMap<SlotId, Vec<f32>>) -> Result<usize> {
+    pub fn weave(
+        &mut self,
+        panel_version: u32,
+        cx: CxId,
+        slots: &BTreeMap<SlotId, Vec<f32>>,
+    ) -> Result<usize> {
         let mut inserted = 0;
         for slot in slots.keys() {
-            self.tag_measured(cx, *slot);
+            self.tag_measured(cx, PanelSlotId::new(panel_version, *slot));
         }
         let ids: Vec<_> = slots.keys().copied().collect();
         for i in 0..ids.len() {
@@ -77,8 +85,8 @@ impl LoomStore {
                 let value = agreement_scalar(&slots[&a], &slots[&b])?;
                 let key = CrossTermKey {
                     cx_id: cx,
-                    a,
-                    b,
+                    a: PanelSlotId::new(panel_version, a),
+                    b: PanelSlotId::new(panel_version, b),
                     kind: CrossTermKind::Agreement,
                 };
                 self.xterm_cf.insert(
@@ -97,13 +105,14 @@ impl LoomStore {
 
     pub fn materialize_plan(
         &mut self,
+        panel_version: u32,
         cx: CxId,
         slots: &BTreeMap<SlotId, Vec<f32>>,
         plan: &MaterializationPlan,
     ) -> Result<usize> {
         let mut inserted = 0;
         for slot in slots.keys() {
-            self.tag_measured(cx, *slot);
+            self.tag_measured(cx, PanelSlotId::new(panel_version, *slot));
         }
         for entry in plan
             .entries
@@ -113,8 +122,8 @@ impl LoomStore {
             let (a, b) = canonical_pair(entry.a, entry.b);
             let key = CrossTermKey {
                 cx_id: cx,
-                a,
-                b,
+                a: PanelSlotId::new(panel_version, a),
+                b: PanelSlotId::new(panel_version, b),
                 kind: entry.kind,
             };
             if self.xterm_cf.contains_key(&key) {
@@ -136,6 +145,7 @@ impl LoomStore {
 
     pub fn cross_term(
         &mut self,
+        panel_version: u32,
         cx: CxId,
         a: SlotId,
         b: SlotId,
@@ -145,8 +155,8 @@ impl LoomStore {
         let (a, b) = canonical_pair(a, b);
         let key = CrossTermKey {
             cx_id: cx,
-            a,
-            b,
+            a: PanelSlotId::new(panel_version, a),
+            b: PanelSlotId::new(panel_version, b),
             kind,
         };
         if let Some(row) = self.xterm_cf.get(&key) {
@@ -161,7 +171,7 @@ impl LoomStore {
     }
 
     pub fn agreement_graph(&self) -> Result<Vec<AgreementEdge>> {
-        let mut edges = BTreeMap::<(SlotId, SlotId), (f32, usize)>::new();
+        let mut edges = BTreeMap::<(PanelSlotId, PanelSlotId), (f32, usize)>::new();
         for row in self.xterm_cf.values() {
             if let CrossTermValue::Scalar(value) = row.value {
                 let entry = edges.entry((row.key.a, row.key.b)).or_default();
@@ -222,8 +232,12 @@ impl LoomStore {
         let mut store = Self::new(cache_capacity);
         for entry in router.iter_cf(ColumnFamily::XTerm)? {
             let row: XtermRow = serde_json::from_slice(&entry.value).map_err(|error| {
-                CalyxError::aster_corrupt_shard(format!("decode xterm row: {error}"))
+                loom_error(
+                    CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED,
+                    format!("decode panel-qualified xterm row: {error}"),
+                )
             })?;
+            validate_panel_pair(&row.key)?;
             if entry.key != xterm_key(&row.key) {
                 return Err(CalyxError::aster_corrupt_shard(
                     "xterm CF key does not match row key",
@@ -236,10 +250,13 @@ impl LoomStore {
 }
 
 fn xterm_key(key: &CrossTermKey) -> Vec<u8> {
-    let mut out = Vec::with_capacity(21);
+    let mut out = Vec::with_capacity(33);
+    out.extend_from_slice(b"CXTX2");
     out.extend_from_slice(key.cx_id.as_bytes());
-    out.extend_from_slice(&key.a.get().to_be_bytes());
-    out.extend_from_slice(&key.b.get().to_be_bytes());
+    out.extend_from_slice(&key.a.panel_version().to_be_bytes());
+    out.extend_from_slice(&key.a.slot_id().get().to_be_bytes());
+    out.extend_from_slice(&key.b.panel_version().to_be_bytes());
+    out.extend_from_slice(&key.b.slot_id().get().to_be_bytes());
     out.push(match key.kind {
         CrossTermKind::Concat => 0,
         CrossTermKind::Interaction => 1,
@@ -247,6 +264,16 @@ fn xterm_key(key: &CrossTermKey) -> Vec<u8> {
         CrossTermKind::Delta => 3,
     });
     out
+}
+
+fn validate_panel_pair(key: &CrossTermKey) -> Result<()> {
+    if key.a.panel_version() != key.b.panel_version() {
+        return Err(loom_error(
+            CALYX_LOOM_PANEL_SCOPE_REQUIRED,
+            format!("xterm pair spans panels {} and {}", key.a, key.b),
+        ));
+    }
+    Ok(())
 }
 
 fn compute_cross_term(

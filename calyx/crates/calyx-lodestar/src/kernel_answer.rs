@@ -155,11 +155,14 @@ pub fn kernel_answer_derivation_hash(
 ) -> Result<[u8; 32]> {
     validate_kernel_answer_record_context(context)?;
     let bytes = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "answer_id": hex(&context.answer_id),
         "query_input_sha256": hex(&context.query_input_sha256),
         "kernel_manifest_sha256": hex(&context.kernel_manifest_sha256),
-        "embedding_slot": context.embedding_slot.get(),
+        "embedding_slot": {
+            "panel_version": context.embedding_slot.panel_version(),
+            "slot_id": context.embedding_slot.slot_id().get(),
+        },
         "nearest_similarity": context.nearest_similarity,
         "admission_threshold": context.admission_threshold,
         "anchor": context.anchor,

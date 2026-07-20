@@ -27,7 +27,7 @@ pub(crate) fn hit_docs_at(
             let required_slots = hit
                 .per_lens
                 .iter()
-                .map(|lens_hit| lens_hit.slot)
+                .map(|lens_hit| lens_hit.slot.slot_id())
                 .collect::<BTreeSet<_>>();
             vault.get_selected_slots_at_snapshot(cx_id, snapshot, required_slots)
         } else {
@@ -40,6 +40,17 @@ pub(crate) fn hit_docs_at(
                 error
             }
         })?;
+        if let Some(mismatched) = hit
+            .per_lens
+            .iter()
+            .find(|lens_hit| lens_hit.slot.panel_version() != cx.panel_version)
+        {
+            return Err(CalyxError::stale_derived(format!(
+                "hit {cx_id} from panel {} contains contribution from {}",
+                cx.panel_version, mismatched.slot
+            ))
+            .into());
+        }
         docs.insert(cx_id, cx);
     }
     Ok(docs)

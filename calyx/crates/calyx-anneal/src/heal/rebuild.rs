@@ -3,7 +3,7 @@ mod builders;
 mod scheduler;
 mod source;
 
-use calyx_core::{Result, Seq, SlotId};
+use calyx_core::{PanelSlotId, Result, Seq};
 use serde::{Deserialize, Serialize};
 
 use crate::{ArtifactKey, ArtifactPtr, BudgetHandle, ChangeId, ComponentKind, ScopeId};
@@ -23,19 +23,23 @@ pub const CALYX_ANNEAL_REBUILD_TRIPWIRE_FAILED: &str = "CALYX_ANNEAL_REBUILD_TRI
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RebuildTarget {
-    AnnIndex { slot_id: SlotId },
+    AnnIndex { panel_slot: PanelSlotId },
     KernelIndex { scope: ScopeId },
-    GuardProfile { slot_id: SlotId },
+    GuardProfile { panel_slot: PanelSlotId },
 }
 
 impl RebuildTarget {
     pub fn component(&self) -> ComponentKind {
         match self {
-            Self::AnnIndex { slot_id } => ComponentKind::AnnIndex { slot_id: *slot_id },
+            Self::AnnIndex { panel_slot } => ComponentKind::AnnIndex {
+                panel_slot: *panel_slot,
+            },
             Self::KernelIndex { scope } => ComponentKind::KernelIndex {
                 scope: scope.clone(),
             },
-            Self::GuardProfile { slot_id } => ComponentKind::GuardProfile { slot_id: *slot_id },
+            Self::GuardProfile { panel_slot } => ComponentKind::GuardProfile {
+                panel_slot: *panel_slot,
+            },
         }
     }
 

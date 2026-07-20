@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CALYX_SEXTANT_NO_LENSES, CALYX_SEXTANT_SLOT_MISSING, sextant_error};
 use crate::fusion::FusionStrategy;
-use crate::fusion::profiles::is_ap60_temporal_primary_slot;
 use crate::hit::Hit;
 use crate::query::Query;
 use crate::search::SearchEngine;
@@ -139,7 +138,7 @@ fn primary_retrieval<'a>(
     } else {
         query.slots.clone()
     };
-    let (primary_slots, temporal_slots_excluded) = split_primary_slots(&selected_slots);
+    let (primary_slots, temporal_slots_excluded) = split_primary_slots(engine, &selected_slots);
     if primary_slots.is_empty() {
         return Err(sextant_error(
             CALYX_SEXTANT_NO_LENSES,
@@ -257,11 +256,11 @@ pub fn validate_primary_temporal_weight(temporal_weight_used: f32) -> Result<()>
     ))
 }
 
-fn split_primary_slots(slots: &[SlotId]) -> (Vec<SlotId>, Vec<SlotId>) {
+fn split_primary_slots(engine: &SearchEngine, slots: &[SlotId]) -> (Vec<SlotId>, Vec<SlotId>) {
     slots
         .iter()
         .copied()
-        .partition(|slot| !is_ap60_temporal_primary_slot(*slot))
+        .partition(|slot| !engine.is_retrieval_only_slot(*slot))
 }
 
 fn ensure_slots_registered(engine: &SearchEngine, slots: &[SlotId]) -> Result<()> {

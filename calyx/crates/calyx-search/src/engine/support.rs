@@ -2,12 +2,13 @@ use std::collections::BTreeMap;
 
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
+use calyx_aster::{cf::ColumnFamily, vault::encode::decode_constellation_base};
 use calyx_core::{Constellation, CxId, SlotVector};
 use calyx_sextant::{FreshnessTag, Hit};
 
 use super::{SEARCH_READER_LEASE_MS, SearchFreshness};
 use crate::error::CliResult;
-use crate::persisted::{PersistedSearchIndexes, load_docs_at};
+use crate::persisted::PersistedSearchIndexes;
 
 pub(super) fn index_freshness_tag(
     indexes: &PersistedSearchIndexes,
@@ -83,8 +84,18 @@ pub(super) fn is_stale_derived(error: &crate::error::SearchError) -> bool {
     matches!(error, crate::error::SearchError::Calyx(inner) if inner.code == "CALYX_STALE_DERIVED")
 }
 
-pub(super) fn vault_base_count_at(vault: &AsterVault, snapshot: Snapshot) -> CliResult<usize> {
-    Ok(load_docs_at(vault, snapshot)?.len())
+pub(super) fn vault_base_count_at(
+    vault: &AsterVault,
+    snapshot: Snapshot,
+    panel_version: u32,
+) -> CliResult<usize> {
+    vault
+        .scan_cf_snapshot(snapshot, ColumnFamily::Base)?
+        .into_iter()
+        .try_fold(0usize, |count, (_, bytes)| {
+            let cx = decode_constellation_base(&bytes)?;
+            Ok(count + usize::from(cx.panel_version == panel_version))
+        })
 }
 
 pub(super) fn renumber_and_truncate(hits: &mut Vec<Hit>, k: usize) {
@@ -118,10 +129,13 @@ pub(super) fn guard_cosine(
         .filter_map(|item| {
             let query = query_vectors
                 .iter()
-                .find(|(slot, _)| *slot == item.slot)?
+                .find(|(slot, _)| *slot == item.slot.slot_id())?
                 .1
                 .as_dense()?;
-            let doc = cx.slots.get(&item.slot)?.as_dense()?;
+            if cx.panel_version != item.slot.panel_version() {
+                return None;
+            }
+            let doc = cx.slots.get(&item.slot.slot_id())?.as_dense()?;
             cosine(query, doc)
         })
         .max_by(f32::total_cmp)
