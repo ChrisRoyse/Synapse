@@ -63,9 +63,16 @@ use std::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::{AgentEndState, AgentEventKind, AgentEventRecord, Event, EventSource};
+use synapse_core::{
+    AgentEndState, AgentEventKind, AgentEventRecord, Event, EventSource,
+    retention::{DEFAULTS as RETENTION_DEFAULTS, RetentionTtl},
+};
 use synapse_reflex::EventBus;
-use synapse_storage::{Db, StorageResult, agent_events::agent_event_scan_start, cf, decode_json};
+use synapse_storage::{
+    Db, StorageError, StorageResult,
+    agent_events::{agent_event_scan_start, decode_agent_event_key},
+    cf, decode_json,
+};
 
 use super::agent_events::{
     AgentEventWriteReadback, TransitionJournalIntent, commit_agent_event_records_with_intents,
@@ -144,6 +151,10 @@ const REBUILD_LOOKBACK_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 
 /// Rebuild scan page size.
 const REBUILD_PAGE_ROWS: usize = 4096;
+
+/// The ambient cursor outbox carries at most registration's two rows plus one
+/// coalesced lifecycle row. Exact-recovery refuses any broader replay surface.
+const MAX_AMBIENT_EXACT_RECOVERY_ROWS: usize = 3;
 
 static NEXT_BUS_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1852,6 +1863,476 @@ pub(crate) fn rebuild_from_journal(db: &Db) -> StorageResult<RebuildReadback> {
         "agent state tracker rebuilt from CF_AGENT_EVENTS"
     );
     Ok(readback)
+}
+
+/// One exact physical `CF_AGENT_EVENTS` row supplied by the ambient
+/// transactional-outbox reconciler. `value` is the canonical encoded event
+/// bytes read from `key`; recovery independently point-reads both again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AmbientExactJournalRow {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// Readback from a quiet live-projection recovery. Recovery never appends a
+/// primary or derived journal row and never publishes transition side effects.
+#[derive(Clone, Debug)]
+pub(crate) struct AmbientProjectionRecoveryReadback {
+    pub readback: AgentStateRead,
+    pub rows_applied: usize,
+    pub already_current: bool,
+}
+
+fn ambient_recovery_read_error(detail: impl Into<String>) -> StorageError {
+    StorageError::ReadFailed {
+        cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+        detail: detail.into(),
+    }
+}
+
+fn ambient_agent_event_retention_ns() -> StorageResult<u64> {
+    let retention = RETENTION_DEFAULTS
+        .iter()
+        .find(|retention| retention.cf == cf::CF_AGENT_EVENTS)
+        .ok_or_else(|| {
+            ambient_recovery_read_error(
+                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_MISSING: CF_AGENT_EVENTS has no retention default; remediation=restore the finite journal retention contract before witness-only recovery",
+            )
+        })?;
+    let hours = match retention.ttl {
+        RetentionTtl::Hours(hours) => hours,
+        RetentionTtl::Days(days) => days.checked_mul(24).ok_or_else(|| {
+            ambient_recovery_read_error(
+                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_OVERFLOW: CF_AGENT_EVENTS day retention does not fit hours; remediation=repair the retention default",
+            )
+        })?,
+        RetentionTtl::None | RetentionTtl::LruOnly => {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_INVALID: CF_AGENT_EVENTS retention is {:?}; remediation=configure a finite time retention before witness-only recovery",
+                retention.ttl
+            )));
+        }
+    };
+    hours
+        .checked_mul(60 * 60)
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .ok_or_else(|| {
+            ambient_recovery_read_error(
+                "AGENT_STATE_AMBIENT_RECOVERY_RETENTION_OVERFLOW: CF_AGENT_EVENTS retention does not fit nanoseconds; remediation=repair the retention default",
+            )
+        })
+}
+
+fn point_read_exact_ambient_journal_row(
+    db: &Db,
+    spawn_id: &str,
+    row: &AmbientExactJournalRow,
+) -> StorageResult<[u8; 32]> {
+    let key_hex = synapse_storage::constellations::hex_encode(&row.key);
+    let revisioned = db
+        .get_cf_revisioned(cf::CF_AGENT_EVENTS, &row.key)
+        .map_err(|error| {
+            ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_POINT_READ_FAILED: spawn_id={spawn_id} key_hex={key_hex}: {error}; remediation=repair the exact Calyx journal point-read before retrying projection recovery"
+            ))
+        })?
+        .ok_or_else(|| {
+            ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_ROW_MISSING: spawn_id={spawn_id} key_hex={key_hex}; remediation=restore/reconcile the exact retained journal row and leave the ambient outbox unacknowledged"
+            ))
+        })?;
+    let actual = revisioned.value.ok_or_else(|| {
+        ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_ROW_EXPIRED: spawn_id={spawn_id} key_hex={key_hex}; remediation=leave the ambient outbox unacknowledged and reconcile the retention-expired operation from durable evidence"
+        ))
+    })?;
+    if actual != row.value {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_ROW_DIVERGED: spawn_id={spawn_id} key_hex={key_hex} expected_value_sha256={} actual_value_sha256={}; remediation=quarantine and repair the divergent journal row before projection recovery",
+            synapse_storage::constellations::sha256_hex(&row.value),
+            synapse_storage::constellations::sha256_hex(&actual)
+        )));
+    }
+    Ok(revisioned.revision_sha256)
+}
+
+fn ambient_projection_journal_witness(
+    db: &Db,
+    spawn_id: &str,
+) -> StorageResult<Option<super::escalation::TransitionProjectionJournalWitness>> {
+    super::escalation::projection_journal_witness_for_anchor(db, spawn_id).map_err(|error| {
+        ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_PROJECTION_WITNESS_READ_FAILED: spawn_id={spawn_id}: {}; remediation=repair the Applied transition projection cursor, Pending index, and exact audit evidence before recovery",
+            error.message
+        ))
+    })
+}
+
+fn ambient_authoritative_projection_row(
+    spawn_id: &str,
+    witness: &super::escalation::TransitionProjectionJournalWitness,
+) -> StorageResult<AmbientExactJournalRow> {
+    let (key_ts_ns, key_seq) = decode_agent_event_key(&witness.journal_key)?;
+    let key_hex = synapse_storage::constellations::hex_encode(&witness.journal_key);
+    let record: AgentEventRecord = decode_json(&witness.journal_value)?;
+    let canonical = super::agent_events::validate_and_encode(&record)?;
+    if key_ts_ns != witness.generation.journal_ts_ns
+        || key_seq != witness.generation.journal_seq
+        || canonical != witness.journal_value
+        || record.ts_ns != witness.generation.journal_ts_ns
+        || record.spawn_id.as_deref() != Some(spawn_id)
+        || !is_state_machine_row(&record)
+        || record
+            .state_to
+            .as_deref()
+            .and_then(AgentLifecycleState::parse)
+            .is_none()
+    {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_PROJECTION_WITNESS_INVALID: spawn_id={spawn_id} generation=({},{}) key_hex={key_hex} key_generation=({key_ts_ns},{key_seq}) record_ts_ns={} record_spawn_id={:?} kind={:?} state_to={:?} canonical_bytes_match={} machine_row={}; remediation=repair the validated Applied projection witness before recovery",
+            witness.generation.journal_ts_ns,
+            witness.generation.journal_seq,
+            record.ts_ns,
+            record.spawn_id,
+            record.kind,
+            record.state_to,
+            canonical == witness.journal_value,
+            is_state_machine_row(&record)
+        )));
+    }
+    Ok(AmbientExactJournalRow {
+        key: witness.journal_key.clone(),
+        value: witness.journal_value.clone(),
+    })
+}
+
+fn point_read_optional_ambient_authoritative_row(
+    db: &Db,
+    spawn_id: &str,
+    row: &AmbientExactJournalRow,
+) -> StorageResult<Option<[u8; 32]>> {
+    let key_hex = synapse_storage::constellations::hex_encode(&row.key);
+    let Some(revisioned) = db
+        .get_cf_revisioned(cf::CF_AGENT_EVENTS, &row.key)
+        .map_err(|error| {
+            ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_READ_FAILED: spawn_id={spawn_id} key_hex={key_hex}: {error}; remediation=repair the exact transition journal point-read before recovery"
+            ))
+        })?
+    else {
+        let (journal_ts_ns, _journal_seq) = decode_agent_event_key(&row.key)?;
+        let retention_ns = ambient_agent_event_retention_ns()?;
+        let now_ns = unix_time_ns_now();
+        let age_ns = now_ns.saturating_sub(journal_ts_ns);
+        if age_ns < retention_ns {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_MISSING_BEFORE_RETENTION: spawn_id={spawn_id} key_hex={key_hex} journal_ts_ns={journal_ts_ns} now_ns={now_ns} age_ns={age_ns} retention_ns={retention_ns}; remediation=repair the prematurely missing physical transition row instead of masking it with the durable witness"
+            )));
+        }
+        return Ok(None);
+    };
+    let Some(actual) = revisioned.value else {
+        // `get_cf_revisioned` exposes `value=None` only for a logically expired
+        // retention envelope. The validated Applied projection cursor is the
+        // durable exact witness once that older journal value retires.
+        return Ok(None);
+    };
+    if actual != row.value {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_DIVERGED: spawn_id={spawn_id} key_hex={key_hex} expected_value_sha256={} actual_value_sha256={}; remediation=quarantine and repair the live journal row that diverges from the Applied projection witness",
+            synapse_storage::constellations::sha256_hex(&row.value),
+            synapse_storage::constellations::sha256_hex(&actual)
+        )));
+    }
+    Ok(Some(revisioned.revision_sha256))
+}
+
+/// Quietly installs the lifecycle projection of an already committed ambient
+/// outbox batch into the process-wide tracker (#1772).
+///
+/// This is deliberately not a general replay API. It accepts only the bounded
+/// one-operation ambient shape, requires strictly ordered journal keys, rejects
+/// machine-derived rows, validates canonical event bytes and spawn identity,
+/// joins the anchor's latest Applied transition watermark/audit witness,
+/// point-reads every live physical row before and after ordered reduction, and
+/// requires the durable witness to remain byte/revision-identical when its
+/// older journal row has retired. It takes the normal transition-pipeline ->
+/// tracker lock order, and swaps the candidate only after the second exact
+/// evidence read. No journal write, cursor write, SSE publication, or
+/// transition side effect occurs here.
+pub(crate) fn recover_ambient_projection_from_exact_journal_rows(
+    db: &Db,
+    spawn_id: &str,
+    rows: &[AmbientExactJournalRow],
+) -> StorageResult<AmbientProjectionRecoveryReadback> {
+    if spawn_id.trim().is_empty() || rows.is_empty() || rows.len() > MAX_AMBIENT_EXACT_RECOVERY_ROWS
+    {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_INPUT_INVALID: spawn_id={spawn_id:?} rows={} max_rows={MAX_AMBIENT_EXACT_RECOVERY_ROWS}; remediation=provide one exact bounded ambient outbox batch",
+            rows.len()
+        )));
+    }
+
+    let mut records = Vec::with_capacity(rows.len());
+    let mut previous_key: Option<&[u8]> = None;
+    for row in rows {
+        if previous_key.is_some_and(|previous| previous >= row.key.as_slice()) {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_ORDER_INVALID: spawn_id={spawn_id} journal keys are not strictly ascending; remediation=repeat the exact ordered CF_AGENT_EVENTS scan"
+            )));
+        }
+        let (key_ts_ns, _key_seq) = decode_agent_event_key(&row.key)?;
+        let record: AgentEventRecord = decode_json(&row.value)?;
+        let canonical = super::agent_events::validate_and_encode(&record)?;
+        if canonical != row.value
+            || record.ts_ns != key_ts_ns
+            || record.spawn_id.as_deref() != Some(spawn_id)
+            || is_state_machine_row(&record)
+        {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_IDENTITY_INVALID: spawn_id={spawn_id} key_hex={} key_ts_ns={key_ts_ns} record_ts_ns={} record_spawn_id={:?} kind={:?} canonical_bytes_match={} machine_row={}; remediation=repair the exact ambient primary-row set before projection recovery",
+                synapse_storage::constellations::hex_encode(&row.key),
+                record.ts_ns,
+                record.spawn_id,
+                record.kind,
+                canonical == row.value,
+                is_state_machine_row(&record)
+            )));
+        }
+        previous_key = Some(&row.key);
+        records.push(record);
+    }
+    let expected_last = records.last().ok_or_else(|| {
+        ambient_recovery_read_error(
+            "AGENT_STATE_AMBIENT_RECOVERY_INPUT_INVALID: validated record set became empty",
+        )
+    })?;
+    let expected_last_event_unix_ms = expected_last.ts_ns / 1_000_000;
+    let expected_last_event_kind = expected_last.kind;
+    let now_unix_ms = unix_time_ns_now() / 1_000_000;
+
+    let _pipeline_guard = transition_pipeline().lock().map_err(|poisoned| {
+        ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_PIPELINE_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon before exact projection recovery"
+        ))
+    })?;
+    let mut live = tracker().lock().map_err(|poisoned| {
+        ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_TRACKER_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon before exact projection recovery"
+        ))
+    })?;
+    let first_projection_witness = ambient_projection_journal_witness(db, spawn_id)?;
+    let authoritative_row = first_projection_witness
+        .as_ref()
+        .map(|witness| ambient_authoritative_projection_row(spawn_id, witness))
+        .transpose()?;
+    let mut recovery_rows = rows.to_vec();
+    if let Some(authoritative) = &authoritative_row {
+        recovery_rows.push(authoritative.clone());
+    }
+    recovery_rows.sort_by(|left, right| left.key.cmp(&right.key));
+    if recovery_rows
+        .windows(2)
+        .any(|window| window[0].key == window[1].key)
+    {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_KEY_DUPLICATE: spawn_id={spawn_id}; the outbox batch overlaps its authoritative projection generation; remediation=repair the cursor/journal key identities before recovery"
+        )));
+    }
+    let recovery_records = recovery_rows
+        .iter()
+        .map(|row| decode_json::<AgentEventRecord>(&row.value))
+        .collect::<StorageResult<Vec<_>>>()?;
+    let expected_authoritative_state = recovery_records
+        .iter()
+        .rev()
+        .find(|record| is_state_machine_row(record))
+        .and_then(|record| {
+            record
+                .state_to
+                .as_deref()
+                .and_then(AgentLifecycleState::parse)
+        });
+    if authoritative_row.is_some() != expected_authoritative_state.is_some() {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_STATE_MISSING: spawn_id={spawn_id} witness_present={} parsed_state={expected_authoritative_state:?}; remediation=repair the Applied transition witness before recovery",
+            authoritative_row.is_some()
+        )));
+    }
+    let first_primary_revisions = rows
+        .iter()
+        .map(|row| point_read_exact_ambient_journal_row(db, spawn_id, row))
+        .collect::<StorageResult<Vec<_>>>()?;
+    let first_authoritative_revision = match &authoritative_row {
+        Some(row) => point_read_optional_ambient_authoritative_row(db, spawn_id, row)?,
+        None => None,
+    };
+
+    let current = live.read_for_session(spawn_id, now_unix_ms);
+    if let (Some(readback), Some(expected_state)) = (current.as_ref(), expected_authoritative_state)
+        && readback.last_event_unix_ms >= expected_last_event_unix_ms
+        && readback.state != expected_state
+    {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_LIVE_STATE_DIVERGED: spawn_id={spawn_id} expected_authoritative_state={} actual_state={} actual_last_event_unix_ms={}; remediation=rebuild the singleton from the stable Applied transition witness before acknowledging the ambient operation",
+            expected_state.as_str(),
+            readback.state.as_str(),
+            readback.last_event_unix_ms
+        )));
+    }
+    let already_current = match current.as_ref() {
+        Some(readback) if readback.last_event_unix_ms > expected_last_event_unix_ms => true,
+        Some(readback) if readback.last_event_unix_ms == expected_last_event_unix_ms => {
+            if expected_authoritative_state.is_none()
+                && readback.last_event_kind != expected_last_event_kind
+            {
+                return Err(ambient_recovery_read_error(format!(
+                    "AGENT_STATE_AMBIENT_RECOVERY_GENERATION_AMBIGUOUS: spawn_id={spawn_id} expected_last_event_unix_ms={expected_last_event_unix_ms} expected_last_event_kind={expected_last_event_kind:?} actual_last_event_kind={:?}; remediation=rebuild the complete ordered agent stream instead of applying an ambiguous same-millisecond fragment",
+                    readback.last_event_kind
+                )));
+            }
+            true
+        }
+        _ => false,
+    };
+
+    let mut candidate = live.clone();
+    let rows_applied = if already_current {
+        0
+    } else {
+        for record in &recovery_records {
+            if is_state_machine_row(record) {
+                candidate.apply_authoritative(record);
+            } else {
+                let _quiet_transition = candidate.apply_event(record);
+            }
+        }
+        let staged = candidate
+            .read_for_session(spawn_id, now_unix_ms)
+            .ok_or_else(|| {
+                ambient_recovery_read_error(format!(
+                    "AGENT_STATE_AMBIENT_RECOVERY_STAGED_PROJECTION_MISSING: spawn_id={spawn_id}; remediation=repair the reducer/ambient identity contract before retrying"
+                ))
+            })?;
+        if staged.last_event_unix_ms < expected_last_event_unix_ms
+            || expected_authoritative_state
+                .is_some_and(|expected_state| staged.state != expected_state)
+            || (expected_authoritative_state.is_none()
+                && staged.last_event_unix_ms == expected_last_event_unix_ms
+                && staged.last_event_kind != expected_last_event_kind)
+        {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_STAGED_PROJECTION_MISMATCH: spawn_id={spawn_id} expected_last_event_unix_ms={expected_last_event_unix_ms} expected_last_event_kind={expected_last_event_kind:?} expected_authoritative_state={:?} actual_state={} actual_last_event_unix_ms={} actual_last_event_kind={:?}; remediation=repair the reducer before installing this projection",
+                expected_authoritative_state.map(AgentLifecycleState::as_str),
+                staged.state.as_str(),
+                staged.last_event_unix_ms,
+                staged.last_event_kind
+            )));
+        }
+        recovery_records.len()
+    };
+
+    for (row, first_revision) in rows.iter().zip(&first_primary_revisions) {
+        let second_revision = point_read_exact_ambient_journal_row(db, spawn_id, row)?;
+        if &second_revision != first_revision {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_ROW_REVISION_CHANGED: spawn_id={spawn_id} key_hex={} first_revision_sha256={} second_revision_sha256={}; remediation=leave the outbox unacknowledged and reconcile the changed physical journal row",
+                synapse_storage::constellations::hex_encode(&row.key),
+                synapse_storage::constellations::hex_encode(first_revision),
+                synapse_storage::constellations::hex_encode(&second_revision)
+            )));
+        }
+    }
+    if let Some(authoritative) = &authoritative_row {
+        let second_authoritative_revision =
+            point_read_optional_ambient_authoritative_row(db, spawn_id, authoritative)?;
+        if second_authoritative_revision != first_authoritative_revision {
+            return Err(ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_AUTHORITATIVE_ROW_REVISION_CHANGED: spawn_id={spawn_id} key_hex={} first_revision_sha256={} second_revision_sha256={}; remediation=leave the outbox unacknowledged and retry only after the physical authoritative-row retention boundary is stable",
+                synapse_storage::constellations::hex_encode(&authoritative.key),
+                first_authoritative_revision.map_or_else(
+                    || "witness_only".to_owned(),
+                    |revision| synapse_storage::constellations::hex_encode(&revision)
+                ),
+                second_authoritative_revision.map_or_else(
+                    || "witness_only".to_owned(),
+                    |revision| synapse_storage::constellations::hex_encode(&revision)
+                )
+            )));
+        }
+    }
+    let second_projection_witness = ambient_projection_journal_witness(db, spawn_id)?;
+    if second_projection_witness != first_projection_witness {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_PROJECTION_WITNESS_CHANGED: spawn_id={spawn_id} first_revision_sha256={} second_revision_sha256={}; remediation=leave the outbox unacknowledged and repeat recovery from one stable Applied transition projection generation",
+            first_projection_witness.as_ref().map_or_else(
+                || "absent".to_owned(),
+                |witness| synapse_storage::constellations::hex_encode(
+                    &witness.watermark_revision_sha256
+                )
+            ),
+            second_projection_witness.as_ref().map_or_else(
+                || "absent".to_owned(),
+                |witness| synapse_storage::constellations::hex_encode(
+                    &witness.watermark_revision_sha256
+                )
+            )
+        )));
+    }
+    if !already_current {
+        *live = candidate;
+    }
+    drop(live);
+
+    // Separate singleton read operation while the transition pipeline remains
+    // held prevents another writer from making the recovery verdict ambiguous.
+    let readback = tracker()
+        .lock()
+        .map_err(|poisoned| {
+            ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_READBACK_LOCK_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon and repeat exact recovery"
+            ))
+        })?
+        .read_for_session(spawn_id, now_unix_ms)
+        .ok_or_else(|| {
+            ambient_recovery_read_error(format!(
+                "AGENT_STATE_AMBIENT_RECOVERY_READBACK_MISSING: spawn_id={spawn_id}; remediation=leave the outbox unacknowledged and repair the live singleton projection"
+            ))
+        })?;
+    if readback.last_event_unix_ms < expected_last_event_unix_ms
+        || expected_authoritative_state
+            .is_some_and(|expected_state| readback.state != expected_state)
+        || (expected_authoritative_state.is_none()
+            && readback.last_event_unix_ms == expected_last_event_unix_ms
+            && readback.last_event_kind != expected_last_event_kind)
+    {
+        return Err(ambient_recovery_read_error(format!(
+            "AGENT_STATE_AMBIENT_RECOVERY_READBACK_MISMATCH: spawn_id={spawn_id} expected_last_event_unix_ms={expected_last_event_unix_ms} expected_last_event_kind={expected_last_event_kind:?} expected_authoritative_state={:?} actual_state={} actual_last_event_unix_ms={} actual_last_event_kind={:?}; remediation=leave the outbox unacknowledged and repair the singleton projection",
+            expected_authoritative_state.map(AgentLifecycleState::as_str),
+            readback.state.as_str(),
+            readback.last_event_unix_ms,
+            readback.last_event_kind
+        )));
+    }
+    tracing::warn!(
+        code = "AGENT_STATE_AMBIENT_PROJECTION_RECOVERED",
+        spawn_id,
+        rows_verified = recovery_rows.len(),
+        primary_rows_verified = rows.len(),
+        authoritative_witness_present = first_projection_witness.is_some(),
+        authoritative_physical_row_present = first_authoritative_revision.is_some(),
+        rows_applied,
+        already_current,
+        projected_state = readback.state.as_str(),
+        projected_last_event_unix_ms = readback.last_event_unix_ms,
+        projected_last_event_kind = ?readback.last_event_kind,
+        "readback=CF_AGENT_EVENTS+AgentStateTracker edge=ambient_exact_projection_recovery"
+    );
+    Ok(AmbientProjectionRecoveryReadback {
+        readback,
+        rows_applied,
+        already_current,
+    })
 }
 
 /// Read joins for `session_list` / `session_status` (process-wide tracker).

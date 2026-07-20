@@ -130,6 +130,89 @@ pub(super) async fn handle(
                 |out| out.anchors = Some(response),
             )))
         }
+        StorageOperation::TemporalPanels => {
+            let spec = params
+                .0
+                .temporal_panels
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "temporal_panels"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_temporal_panels(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_registry",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=temporal_panels",
+                )
+            })?;
+            let response = crate::m3::storage::inspect_temporal_panels(&db, &spec).map_err(
+                |error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "calyx_registry",
+                        STORAGE_SOT,
+                        error,
+                        "inspect the native Registry CF and repair any malformed or missing panel contract",
+                    )
+                },
+            )?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx Registry CF temporal_panel_registrations={}",
+                    response.registration_count
+                ),
+                |out| out.temporal_panels = Some(response),
+            )))
+        }
+        StorageOperation::TemporalRerank => {
+            let spec = params
+                .0
+                .temporal_rerank
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "temporal_rerank"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_temporal_rerank(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_registry",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=temporal_rerank",
+                )
+            })?;
+            let response = crate::m3::storage::run_temporal_rerank(&db, &spec).map_err(
+                |error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "calyx_registry",
+                        STORAGE_SOT,
+                        error,
+                        "supply one bounded content-only candidate set from an exact registered panel generation with active source event time",
+                    )
+                },
+            )?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx Base snapshot={} Registry panel={} generation={} ranked_hits={}",
+                    response.snapshot_seq,
+                    response.panel_name,
+                    response.panel_version,
+                    response.hits.len()
+                ),
+                |out| out.temporal_rerank = Some(response),
+            )))
+        }
         StorageOperation::GcOnce => {
             let spec = params
                 .0

@@ -7261,38 +7261,67 @@ function Stop-SynapseDaemonSupervisorProcessesForInstallHandoff {
         (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $remaining))
 }
 
-function Suspend-SynapseDaemonTaskForInstallHandoff {
+function Remove-SynapseDaemonTaskRestartAuthority {
     param(
         [Parameter(Mandatory=$true)][string]$TaskName,
-        [Parameter(Mandatory=$true)][string]$SupervisorPath
+        [Parameter(Mandatory=$true)][string]$SupervisorPath,
+        [Parameter(Mandatory=$true)][string]$Reason
     )
 
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
-        Info "Synapse daemon scheduled task absent before install handoff: task=$TaskName"
+        Info "Synapse daemon scheduled task already absent before restart-authority removal: task=$TaskName reason=$Reason"
         Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $SupervisorPath
         return
     }
 
-    Info "Suspending Synapse daemon scheduled task before binary handoff: task=$TaskName state=$($task.State)"
-    try {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    } catch {
-        Info "WARN: Stop-ScheduledTask failed before binary handoff task=$TaskName error=$($_.Exception.Message)"
+    $logDir = Split-Path -Parent $SupervisorPath
+    $expectedLauncherPath = Join-Path $logDir 'synapse-daemon-launch-hidden.vbs'
+    $expectedExecutablePath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $expectedArguments = '//B //Nologo "{0}"' -f $expectedLauncherPath
+    $actions = @($task.Actions)
+    if ($actions.Count -ne 1) {
+        Die "SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task=$TaskName reason=$Reason expected_action_count=1 actual_action_count=$($actions.Count) remediation=the named task is not the single setup-owned Synapse daemon launcher; inspect the Task Scheduler action SoT and remove only the verified owner"
     }
 
-    try {
-        Disable-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
+    $action = $actions[0]
+    $actualExecutablePath = try {
+        [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$action.Execute))
     } catch {
-        Die "SYNAPSE_TASK_DISABLE_FAILED task=$TaskName error=$($_.Exception.Message) remediation=setup must disable the auto-start supervisor before replacing synapse-mcp.exe so Task Scheduler cannot relaunch the old installed binary during Copy-Item"
+        [string]$action.Execute
+    }
+    $actualWorkingDirectory = try {
+        [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$action.WorkingDirectory)).TrimEnd('\')
+    } catch {
+        [string]$action.WorkingDirectory
+    }
+    $expectedWorkingDirectory = [System.IO.Path]::GetFullPath($logDir).TrimEnd('\')
+    if ($actualExecutablePath -ine [System.IO.Path]::GetFullPath($expectedExecutablePath) -or
+        [string]$action.Arguments -cne $expectedArguments -or
+        $actualWorkingDirectory -ine $expectedWorkingDirectory) {
+        Die ("SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task={0} reason={1} expected_execute={2} actual_execute={3} expected_arguments={4} actual_arguments={5} expected_working_directory={6} actual_working_directory={7} remediation=the named task action is not the exact setup-owned Synapse hidden launcher; inspect Task Scheduler and refuse to stop or unregister an unverified task" -f `
+            $TaskName,
+            $Reason,
+            $expectedExecutablePath,
+            $action.Execute,
+            $expectedArguments,
+            $action.Arguments,
+            $expectedWorkingDirectory,
+            $action.WorkingDirectory)
+    }
+
+    Info "Removing Synapse daemon Task Scheduler restart authority before process drain: task=$TaskName state=$($task.State) reason=$Reason"
+    try {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    } catch {
+        Die "SYNAPSE_TASK_HANDOFF_UNREGISTER_FAILED task=$TaskName reason=$Reason error=$($_.Exception.Message) remediation=setup must revoke Task Scheduler restart-on-failure authority before stopping the hidden supervisor or replacing the daemon binary"
     }
 
     $readback = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $readback) {
-        Info "Synapse daemon scheduled task disappeared while suspending for handoff: task=$TaskName"
-        return
+    if ($readback) {
+        Die "SYNAPSE_TASK_HANDOFF_UNREGISTER_READBACK_FAILED task=$TaskName reason=$Reason state=$($readback.State) remediation=Task Scheduler still exposes restart authority after unregister; do not stop the supervisor or replace the daemon binary"
     }
-    Info "Synapse daemon scheduled task suspended for handoff: task=$TaskName state=$($readback.State)"
+    Info "Synapse daemon Task Scheduler restart authority removal verified: task=$TaskName reason=$Reason task_present=false"
     Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $SupervisorPath
 }
 
@@ -7493,11 +7522,8 @@ Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintena
 if ($Remove) {
     Step "Removing scheduled task '$TaskName'"
     Assert-SynapseRestartAllowed -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask  -TaskName $TaskName -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Info "Unregistered '$TaskName'."
-    } else { Info "Task '$TaskName' not present." }
+    $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+    Remove-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'remove'
     Stop-SynapseMcpProcesses -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
     if ($Purge) {
         foreach ($p in @($DbPath, $ProfilesDir, (Split-Path -Parent $TokenPath))) {
@@ -7904,7 +7930,7 @@ if (-not $liveDaemonHandoffRequired) {
     Step "Draining live daemon and installing verified binary -> $ExePath"
     Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
     $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
-    Suspend-SynapseDaemonTaskForInstallHandoff -TaskName $TaskName -SupervisorPath $daemonSupervisorPath
+    Remove-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'install_binary'
     Stop-SynapseMcpProcessesForInstallHandoff -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
     Assert-SynapseInstallPathUnlocked -Path $ExePath -Bind $Bind -DbPath $DbPath -TimeoutSeconds 30
 }

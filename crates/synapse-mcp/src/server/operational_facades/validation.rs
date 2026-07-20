@@ -20,6 +20,8 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("summary", params.summary.is_some()),
             ("gc_once", params.gc_once.is_some()),
             ("anchors", params.anchors.is_some()),
+            ("temporal_panels", params.temporal_panels.is_some()),
+            ("temporal_rerank", params.temporal_rerank.is_some()),
         ],
     )
 }

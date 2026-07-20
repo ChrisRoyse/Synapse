@@ -18,6 +18,8 @@ pub(super) fn storage_response(
         summary: None,
         gc_once: None,
         anchors: None,
+        temporal_panels: None,
+        temporal_rerank: None,
     };
     fill(&mut response);
     response

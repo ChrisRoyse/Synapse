@@ -99,7 +99,6 @@ fn approval_toast_activation_callback(
                     decision.as_str(),
                     response.decision.item.decision_note.as_deref(),
                     "approval_toast_activated",
-                    super::session_registry::unix_time_ms_now(),
                 ) {
                     Ok(_maybe_escalation) => tracing::info!(
                         code = "APPROVAL_TOAST_ACTIVATION_DECIDED",
@@ -1358,7 +1357,6 @@ impl SynapseService {
                     params.decision.as_str(),
                     response.item.decision_note.as_deref(),
                     &by_session,
-                    super::session_registry::unix_time_ms_now(),
                 ) {
                     Ok(_maybe_escalation) => Ok(response),
                     Err(error) => {

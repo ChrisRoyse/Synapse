@@ -17,8 +17,10 @@ use super::{
     agent_tasks::{
         EmptyParams, TaskCancelParams, TaskClaimParams, TaskCreateParams, TaskDispatchOnceParams,
         TaskDispatchOnceResponse, TaskGetResponse, TaskIdParams, TaskListParams, TaskListResponse,
-        TaskMutationResponse, TaskNextParams, TaskNextResponse, TaskReconcileResponse,
-        TaskSequenceRepairParams, TaskSequenceRepairResponse, TaskUpdateParams,
+        TaskMutationResponse, TaskNextParams, TaskNextResponse, TaskQueueStateRepairParams,
+        TaskQueueStateRepairResponse, TaskReconcileResponse, TaskRowRepairParams,
+        TaskRowRepairResponse, TaskSequenceRepairParams, TaskSequenceRepairResponse,
+        TaskUpdateParams,
     },
     agent_templates::{
         AgentTemplateDeleteParams, AgentTemplateDeleteResponse, AgentTemplateGetParams,
@@ -199,6 +201,8 @@ pub enum TaskOperation {
     Next,
     Reconcile,
     RepairSequence,
+    RepairQueueState,
+    RepairRow,
     DispatchOnce,
 }
 
@@ -214,6 +218,8 @@ impl TaskOperation {
             Self::Next => "next",
             Self::Reconcile => "reconcile",
             Self::RepairSequence => "repair_sequence",
+            Self::RepairQueueState => "repair_queue_state",
+            Self::RepairRow => "repair_row",
             Self::DispatchOnce => "dispatch_once",
         }
     }
@@ -242,6 +248,10 @@ pub struct TaskParams {
     #[serde(default)]
     pub repair_sequence: Option<TaskSequenceRepairParams>,
     #[serde(default)]
+    pub repair_queue_state: Option<TaskQueueStateRepairParams>,
+    #[serde(default)]
+    pub repair_row: Option<TaskRowRepairParams>,
+    #[serde(default)]
     pub dispatch_once: Option<TaskDispatchOnceParams>,
 }
 
@@ -269,6 +279,10 @@ pub struct TaskResponse {
     pub reconcile: Option<TaskReconcileResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair_sequence: Option<TaskSequenceRepairResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_queue_state: Option<TaskQueueStateRepairResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_row: Option<TaskRowRepairResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_once: Option<TaskDispatchOnceResponse>,
 }
@@ -827,7 +841,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return the task row readback from the real task implementation. repair_sequence is an explicit break-glass/full-capability-only guarded watermark repair; task creation fails closed on malformed or drifted sequence state."
+        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return physical task/coordination readback from the real implementation. repair_sequence, repair_queue_state, and repair_row are explicit break-glass/full-capability-only revision-guarded recovery operations; normal queue use fails closed on malformed or drifted state."
     )]
     pub async fn task(
         &self,
@@ -1056,6 +1070,73 @@ impl SynapseService {
                     |out| out.repair_sequence = Some(response),
                 )))
             }
+            TaskOperation::RepairQueueState => {
+                let spec = params
+                    .0
+                    .repair_queue_state
+                    .ok_or_else(|| missing_task_spec("repair_queue_state"))?;
+                require_queue_repair_profile(
+                    self,
+                    &request_context,
+                    TASK_TOOL,
+                    operation.as_str(),
+                    "agent-task/v2/meta/queue_state",
+                    TASK_SOURCE_OF_TRUTH,
+                )?;
+                let response = self
+                    .task_repair_queue_state_impl(spec)
+                    .map_err(|error| {
+                        task_delegate_error(
+                            operation,
+                            "queue_state",
+                            error,
+                            "inspect the raw queue-state revision and task rows, then supply that exact revision and a monotonic generation floor",
+                        )
+                    })?;
+                Ok(Json(task_response(
+                    operation,
+                    format!(
+                        "CF_KV task queue state repaired={} observed_max={} committed_seq={:?}",
+                        response.repaired_generation,
+                        response.observed_max_task_generation,
+                        response.committed_seq
+                    ),
+                    |out| out.repair_queue_state = Some(response),
+                )))
+            }
+            TaskOperation::RepairRow => {
+                let spec = params
+                    .0
+                    .repair_row
+                    .ok_or_else(|| missing_task_spec("repair_row"))?;
+                let source_id = spec.task_id.clone();
+                require_queue_repair_profile(
+                    self,
+                    &request_context,
+                    TASK_TOOL,
+                    operation.as_str(),
+                    source_id.as_str(),
+                    TASK_SOURCE_OF_TRUTH,
+                )?;
+                let response = self.task_repair_row_impl(spec).map_err(|error| {
+                    task_delegate_error(
+                        operation,
+                        source_id,
+                        error,
+                        "inspect the exact raw row revision plus queue/watermark state and provide a complete invariant-valid replacement",
+                    )
+                })?;
+                Ok(Json(task_response(
+                    operation,
+                    format!(
+                        "CF_KV task row repaired task_id={} generation={} committed_seq={:?}",
+                        response.task.task_id,
+                        response.task.mutation_generation,
+                        response.committed_seq
+                    ),
+                    |out| out.repair_row = Some(response),
+                )))
+            }
             TaskOperation::DispatchOnce => {
                 let spec = params
                     .0
@@ -1170,6 +1251,8 @@ fn validate_task_facade_params(params: &TaskParams) -> Result<(), ErrorData> {
             ("next", params.next.is_some()),
             ("reconcile", params.reconcile.is_some()),
             ("repair_sequence", params.repair_sequence.is_some()),
+            ("repair_queue_state", params.repair_queue_state.is_some()),
+            ("repair_row", params.repair_row.is_some()),
             ("dispatch_once", params.dispatch_once.is_some()),
         ],
     )
@@ -1366,6 +1449,8 @@ fn task_response(
         next: None,
         reconcile: None,
         repair_sequence: None,
+        repair_queue_state: None,
+        repair_row: None,
         dispatch_once: None,
     };
     populate(&mut response);

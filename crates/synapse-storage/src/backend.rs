@@ -8,10 +8,10 @@ use std::{
 
 use calyx_aster::{
     cf::{ColumnFamily, KeyRange, prefix_range},
-    mvcc::{CfRead, LATEST_CF_RANGE_PAGE_MAX_ROWS, tombstone_value},
+    mvcc::{CfRead, Freshness, LATEST_CF_RANGE_PAGE_MAX_ROWS, tombstone_value},
     wal,
 };
-use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId};
+use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, TemporalPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,8 +20,11 @@ use synapse_calyx::{
     SynapseCalyxAnchorWriteReadback, SynapseCalyxCfRangePage, SynapseCalyxCfRows,
     SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxError,
     SynapseCalyxGroundedObservationReadback, SynapseCalyxMultiConditionalWriteOutcome,
-    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault, SynapseCalyxRevisionGuard,
+    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
+    SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
+    SynapseCalyxRevisionGuard, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalRerankReadback,
     SynapseCalyxVault, SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus,
+    VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -33,21 +36,23 @@ use synapse_core::{
 };
 
 use crate::constellations::{
-    ConstellationPutReport, NativeConstellationContext, SYN_ACTION_PANEL_NAME,
-    SYN_ACTION_PANEL_VERSION, SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION,
-    SYN_AGENT_TRANSCRIPT_PANEL_NAME, SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME,
-    SYN_EPISODE_PANEL_VERSION, SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION,
-    SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME,
-    SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION,
-    SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME,
-    SYN_TIMELINE_PANEL_VERSION,
+    ConstellationPutReport, NativeConstellationContext, RecurrenceSubjectKind,
+    SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION, SYN_AGENT_EVENT_PANEL_NAME,
+    SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+    SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
+    SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME,
+    SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION,
+    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+    SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 use crate::{
-    CfEstimateMap, CfRevisionGuard, FixedWidthScanPage, OwnedCfWriteBatch, PhysicalScanPage,
-    RawRow, RevisionGuard, RevisionGuardConflict, RevisionGuardedMutationOutcome,
-    RevisionGuardedWriteOutcome, RevisionedRawValue, STORAGE_REVISION_GUARD_INVALID,
-    STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE, STORAGE_REVISION_GUARDED_OUTCOME_INVALID, ScanWindow,
-    StorageError, StorageResult, cf, constellations, gc, pressure,
+    CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
+    OwnedCfWriteBatch, PhysicalScanPage, RawRow, RevisionGuard, RevisionGuardConflict,
+    RevisionGuardedMutationOutcome, RevisionGuardedWriteOutcome, RevisionedRawValue,
+    STORAGE_REVISION_GUARD_INVALID, STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
+    STORAGE_REVISION_GUARDED_OUTCOME_INVALID, ScanWindow, StorageError, StorageResult, cf,
+    constellations, gc, pressure,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -60,9 +65,16 @@ const CALYX_KV_VALUE_VERSION: u8 = 0x02;
 const CALYX_KV_VALUE_V1_HEADER_BYTES: usize = 1 + 8;
 const CALYX_KV_VALUE_HEADER_BYTES: usize = 1 + 8 + 8;
 const CALYX_MAX_USER_KEY_BYTES: usize = u16::MAX as usize;
-const CALYX_KV_NAMESPACE: u64 = 0;
+const CALYX_KV_LEGACY_LENGTH_ORDERED_NAMESPACE: u64 = 0;
+const CALYX_KV_ORDERED_NAMESPACE: u64 = 1;
 const CALYX_COLLECTION_ID_BASE: u64 = 0x5359_4e43_4600_0000;
 const CALYX_METADATA_COLLECTION_ID: u64 = CALYX_COLLECTION_ID_BASE | 0xffff;
+const CALYX_ORDERED_KEY_MIGRATION_KEY: &[u8] = b"__ordered_key_namespace_v1";
+const CALYX_ORDERED_KEY_MIGRATION_PAYLOAD: &[u8] = b"synapse-calyx-ordered-key-namespace-v1";
+const CALYX_ORDERED_KEY_PHYSICAL_PURGE_KEY: &[u8] = b"__ordered_key_namespace_v1_physical_purge";
+const CALYX_ORDERED_KEY_PHYSICAL_PURGE_PAYLOAD: &[u8] =
+    b"synapse-calyx-ordered-key-namespace-v1-physical-purge";
+const CALYX_ORDERED_KEY_MIGRATION_PAGE_ROWS: usize = 512;
 const CALYX_GC_CF: &str = "storage_gc";
 const CALYX_GC_WAL_RECYCLE_MAX_SEGMENTS: usize = 8;
 const CALYX_GC_WAL_RECYCLE_FSYNC_BUDGET: usize = 8;
@@ -193,6 +205,17 @@ pub struct McpUsageGroundedPublicationReport {
     pub committed_seq: u64,
     pub constellation: ConstellationPutReport,
     pub anchor: CalyxAnchorWriteReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CalyxRecurrenceSubjectReport {
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub subject_cx_id: String,
+    pub subject_panel_name: String,
+    pub subject_panel_version: u32,
+    pub subject_disposition: synapse_calyx::SynapseCalyxPutDisposition,
+    pub occurrence: SynapseCalyxRecurrenceAppendReadback,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,6 +380,26 @@ pub trait StorageBackend: Send + Sync {
         reason: &'static str,
     ) -> StorageResult<SynapseCalyxVaultCloseReadback>;
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>>;
+    fn put_recurrence_subject_occurrence(
+        &self,
+        kind: RecurrenceSubjectKind,
+        subject_id: &str,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<CalyxRecurrenceSubjectReport>;
+    fn read_recurrence_subject_series(
+        &self,
+        kind: RecurrenceSubjectKind,
+        subject_id: &str,
+    ) -> StorageResult<SynapseCalyxRecurrenceSeriesReadback>;
+    fn list_temporal_panels(&self) -> StorageResult<Vec<VaultTemporalPanelRegistration>>;
+    fn temporal_rerank(
+        &self,
+        candidates: &[SynapseCalyxTemporalCandidate],
+        query_time_secs: i64,
+        tz_offset_secs: i32,
+    ) -> StorageResult<SynapseCalyxTemporalRerankReadback>;
     fn put_timeline_constellation(
         &self,
         source_key: &[u8],
@@ -494,6 +537,29 @@ pub trait StorageBackend: Send + Sync {
         after_key: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<FixedWidthScanPage>;
+    fn pin_cf_physical_scan(
+        &self,
+        cf_name: &str,
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease>;
+    fn pin_cf_fixed_width_range_scan(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease>;
+    fn scan_cf_physical_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage>;
+    fn scan_cf_fixed_width_range_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<FixedWidthScanPage>;
+    fn release_coherent_scan(&self, lease: &mut CoherentScanLease) -> StorageResult<bool>;
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>>;
     fn compact_cf(&self, cf_name: &str) -> StorageResult<()>;
     fn compact_cf_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> StorageResult<()>;
@@ -557,6 +623,155 @@ impl CalyxVaultRuntime {
             false,
             |vault| Ok(vault.status()),
         )
+    }
+
+    fn pin_cf_physical_scan(
+        &self,
+        cf_name: &str,
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease> {
+        calyx_collection_id_for_cf_read(cf_name)?;
+        self.with_vault(
+            cf_name,
+            "pin coherent physical Calyx scan",
+            false,
+            |vault| {
+                pin_coherent_scan(
+                    vault,
+                    cf_name,
+                    CoherentScanScope::PhysicalColumnFamily,
+                    max_age_ms,
+                )
+            },
+        )
+    }
+
+    fn pin_cf_fixed_width_range_scan(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease> {
+        calyx_collection_id_for_cf_read(cf_name)?;
+        let key_len = fixed_width_user_key_len(cf_name).unwrap_or(start_key.len());
+        validate_fixed_width_page_request(cf_name, start_key, end_key, None, key_len, 1)?;
+        self.with_vault(
+            cf_name,
+            "pin coherent fixed-width Calyx range scan",
+            false,
+            |vault| {
+                pin_coherent_scan(
+                    vault,
+                    cf_name,
+                    CoherentScanScope::FixedWidthRange {
+                        start_key: start_key.to_vec(),
+                        end_key: end_key.to_vec(),
+                    },
+                    max_age_ms,
+                )
+            },
+        )
+    }
+
+    fn scan_cf_physical_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage> {
+        ensure_coherent_scan_ready(lease, "physical_column_family")?;
+        if !matches!(lease.scope, CoherentScanScope::PhysicalColumnFamily) {
+            return Err(coherent_scan_contract_error(
+                lease,
+                "COHERENT_SCAN_SCOPE_MISMATCH: a fixed-width range lease cannot scan the whole column family",
+            ));
+        }
+        let cf_name = lease.cf_name.clone();
+        let after = lease.next_after.clone();
+        let page = self.with_vault(
+            &cf_name,
+            "continue coherent physical Calyx scan",
+            false,
+            |vault| {
+                read_physical_page_from_vault_snapshot(
+                    vault,
+                    &cf_name,
+                    lease.snapshot,
+                    after.as_deref(),
+                    max_rows,
+                    lease.read_at_unix_ms,
+                )
+            },
+        )?;
+        advance_coherent_scan(lease, page.resume_after_physical.as_deref(), page.more)?;
+        Ok(page)
+    }
+
+    fn scan_cf_fixed_width_range_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<FixedWidthScanPage> {
+        ensure_coherent_scan_ready(lease, "fixed_width_range")?;
+        let (start_key, end_key) = match &lease.scope {
+            CoherentScanScope::FixedWidthRange { start_key, end_key } => {
+                (start_key.clone(), end_key.clone())
+            }
+            CoherentScanScope::PhysicalColumnFamily => {
+                return Err(coherent_scan_contract_error(
+                    lease,
+                    "COHERENT_SCAN_SCOPE_MISMATCH: a whole-column-family lease cannot scan a fixed-width range",
+                ));
+            }
+        };
+        let cf_name = lease.cf_name.clone();
+        let after = lease.next_after.clone();
+        let key_len = fixed_width_user_key_len(&cf_name).unwrap_or(start_key.len());
+        let page = self.with_vault(
+            &cf_name,
+            "continue coherent fixed-width Calyx range scan",
+            false,
+            |vault| {
+                read_fixed_width_page_from_vault_range_snapshot(
+                    vault,
+                    &cf_name,
+                    lease.snapshot,
+                    &start_key,
+                    &end_key,
+                    after.as_deref(),
+                    key_len,
+                    max_rows,
+                    lease.read_at_unix_ms,
+                )
+            },
+        )?;
+        advance_coherent_scan(lease, page.resume_after.as_deref(), page.more)?;
+        Ok(page)
+    }
+
+    fn release_coherent_scan(&self, lease: &mut CoherentScanLease) -> StorageResult<bool> {
+        if lease.released {
+            return Err(coherent_scan_contract_error(
+                lease,
+                "COHERENT_SCAN_ALREADY_RELEASED: a snapshot lease can be released exactly once",
+            ));
+        }
+        let cf_name = lease.cf_name.clone();
+        let released =
+            self.with_vault(&cf_name, "release coherent Calyx scan", false, |vault| {
+                Ok(vault.release_reader(lease.lease_id))
+            })?;
+        lease.released = true;
+        tracing::debug!(
+            code = "STORAGE_COHERENT_SCAN_RELEASED",
+            lease_id = lease.lease_id,
+            snapshot_seq = lease.snapshot_seq,
+            cf_name = %lease.cf_name,
+            completed = lease.completed,
+            released_live_lease = released,
+            "released bounded coherent scan lease"
+        );
+        Ok(released)
     }
 
     fn close(&self, reason: &'static str) -> StorageResult<SynapseCalyxVaultCloseReadback> {
@@ -639,7 +854,15 @@ impl CalyxBackend {
         let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
         let vault = SynapseCalyxVault::open_latest_readback(config)
             .map_err(|source| calyx_open_failed(path, &source))?;
+        prepare_calyx_open_fanout(&vault, path, "before_schema_and_migration")?;
         verify_calyx_schema_version(&vault, path, schema_version)?;
+        ensure_calyx_ordered_key_migration(&vault, path)?;
+        ensure_builtin_panel_generation_reservations(&vault)?;
+        ensure_builtin_temporal_panel_registrations(&vault)?;
+        // A bulk migration can checkpoint many commit sequences at once. It
+        // must not publish a backend whose newly materialized physical files
+        // already exceed the same source ceiling the page readers enforce.
+        prepare_calyx_open_fanout(&vault, path, "after_ordered_key_migration")?;
         Ok(Self {
             path: path.to_path_buf(),
             vault: Arc::new(CalyxVaultRuntime::new(vault)),
@@ -671,6 +894,167 @@ impl CalyxBackend {
             read_all_rows_from_vault(vault, cf_name)
         })
     }
+}
+
+fn ensure_builtin_temporal_panel_registrations(vault: &SynapseCalyxVault) -> StorageResult<()> {
+    let registered_at_unix_ms = calyx_clock_now_for_write(vault, "calyx_registry")?;
+    // Recurrence series belong to stable app/routine subject CxIds, not event
+    // constellations. Claiming recurrence evidence on these panel sidecars
+    // would make provenance dishonest.
+    let policy = TemporalPolicy {
+        recurrence_boost: None,
+        ..Default::default()
+    };
+    let expected = [
+        (SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION),
+        (SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION),
+        (SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION),
+        (
+            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        ),
+    ];
+    for (panel_name, panel_version) in expected {
+        let registration = VaultTemporalPanelRegistration::new(
+            panel_version,
+            panel_name,
+            policy,
+            registered_at_unix_ms,
+        )
+        .map_err(|source| {
+            let source = SynapseCalyxError::from_calyx(
+                "construct native Calyx temporal panel registration",
+                &source,
+            );
+            calyx_write_failed(
+                "calyx_registry",
+                &format!(
+                    "construct temporal panel registration {panel_name} generation {panel_version}"
+                ),
+                &source,
+            )
+        })?;
+        let write = vault
+            .register_temporal_panel(&registration)
+            .map_err(|source| {
+                calyx_write_failed(
+                    "calyx_registry",
+                    &format!("register temporal panel {panel_name} generation {panel_version}"),
+                    &source,
+                )
+            })?;
+        tracing::info!(
+            code = "STORAGE_CALYX_TEMPORAL_PANEL_REGISTERED",
+            panel_name,
+            panel_version,
+            disposition = ?write.disposition,
+            committed_seq = write.committed_seq,
+            "native Calyx temporal panel registration has exact Registry CF readback"
+        );
+    }
+    let readback = vault.list_temporal_panels().map_err(|source| {
+        calyx_write_failed(
+            "calyx_registry",
+            "read back native Calyx temporal panel catalog",
+            &source,
+        )
+    })?;
+    for (panel_name, panel_version) in expected {
+        if !readback.iter().any(|registration| {
+            registration.template.name == panel_name
+                && registration.source_panel_version == panel_version
+                && registration.policy == policy
+        }) {
+            return Err(StorageError::WriteFailed {
+                cf_name: "calyx_registry".to_owned(),
+                detail: format!(
+                    "STORAGE_CALYX_TEMPORAL_PANEL_READBACK_MISSING: panel={panel_name} generation={panel_version}; remediation=inspect native Registry CF and refuse temporal queries until the exact contract exists"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> StorageResult<()> {
+    let reservations = [
+        (SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION),
+        (SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION),
+        (SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION),
+        (
+            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        ),
+        (SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION),
+        (SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION),
+        (SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION),
+        (SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION),
+        (SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION),
+        (SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION),
+        (
+            SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+            SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
+        ),
+    ]
+    .map(|(name, generation)| (name.to_owned(), generation));
+    let readback = vault
+        .reserve_panel_generations(&reservations)
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_registry",
+                "reserve built-in native Calyx panel generations",
+                &source,
+            )
+        })?;
+    if readback.owner_count < reservations.len() as u64
+        || readback.next_generation <= SYN_MCP_USAGE_PANEL_VERSION
+    {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_registry".to_owned(),
+            detail: format!(
+                "STORAGE_CALYX_PANEL_GENERATION_READBACK_INVALID: owners={} expected_at_least={} next={} required_above={}; remediation=inspect native Registry CF allocator ownership before any panel lifecycle mutation",
+                readback.owner_count,
+                reservations.len(),
+                readback.next_generation,
+                SYN_MCP_USAGE_PANEL_VERSION
+            ),
+        });
+    }
+    tracing::info!(
+        code = "STORAGE_CALYX_PANEL_GENERATIONS_RESERVED",
+        owner_count = readback.owner_count,
+        operation_count = readback.operation_count,
+        next_generation = readback.next_generation,
+        latest_seq = readback.latest_seq,
+        "built-in Calyx panel generations have exact Registry CF ownership"
+    );
+    Ok(())
+}
+
+fn prepare_calyx_open_fanout(
+    vault: &SynapseCalyxVault,
+    path: &Path,
+    phase: &'static str,
+) -> StorageResult<()> {
+    let readiness = vault.compact_native_fanout_once().map_err(|source| {
+        calyx_open_failed_detail(
+            path,
+            format!("prepare native Calyx SST fan-out during {phase}: {source}"),
+        )
+    })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_OPEN_FANOUT_READY",
+        phase,
+        attempted_cfs = readiness.attempted_cfs,
+        compacted_cfs = readiness.compacted_cfs,
+        skipped_cfs = readiness.skipped_cfs,
+        reclaimed_input_files = readiness.reclaimed_input_files,
+        input_bytes = readiness.input_bytes,
+        output_bytes = readiness.output_bytes,
+        compacted_cf_names = ?readiness.compacted_cf_names,
+        "prepared and physically verified native Calyx SST fan-out during storage open"
+    );
+    Ok(())
 }
 
 struct CalyxPressureMaintenance {
@@ -1133,6 +1517,96 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
+    fn put_recurrence_subject_occurrence(
+        &self,
+        kind: RecurrenceSubjectKind,
+        subject_id: &str,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<CalyxRecurrenceSubjectReport> {
+        self.with_vault(
+            "calyx_recurrence",
+            "put native Calyx recurrence subject occurrence",
+            true,
+            |vault| {
+                put_recurrence_subject_occurrence_on_vault(
+                    vault,
+                    kind,
+                    subject_id,
+                    event_time_ns,
+                    occurrence_identity,
+                    context,
+                )
+            },
+        )
+    }
+
+    fn read_recurrence_subject_series(
+        &self,
+        kind: RecurrenceSubjectKind,
+        subject_id: &str,
+    ) -> StorageResult<SynapseCalyxRecurrenceSeriesReadback> {
+        self.with_vault(
+            "calyx_recurrence",
+            "read native Calyx recurrence subject series",
+            false,
+            |vault| {
+                let subject_id = validate_recurrence_subject_id(subject_id)?;
+                let input = constellations::recurrence_subject_input_bytes(kind, &subject_id);
+                let cx_id = vault.cx_id_for_input(&input, SYN_RECURRENCE_SUBJECT_PANEL_VERSION);
+                vault.read_recurrence_series(cx_id).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_recurrence",
+                        "read native Calyx recurrence subject series",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn list_temporal_panels(&self) -> StorageResult<Vec<VaultTemporalPanelRegistration>> {
+        self.with_vault(
+            "calyx_registry",
+            "list native Calyx temporal panels",
+            false,
+            |vault| {
+                vault.list_temporal_panels().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_registry",
+                        "list native Calyx temporal panels",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn temporal_rerank(
+        &self,
+        candidates: &[SynapseCalyxTemporalCandidate],
+        query_time_secs: i64,
+        tz_offset_secs: i32,
+    ) -> StorageResult<SynapseCalyxTemporalRerankReadback> {
+        self.with_vault(
+            "calyx_registry",
+            "apply registered Calyx temporal rerank",
+            false,
+            |vault| {
+                vault
+                    .temporal_rerank_registered(candidates, query_time_secs, tz_offset_secs)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_registry",
+                            "apply registered Calyx temporal rerank",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
     fn put_timeline_constellation(
         &self,
         source_key: &[u8],
@@ -1166,6 +1640,42 @@ impl StorageBackend for CalyxBackend {
                                 &source,
                             )
                         })?;
+                if let Some(app) = record
+                    .app
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|app| !app.is_empty())
+                {
+                    let recurrence_context = serde_json::to_vec(&serde_json::json!({
+                        "source_cf": cf::CF_TIMELINE,
+                        "source_key_hex": constellations::hex_encode(source_key),
+                    }))
+                    .map_err(|error| StorageError::WriteFailed {
+                        cf_name: "calyx_recurrence".to_owned(),
+                        detail: format!(
+                            "encode app-usage recurrence context for source key {}: {error}",
+                            constellations::hex_encode(source_key)
+                        ),
+                    })?;
+                    let recurrence = put_recurrence_subject_occurrence_on_vault(
+                        vault,
+                        RecurrenceSubjectKind::AppUsage,
+                        app,
+                        record.ts_ns,
+                        source_key,
+                        &recurrence_context,
+                    )?;
+                    tracing::debug!(
+                        code = "CALYX_APP_USAGE_RECURRENCE_APPENDED",
+                        subject_cx_id = %recurrence.subject_cx_id,
+                        subject_id = %recurrence.subject_id,
+                        occurrence_id = recurrence.occurrence.occurrence_id,
+                        disposition = ?recurrence.occurrence.disposition,
+                        frequency = recurrence.occurrence.frequency,
+                        source_key_hex = %constellations::hex_encode(source_key),
+                        "timeline app usage projected into native Calyx recurrence series"
+                    );
+                }
                 Ok(constellation_report(ConstellationReportInput {
                     panel_name: SYN_TIMELINE_PANEL_NAME,
                     panel_version: SYN_TIMELINE_PANEL_VERSION,
@@ -2319,11 +2829,19 @@ impl StorageBackend for CalyxBackend {
         prefix: &[u8],
         start_key: &[u8],
     ) -> StorageResult<Vec<RawRow>> {
-        let rows = self.read_all_rows(cf_name)?;
-        Ok(rows
-            .into_iter()
-            .filter(|(key, _value)| key.as_slice() >= start_key && key.starts_with(prefix))
-            .collect())
+        self.with_vault(
+            cf_name,
+            "scan ordered Calyx logical prefix range",
+            false,
+            |vault| {
+                let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+                let range = calyx_ordered_prefix_from_range(collection_id, prefix, start_key)?;
+                range.map_or_else(
+                    || Ok(Vec::new()),
+                    |range| read_rows_from_vault_range_filtered(vault, cf_name, &range, false),
+                )
+            },
+        )
     }
 
     fn scan_cf_from(
@@ -2332,20 +2850,23 @@ impl StorageBackend for CalyxBackend {
         start_key: &[u8],
         max_rows: usize,
     ) -> StorageResult<ScanWindow> {
-        let mut rows = self
-            .read_all_rows(cf_name)?
-            .into_iter()
-            .filter(|(key, _value)| key.as_slice() >= start_key);
-        let mut window = Vec::new();
-        let mut more = false;
-        for row in &mut rows {
-            if window.len() == max_rows {
-                more = true;
-                break;
-            }
-            window.push(row);
+        if max_rows == 0 {
+            return Ok((Vec::new(), false));
         }
-        Ok((window, more))
+        if max_rows > LATEST_CF_RANGE_PAGE_MAX_ROWS {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "ordered Calyx logical page max_rows {max_rows} exceeds the hard candidate ceiling {LATEST_CF_RANGE_PAGE_MAX_ROWS}; remediation=use bounded pages at or below the ceiling"
+                ),
+            });
+        }
+        self.with_vault(
+            cf_name,
+            "scan candidate-bounded ordered Calyx logical page",
+            false,
+            |vault| read_ordered_rows_from_vault_page(vault, cf_name, start_key, max_rows),
+        )
     }
 
     fn scan_cf_physical_page(
@@ -2413,6 +2934,46 @@ impl StorageBackend for CalyxBackend {
                 )
             },
         )
+    }
+
+    fn pin_cf_physical_scan(
+        &self,
+        cf_name: &str,
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease> {
+        self.vault.pin_cf_physical_scan(cf_name, max_age_ms)
+    }
+
+    fn pin_cf_fixed_width_range_scan(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease> {
+        self.vault
+            .pin_cf_fixed_width_range_scan(cf_name, start_key, end_key, max_age_ms)
+    }
+
+    fn scan_cf_physical_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage> {
+        self.vault.scan_cf_physical_page_coherent(lease, max_rows)
+    }
+
+    fn scan_cf_fixed_width_range_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<FixedWidthScanPage> {
+        self.vault
+            .scan_cf_fixed_width_range_page_coherent(lease, max_rows)
+    }
+
+    fn release_coherent_scan(&self, lease: &mut CoherentScanLease) -> StorageResult<bool> {
+        self.vault.release_coherent_scan(lease)
     }
 
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>> {
@@ -2591,6 +3152,7 @@ pub fn inspect_calyx_vault_read_only(
     let vault = SynapseCalyxReadOnlyVault::open_existing(config)
         .map_err(|source| calyx_open_failed(path, &source))?;
     let actual = verify_calyx_schema_version_existing(&vault, path, schema_version)?;
+    require_calyx_ordered_key_migration(&vault, path)?;
     inspect_calyx_vault_with_schema(&vault, path, actual)
 }
 
@@ -2604,6 +3166,7 @@ fn scan_calyx_cf_read_only(
     let vault = SynapseCalyxReadOnlyVault::open_existing(config)
         .map_err(|source| calyx_open_failed(path, &source))?;
     verify_calyx_schema_version_existing(&vault, path, schema_version)?;
+    require_calyx_ordered_key_migration(&vault, path)?;
     read_all_rows_from_vault(&vault, cf_name)
 }
 
@@ -2617,6 +3180,7 @@ pub fn scan_calyx_cf_read_only_including_expired(
     let vault = SynapseCalyxReadOnlyVault::open_existing(config)
         .map_err(|source| calyx_open_failed(path, &source))?;
     verify_calyx_schema_version_existing(&vault, path, schema_version)?;
+    require_calyx_ordered_key_migration(&vault, path)?;
     read_all_rows_from_vault_including_expired(&vault, cf_name)
 }
 
@@ -2913,7 +3477,7 @@ struct CalyxKeyParts {
 }
 
 fn decode_calyx_key_parts(full_key: &[u8]) -> Result<CalyxKeyParts, String> {
-    if full_key.len() < 1 + 8 + 8 + 2 {
+    if full_key.len() < 1 + 8 + 8 {
         return Err(format!(
             "Calyx KV key is shorter than the Synapse envelope header: len={}",
             full_key.len()
@@ -2929,17 +3493,23 @@ fn decode_calyx_key_parts(full_key: &[u8]) -> Result<CalyxKeyParts, String> {
     collection_bytes.copy_from_slice(&full_key[1..9]);
     let mut namespace_bytes = [0_u8; 8];
     namespace_bytes.copy_from_slice(&full_key[9..17]);
-    let len = usize::from(u16::from_be_bytes([full_key[17], full_key[18]]));
-    let Some(user_key) = full_key.get(19..19 + len) else {
-        return Err("Calyx KV key length prefix exceeds the stored key".to_owned());
+    let collection_id = u64::from_be_bytes(collection_bytes);
+    let namespace = u64::from_be_bytes(namespace_bytes);
+    let user_key = match namespace {
+        CALYX_KV_LEGACY_LENGTH_ORDERED_NAMESPACE => {
+            decode_calyx_legacy_user_key(collection_id, full_key)?
+        }
+        CALYX_KV_ORDERED_NAMESPACE => decode_calyx_user_key(collection_id, full_key)?,
+        other => {
+            return Err(format!(
+                "Calyx KV key has unsupported namespace {other}; supported legacy={CALYX_KV_LEGACY_LENGTH_ORDERED_NAMESPACE} ordered={CALYX_KV_ORDERED_NAMESPACE}"
+            ));
+        }
     };
-    if full_key.len() != 19 + len {
-        return Err("Calyx KV key has trailing bytes after the user key".to_owned());
-    }
     Ok(CalyxKeyParts {
-        collection_id: u64::from_be_bytes(collection_bytes),
-        namespace: u64::from_be_bytes(namespace_bytes),
-        user_key: user_key.to_vec(),
+        collection_id,
+        namespace,
+        user_key,
     })
 }
 
@@ -3385,6 +3955,116 @@ fn constellation_report(input: ConstellationReportInput<'_>) -> ConstellationPut
     }
 }
 
+fn put_recurrence_subject_occurrence_on_vault(
+    vault: &SynapseCalyxVault,
+    kind: RecurrenceSubjectKind,
+    subject_id: &str,
+    event_time_ns: u64,
+    occurrence_identity: &[u8],
+    context: &[u8],
+) -> StorageResult<CalyxRecurrenceSubjectReport> {
+    let subject_id = validate_recurrence_subject_id(subject_id)?;
+    if occurrence_identity.is_empty() {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_recurrence".to_owned(),
+            detail: format!(
+                "recurrence subject kind={} id={subject_id:?} requires a non-empty caller-stable occurrence identity",
+                kind.as_str()
+            ),
+        });
+    }
+    let input = constellations::recurrence_subject_input_bytes(kind, &subject_id);
+    let cx_id = vault.cx_id_for_input(&input, SYN_RECURRENCE_SUBJECT_PANEL_VERSION);
+    let created_at_ms = calyx_clock_now_for_write(vault, "calyx_recurrence")?;
+    let constellation = constellations::build_recurrence_subject_constellation(
+        NativeConstellationContext {
+            vault_id: vault.vault_id_value(),
+            cx_id,
+            created_at_ms,
+            next_ledger_seq: vault.latest_seq().saturating_add(1),
+        },
+        kind,
+        &subject_id,
+        &input,
+    )?;
+    let subject = vault
+        .put_observation_constellation(constellation)
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_recurrence",
+                "put native Calyx recurrence subject constellation",
+                &source,
+            )
+        })?;
+    let event_time_secs = i64::try_from(event_time_ns / 1_000_000_000).map_err(|error| {
+        StorageError::WriteFailed {
+            cf_name: "calyx_recurrence".to_owned(),
+            detail: format!(
+                "recurrence event time {event_time_ns}ns does not fit EpochSecs for kind={} id={subject_id:?}: {error}",
+                kind.as_str()
+            ),
+        }
+    })?;
+    let observed_at_secs =
+        i64::try_from(created_at_ms / 1_000).map_err(|error| StorageError::WriteFailed {
+            cf_name: "calyx_recurrence".to_owned(),
+            detail: format!("Calyx clock {created_at_ms}ms does not fit EpochSecs: {error}"),
+        })?;
+    let mut identity_hasher = Sha256::new();
+    identity_hasher.update(b"synapse-recurrence-occurrence-v1");
+    identity_hasher.update([0]);
+    identity_hasher.update(kind.as_str().as_bytes());
+    identity_hasher.update([0]);
+    identity_hasher.update(subject_id.as_bytes());
+    identity_hasher.update([0]);
+    identity_hasher.update(occurrence_identity);
+    let occurrence_identity_sha256: [u8; 32] = identity_hasher.finalize().into();
+    let occurrence = vault
+        .append_recurrence_occurrence_once(
+            cx_id,
+            event_time_secs,
+            observed_at_secs,
+            context.to_vec(),
+            occurrence_identity_sha256,
+        )
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_recurrence",
+                "append native Calyx recurrence subject occurrence",
+                &source,
+            )
+        })?;
+    Ok(CalyxRecurrenceSubjectReport {
+        subject_kind: kind.as_str().to_owned(),
+        subject_id,
+        subject_cx_id: cx_id.to_string(),
+        subject_panel_name: SYN_RECURRENCE_SUBJECT_PANEL_NAME.to_owned(),
+        subject_panel_version: SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
+        subject_disposition: subject.disposition,
+        occurrence,
+    })
+}
+
+fn validate_recurrence_subject_id(subject_id: &str) -> StorageResult<String> {
+    let trimmed = subject_id.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_recurrence".to_owned(),
+            detail: "recurrence subject id must not be empty".to_owned(),
+        });
+    }
+    if trimmed.len() > 200 {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_recurrence".to_owned(),
+            detail: format!(
+                "recurrence subject id is {} bytes; maximum is 200",
+                trimmed.len()
+            ),
+        });
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
 fn grounded_observation_as_observation_readback(
     readback: &SynapseCalyxGroundedObservationReadback,
 ) -> SynapseCalyxObservationPutReadback {
@@ -3664,7 +4344,7 @@ fn verify_calyx_schema_version(
     path: &Path,
     schema_version: u32,
 ) -> StorageResult<()> {
-    let key = encode_calyx_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
+    let key = encode_calyx_legacy_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
         .map_err(|detail| calyx_open_failed_detail(path, detail))?;
     let existing = vault
         .read_cf_latest(ColumnFamily::Kv, &key)
@@ -3704,7 +4384,7 @@ fn verify_calyx_schema_version_existing(
     path: &Path,
     expected_schema_version: u32,
 ) -> StorageResult<u32> {
-    let key = encode_calyx_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
+    let key = encode_calyx_legacy_key(CALYX_METADATA_COLLECTION_ID, SCHEMA_VERSION_KEY)
         .map_err(|detail| calyx_open_failed_detail(path, detail))?;
     let Some(value) = vault
         .read_kv_latest(&key)
@@ -3726,6 +4406,378 @@ fn verify_calyx_schema_version_existing(
             actual,
         })
     }
+}
+
+fn ordered_key_migration_sentinel_key(path: &Path) -> StorageResult<Vec<u8>> {
+    encode_calyx_legacy_key(
+        CALYX_METADATA_COLLECTION_ID,
+        CALYX_ORDERED_KEY_MIGRATION_KEY,
+    )
+    .map_err(|detail| calyx_open_failed_detail(path, detail))
+}
+
+fn read_calyx_ordered_key_migration_sentinel(
+    vault: &impl CalyxVaultKvRead,
+    path: &Path,
+) -> StorageResult<bool> {
+    let key = ordered_key_migration_sentinel_key(path)?;
+    let Some(value) = vault
+        .read_kv_latest(&key)
+        .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let envelope =
+        decode_calyx_value_raw(&value).map_err(|detail| calyx_open_failed_detail(path, detail))?;
+    if envelope.expires_at_ms != 0 || envelope.payload != CALYX_ORDERED_KEY_MIGRATION_PAYLOAD {
+        return Err(calyx_open_failed_detail(
+            path,
+            format!(
+                "CALYX_ORDERED_KEY_MIGRATION_SENTINEL_CORRUPT: key={} expires_at_ms={} payload_sha256={}; remediation=inspect the physical metadata row and the legacy/ordered namespace counts before exact repair",
+                hex_prefix_for_log(&key),
+                envelope.expires_at_ms,
+                sha256_hex(envelope.payload)
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn verify_calyx_legacy_namespaces_empty(
+    vault: &impl CalyxVaultKvRead,
+    path: &Path,
+) -> StorageResult<()> {
+    for cf_name in cf::ALL_COLUMN_FAMILIES {
+        let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+        let range = prefix_range(&calyx_legacy_namespace_prefix(collection_id));
+        let rows = vault.scan_kv_range_latest(&range).map_err(|source| {
+            calyx_open_failed_detail(
+                path,
+                format!("verify empty legacy Calyx namespace for {cf_name}: {source}"),
+            )
+        })?;
+        if let Some((physical_key, _value)) = rows.first() {
+            let user_key = decode_calyx_legacy_user_key(collection_id, physical_key).map_err(
+                |detail| {
+                    calyx_open_failed_detail(
+                        path,
+                        format!(
+                            "CALYX_ORDERED_KEY_LEGACY_NAMESPACE_CORRUPT: cf={cf_name} physical_key={} detail={detail}",
+                            hex_prefix_for_log(physical_key)
+                        ),
+                    )
+                },
+            )?;
+            return Err(calyx_open_failed_detail(
+                path,
+                format!(
+                    "CALYX_ORDERED_KEY_MIGRATION_INCOMPLETE: completion sentinel exists while a live legacy row remains: cf={cf_name} user_key_len={} user_key_sha256={}; remediation=remove the invalid sentinel only after preserving this evidence, then reopen the repo-built daemon so the resumable migration finishes",
+                    user_key.len(),
+                    sha256_hex(&user_key)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_calyx_ordered_key_migration(
+    vault: &impl CalyxVaultKvRead,
+    path: &Path,
+) -> StorageResult<()> {
+    if !read_calyx_ordered_key_migration_sentinel(vault, path)? {
+        return Err(calyx_open_failed_detail(
+            path,
+            "CALYX_ORDERED_KEY_MIGRATION_REQUIRED: the read-only vault has no ordered-key migration sentinel; remediation=stop readers and open it once with the repo-built Synapse writer to complete the resumable migration"
+                .to_owned(),
+        ));
+    }
+    verify_calyx_legacy_namespaces_empty(vault, path)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CalyxOrderedKeyMigrationCounts {
+    migrated_rows: u64,
+    resumed_rows: u64,
+    committed_pages: u64,
+}
+
+impl CalyxOrderedKeyMigrationCounts {
+    const fn add(&mut self, other: Self) {
+        self.migrated_rows = self.migrated_rows.saturating_add(other.migrated_rows);
+        self.resumed_rows = self.resumed_rows.saturating_add(other.resumed_rows);
+        self.committed_pages = self.committed_pages.saturating_add(other.committed_pages);
+    }
+}
+
+fn prepare_calyx_ordered_migration_page(
+    vault: &SynapseCalyxVault,
+    path: &Path,
+    cf_name: &str,
+    collection_id: u64,
+    rows: SynapseCalyxCfRows,
+) -> StorageResult<(Vec<SynapseCalyxCfWrite>, CalyxOrderedKeyMigrationCounts)> {
+    let mut writes = Vec::with_capacity(rows.len().saturating_mul(2));
+    let mut counts = CalyxOrderedKeyMigrationCounts::default();
+    for (legacy_key, stored_value) in rows {
+        let user_key = decode_calyx_legacy_user_key(collection_id, &legacy_key).map_err(
+            |detail| {
+                calyx_open_failed_detail(
+                    path,
+                    format!(
+                        "CALYX_ORDERED_KEY_LEGACY_ROW_CORRUPT: cf={cf_name} physical_key={} detail={detail}",
+                        hex_prefix_for_log(&legacy_key)
+                    ),
+                )
+            },
+        )?;
+        let ordered_key = encode_calyx_key(collection_id, &user_key).map_err(|detail| {
+            calyx_open_failed_detail(
+                path,
+                format!(
+                    "encode ordered Calyx key during migration: cf={cf_name} user_key_len={} detail={detail}",
+                    user_key.len()
+                ),
+            )
+        })?;
+        match vault
+            .read_cf_latest(ColumnFamily::Kv, &ordered_key)
+            .map_err(|source| {
+                calyx_open_failed_detail(
+                    path,
+                    format!("read ordered Calyx migration target for {cf_name}: {source}"),
+                )
+            })? {
+            Some(existing) if existing != stored_value => {
+                return Err(calyx_open_failed_detail(
+                    path,
+                    format!(
+                        "CALYX_ORDERED_KEY_MIGRATION_DIVERGED: cf={cf_name} user_key_len={} user_key_sha256={} legacy_value_sha256={} ordered_value_sha256={}; remediation=quarantine and reconcile the exact physical pair before reopening",
+                        user_key.len(),
+                        sha256_hex(&user_key),
+                        sha256_hex(&stored_value),
+                        sha256_hex(&existing)
+                    ),
+                ));
+            }
+            Some(_) => counts.resumed_rows = counts.resumed_rows.saturating_add(1),
+            None => {
+                writes.push(SynapseCalyxCfWrite::new(
+                    ColumnFamily::Kv,
+                    ordered_key,
+                    stored_value,
+                ));
+                counts.migrated_rows = counts.migrated_rows.saturating_add(1);
+            }
+        }
+        writes.push(SynapseCalyxCfWrite::new(
+            ColumnFamily::Kv,
+            legacy_key,
+            tombstone_value(),
+        ));
+    }
+    Ok((writes, counts))
+}
+
+fn migrate_calyx_legacy_cf_ordered(
+    vault: &SynapseCalyxVault,
+    path: &Path,
+    cf_name: &str,
+) -> StorageResult<CalyxOrderedKeyMigrationCounts> {
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = prefix_range(&calyx_legacy_namespace_prefix(collection_id));
+    let mut after_physical = None;
+    let mut counts = CalyxOrderedKeyMigrationCounts::default();
+    loop {
+        let page = vault
+            .scan_cf_range_page_latest(
+                ColumnFamily::Kv,
+                &range,
+                after_physical.as_deref(),
+                CALYX_ORDERED_KEY_MIGRATION_PAGE_ROWS,
+            )
+            .map_err(|source| {
+                calyx_open_failed_detail(
+                    path,
+                    format!("scan resumable legacy Calyx namespace page for {cf_name}: {source}"),
+                )
+            })?;
+        let next_after = page.resume_after;
+        let more = page.more;
+        let (writes, page_counts) =
+            prepare_calyx_ordered_migration_page(vault, path, cf_name, collection_id, page.rows)?;
+        counts.add(page_counts);
+        if !writes.is_empty() {
+            commit_calyx_rows_to_vault(vault, cf_name, writes)?;
+            counts.committed_pages = counts.committed_pages.saturating_add(1);
+        }
+        if !more {
+            return Ok(counts);
+        }
+        after_physical = Some(next_after.ok_or_else(|| {
+            calyx_open_failed_detail(
+                path,
+                format!(
+                    "CALYX_ORDERED_KEY_MIGRATION_CURSOR_MISSING: legacy {cf_name} page reported more candidates without an exclusive physical cursor"
+                ),
+            )
+        })?);
+    }
+}
+
+fn commit_calyx_ordered_migration_sentinel(
+    vault: &SynapseCalyxVault,
+    path: &Path,
+) -> StorageResult<()> {
+    let sentinel_key = ordered_key_migration_sentinel_key(path)?;
+    let sentinel_value = encode_calyx_value(0, 0, CALYX_ORDERED_KEY_MIGRATION_PAYLOAD);
+    commit_calyx_rows_atomically_to_vault(
+        vault,
+        "<ordered-key-migration>",
+        vec![SynapseCalyxCfWrite::new(
+            ColumnFamily::Kv,
+            sentinel_key.clone(),
+            sentinel_value.clone(),
+        )],
+    )?;
+    let readback = vault
+        .read_cf_latest(ColumnFamily::Kv, &sentinel_key)
+        .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?;
+    if readback.as_deref() != Some(sentinel_value.as_slice()) {
+        return Err(calyx_open_failed_detail(
+            path,
+            format!(
+                "CALYX_ORDERED_KEY_MIGRATION_SENTINEL_READBACK_MISMATCH: key={} expected_sha256={} actual_sha256={}; remediation=inspect WAL/MVCC publication before retrying open",
+                hex_prefix_for_log(&sentinel_key),
+                sha256_hex(&sentinel_value),
+                readback
+                    .as_deref()
+                    .map_or_else(|| "absent".to_owned(), sha256_hex)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ordered_key_physical_purge_sentinel_key(path: &Path) -> StorageResult<Vec<u8>> {
+    encode_calyx_legacy_key(
+        CALYX_METADATA_COLLECTION_ID,
+        CALYX_ORDERED_KEY_PHYSICAL_PURGE_KEY,
+    )
+    .map_err(|detail| calyx_open_failed_detail(path, detail))
+}
+
+fn read_calyx_ordered_key_physical_purge_sentinel(
+    vault: &impl CalyxVaultKvRead,
+    path: &Path,
+) -> StorageResult<bool> {
+    let key = ordered_key_physical_purge_sentinel_key(path)?;
+    let Some(value) = vault
+        .read_kv_latest(&key)
+        .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let envelope =
+        decode_calyx_value_raw(&value).map_err(|detail| calyx_open_failed_detail(path, detail))?;
+    if envelope.expires_at_ms != 0 || envelope.payload != CALYX_ORDERED_KEY_PHYSICAL_PURGE_PAYLOAD {
+        return Err(calyx_open_failed_detail(
+            path,
+            format!(
+                "CALYX_ORDERED_KEY_PHYSICAL_PURGE_SENTINEL_CORRUPT: key={} expires_at_ms={} payload_sha256={}; remediation=preserve the KV SST inventory and inspect the exact metadata row before repair",
+                hex_prefix_for_log(&key),
+                envelope.expires_at_ms,
+                sha256_hex(envelope.payload)
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn commit_calyx_ordered_key_physical_purge_sentinel(
+    vault: &SynapseCalyxVault,
+    path: &Path,
+) -> StorageResult<()> {
+    let key = ordered_key_physical_purge_sentinel_key(path)?;
+    let value = encode_calyx_value(0, 0, CALYX_ORDERED_KEY_PHYSICAL_PURGE_PAYLOAD);
+    commit_calyx_rows_atomically_to_vault(
+        vault,
+        "<ordered-key-physical-purge>",
+        vec![SynapseCalyxCfWrite::new(
+            ColumnFamily::Kv,
+            key.clone(),
+            value.clone(),
+        )],
+    )?;
+    let readback = vault
+        .read_cf_latest(ColumnFamily::Kv, &key)
+        .map_err(|source| calyx_open_failed_detail(path, source.to_string()))?;
+    if readback.as_deref() != Some(value.as_slice()) {
+        return Err(calyx_open_failed_detail(
+            path,
+            format!(
+                "CALYX_ORDERED_KEY_PHYSICAL_PURGE_SENTINEL_READBACK_MISMATCH: key={} expected_sha256={} actual_sha256={}; remediation=inspect the WAL commit and latest KV readback before retrying open",
+                hex_prefix_for_log(&key),
+                sha256_hex(&value),
+                readback
+                    .as_deref()
+                    .map_or_else(|| "absent".to_owned(), sha256_hex)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_calyx_ordered_key_physical_purge(
+    vault: &SynapseCalyxVault,
+    path: &Path,
+) -> StorageResult<()> {
+    if read_calyx_ordered_key_physical_purge_sentinel(vault, path)? {
+        return Ok(());
+    }
+    let started = Instant::now();
+    vault.purge_kv_tombstones().map_err(|source| {
+        calyx_open_failed_detail(
+            path,
+            format!(
+                "physically purge retired ordered-key migration tombstones with a complete KV compaction: {source}"
+            ),
+        )
+    })?;
+    verify_calyx_legacy_namespaces_empty(vault, path)?;
+    commit_calyx_ordered_key_physical_purge_sentinel(vault, path)?;
+    tracing::info!(
+        code = "STORAGE_CALYX_ORDERED_KEY_PHYSICAL_PURGE_COMPLETED",
+        latest_seq = vault.latest_seq(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "physically removed retired ordered-key migration tombstones through a complete KV compaction and verified its durable sentinel"
+    );
+    Ok(())
+}
+
+fn ensure_calyx_ordered_key_migration(vault: &SynapseCalyxVault, path: &Path) -> StorageResult<()> {
+    if read_calyx_ordered_key_migration_sentinel(vault, path)? {
+        verify_calyx_legacy_namespaces_empty(vault, path)?;
+        return ensure_calyx_ordered_key_physical_purge(vault, path);
+    }
+
+    let started = Instant::now();
+    let mut counts = CalyxOrderedKeyMigrationCounts::default();
+    for cf_name in cf::ALL_COLUMN_FAMILIES {
+        counts.add(migrate_calyx_legacy_cf_ordered(vault, path, cf_name)?);
+    }
+    verify_calyx_legacy_namespaces_empty(vault, path)?;
+    commit_calyx_ordered_migration_sentinel(vault, path)?;
+    tracing::info!(
+        code = "STORAGE_CALYX_ORDERED_KEY_MIGRATION_COMPLETED",
+        migrated_rows = counts.migrated_rows,
+        resumed_rows = counts.resumed_rows,
+        committed_pages = counts.committed_pages,
+        latest_seq = vault.latest_seq(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "migrated every live logical storage row into the order-preserving Calyx namespace and verified the durable sentinel"
+    );
+    ensure_calyx_ordered_key_physical_purge(vault, path)
 }
 
 fn decode_schema_version(bytes: &[u8]) -> Option<u32> {
@@ -3753,9 +4805,19 @@ fn read_all_rows_from_vault_filtered(
 ) -> StorageResult<Vec<RawRow>> {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    read_rows_from_vault_range_filtered(vault, cf_name, &range, include_expired)
+}
+
+fn read_rows_from_vault_range_filtered(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    range: &KeyRange,
+    include_expired: bool,
+) -> StorageResult<Vec<RawRow>> {
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let rows = vault
-        .scan_kv_range_latest(&range)
-        .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV namespace", &source))?;
+        .scan_kv_range_latest(range)
+        .map_err(|source| calyx_read_failed(cf_name, "scan ordered Calyx KV range", &source))?;
     let mut decoded = Vec::with_capacity(rows.len());
     let now_ms = vault
         .clock_now_ms()
@@ -3778,8 +4840,119 @@ fn read_all_rows_from_vault_filtered(
             decoded.push((user_key, envelope.payload.to_vec()));
         }
     }
-    decoded.sort_by(|left, right| left.0.cmp(&right.0));
+    if !decoded
+        .windows(2)
+        .all(|pair| pair[0].0.as_slice() < pair[1].0.as_slice())
+    {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "CALYX_ORDERED_KEY_RANGE_OUT_OF_ORDER: physical ordered namespace did not decode into strictly increasing logical keys; remediation=inspect duplicate/corrupt namespace-one keys before retrying"
+                .to_owned(),
+        });
+    }
     Ok(decoded)
+}
+
+fn calyx_ordered_prefix_from_range(
+    collection_id: u64,
+    prefix: &[u8],
+    start_key: &[u8],
+) -> StorageResult<Option<KeyRange>> {
+    if prefix.len() > CALYX_MAX_USER_KEY_BYTES || start_key.len() > CALYX_MAX_USER_KEY_BYTES {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name_for_calyx_collection_id(collection_id)
+                .unwrap_or("<unknown>")
+                .to_owned(),
+            detail: format!(
+                "ordered Calyx logical range exceeds the supported key maximum {CALYX_MAX_USER_KEY_BYTES}: prefix_len={} start_key_len={}",
+                prefix.len(),
+                start_key.len()
+            ),
+        });
+    }
+    let mut physical_prefix = calyx_namespace_prefix(collection_id);
+    physical_prefix.extend_from_slice(prefix);
+    let prefix_range = prefix_range(&physical_prefix);
+    let start = if start_key > prefix {
+        encode_calyx_key(collection_id, start_key).map_err(|detail| StorageError::ReadFailed {
+            cf_name: cf_name_for_calyx_collection_id(collection_id)
+                .unwrap_or("<unknown>")
+                .to_owned(),
+            detail,
+        })?
+    } else {
+        physical_prefix
+    };
+    if prefix_range
+        .end
+        .as_deref()
+        .is_some_and(|end| start.as_slice() >= end)
+    {
+        return Ok(None);
+    }
+    Ok(Some(KeyRange {
+        start,
+        end: prefix_range.end,
+    }))
+}
+
+fn read_ordered_rows_from_vault_page(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    start_key: &[u8],
+    max_rows: usize,
+) -> StorageResult<ScanWindow> {
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let namespace_range = prefix_range(&calyx_namespace_prefix(collection_id));
+    let range = KeyRange {
+        start: encode_calyx_key_for_read(cf_name, collection_id, start_key)?,
+        end: namespace_range.end,
+    };
+    let page = vault
+        .scan_kv_range_page_latest(&range, None, max_rows)
+        .map_err(|source| {
+            calyx_read_failed(
+                cf_name,
+                "scan candidate-bounded ordered Calyx logical page",
+                &source,
+            )
+        })?;
+    let now_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
+    let mut decoded = Vec::with_capacity(page.rows.len());
+    for (physical_key, value) in page.rows {
+        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &physical_key)?;
+        let envelope = decode_calyx_value_raw(&value).map_err(|detail| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "decode candidate-bounded ordered Calyx logical page value: key_sha256={} detail={detail}",
+                sha256_hex(&user_key)
+            ),
+        })?;
+        if !calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+            decoded.push((user_key, envelope.payload.to_vec()));
+        }
+    }
+    if !decoded
+        .windows(2)
+        .all(|pair| pair[0].0.as_slice() < pair[1].0.as_slice())
+    {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "CALYX_ORDERED_KEY_PAGE_OUT_OF_ORDER: candidate-bounded page decoded into non-increasing logical keys; remediation=inspect namespace-one physical keys"
+                .to_owned(),
+        });
+    }
+    if decoded.is_empty() && page.more {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "CALYX_ORDERED_KEY_PAGE_NO_LOGICAL_PROGRESS: {max_rows} physical candidates produced no live logical row while more candidates remain; remediation=run retention GC or migrate this caller to the opaque ordered-page cursor before retrying"
+            ),
+        });
+    }
+    Ok((decoded, page.more))
 }
 
 fn fixed_width_user_key_len(cf_name: &str) -> Option<usize> {
@@ -3887,6 +5060,191 @@ fn validate_physical_page_request(
         })?;
     }
     Ok(())
+}
+
+fn pin_coherent_scan(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    scope: CoherentScanScope,
+    max_age_ms: u64,
+) -> StorageResult<CoherentScanLease> {
+    if max_age_ms == 0 || max_age_ms > crate::COHERENT_SCAN_MAX_AGE_MS {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "COHERENT_SCAN_LEASE_AGE_INVALID: requested max_age_ms={max_age_ms}; permitted=1..={}; remediation=use a bounded scan or an explicit delta-first rebase",
+                crate::COHERENT_SCAN_MAX_AGE_MS
+            ),
+        });
+    }
+    let snapshot = vault
+        .pin_reader(Freshness::FreshDerived, max_age_ms)
+        .map_err(|source| calyx_read_failed(cf_name, "pin coherent Calyx scan", &source))?;
+    let read_at_unix_ms = match vault.clock_now_ms() {
+        Ok(now) => now,
+        Err(source) => {
+            let _released = vault.release_reader(snapshot.lease().id());
+            return Err(calyx_read_failed(
+                cf_name,
+                "read Calyx clock for coherent scan",
+                &source,
+            ));
+        }
+    };
+    let lease = snapshot.lease();
+    tracing::debug!(
+        code = "STORAGE_COHERENT_SCAN_PINNED",
+        lease_id = lease.id(),
+        snapshot_seq = snapshot.seq(),
+        issued_at_unix_ms = lease.issued_at(),
+        expires_at_unix_ms = lease.expires_at(),
+        read_at_unix_ms,
+        cf_name,
+        "pinned bounded coherent scan lease"
+    );
+    Ok(CoherentScanLease {
+        lease_id: lease.id(),
+        snapshot_seq: snapshot.seq(),
+        issued_at_unix_ms: lease.issued_at(),
+        expires_at_unix_ms: lease.expires_at(),
+        read_at_unix_ms,
+        cf_name: cf_name.to_owned(),
+        snapshot,
+        scope,
+        next_after: None,
+        started: false,
+        completed: false,
+        released: false,
+    })
+}
+
+fn coherent_scan_contract_error(lease: &CoherentScanLease, detail: &str) -> StorageError {
+    StorageError::ReadFailed {
+        cf_name: lease.cf_name.clone(),
+        detail: format!(
+            "{detail}; lease_id={} snapshot_seq={} issued_at_unix_ms={} expires_at_unix_ms={} started={} completed={} released={}",
+            lease.lease_id,
+            lease.snapshot_seq,
+            lease.issued_at_unix_ms,
+            lease.expires_at_unix_ms,
+            lease.started,
+            lease.completed,
+            lease.released
+        ),
+    }
+}
+
+fn ensure_coherent_scan_ready(
+    lease: &CoherentScanLease,
+    expected_scope: &str,
+) -> StorageResult<()> {
+    if lease.released {
+        return Err(coherent_scan_contract_error(
+            lease,
+            "COHERENT_SCAN_RELEASED: continuation attempted after explicit release",
+        ));
+    }
+    if lease.completed {
+        return Err(coherent_scan_contract_error(
+            lease,
+            "COHERENT_SCAN_COMPLETE: continuation attempted after the terminal page",
+        ));
+    }
+    tracing::trace!(
+        lease_id = lease.lease_id,
+        snapshot_seq = lease.snapshot_seq,
+        cf_name = %lease.cf_name,
+        expected_scope,
+        next_after_len = lease.next_after.as_ref().map_or(0, Vec::len),
+        "validated coherent scan continuation state"
+    );
+    Ok(())
+}
+
+fn advance_coherent_scan(
+    lease: &mut CoherentScanLease,
+    resume_after: Option<&[u8]>,
+    more: bool,
+) -> StorageResult<()> {
+    if more && resume_after.is_none() {
+        return Err(coherent_scan_contract_error(
+            lease,
+            "COHERENT_SCAN_CURSOR_MISSING: page reported more rows without an exclusive cursor",
+        ));
+    }
+    if let Some(resume) = resume_after
+        && lease
+            .next_after
+            .as_deref()
+            .is_some_and(|previous| resume <= previous)
+    {
+        return Err(coherent_scan_contract_error(
+            lease,
+            "COHERENT_SCAN_CURSOR_NON_PROGRESSING: returned cursor did not advance strictly",
+        ));
+    }
+    lease.started = true;
+    lease.completed = !more;
+    lease.next_after = more.then(|| resume_after.unwrap_or_default().to_vec());
+    Ok(())
+}
+
+fn read_physical_page_from_vault_snapshot(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    snapshot: calyx_aster::mvcc::Snapshot,
+    after_physical: Option<&[u8]>,
+    max_rows: usize,
+    read_at_unix_ms: u64,
+) -> StorageResult<PhysicalScanPage> {
+    validate_physical_page_request(cf_name, after_physical, max_rows)?;
+    if max_rows == 0 {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "COHERENT_SCAN_PAGE_SIZE_ZERO: coherent continuation requires max_rows > 0"
+                .to_owned(),
+        });
+    }
+    let candidate_budget = max_rows
+        .checked_add(1)
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "coherent physical page max_rows cannot be usize::MAX".to_owned(),
+        })?;
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    let page = vault
+        .scan_cf_range_page_snapshot(snapshot, ColumnFamily::Kv, &range, after_physical, max_rows)
+        .map_err(|source| {
+            calyx_read_failed(
+                cf_name,
+                "scan pinned candidate-bounded physical Calyx KV namespace page",
+                &source,
+            )
+        })?;
+    validate_physical_page_shape(
+        cf_name,
+        collection_id,
+        after_physical,
+        max_rows,
+        candidate_budget,
+        &page,
+    )?;
+    let (rows, expired_rows_skipped) = decode_physical_page_rows(
+        cf_name,
+        collection_id,
+        after_physical,
+        read_at_unix_ms,
+        &page,
+    )?;
+    Ok(PhysicalScanPage {
+        rows,
+        resume_after_physical: page.resume_after,
+        more: page.more,
+        snapshot_seq: Some(page.snapshot_seq),
+        candidate_rows_examined: page.examined_rows,
+        expired_rows_skipped,
+    })
 }
 
 fn read_physical_page_from_vault(
@@ -4156,6 +5514,71 @@ fn read_fixed_width_page_from_vault_range(
             max_rows,
             candidate_budget,
             now_ms,
+        },
+        page,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_fixed_width_page_from_vault_range_snapshot(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    snapshot: calyx_aster::mvcc::Snapshot,
+    start_key: &[u8],
+    end_key: &[u8],
+    after_key: Option<&[u8]>,
+    key_len: usize,
+    max_rows: usize,
+    read_at_unix_ms: u64,
+) -> StorageResult<FixedWidthScanPage> {
+    validate_fixed_width_page_request(cf_name, start_key, end_key, after_key, key_len, max_rows)?;
+    if max_rows == 0 {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "COHERENT_SCAN_PAGE_SIZE_ZERO: coherent continuation requires max_rows > 0"
+                .to_owned(),
+        });
+    }
+    let candidate_budget = max_rows
+        .checked_add(1)
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "coherent fixed-width page max_rows cannot be usize::MAX".to_owned(),
+        })?;
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = KeyRange {
+        start: encode_calyx_key_for_read(cf_name, collection_id, start_key)?,
+        end: Some(encode_calyx_key_for_read(cf_name, collection_id, end_key)?),
+    };
+    let physical_after = after_key
+        .map(|key| encode_calyx_key_for_read(cf_name, collection_id, key))
+        .transpose()?;
+    let page = vault
+        .scan_cf_range_page_snapshot(
+            snapshot,
+            ColumnFamily::Kv,
+            &range,
+            physical_after.as_deref(),
+            max_rows,
+        )
+        .map_err(|source| {
+            calyx_read_failed(
+                cf_name,
+                "scan pinned Calyx KV fixed-width range page",
+                &source,
+            )
+        })?;
+    decode_fixed_width_page(
+        FixedWidthPageDecodeRequest {
+            cf_name,
+            collection_id,
+            start_key,
+            end_key,
+            after_key,
+            key_len,
+            max_rows,
+            candidate_budget,
+            now_ms: read_at_unix_ms,
         },
         page,
     )
@@ -5746,25 +7169,45 @@ fn encode_calyx_key_for_write(
 }
 
 fn encode_calyx_key(collection_id: u64, user_key: &[u8]) -> Result<Vec<u8>, String> {
-    let user_key_len = u16::try_from(user_key.len()).map_err(|_error| {
-        format!(
-            "Calyx Synapse KV envelope supports keys up to {} bytes; got {}",
-            u16::MAX,
+    if user_key.len() > CALYX_MAX_USER_KEY_BYTES {
+        return Err(format!(
+            "Calyx Synapse KV envelope supports keys up to {CALYX_MAX_USER_KEY_BYTES} bytes; got {}",
             user_key.len()
-        )
-    })?;
+        ));
+    }
     let mut key = calyx_namespace_prefix(collection_id);
-    key.extend_from_slice(&user_key_len.to_be_bytes());
     key.extend_from_slice(user_key);
     Ok(key)
 }
 
 fn calyx_namespace_prefix(collection_id: u64) -> Vec<u8> {
+    calyx_namespace_prefix_for(collection_id, CALYX_KV_ORDERED_NAMESPACE)
+}
+
+fn calyx_legacy_namespace_prefix(collection_id: u64) -> Vec<u8> {
+    calyx_namespace_prefix_for(collection_id, CALYX_KV_LEGACY_LENGTH_ORDERED_NAMESPACE)
+}
+
+fn calyx_namespace_prefix_for(collection_id: u64, namespace: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 8 + 8);
     key.push(CALYX_KV_DISC);
     key.extend_from_slice(&collection_id.to_be_bytes());
-    key.extend_from_slice(&CALYX_KV_NAMESPACE.to_be_bytes());
+    key.extend_from_slice(&namespace.to_be_bytes());
     key
+}
+
+fn encode_calyx_legacy_key(collection_id: u64, user_key: &[u8]) -> Result<Vec<u8>, String> {
+    let user_key_len = u16::try_from(user_key.len()).map_err(|_error| {
+        format!(
+            "legacy Calyx Synapse KV envelope supports keys up to {} bytes; got {}",
+            u16::MAX,
+            user_key.len()
+        )
+    })?;
+    let mut key = calyx_legacy_namespace_prefix(collection_id);
+    key.extend_from_slice(&user_key_len.to_be_bytes());
+    key.extend_from_slice(user_key);
+    Ok(key)
 }
 
 fn decode_calyx_user_key_for_read(
@@ -5781,17 +7224,33 @@ fn decode_calyx_user_key_for_read(
 fn decode_calyx_user_key(collection_id: u64, full_key: &[u8]) -> Result<Vec<u8>, String> {
     let prefix = calyx_namespace_prefix(collection_id);
     let Some(rest) = full_key.strip_prefix(prefix.as_slice()) else {
-        return Err("Calyx KV scan returned a key outside the requested namespace".to_owned());
+        return Err(
+            "Calyx KV scan returned a key outside the requested ordered namespace".to_owned(),
+        );
+    };
+    if rest.len() > CALYX_MAX_USER_KEY_BYTES {
+        return Err(format!(
+            "ordered Calyx KV key exceeds the supported logical key maximum: len={} maximum={CALYX_MAX_USER_KEY_BYTES}",
+            rest.len()
+        ));
+    }
+    Ok(rest.to_vec())
+}
+
+fn decode_calyx_legacy_user_key(collection_id: u64, full_key: &[u8]) -> Result<Vec<u8>, String> {
+    let prefix = calyx_legacy_namespace_prefix(collection_id);
+    let Some(rest) = full_key.strip_prefix(prefix.as_slice()) else {
+        return Err("legacy Calyx KV scan returned a key outside namespace zero".to_owned());
     };
     let Some(len_bytes) = rest.get(0..2) else {
-        return Err("Calyx KV key is missing its user-key length prefix".to_owned());
+        return Err("legacy Calyx KV key is missing its user-key length prefix".to_owned());
     };
     let len = usize::from(u16::from_be_bytes([len_bytes[0], len_bytes[1]]));
     let Some(user_key) = rest.get(2..2 + len) else {
-        return Err("Calyx KV key length prefix exceeds the stored key".to_owned());
+        return Err("legacy Calyx KV key length prefix exceeds the stored key".to_owned());
     };
     if rest.len() != 2 + len {
-        return Err("Calyx KV key has trailing bytes after the user key".to_owned());
+        return Err("legacy Calyx KV key has trailing bytes after the user key".to_owned());
     }
     Ok(user_key.to_vec())
 }

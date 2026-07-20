@@ -3,8 +3,10 @@ use std::env;
 use std::time::Duration;
 
 use calyx_core::{
-    AbsentReason, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens, Modality, SlotId,
-    SlotVector, VaultId,
+    AbsentReason, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens,
+    METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS, METADATA_SOURCE_SEQUENCE,
+    METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE, Modality, SlotId, SlotVector,
+    TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE, TEMPORAL_MISSING_CREATED_AT, VaultId,
 };
 use calyx_lenses::AlgorithmicLens;
 use calyx_lenses::measure::{absent, input_hash};
@@ -45,6 +47,8 @@ pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
 pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_669_001;
 pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
 pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_691_001;
+pub const SYN_RECURRENCE_SUBJECT_PANEL_NAME: &str = "syn-recurrence-subject-v1";
+pub const SYN_RECURRENCE_SUBJECT_PANEL_VERSION: u32 = 1_667_001;
 pub const SYN_MCP_USAGE_KEY_PREFIX: &[u8] = b"mcp-usage/v1/";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_SAMPLE_EVERY_N";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
@@ -178,6 +182,25 @@ const MU_SLOT_SESSION_SEQUENCE_RANK: SlotId = SlotId::new(9);
 const MU_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(10);
 const MU_SLOT_DOW_CYCLIC: SlotId = SlotId::new(11);
 const MU_SLOT_RECORD_VECTOR: SlotId = SlotId::new(12);
+
+const RS_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
+const RS_SLOT_SUBJECT_HASH: SlotId = SlotId::new(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecurrenceSubjectKind {
+    AppUsage,
+    Routine,
+}
+
+impl RecurrenceSubjectKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AppUsage => "app_usage",
+            Self::Routine => "routine",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstellationPutReport {
@@ -370,6 +393,87 @@ pub fn mcp_usage_constellation_input_bytes(
     append_framed(&mut out, source_key);
     append_framed(&mut out, source_value);
     out
+}
+
+#[must_use]
+pub fn recurrence_subject_input_bytes(kind: RecurrenceSubjectKind, subject_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        "synapse-recurrence-subject-v1".len() + kind.as_str().len() + subject_id.len() + 24,
+    );
+    append_framed(&mut out, b"synapse-recurrence-subject-v1");
+    append_framed(&mut out, kind.as_str().as_bytes());
+    append_framed(&mut out, subject_id.as_bytes());
+    out
+}
+
+/// Builds the stable Base row that owns a native recurrence series.
+///
+/// The subject identity deliberately excludes occurrence time: every event
+/// for one app/routine must append below the same `CxId`.
+pub fn build_recurrence_subject_constellation(
+    context: NativeConstellationContext,
+    kind: RecurrenceSubjectKind,
+    subject_id: &str,
+    input_bytes: &[u8],
+) -> StorageResult<Constellation> {
+    let subject_id = non_empty(subject_id).ok_or_else(|| {
+        measurement_error(
+            "empty recurrence subject",
+            format!("kind={}", kind.as_str()),
+        )
+    })?;
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        RS_SLOT_KIND_ONEHOT,
+        measure_text(
+            SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+            AlgorithmicLens::syn_one_hot(
+                "syn.recurrence_subject.kind_onehot.v1",
+                Modality::Structured,
+                4,
+            ),
+            kind.as_str(),
+        )?,
+    );
+    slots.insert(
+        RS_SLOT_SUBJECT_HASH,
+        measure_text(
+            SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+            AlgorithmicLens::syn_hash(
+                "syn.recurrence_subject.identity_hash.v1",
+                Modality::Structured,
+                4096,
+            ),
+            subject_id,
+        )?,
+    );
+    let subject_hash = sha256_hex(input_bytes);
+    let mut metadata = common_metadata(
+        SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+        "CALYX_RECURRENCE_SUBJECT",
+        subject_hash.as_bytes(),
+        input_bytes,
+    );
+    metadata.insert(
+        "recurrence_subject_kind".to_owned(),
+        kind.as_str().to_owned(),
+    );
+    metadata.insert(
+        "recurrence_subject_id".to_owned(),
+        truncate_metadata(subject_id),
+    );
+    constellation(
+        context,
+        SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
+        format!(
+            "synapse://recurrence-subject/{}/{subject_hash}",
+            kind.as_str()
+        ),
+        input_bytes,
+        slots,
+        BTreeMap::new(),
+        metadata,
+    )
 }
 
 /// Build the Calyx constellation for a timeline record.
@@ -2258,6 +2362,7 @@ fn timeline_metadata(
     );
     metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
     metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    activate_temporal_lane(&mut metadata, record.ts_ns, source_key);
     metadata.insert(
         META_RECENCY_BASIS.to_owned(),
         RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
@@ -2301,6 +2406,7 @@ fn episode_metadata(
     );
     metadata.insert("episode_id".to_owned(), record.episode_id.clone());
     metadata.insert(META_EXACT_TS_NS.to_owned(), record.start_ts_ns.to_string());
+    activate_temporal_lane(&mut metadata, record.start_ts_ns, source_key);
     metadata.insert(
         "episode_start_ts_ns".to_owned(),
         record.start_ts_ns.to_string(),
@@ -2365,6 +2471,7 @@ fn agent_event_metadata(
     );
     metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
     metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    activate_temporal_lane(&mut metadata, record.ts_ns, source_key);
     metadata.insert(
         META_RECENCY_BASIS.to_owned(),
         RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
@@ -2474,6 +2581,7 @@ fn agent_transcript_metadata(
     );
     metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
     metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    activate_temporal_lane(&mut metadata, record.ts_ns, source_key);
     metadata.insert(
         "agent_transcript_spawn_id".to_owned(),
         record.spawn_id.clone(),
@@ -2581,6 +2689,7 @@ fn action_metadata(
     if let Some(ts_ns) = json_u64(record, &["ts_ns"]) {
         metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
         metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        activate_temporal_lane(&mut metadata, ts_ns, source_key);
     }
     if let Some(target) = action_target_text(record).as_deref().and_then(non_empty) {
         metadata.insert(
@@ -2604,6 +2713,7 @@ fn reflex_metadata(
     );
     metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
     metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    activate_temporal_lane(&mut metadata, record.ts_ns, source_key);
     metadata.insert("reflex_id".to_owned(), truncate_metadata(&record.reflex_id));
     metadata.insert(
         "reflex_audit_id".to_owned(),
@@ -2637,6 +2747,7 @@ fn process_metadata(
     if let Some(ts_ns) = process_ts_ns(record) {
         metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
         metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        activate_temporal_lane(&mut metadata, ts_ns, source_key);
         metadata.insert(
             META_RECENCY_BASIS.to_owned(),
             RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
@@ -2673,6 +2784,7 @@ fn observation_metadata(
     );
     metadata.insert(META_EXACT_TS_NS.to_owned(), record.ts_ns.to_string());
     metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+    activate_temporal_lane(&mut metadata, record.ts_ns, source_key);
     metadata.insert(
         "observation_id".to_owned(),
         truncate_metadata(&record.observation_id),
@@ -2718,6 +2830,7 @@ fn outcome_metadata(
     if let Some(ts_ns) = outcome_ts_ns(record) {
         metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
         metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        activate_temporal_lane(&mut metadata, ts_ns, source_key);
         metadata.insert(
             META_RECENCY_BASIS.to_owned(),
             RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
@@ -2750,6 +2863,7 @@ fn mcp_usage_metadata(
     if let Some(ts_ns) = mcp_usage_ts_ns(record) {
         metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
         metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
+        activate_temporal_lane(&mut metadata, ts_ns, source_key);
         metadata.insert(
             META_RECENCY_BASIS.to_owned(),
             RECENCY_BASIS_EVENT_TIME_RANK.to_owned(),
@@ -2810,7 +2924,36 @@ fn common_metadata(
     metadata.insert(META_SOURCE_KEY_HEX.to_owned(), hex_encode(source_key));
     metadata.insert(META_RAW_SHA256.to_owned(), sha256_hex(raw_bytes));
     metadata.insert(META_RAW_LEN_BYTES.to_owned(), raw_bytes.len().to_string());
+    metadata.insert(
+        METADATA_TEMPORAL_LANE_STATE.to_owned(),
+        TEMPORAL_LANE_INACTIVE.to_owned(),
+    );
+    metadata.insert(
+        METADATA_TEMPORAL_INACTIVE_REASON.to_owned(),
+        TEMPORAL_MISSING_CREATED_AT.to_owned(),
+    );
     metadata
+}
+
+fn activate_temporal_lane(
+    metadata: &mut BTreeMap<String, String>,
+    event_time_ns: u64,
+    source_key: &[u8],
+) {
+    metadata.insert(
+        METADATA_TEMPORAL_LANE_STATE.to_owned(),
+        TEMPORAL_LANE_ACTIVE.to_owned(),
+    );
+    metadata.remove(METADATA_TEMPORAL_INACTIVE_REASON);
+    metadata.insert(
+        METADATA_SOURCE_EVENT_TIME_SECS.to_owned(),
+        (event_time_ns / NS_PER_SEC).to_string(),
+    );
+    metadata.insert(
+        METADATA_SOURCE_EVENT_TIME_RAW.to_owned(),
+        event_time_ns.to_string(),
+    );
+    metadata.insert(METADATA_SOURCE_SEQUENCE.to_owned(), hex_encode(source_key));
 }
 
 fn measure_text(

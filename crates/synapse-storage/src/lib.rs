@@ -16,22 +16,23 @@ use std::path::{Path, PathBuf};
 
 pub use backend::{
     CalyxAnchorBatchWriteReport, CalyxAnchorRow, CalyxAnchorScanReport, CalyxAnchorValueReadback,
-    CalyxAnchorWriteReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
-    GroundingAnchorSource, GroundingAnchorValue, McpUsageGroundedPublicationReport,
-    STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind, StorageCfDump, StorageDumpRow,
-    dump_cf_read_only, dump_cf_read_only_with_expired, inspect_calyx_vault_read_only,
-    scan_cf_read_only, scan_cf_read_only_with_expired,
+    CalyxAnchorWriteReport, CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect,
+    CalyxVaultInspect, GroundingAnchor, GroundingAnchorSource, GroundingAnchorValue,
+    McpUsageGroundedPublicationReport, STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind,
+    StorageCfDump, StorageDumpRow, dump_cf_read_only, dump_cf_read_only_with_expired,
+    inspect_calyx_vault_read_only, scan_cf_read_only, scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
-    ConstellationPutReport, SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION,
+    ConstellationPutReport, RecurrenceSubjectKind, SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION,
     SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
     SYN_MCP_USAGE_KEY_PREFIX, SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION,
     SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
     SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT, SYN_OBSERVATION_SAMPLE_EVERY_N_ENV,
     SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
-    SYN_PROCESS_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
+    SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+    SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
     SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
 };
 pub use error::{
@@ -146,6 +147,11 @@ pub type CfWriteBatch<'a> = (&'a str, Vec<RawRow>);
 pub(crate) type OwnedCfWriteBatch = (String, Vec<RawRow>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
+/// Default bounded lifetime for one coherent multi-page enumeration.
+pub const COHERENT_SCAN_DEFAULT_MAX_AGE_MS: u64 = 60_000;
+/// Hard retention ceiling for a coherent reader lease. Long jobs must rebase
+/// explicitly instead of pinning unbounded MVCC history.
+pub const COHERENT_SCAN_MAX_AGE_MS: u64 = 5 * 60_000;
 /// One candidate-bounded page in a logical column family's physical Calyx
 /// namespace.
 ///
@@ -196,6 +202,56 @@ pub struct FixedWidthScanPage {
     pub snapshot_seq: Option<u64>,
     pub candidate_rows_examined: usize,
     pub expired_rows_skipped: usize,
+}
+
+#[derive(Debug)]
+enum CoherentScanScope {
+    PhysicalColumnFamily,
+    FixedWidthRange {
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+    },
+}
+
+/// One bounded, single-sequence Calyx scan lease.
+///
+/// The lease is deliberately stateful and non-cloneable. Continuation is
+/// carried inside the handle so callers cannot replay an old cursor, cross a
+/// column-family/range boundary, or silently start a later page at a new
+/// generation. Release it as soon as enumeration completes; Calyx also
+/// enforces `expires_at_unix_ms` when a caller fails to release it.
+#[derive(Debug)]
+pub struct CoherentScanLease {
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub read_at_unix_ms: u64,
+    pub cf_name: String,
+    snapshot: calyx_aster::mvcc::Snapshot,
+    scope: CoherentScanScope,
+    next_after: Option<Vec<u8>>,
+    started: bool,
+    completed: bool,
+    released: bool,
+}
+
+impl CoherentScanLease {
+    /// Returns the exact exclusive cursor that the next page will consume.
+    #[must_use]
+    pub fn next_after(&self) -> Option<&[u8]> {
+        self.next_after.as_deref()
+    }
+
+    #[must_use]
+    pub const fn is_completed(&self) -> bool {
+        self.completed
+    }
+
+    #[must_use]
+    pub const fn is_released(&self) -> bool {
+        self.released
+    }
 }
 
 impl FixedWidthScanPage {
@@ -653,6 +709,74 @@ impl Db {
     #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
     pub fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {
         self.backend.calyx_vault_inspect()
+    }
+
+    /// Appends one physical event to the stable native Calyx recurrence
+    /// subject identified by `kind + subject_id`.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for empty/oversized identities, conflicting replay
+    /// evidence, invalid event time/context, or any Base/Recurrence commit.
+    #[tracing::instrument(skip_all, fields(subject_kind = kind.as_str(), backend = self.backend_name()))]
+    pub fn put_recurrence_subject_occurrence(
+        &self,
+        kind: RecurrenceSubjectKind,
+        subject_id: &str,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<CalyxRecurrenceSubjectReport> {
+        self.backend.put_recurrence_subject_occurrence(
+            kind,
+            subject_id,
+            event_time_ns,
+            occurrence_identity,
+            context,
+        )
+    }
+
+    /// Reads the physical recurrence series for one stable subject.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the subject identity or native recurrence rows are invalid.
+    pub fn read_recurrence_subject_series(
+        &self,
+        kind: RecurrenceSubjectKind,
+        subject_id: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxRecurrenceSeriesReadback> {
+        self.backend
+            .read_recurrence_subject_series(kind, subject_id)
+    }
+
+    /// Lists the validated retrieval-only temporal contracts stored in the
+    /// native Calyx Registry CF.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when any catalog row is malformed or mis-keyed.
+    pub fn list_temporal_panels(
+        &self,
+    ) -> StorageResult<Vec<synapse_calyx::VaultTemporalPanelRegistration>> {
+        self.backend.list_temporal_panels()
+    }
+
+    /// Applies the exact registered Calyx temporal policy to a bounded
+    /// content-only candidate set.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for invalid candidates, mixed/unregistered panel
+    /// generations, missing event-time evidence, or AP-60 bound violations.
+    pub fn temporal_rerank(
+        &self,
+        candidates: &[synapse_calyx::SynapseCalyxTemporalCandidate],
+        query_time_secs: i64,
+        tz_offset_secs: i32,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxTemporalRerankReadback> {
+        self.backend
+            .temporal_rerank(candidates, query_time_secs, tz_offset_secs)
     }
 
     /// Returns the status of the exact process-local Calyx vault that owns
@@ -1134,6 +1258,78 @@ impl Db {
     ) -> StorageResult<FixedWidthScanPage> {
         self.backend
             .scan_cf_fixed_width_range_page(cf_name, start_key, end_key, after_key, max_rows)
+    }
+
+    /// Pins one bounded coherent enumeration of an entire logical column
+    /// family. Continue only with [`Self::scan_cf_physical_page_coherent`] and
+    /// release with [`Self::release_coherent_scan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an unknown CF or a zero/unbounded lease.
+    pub fn pin_cf_physical_scan(
+        &self,
+        cf_name: &str,
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease> {
+        self.backend.pin_cf_physical_scan(cf_name, max_age_ms)
+    }
+
+    /// Pins one bounded coherent fixed-width range enumeration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the CF/range is invalid or the lease
+    /// lifetime exceeds [`COHERENT_SCAN_MAX_AGE_MS`].
+    pub fn pin_cf_fixed_width_range_scan(
+        &self,
+        cf_name: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        max_age_ms: u64,
+    ) -> StorageResult<CoherentScanLease> {
+        self.backend
+            .pin_cf_fixed_width_range_scan(cf_name, start_key, end_key, max_age_ms)
+    }
+
+    /// Reads the next page from a pinned whole-CF enumeration. The lease owns
+    /// its exclusive cursor and rejects continuation after completion/release.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error on expiry, scope mismatch, invalid page
+    /// size, cursor drift, or unavailable historical state.
+    pub fn scan_cf_physical_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<PhysicalScanPage> {
+        self.backend.scan_cf_physical_page_coherent(lease, max_rows)
+    }
+
+    /// Reads the next page from a pinned fixed-width range enumeration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error on expiry, scope mismatch, invalid page
+    /// size, cursor drift, or unavailable historical state.
+    pub fn scan_cf_fixed_width_range_page_coherent(
+        &self,
+        lease: &mut CoherentScanLease,
+        max_rows: usize,
+    ) -> StorageResult<FixedWidthScanPage> {
+        self.backend
+            .scan_cf_fixed_width_range_page_coherent(lease, max_rows)
+    }
+
+    /// Releases a bounded coherent scan lease exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error if the handle was already released or the
+    /// Calyx vault lifecycle is unavailable.
+    pub fn release_coherent_scan(&self, lease: &mut CoherentScanLease) -> StorageResult<bool> {
+        self.backend.release_coherent_scan(lease)
     }
 
     /// Scans up to `max_rows` rows from the end of one column family.

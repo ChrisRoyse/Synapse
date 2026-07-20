@@ -16,6 +16,8 @@ calyx-aster = { path = "../../calyx/crates/calyx-aster" }
 calyx-core = { path = "../../calyx/crates/calyx-core" }
 calyx-forge = { path = "../../calyx/crates/calyx-forge" }
 calyx-ledger = { path = "../../calyx/crates/calyx-ledger" }
+calyx-registry = { path = "../../calyx/crates/calyx-registry" }
+calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

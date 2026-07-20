@@ -411,6 +411,10 @@ pub struct WorkspaceListResponse {
     pub prefix: String,
     pub values_included: bool,
     pub now_unix_ms: u64,
+    /// Exact Calyx generation used for every row in this multi-page list.
+    pub snapshot_seq: u64,
+    /// Retention-evaluation time frozen when the coherent scan was pinned.
+    pub snapshot_read_at_unix_ms: u64,
     pub scanned_rows: usize,
     pub expired_rows_deleted: usize,
     /// Compatibility field retained for response stability. Always empty:
@@ -1399,6 +1403,8 @@ impl SynapseService {
             run_id,
             prefix,
             reader_session_id = session_id,
+            snapshot_seq = scan.snapshot_seq,
+            snapshot_read_at_unix_ms = scan.snapshot_read_at_unix_ms,
             scanned_rows = scan.scanned_rows,
             expired_rows_deleted = scan.expired_rows_deleted,
             corrupt_rows_skipped = 0,
@@ -1412,6 +1418,8 @@ impl SynapseService {
             prefix,
             values_included: params.include_values,
             now_unix_ms,
+            snapshot_seq: scan.snapshot_seq,
+            snapshot_read_at_unix_ms: scan.snapshot_read_at_unix_ms,
             scanned_rows: scan.scanned_rows,
             expired_rows_deleted: scan.expired_rows_deleted,
             corrupt_rows_skipped: Vec::new(),
@@ -2139,9 +2147,45 @@ fn workspace_absent_readback(row_key: &str) -> WorkspaceAbsentReadback {
 }
 
 struct WorkspaceRunScan {
+    snapshot_seq: u64,
+    snapshot_read_at_unix_ms: u64,
     scanned_rows: usize,
     expired_rows_deleted: usize,
     rows: Vec<DecodedWorkspaceRow>,
+}
+
+fn finish_workspace_coherent_scan<T>(
+    db: &Db,
+    lease: &mut synapse_storage::CoherentScanLease,
+    operation: &'static str,
+    scan_result: Result<T, ErrorData>,
+) -> Result<T, ErrorData> {
+    let lease_id = lease.lease_id;
+    let snapshot_seq = lease.snapshot_seq;
+    let release_result = db.release_coherent_scan(lease);
+    match (scan_result, release_result) {
+        (Err(scan_error), Ok(_)) => Err(scan_error),
+        (Err(scan_error), Err(release_error)) => Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{operation}: {}; additionally failed to release coherent workspace scan lease_id={lease_id} snapshot_seq={snapshot_seq}: {release_error}",
+                scan_error.message
+            ),
+        )),
+        (Ok(_), Err(release_error)) => Err(mcp_error(
+            release_error.code(),
+            format!(
+                "{operation}: failed to release coherent workspace scan lease_id={lease_id} snapshot_seq={snapshot_seq}: {release_error}"
+            ),
+        )),
+        (Ok(_), Ok(false)) => Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{operation}: coherent workspace snapshot expired before release lease_id={lease_id} snapshot_seq={snapshot_seq}; repeat the bounded operation"
+            ),
+        )),
+        (Ok(value), Ok(true)) => Ok(value),
+    }
 }
 
 fn dashboard_json_readback(value: impl Serialize) -> Result<Value, ErrorData> {
@@ -2162,74 +2206,117 @@ fn scan_workspace_run(
     operation: &'static str,
 ) -> Result<WorkspaceRunScan, ErrorData> {
     let prefix = workspace_run_prefix(run_id).into_bytes();
-    let mut after_physical = None::<Vec<u8>>;
+    let mut lease = db
+        .pin_cf_physical_scan(cf::CF_KV, synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("{operation} could not pin a coherent workspace scan: {error}"),
+            )
+        })?;
+    let lease_id = lease.lease_id;
+    let snapshot_seq = lease.snapshot_seq;
+    let snapshot_read_at_unix_ms = lease.read_at_unix_ms;
     let mut scanned_rows = 0_usize;
     let mut expired_rows_deleted = 0_usize;
     let mut decoded_rows = Vec::new();
-    loop {
-        let page = db
-            .scan_cf_physical_page(
-                cf::CF_KV,
-                after_physical.as_deref(),
-                WORKSPACE_SCAN_PAGE_ROWS,
-            )
-            .map_err(|error| {
+    let scan_result = (|| -> Result<(), ErrorData> {
+        loop {
+            let page = db
+                .scan_cf_physical_page_coherent(&mut lease, WORKSPACE_SCAN_PAGE_ROWS)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "{operation} coherent physical workspace page read failed: lease_id={lease_id} snapshot_seq={snapshot_seq} page_rows={WORKSPACE_SCAN_PAGE_ROWS}: {error}"
+                        ),
+                    )
+                })?;
+            let page_snapshot_seq = page.snapshot_seq.ok_or_else(|| {
                 mcp_error(
-                    error.code(),
+                    error_codes::STORAGE_READ_FAILED,
                     format!(
-                        "{operation} bounded physical workspace page read failed: after_physical_hex={} page_rows={WORKSPACE_SCAN_PAGE_ROWS}: {error}",
-                        after_physical
-                            .as_deref()
-                            .map_or_else(|| "none".to_owned(), hex_bytes)
+                        "{operation} coherent workspace page omitted its pinned snapshot sequence: lease_id={lease_id} expected_snapshot_seq={snapshot_seq}"
                     ),
                 )
             })?;
-        let mut expired_rows = Vec::new();
-        for (key, _scanned_value) in page.rows {
-            if !key.starts_with(&prefix) {
-                continue;
+            if page_snapshot_seq != snapshot_seq {
+                return Err(mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "{operation} coherent workspace page escaped its pinned generation: lease_id={lease_id} expected_snapshot_seq={snapshot_seq} actual_snapshot_seq={page_snapshot_seq}"
+                    ),
+                ));
             }
-            scanned_rows = scanned_rows.saturating_add(1);
-            let Some(raw) = read_workspace_raw_row_by_key(db, &key, operation)? else {
-                // A concurrent guarded delete made this scanned key no longer
-                // authoritative. It is absent from the point-read SoT.
-                continue;
-            };
-            let row = decode_workspace_row(raw.key.clone(), raw.encoded.clone())
-                .map_err(|detail| workspace_corrupt_error(&raw, operation, detail))?;
-            if row.entry.expires_at_unix_ms <= now_unix_ms {
-                expired_rows.push((row.key, raw.revision_sha256));
-            } else if result_limit != 0
-                && result_prefix.is_none_or(|prefix| row.entry.key.starts_with(prefix))
-            {
-                decoded_rows.push(row);
+            let mut expired_rows = Vec::new();
+            for (key, scanned_value) in page.rows {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                scanned_rows = scanned_rows.saturating_add(1);
+                let snapshot_raw = WorkspaceRawRow {
+                    key: key.clone(),
+                    revision_sha256: Sha256::digest(&scanned_value).into(),
+                    encoded: scanned_value.clone(),
+                };
+                let row = decode_workspace_row(key.clone(), scanned_value.clone())
+                    .map_err(|detail| workspace_corrupt_error(&snapshot_raw, operation, detail))?;
+                if row.entry.expires_at_unix_ms <= now_unix_ms {
+                    if let Some(current) = read_workspace_raw_row_by_key(db, &key, operation)? {
+                        if current.encoded == scanned_value {
+                            expired_rows.push((row.key, current.revision_sha256));
+                        } else {
+                            tracing::debug!(
+                                code = "WORKSPACE_EXPIRED_CLEANUP_SNAPSHOT_SUPERSEDED",
+                                operation,
+                                lease_id,
+                                snapshot_seq,
+                                row_key_hex = %hex_bytes(&key),
+                                snapshot_value_sha256 = %hash_bytes(&scanned_value),
+                                current_value_sha256 = %hash_bytes(&current.encoded),
+                                current_revision_sha256 = %hex_bytes(&current.revision_sha256),
+                                "did not delete a workspace row superseded after the pinned list snapshot"
+                            );
+                        }
+                    }
+                } else if result_limit != 0
+                    && result_prefix.is_none_or(|prefix| row.entry.key.starts_with(prefix))
+                {
+                    decoded_rows.push(row);
+                }
+            }
+            // Physical Calyx order includes the encoded user-key length and is
+            // deliberately opaque. Retain the lexicographically smallest
+            // bounded logical result set from this one pinned generation so
+            // public ordering/limit semantics do not depend on physical layout.
+            if decoded_rows.len() > result_limit {
+                decoded_rows.sort_by(|left, right| left.entry.key.cmp(&right.entry.key));
+                decoded_rows.truncate(result_limit);
+            }
+            expired_rows_deleted = expired_rows_deleted.saturating_add(
+                delete_workspace_rows_if_revisions(db, expired_rows, operation)?,
+            );
+            if !page.more {
+                break;
             }
         }
-        // Physical Calyx order includes the encoded user-key length and is
-        // deliberately opaque. Retain the lexicographically smallest bounded
-        // logical result set so the public list ordering/limit semantics do
-        // not depend on that physical layout.
-        if decoded_rows.len() > result_limit {
-            decoded_rows.sort_by(|left, right| left.entry.key.cmp(&right.entry.key));
-            decoded_rows.truncate(result_limit);
-        }
-        expired_rows_deleted = expired_rows_deleted.saturating_add(
-            delete_workspace_rows_if_revisions(db, expired_rows, operation)?,
-        );
-        if !page.more {
-            break;
-        }
-        let Some(next_cursor) = page.resume_after_physical else {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "{operation} physical workspace scan reported more candidates without its opaque continuation cursor"
-                ),
-            ));
-        };
-        after_physical = Some(next_cursor);
-    }
+        Ok(())
+    })();
+    finish_workspace_coherent_scan(db, &mut lease, operation, scan_result)?;
+    tracing::debug!(
+        code = "WORKSPACE_COHERENT_SCAN_COMPLETED",
+        operation,
+        run_id,
+        lease_id,
+        snapshot_seq,
+        snapshot_read_at_unix_ms,
+        scanned_rows,
+        expired_rows_deleted,
+        "workspace multi-page enumeration completed and released one pinned Calyx generation"
+    );
     Ok(WorkspaceRunScan {
+        snapshot_seq,
+        snapshot_read_at_unix_ms,
         scanned_rows,
         expired_rows_deleted,
         rows: decoded_rows,

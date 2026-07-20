@@ -33,12 +33,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use rmcp::{RoleServer, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 use synapse_storage::{Db, RevisionGuard, cf};
 
@@ -56,7 +58,12 @@ use crate::m4::{
 const TASK_NAMESPACE: &str = "agent-task/v1";
 const TASK_SCHEMA_VERSION: u32 = 1;
 const TASK_SEQUENCE_KEY: &str = "agent-task/v1/meta/last_enqueue_seq";
+const TASK_QUEUE_STATE_KEY: &str = "agent-task/v2/meta/queue_state";
+const TASK_QUEUE_STATE_SCHEMA_VERSION: u32 = 1;
 const TASK_CREATE_MAX_CONFLICT_RETRIES: usize = 64;
+const TASK_DISPATCH_RESERVATION_SCHEMA_VERSION: u32 = 1;
+const TASK_DISPATCH_RESERVATION_MIN_LEASE_MS: u64 = 15 * 60 * 1_000;
+const TASK_DISPATCH_RESERVATION_GRACE_MS: u64 = 5 * 60 * 1_000;
 
 const MAX_TASK_ID_CHARS: usize = 200;
 const MAX_TITLE_CHARS: usize = 500;
@@ -75,6 +82,11 @@ const DEFAULT_CONCURRENCY_CAP: usize = 8;
 /// Dashboard dispatches are often approval-gated by a human; keep them above
 /// the generic MCP spawn default so permission prompts do not exhaust readback.
 const DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS: u64 = 600_000;
+
+fn task_queue_mutation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// The lifecycle states a task moves through. `done`/`cancelled` are terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -172,6 +184,18 @@ pub struct TaskAttempt {
     pub reason: Option<String>,
 }
 
+/// Durable pre-spawn admission owned by one dispatch call. It is persisted in
+/// the task row before any agent process can be launched, so it already counts
+/// toward the global concurrency cap and survives a daemon/process failure.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchReservation {
+    pub schema_version: u32,
+    pub reservation_id: String,
+    pub reserved_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
 /// The durable task record. One CF_KV row per task, mutated in place (with a
 /// flush) — operational state, not versioned config.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -196,7 +220,16 @@ pub struct AgentTask {
     /// Global monotonic enqueue sequence — strict FIFO order within a
     /// (priority, template) bucket, stable across restarts.
     pub enqueue_seq: u64,
+    /// Queue-wide mutation generation written atomically with this row. Zero
+    /// identifies a legacy row that predates guarded post-create mutations.
+    #[serde(default)]
+    pub mutation_generation: u64,
     pub attempts: Vec<TaskAttempt>,
+    /// Present only between guarded dispatch admission and guarded binding (or
+    /// failure). Ordinary claim/update/cancel operations reject a live
+    /// reservation instead of overwriting its in-flight external effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_reservation: Option<TaskDispatchReservation>,
     /// Set when the task entered `review` for a non-success reason (e.g. an
     /// orphaned attempt), so the attention queue can explain why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,12 +432,72 @@ pub struct TaskSequenceRepairParams {
 pub struct TaskSequenceRepairResponse {
     pub ok: bool,
     pub observed_task_rows: usize,
+    pub unobservable_task_sequences: usize,
     pub observed_max_task_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_decodable_sequence: Option<u64>,
     pub requested_minimum_sequence: u64,
     pub repaired_sequence: u64,
     pub committed_seq: u64,
+    pub written_row: TaskRowReadback,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskQueueStateRepairParams {
+    /// Exact SHA-256 revision observed through a separate physical read. `None`
+    /// is accepted only when the coordination row is physically absent.
+    #[serde(default)]
+    #[schemars(default)]
+    pub expected_revision_sha256: Option<String>,
+    /// Operator-observed lower bound for the last durable queue generation.
+    /// This is mandatory when any task row is too corrupt to expose its own
+    /// generation, so repair never silently rewinds coordination state.
+    pub minimum_mutation_generation: u64,
+    /// Audit reason for the explicit destructive metadata repair.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskQueueStateRepairResponse {
+    pub ok: bool,
+    pub observed_task_rows: usize,
+    pub unobservable_task_generations: usize,
+    pub observed_max_task_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_decodable_generation: Option<u64>,
+    pub requested_minimum_generation: u64,
+    pub repaired_generation: u64,
+    pub previous_revision_sha256: Option<String>,
+    pub committed_seq: Option<u64>,
+    pub written_row: TaskRowReadback,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRowRepairParams {
+    /// Physical task identity to repair.
+    pub task_id: String,
+    /// Exact SHA-256 revision observed through a separate physical read.
+    pub expected_revision_sha256: String,
+    /// Complete valid replacement. The repair assigns the next durable queue
+    /// generation; callers must provide `mutation_generation = 0` as an
+    /// explicit acknowledgement that no stale generation is being preserved.
+    pub replacement: AgentTask,
+    /// Audit reason for the explicit destructive row repair.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRowRepairResponse {
+    pub ok: bool,
+    pub previous_revision_sha256: String,
+    pub previous_value_len_bytes: u64,
+    pub unobservable_other_task_rows: usize,
+    pub committed_seq: Option<u64>,
+    pub task: AgentTask,
     pub written_row: TaskRowReadback,
 }
 
@@ -546,7 +639,7 @@ fn validate_template_params(params: &BTreeMap<String, String>) -> Result<(), Err
     Ok(())
 }
 
-// ---- dispatch selection (pure, unit-tested) -------------------------------
+// ---- dispatch selection ---------------------------------------------------
 
 /// The dispatcher's decision over a set of tasks. Returns the `task_id` of the
 /// next task to dispatch, or a reason it dispatched nothing.
@@ -681,7 +774,306 @@ fn decode_task(row_key: &str, bytes: &[u8]) -> Result<AgentTask, ErrorData> {
             ),
         ));
     }
+    validate_decoded_task(row_key, &task)?;
     Ok(task)
+}
+
+fn validate_decoded_task(row_key: &str, task: &AgentTask) -> Result<(), ErrorData> {
+    let oversized_description = task
+        .description
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > MAX_TEXT_CHARS);
+    let oversized_acceptance = task
+        .acceptance
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > MAX_TEXT_CHARS);
+    let invalid_template_param = task
+        .template_params
+        .values()
+        .any(|value| value.len() > MAX_PARAM_VALUE_BYTES || value.contains('\0'));
+    let oversized_review_reason = task
+        .review_reason
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > MAX_TEXT_CHARS);
+    if !is_kebab_id(&task.task_id)
+        || task.task_id.len() > MAX_TASK_ID_CHARS
+        || task.title.trim().is_empty()
+        || task.title.chars().count() > MAX_TITLE_CHARS
+        || oversized_description
+        || oversized_acceptance
+        || !is_kebab_id(&task.template_id)
+        || invalid_template_param
+        || !(MIN_PRIORITY..=MAX_PRIORITY).contains(&task.priority)
+        || oversized_review_reason
+        || task.created_unix_ms == 0
+        || task.updated_unix_ms < task.created_unix_ms
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_TASK_ROW_FIELDS_INVALID: row={row_key:?} task_id={:?} title_chars={} \
+                 template_id={:?} priority={} oversized_description={} oversized_acceptance={} \
+                 invalid_template_param={} oversized_review_reason={} created={} updated={}; \
+                 task mutations are disabled until explicit repair",
+                task.task_id,
+                task.title.chars().count(),
+                task.template_id,
+                task.priority,
+                oversized_description,
+                oversized_acceptance,
+                invalid_template_param,
+                oversized_review_reason,
+                task.created_unix_ms,
+                task.updated_unix_ms
+            ),
+        ));
+    }
+    let mut pending = Vec::new();
+    for (index, attempt) in task.attempts.iter().enumerate() {
+        let expected_attempt_id = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!("AGENT_TASK_ATTEMPT_ID_EXHAUSTED: row={row_key:?}"),
+                )
+            })?;
+        let pending_shape_valid = attempt.outcome != AttemptOutcome::Pending
+            || (!attempt.session_id.trim().is_empty()
+                && attempt.ended_unix_ms.is_none()
+                && attempt.reason.is_none());
+        let terminal_shape_valid = attempt.outcome == AttemptOutcome::Pending
+            || attempt
+                .ended_unix_ms
+                .is_some_and(|ended| ended >= attempt.started_unix_ms);
+        let reason_size_valid = attempt
+            .reason
+            .as_ref()
+            .is_none_or(|reason| reason.chars().count() <= MAX_TEXT_CHARS);
+        if attempt.attempt_id != expected_attempt_id
+            || attempt.started_unix_ms == 0
+            || !pending_shape_valid
+            || !terminal_shape_valid
+            || !reason_size_valid
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_ATTEMPT_INVALID: row={row_key:?} task_id={:?} index={} \
+                     attempt_id={} expected_attempt_id={expected_attempt_id} session_id={:?} \
+                     outcome={:?} started={} ended={:?} reason={:?}",
+                    task.task_id,
+                    index,
+                    attempt.attempt_id,
+                    attempt.session_id,
+                    attempt.outcome,
+                    attempt.started_unix_ms,
+                    attempt.ended_unix_ms,
+                    attempt.reason
+                ),
+            ));
+        }
+        if attempt.outcome == AttemptOutcome::Pending {
+            pending.push(attempt);
+        }
+    }
+    let expected_pending = usize::from(task.state == TaskState::InProgress);
+    if pending.len() != expected_pending {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "AGENT_TASK_PENDING_ATTEMPT_INVARIANT: row={row_key:?} task_id={:?} state={} \
+                 pending_attempts={} expected_pending={expected_pending}",
+                task.task_id,
+                task.state.as_str(),
+                pending.len()
+            ),
+        ));
+    }
+    if let Some(reservation) = &task.dispatch_reservation {
+        let pending_attempt = pending.first().copied().ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_RESERVATION_ATTEMPT_MISSING: row={row_key:?} reservation={}",
+                    reservation.reservation_id
+                ),
+            )
+        })?;
+        if reservation.schema_version != TASK_DISPATCH_RESERVATION_SCHEMA_VERSION
+            || !is_lower_sha256(&reservation.reservation_id)
+            || reservation.reserved_unix_ms == 0
+            || reservation.expires_at_unix_ms <= reservation.reserved_unix_ms
+            || pending_attempt.session_id != reservation_session_id(&reservation.reservation_id)
+            || pending_attempt.started_unix_ms != reservation.reserved_unix_ms
+            || pending_attempt.spawn_id.is_some()
+            || pending_attempt.template_version.is_some()
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_RESERVATION_INVALID: row={row_key:?} task_id={:?} \
+                     reservation={reservation:?} pending_attempt={pending_attempt:?}; task \
+                     mutations are disabled until explicit repair",
+                    task.task_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn reservation_session_id(reservation_id: &str) -> String {
+    format!("task-dispatch-reservation-{reservation_id}")
+}
+
+fn next_attempt_id(task: &AgentTask) -> Result<u32, ErrorData> {
+    u32::try_from(task.attempts.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_ATTEMPT_ID_EXHAUSTED: task {:?} has no remaining u32 attempt id",
+                    task.task_id
+                ),
+            )
+        })
+}
+
+fn active_dispatch_reservation_error(task: &AgentTask, operation: &str) -> ErrorData {
+    let reservation = task
+        .dispatch_reservation
+        .as_ref()
+        .map(|reservation| reservation.reservation_id.as_str())
+        .unwrap_or("corrupt-missing-reservation");
+    mcp_error(
+        error_codes::AGENT_TASK_INVALID_TRANSITION,
+        format!(
+            "AGENT_TASK_DISPATCH_RESERVATION_ACTIVE: task {:?} cannot {operation} while durable \
+             dispatch reservation {reservation:?} owns the pre-spawn transition; wait for guarded \
+             bind/failure or reconcile it after its lease expires",
+            task.task_id
+        ),
+    )
+}
+
+fn task_dispatch_reservation_lease_ms(wait_timeout_ms: u64) -> Result<u64, ErrorData> {
+    wait_timeout_ms
+        .checked_add(TASK_DISPATCH_RESERVATION_GRACE_MS)
+        .map(|lease_ms| lease_ms.max(TASK_DISPATCH_RESERVATION_MIN_LEASE_MS))
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_TASK_RESERVATION_LEASE_EXHAUSTED: wait_timeout_ms={wait_timeout_ms} \
+                     grace_ms={TASK_DISPATCH_RESERVATION_GRACE_MS}"
+                ),
+            )
+        })
+}
+
+fn build_task_dispatch_reservation(
+    task: &AgentTask,
+    queue_generation: u64,
+    reserved_unix_ms: u64,
+    wait_timeout_ms: u64,
+) -> Result<TaskDispatchReservation, ErrorData> {
+    let expires_at_unix_ms = reserved_unix_ms
+        .checked_add(task_dispatch_reservation_lease_ms(wait_timeout_ms)?)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_RESERVATION_TIMESTAMP_EXHAUSTED: task={:?} reserved={reserved_unix_ms} \
+                     wait_timeout_ms={wait_timeout_ms}",
+                    task.task_id
+                ),
+            )
+        })?;
+    let identity = TaskDispatchReservationIdentity {
+        schema_version: TASK_DISPATCH_RESERVATION_SCHEMA_VERSION,
+        task_id: &task.task_id,
+        enqueue_seq: task.enqueue_seq,
+        queue_generation,
+        reserved_unix_ms,
+        expires_at_unix_ms,
+    };
+    let encoded = synapse_storage::encode_json(&identity).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_RESERVATION_IDENTITY_ENCODE_FAILED: task={:?}: {error}",
+                task.task_id
+            ),
+        )
+    })?;
+    let reservation_id = sha256_hex(&encoded);
+    Ok(TaskDispatchReservation {
+        schema_version: TASK_DISPATCH_RESERVATION_SCHEMA_VERSION,
+        reservation_id,
+        reserved_unix_ms,
+        expires_at_unix_ms,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn parse_revision_sha256(value: &str, field: &str) -> Result<[u8; 32], ErrorData> {
+    if !is_lower_sha256(value) {
+        return Err(params_error(format!(
+            "agent_task {field} must be exactly 64 lowercase hexadecimal characters"
+        )));
+    }
+    let mut revision = [0_u8; 32];
+    for (index, slot) in revision.iter_mut().enumerate() {
+        let start = index.checked_mul(2).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "agent_task revision parser index overflow",
+            )
+        })?;
+        let end = start.checked_add(2).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "agent_task revision parser range overflow",
+            )
+        })?;
+        let pair = value.get(start..end).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "agent_task revision parser lost a validated hexadecimal pair",
+            )
+        })?;
+        *slot = u8::from_str_radix(pair, 16).map_err(|error| {
+            params_error(format!(
+                "agent_task {field} contains an invalid hexadecimal pair at byte {start}: {error}"
+            ))
+        })?;
+    }
+    Ok(revision)
+}
+
+fn revision_sha256_hex(revision: &[u8; 32]) -> String {
+    synapse_storage::constellations::hex_encode(revision)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -694,7 +1086,67 @@ struct SpawnTerminalCompletion {
 #[derive(Clone, Debug)]
 struct AgentTaskRow {
     key: Vec<u8>,
+    revision_sha256: [u8; 32],
     task: AgentTask,
+}
+
+struct ScannedTaskRow {
+    key: Vec<u8>,
+    encoded: Vec<u8>,
+    task: AgentTask,
+}
+
+type RawTaskRow = (Vec<u8>, Vec<u8>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskQueueState {
+    schema_version: u32,
+    mutation_generation: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct TaskDispatchReservationIdentity<'a> {
+    schema_version: u32,
+    task_id: &'a str,
+    enqueue_seq: u64,
+    queue_generation: u64,
+    reserved_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RevisionedTaskQueueState {
+    state: TaskQueueState,
+    revision_sha256: [u8; 32],
+}
+
+struct StableTaskSnapshot {
+    queue_state: RevisionedTaskQueueState,
+    rows: Vec<AgentTaskRow>,
+}
+
+enum GuardedTaskMutationOutcome {
+    Conflict,
+    Committed {
+        task: Box<AgentTask>,
+        written_row: TaskRowReadback,
+    },
+}
+
+enum DispatchReservationOutcome {
+    Empty {
+        in_flight: usize,
+    },
+    AtCapacity {
+        in_flight: usize,
+    },
+    Reserved {
+        task: Box<AgentTask>,
+        reservation_id: String,
+        in_flight_before: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -782,23 +1234,45 @@ impl SynapseService {
     }
 
     fn read_task(db: &Db, task_id: &str) -> Result<Option<AgentTask>, ErrorData> {
+        Self::read_task_row_revisioned(db, task_id).map(|row| row.map(|row| row.task))
+    }
+
+    fn read_task_row_revisioned(db: &Db, task_id: &str) -> Result<Option<AgentTaskRow>, ErrorData> {
         let key = task_key(task_id);
-        let value = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
+        let revisioned = db
+            .get_cf_revisioned(cf::CF_KV, key.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("agent_task failed to read revisioned row {key}: {error}"),
+                )
+            })?;
+        let Some(revisioned) = revisioned else {
+            return Ok(None);
+        };
+        let encoded = revisioned.value.ok_or_else(|| {
             mcp_error(
-                error.code(),
-                format!("agent_task failed to read {key}: {error}"),
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_ROW_EXPIRED: {key} has a physical expired envelope; task \
+                     mutations are disabled until the exact row is repaired"
+                ),
             )
         })?;
-        value
-            .map(|raw_value| decode_task(&key, &raw_value))
-            .transpose()
+        let task = decode_task(&key, &encoded)?;
+        Ok(Some(AgentTaskRow {
+            key: key.into_bytes(),
+            revision_sha256: revisioned.revision_sha256,
+            task,
+        }))
     }
 
     pub(crate) fn read_all_tasks(db: &Db) -> Result<Vec<AgentTask>, ErrorData> {
-        Self::scan_task_rows(db).map(|rows| rows.into_iter().map(|row| row.task).collect())
+        Self::stable_task_snapshot(db, unix_time_ms_now())
+            .map(|snapshot| snapshot.rows.into_iter().map(|row| row.task).collect())
     }
 
-    fn scan_task_rows(db: &Db) -> Result<Vec<AgentTaskRow>, ErrorData> {
+    fn scan_raw_task_values(db: &Db) -> Result<Vec<RawTaskRow>, ErrorData> {
         let prefix = task_prefix();
         let mut start = prefix.as_bytes().to_vec();
         let mut out = Vec::new();
@@ -821,11 +1295,7 @@ impl SynapseService {
                     stop = true;
                     break;
                 }
-                let key = String::from_utf8_lossy(&raw_key).into_owned();
-                out.push(AgentTaskRow {
-                    key: raw_key.clone(),
-                    task: decode_task(&key, &raw_value)?,
-                });
+                out.push((raw_key.clone(), raw_value));
                 last_key = Some(raw_key);
             }
             if stop || !more {
@@ -837,6 +1307,265 @@ impl SynapseService {
             start = key_after(&key);
         }
         Ok(out)
+    }
+
+    fn scan_task_values(db: &Db) -> Result<Vec<ScannedTaskRow>, ErrorData> {
+        Self::scan_raw_task_values(db)?
+            .into_iter()
+            .map(|(key, encoded)| {
+                let key_text = String::from_utf8_lossy(&key).into_owned();
+                let task = decode_task(&key_text, &encoded)?;
+                Ok(ScannedTaskRow { key, encoded, task })
+            })
+            .collect()
+    }
+
+    fn scan_task_rows_revisioned(db: &Db) -> Result<Option<Vec<AgentTaskRow>>, ErrorData> {
+        let scanned = Self::scan_task_values(db)?;
+        let mut rows = Vec::with_capacity(scanned.len());
+        for row in scanned {
+            let revisioned = db.get_cf_revisioned(cf::CF_KV, &row.key).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "read exact revision during task queue snapshot {}: {error}",
+                        String::from_utf8_lossy(&row.key)
+                    ),
+                )
+            })?;
+            let Some(revisioned) = revisioned else {
+                return Ok(None);
+            };
+            if revisioned.value.as_deref() != Some(row.encoded.as_slice()) {
+                return Ok(None);
+            }
+            rows.push(AgentTaskRow {
+                key: row.key,
+                revision_sha256: revisioned.revision_sha256,
+                task: row.task,
+            });
+        }
+        Ok(Some(rows))
+    }
+
+    fn encode_task_queue_state(state: &TaskQueueState) -> Result<Vec<u8>, ErrorData> {
+        synapse_storage::encode_json(state).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!("encode durable task queue state: {error}"),
+            )
+        })
+    }
+
+    fn read_task_queue_state_revisioned(
+        db: &Db,
+    ) -> Result<Option<RevisionedTaskQueueState>, ErrorData> {
+        let revisioned = db
+            .get_cf_revisioned(cf::CF_KV, TASK_QUEUE_STATE_KEY.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("read revisioned durable task queue state: {error}"),
+                )
+            })?;
+        let Some(revisioned) = revisioned else {
+            return Ok(None);
+        };
+        let value = revisioned.value.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_QUEUE_STATE_EXPIRED: {TASK_QUEUE_STATE_KEY} has an expired \
+                     physical envelope; task mutations are disabled until explicit repair"
+                ),
+            )
+        })?;
+        let state: TaskQueueState = synapse_storage::decode_json(&value).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_QUEUE_STATE_CORRUPTED: decode {TASK_QUEUE_STATE_KEY}: {error}; \
+                     task mutations are disabled until explicit repair"
+                ),
+            )
+        })?;
+        if state.schema_version != TASK_QUEUE_STATE_SCHEMA_VERSION {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_QUEUE_STATE_VERSION_INVALID: {TASK_QUEUE_STATE_KEY} has \
+                     schema_version={}, expected {TASK_QUEUE_STATE_SCHEMA_VERSION}",
+                    state.schema_version
+                ),
+            ));
+        }
+        Ok(Some(RevisionedTaskQueueState {
+            state,
+            revision_sha256: revisioned.revision_sha256,
+        }))
+    }
+
+    fn initialize_task_queue_state(
+        db: &Db,
+        now_unix_ms: u64,
+    ) -> Result<RevisionedTaskQueueState, ErrorData> {
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            if let Some(state) = Self::read_task_queue_state_revisioned(db)? {
+                return Ok(state);
+            }
+            // Decode every legacy row before establishing the generation. A
+            // malformed row cannot be hidden by initializing coordination
+            // metadata around it.
+            let rows = Self::scan_task_values(db)?;
+            let initial_generation = rows
+                .iter()
+                .map(|row| row.task.mutation_generation)
+                .max()
+                .unwrap_or(0);
+            let state = TaskQueueState {
+                schema_version: TASK_QUEUE_STATE_SCHEMA_VERSION,
+                mutation_generation: initial_generation,
+                updated_unix_ms: now_unix_ms,
+            };
+            let encoded = Self::encode_task_queue_state(&state)?;
+            let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+                cf::CF_KV,
+                [RevisionGuard::new(TASK_QUEUE_STATE_KEY.as_bytes(), None)],
+                std::iter::empty::<Vec<u8>>(),
+                [(TASK_QUEUE_STATE_KEY.as_bytes().to_vec(), encoded.clone())],
+            );
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let readback = Self::read_task_queue_state_revisioned(db)?;
+                    if let Some(readback) = readback.filter(|readback| readback.state == state) {
+                        tracing::warn!(
+                            code = "AGENT_TASK_QUEUE_STATE_INIT_AMBIGUOUS_COMMIT_RECONCILED",
+                            initial_generation,
+                            "separate physical queue-state readback proved initialization committed"
+                        );
+                        return Ok(readback);
+                    }
+                    return Err(mcp_error(
+                        error.code(),
+                        format!(
+                            "AGENT_TASK_QUEUE_STATE_INIT_COMMIT_AMBIGUOUS: initialization failed \
+                             ({error}) and exact queue-state readback did not prove commit"
+                        ),
+                    ));
+                }
+            };
+            if !outcome.applied {
+                tracing::warn!(
+                    code = "AGENT_TASK_QUEUE_STATE_INIT_CONFLICT",
+                    retry,
+                    "task queue-state initialization conflicted; rereading physical state"
+                );
+                continue;
+            }
+            let readback = Self::read_task_queue_state_revisioned(db)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_QUEUE_STATE_INIT_READBACK_MISSING: committed_seq={} key={TASK_QUEUE_STATE_KEY}",
+                        outcome.committed_seq
+                    ),
+                )
+            })?;
+            if readback.state != state {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_QUEUE_STATE_INIT_READBACK_DRIFT: committed_seq={} \
+                         expected_generation={initial_generation} actual_generation={}",
+                        outcome.committed_seq, readback.state.mutation_generation
+                    ),
+                ));
+            }
+            return Ok(readback);
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_QUEUE_STATE_INIT_CONTENTION: initialization conflicted \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} times"
+            ),
+        ))
+    }
+
+    fn next_task_queue_state(
+        current: &TaskQueueState,
+        now_unix_ms: u64,
+    ) -> Result<TaskQueueState, ErrorData> {
+        let mutation_generation = current.mutation_generation.checked_add(1).ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                "AGENT_TASK_QUEUE_GENERATION_EXHAUSTED: durable generation reached u64::MAX",
+            )
+        })?;
+        Ok(TaskQueueState {
+            schema_version: TASK_QUEUE_STATE_SCHEMA_VERSION,
+            mutation_generation,
+            updated_unix_ms: now_unix_ms,
+        })
+    }
+
+    fn stable_task_snapshot(db: &Db, now_unix_ms: u64) -> Result<StableTaskSnapshot, ErrorData> {
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            let before = Self::initialize_task_queue_state(db, now_unix_ms)?;
+            let rows = Self::scan_task_rows_revisioned(db)?;
+            let after = Self::read_task_queue_state_revisioned(db)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_QUEUE_STATE_MISSING: {TASK_QUEUE_STATE_KEY} disappeared \
+                         during a physical task-row audit"
+                    ),
+                )
+            })?;
+            let Some(rows) = rows else {
+                tracing::debug!(
+                    code = "AGENT_TASK_QUEUE_SNAPSHOT_ROW_CONFLICT",
+                    retry,
+                    "task row changed during physical scan; rereading all SoTs"
+                );
+                continue;
+            };
+            if before.revision_sha256 != after.revision_sha256 {
+                tracing::debug!(
+                    code = "AGENT_TASK_QUEUE_SNAPSHOT_CONFLICT",
+                    retry,
+                    "task row or queue generation changed during physical scan; rereading all SoTs"
+                );
+                continue;
+            }
+            if let Some(row) = rows
+                .iter()
+                .find(|row| row.task.mutation_generation > after.state.mutation_generation)
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_QUEUE_GENERATION_DRIFT: task {:?} row_generation={} exceeds \
+                         durable_queue_generation={}; task mutations are disabled until repair",
+                        row.task.task_id,
+                        row.task.mutation_generation,
+                        after.state.mutation_generation
+                    ),
+                ));
+            }
+            return Ok(StableTaskSnapshot {
+                queue_state: after,
+                rows,
+            });
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_QUEUE_SNAPSHOT_CONTENTION: queue changed during \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} consecutive physical audits"
+            ),
+        ))
     }
 
     fn decode_enqueue_seq_watermark(value: &[u8]) -> Result<u64, ErrorData> {
@@ -906,7 +1635,7 @@ impl SynapseService {
             if let Some(sequence) = Self::read_enqueue_seq_watermark_revisioned(db)? {
                 return Ok(sequence);
             }
-            let max_seq = Self::scan_task_rows(db)?
+            let max_seq = Self::scan_task_values(db)?
                 .iter()
                 .map(|row| row.task.enqueue_seq)
                 .max()
@@ -971,137 +1700,707 @@ impl SynapseService {
         ))
     }
 
-    fn delete_task_keys(db: &Db, mut keys: Vec<Vec<u8>>) -> Result<usize, ErrorData> {
-        keys.sort();
-        keys.dedup();
-        let deleted = keys.len();
-        for chunk in keys.chunks(DELETE_BATCH_ROWS) {
-            db.delete_batch(cf::CF_KV, chunk.iter().cloned())
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("agent_task failed to prune terminal rows: {error}"),
-                    )
-                })?;
-        }
-        Ok(deleted)
-    }
-
-    fn prune_terminal_task_rows(
-        db: &Db,
-        now: u64,
-        rows: &[AgentTaskRow],
-    ) -> Result<usize, ErrorData> {
+    fn terminal_task_rows_to_prune(now: u64, rows: &[AgentTaskRow]) -> Vec<AgentTaskRow> {
         let mut terminal = rows
             .iter()
             .filter(|row| row.task.state.is_terminal())
-            .map(|row| (row.task.updated_unix_ms, row.key.clone()))
+            .map(|row| (row.task.updated_unix_ms, row))
             .collect::<Vec<_>>();
-        terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.key.cmp(&b.1.key)));
 
-        let mut delete = terminal
+        let mut delete_keys = terminal
             .iter()
-            .filter(|(updated_at, _key)| {
+            .filter(|(updated_at, _row)| {
                 updated_at.saturating_add(TERMINAL_TASK_RETENTION_MS) <= now
             })
-            .map(|(_updated_at, key)| key.clone())
-            .collect::<Vec<_>>();
+            .map(|(_updated_at, row)| row.key.clone())
+            .collect::<BTreeSet<_>>();
 
         if terminal.len() > TERMINAL_TASK_RETAIN_ROWS {
             let over_cap = terminal.len() - TERMINAL_TASK_RETAIN_ROWS;
-            delete.extend(
+            delete_keys.extend(
                 terminal
                     .iter()
                     .take(over_cap)
-                    .map(|(_updated_at, key)| key.clone()),
+                    .map(|(_updated_at, row)| row.key.clone()),
             );
         }
-
-        let deleted = Self::delete_task_keys(db, delete)?;
-        if deleted > 0 {
-            tracing::info!(
-                code = "AGENT_TASK_RETENTION_PRUNED",
-                scanned_rows = rows.len(),
-                terminal_rows = terminal.len(),
-                deleted_rows = deleted,
-                retain_terminal_rows = TERMINAL_TASK_RETAIN_ROWS,
-                retention_ms = TERMINAL_TASK_RETENTION_MS,
-                "readback=CF_KV terminal agent task rows pruned"
-            );
-        }
-        Ok(deleted)
+        rows.iter()
+            .filter(|row| delete_keys.contains(&row.key))
+            .cloned()
+            .collect()
     }
 
     fn prune_terminal_tasks(db: &Db, now: u64) -> Result<usize, ErrorData> {
+        let _mutation_guard = Self::acquire_task_queue_mutation_lock("task_retention_prune")?;
+        let mut deleted_total = 0_usize;
         for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
-            let before = Self::initialize_enqueue_seq_watermark(db)?;
-            let rows = Self::scan_task_rows(db)?;
-            let after = Self::read_enqueue_seq_watermark_revisioned(db)?.ok_or_else(|| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "AGENT_TASK_SEQUENCE_MISSING: {TASK_SEQUENCE_KEY} disappeared during a \
-                         physical queue audit"
-                    ),
-                )
-            })?;
-            if before.revision_sha256 != after.revision_sha256 {
-                tracing::debug!(
-                    code = "AGENT_TASK_SEQUENCE_AUDIT_CONFLICT",
-                    retry,
-                    "task sequence changed during the physical row audit; rereading both SoTs"
-                );
-                continue;
-            }
-            let max_row_sequence = rows
+            let snapshot = Self::stable_task_snapshot(db, now)?;
+            let sequence = Self::initialize_enqueue_seq_watermark(db)?;
+            let max_row_sequence = snapshot
+                .rows
                 .iter()
                 .map(|row| row.task.enqueue_seq)
                 .max()
                 .unwrap_or(0);
-            if max_row_sequence > after.value {
+            if max_row_sequence > sequence.value {
                 return Err(mcp_error(
                     error_codes::STORAGE_CORRUPTED,
                     format!(
                         "AGENT_TASK_SEQUENCE_DRIFT: physical task max_enqueue_seq={max_row_sequence} \
                          exceeds durable watermark={}; task mutations are disabled until the \
                          watermark is explicitly repaired",
-                        after.value
+                        sequence.value
                     ),
                 ));
             }
-            return Self::prune_terminal_task_rows(db, now, &rows);
+            let delete = Self::terminal_task_rows_to_prune(now, &snapshot.rows);
+            if delete.is_empty() {
+                return Ok(deleted_total);
+            }
+            let terminal_rows = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.task.state.is_terminal())
+                .count();
+            let mut queue = snapshot.queue_state;
+            let mut restart = false;
+            for chunk in delete.chunks(DELETE_BATCH_ROWS) {
+                let next_queue = Self::next_task_queue_state(&queue.state, now)?;
+                let encoded_queue = Self::encode_task_queue_state(&next_queue)?;
+                let mut guards = Vec::with_capacity(chunk.len() + 1);
+                guards.push(RevisionGuard::new(
+                    TASK_QUEUE_STATE_KEY.as_bytes(),
+                    Some(queue.revision_sha256),
+                ));
+                guards.extend(
+                    chunk
+                        .iter()
+                        .map(|row| RevisionGuard::new(row.key.clone(), Some(row.revision_sha256))),
+                );
+                let keys = chunk.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
+                let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+                    cf::CF_KV,
+                    guards,
+                    keys.clone(),
+                    [(TASK_QUEUE_STATE_KEY.as_bytes().to_vec(), encoded_queue)],
+                );
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let all_absent = keys.iter().try_fold(true, |all_absent, key| {
+                            db.get_cf(cf::CF_KV, key)
+                                .map(|value| all_absent && value.is_none())
+                                .map_err(|read_error| {
+                                    mcp_error(
+                                        read_error.code(),
+                                        format!(
+                                            "AGENT_TASK_RETENTION_COMMIT_AMBIGUOUS: prune failed \
+                                             ({error}) and exact row readback failed for {}: \
+                                             {read_error}",
+                                            String::from_utf8_lossy(key)
+                                        ),
+                                    )
+                                })
+                        })?;
+                        let queue_readback = Self::read_task_queue_state_revisioned(db)?;
+                        if all_absent
+                            && queue_readback.as_ref().is_some_and(|readback| {
+                                readback.state.mutation_generation >= next_queue.mutation_generation
+                            })
+                        {
+                            deleted_total = deleted_total.saturating_add(keys.len());
+                            queue = queue_readback.ok_or_else(|| {
+                                mcp_error(
+                                    error_codes::STORAGE_CORRUPTED,
+                                    "task retention queue readback disappeared after exact proof",
+                                )
+                            })?;
+                            continue;
+                        }
+                        return Err(mcp_error(
+                            error.code(),
+                            format!(
+                                "AGENT_TASK_RETENTION_COMMIT_AMBIGUOUS: prune failed ({error}); \
+                                 exact row/queue readback did not prove commit, so no blind retry \
+                                 was attempted"
+                            ),
+                        ));
+                    }
+                };
+                if !outcome.applied {
+                    tracing::warn!(
+                        code = "AGENT_TASK_RETENTION_REVISION_CONFLICT",
+                        retry,
+                        "terminal task or queue generation changed; rebuilding prune set"
+                    );
+                    restart = true;
+                    break;
+                }
+                for key in &keys {
+                    if db
+                        .get_cf(cf::CF_KV, key)
+                        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+                        .is_some()
+                    {
+                        return Err(mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            format!(
+                                "AGENT_TASK_RETENTION_READBACK_PRESENT: committed_seq={} row={} \
+                                 remains physically present",
+                                outcome.committed_seq,
+                                String::from_utf8_lossy(key)
+                            ),
+                        ));
+                    }
+                }
+                queue = Self::read_task_queue_state_revisioned(db)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        "task queue state missing after guarded terminal prune",
+                    )
+                })?;
+                if queue.state.mutation_generation < next_queue.mutation_generation {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        "task queue generation did not advance after guarded terminal prune",
+                    ));
+                }
+                deleted_total = deleted_total.saturating_add(keys.len());
+            }
+            if restart {
+                continue;
+            }
+            tracing::info!(
+                code = "AGENT_TASK_RETENTION_PRUNED",
+                scanned_rows = snapshot.rows.len(),
+                terminal_rows,
+                deleted_rows = deleted_total,
+                retain_terminal_rows = TERMINAL_TASK_RETAIN_ROWS,
+                retention_ms = TERMINAL_TASK_RETENTION_MS,
+                "readback=CF_KV terminal agent task rows pruned under queue generation"
+            );
+            return Ok(deleted_total);
         }
         Err(mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
-                "AGENT_TASK_SEQUENCE_AUDIT_CONTENTION: {TASK_SEQUENCE_KEY} changed during \
-                 {TASK_CREATE_MAX_CONFLICT_RETRIES} consecutive physical queue audits"
+                "AGENT_TASK_RETENTION_CONTENTION: terminal prune conflicted \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} times"
             ),
         ))
     }
 
-    /// Persists a task row and flushes so it is durable + immediately visible on
-    /// the read path before the caller returns.
-    fn write_task(db: &Db, task: &AgentTask) -> Result<TaskRowReadback, ErrorData> {
-        let key = task_key(&task.task_id);
-        let encoded = encode_task(task)?;
-        db.put_batch(cf::CF_KV, [(key.clone().into_bytes(), encoded.clone())])
+    fn acquire_task_queue_mutation_lock(
+        context: &str,
+    ) -> Result<std::sync::MutexGuard<'static, ()>, ErrorData> {
+        task_queue_mutation_lock().lock().map_err(|poisoned| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "AGENT_TASK_QUEUE_MUTATION_LOCK_POISONED: context={context}: {poisoned}; \
+                     remediation=restart the daemon and audit the queue generation plus exact task \
+                     revisions before retrying"
+                ),
+            )
+        })
+    }
+
+    fn verify_guarded_task_successor(
+        db: &Db,
+        task_id: &str,
+        encoded_successor: &[u8],
+        expected_generation: u64,
+        context: &str,
+    ) -> Result<TaskRowReadback, ErrorData> {
+        let key = task_key(task_id);
+        let stored = db
+            .get_cf(cf::CF_KV, key.as_bytes())
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_task failed to persist {key}: {error}"),
+                    format!(
+                        "AGENT_TASK_MUTATION_READBACK_FAILED: context={context} row={key} \
+                         generation={expected_generation}: {error}"
+                    ),
+                )
+            })?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_MUTATION_READBACK_MISSING: context={context} row={key} \
+                         generation={expected_generation}"
+                    ),
                 )
             })?;
-        db.flush().map_err(|error| {
+        if stored != encoded_successor {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_MUTATION_READBACK_DRIFT: context={context} row={key} \
+                     generation={expected_generation} exact successor bytes do not match"
+                ),
+            ));
+        }
+        let decoded = decode_task(&key, &stored)?;
+        if decoded.mutation_generation != expected_generation {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_MUTATION_GENERATION_DRIFT: context={context} row={key} \
+                     expected_generation={expected_generation} row_generation={}",
+                    decoded.mutation_generation
+                ),
+            ));
+        }
+        let queue = Self::read_task_queue_state_revisioned(db)?.ok_or_else(|| {
             mcp_error(
-                error.code(),
-                format!("agent_task persisted {key} but failed to flush to disk: {error}"),
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_QUEUE_STATE_MISSING: context={context} expected_generation={expected_generation}"
+                ),
             )
         })?;
+        if queue.state.mutation_generation < expected_generation {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_QUEUE_GENERATION_ROLLBACK: context={context} \
+                     expected_generation_at_least={expected_generation} actual_generation={}",
+                    queue.state.mutation_generation
+                ),
+            ));
+        }
         Ok(TaskRowReadback {
             cf_name: cf::CF_KV.to_owned(),
             row_key: key,
-            value_len_bytes: encoded.len() as u64,
+            value_len_bytes: stored.len() as u64,
+        })
+    }
+
+    fn commit_guarded_task_successor(
+        db: &Db,
+        predecessor: &AgentTaskRow,
+        queue: &RevisionedTaskQueueState,
+        mut successor: AgentTask,
+        now_unix_ms: u64,
+        context: &str,
+    ) -> Result<GuardedTaskMutationOutcome, ErrorData> {
+        if successor.task_id != predecessor.task.task_id
+            || successor.schema_version != TASK_SCHEMA_VERSION
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_MUTATION_IDENTITY_INVALID: context={context} predecessor={:?} \
+                     successor={:?} successor_schema={}",
+                    predecessor.task.task_id, successor.task_id, successor.schema_version
+                ),
+            ));
+        }
+        let next_queue = Self::next_task_queue_state(&queue.state, now_unix_ms)?;
+        successor.mutation_generation = next_queue.mutation_generation;
+        successor.updated_unix_ms = now_unix_ms;
+        let key_text = String::from_utf8(predecessor.key.clone()).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!("agent task physical key is not UTF-8: {error}"),
+            )
+        })?;
+        let encoded_successor = encode_task(&successor)?;
+        let _validated = decode_task(&key_text, &encoded_successor)?;
+        let encoded_queue = Self::encode_task_queue_state(&next_queue)?;
+        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [
+                RevisionGuard::new(TASK_QUEUE_STATE_KEY.as_bytes(), Some(queue.revision_sha256)),
+                RevisionGuard::new(predecessor.key.clone(), Some(predecessor.revision_sha256)),
+            ],
+            std::iter::empty::<Vec<u8>>(),
+            [
+                (TASK_QUEUE_STATE_KEY.as_bytes().to_vec(), encoded_queue),
+                (predecessor.key.clone(), encoded_successor.clone()),
+            ],
+        );
+        let committed_seq = match outcome {
+            Ok(outcome) => {
+                if !outcome.applied {
+                    return Ok(GuardedTaskMutationOutcome::Conflict);
+                }
+                outcome.committed_seq
+            }
+            Err(error) => {
+                match Self::verify_guarded_task_successor(
+                    db,
+                    &successor.task_id,
+                    &encoded_successor,
+                    next_queue.mutation_generation,
+                    context,
+                ) {
+                    Ok(_readback) => {
+                        tracing::warn!(
+                            code = "AGENT_TASK_MUTATION_AMBIGUOUS_COMMIT_RECONCILED",
+                            context,
+                            task_id = %successor.task_id,
+                            mutation_generation = next_queue.mutation_generation,
+                            "separate exact task-row and queue-state readback proved commit"
+                        );
+                    }
+                    Err(readback_error) => {
+                        return Err(mcp_error(
+                            error.code(),
+                            format!(
+                                "AGENT_TASK_MUTATION_COMMIT_AMBIGUOUS: context={context} \
+                                 task_id={:?} commit_error={error}; exact successor readback did \
+                                 not prove commit: {}; no stale retry was attempted",
+                                successor.task_id, readback_error.message
+                            ),
+                        ));
+                    }
+                }
+                0
+            }
+        };
+        let written_row = Self::verify_guarded_task_successor(
+            db,
+            &successor.task_id,
+            &encoded_successor,
+            next_queue.mutation_generation,
+            context,
+        )?;
+        tracing::debug!(
+            code = "AGENT_TASK_MUTATION_COMMITTED",
+            context,
+            task_id = %successor.task_id,
+            state = successor.state.as_str(),
+            mutation_generation = successor.mutation_generation,
+            committed_seq,
+            "readback=CF_KV edge=guarded_task_mutation"
+        );
+        Ok(GuardedTaskMutationOutcome::Committed {
+            task: Box::new(successor),
+            written_row,
+        })
+    }
+
+    fn mutate_task_guarded<F>(
+        db: &Db,
+        task_id: &str,
+        context: &str,
+        mut transition: F,
+    ) -> Result<(AgentTask, TaskRowReadback), ErrorData>
+    where
+        F: FnMut(&AgentTask, u64) -> Result<AgentTask, ErrorData>,
+    {
+        let _mutation_guard = Self::acquire_task_queue_mutation_lock(context)?;
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            let queue = Self::initialize_task_queue_state(db, unix_time_ms_now())?;
+            let predecessor = Self::read_task_row_revisioned(db, task_id)?
+                .ok_or_else(|| task_not_found(task_id))?;
+            let now = unix_time_ms_now();
+            let successor = transition(&predecessor.task, now)?;
+            match Self::commit_guarded_task_successor(
+                db,
+                &predecessor,
+                &queue,
+                successor,
+                now,
+                context,
+            )? {
+                GuardedTaskMutationOutcome::Conflict => {
+                    tracing::warn!(
+                        code = "AGENT_TASK_MUTATION_REVISION_CONFLICT",
+                        context,
+                        task_id,
+                        retry,
+                        "task or queue generation changed; rereading and recomputing transition"
+                    );
+                }
+                GuardedTaskMutationOutcome::Committed { task, written_row } => {
+                    return Ok((*task, written_row));
+                }
+            }
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_MUTATION_CONTENTION: context={context} task={task_id:?} conflicted \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} times"
+            ),
+        ))
+    }
+
+    fn reserve_next_dispatch(
+        db: &Db,
+        concurrency_cap: usize,
+        wait_timeout_ms: u64,
+        context: &str,
+    ) -> Result<DispatchReservationOutcome, ErrorData> {
+        if concurrency_cap == 0 {
+            return Err(params_error(
+                "agent_task concurrency_cap must be at least 1",
+            ));
+        }
+        if wait_timeout_ms == 0 || wait_timeout_ms > 1_800_000 {
+            return Err(params_error(
+                "agent_task dispatch wait_timeout_ms must be 1..=1800000",
+            ));
+        }
+        let _mutation_guard = Self::acquire_task_queue_mutation_lock(context)?;
+        for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+            let now = unix_time_ms_now();
+            let snapshot = Self::stable_task_snapshot(db, now)?;
+            let tasks = snapshot
+                .rows
+                .iter()
+                .map(|row| row.task.clone())
+                .collect::<Vec<_>>();
+            let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
+            let task_id = match dispatch_decision(&tasks, concurrency_cap) {
+                DispatchDecision::Empty => {
+                    return Ok(DispatchReservationOutcome::Empty { in_flight });
+                }
+                DispatchDecision::AtCapacity { in_flight } => {
+                    return Ok(DispatchReservationOutcome::AtCapacity { in_flight });
+                }
+                DispatchDecision::Dispatch { task_id } => task_id,
+            };
+            let predecessor = snapshot
+                .rows
+                .iter()
+                .find(|row| row.task.task_id == task_id)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "AGENT_TASK_DISPATCH_SELECTION_MISSING: selected task {task_id:?} \
+                             was absent from its stable physical snapshot"
+                        ),
+                    )
+                })?;
+            if predecessor.task.state != TaskState::Todo
+                || predecessor.task.dispatch_reservation.is_some()
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_DISPATCH_SELECTION_INVALID: selected task {task_id:?} \
+                         state={} reservation_present={}",
+                        predecessor.task.state.as_str(),
+                        predecessor.task.dispatch_reservation.is_some()
+                    ),
+                ));
+            }
+            let next_generation = snapshot
+                .queue_state
+                .state
+                .mutation_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        "AGENT_TASK_QUEUE_GENERATION_EXHAUSTED during dispatch reservation",
+                    )
+                })?;
+            let reservation = build_task_dispatch_reservation(
+                &predecessor.task,
+                next_generation,
+                now,
+                wait_timeout_ms,
+            )?;
+            let mut successor = predecessor.task.clone();
+            successor.attempts.push(TaskAttempt {
+                attempt_id: next_attempt_id(&successor)?,
+                session_id: reservation_session_id(&reservation.reservation_id),
+                spawn_id: None,
+                template_version: None,
+                outcome: AttemptOutcome::Pending,
+                started_unix_ms: now,
+                ended_unix_ms: None,
+                reason: None,
+            });
+            successor.state = TaskState::InProgress;
+            successor.dispatch_reservation = Some(reservation.clone());
+            match Self::commit_guarded_task_successor(
+                db,
+                predecessor,
+                &snapshot.queue_state,
+                successor,
+                now,
+                context,
+            )? {
+                GuardedTaskMutationOutcome::Conflict => {
+                    tracing::warn!(
+                        code = "AGENT_TASK_DISPATCH_RESERVATION_CONFLICT",
+                        context,
+                        retry,
+                        "admission snapshot changed; recomputing cap and selection"
+                    );
+                }
+                GuardedTaskMutationOutcome::Committed { task, .. } => {
+                    tracing::info!(
+                        code = "AGENT_TASK_DISPATCH_RESERVED",
+                        context,
+                        task_id = %task.task_id,
+                        reservation_id = %reservation.reservation_id,
+                        reservation_expires_at_unix_ms = reservation.expires_at_unix_ms,
+                        in_flight_before = in_flight,
+                        concurrency_cap,
+                        task_generation = task.mutation_generation,
+                        "readback=CF_KV edge=task_dispatch_reservation"
+                    );
+                    return Ok(DispatchReservationOutcome::Reserved {
+                        task,
+                        reservation_id: reservation.reservation_id,
+                        in_flight_before: in_flight,
+                    });
+                }
+            }
+        }
+        Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "AGENT_TASK_DISPATCH_ADMISSION_CONTENTION: context={context} conflicted \
+                 {TASK_CREATE_MAX_CONFLICT_RETRIES} times while recomputing the stable cap"
+            ),
+        ))
+    }
+
+    fn bind_dispatch_reservation(
+        db: &Db,
+        task_id: &str,
+        reservation_id: &str,
+        session_id: &str,
+        spawn_id: String,
+        template_version: Option<u32>,
+        context: &str,
+    ) -> Result<(AgentTask, TaskRowReadback), ErrorData> {
+        if session_id.trim().is_empty() || !is_spawn_id_shape(&spawn_id) {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "AGENT_TASK_DISPATCH_BIND_IDENTITY_INVALID: task={task_id:?} \
+                     reservation={reservation_id} session_id={session_id:?} spawn_id={spawn_id:?}"
+                ),
+            ));
+        }
+        Self::mutate_task_guarded(db, task_id, context, |predecessor, _now| {
+            let reservation = predecessor.dispatch_reservation.as_ref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::AGENT_TASK_INVALID_TRANSITION,
+                    format!(
+                        "AGENT_TASK_DISPATCH_BIND_RESERVATION_MISSING: task={task_id:?} \
+                         expected_reservation={reservation_id} state={}",
+                        predecessor.state.as_str()
+                    ),
+                )
+            })?;
+            if reservation.reservation_id != reservation_id {
+                return Err(mcp_error(
+                    error_codes::AGENT_TASK_INVALID_TRANSITION,
+                    format!(
+                        "AGENT_TASK_DISPATCH_BIND_RESERVATION_CONFLICT: task={task_id:?} \
+                         expected={reservation_id} actual={}",
+                        reservation.reservation_id
+                    ),
+                ));
+            }
+            let expected_session = reservation_session_id(reservation_id);
+            let mut task = predecessor.clone();
+            let pending = task
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.outcome == AttemptOutcome::Pending)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "AGENT_TASK_DISPATCH_BIND_ATTEMPT_MISSING: task={task_id:?} \
+                             reservation={reservation_id}"
+                        ),
+                    )
+                })?;
+            if pending.session_id != expected_session
+                || pending.spawn_id.is_some()
+                || pending.template_version.is_some()
+            {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_DISPATCH_BIND_ATTEMPT_DRIFT: task={task_id:?} \
+                         reservation={reservation_id} pending={pending:?}"
+                    ),
+                ));
+            }
+            pending.session_id = session_id.to_owned();
+            pending.spawn_id = Some(spawn_id.clone());
+            pending.template_version = template_version;
+            task.dispatch_reservation = None;
+            Ok(task)
+        })
+    }
+
+    fn fail_dispatch_reservation(
+        db: &Db,
+        task_id: &str,
+        reservation_id: &str,
+        reason: String,
+        context: &str,
+    ) -> Result<(AgentTask, TaskRowReadback), ErrorData> {
+        Self::mutate_task_guarded(db, task_id, context, |predecessor, now| {
+            let reservation = predecessor.dispatch_reservation.as_ref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::AGENT_TASK_INVALID_TRANSITION,
+                    format!(
+                        "AGENT_TASK_DISPATCH_FAILURE_RESERVATION_MISSING: task={task_id:?} \
+                         expected_reservation={reservation_id} state={}",
+                        predecessor.state.as_str()
+                    ),
+                )
+            })?;
+            if reservation.reservation_id != reservation_id {
+                return Err(mcp_error(
+                    error_codes::AGENT_TASK_INVALID_TRANSITION,
+                    format!(
+                        "AGENT_TASK_DISPATCH_FAILURE_RESERVATION_CONFLICT: task={task_id:?} \
+                         expected={reservation_id} actual={}",
+                        reservation.reservation_id
+                    ),
+                ));
+            }
+            let expected_session = reservation_session_id(reservation_id);
+            let mut task = predecessor.clone();
+            let pending = task
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.outcome == AttemptOutcome::Pending)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "AGENT_TASK_DISPATCH_FAILURE_ATTEMPT_MISSING: task={task_id:?} \
+                             reservation={reservation_id}"
+                        ),
+                    )
+                })?;
+            if pending.session_id != expected_session {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "AGENT_TASK_DISPATCH_FAILURE_ATTEMPT_DRIFT: task={task_id:?} \
+                         reservation={reservation_id} pending_session={:?}",
+                        pending.session_id
+                    ),
+                ));
+            }
+            pending.outcome = AttemptOutcome::Failed;
+            pending.ended_unix_ms = Some(now);
+            pending.reason = Some(reason.clone());
+            task.dispatch_reservation = None;
+            task.state = TaskState::Todo;
+            task.review_reason = None;
+            Ok(task)
         })
     }
 
@@ -1127,14 +2426,72 @@ impl SynapseService {
         now: u64,
         spawn_log_root: Option<&Path>,
     ) -> Result<(usize, Vec<String>), ErrorData> {
-        let tasks = Self::read_all_tasks(db)?;
+        let snapshot = Self::stable_task_snapshot(db, now)?;
         let mut scanned = 0usize;
         let mut flagged = Vec::new();
-        for mut task in tasks {
+        for row in snapshot.rows {
+            let task = row.task;
             if task.state != TaskState::InProgress {
                 continue;
             }
             scanned += 1;
+            if let Some(reservation) = &task.dispatch_reservation {
+                if reservation.expires_at_unix_ms > now {
+                    continue;
+                }
+                let reservation_id = reservation.reservation_id.clone();
+                let reason = format!(
+                    "expired durable dispatch reservation {reservation_id} at {} ms before a \
+                     spawned session was bound; external spawn outcome is unknown and requires review",
+                    reservation.expires_at_unix_ms
+                );
+                let (reconciled, _readback) = Self::mutate_task_guarded(
+                    db,
+                    &task.task_id,
+                    "task_reconcile_expired_reservation",
+                    |predecessor, transition_now| {
+                        let current =
+                            predecessor.dispatch_reservation.as_ref().ok_or_else(|| {
+                                mcp_error(
+                                    error_codes::AGENT_TASK_INVALID_TRANSITION,
+                                    format!(
+                                        "AGENT_TASK_RECONCILE_RESERVATION_SUPERSEDED: task={:?} \
+                                     expected_reservation={reservation_id} is no longer present",
+                                        predecessor.task_id
+                                    ),
+                                )
+                            })?;
+                        if current.reservation_id != reservation_id
+                            || current.expires_at_unix_ms > transition_now
+                        {
+                            return Err(mcp_error(
+                                error_codes::AGENT_TASK_INVALID_TRANSITION,
+                                format!(
+                                    "AGENT_TASK_RECONCILE_RESERVATION_CONFLICT: task={:?} \
+                                     expected={reservation_id} actual={} expires_at={} now={transition_now}",
+                                    predecessor.task_id,
+                                    current.reservation_id,
+                                    current.expires_at_unix_ms
+                                ),
+                            ));
+                        }
+                        let mut successor = predecessor.clone();
+                        for attempt in &mut successor.attempts {
+                            if attempt.outcome == AttemptOutcome::Pending {
+                                attempt.outcome = AttemptOutcome::Orphaned;
+                                attempt.ended_unix_ms = Some(transition_now);
+                                attempt.reason = Some(reason.clone());
+                            }
+                        }
+                        successor.dispatch_reservation = None;
+                        successor.state = TaskState::Review;
+                        successor.review_reason = Some(reason.clone());
+                        Ok(successor)
+                    },
+                )?;
+                flagged.push(reconciled.task_id);
+                continue;
+            }
             let missing_live_session = match task.live_attempt() {
                 // An in_progress task with no live attempt is itself orphaned.
                 None => true,
@@ -1143,40 +2500,81 @@ impl SynapseService {
             if !missing_live_session {
                 continue;
             }
-
-            let terminal_completion = task
-                .live_attempt()
-                .and_then(|attempt| attempt.spawn_id.as_deref())
-                .and_then(|spawn_id| read_spawn_terminal_completion(spawn_log_root, spawn_id));
-            let (outcome, attempt_reason, review_reason, flagged_orphan) = match terminal_completion
-            {
-                Some(completion) if completion.is_success() => {
-                    (AttemptOutcome::Succeeded, completion.reason(), None, false)
-                }
-                Some(completion) => {
-                    let reason = completion.reason();
-                    (AttemptOutcome::Failed, reason.clone(), Some(reason), false)
-                }
-                None => {
-                    let reason = format!(
-                        "orphaned: in_progress attempt session no longer live and no terminal completion artifact was available (reconciled at {now} ms)"
-                    );
-                    (AttemptOutcome::Orphaned, reason.clone(), Some(reason), true)
-                }
-            };
-            for attempt in &mut task.attempts {
-                if attempt.outcome == AttemptOutcome::Pending {
-                    attempt.outcome = outcome;
-                    attempt.ended_unix_ms = Some(now);
-                    attempt.reason = Some(attempt_reason.clone());
-                }
-            }
-            task.state = TaskState::Review;
-            task.review_reason = review_reason;
-            task.updated_unix_ms = now;
-            Self::write_task(db, &task)?;
+            let task_id = task.task_id.clone();
+            let (reconciled, _readback) = Self::mutate_task_guarded(
+                db,
+                &task_id,
+                "task_reconcile",
+                |predecessor, transition_now| {
+                    if predecessor.state != TaskState::InProgress
+                        || predecessor.dispatch_reservation.is_some()
+                    {
+                        return Err(mcp_error(
+                            error_codes::AGENT_TASK_INVALID_TRANSITION,
+                            format!(
+                                "AGENT_TASK_RECONCILE_SUPERSEDED: task={:?} state={} \
+                                 reservation_present={}",
+                                predecessor.task_id,
+                                predecessor.state.as_str(),
+                                predecessor.dispatch_reservation.is_some()
+                            ),
+                        ));
+                    }
+                    let missing = predecessor
+                        .live_attempt()
+                        .is_none_or(|attempt| !live.contains(&attempt.session_id));
+                    if !missing {
+                        return Err(mcp_error(
+                            error_codes::AGENT_TASK_INVALID_TRANSITION,
+                            format!(
+                                "AGENT_TASK_RECONCILE_SESSION_RECOVERED: task={:?} live session \
+                                 reappeared before guarded reconciliation",
+                                predecessor.task_id
+                            ),
+                        ));
+                    }
+                    let terminal_completion = predecessor
+                        .live_attempt()
+                        .and_then(|attempt| attempt.spawn_id.as_deref())
+                        .and_then(|spawn_id| {
+                            read_spawn_terminal_completion(spawn_log_root, spawn_id)
+                        });
+                    let (outcome, attempt_reason, review_reason) = match terminal_completion {
+                        Some(completion) if completion.is_success() => {
+                            (AttemptOutcome::Succeeded, completion.reason(), None)
+                        }
+                        Some(completion) => {
+                            let reason = completion.reason();
+                            (AttemptOutcome::Failed, reason.clone(), Some(reason))
+                        }
+                        None => {
+                            let reason = format!(
+                                "orphaned: in_progress attempt session no longer live and no \
+                                 terminal completion artifact was available (reconciled at \
+                                 {transition_now} ms)"
+                            );
+                            (AttemptOutcome::Orphaned, reason.clone(), Some(reason))
+                        }
+                    };
+                    let mut successor = predecessor.clone();
+                    for attempt in &mut successor.attempts {
+                        if attempt.outcome == AttemptOutcome::Pending {
+                            attempt.outcome = outcome;
+                            attempt.ended_unix_ms = Some(transition_now);
+                            attempt.reason = Some(attempt_reason.clone());
+                        }
+                    }
+                    successor.state = TaskState::Review;
+                    successor.review_reason = review_reason;
+                    Ok(successor)
+                },
+            )?;
+            let flagged_orphan = reconciled
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.outcome == AttemptOutcome::Orphaned);
             if flagged_orphan {
-                flagged.push(task.task_id.clone());
+                flagged.push(reconciled.task_id);
             }
         }
         Ok((scanned, flagged))
@@ -1205,33 +2603,35 @@ impl SynapseService {
         session_id: &str,
         spawn_id: Option<String>,
         template_version: Option<u32>,
-    ) -> Result<AgentTask, ErrorData> {
-        let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
-        if task.state != TaskState::Todo {
-            return Err(mcp_error(
-                error_codes::AGENT_TASK_INVALID_TRANSITION,
-                format!(
-                    "agent_task {task_id:?} cannot be claimed: it is {}, not todo (already claimed or finished)",
-                    task.state.as_str()
-                ),
-            ));
-        }
-        let now = unix_time_ms_now();
-        let attempt_id = u32::try_from(task.attempts.len()).unwrap_or(u32::MAX) + 1;
-        task.attempts.push(TaskAttempt {
-            attempt_id,
-            session_id: session_id.to_owned(),
-            spawn_id,
-            template_version,
-            outcome: AttemptOutcome::Pending,
-            started_unix_ms: now,
-            ended_unix_ms: None,
-            reason: None,
-        });
-        task.state = TaskState::InProgress;
-        task.updated_unix_ms = now;
-        Self::write_task(db, &task)?;
-        Ok(task)
+    ) -> Result<(AgentTask, TaskRowReadback), ErrorData> {
+        Self::mutate_task_guarded(db, task_id, "task_claim", |predecessor, now| {
+            if predecessor.dispatch_reservation.is_some() {
+                return Err(active_dispatch_reservation_error(predecessor, "claim"));
+            }
+            if predecessor.state != TaskState::Todo {
+                return Err(mcp_error(
+                    error_codes::AGENT_TASK_INVALID_TRANSITION,
+                    format!(
+                        "agent_task {task_id:?} cannot be claimed: it is {}, not todo \
+                             (already claimed or finished)",
+                        predecessor.state.as_str()
+                    ),
+                ));
+            }
+            let mut task = predecessor.clone();
+            task.attempts.push(TaskAttempt {
+                attempt_id: next_attempt_id(predecessor)?,
+                session_id: session_id.to_owned(),
+                spawn_id: spawn_id.clone(),
+                template_version,
+                outcome: AttemptOutcome::Pending,
+                started_unix_ms: now,
+                ended_unix_ms: None,
+                reason: None,
+            });
+            task.state = TaskState::InProgress;
+            Ok(task)
+        })
     }
 
     fn task_create_impl(
@@ -1264,9 +2664,11 @@ impl SynapseService {
         let db = self.agent_task_db()?;
         let now = unix_time_ms_now();
         Self::prune_terminal_tasks(&db, now)?;
+        let _mutation_guard = Self::acquire_task_queue_mutation_lock("task_create")?;
         let row_key = task_key(&params.task_id);
         let (task, written_row) = 'create: {
             for retry in 0..TASK_CREATE_MAX_CONFLICT_RETRIES {
+                let queue = Self::initialize_task_queue_state(&db, now)?;
                 let sequence = Self::initialize_enqueue_seq_watermark(&db)?;
                 let existing = db
                     .get_cf_revisioned(cf::CF_KV, row_key.as_bytes())
@@ -1306,6 +2708,7 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                let next_queue = Self::next_task_queue_state(&queue.state, now)?;
                 let task = AgentTask {
                     schema_version: TASK_SCHEMA_VERSION,
                     task_id: params.task_id.clone(),
@@ -1317,16 +2720,23 @@ impl SynapseService {
                     template_id: params.template_id.clone(),
                     template_params: params.template_params.clone(),
                     enqueue_seq: next_seq,
+                    mutation_generation: next_queue.mutation_generation,
                     attempts: Vec::new(),
+                    dispatch_reservation: None,
                     review_reason: None,
                     created_unix_ms: now,
                     updated_unix_ms: now,
                 };
                 let encoded_task = encode_task(&task)?;
                 let encoded_sequence = next_seq.to_string().into_bytes();
+                let encoded_queue = Self::encode_task_queue_state(&next_queue)?;
                 let outcome = db.mutate_batch_if_revisions_pressure_bypass(
                     cf::CF_KV,
                     [
+                        RevisionGuard::new(
+                            TASK_QUEUE_STATE_KEY.as_bytes(),
+                            Some(queue.revision_sha256),
+                        ),
                         RevisionGuard::new(
                             TASK_SEQUENCE_KEY.as_bytes(),
                             Some(sequence.revision_sha256),
@@ -1335,6 +2745,7 @@ impl SynapseService {
                     ],
                     std::iter::empty::<Vec<u8>>(),
                     [
+                        (TASK_QUEUE_STATE_KEY.as_bytes().to_vec(), encoded_queue),
                         (
                             TASK_SEQUENCE_KEY.as_bytes().to_vec(),
                             encoded_sequence.clone(),
@@ -1359,20 +2770,26 @@ impl SynapseService {
                             },
                         )?;
                         let stored_sequence = Self::read_enqueue_seq_watermark_revisioned(&db)?;
-                        if let (Some(stored_task), Some(stored_sequence)) =
-                            (stored_task, stored_sequence)
+                        let stored_queue = Self::read_task_queue_state_revisioned(&db)?;
+                        if let (Some(stored_task), Some(stored_sequence), Some(stored_queue)) =
+                            (stored_task, stored_sequence, stored_queue)
                         {
                             let decoded = decode_task(&row_key, &stored_task)?;
                             if stored_task == encoded_task
                                 && decoded.task_id == task.task_id
                                 && decoded.enqueue_seq == next_seq
+                                && decoded.mutation_generation == next_queue.mutation_generation
                                 && stored_sequence.value >= next_seq
+                                && stored_queue.state.mutation_generation
+                                    >= next_queue.mutation_generation
                             {
                                 tracing::warn!(
                                     code = "AGENT_TASK_CREATE_AMBIGUOUS_COMMIT_RECONCILED",
                                     task_id = %task.task_id,
                                     enqueue_seq = next_seq,
                                     watermark_after = stored_sequence.value,
+                                    mutation_generation = next_queue.mutation_generation,
+                                    queue_generation_after = stored_queue.state.mutation_generation,
                                     exact_bytes_match = stored_task == encoded_task,
                                     "separate physical item/watermark readback proved the guarded create committed"
                                 );
@@ -1390,7 +2807,7 @@ impl SynapseService {
                             error.code(),
                             format!(
                                 "AGENT_TASK_CREATE_NOT_COMMITTED: guarded create for {row_key} \
-                                 failed: {error}; separate item/watermark readback did not prove \
+                                 failed: {error}; separate item/watermark/queue readback did not prove \
                                  this create committed, so no stale sequence retry was attempted"
                             ),
                         ));
@@ -1443,21 +2860,39 @@ impl SynapseService {
                             ),
                         )
                     })?;
-                if decoded.task_id != task.task_id
+                let stored_queue =
+                    Self::read_task_queue_state_revisioned(&db)?.ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            format!(
+                                "AGENT_TASK_CREATE_QUEUE_STATE_MISSING: committed_seq={} but \
+                             {TASK_QUEUE_STATE_KEY} is physically absent",
+                                outcome.committed_seq
+                            ),
+                        )
+                    })?;
+                if stored_task != encoded_task
+                    || decoded.task_id != task.task_id
                     || decoded.enqueue_seq != next_seq
+                    || decoded.mutation_generation != next_queue.mutation_generation
                     || stored_sequence.value < next_seq
+                    || stored_queue.state.mutation_generation < next_queue.mutation_generation
                 {
                     return Err(mcp_error(
                         error_codes::STORAGE_CORRUPTED,
                         format!(
                             "AGENT_TASK_CREATE_READBACK_DRIFT: committed_seq={} expected_task={} \
                              expected_enqueue_seq={next_seq} actual_task={} actual_enqueue_seq={} \
-                             watermark={}; task creation is disabled",
+                             expected_generation={} actual_row_generation={} watermark={} \
+                             queue_generation={}; task creation is disabled",
                             outcome.committed_seq,
                             task.task_id,
                             decoded.task_id,
                             decoded.enqueue_seq,
-                            stored_sequence.value
+                            next_queue.mutation_generation,
+                            decoded.mutation_generation,
+                            stored_sequence.value,
+                            stored_queue.state.mutation_generation
                         ),
                     ));
                 }
@@ -1505,70 +2940,90 @@ impl SynapseService {
         &self,
         params: TaskUpdateParams,
     ) -> Result<TaskMutationResponse, ErrorData> {
-        let db = self.agent_task_db()?;
-        let mut task = Self::read_task(&db, &params.task_id)?
-            .ok_or_else(|| task_not_found(&params.task_id))?;
-        let now = unix_time_ms_now();
-
         if let Some(priority) = params.priority {
             validate_priority(priority)?;
-            task.priority = priority;
         }
-        if let Some(title) = params.title {
+        if let Some(title) = &params.title {
             if title.trim().is_empty() {
                 return Err(params_error("agent_task title must not be empty"));
             }
-            validate_text("title", &title, MAX_TITLE_CHARS)?;
-            task.title = title;
+            validate_text("title", title, MAX_TITLE_CHARS)?;
         }
-        if let Some(description) = params.description {
-            validate_text("description", &description, MAX_TEXT_CHARS)?;
-            task.description = Some(description);
+        if let Some(description) = &params.description {
+            validate_text("description", description, MAX_TEXT_CHARS)?;
         }
-        if let Some(acceptance) = params.acceptance {
-            validate_text("acceptance", &acceptance, MAX_TEXT_CHARS)?;
-            task.acceptance = Some(acceptance);
+        if let Some(acceptance) = &params.acceptance {
+            validate_text("acceptance", acceptance, MAX_TEXT_CHARS)?;
         }
-
-        if let Some(target) = params.state {
-            if target != task.state {
-                if !task.state.can_transition_to(target) {
-                    return Err(mcp_error(
-                        error_codes::AGENT_TASK_INVALID_TRANSITION,
-                        format!(
-                            "agent_task {:?} cannot move {} -> {}; valid targets: {:?}",
-                            task.task_id,
-                            task.state.as_str(),
-                            target.as_str(),
-                            task.state.allowed_targets()
-                        ),
-                    ));
+        let db = self.agent_task_db()?;
+        let task_id = params.task_id.clone();
+        let (task, written_row) =
+            Self::mutate_task_guarded(&db, &task_id, "task_update", |predecessor, now| {
+                if predecessor.dispatch_reservation.is_some() {
+                    return Err(active_dispatch_reservation_error(predecessor, "update"));
                 }
-                // Settle the live attempt when leaving in_progress.
-                let outcome = match target {
-                    TaskState::Review | TaskState::Done => Some(AttemptOutcome::Succeeded),
-                    TaskState::Cancelled => Some(AttemptOutcome::Failed),
-                    _ => None,
-                };
-                if let Some(outcome) = outcome {
-                    for attempt in &mut task.attempts {
-                        if attempt.outcome == AttemptOutcome::Pending {
-                            attempt.outcome = outcome;
-                            attempt.ended_unix_ms = Some(now);
-                            attempt.reason.clone_from(&params.reason);
+                let mut task = predecessor.clone();
+                if let Some(priority) = params.priority {
+                    task.priority = priority;
+                }
+                if let Some(title) = &params.title {
+                    task.title.clone_from(title);
+                }
+                if let Some(description) = &params.description {
+                    task.description = Some(description.clone());
+                }
+                if let Some(acceptance) = &params.acceptance {
+                    task.acceptance = Some(acceptance.clone());
+                }
+                if let Some(target) = params.state
+                    && target != task.state
+                {
+                    if target == TaskState::InProgress {
+                        return Err(mcp_error(
+                            error_codes::AGENT_TASK_INVALID_TRANSITION,
+                            format!(
+                                "agent_task {:?} cannot enter in_progress through task_update; \
+                                 use task_claim or task_dispatch_once so a durable attempt \
+                                 identity is created atomically",
+                                task.task_id
+                            ),
+                        ));
+                    }
+                    if !task.state.can_transition_to(target) {
+                        return Err(mcp_error(
+                            error_codes::AGENT_TASK_INVALID_TRANSITION,
+                            format!(
+                                "agent_task {:?} cannot move {} -> {}; valid targets: {:?}",
+                                task.task_id,
+                                task.state.as_str(),
+                                target.as_str(),
+                                task.state.allowed_targets()
+                            ),
+                        ));
+                    }
+                    let outcome = match target {
+                        TaskState::Review | TaskState::Done => Some(AttemptOutcome::Succeeded),
+                        TaskState::Cancelled | TaskState::Todo => Some(AttemptOutcome::Failed),
+                        TaskState::InProgress => None,
+                    };
+                    if let Some(outcome) = outcome {
+                        for attempt in &mut task.attempts {
+                            if attempt.outcome == AttemptOutcome::Pending {
+                                attempt.outcome = outcome;
+                                attempt.ended_unix_ms = Some(now);
+                                attempt.reason.clone_from(&params.reason);
+                            }
                         }
                     }
+                    task.review_reason = if target == TaskState::Review {
+                        params.reason.clone()
+                    } else {
+                        None
+                    };
+                    task.state = target;
                 }
-                task.review_reason = if target == TaskState::Review {
-                    params.reason.clone()
-                } else {
-                    None
-                };
-                task.state = target;
-            }
-        }
-        task.updated_unix_ms = now;
-        let written_row = Self::write_task(&db, &task)?;
+                Ok(task)
+            })?;
         tracing::info!(
             code = "AGENT_TASK_UPDATE",
             task_id = %task.task_id,
@@ -1589,12 +3044,8 @@ impl SynapseService {
             ));
         }
         let db = self.agent_task_db()?;
-        let task = Self::claim_internal(&db, &params.task_id, &params.session_id, None, None)?;
-        let written_row = TaskRowReadback {
-            cf_name: cf::CF_KV.to_owned(),
-            row_key: task_key(&task.task_id),
-            value_len_bytes: encode_task(&task)?.len() as u64,
-        };
+        let (task, written_row) =
+            Self::claim_internal(&db, &params.task_id, &params.session_id, None, None)?;
         tracing::info!(
             code = "AGENT_TASK_CLAIM",
             task_id = %task.task_id,
@@ -1723,12 +3174,35 @@ impl SynapseService {
                      sequence so repair cannot reuse an unknown allocation",
                 ));
             }
-            let rows = Self::scan_task_rows(&db)?;
-            let observed_max_task_sequence = rows
-                .iter()
-                .map(|row| row.task.enqueue_seq)
-                .max()
-                .unwrap_or(0);
+            let raw_rows = Self::scan_raw_task_values(&db)?;
+            let mut observed_max_task_sequence = 0_u64;
+            let mut unobservable_task_sequences = 0_usize;
+            for (key, encoded) in &raw_rows {
+                let key_text = String::from_utf8_lossy(key);
+                match decode_task(&key_text, encoded) {
+                    Ok(task) => {
+                        observed_max_task_sequence =
+                            observed_max_task_sequence.max(task.enqueue_seq);
+                    }
+                    Err(error) => {
+                        unobservable_task_sequences = unobservable_task_sequences.saturating_add(1);
+                        tracing::error!(
+                            code = "AGENT_TASK_SEQUENCE_REPAIR_ROW_UNOBSERVABLE",
+                            row_key = %key_text,
+                            error_code = %error_code_str(&error),
+                            error = %error.message,
+                            "task row sequence is unobservable during explicit watermark repair"
+                        );
+                    }
+                }
+            }
+            if unobservable_task_sequences > 0 && params.minimum_last_enqueue_seq == 0 {
+                return Err(params_error(format!(
+                    "task sequence repair found {unobservable_task_sequences} task row(s) whose \
+                     sequence is unobservable; minimum_last_enqueue_seq must be the non-zero last \
+                     known-good physical allocation so repair cannot reuse an unknown sequence"
+                )));
+            }
             let repaired_sequence = params
                 .minimum_last_enqueue_seq
                 .max(observed_max_task_sequence)
@@ -1784,7 +3258,8 @@ impl SynapseService {
             tracing::warn!(
                 code = "AGENT_TASK_SEQUENCE_REPAIRED",
                 reason = %params.reason,
-                observed_task_rows = rows.len(),
+                observed_task_rows = raw_rows.len(),
+                unobservable_task_sequences,
                 observed_max_task_sequence,
                 previous_decodable_sequence,
                 requested_minimum_sequence = params.minimum_last_enqueue_seq,
@@ -1794,7 +3269,8 @@ impl SynapseService {
             );
             return Ok(TaskSequenceRepairResponse {
                 ok: true,
-                observed_task_rows: rows.len(),
+                observed_task_rows: raw_rows.len(),
+                unobservable_task_sequences,
                 observed_max_task_sequence,
                 previous_decodable_sequence,
                 requested_minimum_sequence: params.minimum_last_enqueue_seq,
@@ -1816,36 +3292,434 @@ impl SynapseService {
         ))
     }
 
-    fn record_failed_attempt_internal(
-        db: &Db,
-        task_id: &str,
-        reason: String,
-    ) -> Result<AgentTask, ErrorData> {
-        let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
-        if task.state != TaskState::Todo {
+    pub(crate) fn task_repair_queue_state_impl(
+        &self,
+        params: TaskQueueStateRepairParams,
+    ) -> Result<TaskQueueStateRepairResponse, ErrorData> {
+        if params.reason.trim().is_empty() {
+            return Err(params_error(
+                "task queue-state repair requires a non-empty audit reason",
+            ));
+        }
+        validate_text("repair reason", &params.reason, MAX_TEXT_CHARS)?;
+        let expected_revision = params
+            .expected_revision_sha256
+            .as_deref()
+            .map(|revision| parse_revision_sha256(revision, "expected_revision_sha256"))
+            .transpose()?;
+        let db = self.agent_task_db()?;
+        let _mutation_guard = Self::acquire_task_queue_mutation_lock("task_repair_queue_state")?;
+        let current = db
+            .get_cf_revisioned(cf::CF_KV, TASK_QUEUE_STATE_KEY.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("read raw task queue state for explicit repair: {error}"),
+                )
+            })?;
+        let actual_revision = current
+            .as_ref()
+            .map(|revisioned| revisioned.revision_sha256);
+        if actual_revision != expected_revision {
             return Err(mcp_error(
-                error_codes::AGENT_TASK_INVALID_TRANSITION,
+                error_codes::STORAGE_WRITE_FAILED,
                 format!(
-                    "agent_task {task_id:?} cannot record a dispatch-failure attempt: it is {}, not todo (raced by another dispatcher?)",
-                    task.state.as_str()
+                    "TASK_QUEUE_STATE_REPAIR_REVISION_MISMATCH: key={TASK_QUEUE_STATE_KEY} \
+                     expected_revision={} actual_revision={}; perform a new separate physical \
+                     read before retrying",
+                    expected_revision
+                        .as_ref()
+                        .map(revision_sha256_hex)
+                        .unwrap_or_else(|| "<absent>".to_owned()),
+                    actual_revision
+                        .as_ref()
+                        .map(revision_sha256_hex)
+                        .unwrap_or_else(|| "<absent>".to_owned())
                 ),
             ));
         }
+        let previous_decodable_generation = current
+            .as_ref()
+            .and_then(|revisioned| revisioned.value.as_deref())
+            .and_then(|value| synapse_storage::decode_json::<TaskQueueState>(value).ok())
+            .filter(|state| state.schema_version == TASK_QUEUE_STATE_SCHEMA_VERSION)
+            .map(|state| state.mutation_generation);
+        let raw_rows = Self::scan_raw_task_values(&db)?;
+        let mut observed_max_task_generation = 0_u64;
+        let mut unobservable_task_generations = 0_usize;
+        for (key, encoded) in &raw_rows {
+            let key_text = String::from_utf8_lossy(key);
+            match decode_task(&key_text, encoded) {
+                Ok(task) => {
+                    observed_max_task_generation =
+                        observed_max_task_generation.max(task.mutation_generation);
+                }
+                Err(error) => {
+                    unobservable_task_generations = unobservable_task_generations.saturating_add(1);
+                    tracing::error!(
+                        code = "AGENT_TASK_QUEUE_REPAIR_ROW_UNOBSERVABLE",
+                        row_key = %key_text,
+                        error_code = %error_code_str(&error),
+                        error = %error.message,
+                        "task row generation is unobservable during explicit queue-state repair"
+                    );
+                }
+            }
+        }
+        let current_is_unobservable = current.is_some() && previous_decodable_generation.is_none();
+        if (current_is_unobservable || unobservable_task_generations > 0)
+            && params.minimum_mutation_generation == 0
+        {
+            return Err(params_error(format!(
+                "task queue-state repair has unobservable durable history \
+                 (queue_state_unobservable={current_is_unobservable}, \
+                 unobservable_task_rows={unobservable_task_generations}); \
+                 minimum_mutation_generation must be a non-zero last known-good physical floor"
+            )));
+        }
+        let repaired_generation = params
+            .minimum_mutation_generation
+            .max(observed_max_task_generation)
+            .max(previous_decodable_generation.unwrap_or(0));
+        let repaired = TaskQueueState {
+            schema_version: TASK_QUEUE_STATE_SCHEMA_VERSION,
+            mutation_generation: repaired_generation,
+            updated_unix_ms: unix_time_ms_now(),
+        };
+        let encoded = Self::encode_task_queue_state(&repaired)?;
+        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [RevisionGuard::new(
+                TASK_QUEUE_STATE_KEY.as_bytes(),
+                expected_revision,
+            )],
+            std::iter::empty::<Vec<u8>>(),
+            [(TASK_QUEUE_STATE_KEY.as_bytes().to_vec(), encoded.clone())],
+        );
+        let committed_seq = match outcome {
+            Ok(outcome) if outcome.applied => Some(outcome.committed_seq),
+            Ok(outcome) => {
+                return Err(mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "TASK_QUEUE_STATE_REPAIR_CONFLICT: exact revision guard changed before \
+                         commit; conflict_guard={:?}; perform a new separate physical read",
+                        outcome
+                            .conflict
+                            .as_ref()
+                            .map(|conflict| conflict.guard_index)
+                    ),
+                ));
+            }
+            Err(error) => {
+                let readback = db
+                    .get_cf(cf::CF_KV, TASK_QUEUE_STATE_KEY.as_bytes())
+                    .map_err(|read_error| {
+                        mcp_error(
+                            read_error.code(),
+                            format!(
+                                "TASK_QUEUE_STATE_REPAIR_COMMIT_AMBIGUOUS: commit failed \
+                                 ({error}) and exact readback failed ({read_error})"
+                            ),
+                        )
+                    })?;
+                if readback.as_deref() == Some(encoded.as_slice()) {
+                    tracing::warn!(
+                        code = "AGENT_TASK_QUEUE_REPAIR_AMBIGUOUS_COMMIT_RECONCILED",
+                        repaired_generation,
+                        "exact physical readback proved the queue-state repair committed"
+                    );
+                    None
+                } else {
+                    return Err(mcp_error(
+                        error.code(),
+                        format!(
+                            "TASK_QUEUE_STATE_REPAIR_NOT_COMMITTED: guarded repair failed: \
+                             {error}; exact physical readback did not prove the requested bytes"
+                        ),
+                    ));
+                }
+            }
+        };
+        let readback = Self::read_task_queue_state_revisioned(&db)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                "TASK_QUEUE_STATE_REPAIR_READBACK_MISSING: repaired row is physically absent",
+            )
+        })?;
+        if readback.state != repaired {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "TASK_QUEUE_STATE_REPAIR_READBACK_DRIFT: expected_generation={} \
+                     actual_generation={}",
+                    repaired_generation, readback.state.mutation_generation
+                ),
+            ));
+        }
+        tracing::warn!(
+            code = "AGENT_TASK_QUEUE_STATE_REPAIRED",
+            reason = %params.reason,
+            observed_task_rows = raw_rows.len(),
+            unobservable_task_generations,
+            observed_max_task_generation,
+            previous_decodable_generation,
+            requested_minimum_generation = params.minimum_mutation_generation,
+            repaired_generation,
+            committed_seq,
+            "explicit revision-bound task queue-state repair completed with physical readback"
+        );
+        Ok(TaskQueueStateRepairResponse {
+            ok: true,
+            observed_task_rows: raw_rows.len(),
+            unobservable_task_generations,
+            observed_max_task_generation,
+            previous_decodable_generation,
+            requested_minimum_generation: params.minimum_mutation_generation,
+            repaired_generation,
+            previous_revision_sha256: actual_revision.as_ref().map(revision_sha256_hex),
+            committed_seq,
+            written_row: TaskRowReadback {
+                cf_name: cf::CF_KV.to_owned(),
+                row_key: TASK_QUEUE_STATE_KEY.to_owned(),
+                value_len_bytes: encoded.len() as u64,
+            },
+        })
+    }
+
+    pub(crate) fn task_repair_row_impl(
+        &self,
+        params: TaskRowRepairParams,
+    ) -> Result<TaskRowRepairResponse, ErrorData> {
+        if !is_kebab_id(&params.task_id) || params.task_id.len() > MAX_TASK_ID_CHARS {
+            return Err(params_error(format!(
+                "agent_task task_id must be non-empty [a-z0-9._-] and <= {MAX_TASK_ID_CHARS} chars"
+            )));
+        }
+        if params.reason.trim().is_empty() {
+            return Err(params_error(
+                "task row repair requires a non-empty audit reason",
+            ));
+        }
+        validate_text("repair reason", &params.reason, MAX_TEXT_CHARS)?;
+        let expected_revision =
+            parse_revision_sha256(&params.expected_revision_sha256, "expected_revision_sha256")?;
+        if params.replacement.task_id != params.task_id {
+            return Err(params_error(format!(
+                "task row repair identity mismatch: task_id={:?} replacement.task_id={:?}",
+                params.task_id, params.replacement.task_id
+            )));
+        }
+        if params.replacement.mutation_generation != 0 {
+            return Err(params_error(
+                "task row repair replacement.mutation_generation must be 0; the repair assigns the next durable generation",
+            ));
+        }
+        let db = self.agent_task_db()?;
+        let _mutation_guard = Self::acquire_task_queue_mutation_lock("task_repair_row")?;
+        let row_key = task_key(&params.task_id);
+        let current = db
+            .get_cf_revisioned(cf::CF_KV, row_key.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("read raw task row {row_key} for explicit repair: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::AGENT_TASK_NOT_FOUND,
+                    format!(
+                        "TASK_ROW_REPAIR_ABSENT: {row_key} is physically absent; repair never creates a new task identity"
+                    ),
+                )
+            })?;
+        if current.revision_sha256 != expected_revision {
+            return Err(mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "TASK_ROW_REPAIR_REVISION_MISMATCH: row={row_key} expected_revision={} \
+                     actual_revision={}; perform a new separate physical read before retrying",
+                    params.expected_revision_sha256,
+                    revision_sha256_hex(&current.revision_sha256)
+                ),
+            ));
+        }
+        let previous_value_len_bytes = current.value.as_ref().map_or(0, |value| value.len() as u64);
+        let queue = Self::read_task_queue_state_revisioned(&db)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "TASK_ROW_REPAIR_QUEUE_STATE_MISSING: {TASK_QUEUE_STATE_KEY} must be explicitly repaired before a task row"
+                ),
+            )
+        })?;
+        let sequence = Self::read_enqueue_seq_watermark_revisioned(&db)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "TASK_ROW_REPAIR_SEQUENCE_MISSING: {TASK_SEQUENCE_KEY} must be explicitly repaired before a task row"
+                ),
+            )
+        })?;
+        if params.replacement.enqueue_seq > sequence.value {
+            return Err(params_error(format!(
+                "task row repair replacement.enqueue_seq={} exceeds durable watermark={}; \
+                 repair the watermark to an operator-observed monotonic floor first",
+                params.replacement.enqueue_seq, sequence.value
+            )));
+        }
+        let mut unobservable_other_task_rows = 0_usize;
+        for (key, encoded) in Self::scan_raw_task_values(&db)? {
+            if key == row_key.as_bytes() {
+                continue;
+            }
+            let key_text = String::from_utf8_lossy(&key);
+            match decode_task(&key_text, &encoded) {
+                Ok(task) if task.enqueue_seq == params.replacement.enqueue_seq => {
+                    return Err(params_error(format!(
+                        "task row repair replacement.enqueue_seq={} is already owned by task {:?}; enqueue identities must remain unique",
+                        params.replacement.enqueue_seq, task.task_id
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    unobservable_other_task_rows = unobservable_other_task_rows.saturating_add(1);
+                    tracing::error!(
+                        code = "AGENT_TASK_ROW_REPAIR_OTHER_ROW_UNOBSERVABLE",
+                        row_key = %key_text,
+                        error_code = %error_code_str(&error),
+                        error = %error.message,
+                        "another corrupt task row remains fail-closed during explicit row repair"
+                    );
+                }
+            }
+        }
         let now = unix_time_ms_now();
-        let attempt_id = u32::try_from(task.attempts.len()).unwrap_or(u32::MAX) + 1;
-        task.attempts.push(TaskAttempt {
-            attempt_id,
-            session_id: String::new(),
-            spawn_id: None,
-            template_version: None,
-            outcome: AttemptOutcome::Failed,
-            started_unix_ms: now,
-            ended_unix_ms: Some(now),
-            reason: Some(reason),
-        });
-        task.updated_unix_ms = now;
-        Self::write_task(db, &task)?;
-        Ok(task)
+        let next_queue = Self::next_task_queue_state(&queue.state, now)?;
+        let mut replacement = params.replacement;
+        replacement.schema_version = TASK_SCHEMA_VERSION;
+        replacement.mutation_generation = next_queue.mutation_generation;
+        let encoded_task = encode_task(&replacement)?;
+        decode_task(&row_key, &encoded_task)?;
+        let encoded_queue = Self::encode_task_queue_state(&next_queue)?;
+        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [
+                RevisionGuard::new(TASK_QUEUE_STATE_KEY.as_bytes(), Some(queue.revision_sha256)),
+                RevisionGuard::new(row_key.as_bytes(), Some(expected_revision)),
+            ],
+            std::iter::empty::<Vec<u8>>(),
+            [
+                (TASK_QUEUE_STATE_KEY.as_bytes().to_vec(), encoded_queue),
+                (row_key.as_bytes().to_vec(), encoded_task.clone()),
+            ],
+        );
+        let committed_seq = match outcome {
+            Ok(outcome) if outcome.applied => Some(outcome.committed_seq),
+            Ok(outcome) => {
+                return Err(mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "TASK_ROW_REPAIR_CONFLICT: row={row_key} conflict_guard={:?}; queue or \
+                         row changed after the physical observation, so no repair was applied",
+                        outcome
+                            .conflict
+                            .as_ref()
+                            .map(|conflict| conflict.guard_index)
+                    ),
+                ));
+            }
+            Err(error) => {
+                let stored = db
+                    .get_cf(cf::CF_KV, row_key.as_bytes())
+                    .map_err(|read_error| {
+                        mcp_error(
+                            read_error.code(),
+                            format!(
+                                "TASK_ROW_REPAIR_COMMIT_AMBIGUOUS: row={row_key} commit failed \
+                             ({error}) and exact readback failed ({read_error})"
+                            ),
+                        )
+                    })?;
+                let queue_readback = Self::read_task_queue_state_revisioned(&db)?;
+                if stored.as_deref() == Some(encoded_task.as_slice())
+                    && queue_readback.as_ref().is_some_and(|readback| {
+                        readback.state.mutation_generation >= next_queue.mutation_generation
+                    })
+                {
+                    tracing::warn!(
+                        code = "AGENT_TASK_ROW_REPAIR_AMBIGUOUS_COMMIT_RECONCILED",
+                        task_id = %replacement.task_id,
+                        mutation_generation = next_queue.mutation_generation,
+                        "exact task/queue physical readback proved the repair committed"
+                    );
+                    None
+                } else {
+                    return Err(mcp_error(
+                        error.code(),
+                        format!(
+                            "TASK_ROW_REPAIR_NOT_COMMITTED: row={row_key} guarded repair failed: \
+                             {error}; exact task/queue readback did not prove the requested state"
+                        ),
+                    ));
+                }
+            }
+        };
+        let row_readback =
+            Self::read_task_row_revisioned(&db, &params.task_id)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!("TASK_ROW_REPAIR_READBACK_MISSING: {row_key} is physically absent"),
+                )
+            })?;
+        if row_readback.task != replacement {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "TASK_ROW_REPAIR_READBACK_DRIFT: row={row_key} exact decoded replacement differs after commit"
+                ),
+            ));
+        }
+        let queue_readback = Self::read_task_queue_state_revisioned(&db)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                "TASK_ROW_REPAIR_QUEUE_READBACK_MISSING: queue state disappeared after commit",
+            )
+        })?;
+        if queue_readback.state.mutation_generation < next_queue.mutation_generation {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "TASK_ROW_REPAIR_QUEUE_READBACK_DRIFT: expected_generation_at_least={} actual_generation={}",
+                    next_queue.mutation_generation, queue_readback.state.mutation_generation
+                ),
+            ));
+        }
+        tracing::warn!(
+            code = "AGENT_TASK_ROW_REPAIRED",
+            reason = %params.reason,
+            task_id = %replacement.task_id,
+            previous_revision_sha256 = %params.expected_revision_sha256,
+            previous_value_len_bytes,
+            unobservable_other_task_rows,
+            mutation_generation = replacement.mutation_generation,
+            committed_seq,
+            "explicit revision-bound task row repair completed with physical task/queue readback"
+        );
+        Ok(TaskRowRepairResponse {
+            ok: true,
+            previous_revision_sha256: params.expected_revision_sha256,
+            previous_value_len_bytes,
+            unobservable_other_task_rows,
+            committed_seq,
+            task: replacement,
+            written_row: TaskRowReadback {
+                cf_name: cf::CF_KV.to_owned(),
+                row_key,
+                value_len_bytes: encoded_task.len() as u64,
+            },
+        })
     }
 
     async fn task_dispatch_once_impl(
@@ -1858,10 +3732,14 @@ impl SynapseService {
         let db = self.agent_task_db()?;
         Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
-        let tasks = Self::read_all_tasks(&db)?;
-        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
-        let task_id = match dispatch_decision(&tasks, params.concurrency_cap) {
-            DispatchDecision::Empty => {
+        let wait_timeout_ms = dashboard_task_dispatch_wait_timeout_ms(params.wait_timeout_ms);
+        let (task, reservation_id, in_flight) = match Self::reserve_next_dispatch(
+            &db,
+            params.concurrency_cap,
+            wait_timeout_ms,
+            "mcp_task_dispatch_reserve",
+        )? {
+            DispatchReservationOutcome::Empty { in_flight } => {
                 return Ok(TaskDispatchOnceResponse {
                     ok: true,
                     decision: "empty".to_owned(),
@@ -1871,7 +3749,7 @@ impl SynapseService {
                     concurrency_cap: params.concurrency_cap,
                 });
             }
-            DispatchDecision::AtCapacity { in_flight } => {
+            DispatchReservationOutcome::AtCapacity { in_flight } => {
                 return Ok(TaskDispatchOnceResponse {
                     ok: true,
                     decision: format!("at_capacity:{in_flight}"),
@@ -1881,11 +3759,13 @@ impl SynapseService {
                     concurrency_cap: params.concurrency_cap,
                 });
             }
-            DispatchDecision::Dispatch { task_id } => task_id,
+            DispatchReservationOutcome::Reserved {
+                task,
+                reservation_id,
+                in_flight_before,
+            } => (task, reservation_id, in_flight_before),
         };
-
-        let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
-        let wait_timeout_ms = dashboard_task_dispatch_wait_timeout_ms(params.wait_timeout_ms);
+        let task_id = task.task_id.clone();
         let request = ActSpawnAgentRequest {
             template_id: Some(task.template_id.clone()),
             template_version: None,
@@ -1922,7 +3802,23 @@ impl SynapseService {
                     "dispatch spawn failed [{error_code}]: {}",
                     spawn_error.message
                 );
-                Self::record_failed_attempt_internal(&db, &task_id, reason.clone())?;
+                if let Err(settle_error) = Self::fail_dispatch_reservation(
+                    &db,
+                    &task_id,
+                    &reservation_id,
+                    reason.clone(),
+                    "mcp_task_dispatch_spawn_failed",
+                ) {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_WRITE_FAILED,
+                        format!(
+                            "AGENT_TASK_DISPATCH_FAILURE_SETTLE_FAILED: task={task_id:?} \
+                             reservation={reservation_id} spawn_error={}; settle_error={}; \
+                             durable reservation remains authoritative and requires reconciliation",
+                            spawn_error.message, settle_error.message
+                        ),
+                    ));
+                }
                 tracing::error!(
                     code = "AGENT_TASK_DISPATCH_SPAWN_FAILED",
                     task_id = %task_id,
@@ -1945,34 +3841,49 @@ impl SynapseService {
                 error_code_str(&error),
                 error.message
             );
-            Self::record_failed_attempt_internal(&db, &task_id, reason)?;
+            Self::fail_dispatch_reservation(
+                &db,
+                &task_id,
+                &reservation_id,
+                reason,
+                "mcp_task_dispatch_operator_panic",
+            )?;
             return Err(error);
         }
 
-        let claimed = match Self::claim_internal(
+        let claimed = match Self::bind_dispatch_reservation(
             &db,
             &task_id,
+            &reservation_id,
             &response.session_id,
-            Some(response.spawn_id.clone()),
+            response.spawn_id.clone(),
             response.template_version,
+            "mcp_task_dispatch_bind",
         ) {
-            Ok(task) => task,
+            Ok((task, _readback)) => task,
             Err(claim_error) => {
+                let cleanup = self
+                    .cleanup_spawn_response_after_operator_panic(
+                        &response,
+                        "mcp_task_dispatch_bind_failed",
+                    )
+                    .await;
                 tracing::error!(
-                    code = "AGENT_TASK_DISPATCH_ORPHAN",
+                    code = "AGENT_TASK_DISPATCH_BIND_FAILED",
                     task_id = %task_id,
                     spawn_id = %response.spawn_id,
                     session_id = %response.session_id,
-                    "readback=agent_tasks edge=dispatch_claim_failed: live agent is unbound"
+                    cleanup = %cleanup,
+                    "guarded dispatch bind failed; spawned agent cleanup was attempted"
                 );
                 return Err(mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
                     format!(
-                        "task_dispatch_once spawned agent session {:?} (spawn {:?}) for task {task_id:?} but could not bind the attempt: {}. The agent is live and unbound; use agent_kill on the spawn. Underlying error: {}",
-                        response.session_id,
-                        response.spawn_id,
-                        claim_error.message,
-                        claim_error.message
+                        "task_dispatch_once spawned agent session {:?} (spawn {:?}) for task \
+                         {task_id:?} but could not bind durable reservation {reservation_id}; \
+                         cleanup={cleanup}. The task reservation remains authoritative for \
+                         reconcile. Underlying error: {}",
+                        response.session_id, response.spawn_id, claim_error.message
                     ),
                 ));
             }
@@ -2041,6 +3952,9 @@ impl SynapseService {
         let db = self.agent_task_db()?;
         let before = Self::read_task(&db, &params.task_id)?
             .ok_or_else(|| task_not_found(&params.task_id))?;
+        if before.dispatch_reservation.is_some() {
+            return Err(active_dispatch_reservation_error(&before, "cancel"));
+        }
         let interrupt_target = before.live_attempt().and_then(|attempt| {
             attempt
                 .spawn_id
@@ -2080,10 +3994,14 @@ impl SynapseService {
         let db = self.agent_task_db()?;
         Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
-        let tasks = Self::read_all_tasks(&db)?;
-        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
-        let task_id = match dispatch_decision(&tasks, params.concurrency_cap) {
-            DispatchDecision::Empty => {
+        let wait_timeout_ms = dashboard_task_dispatch_wait_timeout_ms(params.wait_timeout_ms);
+        let (task, reservation_id, in_flight) = match Self::reserve_next_dispatch(
+            &db,
+            params.concurrency_cap,
+            wait_timeout_ms,
+            "dashboard_task_dispatch_reserve",
+        )? {
+            DispatchReservationOutcome::Empty { in_flight } => {
                 return Ok(TaskDispatchOnceResponse {
                     ok: true,
                     decision: "empty".to_owned(),
@@ -2093,7 +4011,7 @@ impl SynapseService {
                     concurrency_cap: params.concurrency_cap,
                 });
             }
-            DispatchDecision::AtCapacity { in_flight } => {
+            DispatchReservationOutcome::AtCapacity { in_flight } => {
                 return Ok(TaskDispatchOnceResponse {
                     ok: true,
                     decision: format!("at_capacity:{in_flight}"),
@@ -2103,10 +4021,13 @@ impl SynapseService {
                     concurrency_cap: params.concurrency_cap,
                 });
             }
-            DispatchDecision::Dispatch { task_id } => task_id,
+            DispatchReservationOutcome::Reserved {
+                task,
+                reservation_id,
+                in_flight_before,
+            } => (task, reservation_id, in_flight_before),
         };
-
-        let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
+        let task_id = task.task_id.clone();
         let request = ActSpawnAgentRequest {
             template_id: Some(task.template_id.clone()),
             template_version: None,
@@ -2119,7 +4040,7 @@ impl SynapseService {
             target: None,
             working_dir: None,
             mcp_url: params.mcp_url,
-            wait_timeout_ms: params.wait_timeout_ms,
+            wait_timeout_ms,
             hold_open_ms: default_agent_spawn_hold_open_ms(),
             require_approval_gate: crate::m4::default_require_approval_gate(),
         };
@@ -2143,7 +4064,24 @@ impl SynapseService {
                     "dashboard dispatch spawn failed [{error_code}]: {}",
                     spawn_error.message
                 );
-                Self::record_failed_attempt_internal(&db, &task_id, reason.clone())?;
+                if let Err(settle_error) = Self::fail_dispatch_reservation(
+                    &db,
+                    &task_id,
+                    &reservation_id,
+                    reason.clone(),
+                    "dashboard_task_dispatch_spawn_failed",
+                ) {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_WRITE_FAILED,
+                        format!(
+                            "AGENT_TASK_DASHBOARD_DISPATCH_FAILURE_SETTLE_FAILED: \
+                             task={task_id:?} reservation={reservation_id} spawn_error={}; \
+                             settle_error={}; durable reservation remains authoritative and \
+                             requires reconciliation",
+                            spawn_error.message, settle_error.message
+                        ),
+                    ));
+                }
                 tracing::error!(
                     code = "AGENT_TASK_DASHBOARD_DISPATCH_SPAWN_FAILED",
                     task_id = %task_id,
@@ -2166,34 +4104,49 @@ impl SynapseService {
                 error_code_str(&error),
                 error.message
             );
-            Self::record_failed_attempt_internal(&db, &task_id, reason)?;
+            Self::fail_dispatch_reservation(
+                &db,
+                &task_id,
+                &reservation_id,
+                reason,
+                "dashboard_task_dispatch_operator_panic",
+            )?;
             return Err(error);
         }
 
-        let claimed = match Self::claim_internal(
+        let claimed = match Self::bind_dispatch_reservation(
             &db,
             &task_id,
+            &reservation_id,
             &response.session_id,
-            Some(response.spawn_id.clone()),
+            response.spawn_id.clone(),
             response.template_version,
+            "dashboard_task_dispatch_bind",
         ) {
-            Ok(task) => task,
+            Ok((task, _readback)) => task,
             Err(claim_error) => {
+                let cleanup = self
+                    .cleanup_spawn_response_after_operator_panic(
+                        &response,
+                        "dashboard_task_dispatch_bind_failed",
+                    )
+                    .await;
                 tracing::error!(
-                    code = "AGENT_TASK_DASHBOARD_DISPATCH_ORPHAN",
+                    code = "AGENT_TASK_DASHBOARD_DISPATCH_BIND_FAILED",
                     task_id = %task_id,
                     spawn_id = %response.spawn_id,
                     session_id = %response.session_id,
-                    "readback=agent_tasks edge=dashboard_dispatch_claim_failed: live agent is unbound"
+                    cleanup = %cleanup,
+                    "guarded dashboard dispatch bind failed; spawned agent cleanup was attempted"
                 );
                 return Err(mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
                     format!(
-                        "dashboard task dispatch spawned agent session {:?} (spawn {:?}) for task {task_id:?} but could not bind the attempt: {}. The agent is live and unbound; use agent_kill on the spawn. Underlying error: {}",
-                        response.session_id,
-                        response.spawn_id,
-                        claim_error.message,
-                        claim_error.message
+                        "dashboard task dispatch spawned agent session {:?} (spawn {:?}) for task \
+                         {task_id:?} but could not bind durable reservation {reservation_id}; \
+                         cleanup={cleanup}. The task reservation remains authoritative for \
+                         reconcile. Underlying error: {}",
+                        response.session_id, response.spawn_id, claim_error.message
                     ),
                 ));
             }

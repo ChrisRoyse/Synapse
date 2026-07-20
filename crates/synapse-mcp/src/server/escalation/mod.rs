@@ -56,11 +56,14 @@ use super::agent_state::{AgentLifecycleState, AgentStateRead, StateTransition};
 use super::notify_tools::{
     MAX_BODY_CHARS, MAX_TITLE_CHARS, NotifyHumanParams, NotifyHumanResponse, NotifyKind,
     PreparedToastPayload, SYNAPSE_AUMID, SYNAPSE_ESCALATION_TOAST_GROUP, SYNAPSE_TOAST_GROUP,
-    ToastCleanupReport, ToastHistoryReadback, ToastPreShowAuthorizer, ToastPreShowFailure,
-    ToastRemovalOutcome, ToastShowAuthority, inspect_internal_escalation_toast,
-    inspect_internal_toast, prepare_internal_escalation_toast, prepared_toast_payload_valid,
+    TOAST_RENDERER_VERSION_CURRENT, TOAST_RENDERER_VERSION_V1, ToastCleanupReport,
+    ToastHistoryReadback, ToastPreShowAuthorizer, ToastPreShowFailure, ToastRemovalOutcome,
+    ToastShowAuthority, inspect_internal_escalation_toast, inspect_internal_toast,
+    legacy_prepared_toast_payload_v1_valid, prepare_internal_escalation_toast,
+    prepared_toast_payload_matches_request, prepared_toast_payload_valid,
     remove_internal_escalation_toast, remove_internal_toast, remove_orphaned_escalation_toasts,
     run_internal_escalation_toast_blocking, toast_tag_for, toast_text_char_allowed,
+    upgrade_prepared_toast_payload_v1,
 };
 use super::session_registry::unix_time_ms_now;
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
@@ -626,15 +629,16 @@ pub(crate) enum Tier0ToastDelivery {
     LegacyUnclassified,
     /// A new-schema escalation has not yet entered the delivery pipeline.
     NotRequested,
-    /// The intent and exact Applied projection generation are durable. No
-    /// WinRT call has been claimed, so retry after restart is safe.
+    /// The intent and exact Applied projection generation are durable.
+    /// `ToastNotifier.Show` has not been claimed, so retry after restart is safe.
     KnownUnsent {
         tag: String,
         projection_generation: TransitionGeneration,
         prepared_at_unix_ms: u64,
     },
-    /// The WinRT side-effect boundary has been claimed. A crash from here has
-    /// an unknown delivery outcome until Action Center history is inspected.
+    /// The `ToastNotifier.Show` side-effect boundary has been claimed. A crash
+    /// from here has an unknown delivery outcome until Action Center history is
+    /// inspected.
     StartedUnknown {
         tag: String,
         projection_generation: TransitionGeneration,
@@ -658,6 +662,18 @@ pub(crate) enum Tier0ToastDelivery {
         dismissed_readback: ToastHistoryReadback,
         verified_at_unix_ms: u64,
         dismissed_at_unix_ms: u64,
+    },
+    /// A matching reserved Tag+Group row physically existed before this caller
+    /// reached the `ToastNotifier.Show` authorizer. The row is quarantined: no
+    /// Show was invoked, no delivery is attributed to this escalation, and no
+    /// automatic replay is allowed while the collision remains unresolved.
+    PreShowCollision {
+        tag: String,
+        projection_generation: TransitionGeneration,
+        error_code: String,
+        error_message: String,
+        history_readback: ToastHistoryReadback,
+        classified_at_unix_ms: u64,
     },
     /// Delivery could not be proved. `side_effect_possible` prevents an unsafe
     /// automatic replay when WinRT may have displayed and then lost/dismissed it.
@@ -854,7 +870,7 @@ impl Tier0LiveClaim {
             return Err(mcp_error(
                 error_codes::STORAGE_CORRUPTED,
                 format!(
-                    "Tier-0 escalation {escalation_id} was claimed by two live callers before WinRT I/O"
+                    "Tier-0 escalation {escalation_id} was claimed by two live callers before ToastNotifier.Show"
                 ),
             ));
         }
@@ -2568,6 +2584,43 @@ fn verify_applied_projection_evidence(
     Ok(())
 }
 
+pub(crate) fn projection_journal_witness_for_anchor(
+    db: &Db,
+    anchor: &str,
+) -> Result<Option<TransitionProjectionJournalWitness>, ErrorData> {
+    let Some(cursor) = read_projection_watermark(db, anchor)? else {
+        return Ok(None);
+    };
+    verify_applied_projection_evidence(db, &cursor.record)?;
+    let journal_key =
+        decode_projection_hex("journal_key_hex", &cursor.record.observed.journal_key_hex)?;
+    let expected_journal_key = synapse_storage::agent_events::agent_event_key(
+        cursor.record.observed.generation.journal_ts_ns,
+        cursor.record.observed.generation.journal_seq,
+    );
+    if journal_key != expected_journal_key {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "Applied transition projection witness key differs from its generation: anchor={anchor:?} generation={:?} stored_key={} expected_key={}",
+                cursor.record.observed.generation,
+                hex_bytes(&journal_key),
+                hex_bytes(&expected_journal_key)
+            ),
+        ));
+    }
+    let journal_value = decode_projection_hex(
+        "journal_value_hex",
+        &cursor.record.observed.journal_value_hex,
+    )?;
+    Ok(Some(TransitionProjectionJournalWitness {
+        generation: cursor.record.observed.generation,
+        journal_key,
+        journal_value,
+        watermark_revision_sha256: cursor.revision_sha256,
+    }))
+}
+
 fn verify_applied_projection_for_transition(
     db: &Db,
     transition: &StateTransition,
@@ -2808,6 +2861,7 @@ fn tier0_delivery_tag(delivery: &Tier0ToastDelivery) -> Option<&str> {
         | Tier0ToastDelivery::StartedUnknown { tag, .. }
         | Tier0ToastDelivery::VerifiedPresent { tag, .. }
         | Tier0ToastDelivery::VerifiedDismissed { tag, .. }
+        | Tier0ToastDelivery::PreShowCollision { tag, .. }
         | Tier0ToastDelivery::Failed { tag, .. }
         | Tier0ToastDelivery::RemovalFailed { tag, .. }
         | Tier0ToastDelivery::Removed { tag, .. } => Some(tag),
@@ -2849,6 +2903,14 @@ fn tier0_removal_payload_binding_valid(item: &EscalationItem, tag: &str) -> bool
     tier0_group_for_exact_tag(item, tag).is_some() && tier0_prepared_binding_valid(item, true)
 }
 
+fn tier0_prepared_request_binding_valid(
+    item: &EscalationItem,
+    prepared: &PreparedToastPayload,
+) -> bool {
+    tier0_notify_params_for_prepared(item, prepared)
+        .is_some_and(|params| prepared_toast_payload_matches_request(prepared, &params, &[]))
+}
+
 fn tier0_prepared_binding_valid(item: &EscalationItem, allow_absent: bool) -> bool {
     match (
         item.tier0_payload_sha256.as_deref(),
@@ -2857,9 +2919,11 @@ fn tier0_prepared_binding_valid(item: &EscalationItem, allow_absent: bool) -> bo
         (None, None) => allow_absent,
         (Some(payload_sha256), Some(prepared)) => {
             is_canonical_sha256(payload_sha256)
-                && prepared_toast_payload_valid(prepared)
                 && prepared.payload_sha256 == payload_sha256
                 && prepared.suppress_popup == item.tier0_quiet_digest
+                && ((prepared_toast_payload_valid(prepared)
+                    && tier0_prepared_request_binding_valid(item, prepared))
+                    || legacy_prepared_toast_payload_v1_valid(prepared))
         }
         _ => false,
     }
@@ -2924,16 +2988,15 @@ fn tier0_readback_identity_shape_valid(
     let Some(expected_group) = tier0_group_for_exact_tag(item, expected_tag) else {
         return false;
     };
+    let Ok(history_count) = usize::try_from(readback.history_count) else {
+        return false;
+    };
     if readback.aumid != SYNAPSE_AUMID
         || readback.group != expected_group
         || readback.tag != expected_tag
-        || readback.history_count > 1
-        || readback.present != (readback.history_count == 1)
-        || match readback.history_count {
-            0 => !readback.payload_sha256s.is_empty() || !readback.expiration_unix_ms.is_empty(),
-            1 => readback.payload_sha256s.len() != 1 || readback.expiration_unix_ms.len() != 1,
-            _ => true,
-        }
+        || readback.present != (history_count > 0)
+        || readback.payload_sha256s.len() != history_count
+        || readback.expiration_unix_ms.len() != history_count
         || readback
             .payload_sha256s
             .iter()
@@ -3036,6 +3099,27 @@ fn validate_tier0_delivery(item: &EscalationItem) -> Result<(), ErrorData> {
                 && !dismissed_readback.present
                 && dismissed_readback.history_count == 0
         }
+        Tier0ToastDelivery::PreShowCollision {
+            tag,
+            projection_generation,
+            error_code,
+            error_message,
+            history_readback,
+            classified_at_unix_ms,
+        } => {
+            !item.tier0_fired
+                && item.tier0_toast_removed.is_none()
+                && *tag == escalation_toast_tag(&item.escalation_id)
+                && tier0_payload_binding_valid(item, tag)
+                && projection_generation.journal_ts_ns > 0
+                && !error_code.is_empty()
+                && !error_message.is_empty()
+                && *classified_at_unix_ms >= item.created_at_unix_ms
+                && tier0_readback_identity_shape_valid(item, tag, history_readback)
+                && history_readback.present
+                && history_readback.history_count > 0
+                && !tier0_readback_contract_valid(item, tag, history_readback)
+        }
         Tier0ToastDelivery::Failed {
             error_code,
             error_message,
@@ -3044,11 +3128,14 @@ fn validate_tier0_delivery(item: &EscalationItem) -> Result<(), ErrorData> {
             history_readback,
             failed_at_unix_ms,
             tag,
-            projection_generation: _,
+            projection_generation,
         } => {
             item.tier0_fired == *delivery_proven_before_failure
                 && item.tier0_toast_removed.is_none()
                 && tier0_payload_binding_valid(item, tag)
+                && projection_generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.journal_ts_ns > 0)
                 && !error_code.is_empty()
                 && !error_message.is_empty()
                 && *side_effect_possible
@@ -3057,8 +3144,8 @@ fn validate_tier0_delivery(item: &EscalationItem) -> Result<(), ErrorData> {
                     tier0_readback_identity_shape_valid(item, tag, readback)
                         && ((!readback.present && readback.history_count == 0)
                             || (readback.present
-                                && readback.history_count == 1
-                                && !tier0_readback_contract_valid(item, tag, readback)))
+                                && (readback.history_count != 1
+                                    || !tier0_readback_contract_valid(item, tag, readback))))
                 })
         }
         Tier0ToastDelivery::RemovalFailed {
@@ -3313,6 +3400,14 @@ pub(crate) struct TransitionGeneration {
     pub(crate) journal_seq: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TransitionProjectionJournalWitness {
+    pub(crate) generation: TransitionGeneration,
+    pub(crate) journal_key: Vec<u8>,
+    pub(crate) journal_value: Vec<u8>,
+    pub(crate) watermark_revision_sha256: [u8; 32],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TransitionProjectionInput {
@@ -3543,6 +3638,30 @@ fn write_item_and_audit_guarded(
         guards: extra_guards,
     } = extra_rows;
     let item_key = item_key(&item.escalation_id);
+    if let ItemWriteGuard::Revision(expected_revision_sha256) = guard
+        && let Some(current) = db
+            .get_cf_revisioned(cf::CF_KV, &item_key)
+            .map_err(storage_error)?
+        && current.revision_sha256 == expected_revision_sha256
+    {
+        let current_value = live_revisioned_value(
+            &current,
+            &format!("escalation monotonic-time guard {}", item.escalation_id),
+        )?;
+        let current_item = decode_item_identity(&item.escalation_id, current_value)?;
+        if item.updated_at_unix_ms < current_item.updated_at_unix_ms {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "revision-guarded escalation mutation would move durable time backward: escalation_id={} event={} current_updated_at_unix_ms={} proposed_updated_at_unix_ms={}; use a fresh mutation-boundary clock clamped to current state",
+                    item.escalation_id,
+                    event,
+                    current_item.updated_at_unix_ms,
+                    item.updated_at_unix_ms
+                ),
+            ));
+        }
+    }
     let item_value = encode_item(item)?;
     let event_id = Uuid::now_v7().simple().to_string();
     let at = item.updated_at_unix_ms;
@@ -4256,12 +4375,47 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 fn scan_item_page(
     db: &Db,
-    start: &[u8],
-    end: &[u8],
-    after_key: Option<&[u8]>,
+    lease: &mut synapse_storage::CoherentScanLease,
 ) -> Result<synapse_storage::FixedWidthScanPage, ErrorData> {
-    db.scan_cf_fixed_width_range_page(cf::CF_KV, start, end, after_key, SCAN_CHUNK_ROWS)
+    db.scan_cf_fixed_width_range_page_coherent(lease, SCAN_CHUNK_ROWS)
         .map_err(storage_error)
+}
+
+fn finish_coherent_scan<T>(
+    db: &Db,
+    lease: &mut synapse_storage::CoherentScanLease,
+    context: &'static str,
+    scan_result: Result<T, ErrorData>,
+) -> Result<T, ErrorData> {
+    let lease_id = lease.lease_id;
+    let snapshot_seq = lease.snapshot_seq;
+    let release_result = db.release_coherent_scan(lease);
+    match (scan_result, release_result) {
+        (Err(scan_error), Ok(_)) => Err(scan_error),
+        (Err(scan_error), Err(release_error)) => Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{context}: {}; additionally failed to release coherent lease_id={lease_id} \
+                 snapshot_seq={snapshot_seq}: {release_error}",
+                scan_error.message
+            ),
+        )),
+        (Ok(_value), Err(error)) => Err(mcp_error(
+            error.code(),
+            format!(
+                "{context}: coherent snapshot release failed lease_id={lease_id} \
+                 snapshot_seq={snapshot_seq}: {error}"
+            ),
+        )),
+        (Ok(_), Ok(false)) => Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{context}: coherent snapshot expired before release lease_id={lease_id} \
+                 snapshot_seq={snapshot_seq}; repeat the bounded one-generation operation"
+            ),
+        )),
+        (Ok(value), Ok(true)) => Ok(value),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -4363,21 +4517,34 @@ fn next_item_page_cursor(
 
 fn scan_item_rows(db: &Db) -> Result<Vec<EscalationItemRow>, ErrorData> {
     let (start, end) = item_scan_bounds();
-    let mut after_key = None;
+    let mut lease = db
+        .pin_cf_fixed_width_range_scan(
+            cf::CF_KV,
+            &start,
+            &end,
+            synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS,
+        )
+        .map_err(storage_error)?;
+    let lease_id = lease.lease_id;
+    let snapshot_seq = lease.snapshot_seq;
     let mut snapshot_telemetry = ItemPageSnapshotTelemetry::default();
     let mut out = Vec::new();
     let mut pages = 0usize;
-    loop {
-        let page = scan_item_page(db, &start, &end, after_key.as_deref())?;
-        pages = pages.saturating_add(1);
-        snapshot_telemetry.observe(page.snapshot_seq)?;
-        let next = next_item_page_cursor(&page, after_key.as_deref())?;
-        out.extend(decode_item_page(db, page.rows)?);
-        let Some(cursor) = next else {
-            break;
-        };
-        after_key = Some(cursor);
-    }
+    let scan_result = (|| -> Result<(), ErrorData> {
+        loop {
+            let cursor_before = lease.next_after().map(ToOwned::to_owned);
+            let page = scan_item_page(db, &mut lease)?;
+            pages = pages.saturating_add(1);
+            snapshot_telemetry.observe(page.snapshot_seq)?;
+            let next = next_item_page_cursor(&page, cursor_before.as_deref())?;
+            out.extend(decode_item_page(db, page.rows)?);
+            if next.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    finish_coherent_scan(db, &mut lease, "ESCALATION_ITEM_SCAN", scan_result)?;
     tracing::debug!(
         code = "ESCALATION_ITEM_SCAN_PAGE_SNAPSHOTS",
         scan_mode = "synchronous",
@@ -4385,7 +4552,9 @@ fn scan_item_rows(db: &Db) -> Result<Vec<EscalationItemRow>, ErrorData> {
         first_snapshot_seq = snapshot_telemetry.first,
         last_snapshot_seq = snapshot_telemetry.last,
         snapshot_seq_changes = snapshot_telemetry.changes,
-        "completed ordered escalation item paging across per-page atomic snapshots"
+        lease_id,
+        snapshot_seq,
+        "completed ordered escalation item paging at one pinned Calyx generation"
     );
     Ok(out)
 }
@@ -4407,51 +4576,73 @@ async fn scan_item_rows_cancellable(
 ) -> Result<Option<CancellableItemScan>, ErrorData> {
     let started = Instant::now();
     let (start, end) = item_scan_bounds();
-    let mut after_key = None;
+    let mut lease = db
+        .pin_cf_fixed_width_range_scan(
+            cf::CF_KV,
+            &start,
+            &end,
+            synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS,
+        )
+        .map_err(storage_error)?;
+    let lease_id = lease.lease_id;
+    let snapshot_seq = lease.snapshot_seq;
     let mut snapshot_telemetry = ItemPageSnapshotTelemetry::default();
     let mut rows = Vec::new();
     let mut pages = 0usize;
     let mut candidate_rows_examined = 0usize;
     let mut expired_rows_skipped = 0usize;
-    loop {
-        if shutdown.is_cancelled() {
-            return Ok(None);
+    let scan_result = async {
+        loop {
+            if shutdown.is_cancelled() {
+                return Ok(None);
+            }
+            let cursor_before = lease.next_after().map(ToOwned::to_owned);
+            let page_started = Instant::now();
+            let page = scan_item_page(db, &mut lease)?;
+            pages = pages.saturating_add(1);
+            candidate_rows_examined =
+                candidate_rows_examined.saturating_add(page.candidate_rows_examined);
+            expired_rows_skipped = expired_rows_skipped.saturating_add(page.expired_rows_skipped);
+            snapshot_telemetry.observe(page.snapshot_seq)?;
+            let next = next_item_page_cursor(&page, cursor_before.as_deref())?;
+            rows.extend(decode_item_page(db, page.rows)?);
+            let page_elapsed_ms = page_started.elapsed().as_millis();
+            if page_elapsed_ms >= WORKER_SLOW_SCAN_LOG_MS {
+                tracing::warn!(
+                    code = "ESCALATION_ITEM_PAGE_SLOW",
+                    page_elapsed_ms,
+                    page_number = pages,
+                    candidate_rows_examined = page.candidate_rows_examined,
+                    expired_rows_skipped = page.expired_rows_skipped,
+                    page_more = page.more,
+                    page_snapshot_seq = page.snapshot_seq,
+                    first_snapshot_seq = snapshot_telemetry.first,
+                    snapshot_seq_changes = snapshot_telemetry.changes,
+                    requested_candidate_rows = SCAN_CHUNK_ROWS,
+                    item_key_len = ITEM_KEY_LEN,
+                    "candidate-bounded escalation item page exceeded the latency budget"
+                );
+            }
+            if shutdown.is_cancelled() {
+                return Ok(None);
+            }
+            if next.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        let page_started = Instant::now();
-        let page = scan_item_page(db, &start, &end, after_key.as_deref())?;
-        pages = pages.saturating_add(1);
-        candidate_rows_examined =
-            candidate_rows_examined.saturating_add(page.candidate_rows_examined);
-        expired_rows_skipped = expired_rows_skipped.saturating_add(page.expired_rows_skipped);
-        snapshot_telemetry.observe(page.snapshot_seq)?;
-        let next = next_item_page_cursor(&page, after_key.as_deref())?;
-        rows.extend(decode_item_page(db, page.rows)?);
-        let page_elapsed_ms = page_started.elapsed().as_millis();
-        if page_elapsed_ms >= WORKER_SLOW_SCAN_LOG_MS {
-            tracing::warn!(
-                code = "ESCALATION_ITEM_PAGE_SLOW",
-                page_elapsed_ms,
-                page_number = pages,
-                candidate_rows_examined = page.candidate_rows_examined,
-                expired_rows_skipped = page.expired_rows_skipped,
-                page_more = page.more,
-                page_snapshot_seq = page.snapshot_seq,
-                first_snapshot_seq = snapshot_telemetry.first,
-                snapshot_seq_changes = snapshot_telemetry.changes,
-                requested_candidate_rows = SCAN_CHUNK_ROWS,
-                item_key_len = ITEM_KEY_LEN,
-                "candidate-bounded escalation item page exceeded the latency budget"
-            );
-        }
-        if shutdown.is_cancelled() {
-            return Ok(None);
-        }
-        let Some(cursor) = next else {
-            break;
-        };
-        after_key = Some(cursor);
-        tokio::task::yield_now().await;
+        Ok(Some(()))
     }
+    .await;
+    let Some(()) = finish_coherent_scan(
+        db,
+        &mut lease,
+        "ESCALATION_ITEM_SCAN_CANCELLABLE",
+        scan_result,
+    )?
+    else {
+        return Ok(None);
+    };
     tracing::debug!(
         code = "ESCALATION_ITEM_SCAN_PAGE_SNAPSHOTS",
         scan_mode = "cancellable",
@@ -4459,7 +4650,9 @@ async fn scan_item_rows_cancellable(
         first_snapshot_seq = snapshot_telemetry.first,
         last_snapshot_seq = snapshot_telemetry.last,
         snapshot_seq_changes = snapshot_telemetry.changes,
-        "completed ordered escalation item paging across per-page atomic snapshots"
+        lease_id,
+        snapshot_seq,
+        "completed ordered escalation item paging at one pinned Calyx generation"
     );
     Ok(Some(CancellableItemScan {
         rows,
@@ -4640,6 +4833,18 @@ fn current_terminal_delete_guard(
             &format!("terminal escalation item {}", candidate.escalation_id),
         )?,
     )?;
+    if item
+        .tier0_prepared_payload
+        .as_ref()
+        .is_some_and(legacy_prepared_toast_payload_v1_valid)
+    {
+        tracing::warn!(
+            code = "ESCALATION_RETENTION_TIER0_PAYLOAD_MIGRATION_REQUIRED",
+            escalation_id = %item.escalation_id,
+            "terminal escalation retention deferred until the schema-v1 frozen toast is rerendered, exact-compared, and durably bound to its logical request"
+        );
+        return Ok(None);
+    }
     if item.status.is_open() || item.updated_at_unix_ms != candidate.scanned_updated_at_unix_ms {
         tracing::info!(
             code = "ESCALATION_RETENTION_CANDIDATE_SUPERSEDED",
@@ -6143,40 +6348,6 @@ fn validate_projection_watermark_page_key(key: &[u8]) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn next_projection_migration_page_cursor(
-    page: &synapse_storage::FixedWidthScanPage,
-    previous: Option<&[u8]>,
-    start: &[u8],
-    end: &[u8],
-) -> Result<Option<Vec<u8>>, ErrorData> {
-    if !page.more {
-        return Ok(None);
-    }
-    let cursor = page.resume_after.clone().ok_or_else(|| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            "projection migration fixed-width page reported more candidates without a resume cursor",
-        )
-    })?;
-    validate_projection_watermark_page_key(&cursor)?;
-    if cursor.as_slice() < start
-        || cursor.as_slice() >= end
-        || previous.is_some_and(|previous| cursor.as_slice() <= previous)
-    {
-        return Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "projection migration fixed-width page returned an out-of-range or non-progressing cursor: start={} end={} previous={} current={}",
-                hex_bytes(start),
-                hex_bytes(end),
-                previous.map_or_else(|| "none".to_owned(), hex_bytes),
-                hex_bytes(&cursor)
-            ),
-        ));
-    }
-    Ok(Some(cursor))
-}
-
 fn read_pending_projection_index_migration(
     db: &Db,
 ) -> Result<Option<PendingProjectionIndexMigrationReadback>, ErrorData> {
@@ -6438,148 +6609,164 @@ fn ensure_pending_projection_index_migration_locked(db: &Db) -> Result<(), Error
     }
 
     let (start, end) = projection_watermark_scan_bounds();
-    let mut after_key = None;
+    let mut lease = db
+        .pin_cf_fixed_width_range_scan(
+            cf::CF_KV,
+            &start,
+            &end,
+            synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS,
+        )
+        .map_err(storage_error)?;
+    let lease_id = lease.lease_id;
+    let pinned_snapshot_seq = lease.snapshot_seq;
     let mut cursor_rows_audited = 0_u64;
     let mut pending_rows_indexed = 0_u64;
     let mut applied_rows_verified = 0_u64;
     let mut pages = 0_u64;
     let mut audit = Sha256::new();
     audit.update(b"synapse.escalation.pending-projection-index-migration.v1\0");
-    loop {
-        let page = db
-            .scan_cf_fixed_width_range_page(
-                cf::CF_KV,
-                &start,
-                &end,
-                after_key.as_deref(),
-                PENDING_PROJECTION_PAGE_ROWS,
-            )
-            .map_err(storage_error)?;
-        let snapshot_seq = page.snapshot_seq.ok_or_else(|| {
-            mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                "projection migration fixed-width page omitted its atomic Calyx snapshot sequence",
-            )
-        })?;
-        let next_after = next_projection_migration_page_cursor(
-            &page,
-            after_key.as_deref(),
-            start.as_slice(),
-            end.as_slice(),
-        )?;
-        pages = pages.saturating_add(1);
-        let page_rows = page.rows.len();
-        for (cursor_key, scanned_value) in page.rows {
-            validate_projection_watermark_page_key(&cursor_key)?;
-            let physical = db
-                .get_cf_revisioned(cf::CF_KV, &cursor_key)
-                .map_err(storage_error)?
-                .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::STORAGE_CORRUPTED,
-                        format!(
-                            "projection cursor disappeared during bounded migration audit: cursor_key={}",
-                            hex_bytes(&cursor_key)
-                        ),
-                    )
-                })?;
-            let physical_value =
-                live_revisioned_value(&physical, "projection migration cursor point read")?;
-            if physical_value != scanned_value {
+    let scan_result = (|| -> Result<(), ErrorData> {
+        loop {
+            let page = db
+                .scan_cf_fixed_width_range_page_coherent(&mut lease, PENDING_PROJECTION_PAGE_ROWS)
+                .map_err(storage_error)?;
+            let snapshot_seq = page.snapshot_seq.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    "projection migration coherent page omitted its pinned Calyx snapshot sequence",
+                )
+            })?;
+            if snapshot_seq != pinned_snapshot_seq {
                 return Err(mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
+                    error_codes::STORAGE_READ_FAILED,
                     format!(
-                        "projection cursor drifted during bounded migration audit: cursor_key={} scanned_sha256={} physical_sha256={} cursor_revision={}",
-                        hex_bytes(&cursor_key),
-                        hex_bytes(&Sha256::digest(&scanned_value)),
-                        hex_bytes(&Sha256::digest(physical_value)),
-                        hex_bytes(&physical.revision_sha256)
+                        "projection migration coherent page escaped its pinned generation: lease_id={lease_id} expected_snapshot_seq={pinned_snapshot_seq} actual_snapshot_seq={snapshot_seq}"
                     ),
                 ));
             }
-            let record = decode_json::<TransitionProjectionWatermark>(physical_value).map_err(
-                |error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "projection cursor decode failed during bounded migration audit: cursor_key={} error={error}",
-                            hex_bytes(&cursor_key)
-                        ),
-                    )
-                },
-            )?;
-            validate_projection_watermark(&cursor_key, &record)?;
-            let cursor = RevisionedTransitionProjectionWatermark {
-                record,
-                value: physical_value.to_vec(),
-                revision_sha256: physical.revision_sha256,
-            };
-            let index = match cursor.record.phase {
-                TransitionProjectionPhase::Pending => {
-                    pending_rows_indexed = pending_rows_indexed.saturating_add(1);
-                    match read_pending_projection_index(db, &cursor.record.anchor)? {
-                        Some(index) => {
-                            validate_pending_projection_index_binding(
-                                &pending_projection_index_key(&cursor.record.anchor),
-                                &index.record,
-                                &cursor_key,
-                                &cursor.value,
-                                &cursor.record,
-                            )?;
-                            index
-                        }
-                        None => migrate_one_pending_projection_index(db, &cursor_key, &cursor)?,
-                    }
-                }
-                TransitionProjectionPhase::Applied => {
-                    applied_rows_verified = applied_rows_verified.saturating_add(1);
-                    verify_applied_projection_evidence(db, &cursor.record)?;
-                    if let Some(index) = read_pending_projection_index(db, &cursor.record.anchor)? {
-                        return Err(mcp_error(
+            pages = pages.saturating_add(1);
+            let page_rows = page.rows.len();
+            for (cursor_key, scanned_value) in page.rows {
+                validate_projection_watermark_page_key(&cursor_key)?;
+                let physical = db
+                    .get_cf_revisioned(cf::CF_KV, &cursor_key)
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        mcp_error(
                             error_codes::STORAGE_CORRUPTED,
                             format!(
-                                "Applied cursor retained Pending work during migration audit: anchor={:?} generation={:?} cursor_key={} index_key={} index_revision={}",
-                                cursor.record.anchor,
-                                cursor.record.observed.generation,
-                                hex_bytes(&cursor_key),
-                                hex_bytes(&pending_projection_index_key(&cursor.record.anchor)),
-                                hex_bytes(&index.revision_sha256)
+                                "projection cursor disappeared during coherent migration audit: lease_id={lease_id} snapshot_seq={pinned_snapshot_seq} cursor_key={}",
+                                hex_bytes(&cursor_key)
                             ),
-                        ));
-                    }
-                    append_projection_migration_audit_witness(
-                        &mut audit,
-                        &cursor_key,
-                        &cursor,
-                        None,
-                    );
-                    cursor_rows_audited = cursor_rows_audited.saturating_add(1);
-                    continue;
+                        )
+                    })?;
+                let physical_value =
+                    live_revisioned_value(&physical, "projection migration cursor point read")?;
+                if physical_value != scanned_value {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "projection cursor drifted while the transition lock and coherent migration snapshot were held: lease_id={lease_id} snapshot_seq={pinned_snapshot_seq} cursor_key={} scanned_sha256={} physical_sha256={} cursor_revision={}",
+                            hex_bytes(&cursor_key),
+                            hex_bytes(&Sha256::digest(&scanned_value)),
+                            hex_bytes(&Sha256::digest(physical_value)),
+                            hex_bytes(&physical.revision_sha256)
+                        ),
+                    ));
                 }
-            };
-            append_projection_migration_audit_witness(
-                &mut audit,
-                &cursor_key,
-                &cursor,
-                Some(index.revision_sha256),
+                let record = decode_json::<TransitionProjectionWatermark>(physical_value).map_err(
+                    |error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "projection cursor decode failed during coherent migration audit: lease_id={lease_id} snapshot_seq={pinned_snapshot_seq} cursor_key={} error={error}",
+                                hex_bytes(&cursor_key)
+                            ),
+                        )
+                    },
+                )?;
+                validate_projection_watermark(&cursor_key, &record)?;
+                let cursor = RevisionedTransitionProjectionWatermark {
+                    record,
+                    value: physical_value.to_vec(),
+                    revision_sha256: physical.revision_sha256,
+                };
+                let index = match cursor.record.phase {
+                    TransitionProjectionPhase::Pending => {
+                        pending_rows_indexed = pending_rows_indexed.saturating_add(1);
+                        match read_pending_projection_index(db, &cursor.record.anchor)? {
+                            Some(index) => {
+                                validate_pending_projection_index_binding(
+                                    &pending_projection_index_key(&cursor.record.anchor),
+                                    &index.record,
+                                    &cursor_key,
+                                    &cursor.value,
+                                    &cursor.record,
+                                )?;
+                                index
+                            }
+                            None => migrate_one_pending_projection_index(db, &cursor_key, &cursor)?,
+                        }
+                    }
+                    TransitionProjectionPhase::Applied => {
+                        applied_rows_verified = applied_rows_verified.saturating_add(1);
+                        verify_applied_projection_evidence(db, &cursor.record)?;
+                        if let Some(index) =
+                            read_pending_projection_index(db, &cursor.record.anchor)?
+                        {
+                            return Err(mcp_error(
+                                error_codes::STORAGE_CORRUPTED,
+                                format!(
+                                    "Applied cursor retained Pending work during migration audit: anchor={:?} generation={:?} cursor_key={} index_key={} index_revision={}",
+                                    cursor.record.anchor,
+                                    cursor.record.observed.generation,
+                                    hex_bytes(&cursor_key),
+                                    hex_bytes(&pending_projection_index_key(&cursor.record.anchor)),
+                                    hex_bytes(&index.revision_sha256)
+                                ),
+                            ));
+                        }
+                        append_projection_migration_audit_witness(
+                            &mut audit,
+                            &cursor_key,
+                            &cursor,
+                            None,
+                        );
+                        cursor_rows_audited = cursor_rows_audited.saturating_add(1);
+                        continue;
+                    }
+                };
+                append_projection_migration_audit_witness(
+                    &mut audit,
+                    &cursor_key,
+                    &cursor,
+                    Some(index.revision_sha256),
+                );
+                cursor_rows_audited = cursor_rows_audited.saturating_add(1);
+            }
+            tracing::debug!(
+                code = "ESCALATION_PENDING_PROJECTION_MIGRATION_PAGE_AUDITED",
+                page_number = pages,
+                page_rows,
+                candidate_rows_examined = page.candidate_rows_examined,
+                expired_rows_skipped = page.expired_rows_skipped,
+                snapshot_seq,
+                lease_id,
+                requested_candidate_rows = PENDING_PROJECTION_PAGE_ROWS,
+                "processed one bounded projection-cursor page from the pinned migration generation"
             );
-            cursor_rows_audited = cursor_rows_audited.saturating_add(1);
+            if !page.more {
+                break;
+            }
         }
-        tracing::debug!(
-            code = "ESCALATION_PENDING_PROJECTION_MIGRATION_PAGE_AUDITED",
-            page_number = pages,
-            page_rows,
-            candidate_rows_examined = page.candidate_rows_examined,
-            expired_rows_skipped = page.expired_rows_skipped,
-            snapshot_seq,
-            requested_candidate_rows = PENDING_PROJECTION_PAGE_ROWS,
-            "processed and discarded one bounded physical projection-cursor migration page"
-        );
-        let Some(next) = next_after else {
-            break;
-        };
-        after_key = Some(next);
-    }
+        Ok(())
+    })();
+    finish_coherent_scan(
+        db,
+        &mut lease,
+        "ESCALATION_PENDING_PROJECTION_INDEX_MIGRATION",
+        scan_result,
+    )?;
 
     let record = PendingProjectionIndexMigrationRecord {
         schema_version: SCHEMA_VERSION,
@@ -6658,8 +6845,10 @@ fn ensure_pending_projection_index_migration_locked(db: &Db) -> Result<(), Error
         pending_rows_indexed,
         applied_rows_verified,
         pages,
+        lease_id,
+        snapshot_seq = pinned_snapshot_seq,
         audit_sha256 = %record.audit_sha256,
-        "durable one-time bounded cursor audit completed before delta-first Pending reconciliation"
+        "durable one-time cursor audit completed from one pinned Calyx generation before delta-first Pending reconciliation"
     );
     Ok(())
 }
@@ -6760,6 +6949,11 @@ fn reconcile_pending_projection_page_locked(
     db: &Db,
     after_key: Option<&[u8]>,
 ) -> Result<PendingProjectionPageReconcile, ErrorData> {
+    // This is deliberately an eventual/restarting work-queue drain, not a
+    // one-generation audit. Each page is atomic and every candidate is
+    // revision/binding checked while the transition lock is held. Inserts
+    // behind `after_key` are picked up when the recurring worker restarts from
+    // the prefix; no completion sentinel is written from this pass.
     let (start, end) = pending_projection_index_scan_bounds();
     let page = db
         .scan_cf_fixed_width_range_page(
@@ -6915,6 +7109,8 @@ fn reconcile_pending_projection_page(
 /// Startup reconciliation drains durable Pending work through bounded physical
 /// pages. Applied cursors are deliberately not part of this recurring workset;
 /// their evidence remains exact-point-verifiable at claim/audit boundaries.
+/// This eventual pass never claims one-snapshot coverage and the worker repeats
+/// it from the prefix so concurrent inserts behind a page cursor remain work.
 pub(crate) fn reconcile_transition_projections(db: &Db) -> Result<usize, ErrorData> {
     ensure_pending_projection_index_migration(db)?;
     let mut after_key = None;
@@ -6955,7 +7151,7 @@ pub(crate) fn reconcile_transition_projections(db: &Db) -> Result<usize, ErrorDa
         expired_rows_skipped,
         pending_index_prefix = PENDING_PROJECTION_INDEX_PREFIX,
         pending_index_key_len = PENDING_PROJECTION_INDEX_KEY_LEN,
-        "all durable Pending transition projections were drained through bounded physical pages"
+        "startup Pending transition projection pass reached the end of its eventual/restarting workset"
     );
     Ok(reconciled)
 }
@@ -7023,7 +7219,7 @@ async fn reconcile_transition_projections_cancellable(
             candidate_rows_examined,
             expired_rows_skipped,
             pending_index_prefix = PENDING_PROJECTION_INDEX_PREFIX,
-            "durable Pending transition projections were drained without scanning Applied cursors"
+            "one eventual/restarting Pending transition projection pass reconciled work without scanning Applied cursors"
         );
     }
     Ok(Some(reconciled))
@@ -7155,7 +7351,7 @@ fn note_transition_locked(
             }
             let item = &mut current.item;
             item.status = EscalationStatus::Resolved;
-            item.updated_at_unix_ms = now_unix_ms;
+            item.updated_at_unix_ms = now_unix_ms.max(item.updated_at_unix_ms);
             item.next_escalate_at_unix_ms = None;
             item.closed_reason = Some(format!("state_change:{new_state}"));
             let mut approval_rows = linked_approval_terminal_rows(
@@ -7550,10 +7746,11 @@ fn ack_escalation(
     escalation_id: &str,
     via: &str,
     note: Option<&str>,
-    now_unix_ms: u64,
 ) -> Result<AckEscalationOutcome, ErrorData> {
     super::agent_state::with_transition_pipeline_lock(|| {
-        ack_escalation_locked(db, escalation_id, via, note, now_unix_ms)
+        let linearized_at_unix_ms =
+            checked_unix_time_ms("escalation acknowledgment linearization boundary")?;
+        ack_escalation_locked(db, escalation_id, via, note, linearized_at_unix_ms)
     })
     .map_err(|detail| {
         mcp_error(
@@ -7570,7 +7767,7 @@ fn ack_escalation_locked(
     escalation_id: &str,
     via: &str,
     note: Option<&str>,
-    now_unix_ms: u64,
+    linearized_at_unix_ms: u64,
 ) -> Result<AckEscalationOutcome, ErrorData> {
     for attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
         let mut current = read_item_revisioned(db, escalation_id)?.ok_or_else(|| {
@@ -7586,9 +7783,10 @@ fn ack_escalation_locked(
                 newly_acked: false,
             });
         }
+        let acknowledged_at_unix_ms = linearized_at_unix_ms.max(current.item.updated_at_unix_ms);
         current.item.status = EscalationStatus::Acked;
-        current.item.updated_at_unix_ms = now_unix_ms;
-        current.item.acked_at_unix_ms = Some(now_unix_ms);
+        current.item.updated_at_unix_ms = acknowledged_at_unix_ms;
+        current.item.acked_at_unix_ms = Some(acknowledged_at_unix_ms);
         current.item.acked_via = Some(via.to_owned());
         current.item.next_escalate_at_unix_ms = None;
         match write_item_and_audit_if_revision(
@@ -7659,7 +7857,6 @@ pub(crate) fn ack_from_approval_item_decision(
     decision: &str,
     note: Option<&str>,
     by_session: &str,
-    now_unix_ms: u64,
 ) -> Result<Option<EscalationItem>, ErrorData> {
     if approval.kind != ApprovalKind::AgentEscalation {
         return Ok(None);
@@ -7705,7 +7902,7 @@ pub(crate) fn ack_from_approval_item_decision(
     })?;
     validate_linked_approval_for_escalation(&linked_item, approval)?;
     let via = format!("approval_decide:{decision}");
-    let outcome = ack_escalation(db, escalation_id, &via, note, now_unix_ms)?;
+    let outcome = ack_escalation(db, escalation_id, &via, note)?;
     tracing::info!(
         code = "ESCALATION_ACKED_FROM_APPROVAL",
         escalation_id,
@@ -7735,7 +7932,6 @@ fn start_webhook_dispatch(
     channel: &WebhookChannel,
     receiver_generation: &str,
     config_revision_sha256: [u8; 32],
-    now_unix_ms: u64,
 ) -> Result<WebhookDispatch, ErrorData> {
     if !valid_receiver_generation(receiver_generation) {
         return Err(mcp_error(
@@ -7768,6 +7964,11 @@ fn start_webhook_dispatch(
     if let Some(current) = current_outbox {
         match current.record.state {
             WebhookOutboxState::InFlight | WebhookOutboxState::PostStarted => {
+                let reconciled_at_unix_ms =
+                    checked_unix_time_ms("recovered webhook outbox reconciliation boundary")?
+                        .max(item.updated_at_unix_ms)
+                        .max(current.record.attempt_started_at_unix_ms)
+                        .max(current.record.updated_at_unix_ms);
                 let post_started = current.record.state == WebhookOutboxState::PostStarted;
                 let (attempt_outcome, outbox_state, error) = if post_started {
                     (
@@ -7799,9 +8000,7 @@ fn start_webhook_dispatch(
                         http_status: current.record.http_status,
                         error: Some(error),
                         signed: current.record.signed,
-                        at_unix_ms: now_unix_ms
-                            .max(current.record.attempt_started_at_unix_ms)
-                            .max(current.record.updated_at_unix_ms),
+                        at_unix_ms: reconciled_at_unix_ms,
                     },
                     state: outbox_state,
                     contract_verified: current.record.contract_verified,
@@ -7824,9 +8023,11 @@ fn start_webhook_dispatch(
                     ));
                 }
                 let mut retry = current.record;
-                let retry_started_at = now_unix_ms
-                    .max(retry.attempt_started_at_unix_ms)
-                    .max(retry.updated_at_unix_ms);
+                let retry_started_at =
+                    checked_unix_time_ms("webhook retry durable-intent boundary")?
+                        .max(item.updated_at_unix_ms)
+                        .max(retry.attempt_started_at_unix_ms)
+                        .max(retry.updated_at_unix_ms);
                 retry.state = WebhookOutboxState::InFlight;
                 retry.attempt_number = retry.attempt_number.saturating_add(1);
                 retry.attempt_started_at_unix_ms = retry_started_at;
@@ -7925,6 +8126,9 @@ fn start_webhook_dispatch(
             ),
         )
     })?;
+    let attempt_started_at_unix_ms =
+        checked_unix_time_ms("webhook initial durable-intent boundary")?
+            .max(item.updated_at_unix_ms);
     let outbox = WebhookOutboxRecord {
         schema_version: SCHEMA_VERSION,
         delivery_id: webhook_delivery_id(&item.escalation_id, &channel.channel_id),
@@ -7940,8 +8144,8 @@ fn start_webhook_dispatch(
         body_json,
         state: WebhookOutboxState::InFlight,
         attempt_number: 1,
-        attempt_started_at_unix_ms: now_unix_ms,
-        updated_at_unix_ms: now_unix_ms,
+        attempt_started_at_unix_ms,
+        updated_at_unix_ms: attempt_started_at_unix_ms,
         contract_verified: false,
         signed: channel.secret.is_some(),
         http_status: None,
@@ -7951,7 +8155,7 @@ fn start_webhook_dispatch(
         response_receipt_state: None,
         post_started_owner_epoch: None,
     };
-    item.updated_at_unix_ms = now_unix_ms;
+    item.updated_at_unix_ms = attempt_started_at_unix_ms;
     let detail = json!({
         "delivery_id": outbox.delivery_id,
         "channel_name": outbox.channel_name,
@@ -8254,6 +8458,12 @@ fn finalize_webhook_delivery(
             result.state
         };
         let mut persisted_attempt = result.attempt.clone();
+        persisted_attempt.at_unix_ms =
+            checked_unix_time_ms("webhook outcome durable-finalization boundary")?
+                .max(persisted_attempt.at_unix_ms)
+                .max(item.updated_at_unix_ms)
+                .max(current_outbox.record.attempt_started_at_unix_ms)
+                .max(current_outbox.record.updated_at_unix_ms);
         if persisted_state == WebhookOutboxState::TerminalFailure
             && result.state == WebhookOutboxState::TransientFailure
         {
@@ -8537,6 +8747,7 @@ fn reconcile_recovered_inflight_outbox(
             error: Some(retry_remediation),
             signed: current.record.signed,
             at_unix_ms: now_unix_ms
+                .max(item.updated_at_unix_ms)
                 .max(current.record.attempt_started_at_unix_ms)
                 .max(current.record.updated_at_unix_ms),
         },
@@ -8656,7 +8867,9 @@ fn stopped_retryable_terminal_record(
             ),
         ));
     }
-    let terminalized_at = now_unix_ms.max(current.record.updated_at_unix_ms);
+    let terminalized_at = now_unix_ms
+        .max(item.updated_at_unix_ms)
+        .max(current.record.updated_at_unix_ms);
     attempt.outcome = terminal_outcome;
     attempt.at_unix_ms = terminalized_at;
     append_terminal_remediation(&mut attempt.error, &remediation);
@@ -8879,6 +9092,7 @@ fn terminalize_deconfigured_outbox(
         item.ladder_index = item.ladder_index.saturating_add(1);
         item.next_escalate_at_unix_ms = None;
         let terminalized_at = now_unix_ms
+            .max(item.updated_at_unix_ms)
             .max(current_outbox.record.attempt_started_at_unix_ms)
             .max(current_outbox.record.updated_at_unix_ms);
         item.updated_at_unix_ms = terminalized_at;
@@ -9159,7 +9373,10 @@ pub(crate) async fn process_pending(
                 let approval_closed = !terminal_rows.is_empty();
                 terminal_rows.extend(terminal_open_index_row(db, &item)?);
                 if !terminal_rows.is_empty() {
-                    item.updated_at_unix_ms = now_unix_ms;
+                    item.updated_at_unix_ms =
+                        checked_unix_time_ms("terminal linked-approval closure boundary")?
+                            .max(now_unix_ms)
+                            .max(item.updated_at_unix_ms);
                     let outcome = write_item_and_audit_with_extra_rows_if_revision(
                         db,
                         &item,
@@ -9197,7 +9414,10 @@ pub(crate) async fn process_pending(
             || agent_state.state.as_str() != item.attention_state
         {
             item.status = EscalationStatus::Resolved;
-            item.updated_at_unix_ms = now_unix_ms;
+            item.updated_at_unix_ms =
+                checked_unix_time_ms("authoritative-state escalation resolution boundary")?
+                    .max(now_unix_ms)
+                    .max(item.updated_at_unix_ms);
             item.next_escalate_at_unix_ms = None;
             let authoritative_state = agent_state.state.as_str();
             let reason = agent_state
@@ -9295,7 +9515,10 @@ pub(crate) async fn process_pending(
         // TTL expiry takes precedence over further delivery.
         if now_unix_ms >= item.expires_at_unix_ms {
             item.status = EscalationStatus::Expired;
-            item.updated_at_unix_ms = now_unix_ms;
+            item.updated_at_unix_ms =
+                checked_unix_time_ms("escalation TTL terminalization boundary")?
+                    .max(now_unix_ms)
+                    .max(item.updated_at_unix_ms);
             item.next_escalate_at_unix_ms = None;
             item.closed_reason = Some("ttl_expired".to_owned());
             let mut approval_rows = linked_approval_terminal_rows(
@@ -9517,7 +9740,6 @@ pub(crate) async fn process_pending(
                     &channel,
                     receiver_generation,
                     config_revision_sha256,
-                    now_unix_ms,
                 )?;
                 let result = match dispatch {
                     WebhookDispatch::Send(outbox) => {
@@ -9622,7 +9844,10 @@ pub(crate) async fn process_pending(
         }
 
         if dirty {
-            item.updated_at_unix_ms = now_unix_ms;
+            item.updated_at_unix_ms =
+                checked_unix_time_ms("escalation worker dirty-item mutation boundary")?
+                    .max(now_unix_ms)
+                    .max(item.updated_at_unix_ms);
             let outcome = write_item_and_audit_if_revision(
                 db,
                 &item,
@@ -9636,17 +9861,199 @@ pub(crate) async fn process_pending(
     Ok(Some(report))
 }
 
+async fn migrate_tier0_payload_v1_if_present(
+    db: &Db,
+    item: &mut EscalationItem,
+    item_revision_sha256: &mut [u8; 32],
+) -> Result<(), ErrorData> {
+    for migration_attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
+        let Some(legacy_payload) = item.tier0_prepared_payload.clone() else {
+            return Ok(());
+        };
+        if prepared_toast_payload_valid(&legacy_payload) {
+            if !tier0_prepared_request_binding_valid(item, &legacy_payload) {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "Tier-0 schema-v2 payload is not bound to its durable escalation request: escalation_id={} payload_sha256={} intent_sha256={}",
+                        item.escalation_id,
+                        legacy_payload.payload_sha256,
+                        legacy_payload.intent_sha256
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        if !legacy_prepared_toast_payload_v1_valid(&legacy_payload) {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "Tier-0 frozen payload is neither valid schema v2 nor an exact migratable schema v1 payload: escalation_id={} schema_version={} payload_sha256={:?} intent_sha256={:?}",
+                    item.escalation_id,
+                    legacy_payload.schema_version,
+                    legacy_payload.payload_sha256,
+                    legacy_payload.intent_sha256
+                ),
+            ));
+        }
+        let uses_legacy_identity = item.tier0_delivery == Tier0ToastDelivery::LegacyUnclassified
+            || tier0_delivery_tag(&item.tier0_delivery)
+                == Some(legacy_escalation_toast_tag(&item.escalation_id).as_str());
+        let logical_params = if uses_legacy_identity {
+            legacy_tier0_notify_params(item)
+        } else {
+            tier0_notify_params_v1(item)
+        };
+        let canonical_probe =
+            prepare_internal_escalation_toast(logical_params.clone(), Vec::new()).await?;
+        let Some(upgraded_payload) = upgrade_prepared_toast_payload_v1(
+            &legacy_payload,
+            &canonical_probe,
+            &logical_params,
+            &[],
+        ) else {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "Tier-0 schema-v1 payload cannot be migrated because the frozen v1 renderer's fresh WinRT canonical readback differs: escalation_id={} legacy_payload_sha256={} rendered_payload_sha256={} canonical_xml_equal={} suppress_popup_equal={} logical_identity={} legacy_renderer_version={}",
+                    item.escalation_id,
+                    legacy_payload.payload_sha256,
+                    canonical_probe.payload_sha256,
+                    legacy_payload.canonical_xml == canonical_probe.canonical_xml,
+                    legacy_payload.suppress_popup == canonical_probe.suppress_popup,
+                    if uses_legacy_identity {
+                        "legacy_tag_group_template"
+                    } else {
+                        "reserved_tag_group_template"
+                    },
+                    TOAST_RENDERER_VERSION_V1,
+                ),
+            ));
+        };
+        let expected_revision = *item_revision_sha256;
+        let outcome = super::agent_state::with_transition_pipeline_lock(|| {
+            let migration_now =
+                checked_unix_time_ms("Tier-0 payload v1-to-v2 migration boundary")?
+                    .max(item.updated_at_unix_ms);
+            let mut updated = item.clone();
+            updated.tier0_prepared_payload = Some(upgraded_payload.clone());
+            updated.updated_at_unix_ms = migration_now;
+            write_item_and_audit_if_revision(
+                db,
+                &updated,
+                "tier0_payload_intent_binding_migrated_v1_to_v2",
+                json!({
+                    "old_schema_version": legacy_payload.schema_version,
+                    "new_schema_version": upgraded_payload.schema_version,
+                    "renderer_version": upgraded_payload.renderer_version,
+                    "payload_sha256": upgraded_payload.payload_sha256,
+                    "intent_sha256": upgraded_payload.intent_sha256,
+                    "canonical_xml_exact_match": true,
+                    "suppress_popup_exact_match": true,
+                    "logical_identity": if uses_legacy_identity {
+                        "legacy_tag_group_template"
+                    } else {
+                        "reserved_tag_group_template"
+                    },
+                    "renderer": "WinRT XmlDocument.LoadXml/GetXml",
+                }),
+                expected_revision,
+            )
+        })
+        .map_err(|detail| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "Tier-0 payload migration could not acquire the transition boundary: escalation_id={} detail={detail}",
+                    item.escalation_id
+                ),
+            )
+        })??;
+        match outcome {
+            ItemWriteOutcome::Applied {
+                revision_sha256,
+                committed_seq,
+            } => {
+                let readback = read_item_revisioned(db, &item.escalation_id)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "Tier-0 payload migration item {} disappeared after committed_seq={committed_seq}",
+                            item.escalation_id
+                        ),
+                    )
+                })?;
+                if readback.item.tier0_prepared_payload.as_ref() != Some(&upgraded_payload)
+                    || readback.item.tier0_payload_sha256
+                        != Some(upgraded_payload.payload_sha256.clone())
+                    || readback.revision_sha256 != revision_sha256
+                {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "Tier-0 payload v1-to-v2 migration readback differed: escalation_id={} expected_payload_sha256={} expected_intent_sha256={} committed_seq={committed_seq}",
+                            item.escalation_id,
+                            upgraded_payload.payload_sha256,
+                            upgraded_payload.intent_sha256
+                        ),
+                    ));
+                }
+                tracing::info!(
+                    code = "ESCALATION_TIER0_PAYLOAD_V2_MIGRATED",
+                    escalation_id = %item.escalation_id,
+                    migration_attempt,
+                    committed_seq,
+                    payload_sha256 = %upgraded_payload.payload_sha256,
+                    intent_sha256 = %upgraded_payload.intent_sha256,
+                    "readback=CF_KV schema-v2 frozen payload preserves exact schema-v1 XML while binding the durable logical request"
+                );
+                *item = readback.item;
+                *item_revision_sha256 = readback.revision_sha256;
+                return Ok(());
+            }
+            ItemWriteOutcome::Conflict { observed_seq, .. } => {
+                tracing::info!(
+                    code = "ESCALATION_TIER0_PAYLOAD_V2_MIGRATION_RETRY",
+                    escalation_id = %item.escalation_id,
+                    migration_attempt,
+                    observed_seq,
+                    "Tier-0 payload migration raced another item transition; rereading and rerendering"
+                );
+                let refreshed = read_item_revisioned(db, &item.escalation_id)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "Tier-0 payload migration lost escalation item {} after a revision conflict",
+                            item.escalation_id
+                        ),
+                    )
+                })?;
+                *item = refreshed.item;
+                *item_revision_sha256 = refreshed.revision_sha256;
+            }
+        }
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "Tier-0 schema-v1 payload for {} could not acquire a stable migration revision after {ACK_REVISION_MAX_ATTEMPTS} attempts",
+            item.escalation_id
+        ),
+    ))
+}
+
 async fn remove_tier0_if_terminal(
     db: &Db,
     item: &mut EscalationItem,
     item_revision_sha256: &mut [u8; 32],
 ) -> Result<bool, ErrorData> {
     if item.status == EscalationStatus::Pending
-        || matches!(
-            item.tier0_delivery,
-            Tier0ToastDelivery::Suppressed { .. } | Tier0ToastDelivery::Removed { .. }
-        )
+        || matches!(item.tier0_delivery, Tier0ToastDelivery::Suppressed { .. })
     {
+        return Ok(false);
+    }
+    if matches!(item.tier0_delivery, Tier0ToastDelivery::Removed { .. }) {
+        migrate_tier0_payload_v1_if_present(db, item, item_revision_sha256).await?;
         return Ok(false);
     }
     if let Tier0ToastDelivery::RemovalFailed {
@@ -9657,6 +10064,7 @@ async fn remove_tier0_if_terminal(
     {
         return Ok(false);
     }
+    migrate_tier0_payload_v1_if_present(db, item, item_revision_sha256).await?;
     let (tag, expected_group) = tier0_reconciliation_identity(item)?;
     let mut absence_only_outcome = if item.tier0_delivery == Tier0ToastDelivery::NotRequested
         && item.tier0_payload_sha256.is_none()
@@ -9765,6 +10173,7 @@ async fn remove_tier0_if_terminal(
         (Some(payload_sha256), Some(prepared))
             if is_canonical_sha256(&payload_sha256)
                 && prepared_toast_payload_valid(&prepared)
+                && tier0_prepared_request_binding_valid(item, &prepared)
                 && prepared.payload_sha256 == payload_sha256 =>
         {
             Some(payload_sha256)
@@ -10295,6 +10704,7 @@ async fn claim_and_fire_tier0(
     prepared_payload: PreparedToastPayload,
 ) -> Result<Tier0ClaimExecution, ErrorData> {
     let escalation_id = notify_item.escalation_id.clone();
+    let collision_prepared_payload = prepared_payload.clone();
     let expected_preflight = prepared_payload.clone();
     let authorization_state = Arc::new(Mutex::new(Tier0AuthorizationState::default()));
     let authorization_state_for_worker = Arc::clone(&authorization_state);
@@ -10400,17 +10810,64 @@ async fn claim_and_fire_tier0(
         )
     })?;
 
-    let mut state = authorization_state.lock().map_err(|poisoned| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "Tier-0 authorization result state is poisoned after notify completion: escalation_id={escalation_id} detail={poisoned}"
-            ),
-        )
-    })?;
-    let Some(claim) = state.claim.take() else {
+    let (claim, expired_before_show) = {
+        let mut state = authorization_state.lock().map_err(|poisoned| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "Tier-0 authorization result state is poisoned after notify completion: escalation_id={escalation_id} detail={poisoned}"
+                ),
+            )
+        })?;
+        (state.claim.take(), state.expired_before_show)
+    };
+    let Some(claim) = claim else {
         return match send_result {
-            Err(error) => Err(error),
+            Err(error) => {
+                let tag = escalation_toast_tag(&escalation_id);
+                let physical_readback = inspect_internal_escalation_toast(tag.clone())
+                    .await
+                    .map_err(|inspection_error| {
+                        mcp_error(
+                            error_codes::NOTIFY_DELIVERY_UNVERIFIED,
+                            format!(
+                                "Tier-0 toast failed before the queue-head authorizer and the mandatory collision readback also failed: escalation_id={escalation_id} original_error={}; inspection_error_code={} inspection_error={}",
+                                error.message,
+                                error_data_symbol(&inspection_error),
+                                inspection_error.message
+                            ),
+                        )
+                    })?;
+                if physical_readback.present {
+                    let classified = classify_tier0_pre_show_collision(
+                        &db,
+                        &escalation_id,
+                        &collision_prepared_payload,
+                        &physical_readback,
+                        &error,
+                    )?;
+                    tracing::warn!(
+                        code = "ESCALATION_TIER0_PRE_SHOW_COLLISION_OBSERVED",
+                        escalation_id,
+                        tag,
+                        classified,
+                        history_count = physical_readback.history_count,
+                        payload_sha256s = ?physical_readback.payload_sha256s,
+                        expiration_unix_ms = ?physical_readback.expiration_unix_ms,
+                        original_error_code = error_data_symbol(&error),
+                        "readback=Action Center contained reserved Tag+Group rows before this caller reached the ToastNotifier.Show authorizer"
+                    );
+                } else {
+                    tracing::warn!(
+                        code = "ESCALATION_TIER0_PRE_SHOW_FAILURE_ABSENT",
+                        escalation_id,
+                        tag,
+                        original_error_code = error_data_symbol(&error),
+                        "readback=Action Center exact reserved Tag+Group was absent after failure before the ToastNotifier.Show authorizer"
+                    );
+                }
+                Err(error)
+            }
             Ok(_) => Err(mcp_error(
                 error_codes::STORAGE_CORRUPTED,
                 format!(
@@ -10419,8 +10876,6 @@ async fn claim_and_fire_tier0(
             )),
         };
     };
-    let expired_before_show = state.expired_before_show;
-    drop(state);
     let send_result = match send_result {
         Err(error) if matches!(claim, Tier0ToastClaim::NoAction) && !expired_before_show => {
             return Err(error);
@@ -10447,6 +10902,228 @@ fn tier0_projection_guard(
             Some(projection.revision_sha256),
         )],
     }
+}
+
+fn classify_tier0_pre_show_collision(
+    db: &Db,
+    escalation_id: &str,
+    prepared_payload: &PreparedToastPayload,
+    history_readback: &ToastHistoryReadback,
+    send_error: &ErrorData,
+) -> Result<bool, ErrorData> {
+    super::agent_state::with_transition_pipeline_lock(|| {
+        classify_tier0_pre_show_collision_locked(
+            db,
+            escalation_id,
+            prepared_payload,
+            history_readback,
+            send_error,
+        )
+    })
+    .map_err(|detail| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "Tier-0 pre-Show collision classification could not acquire the transition/ack boundary: escalation_id={escalation_id} detail={detail}"
+            ),
+        )
+    })?
+}
+
+fn classify_tier0_pre_show_collision_locked(
+    db: &Db,
+    escalation_id: &str,
+    prepared_payload: &PreparedToastPayload,
+    history_readback: &ToastHistoryReadback,
+    send_error: &ErrorData,
+) -> Result<bool, ErrorData> {
+    if !history_readback.present || history_readback.history_count == 0 {
+        return Ok(false);
+    }
+    if !prepared_toast_payload_valid(prepared_payload) {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "Tier-0 pre-Show collision classification received an invalid frozen payload: escalation_id={escalation_id} payload_sha256={:?}",
+                prepared_payload.payload_sha256
+            ),
+        ));
+    }
+    for revision_attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
+        let current = read_item_revisioned(db, escalation_id)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "Tier-0 pre-Show collision classification lost escalation item {escalation_id}"
+                ),
+            )
+        })?;
+        if current.item.status != EscalationStatus::Pending
+            || current.item.tier0_suppressed_reason.is_some()
+        {
+            return Ok(false);
+        }
+        if !tier0_prepared_request_binding_valid(&current.item, prepared_payload) {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "Tier-0 pre-Show collision frozen payload is not bound to the current escalation request: escalation_id={escalation_id} payload_sha256={} intent_sha256={}",
+                    prepared_payload.payload_sha256, prepared_payload.intent_sha256
+                ),
+            ));
+        }
+        match &current.item.tier0_delivery {
+            Tier0ToastDelivery::NotRequested => {}
+            Tier0ToastDelivery::KnownUnsent { .. } => {
+                if current.item.tier0_payload_sha256.as_deref()
+                    != Some(prepared_payload.payload_sha256.as_str())
+                    || current.item.tier0_prepared_payload.as_ref() != Some(prepared_payload)
+                {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "Tier-0 pre-Show collision payload disagrees with durable KnownUnsent intent: escalation_id={escalation_id} durable_sha256={:?} observed_sha256={} exact_payload_equal={}",
+                            current.item.tier0_payload_sha256,
+                            prepared_payload.payload_sha256,
+                            current.item.tier0_prepared_payload.as_ref() == Some(prepared_payload)
+                        ),
+                    ));
+                }
+            }
+            Tier0ToastDelivery::PreShowCollision { .. } => return Ok(true),
+            Tier0ToastDelivery::LegacyUnclassified
+            | Tier0ToastDelivery::StartedUnknown { .. }
+            | Tier0ToastDelivery::VerifiedPresent { .. }
+            | Tier0ToastDelivery::VerifiedDismissed { .. }
+            | Tier0ToastDelivery::Failed { .. }
+            | Tier0ToastDelivery::RemovalFailed { .. }
+            | Tier0ToastDelivery::Removed { .. }
+            | Tier0ToastDelivery::Suppressed { .. } => return Ok(false),
+        }
+        let classify_now_unix_ms =
+            checked_unix_time_ms("Tier-0 pre-Show physical collision classification boundary")?
+                .max(current.item.updated_at_unix_ms);
+        let Some(projection) =
+            applied_projection_for_tier0_claim(db, &current.item, classify_now_unix_ms)?
+        else {
+            return Ok(false);
+        };
+        let expected_tag = escalation_toast_tag(escalation_id);
+        if history_readback.tag != expected_tag
+            || !tier0_readback_identity_shape_valid(&current.item, &expected_tag, history_readback)
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "Tier-0 pre-Show collision readback has an invalid reserved identity/shape: escalation_id={escalation_id} expected_tag={expected_tag} readback={history_readback:?}"
+                ),
+            ));
+        }
+        let generation = projection.record.observed.generation;
+        let mut item = current.item;
+        item.tier0_payload_sha256 = Some(prepared_payload.payload_sha256.clone());
+        item.tier0_prepared_payload = Some(prepared_payload.clone());
+        let expected_expiration_unix_ms = Some(item.expires_at_unix_ms);
+        let physical_contract_matches = history_readback.history_count == 1
+            && history_readback.payload_sha256s.first().map(String::as_str)
+                == Some(prepared_payload.payload_sha256.as_str())
+            && history_readback.expiration_unix_ms.first() == Some(&expected_expiration_unix_ms);
+        if physical_contract_matches {
+            tracing::info!(
+                code = "ESCALATION_TIER0_PRE_SHOW_EXACT_ROW_DEFERRED",
+                escalation_id,
+                revision_attempt,
+                "Action Center contains one exact pre-existing row; leaving the item retriable so the normal durable claim/dedupe path can attribute physical delivery"
+            );
+            return Ok(false);
+        }
+        let error_code = error_data_symbol(send_error);
+        let error_message = format!(
+            "{}; Action Center already contained the reserved Tag+Group before this caller reached the ToastNotifier.Show authorizer; expected_sha256={} actual_sha256={:?} expected_expiration_unix_ms={expected_expiration_unix_ms:?} actual_expiration_unix_ms={:?} history_count={} physical_contract_matches={physical_contract_matches}; Show was not invoked and the physical rows are quarantined",
+            send_error.message,
+            prepared_payload.payload_sha256,
+            history_readback.payload_sha256s,
+            history_readback.expiration_unix_ms,
+            history_readback.history_count,
+        );
+        item.tier0_fired = false;
+        item.tier0_delivery = Tier0ToastDelivery::PreShowCollision {
+            tag: expected_tag.clone(),
+            projection_generation: generation,
+            error_code: error_code.clone(),
+            error_message: error_message.clone(),
+            history_readback: history_readback.clone(),
+            classified_at_unix_ms: classify_now_unix_ms,
+        };
+        item.updated_at_unix_ms = classify_now_unix_ms;
+        let outcome = write_item_and_audit_with_extra_rows_if_revision(
+            db,
+            &item,
+            "tier0_pre_show_physical_collision",
+            json!({
+                "tag": history_readback.tag,
+                "group": history_readback.group,
+                "history_readback": history_readback,
+                "expected_payload_sha256": prepared_payload.payload_sha256,
+                "expected_expiration_unix_ms": expected_expiration_unix_ms,
+                "physical_contract_matches": physical_contract_matches,
+                "toast_show_invoked": false,
+                "error_code": error_code,
+                "error_message": error_message,
+                "source_of_truth": "Windows Action Center history",
+            }),
+            tier0_projection_guard(&item, &projection),
+            current.revision_sha256,
+        )?;
+        match outcome {
+            ItemWriteOutcome::Applied { committed_seq, .. } => {
+                let actual = read_item_revisioned(db, escalation_id)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "Tier-0 pre-Show collision item {escalation_id} disappeared after committed_seq={committed_seq}"
+                        ),
+                    )
+                })?;
+                if actual.item.tier0_delivery != item.tier0_delivery
+                    || actual.item.tier0_payload_sha256 != item.tier0_payload_sha256
+                    || actual.item.tier0_prepared_payload != item.tier0_prepared_payload
+                {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "Tier-0 pre-Show collision durable readback differed: escalation_id={escalation_id} expected={:?} actual={:?} committed_seq={committed_seq}",
+                            item.tier0_delivery, actual.item.tier0_delivery
+                        ),
+                    ));
+                }
+                tracing::warn!(
+                    code = "ESCALATION_TIER0_PRE_SHOW_COLLISION_DURABLE",
+                    escalation_id,
+                    revision_attempt,
+                    committed_seq,
+                    history_count = history_readback.history_count,
+                    payload_sha256s = ?history_readback.payload_sha256s,
+                    expiration_unix_ms = ?history_readback.expiration_unix_ms,
+                    "readback=CF_KV preserves full Action Center collision evidence; ToastNotifier.Show was not invoked"
+                );
+                return Ok(true);
+            }
+            ItemWriteOutcome::Conflict { observed_seq, .. } => tracing::info!(
+                code = "ESCALATION_TIER0_PRE_SHOW_COLLISION_REVISION_RETRY",
+                escalation_id,
+                revision_attempt,
+                observed_seq,
+                "Tier-0 pre-Show collision classification raced another item/projection update; rereading"
+            ),
+        }
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "Tier-0 pre-Show collision for {escalation_id} could not acquire stable item/projection revisions after {ACK_REVISION_MAX_ATTEMPTS} attempts"
+        ),
+    ))
 }
 
 fn claim_tier0_toast_locked(
@@ -10479,6 +11156,7 @@ fn claim_tier0_toast_locked(
                     )
                 })?;
                 if !prepared_toast_payload_valid(prepared_payload)
+                    || !tier0_prepared_request_binding_valid(&current.item, prepared_payload)
                     || prepared_payload.suppress_popup != current.item.tier0_quiet_digest
                 {
                     return Err(mcp_error(
@@ -10574,6 +11252,7 @@ fn claim_tier0_toast_locked(
             }
             Tier0ToastDelivery::VerifiedPresent { .. }
             | Tier0ToastDelivery::VerifiedDismissed { .. }
+            | Tier0ToastDelivery::PreShowCollision { .. }
             | Tier0ToastDelivery::Failed { .. }
             | Tier0ToastDelivery::RemovalFailed { .. }
             | Tier0ToastDelivery::Removed { .. }
@@ -10602,6 +11281,7 @@ fn claim_tier0_toast_locked(
                     )
                 })?;
                 if !prepared_toast_payload_valid(prepared_payload)
+                    || !tier0_prepared_request_binding_valid(&item, prepared_payload)
                     || prepared_payload.suppress_popup != item.tier0_quiet_digest
                 {
                     return Err(mcp_error(
@@ -10625,7 +11305,7 @@ fn claim_tier0_toast_locked(
                         "tag": tag,
                         "state": "known_unsent",
                         "projection_generation": generation,
-                        "network_io": "not_started",
+                        "toast_show_not_started": true,
                         "payload_sha256": prepared_payload.payload_sha256,
                         "payload_schema_version": prepared_payload.schema_version,
                     }),
@@ -10732,7 +11412,7 @@ fn claim_tier0_toast_locked(
                     revision_attempt,
                     committed_seq,
                     state = ?item.tier0_delivery,
-                    "readback=CF_KV Tier-0 state and exact Applied projection guard committed before WinRT I/O"
+                    "readback=CF_KV Tier-0 state and exact Applied projection guard committed before ToastNotifier.Show"
                 );
                 if matches!(
                     item.tier0_delivery,
@@ -10874,7 +11554,11 @@ fn restore_known_unsent_before_show_locked(
     ))
 }
 
-fn tier0_project_text(label: &str, value: &str, max_chars: usize) -> String {
+/// Frozen renderer used only to prove and migrate schema-v1 payload bytes. It
+/// intentionally preserves the historical character-level truncation contract,
+/// including a possible partial `[U+NNNN]` token at the boundary. New payloads
+/// must use `tier0_project_text` (renderer v2) below.
+fn tier0_project_text_v1(label: &str, value: &str, max_chars: usize) -> String {
     let original_chars = value.chars().count();
     let mut escaped_codepoints = 0_usize;
     let mut xml_safe = String::with_capacity(value.len());
@@ -10900,9 +11584,60 @@ fn tier0_project_text(label: &str, value: &str, max_chars: usize) -> String {
     let marker = format!(
         "[… projected; original_chars={original_chars}; escaped_codepoints={escaped_codepoints}; source_sha256={source_sha256}]"
     );
+    let keep_chars = max_chars.saturating_sub(marker.chars().count());
+    let mut projected = xml_safe.chars().take(keep_chars).collect::<String>();
+    projected.push_str(&marker);
+    tracing::info!(
+        code = "ESCALATION_TIER0_TEXT_PROJECTED_V1_MIGRATION",
+        label,
+        original_chars,
+        escaped_codepoints,
+        projected_chars = projected.chars().count(),
+        source_sha256,
+        renderer_version = TOAST_RENDERER_VERSION_V1,
+        "frozen renderer v1 reproduced historical Tier-0 projection bytes for exact payload migration only"
+    );
+    projected
+}
+
+fn tier0_project_text(label: &str, value: &str, max_chars: usize) -> String {
+    let mut original_chars = 0_usize;
+    let mut escaped_codepoints = 0_usize;
+    for character in value.chars() {
+        original_chars += 1;
+        if !toast_text_char_allowed(character) {
+            escaped_codepoints += 1;
+        }
+    }
+    if escaped_codepoints == 0 && original_chars <= max_chars {
+        return value.to_owned();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-tier0-text-projection-v1\0");
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    let source_sha256 = hex_bytes(&hasher.finalize());
+    let marker = format!(
+        "[… projected; original_chars={original_chars}; escaped_codepoints={escaped_codepoints}; source_sha256={source_sha256}]"
+    );
     let marker_chars = marker.chars().count();
     let keep_chars = max_chars.saturating_sub(marker_chars);
-    let mut projected = xml_safe.chars().take(keep_chars).collect::<String>();
+    let mut projected = String::with_capacity(max_chars);
+    let mut projected_chars = 0_usize;
+    for character in value.chars() {
+        let token = if toast_text_char_allowed(character) {
+            character.to_string()
+        } else {
+            format!("[U+{:04X}]", character as u32)
+        };
+        let token_chars = token.chars().count();
+        if projected_chars.saturating_add(token_chars) > keep_chars {
+            break;
+        }
+        projected.push_str(&token);
+        projected_chars += token_chars;
+    }
     projected.push_str(&marker);
     tracing::info!(
         code = "ESCALATION_TIER0_TEXT_PROJECTED",
@@ -10911,6 +11646,7 @@ fn tier0_project_text(label: &str, value: &str, max_chars: usize) -> String {
         escaped_codepoints,
         projected_chars = projected.chars().count(),
         source_sha256,
+        renderer_version = TOAST_RENDERER_VERSION_CURRENT,
         digest_domain = "synapse-tier0-text-projection-v1",
         "Tier-0 toast uses a bounded deterministic projection; source_sha256 binds the full source and full context remains durable in CF_KV"
     );
@@ -10949,6 +11685,36 @@ fn tier0_notify_params(item: &EscalationItem) -> NotifyHumanParams {
     }
 }
 
+fn tier0_notify_params_v1(item: &EscalationItem) -> NotifyHumanParams {
+    let title_prefix = "Synapse: ";
+    let title_suffix = format!(" [{}]", item.severity.as_str());
+    let action_chars = MAX_TITLE_CHARS
+        .saturating_sub(title_prefix.chars().count())
+        .saturating_sub(title_suffix.chars().count());
+    let action = tier0_project_text_v1("title_action", &item.context.action, action_chars);
+    let title = format!("{title_prefix}{action}{title_suffix}");
+
+    let anchor = tier0_project_text_v1("anchor", &item.anchor, 256);
+    let identity = format!("Agent: {anchor}\nEscalation: {}", item.escalation_id);
+    let mut context = format!("Reason: {}", item.context.reason);
+    if let Some(waiting) = &item.context.waiting_for {
+        context.push_str("\nWaiting on: ");
+        context.push_str(waiting);
+    }
+    let context_chars = MAX_BODY_CHARS
+        .saturating_sub(identity.chars().count())
+        .saturating_sub(1);
+    let context = tier0_project_text_v1("reason_waiting_context", &context, context_chars);
+    let body = format!("{identity}\n{context}");
+    NotifyHumanParams {
+        title,
+        body,
+        kind: item.severity.notify_kind(),
+        dedupe_key: Some(escalation_toast_dedupe_key(&item.escalation_id)),
+        suppress_popup: item.tier0_quiet_digest,
+    }
+}
+
 /// Recreates the exact payload template shipped before the reserved Tier-0
 /// namespace migration. Legacy rows are never trusted by Tag+Group alone: the
 /// canonical WinRT digest of this frozen template must bind physical history.
@@ -10973,17 +11739,38 @@ fn legacy_tier0_notify_params(item: &EscalationItem) -> NotifyHumanParams {
 }
 
 fn tier0_notify_params_for_state(item: &EscalationItem) -> NotifyHumanParams {
-    if item.tier0_delivery == Tier0ToastDelivery::LegacyUnclassified {
+    let legacy_tag = legacy_escalation_toast_tag(&item.escalation_id);
+    if item.tier0_delivery == Tier0ToastDelivery::LegacyUnclassified
+        || tier0_delivery_tag(&item.tier0_delivery) == Some(legacy_tag.as_str())
+    {
         legacy_tier0_notify_params(item)
     } else {
         tier0_notify_params(item)
     }
 }
 
+fn tier0_notify_params_for_prepared(
+    item: &EscalationItem,
+    prepared: &PreparedToastPayload,
+) -> Option<NotifyHumanParams> {
+    let legacy_tag = legacy_escalation_toast_tag(&item.escalation_id);
+    if item.tier0_delivery == Tier0ToastDelivery::LegacyUnclassified
+        || tier0_delivery_tag(&item.tier0_delivery) == Some(legacy_tag.as_str())
+    {
+        return Some(legacy_tier0_notify_params(item));
+    }
+    match prepared.renderer_version {
+        TOAST_RENDERER_VERSION_V1 => Some(tier0_notify_params_v1(item)),
+        TOAST_RENDERER_VERSION_CURRENT => Some(tier0_notify_params(item)),
+        _ => None,
+    }
+}
+
 async fn prepare_tier0_payload(item: &EscalationItem) -> Result<PreparedToastPayload, ErrorData> {
-    let prepared =
-        prepare_internal_escalation_toast(tier0_notify_params_for_state(item), Vec::new()).await?;
+    let params = tier0_notify_params_for_state(item);
+    let prepared = prepare_internal_escalation_toast(params.clone(), Vec::new()).await?;
     if !prepared_toast_payload_valid(&prepared)
+        || !prepared_toast_payload_matches_request(&prepared, &params, &[])
         || !is_canonical_sha256(&prepared.payload_sha256)
         || prepared.suppress_popup != item.tier0_quiet_digest
     {
@@ -11007,8 +11794,20 @@ fn fire_tier0_blocking(
     frozen_payload: PreparedToastPayload,
     pre_show_authorizer: ToastPreShowAuthorizer,
 ) -> Result<Option<NotifyHumanResponse>, ErrorData> {
+    let params = tier0_notify_params_for_prepared(item, &frozen_payload).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "Tier-0 frozen payload selected an unsupported renderer: escalation_id={} schema_version={} renderer_version={} payload_sha256={}",
+                item.escalation_id,
+                frozen_payload.schema_version,
+                frozen_payload.renderer_version,
+                frozen_payload.payload_sha256
+            ),
+        )
+    })?;
     run_internal_escalation_toast_blocking(
-        tier0_notify_params_for_state(item),
+        params,
         escalation_toast_tag(&item.escalation_id),
         Vec::new(),
         frozen_payload,
@@ -11281,6 +12080,7 @@ fn classify_tier0_history_locked(
             }
             Tier0ToastDelivery::VerifiedPresent { .. }
             | Tier0ToastDelivery::VerifiedDismissed { .. } => return Ok(Some(true)),
+            Tier0ToastDelivery::PreShowCollision { .. } => return Ok(Some(false)),
             Tier0ToastDelivery::Failed { .. } => return Ok(Some(false)),
             Tier0ToastDelivery::NotRequested
             | Tier0ToastDelivery::KnownUnsent { .. }
@@ -11332,21 +12132,19 @@ fn classify_tier0_history_locked(
             && readback.history_count == 1
             && readback.expiration_unix_ms.first() == Some(&expected_expiration_unix_ms);
         let physical_identity_matches = payload_matches && expiration_matches;
-        let classified_at = now_unix_ms.max(current.item.updated_at_unix_ms);
+        let classified_at = checked_unix_time_ms("Tier-0 physical classification boundary")?
+            .max(now_unix_ms)
+            .max(current.item.updated_at_unix_ms);
         let legacy_compatibility_delivery_proven = current.item.tier0_delivery
             == Tier0ToastDelivery::LegacyUnclassified
             && current.item.tier0_fired;
         let legacy_compatibility_verified_at = current.item.updated_at_unix_ms;
-        let delivery_proof_source = if send_verified {
-            "current send exact Action Center readback"
-        } else if legacy_compatibility_delivery_proven {
-            "legacy tier0_fired compatibility proof"
-        } else {
-            "none"
-        };
+        let delivery_proven_before_classification = current.item.tier0_fired;
         let mut item = current.item;
         let delivery_proven;
+        let delivery_proof_source;
         let event = if physical_identity_matches {
+            delivery_proof_source = "separate Action Center exact payload and expiration readback";
             item.tier0_fired = true;
             item.tier0_delivery = Tier0ToastDelivery::VerifiedPresent {
                 tag: readback.tag.clone(),
@@ -11357,6 +12155,11 @@ fn classify_tier0_history_locked(
             delivery_proven = true;
             "tier0_verified_present"
         } else if (send_verified || legacy_compatibility_delivery_proven) && !readback.present {
+            delivery_proof_source = if send_verified {
+                "current send exact Action Center delivery readback followed by separate absence"
+            } else {
+                "legacy tier0_fired compatibility proof followed by separate absence"
+            };
             item.tier0_fired = true;
             item.tier0_delivery = Tier0ToastDelivery::VerifiedDismissed {
                 tag: readback.tag.clone(),
@@ -11377,6 +12180,13 @@ fn classify_tier0_history_locked(
                 "tier0_legacy_verified_then_dismissed"
             }
         } else {
+            delivery_proof_source = if send_verified {
+                "current send exact Action Center delivery proof retained; subsequent physical contract rejected"
+            } else if delivery_proven_before_classification {
+                "prior compatibility delivery proof retained; current physical contract rejected"
+            } else {
+                "no accepted delivery proof; current physical contract rejected"
+            };
             let error_code = send_error.map_or_else(
                 || error_codes::NOTIFY_DELIVERY_UNVERIFIED.to_owned(),
                 error_data_symbol,
@@ -11393,7 +12203,8 @@ fn classify_tier0_history_locked(
                 || physical_detail.clone(),
                 |error| format!("{}; {physical_detail}", error.message),
             );
-            let delivery_proven_before_failure = item.tier0_fired;
+            let delivery_proven_before_failure = item.tier0_fired || send_verified;
+            item.tier0_fired = delivery_proven_before_failure;
             item.tier0_delivery = Tier0ToastDelivery::Failed {
                 tag: readback.tag.clone(),
                 projection_generation: Some(generation),
@@ -11417,15 +12228,21 @@ fn classify_tier0_history_locked(
                 "group": readback.group,
                 "history_count": readback.history_count,
                 "present": readback.present,
+                "history_readback": readback,
                 "payload_matches": payload_matches,
                 "expiration_matches": expiration_matches,
                 "expected_expiration_unix_ms": expected_expiration_unix_ms,
                 "actual_expiration_unix_ms": readback.expiration_unix_ms,
                 "send_verified_before_separate_read": send_verified,
-                "delivery_proof_before_classification": item.tier0_fired,
+                "delivery_proof_before_classification": delivery_proven_before_classification,
+                "delivery_proof_after_classification": item.tier0_fired,
                 "delivery_proof_source": delivery_proof_source,
                 "send_error_code": send_error.map(error_data_symbol),
                 "send_error_message": send_error.map(|error| error.message.to_string()),
+                "physical_failure_message": match &item.tier0_delivery {
+                    Tier0ToastDelivery::Failed { error_message, .. } => Some(error_message),
+                    _ => None,
+                },
                 "source_of_truth": "Windows Action Center history",
             }),
             guards,
@@ -11494,12 +12311,18 @@ async fn drive_tier0_delivery(
     escalation_id: &str,
     _sweep_now_unix_ms: u64,
 ) -> Result<Tier0ProcessOutcome, ErrorData> {
-    let preflight_item = read_item_revisioned(db, escalation_id)?.ok_or_else(|| {
+    let mut preflight_item = read_item_revisioned(db, escalation_id)?.ok_or_else(|| {
         mcp_error(
             error_codes::STORAGE_CORRUPTED,
             format!("Tier-0 preflight has no escalation item {escalation_id}"),
         )
     })?;
+    migrate_tier0_payload_v1_if_present(
+        db,
+        &mut preflight_item.item,
+        &mut preflight_item.revision_sha256,
+    )
+    .await?;
     if preflight_item.item.status != EscalationStatus::Pending
         || preflight_item.item.tier0_suppressed_reason.is_some()
     {
@@ -11508,6 +12331,7 @@ async fn drive_tier0_delivery(
     match &preflight_item.item.tier0_delivery {
         Tier0ToastDelivery::VerifiedPresent { .. }
         | Tier0ToastDelivery::VerifiedDismissed { .. }
+        | Tier0ToastDelivery::PreShowCollision { .. }
         | Tier0ToastDelivery::Failed { .. }
         | Tier0ToastDelivery::RemovalFailed { .. }
         | Tier0ToastDelivery::Removed { .. }
@@ -11520,6 +12344,7 @@ async fn drive_tier0_delivery(
     let prepared_payload = match preflight_item.item.tier0_prepared_payload.clone() {
         Some(prepared)
             if prepared_toast_payload_valid(&prepared)
+                && tier0_prepared_request_binding_valid(&preflight_item.item, &prepared)
                 && prepared.suppress_popup == preflight_item.item.tier0_quiet_digest =>
         {
             prepared
@@ -11643,7 +12468,7 @@ async fn drive_tier0_delivery(
         Some(false) => Err(mcp_error(
             error_codes::NOTIFY_DELIVERY_UNVERIFIED,
             format!(
-                "Tier-0 toast {escalation_id} is absent after its started/legacy ambiguity boundary; durable state is failed and automatic replay is disabled"
+                "Tier-0 toast {escalation_id} failed or had an ambiguous physical contract after its started/legacy boundary; durable state preserves the full Action Center readback and automatic replay is disabled"
             ),
         )),
         None => Ok(Tier0ProcessOutcome::NoAction),
@@ -12975,7 +13800,6 @@ impl SynapseService {
             &params.escalation_id,
             "escalation_ack_tool",
             params.note.as_deref(),
-            unix_time_ms_now(),
         )?;
         Ok(Json(EscalationAckResponse {
             escalation: outcome.escalation,

@@ -38,7 +38,9 @@ pub(crate) const SYNAPSE_ESCALATION_TOAST_GROUP: &str = "synapse-escalation-v1";
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 pub(crate) const MAX_BODY_CHARS: usize = 2000;
 const MAX_DEDUPE_KEY_CHARS: usize = 256;
-const TOAST_PAYLOAD_SCHEMA_VERSION: u32 = 1;
+const TOAST_PAYLOAD_SCHEMA_VERSION: u32 = 2;
+pub(crate) const TOAST_RENDERER_VERSION_V1: u32 = 1;
+pub(crate) const TOAST_RENDERER_VERSION_CURRENT: u32 = 2;
 const MAX_FROZEN_TOAST_XML_BYTES: usize = 32 * 1024;
 #[cfg(windows)]
 const HISTORY_VERIFY_TIMEOUT_MS: u64 = 3_000;
@@ -181,11 +183,21 @@ pub(crate) struct ToastCleanupReport {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedToastPayload {
     pub schema_version: u32,
+    /// Logical renderer contract used to derive the request bound below. V1 is
+    /// retained only to verify/migrate exact historical bytes; all new payloads
+    /// use the current renderer.
+    #[serde(default)]
+    pub renderer_version: u32,
     /// Exact canonical WinRT LoadXml/GetXml output frozen before authorization.
     pub canonical_xml: String,
     pub suppress_popup: bool,
     /// Domain-separated digest over schema marker, suppress-popup, and XML.
     pub payload_sha256: String,
+    /// Domain-separated binding of the exact logical request, action list,
+    /// renderer schema, and `payload_sha256`. This prevents a self-consistent
+    /// frozen XML payload from being copied onto a different request.
+    #[serde(default)]
+    pub intent_sha256: String,
 }
 
 #[cfg(not(windows))]
@@ -473,12 +485,122 @@ fn toast_payload_digest(canonical_xml: &str, suppress_popup: bool) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn hash_intent_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn toast_intent_digest(
+    params: &NotifyHumanParams,
+    actions: &[ToastAction],
+    payload_sha256: &str,
+    renderer_version: u32,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-toast-intent-v1\0");
+    hasher.update(TOAST_PAYLOAD_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(renderer_version.to_le_bytes());
+    hash_intent_field(&mut hasher, params.title.as_bytes());
+    hash_intent_field(&mut hasher, params.body.as_bytes());
+    hash_intent_field(&mut hasher, params.kind.as_str().as_bytes());
+    match params.dedupe_key.as_deref() {
+        Some(dedupe_key) => {
+            hasher.update([1]);
+            hash_intent_field(&mut hasher, dedupe_key.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update([u8::from(params.suppress_popup)]);
+    hasher.update((actions.len() as u64).to_le_bytes());
+    for action in actions {
+        hash_intent_field(&mut hasher, action.content.as_bytes());
+        hash_intent_field(&mut hasher, action.arguments.as_bytes());
+        hash_intent_field(
+            &mut hasher,
+            action.activation_type.as_xml_value().as_bytes(),
+        );
+    }
+    hash_intent_field(&mut hasher, payload_sha256.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 pub(crate) fn prepared_toast_payload_valid(payload: &PreparedToastPayload) -> bool {
     payload.schema_version == TOAST_PAYLOAD_SCHEMA_VERSION
+        && matches!(
+            payload.renderer_version,
+            TOAST_RENDERER_VERSION_V1 | TOAST_RENDERER_VERSION_CURRENT
+        )
         && !payload.canonical_xml.is_empty()
         && payload.canonical_xml.len() <= MAX_FROZEN_TOAST_XML_BYTES
         && toast_payload_digest(&payload.canonical_xml, payload.suppress_popup)
             == payload.payload_sha256
+        && canonical_sha256(&payload.intent_sha256)
+}
+
+pub(crate) fn legacy_prepared_toast_payload_v1_valid(payload: &PreparedToastPayload) -> bool {
+    payload.schema_version == 1
+        && payload.renderer_version == 0
+        && payload.intent_sha256.is_empty()
+        && !payload.canonical_xml.is_empty()
+        && payload.canonical_xml.len() <= MAX_FROZEN_TOAST_XML_BYTES
+        && toast_payload_digest(&payload.canonical_xml, payload.suppress_popup)
+            == payload.payload_sha256
+}
+
+pub(crate) fn prepared_toast_payload_matches_request(
+    payload: &PreparedToastPayload,
+    params: &NotifyHumanParams,
+    actions: &[ToastAction],
+) -> bool {
+    prepared_toast_payload_valid(payload)
+        && toast_intent_digest(
+            params,
+            actions,
+            &payload.payload_sha256,
+            payload.renderer_version,
+        ) == payload.intent_sha256
+}
+
+pub(crate) fn upgrade_prepared_toast_payload_v1(
+    legacy: &PreparedToastPayload,
+    canonical_probe: &PreparedToastPayload,
+    params: &NotifyHumanParams,
+    actions: &[ToastAction],
+) -> Option<PreparedToastPayload> {
+    let legacy_is_valid = legacy_prepared_toast_payload_v1_valid(legacy);
+    let canonical_probe_is_valid = prepared_toast_payload_valid(canonical_probe);
+    if !legacy_is_valid
+        || !canonical_probe_is_valid
+        || legacy.canonical_xml != canonical_probe.canonical_xml
+        || legacy.suppress_popup != canonical_probe.suppress_popup
+        || legacy.payload_sha256 != canonical_probe.payload_sha256
+    {
+        return None;
+    }
+    Some(PreparedToastPayload {
+        schema_version: TOAST_PAYLOAD_SCHEMA_VERSION,
+        renderer_version: TOAST_RENDERER_VERSION_V1,
+        canonical_xml: legacy.canonical_xml.clone(),
+        suppress_popup: legacy.suppress_popup,
+        payload_sha256: legacy.payload_sha256.clone(),
+        intent_sha256: toast_intent_digest(
+            params,
+            actions,
+            &legacy.payload_sha256,
+            TOAST_RENDERER_VERSION_V1,
+        ),
+    })
 }
 
 fn notify_request_details(params: &NotifyHumanParams, tag: &str) -> Value {
@@ -509,9 +631,10 @@ mod windows_toast {
         HISTORY_VERIFY_POLL_MS, HISTORY_VERIFY_TIMEOUT_MS, HistoryInspection,
         MAX_FROZEN_TOAST_XML_BYTES, NotifyFailure, NotifyHumanParams, PreparedToastPayload,
         SYNAPSE_AUMID, SYNAPSE_ESCALATION_TOAST_GROUP, SYNAPSE_NOTIFY_DISPLAY_NAME,
-        TOAST_PAYLOAD_SCHEMA_VERSION, ToastAction, ToastActivationCallback, ToastCleanupReport,
-        ToastOutcome, ToastPreShowAuthorizer, ToastRemovalOutcome, error_codes,
-        is_escalation_toast_tag, toast_payload_digest, toast_xml_with_actions,
+        TOAST_PAYLOAD_SCHEMA_VERSION, TOAST_RENDERER_VERSION_CURRENT, TOAST_RENDERER_VERSION_V1,
+        ToastAction, ToastActivationCallback, ToastCleanupReport, ToastOutcome,
+        ToastPreShowAuthorizer, ToastRemovalOutcome, error_codes, is_escalation_toast_tag,
+        toast_intent_digest, toast_payload_digest, toast_xml_with_actions,
     };
     use std::{
         collections::{BTreeSet, VecDeque},
@@ -1706,14 +1829,20 @@ mod windows_toast {
                 format!("XmlDocument.GetXml canonical readback failed: {error}"),
             )
         })?;
+        let canonical_xml = canonical_xml.to_string_lossy();
+        let payload_sha256 = toast_payload_digest(&canonical_xml, params.suppress_popup);
         let prepared = PreparedToastPayload {
             schema_version: TOAST_PAYLOAD_SCHEMA_VERSION,
-            canonical_xml: canonical_xml.to_string_lossy(),
+            renderer_version: TOAST_RENDERER_VERSION_CURRENT,
+            canonical_xml,
             suppress_popup: params.suppress_popup,
-            payload_sha256: toast_payload_digest(
-                &canonical_xml.to_string_lossy(),
-                params.suppress_popup,
+            intent_sha256: toast_intent_digest(
+                params,
+                actions,
+                &payload_sha256,
+                TOAST_RENDERER_VERSION_CURRENT,
             ),
+            payload_sha256,
         };
         Ok((document, prepared))
     }
@@ -1727,9 +1856,14 @@ mod windows_toast {
 
     fn prepare_frozen_toast_document(
         params: &NotifyHumanParams,
+        actions: &[ToastAction],
         frozen: &PreparedToastPayload,
     ) -> Result<(XmlDocument, PreparedToastPayload), NotifyFailure> {
         if frozen.schema_version != TOAST_PAYLOAD_SCHEMA_VERSION
+            || !matches!(
+                frozen.renderer_version,
+                TOAST_RENDERER_VERSION_V1 | TOAST_RENDERER_VERSION_CURRENT
+            )
             || frozen.canonical_xml.is_empty()
             || frozen.canonical_xml.len() > MAX_FROZEN_TOAST_XML_BYTES
             || frozen.suppress_popup != params.suppress_popup
@@ -1737,8 +1871,9 @@ mod windows_toast {
             return Err(NotifyFailure::new(
                 error_codes::NOTIFY_XML_PAYLOAD_INVALID,
                 format!(
-                    "frozen toast payload metadata is invalid: schema_version={} expected_schema_version={TOAST_PAYLOAD_SCHEMA_VERSION} xml_bytes={} max_xml_bytes={MAX_FROZEN_TOAST_XML_BYTES} frozen_suppress_popup={} params_suppress_popup={}",
+                    "frozen toast payload metadata is invalid: schema_version={} expected_schema_version={TOAST_PAYLOAD_SCHEMA_VERSION} renderer_version={} supported_renderer_versions=[{TOAST_RENDERER_VERSION_V1},{TOAST_RENDERER_VERSION_CURRENT}] xml_bytes={} max_xml_bytes={MAX_FROZEN_TOAST_XML_BYTES} frozen_suppress_popup={} params_suppress_popup={}",
                     frozen.schema_version,
+                    frozen.renderer_version,
                     frozen.canonical_xml.len(),
                     frozen.suppress_popup,
                     params.suppress_popup
@@ -1752,6 +1887,17 @@ mod windows_toast {
                 format!(
                     "frozen toast payload digest is corrupt: expected_sha256={expected_digest} durable_sha256={}",
                     frozen.payload_sha256
+                ),
+            ));
+        }
+        let expected_intent_sha256 =
+            toast_intent_digest(params, actions, &expected_digest, frozen.renderer_version);
+        if expected_intent_sha256 != frozen.intent_sha256 {
+            return Err(NotifyFailure::new(
+                error_codes::NOTIFY_DELIVERY_UNVERIFIED,
+                format!(
+                    "frozen toast payload is not bound to this logical request/actions: expected_intent_sha256={expected_intent_sha256} durable_intent_sha256={} payload_sha256={}",
+                    frozen.intent_sha256, frozen.payload_sha256
                 ),
             ));
         }
@@ -1990,7 +2136,7 @@ mod windows_toast {
         };
 
         let (document, prepared) = match frozen_payload {
-            Some(frozen) => prepare_frozen_toast_document(params, frozen)?,
+            Some(frozen) => prepare_frozen_toast_document(params, actions, frozen)?,
             None => prepare_toast_document(params, actions)?,
         };
         let existing = if params.dedupe_key.is_some() {
@@ -2553,11 +2699,12 @@ pub(crate) async fn prepare_internal_escalation_toast(
 }
 
 /// Synchronous bridge used only from a Tokio blocking thread. The supplied
-/// authorizer runs at the COM queue head immediately before dedupe/Show and
-/// retains the transition linearization boundary through dedupe or the actual
-/// `Show` invocation. Physical history verification is a separate read after
-/// releasing the boundary. `None` means authorization or pre-Show
-/// reconciliation skipped the side effect.
+/// authorizer runs at the COM queue head after physical dedupe inspection and
+/// immediately before accepting dedupe success or invoking `ToastNotifier.Show`.
+/// It retains the transition linearization boundary through that decision.
+/// Physical history verification is a separate read after releasing the
+/// boundary. `None` means authorization or pre-Show reconciliation skipped the
+/// side effect.
 pub(crate) fn run_internal_escalation_toast_blocking(
     params: NotifyHumanParams,
     tag: String,
@@ -2599,7 +2746,7 @@ pub(crate) fn run_internal_escalation_toast_blocking(
             tag = %tag,
             group = SYNAPSE_ESCALATION_TOAST_GROUP,
             not_after_unix_ms,
-            "COM queue-head authorization skipped escalation toast before dedupe/Show"
+            "COM queue-head authorization skipped escalation toast before accepting dedupe success or invoking ToastNotifier.Show"
         );
         return Ok(None);
     };

@@ -4,6 +4,7 @@ mod async_vault;
 mod error_bridge;
 mod math;
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -14,16 +15,36 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_key, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
+use calyx_aster::dedup::EpochSecs;
 use calyx_aster::mvcc::{Freshness, Snapshot};
+use calyx_aster::recurrence::{
+    OccurrenceContext, RecurrenceAppendDisposition, RecurrenceSeriesReadback, RetentionPolicy,
+    append_occurrence_once, read_series_readback,
+};
 use calyx_aster::vault::{
     AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook, VaultOptions,
     encode as vault_encode,
 };
+pub use calyx_core::TemporalPolicy;
 use calyx_core::{
-    Anchor, AnchorKind, CalyxError, Clock, Constellation, CxId, Seq, SystemClock, Ts, VaultId,
+    Anchor, AnchorKind, CalyxError, Clock, Constellation, CxId, METADATA_SOURCE_EVENT_TIME_RAW,
+    METADATA_SOURCE_EVENT_TIME_SECS, METADATA_TEMPORAL_LANE_STATE, Seq, SystemClock,
+    TEMPORAL_LANE_ACTIVE, Ts, VaultId, VaultStore,
 };
 use calyx_forge::HostGpuReservationSnapshot;
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
+pub use calyx_registry::{
+    PanelGenerationAllocation, PanelGenerationAllocatorReadback, VaultTemporalPanelRegistration,
+    VaultTemporalPanelRegistrationWrite,
+};
+use calyx_registry::{
+    allocate_vault_panel_generation, list_vault_temporal_panels,
+    read_vault_panel_generation_allocator, read_vault_temporal_panel,
+    register_vault_temporal_panel, reserve_vault_panel_generations,
+};
+use calyx_sextant::{
+    CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
+};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -255,6 +276,70 @@ pub struct SynapseCalyxObservationPutReadback {
     pub latest_seq: Seq,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxRecurrenceAppendDisposition {
+    Inserted,
+    ExistingIdentical,
+}
+
+impl From<RecurrenceAppendDisposition> for SynapseCalyxRecurrenceAppendDisposition {
+    fn from(value: RecurrenceAppendDisposition) -> Self {
+        match value {
+            RecurrenceAppendDisposition::Inserted => Self::Inserted,
+            RecurrenceAppendDisposition::ExistingIdentical => Self::ExistingIdentical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxRecurrenceAppendReadback {
+    pub cx_id: String,
+    pub occurrence_id: u64,
+    pub disposition: SynapseCalyxRecurrenceAppendDisposition,
+    pub frequency: u64,
+    pub active_occurrences: usize,
+    pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxRecurrenceSeriesReadback {
+    pub cx_id: String,
+    pub series: RecurrenceSeriesReadback,
+    pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxTemporalCandidate {
+    pub cx_id: String,
+    pub base_score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxTemporalRankedHit {
+    pub cx_id: String,
+    pub event_time_secs: i64,
+    pub original_rank: usize,
+    pub rank: usize,
+    pub base_score: f32,
+    pub score: f32,
+    pub temporal_scores: TemporalScores,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxTemporalRerankReadback {
+    pub snapshot_seq: Seq,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub panel_registered_at_unix_ms: u64,
+    pub query_time_secs: i64,
+    pub tz_offset_secs: i32,
+    pub temporal_lenses: Vec<String>,
+    pub policy: TemporalPolicy,
+    pub pre_boost_ranking: Vec<String>,
+    pub hits: Vec<SynapseCalyxTemporalRankedHit>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxAnchorWriteReadback {
     pub cx_id: String,
@@ -308,6 +393,7 @@ const IDENTITY_FILE_NAME: &str = "vault-identity.json";
 const MACHINE_SALT_FILE_NAME: &str = "machine-salt.bin";
 const LOCK_FILE_NAME: &str = "vault.lock";
 const PID_FILE_NAME: &str = "vault.pid";
+const SYNAPSE_PANEL_NAME_METADATA: &str = "synapse_panel_name";
 const IDENTITY_SCHEMA_VERSION: u32 = 1;
 const MACHINE_SALT_BYTES: usize = 32;
 
@@ -653,6 +739,86 @@ fn validate_f32(name: &str, value: f32, min: f32, max: f32) -> Result<(), Synaps
 
 fn invalid_config(message: impl Into<String>) -> SynapseCalyxError {
     SynapseCalyxError::new("SYNAPSE_CALYX_CONFIG_INVALID", message, CONFIG_REMEDIATION)
+}
+
+fn validated_source_event_time(constellation: &Constellation) -> Result<i64, SynapseCalyxError> {
+    if constellation.metadata_value(METADATA_TEMPORAL_LANE_STATE) != Some(TEMPORAL_LANE_ACTIVE) {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_TEMPORAL_LANE_INACTIVE",
+            format!(
+                "candidate {} does not declare temporal_lane_state=active",
+                constellation.cx_id
+            ),
+            "rebuild the source constellation from an authoritative event timestamp before temporal retrieval",
+        ));
+    }
+    let event_time_secs = constellation
+        .metadata_value(METADATA_SOURCE_EVENT_TIME_SECS)
+        .ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_MISSING",
+                format!(
+                    "candidate {} is active but metadata {METADATA_SOURCE_EVENT_TIME_SECS:?} is absent",
+                    constellation.cx_id
+                ),
+                "repair the source projection so active temporal lanes persist exact event-time seconds",
+            )
+        })?
+        .parse::<i64>()
+        .map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_INVALID",
+                format!(
+                    "candidate {} has invalid {METADATA_SOURCE_EVENT_TIME_SECS}: {error}",
+                    constellation.cx_id
+                ),
+                "rebuild the source constellation from a valid Unix event timestamp",
+            )
+        })?;
+    let raw_ns = constellation
+        .metadata_value(METADATA_SOURCE_EVENT_TIME_RAW)
+        .ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_RAW_MISSING",
+                format!(
+                    "candidate {} is active but metadata {METADATA_SOURCE_EVENT_TIME_RAW:?} is absent",
+                    constellation.cx_id
+                ),
+                "repair the source projection so active temporal lanes retain the verbatim source timestamp",
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_RAW_INVALID",
+                format!(
+                    "candidate {} has invalid nanosecond {METADATA_SOURCE_EVENT_TIME_RAW}: {error}",
+                    constellation.cx_id
+                ),
+                "rebuild the source constellation from its authoritative unsigned nanosecond timestamp",
+            )
+        })?;
+    let derived_secs = i64::try_from(raw_ns / 1_000_000_000).map_err(|error| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_OVERFLOW",
+            format!(
+                "candidate {} raw event timestamp {raw_ns}ns cannot convert to Unix seconds: {error}",
+                constellation.cx_id
+            ),
+            "repair the corrupt event timestamp at the source and rebuild its constellation",
+        )
+    })?;
+    if derived_secs != event_time_secs {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_MISMATCH",
+            format!(
+                "candidate {} event_time_secs={event_time_secs} disagrees with raw_ns={raw_ns} -> {derived_secs}",
+                constellation.cx_id
+            ),
+            "repair the source projection and rebuild the constellation; do not score contradictory time evidence",
+        ));
+    }
+    Ok(event_time_secs)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1110,6 +1276,61 @@ impl SynapseCalyxReadOnlyVault {
             })
     }
 
+    /// Reads one candidate-bounded range page through an existing pinned
+    /// snapshot lease. The returned cursor names the last row included in the
+    /// page; `more` is established with one bounded lookahead at the same
+    /// pinned sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the lease is expired or
+    /// unavailable, the range/cursor is invalid, or the snapshot cannot be
+    /// served by the opened recovery mode.
+    pub fn scan_cf_range_page_snapshot(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
+        if limit == 0 {
+            return Ok(SynapseCalyxCfRangePage {
+                snapshot_seq: snapshot.seq(),
+                rows: Vec::new(),
+                resume_after: None,
+                more: false,
+                examined_rows: 0,
+            });
+        }
+        let candidate_limit = limit.checked_add(1).ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SNAPSHOT_PAGE_LIMIT_EXHAUSTED",
+                "pinned Calyx page limit cannot be usize::MAX because continuation requires one lookahead row",
+                "request a smaller bounded page",
+            )
+        })?;
+        let mut rows = self
+            .vault
+            .scan_cf_range_page_snapshot(snapshot, cf, range, after_key, candidate_limit)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("scan pinned Calyx CF range page", &error)
+            })?;
+        let examined_rows = rows.len();
+        let more = examined_rows > limit;
+        if more {
+            rows.truncate(limit);
+        }
+        let resume_after = rows.last().map(|(key, _value)| key.clone());
+        Ok(SynapseCalyxCfRangePage {
+            snapshot_seq: snapshot.seq(),
+            rows,
+            resume_after,
+            more,
+            examined_rows,
+        })
+    }
+
     /// Reads one raw CF row at a numeric snapshot.
     ///
     /// # Errors
@@ -1489,6 +1710,516 @@ impl SynapseCalyxVault {
             .collect())
     }
 
+    /// Projects one caller-identified physical event into a bounded native
+    /// Calyx recurrence series exactly once.
+    ///
+    /// Replaying the same identity with the same timestamp/context is an
+    /// idempotent success. Reusing the identity for different evidence fails
+    /// closed in Aster before commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the subject Base row is absent, the
+    /// event/context is invalid, identity evidence conflicts, or the atomic
+    /// Base+Recurrence commit/readback fails.
+    pub fn append_recurrence_occurrence_once(
+        &self,
+        cx_id: CxId,
+        event_time_secs: i64,
+        observed_at_secs: i64,
+        context: Vec<u8>,
+        occurrence_identity_sha256: [u8; 32],
+    ) -> Result<SynapseCalyxRecurrenceAppendReadback, SynapseCalyxError> {
+        let context = OccurrenceContext::new(context).map_err(|error| {
+            SynapseCalyxError::from_calyx("validate native Calyx recurrence context", &error)
+        })?;
+        let outcome = append_occurrence_once(
+            &self.vault,
+            cx_id,
+            EpochSecs(event_time_secs),
+            context,
+            EpochSecs(observed_at_secs),
+            RetentionPolicy::default(),
+            occurrence_identity_sha256,
+        )
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx("append native Calyx recurrence occurrence", &error)
+        })?;
+        let readback = read_series_readback(&self.vault, cx_id).map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "read native Calyx recurrence series after append",
+                &error,
+            )
+        })?;
+        Ok(SynapseCalyxRecurrenceAppendReadback {
+            cx_id: cx_id.to_string(),
+            occurrence_id: outcome.occurrence_id.0,
+            disposition: outcome.disposition.into(),
+            frequency: readback.series.frequency,
+            active_occurrences: readback.series.occurrences.len(),
+            latest_seq: self.vault.latest_seq(),
+        })
+    }
+
+    /// Reads one physical native Calyx recurrence series.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when recurrence rows cannot be decoded or
+    /// the subject Base frequency is corrupt.
+    pub fn read_recurrence_series(
+        &self,
+        cx_id: CxId,
+    ) -> Result<SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxError> {
+        let series = read_series_readback(&self.vault, cx_id).map_err(|error| {
+            SynapseCalyxError::from_calyx("read native Calyx recurrence series", &error)
+        })?;
+        Ok(SynapseCalyxRecurrenceSeriesReadback {
+            cx_id: cx_id.to_string(),
+            series,
+            latest_seq: self.vault.latest_seq(),
+        })
+    }
+
+    /// Idempotently registers Calyx's canonical retrieval-only temporal
+    /// sidecars for one exact source-panel generation in the native Registry
+    /// CF. An incompatible registration for an existing generation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx error when the contract is invalid, the
+    /// immutable identity conflicts, or the Registry write/readback fails.
+    pub fn register_temporal_panel(
+        &self,
+        registration: &VaultTemporalPanelRegistration,
+    ) -> Result<VaultTemporalPanelRegistrationWrite, SynapseCalyxError> {
+        register_vault_temporal_panel(&self.vault, registration).map_err(|error| {
+            SynapseCalyxError::from_calyx("register native Calyx temporal panel", &error)
+        })
+    }
+
+    /// Reserves immutable built-in panel generations in the vault-global
+    /// allocator and advances the dynamic allocation watermark beyond them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured conflict when one generation is already owned by
+    /// another panel, or a durability error when CAS/readback fails.
+    pub fn reserve_panel_generations(
+        &self,
+        reservations: &[(String, u32)],
+    ) -> Result<PanelGenerationAllocatorReadback, SynapseCalyxError> {
+        reserve_vault_panel_generations(&self.vault, reservations).map_err(|error| {
+            SynapseCalyxError::from_calyx("reserve native Calyx panel generations", &error)
+        })
+    }
+
+    /// Allocates one vault-global panel generation idempotently by operation
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for invalid identity, ownership conflict,
+    /// exhaustion, or a failed atomic Registry-CF readback.
+    pub fn allocate_panel_generation(
+        &self,
+        panel_name: &str,
+        operation_id: &str,
+    ) -> Result<PanelGenerationAllocation, SynapseCalyxError> {
+        allocate_vault_panel_generation(&self.vault, panel_name, operation_id).map_err(|error| {
+            SynapseCalyxError::from_calyx("allocate native Calyx panel generation", &error)
+        })
+    }
+
+    /// Reads the validated vault-global panel generation allocator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Registry-CF state is malformed.
+    pub fn panel_generation_allocator(
+        &self,
+    ) -> Result<PanelGenerationAllocatorReadback, SynapseCalyxError> {
+        read_vault_panel_generation_allocator(&self.vault).map_err(|error| {
+            SynapseCalyxError::from_calyx("read native Calyx panel generation allocator", &error)
+        })
+    }
+
+    /// Reads one exact native temporal panel registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the identity is invalid or Registry CF
+    /// bytes cannot be read and validated.
+    pub fn read_temporal_panel(
+        &self,
+        panel_name: &str,
+        panel_version: u32,
+    ) -> Result<Option<VaultTemporalPanelRegistration>, SynapseCalyxError> {
+        read_vault_temporal_panel(&self.vault, panel_name, panel_version).map_err(|error| {
+            SynapseCalyxError::from_calyx("read native Calyx temporal panel", &error)
+        })
+    }
+
+    /// Lists every validated native temporal panel registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when any Registry CF row is malformed,
+    /// mis-keyed, or unreadable.
+    pub fn list_temporal_panels(
+        &self,
+    ) -> Result<Vec<VaultTemporalPanelRegistration>, SynapseCalyxError> {
+        list_vault_temporal_panels(&self.vault).map_err(|error| {
+            SynapseCalyxError::from_calyx("list native Calyx temporal panels", &error)
+        })
+    }
+
+    /// Applies the exact immutable policy registered for the first candidate's
+    /// source panel. Full candidate/panel validation still occurs inside
+    /// [`Self::temporal_rerank`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an empty set, invalid/missing first Base
+    /// row, missing panel metadata/registration, or any rerank invariant.
+    pub fn temporal_rerank_registered(
+        &self,
+        candidates: &[SynapseCalyxTemporalCandidate],
+        query_time_secs: i64,
+        tz_offset_secs: i32,
+    ) -> Result<SynapseCalyxTemporalRerankReadback, SynapseCalyxError> {
+        let first = candidates.first().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_CANDIDATE_COUNT_INVALID",
+                "temporal rerank candidate set is empty",
+                "supply the bounded, non-empty output of content-only primary retrieval",
+            )
+        })?;
+        let cx_id = CxId::from_str(first.cx_id.trim()).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_CX_ID_INVALID",
+                format!("first candidate CxId {:?} is invalid: {error}", first.cx_id),
+                "supply the exact CxId returned by native Calyx content retrieval",
+            )
+        })?;
+        let constellation = self
+            .vault
+            .get(cx_id, self.vault.snapshot())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("read first temporal candidate Base row {cx_id}"),
+                    &error,
+                )
+            })?;
+        let panel_name = constellation
+            .metadata
+            .get(SYNAPSE_PANEL_NAME_METADATA)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_PANEL_NAME_MISSING",
+                    format!(
+                        "candidate {cx_id} has no non-empty {SYNAPSE_PANEL_NAME_METADATA} metadata"
+                    ),
+                    "rebuild the source constellation with its exact immutable panel name",
+                )
+            })?;
+        let registration = read_vault_temporal_panel(
+            &self.vault,
+            panel_name,
+            constellation.panel_version,
+        )
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                &format!(
+                    "read registered policy for panel {panel_name} generation {}",
+                    constellation.panel_version
+                ),
+                &error,
+            )
+        })?
+        .ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_PANEL_UNREGISTERED",
+                format!(
+                    "panel {panel_name} generation {} has no native Registry CF temporal contract",
+                    constellation.panel_version
+                ),
+                "register and physically read back the exact immutable panel generation before serving temporal queries",
+            )
+        })?;
+        self.temporal_rerank(
+            candidates,
+            query_time_secs,
+            tz_offset_secs,
+            registration.policy,
+        )
+    }
+
+    /// Applies Calyx's AP-60 dynamic temporal scoring to an already-retrieved
+    /// content candidate set at one coherent Base snapshot.
+    ///
+    /// Primary relevance is caller-supplied and never recomputed from time.
+    /// Every candidate must carry explicit active event-time metadata written
+    /// by its source projection. Recurrence scoring is intentionally rejected
+    /// here because recurrence subjects are separate physical entities; a
+    /// policy that claims otherwise would produce dishonest evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for empty/oversized/duplicate candidates,
+    /// invalid scores or policy, missing/malformed temporal metadata, mixed
+    /// panel versions, absent Base rows, or a bound violation.
+    pub fn temporal_rerank(
+        &self,
+        candidates: &[SynapseCalyxTemporalCandidate],
+        query_time_secs: i64,
+        tz_offset_secs: i32,
+        policy: TemporalPolicy,
+    ) -> Result<SynapseCalyxTemporalRerankReadback, SynapseCalyxError> {
+        if candidates.is_empty() || candidates.len() > 1_000 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_CANDIDATE_COUNT_INVALID",
+                format!(
+                    "temporal rerank candidate count must be in 1..=1000; got {}",
+                    candidates.len()
+                ),
+                "supply the bounded, non-empty output of content-only primary retrieval",
+            ));
+        }
+        if policy.recurrence_boost.is_some() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_RECURRENCE_SUBJECT_REQUIRED",
+                "event-constellation rerank cannot apply recurrence boost because native recurrence series are keyed by stable app/routine subject CxIds",
+                "disable recurrence_boost for event rerank or query the exact recurrence subject series",
+            ));
+        }
+        policy.validate().map_err(|error| {
+            SynapseCalyxError::from_calyx("validate Calyx temporal rerank policy", &error)
+        })?;
+
+        let snapshot = self.vault.snapshot();
+        let mut seen = BTreeSet::new();
+        let mut panel_name = None;
+        let mut panel_version = None;
+        let mut hits = Vec::with_capacity(candidates.len());
+        let mut parsed_candidates = Vec::with_capacity(candidates.len());
+        for (index, candidate) in candidates.iter().enumerate() {
+            if !candidate.base_score.is_finite() || candidate.base_score <= 0.0 {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_BASE_SCORE_INVALID",
+                    format!(
+                        "candidate {} has base_score {}; expected a finite value greater than zero",
+                        candidate.cx_id, candidate.base_score
+                    ),
+                    "repair content-only primary retrieval so every candidate has a positive finite score",
+                ));
+            }
+            let cx_id = CxId::from_str(candidate.cx_id.trim()).map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_CX_ID_INVALID",
+                    format!("candidate CxId {:?} is invalid: {error}", candidate.cx_id),
+                    "supply the exact CxId returned by native Calyx content retrieval",
+                )
+            })?;
+            if !seen.insert(cx_id) {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_CANDIDATE_DUPLICATE",
+                    format!("candidate CxId {cx_id} occurs more than once"),
+                    "deduplicate primary candidates before temporal rerank",
+                ));
+            }
+            let constellation = self.vault.get(cx_id, snapshot).map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("read temporal candidate Base row {cx_id} at snapshot {snapshot}"),
+                    &error,
+                )
+            })?;
+            let candidate_panel_name = constellation
+                .metadata
+                .get(SYNAPSE_PANEL_NAME_METADATA)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_TEMPORAL_PANEL_NAME_MISSING",
+                        format!(
+                            "candidate {cx_id} has no non-empty {SYNAPSE_PANEL_NAME_METADATA} metadata"
+                        ),
+                        "rebuild the source constellation with its exact immutable panel name",
+                    )
+                })?;
+            if let Some(expected) = panel_name.as_deref() {
+                if expected != candidate_panel_name {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_TEMPORAL_MIXED_PANEL",
+                        format!(
+                            "candidate {cx_id} uses panel {candidate_panel_name}, but the rerank set started with {expected}"
+                        ),
+                        "partition candidates by exact panel name and version before temporal rerank",
+                    ));
+                }
+            } else {
+                panel_name = Some(candidate_panel_name.clone());
+            }
+            if let Some(expected) = panel_version {
+                if expected != constellation.panel_version {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_TEMPORAL_MIXED_PANEL",
+                        format!(
+                            "candidate {cx_id} uses panel {}, but the rerank set started with panel {expected}",
+                            constellation.panel_version
+                        ),
+                        "partition candidates by exact panel version before temporal rerank",
+                    ));
+                }
+            } else {
+                panel_version = Some(constellation.panel_version);
+            }
+            let event_time_secs = validated_source_event_time(&constellation)?;
+            hits.push(Hit {
+                cx_id,
+                score: candidate.base_score,
+                rank: index + 1,
+                event_time_secs: Some(event_time_secs),
+                temporal_scores: None,
+                causal_confidence: CausalConfidence::Absent,
+                causal_gate: None,
+                per_lens: Vec::new(),
+                cross_terms_used: false,
+                guard: None,
+                provenance: constellation.provenance,
+                provenance_source: ProvenanceSource::Stored,
+                freshness: FreshnessTag::fresh(snapshot),
+                explain: None,
+            });
+            parsed_candidates.push((cx_id, candidate.base_score, index + 1));
+        }
+
+        let panel_name = panel_name.ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_PANEL_NAME_MISSING",
+                "non-empty temporal candidate set did not establish a panel name",
+                "inspect candidate validation; every persisted Base row must identify its panel",
+            )
+        })?;
+        let panel_version = panel_version.ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_PANEL_MISSING",
+                "non-empty temporal candidate set did not establish a panel version",
+                "inspect candidate validation; every persisted Base row must identify its panel",
+            )
+        })?;
+        let registration = read_vault_temporal_panel(&self.vault, &panel_name, panel_version)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!(
+                        "read temporal registration for panel {panel_name} generation {panel_version}"
+                    ),
+                    &error,
+                )
+            })?
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_PANEL_UNREGISTERED",
+                    format!(
+                        "panel {panel_name} generation {panel_version} has no native Registry CF temporal contract"
+                    ),
+                    "register and physically read back the exact immutable panel generation before serving temporal queries",
+                )
+            })?;
+        if registration.policy != policy {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_TEMPORAL_POLICY_DRIFT",
+                format!(
+                    "requested temporal policy differs from registered panel {panel_name} generation {panel_version} policy"
+                ),
+                "use the exact policy stored in the native Registry CF or publish a new panel generation",
+            ));
+        }
+
+        let ranked =
+            apply_temporal_boost(hits, &registration.policy, query_time_secs, tz_offset_secs)
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx(
+                        "apply Calyx temporal post-retrieval boost",
+                        &error,
+                    )
+                })?;
+        let mut out = Vec::with_capacity(ranked.len());
+        for hit in ranked {
+            let (base_score, original_rank) = parsed_candidates
+                .iter()
+                .find(|(cx_id, _, _)| *cx_id == hit.cx_id)
+                .map(|(_, score, rank)| (*score, *rank))
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_TEMPORAL_RANKING_CORRUPT",
+                        format!(
+                            "ranked hit {} was not present in primary candidates",
+                            hit.cx_id
+                        ),
+                        "inspect the Calyx temporal scorer and candidate identity handling",
+                    )
+                })?;
+            let max_score = base_score * (1.0 + registration.policy.boost.post_retrieval_alpha);
+            if hit.score > max_score + (max_score.abs() * 1.0e-6) {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_BOUND_VIOLATION",
+                    format!(
+                        "candidate {} base_score={base_score} scored {} above AP-60 maximum {max_score}",
+                        hit.cx_id, hit.score
+                    ),
+                    "inspect temporal fusion weights and keep the post-retrieval multiplier within the validated alpha",
+                ));
+            }
+            let temporal_scores = hit.temporal_scores.ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_EVIDENCE_MISSING",
+                    format!("candidate {} returned without temporal score evidence", hit.cx_id),
+                    "inspect the Calyx temporal scorer; never publish a rerank without per-component evidence",
+                )
+            })?;
+            let event_time_secs = hit.event_time_secs.ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_TEMPORAL_EVENT_TIME_DROPPED",
+                    format!(
+                        "candidate {} lost its validated event time during temporal scoring",
+                        hit.cx_id
+                    ),
+                    "inspect Calyx temporal scoring; scored hits must retain their source event time",
+                )
+            })?;
+            out.push(SynapseCalyxTemporalRankedHit {
+                cx_id: hit.cx_id.to_string(),
+                event_time_secs,
+                original_rank,
+                rank: hit.rank,
+                base_score,
+                score: hit.score,
+                temporal_scores,
+            });
+        }
+        Ok(SynapseCalyxTemporalRerankReadback {
+            snapshot_seq: snapshot,
+            panel_name,
+            panel_version,
+            panel_registered_at_unix_ms: registration.registered_at_unix_ms,
+            query_time_secs,
+            tz_offset_secs,
+            temporal_lenses: vec![
+                "E2_Temporal_Recent".to_owned(),
+                "E3_Temporal_Periodic".to_owned(),
+                "E4_Temporal_Positional".to_owned(),
+            ],
+            policy: registration.policy,
+            pre_boost_ranking: candidates
+                .iter()
+                .map(|candidate| candidate.cx_id.clone())
+                .collect(),
+            hits: out,
+        })
+    }
+
     /// Writes grounded anchors through Aster's ledger-stamped anchor path.
     ///
     /// # Errors
@@ -1629,8 +2360,9 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("compact Calyx KV CF", &error))
     }
 
-    /// Runs one bounded file-count/byte-debt maintenance pass across native
-    /// Aster column families and returns physical reclamation readback.
+    /// Drains urgent file-count debt across native Aster column families and
+    /// returns physical reclamation readback. Each rewrite is file/byte
+    /// bounded; the pass covers every CF near the shared page-source ceiling.
     ///
     /// # Errors
     ///
@@ -1992,6 +2724,58 @@ impl SynapseCalyxVault {
             })
     }
 
+    /// Reads one candidate-bounded range page through an existing pinned
+    /// snapshot lease, with one same-sequence lookahead for continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the lease is expired or
+    /// unavailable, or the requested page cannot be served.
+    pub fn scan_cf_range_page_snapshot(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
+        if limit == 0 {
+            return Ok(SynapseCalyxCfRangePage {
+                snapshot_seq: snapshot.seq(),
+                rows: Vec::new(),
+                resume_after: None,
+                more: false,
+                examined_rows: 0,
+            });
+        }
+        let candidate_limit = limit.checked_add(1).ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SNAPSHOT_PAGE_LIMIT_EXHAUSTED",
+                "pinned Calyx page limit cannot be usize::MAX because continuation requires one lookahead row",
+                "request a smaller bounded page",
+            )
+        })?;
+        let mut rows = self
+            .vault
+            .scan_cf_range_page_snapshot(snapshot, cf, range, after_key, candidate_limit)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("scan pinned Calyx CF range page", &error)
+            })?;
+        let examined_rows = rows.len();
+        let more = examined_rows > limit;
+        if more {
+            rows.truncate(limit);
+        }
+        let resume_after = rows.last().map(|(key, _value)| key.clone());
+        Ok(SynapseCalyxCfRangePage {
+            snapshot_seq: snapshot.seq(),
+            rows,
+            resume_after,
+            more,
+            examined_rows,
+        })
+    }
+
     /// Decodes the physical `Anchors` CF rows currently visible for one
     /// constellation id.
     ///
@@ -2047,7 +2831,12 @@ impl SynapseCalyxVault {
         self.vault.release_reader(lease_id)
     }
 
-    /// Flushes Aster's WAL-backed batcher and pending durable checkpoints.
+    /// Synchronizes Aster's WAL-backed group-commit batcher.
+    ///
+    /// A successful write has already crossed the fsynced WAL boundary. This
+    /// method is an explicit ordering barrier and deliberately does not turn
+    /// every staged commit sequence into a tiny checkpoint SST; owned storage
+    /// maintenance checkpoints and compacts those batches as one lifecycle.
     ///
     /// # Errors
     ///
@@ -2055,8 +2844,8 @@ impl SynapseCalyxVault {
     /// flush fails.
     pub fn flush(&self) -> Result<(), SynapseCalyxError> {
         self.vault
-            .flush()
-            .map_err(|error| SynapseCalyxError::from_calyx("flush Calyx Aster vault", &error))
+            .sync_wal()
+            .map_err(|error| SynapseCalyxError::from_calyx("sync Calyx Aster WAL", &error))
     }
 
     /// Flushes and closes the durable vault, then proves the lock can be
@@ -2078,6 +2867,19 @@ impl SynapseCalyxVault {
             open_mode: _,
         } = self;
         let latest_seq = vault.latest_seq();
+        let close_compaction = vault.compact_native_fanout_once().map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "checkpoint and prepare Calyx SST fan-out before close",
+                &error,
+            )
+        })?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_VAULT_CLOSE_FANOUT_READY",
+            reason,
+            vault_dir = %config.vault_dir.display(),
+            compaction_attempts = close_compaction.len(),
+            "checkpointed pending commits and prepared native SST fan-out before final router flush"
+        );
         vault.flush().map_err(|error| {
             SynapseCalyxError::from_calyx("flush durable Calyx Aster vault", &error)
         })?;

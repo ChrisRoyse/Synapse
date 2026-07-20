@@ -41,7 +41,9 @@ use synapse_core::types::{
     RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep,
     RoutineTransition,
 };
-use synapse_storage::{Db, cf, decode_json, encode_json, routines as routine_codec};
+use synapse_storage::{
+    Db, RecurrenceSubjectKind, cf, decode_json, encode_json, routines as routine_codec,
+};
 
 use crate::m1::mcp_error;
 
@@ -781,6 +783,7 @@ pub fn mine_and_store_routines(
             "routine_mine dry run computed without mutating CF_ROUTINES"
         );
     } else {
+        project_routine_recurrence_series(db, &mining.routines)?;
         let stale_keys = existing_routine_keys(db, &mut scanned_rows)?;
         deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         db.mutate_batch_pressure_bypass(cf::CF_ROUTINES, stale_keys, new_rows)
@@ -839,6 +842,56 @@ pub fn mine_and_store_routines(
         dry_run: params.dry_run,
         routines: mining.routines,
     })
+}
+
+fn project_routine_recurrence_series(db: &Db, routines: &[RoutineRecord]) -> Result<(), ErrorData> {
+    for routine in routines {
+        for evidence in &routine.evidence {
+            let event_time_ns = evidence
+                .day_start_ns
+                .checked_add(u64::from(evidence.minute_of_day).saturating_mul(60_000_000_000))
+                .ok_or_else(|| {
+                    internal(format!(
+                        "CALYX_ROUTINE_RECURRENCE_TIME_OVERFLOW: routine={} day_start_ns={} minute_of_day={}",
+                        routine.routine_id, evidence.day_start_ns, evidence.minute_of_day
+                    ))
+                })?;
+            let occurrence_identity = serde_json::to_vec(evidence).map_err(|error| {
+                internal(format!(
+                    "CALYX_ROUTINE_RECURRENCE_IDENTITY_ENCODE_FAILED: routine={} day_start_ns={}: {error}",
+                    routine.routine_id, evidence.day_start_ns
+                ))
+            })?;
+            let context = serde_json::to_vec(&serde_json::json!({
+                "routine_id": routine.routine_id,
+                "day_start_ns": evidence.day_start_ns,
+                "minute_of_day": evidence.minute_of_day,
+            }))
+            .map_err(|error| {
+                internal(format!(
+                    "CALYX_ROUTINE_RECURRENCE_CONTEXT_ENCODE_FAILED: routine={} day_start_ns={}: {error}",
+                    routine.routine_id, evidence.day_start_ns
+                ))
+            })?;
+            db.put_recurrence_subject_occurrence(
+                RecurrenceSubjectKind::Routine,
+                &routine.routine_id,
+                event_time_ns,
+                &occurrence_identity,
+                &context,
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "CALYX_ROUTINE_RECURRENCE_PROJECTION_FAILED: routine={} day_start_ns={} minute_of_day={}: {error}; CF_ROUTINES was not replaced",
+                        routine.routine_id, evidence.day_start_ns, evidence.minute_of_day
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Default and maximum `routine_list` page sizes.

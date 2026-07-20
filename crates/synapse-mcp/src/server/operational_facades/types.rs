@@ -20,6 +20,8 @@ use crate::m3::{
     storage::{
         StorageAnchorsParams, StorageAnchorsResponse, StorageGcOnceParams, StorageGcOnceResponse,
         StorageInspectParams, StorageInspectResponse, StorageSummaryResponse,
+        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
+        StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -29,6 +31,8 @@ pub enum StorageOperation {
     Summary,
     GcOnce,
     Anchors,
+    TemporalPanels,
+    TemporalRerank,
 }
 
 impl StorageOperation {
@@ -38,6 +42,8 @@ impl StorageOperation {
             Self::Summary => "summary",
             Self::GcOnce => "gc_once",
             Self::Anchors => "anchors",
+            Self::TemporalPanels => "temporal_panels",
+            Self::TemporalRerank => "temporal_rerank",
         }
     }
 }
@@ -54,6 +60,10 @@ pub struct StorageParams {
     pub gc_once: Option<StorageGcOnceParams>,
     #[serde(default)]
     pub anchors: Option<StorageAnchorsParams>,
+    #[serde(default)]
+    pub temporal_panels: Option<StorageTemporalPanelsParams>,
+    #[serde(default)]
+    pub temporal_rerank: Option<StorageTemporalRerankParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -70,6 +80,10 @@ pub struct StorageResponse {
     pub gc_once: Option<StorageGcOnceResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchors: Option<StorageAnchorsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_panels: Option<StorageTemporalPanelsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_rerank: Option<StorageTemporalRerankResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

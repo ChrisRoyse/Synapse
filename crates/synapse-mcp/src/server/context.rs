@@ -599,7 +599,6 @@ impl SynapseService {
                     params.decision.as_str(),
                     response.decision.item.decision_note.as_deref(),
                     by_session,
-                    super::session_registry::unix_time_ms_now(),
                 ) {
                     Ok(_maybe_escalation) => Ok(response),
                     Err(error) => {
@@ -737,7 +736,6 @@ impl SynapseService {
                     decision.as_str(),
                     response.item.decision_note.as_deref(),
                     by_session,
-                    super::session_registry::unix_time_ms_now(),
                 ) {
                     Ok(_maybe_escalation) => Ok(response),
                     Err(error) => {

@@ -94,6 +94,26 @@ pub struct StoragePressureSampleParams {
     pub free_bytes: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalPanelsParams {}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalRerankParams {
+    #[schemars(length(min = 1, max = 1000))]
+    pub candidates: Vec<StorageTemporalCandidate>,
+    pub query_time_secs: i64,
+    pub tz_offset_secs: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalCandidate {
+    pub cx_id: String,
+    pub base_score: f32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageInspectResponse {
@@ -289,6 +309,84 @@ pub struct StoragePressureLevel {
     pub value: u8,
 }
 
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalPanelsResponse {
+    pub registry_cf: String,
+    pub registration_count: u64,
+    pub panels: Vec<StorageTemporalPanel>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalPanel {
+    pub schema_version: u16,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub registered_at_unix_ms: u64,
+    pub temporal_slots: Vec<StorageTemporalSlot>,
+    pub policy: StorageTemporalPolicy,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalSlot {
+    pub name: String,
+    pub runtime: String,
+    pub output: String,
+    pub retrieval_only: bool,
+    pub excluded_from_dedup: bool,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalPolicy {
+    pub enabled: bool,
+    pub never_dominant: bool,
+    pub decay: String,
+    pub periodic_target_hour: Option<u8>,
+    pub periodic_target_day_of_week: Option<u8>,
+    pub periodic_use_query_time: bool,
+    pub sequence_direction: String,
+    pub sequence_multi_anchor_mode: String,
+    pub fusion_recency: f32,
+    pub fusion_sequence: f32,
+    pub fusion_periodic: f32,
+    pub post_retrieval_alpha: f32,
+    pub recurrence_boost_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalRerankResponse {
+    pub registry_cf: String,
+    pub snapshot_seq: u64,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub panel_registered_at_unix_ms: u64,
+    pub query_time_secs: i64,
+    pub tz_offset_secs: i32,
+    pub temporal_lenses: Vec<String>,
+    pub policy: StorageTemporalPolicy,
+    pub pre_boost_ranking: Vec<String>,
+    pub hits: Vec<StorageTemporalRankedHit>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalRankedHit {
+    pub cx_id: String,
+    pub event_time_secs: i64,
+    pub original_rank: u64,
+    pub rank: u64,
+    pub base_score: f32,
+    pub score: f32,
+    pub e2_recency: f32,
+    pub e3_periodic: f32,
+    pub e4_sequence: f32,
+}
+
 #[must_use]
 pub const fn storage_inspect() -> M3ToolStub {
     M3ToolStub::new("storage_inspect")
@@ -334,6 +432,20 @@ pub fn required_permissions_pressure(_params: &StoragePressureSampleParams) -> R
     required([Permission::WriteStorage])
 }
 
+#[must_use]
+pub fn required_permissions_temporal_panels(
+    _params: &StorageTemporalPanelsParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_temporal_rerank(
+    _params: &StorageTemporalRerankParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
 pub fn inspect_storage(
     db: &synapse_storage::Db,
     _params: &StorageInspectParams,
@@ -369,6 +481,67 @@ pub fn inspect_storage_anchors(
         .calyx_anchor_scan_for_source(cf_name, &key, &source_value)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(storage_anchors_response(report, source_value_len_bytes))
+}
+
+pub fn inspect_temporal_panels(
+    db: &synapse_storage::Db,
+    _params: &StorageTemporalPanelsParams,
+) -> Result<StorageTemporalPanelsResponse, ErrorData> {
+    let registrations = db
+        .list_temporal_panels()
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageTemporalPanelsResponse {
+        registry_cf: "registry".to_owned(),
+        registration_count: registrations.len() as u64,
+        panels: registrations
+            .into_iter()
+            .map(storage_temporal_panel)
+            .collect(),
+    })
+}
+
+pub fn run_temporal_rerank(
+    db: &synapse_storage::Db,
+    params: &StorageTemporalRerankParams,
+) -> Result<StorageTemporalRerankResponse, ErrorData> {
+    let candidates = params
+        .candidates
+        .iter()
+        .map(|candidate| synapse_calyx::SynapseCalyxTemporalCandidate {
+            cx_id: candidate.cx_id.clone(),
+            base_score: candidate.base_score,
+        })
+        .collect::<Vec<_>>();
+    let readback = db
+        .temporal_rerank(&candidates, params.query_time_secs, params.tz_offset_secs)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageTemporalRerankResponse {
+        registry_cf: "registry".to_owned(),
+        snapshot_seq: readback.snapshot_seq,
+        panel_name: readback.panel_name,
+        panel_version: readback.panel_version,
+        panel_registered_at_unix_ms: readback.panel_registered_at_unix_ms,
+        query_time_secs: readback.query_time_secs,
+        tz_offset_secs: readback.tz_offset_secs,
+        temporal_lenses: readback.temporal_lenses,
+        policy: storage_temporal_policy(&readback.policy),
+        pre_boost_ranking: readback.pre_boost_ranking,
+        hits: readback
+            .hits
+            .into_iter()
+            .map(|hit| StorageTemporalRankedHit {
+                cx_id: hit.cx_id,
+                event_time_secs: hit.event_time_secs,
+                original_rank: hit.original_rank as u64,
+                rank: hit.rank as u64,
+                base_score: hit.base_score,
+                score: hit.score,
+                e2_recency: hit.temporal_scores.e2_recency,
+                e3_periodic: hit.temporal_scores.e3_periodic,
+                e4_sequence: hit.temporal_scores.e4_sequence,
+            })
+            .collect(),
+    })
 }
 
 pub fn inspect_storage_summary(
@@ -729,6 +902,49 @@ fn known_anchor_source_cf_for_key(raw: &str, key: &[u8]) -> Result<&'static str,
     synapse_storage::constellations::anchor_panel_for_source_row(cf_name, key)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(cf_name)
+}
+
+fn storage_temporal_panel(
+    registration: synapse_calyx::VaultTemporalPanelRegistration,
+) -> StorageTemporalPanel {
+    StorageTemporalPanel {
+        schema_version: registration.schema_version,
+        panel_name: registration.template.name,
+        panel_version: registration.source_panel_version,
+        registered_at_unix_ms: registration.registered_at_unix_ms,
+        temporal_slots: registration
+            .template
+            .slots
+            .into_iter()
+            .map(|slot| StorageTemporalSlot {
+                name: slot.name,
+                runtime: format!("{:?}", slot.runtime),
+                output: format!("{:?}", slot.output),
+                retrieval_only: slot.retrieval_only,
+                excluded_from_dedup: slot.excluded_from_dedup,
+                required: slot.required,
+            })
+            .collect(),
+        policy: storage_temporal_policy(&registration.policy),
+    }
+}
+
+fn storage_temporal_policy(policy: &synapse_calyx::TemporalPolicy) -> StorageTemporalPolicy {
+    StorageTemporalPolicy {
+        enabled: policy.enabled,
+        never_dominant: policy.never_dominant,
+        decay: format!("{:?}", policy.decay),
+        periodic_target_hour: policy.periodic.target_hour,
+        periodic_target_day_of_week: policy.periodic.target_day_of_week,
+        periodic_use_query_time: policy.periodic.use_now,
+        sequence_direction: format!("{:?}", policy.sequence.direction),
+        sequence_multi_anchor_mode: format!("{:?}", policy.sequence.multi_anchor_mode),
+        fusion_recency: policy.fusion_weights.recency,
+        fusion_sequence: policy.fusion_weights.sequence,
+        fusion_periodic: policy.fusion_weights.periodic,
+        post_retrieval_alpha: policy.boost.post_retrieval_alpha,
+        recurrence_boost_enabled: policy.recurrence_boost.is_some(),
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

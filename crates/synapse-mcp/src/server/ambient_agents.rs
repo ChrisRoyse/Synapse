@@ -56,7 +56,11 @@
 //! stable operation identity on the bounded primary event batch, reads the
 //! physical journal independently, and acknowledges only an exact set. An
 //! unresolved event or acknowledgement commit latches relay fail-stop until
-//! daemon/vault reopen rebuilds state from durable WAL reality (#1771).
+//! daemon/vault reopen rebuilds state from durable WAL reality (#1771). When a
+//! retained exact batch predates the global 24-hour startup projection window,
+//! relay quietly replays those exact physical rows into the live tracker under
+//! its normal locks, verifies the singleton and journal again, and never
+//! re-journals replacement evidence (#1772).
 
 use std::{
     collections::BTreeMap,
@@ -75,7 +79,10 @@ use synapse_core::{
     AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS, AgentEventKind, AgentEventRecord,
     AgentTranscriptRecord, GenAiOperationName, TranscriptParseStatus, TranscriptRole,
     TranscriptSource, TranscriptToolCall, TranscriptUsage,
+    retention::{DEFAULTS as RETENTION_DEFAULTS, RetentionTtl},
 };
+
+type AmbientOutboxScanReadback = (Vec<(Vec<u8>, Vec<u8>)>, usize, u64, u64);
 use synapse_storage::{
     Db,
     agent_events::agent_event_key,
@@ -88,6 +95,7 @@ use super::{
     agent_events::{
         provider_for_agent_kind, record_agent_events, unix_time_ns_now, validate_and_encode,
     },
+    agent_state::AmbientExactJournalRow,
     agent_transcripts::{
         BoundedTailRead, BoundedTranscriptTailReader, MAX_AGENT_TRANSCRIPT_COMMIT_ROWS,
         MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES, PreparedTranscriptRow,
@@ -119,6 +127,7 @@ const SPAWN_ID_PREFIX: &str = "agent-spawn-ambient-claude-";
 const AGENT_KIND: &str = "claude";
 const CURSOR_VERSION: u32 = 1;
 const AMBIENT_OUTBOX_VERSION: u32 = 1;
+const AMBIENT_PROJECTION_CHECKPOINT_VERSION: u32 = 1;
 const AMBIENT_OUTBOX_OPERATION_FIELD: &str = "ambient_outbox_operation_id";
 const MAX_AMBIENT_OUTBOX_RECORDS: usize = 3;
 const AMBIENT_OUTBOX_SCAN_PAGE_ROWS: usize = 256;
@@ -139,6 +148,7 @@ static PRESSURE_DEFERRALS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CYCLES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OUTBOX_ACKNOWLEDGED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OUTBOX_RECOVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOX_PROJECTION_RECOVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static AMBIENT_OUTBOX_RECONCILIATION_LATCH: AtomicBool = AtomicBool::new(false);
 
 fn ambient_outbox_relay_lock() -> &'static Mutex<()> {
@@ -178,6 +188,7 @@ pub(crate) fn ingest_stats() -> Value {
         "cycles_total": CYCLES_TOTAL.load(Ordering::Relaxed),
         "outbox_acknowledged_total": OUTBOX_ACKNOWLEDGED_TOTAL.load(Ordering::Relaxed),
         "outbox_recovered_total": OUTBOX_RECOVERED_TOTAL.load(Ordering::Relaxed),
+        "outbox_projection_recovered_total": OUTBOX_PROJECTION_RECOVERED_TOTAL.load(Ordering::Relaxed),
         "outbox_reconciliation_latched": AMBIENT_OUTBOX_RECONCILIATION_LATCH.load(Ordering::Acquire),
     })
 }
@@ -237,10 +248,28 @@ struct AmbientEventOutboxIdentity<'a> {
     acknowledge_state: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Durable bounded replay pointer retained after outbox acknowledgement. The
+/// journal keys plus the original operation intent let every later daemon
+/// process restore the same live projection while the 30-day source rows are
+/// retained, without appending replacement evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmbientProjectionCheckpoint {
+    record_version: u32,
+    outbox: AmbientEventOutbox,
+    journal_keys: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AmbientOutboxJournalState {
     Absent,
-    Exact,
+    Exact(Vec<AmbientExactJournalRow>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AmbientProjectionCheckpointJournalState {
+    Absent,
+    Exact(Vec<AmbientExactJournalRow>),
 }
 
 #[derive(Debug)]
@@ -248,6 +277,12 @@ struct AmbientOutboxRelayOutcome {
     cursor: AmbientCursor,
     revision_sha256: Option<[u8; 32]>,
     newly_registered: bool,
+}
+
+#[derive(Debug)]
+struct AmbientProjectionCheckpointOutcome {
+    cursor: AmbientCursor,
+    revision_sha256: Option<[u8; 32]>,
 }
 
 /// Durable per-session tail state in `CF_KV` under [`CURSOR_KV_PREFIX`].
@@ -298,6 +333,10 @@ struct AmbientCursor {
     /// after exact `CF_AGENT_EVENTS` readback proves delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_event_outbox: Option<AmbientEventOutbox>,
+    /// Latest acknowledged lifecycle operation and its exact physical keys.
+    /// This is a bounded materialized-view replay checkpoint, not pending work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_checkpoint: Option<AmbientProjectionCheckpoint>,
     /// Sticky structured error; a parked session is skipped (and counted) until
     /// the cursor row is cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -486,6 +525,9 @@ fn load_cursor(db: &Db, spawn_id: &str) -> Result<LoadedAmbientCursor, String> {
     }
     if let Some(outbox) = &cursor.pending_event_outbox {
         validate_event_outbox(&cursor, outbox)?;
+    }
+    if let Some(checkpoint) = &cursor.projection_checkpoint {
+        validate_projection_checkpoint(&cursor, checkpoint)?;
     }
     Ok(LoadedAmbientCursor {
         cursor: Some(cursor),
@@ -818,7 +860,7 @@ fn event_matches_state(record: &AgentEventRecord, state: &str) -> bool {
     }
 }
 
-fn validate_event_outbox(
+fn validate_event_outbox_identity(
     cursor: &AmbientCursor,
     outbox: &AmbientEventOutbox,
 ) -> Result<(), String> {
@@ -843,25 +885,6 @@ fn validate_event_outbox(
             outbox.records.len()
         ));
     }
-    if (!outbox.acknowledge_registration && outbox.acknowledge_state.is_none())
-        || (outbox.acknowledge_registration && cursor.registered)
-        || (!outbox.acknowledge_registration && !cursor.registered)
-        || outbox
-            .acknowledge_state
-            .as_deref()
-            .is_some_and(|state| cursor.last_emitted_state.as_deref() == Some(state))
-    {
-        return Err(format!(
-            "AMBIENT_OUTBOX_EFFECT_INVALID: spawn_id={} operation_id={} cursor_registered={} acknowledge_registration={} cursor_state={:?} acknowledge_state={:?}; remediation=repair the cursor/outbox acknowledgement state from the exact journal rows",
-            cursor.spawn_id,
-            outbox.operation_id,
-            cursor.registered,
-            outbox.acknowledge_registration,
-            cursor.last_emitted_state,
-            outbox.acknowledge_state
-        ));
-    }
-
     let mut requested = 0_usize;
     let mut ready = 0_usize;
     let mut state_records = 0_usize;
@@ -966,6 +989,95 @@ fn validate_event_outbox(
     Ok(())
 }
 
+fn validate_event_outbox(
+    cursor: &AmbientCursor,
+    outbox: &AmbientEventOutbox,
+) -> Result<(), String> {
+    validate_event_outbox_identity(cursor, outbox)?;
+    if (!outbox.acknowledge_registration && outbox.acknowledge_state.is_none())
+        || (outbox.acknowledge_registration && cursor.registered)
+        || (!outbox.acknowledge_registration && !cursor.registered)
+        || outbox
+            .acknowledge_state
+            .as_deref()
+            .is_some_and(|state| cursor.last_emitted_state.as_deref() == Some(state))
+    {
+        return Err(format!(
+            "AMBIENT_OUTBOX_EFFECT_INVALID: spawn_id={} operation_id={} cursor_registered={} acknowledge_registration={} cursor_state={:?} acknowledge_state={:?}; remediation=repair the cursor/outbox acknowledgement state from the exact journal rows",
+            cursor.spawn_id,
+            outbox.operation_id,
+            cursor.registered,
+            outbox.acknowledge_registration,
+            cursor.last_emitted_state,
+            outbox.acknowledge_state
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_checkpoint(
+    cursor: &AmbientCursor,
+    checkpoint: &AmbientProjectionCheckpoint,
+) -> Result<(), String> {
+    if checkpoint.record_version != AMBIENT_PROJECTION_CHECKPOINT_VERSION
+        || checkpoint.journal_keys.len() != checkpoint.outbox.records.len()
+        || checkpoint.journal_keys.is_empty()
+        || checkpoint.journal_keys.len() > MAX_AMBIENT_OUTBOX_RECORDS
+    {
+        return Err(format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_ENVELOPE_INVALID: spawn_id={} version={} expected_version={AMBIENT_PROJECTION_CHECKPOINT_VERSION} journal_keys={} records={}; remediation=repair the bounded cursor checkpoint from exact CF_AGENT_EVENTS rows",
+            cursor.spawn_id,
+            checkpoint.record_version,
+            checkpoint.journal_keys.len(),
+            checkpoint.outbox.records.len()
+        ));
+    }
+    let mut identity_cursor = cursor.clone();
+    identity_cursor.offset_bytes = checkpoint.outbox.checkpoint_offset_bytes;
+    identity_cursor.lines_ingested = checkpoint.outbox.checkpoint_lines_ingested;
+    validate_event_outbox_identity(&identity_cursor, &checkpoint.outbox)?;
+    let mut previous_key: Option<&[u8]> = None;
+    for key in &checkpoint.journal_keys {
+        if previous_key.is_some_and(|previous| previous >= key.as_slice()) {
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_KEY_ORDER_INVALID: spawn_id={} operation_id={}; remediation=repair the checkpoint from the exact ordered journal scan",
+                cursor.spawn_id, checkpoint.outbox.operation_id
+            ));
+        }
+        let (key_ts_ns, _key_seq) =
+            synapse_storage::agent_events::decode_agent_event_key(key).map_err(|error| {
+                format!(
+                    "AMBIENT_PROJECTION_CHECKPOINT_KEY_INVALID: spawn_id={} operation_id={} key_hex={}: {error}; remediation=repair the invalid physical journal identity",
+                    cursor.spawn_id,
+                    checkpoint.outbox.operation_id,
+                    synapse_storage::constellations::hex_encode(key)
+                )
+            })?;
+        if key_ts_ns != checkpoint.outbox.event_ts_ns {
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_TIMESTAMP_MISMATCH: spawn_id={} operation_id={} key_ts_ns={key_ts_ns} expected_event_ts_ns={}; remediation=repair the cursor checkpoint from exact primary rows",
+                cursor.spawn_id, checkpoint.outbox.operation_id, checkpoint.outbox.event_ts_ns
+            ));
+        }
+        previous_key = Some(key);
+    }
+    Ok(())
+}
+
+fn projection_checkpoint_from_exact_rows(
+    cursor: &AmbientCursor,
+    outbox: &AmbientEventOutbox,
+    exact_rows: &[AmbientExactJournalRow],
+) -> Result<AmbientProjectionCheckpoint, String> {
+    let checkpoint = AmbientProjectionCheckpoint {
+        record_version: AMBIENT_PROJECTION_CHECKPOINT_VERSION,
+        outbox: outbox.clone(),
+        journal_keys: exact_rows.iter().map(|row| row.key.clone()).collect(),
+    };
+    validate_projection_checkpoint(cursor, &checkpoint)?;
+    Ok(checkpoint)
+}
+
 fn encoded_record_multiset(
     records: &[AgentEventRecord],
 ) -> Result<BTreeMap<Vec<u8>, usize>, String> {
@@ -992,70 +1104,21 @@ fn inspect_outbox_journal(
     })?;
     let start_key = agent_event_key(outbox.event_ts_ns, 0);
     let end_key = agent_event_key(end_ts_ns, 0);
-    let mut rows = Vec::new();
-    let mut after_key: Option<Vec<u8>> = None;
-    let mut candidate_rows_examined = 0_usize;
-    loop {
-        let remaining = MAX_AMBIENT_OUTBOX_TIMESTAMP_CANDIDATES
-            .checked_sub(candidate_rows_examined)
-            .ok_or_else(|| {
-                format!(
-                    "AMBIENT_OUTBOX_JOURNAL_RANGE_OVERSIZED: spawn_id={} operation_id={} event_ts_ns={} candidates={} cap={MAX_AMBIENT_OUTBOX_TIMESTAMP_CANDIDATES}; remediation=inspect the pathological same-nanosecond journal partition before retrying relay",
-                    cursor.spawn_id,
-                    outbox.operation_id,
-                    outbox.event_ts_ns,
-                    candidate_rows_examined
-                )
-            })?;
-        if remaining == 0 {
-            return Err(format!(
-                "AMBIENT_OUTBOX_JOURNAL_RANGE_OVERSIZED: spawn_id={} operation_id={} event_ts_ns={} candidates={candidate_rows_examined} cap={MAX_AMBIENT_OUTBOX_TIMESTAMP_CANDIDATES}; remediation=inspect the pathological same-nanosecond journal partition before retrying relay",
-                cursor.spawn_id, outbox.operation_id, outbox.event_ts_ns
-            ));
-        }
-        let page_rows = remaining.min(AMBIENT_OUTBOX_SCAN_PAGE_ROWS);
-        let page = db
-            .scan_cf_fixed_width_range_page(
-                cf::CF_AGENT_EVENTS,
-                &start_key,
-                &end_key,
-                after_key.as_deref(),
-                page_rows,
-            )
-            .map_err(|error| {
-                format!(
-                    "AMBIENT_OUTBOX_JOURNAL_SCAN_FAILED: spawn_id={} operation_id={} event_ts_ns={} after_key_hex={}: {error}; remediation=repair the candidate-bounded CF_AGENT_EVENTS timestamp-range read before retrying relay",
-                    cursor.spawn_id,
-                    outbox.operation_id,
-                    outbox.event_ts_ns,
-                    after_key.as_deref().map_or_else(
-                        || "none".to_owned(),
-                        synapse_storage::constellations::hex_encode
-                    )
-                )
-            })?;
-        candidate_rows_examined = candidate_rows_examined
-            .checked_add(page.candidate_rows_examined)
-            .ok_or_else(|| {
-                format!(
-                    "AMBIENT_OUTBOX_JOURNAL_SCAN_COUNTER_OVERFLOW: spawn_id={} operation_id={}; remediation=repair the Calyx page accounting contract",
-                    cursor.spawn_id, outbox.operation_id
-                )
-            })?;
-        rows.extend(page.rows);
-        if !page.more {
-            break;
-        }
-        after_key = page.resume_after;
-        if after_key.is_none() {
-            return Err(format!(
-                "AMBIENT_OUTBOX_JOURNAL_SCAN_CURSOR_MISSING: spawn_id={} operation_id={} event_ts_ns={} candidates={candidate_rows_examined}; remediation=repair the Calyx fixed-width page contract before retrying relay",
-                cursor.spawn_id, outbox.operation_id, outbox.event_ts_ns
-            ));
-        }
-    }
+    let (rows, candidate_rows_examined, snapshot_seq, lease_id) =
+        scan_outbox_journal_rows(db, cursor, outbox, &start_key, &end_key)?;
+    tracing::debug!(
+        code = "AMBIENT_OUTBOX_JOURNAL_SNAPSHOT_COMPLETE",
+        spawn_id = %cursor.spawn_id,
+        operation_id = %outbox.operation_id,
+        lease_id,
+        snapshot_seq,
+        candidate_rows_examined,
+        matched_range_rows = rows.len(),
+        "completed one-generation ambient journal audit and released its lease"
+    );
     let expected = encoded_record_multiset(&outbox.records)?;
     let mut actual = BTreeMap::new();
+    let mut exact_rows = Vec::with_capacity(outbox.records.len());
     for (key, encoded) in rows {
         let record: AgentEventRecord = decode_json(&encoded).map_err(|error| {
             format!(
@@ -1072,7 +1135,11 @@ fn inspect_outbox_journal(
             .and_then(Value::as_str)
             == Some(outbox.operation_id.as_str())
         {
-            *actual.entry(encoded).or_insert(0) += 1;
+            *actual.entry(encoded.clone()).or_insert(0) += 1;
+            exact_rows.push(AmbientExactJournalRow {
+                key,
+                value: encoded,
+            });
         }
     }
     if actual.is_empty() {
@@ -1088,7 +1155,175 @@ fn inspect_outbox_journal(
             actual.values().sum::<usize>()
         ));
     }
-    Ok(AmbientOutboxJournalState::Exact)
+    Ok(AmbientOutboxJournalState::Exact(exact_rows))
+}
+
+fn scan_outbox_journal_rows(
+    db: &Db,
+    cursor: &AmbientCursor,
+    outbox: &AmbientEventOutbox,
+    start_key: &[u8],
+    end_key: &[u8],
+) -> Result<AmbientOutboxScanReadback, String> {
+    let mut lease = db
+        .pin_cf_fixed_width_range_scan(
+            cf::CF_AGENT_EVENTS,
+            start_key,
+            end_key,
+            synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS,
+        )
+        .map_err(|error| {
+            format!(
+                "AMBIENT_OUTBOX_JOURNAL_SNAPSHOT_PIN_FAILED: spawn_id={} operation_id={} \
+                 event_ts_ns={}: {error}; remediation=repair the bounded Calyx reader-lease path",
+                cursor.spawn_id, outbox.operation_id, outbox.event_ts_ns
+            )
+        })?;
+    let snapshot_seq = lease.snapshot_seq;
+    let lease_id = lease.lease_id;
+    let mut rows = Vec::new();
+    let mut candidate_rows_examined = 0_usize;
+    let scan_result = (|| -> Result<(), String> {
+        loop {
+            let remaining = MAX_AMBIENT_OUTBOX_TIMESTAMP_CANDIDATES
+            .checked_sub(candidate_rows_examined)
+            .ok_or_else(|| {
+                format!(
+                    "AMBIENT_OUTBOX_JOURNAL_RANGE_OVERSIZED: spawn_id={} operation_id={} event_ts_ns={} candidates={} cap={MAX_AMBIENT_OUTBOX_TIMESTAMP_CANDIDATES}; remediation=inspect the pathological same-nanosecond journal partition before retrying relay",
+                    cursor.spawn_id,
+                    outbox.operation_id,
+                    outbox.event_ts_ns,
+                    candidate_rows_examined
+                )
+            })?;
+            if remaining == 0 {
+                return Err(format!(
+                    "AMBIENT_OUTBOX_JOURNAL_RANGE_OVERSIZED: spawn_id={} operation_id={} event_ts_ns={} candidates={candidate_rows_examined} cap={MAX_AMBIENT_OUTBOX_TIMESTAMP_CANDIDATES}; remediation=inspect the pathological same-nanosecond journal partition before retrying relay",
+                    cursor.spawn_id, outbox.operation_id, outbox.event_ts_ns
+                ));
+            }
+            let page_rows = remaining.min(AMBIENT_OUTBOX_SCAN_PAGE_ROWS);
+            let cursor_before = lease.next_after().map(ToOwned::to_owned);
+            let page = db
+            .scan_cf_fixed_width_range_page_coherent(&mut lease, page_rows)
+            .map_err(|error| {
+                format!(
+                    "AMBIENT_OUTBOX_JOURNAL_SCAN_FAILED: spawn_id={} operation_id={} event_ts_ns={} after_key_hex={}: {error}; remediation=repair the candidate-bounded CF_AGENT_EVENTS timestamp-range read before retrying relay",
+                    cursor.spawn_id,
+                    outbox.operation_id,
+                    outbox.event_ts_ns,
+                    cursor_before.as_deref().map_or_else(
+                        || "none".to_owned(),
+                        synapse_storage::constellations::hex_encode
+                    )
+                )
+            })?;
+            candidate_rows_examined = candidate_rows_examined
+            .checked_add(page.candidate_rows_examined)
+            .ok_or_else(|| {
+                format!(
+                    "AMBIENT_OUTBOX_JOURNAL_SCAN_COUNTER_OVERFLOW: spawn_id={} operation_id={}; remediation=repair the Calyx page accounting contract",
+                    cursor.spawn_id, outbox.operation_id
+                )
+            })?;
+            rows.extend(page.rows);
+            if !page.more {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    let release_result = db.release_coherent_scan(&mut lease);
+    match (scan_result, release_result) {
+        (Err(scan_error), Ok(_)) => return Err(scan_error),
+        (Err(scan_error), Err(release_error)) => {
+            return Err(format!(
+                "{scan_error}; additionally failed to release coherent lease_id={lease_id} \
+                 snapshot_seq={snapshot_seq}: {release_error}"
+            ));
+        }
+        (Ok(()), Err(error)) => {
+            return Err(format!(
+                "AMBIENT_OUTBOX_JOURNAL_SNAPSHOT_RELEASE_FAILED: spawn_id={} operation_id={} \
+                 lease_id={lease_id} snapshot_seq={snapshot_seq}: {error}",
+                cursor.spawn_id, outbox.operation_id
+            ));
+        }
+        (Ok(()), Ok(false)) => {
+            return Err(format!(
+                "AMBIENT_OUTBOX_JOURNAL_SNAPSHOT_EXPIRED_AT_RELEASE: spawn_id={} operation_id={} \
+                 lease_id={lease_id} snapshot_seq={snapshot_seq}; remediation=repeat the bounded exact audit",
+                cursor.spawn_id, outbox.operation_id
+            ));
+        }
+        (Ok(()), Ok(true)) => {}
+    }
+    Ok((rows, candidate_rows_examined, snapshot_seq, lease_id))
+}
+
+fn inspect_projection_checkpoint_journal(
+    db: &Db,
+    cursor: &AmbientCursor,
+    checkpoint: &AmbientProjectionCheckpoint,
+) -> Result<AmbientProjectionCheckpointJournalState, String> {
+    validate_projection_checkpoint(cursor, checkpoint)?;
+    let mut exact_rows = Vec::with_capacity(checkpoint.journal_keys.len());
+    let mut missing_rows = 0_usize;
+    for (key, record) in checkpoint
+        .journal_keys
+        .iter()
+        .zip(&checkpoint.outbox.records)
+    {
+        let expected = validate_and_encode(record).map_err(|error| {
+            format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_RECORD_INVALID: spawn_id={} operation_id={} key_hex={}: {error}; remediation=repair the cursor checkpoint before recovery",
+                cursor.spawn_id,
+                checkpoint.outbox.operation_id,
+                synapse_storage::constellations::hex_encode(key)
+            )
+        })?;
+        let revisioned = db
+            .get_cf_revisioned(cf::CF_AGENT_EVENTS, key)
+            .map_err(|error| {
+                format!(
+                    "AMBIENT_PROJECTION_CHECKPOINT_ROW_READ_FAILED: spawn_id={} operation_id={} key_hex={}: {error}; remediation=repair the exact Calyx point-read before recovery",
+                    cursor.spawn_id,
+                    checkpoint.outbox.operation_id,
+                    synapse_storage::constellations::hex_encode(key)
+                )
+            })?;
+        let Some(actual) = revisioned.and_then(|row| row.value) else {
+            missing_rows += 1;
+            continue;
+        };
+        if actual != expected {
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_ROW_DIVERGED: spawn_id={} operation_id={} key_hex={} expected_value_sha256={} actual_value_sha256={}; remediation=quarantine and repair the divergent primary journal row before recovery",
+                cursor.spawn_id,
+                checkpoint.outbox.operation_id,
+                synapse_storage::constellations::hex_encode(key),
+                sha256_hex(&expected),
+                sha256_hex(&actual)
+            ));
+        }
+        exact_rows.push(AmbientExactJournalRow {
+            key: key.clone(),
+            value: actual,
+        });
+    }
+    if missing_rows == checkpoint.journal_keys.len() {
+        return Ok(AmbientProjectionCheckpointJournalState::Absent);
+    }
+    if missing_rows != 0 {
+        return Err(format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_JOURNAL_PARTIAL: spawn_id={} operation_id={} expected_rows={} present_rows={} missing_rows={missing_rows}; remediation=leave the checkpoint intact and reconcile the partially retained operation before recovery",
+            cursor.spawn_id,
+            checkpoint.outbox.operation_id,
+            checkpoint.journal_keys.len(),
+            exact_rows.len()
+        ));
+    }
+    Ok(AmbientProjectionCheckpointJournalState::Exact(exact_rows))
 }
 
 fn inspect_outbox_live_projection(
@@ -1125,6 +1360,219 @@ fn inspect_outbox_live_projection(
     Ok(())
 }
 
+fn agent_event_retention_ns() -> Result<u64, String> {
+    let retention = RETENTION_DEFAULTS
+        .iter()
+        .find(|retention| retention.cf == cf::CF_AGENT_EVENTS)
+        .ok_or_else(|| {
+            "AMBIENT_OUTBOX_RETENTION_CONTRACT_MISSING: CF_AGENT_EVENTS has no retention default; remediation=restore the journal retention contract before relay"
+                .to_owned()
+        })?;
+    let hours = match retention.ttl {
+        RetentionTtl::Hours(hours) => hours,
+        RetentionTtl::Days(days) => days.checked_mul(24).ok_or_else(|| {
+            "AMBIENT_OUTBOX_RETENTION_CONTRACT_OVERFLOW: CF_AGENT_EVENTS day retention does not fit hours; remediation=repair the retention default"
+                .to_owned()
+        })?,
+        RetentionTtl::None | RetentionTtl::LruOnly => {
+            return Err(format!(
+                "AMBIENT_OUTBOX_RETENTION_CONTRACT_INVALID: CF_AGENT_EVENTS retention is {:?}; remediation=configure a finite time retention so absence ambiguity has a physical boundary",
+                retention.ttl
+            ));
+        }
+    };
+    hours
+        .checked_mul(60 * 60)
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .ok_or_else(|| {
+            "AMBIENT_OUTBOX_RETENTION_CONTRACT_OVERFLOW: CF_AGENT_EVENTS retention does not fit nanoseconds; remediation=repair the retention default"
+                .to_owned()
+        })
+}
+
+fn ensure_absent_outbox_is_within_journal_retention(
+    cursor: &AmbientCursor,
+    outbox: &AmbientEventOutbox,
+) -> Result<(), String> {
+    let retention_ns = agent_event_retention_ns()?;
+    let now_ns = unix_time_ns_now();
+    let outbox_age_ns = now_ns.saturating_sub(outbox.event_ts_ns);
+    if outbox_age_ns >= retention_ns {
+        return Err(format!(
+            "AMBIENT_OUTBOX_JOURNAL_ABSENCE_AMBIGUOUS: spawn_id={} operation_id={} event_ts_ns={} now_ns={now_ns} age_ns={outbox_age_ns} retention_ns={retention_ns}; the operation is absent after its journal-retention horizon, so relay cannot distinguish never-committed from committed-then-expired; remediation=leave the outbox unacknowledged and reconcile from retained external/source evidence instead of appending a replacement event",
+            cursor.spawn_id, outbox.operation_id, outbox.event_ts_ns
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_projection_checkpoint(
+    db: &Db,
+    spawn_id: &str,
+) -> Result<AmbientProjectionCheckpointOutcome, String> {
+    let _relay_guard = ambient_outbox_relay_lock().lock().map_err(|poisoned| {
+        format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_LOCK_POISONED: spawn_id={spawn_id}: {poisoned}; remediation=restart the daemon and reconcile the cursor checkpoint against CF_AGENT_EVENTS"
+        )
+    })?;
+    if AMBIENT_OUTBOX_RECONCILIATION_LATCH.load(Ordering::Acquire) {
+        return Err(format!(
+            "AMBIENT_OUTBOX_COMMIT_RECONCILIATION_REQUIRED: spawn_id={spawn_id} a prior event, projection, or acknowledgement outcome is unresolved in this process; remediation=stop the daemon, reopen Calyx, and reconcile the persisted cursor evidence before recovery"
+        ));
+    }
+    let loaded = load_cursor(db, spawn_id)?;
+    let mut cursor = loaded.cursor.ok_or_else(|| {
+        format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_CURSOR_MISSING: spawn_id={spawn_id}; remediation=restore the authoritative ambient cursor before projection recovery"
+        )
+    })?;
+    let mut revision_sha256 = loaded.revision_sha256;
+    if cursor.pending_event_outbox.is_some() {
+        return Err(format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_PENDING_OUTBOX: spawn_id={spawn_id}; remediation=relay the newer pending operation before reconciling its predecessor checkpoint"
+        ));
+    }
+    let Some(checkpoint) = cursor.projection_checkpoint.clone() else {
+        return Ok(AmbientProjectionCheckpointOutcome {
+            cursor,
+            revision_sha256,
+        });
+    };
+    let live_projection = inspect_outbox_live_projection(&cursor, &checkpoint.outbox);
+
+    let exact_rows = match inspect_projection_checkpoint_journal(db, &cursor, &checkpoint) {
+        Ok(AmbientProjectionCheckpointJournalState::Exact(rows)) => rows,
+        Ok(AmbientProjectionCheckpointJournalState::Absent) => {
+            let retention_ns = match agent_event_retention_ns() {
+                Ok(retention_ns) => retention_ns,
+                Err(error) => {
+                    AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                    return Err(format!(
+                        "AMBIENT_PROJECTION_CHECKPOINT_RETENTION_UNRESOLVED: spawn_id={} operation_id={} error={error}; remediation=leave the checkpoint intact and repair the journal retention contract before deciding whether missing rows expired",
+                        cursor.spawn_id, checkpoint.outbox.operation_id
+                    ));
+                }
+            };
+            let now_ns = unix_time_ns_now();
+            let checkpoint_age_ns = now_ns.saturating_sub(checkpoint.outbox.event_ts_ns);
+            if checkpoint_age_ns < retention_ns {
+                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                return Err(format!(
+                    "AMBIENT_PROJECTION_CHECKPOINT_ROWS_MISSING: spawn_id={} operation_id={} age_ns={checkpoint_age_ns} retention_ns={retention_ns}; acknowledged primary rows disappeared before their retention boundary; remediation=leave the checkpoint intact, stop the daemon, and repair/reconcile CF_AGENT_EVENTS",
+                    cursor.spawn_id, checkpoint.outbox.operation_id
+                ));
+            }
+            cursor.projection_checkpoint = None;
+            cursor.updated_ts_ns = now_ns;
+            if let Err(error) = store_cursor(db, &cursor, &mut revision_sha256) {
+                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                return Err(format!(
+                    "AMBIENT_PROJECTION_CHECKPOINT_RETIRE_RECONCILIATION_REQUIRED: spawn_id={} operation_id={} checkpoint_age_ns={checkpoint_age_ns} retention_ns={retention_ns} cursor_error={error}; remediation=stop the daemon and inspect the cursor WAL outcome before retrying retirement",
+                    cursor.spawn_id, checkpoint.outbox.operation_id
+                ));
+            }
+            tracing::info!(
+                code = "AMBIENT_PROJECTION_CHECKPOINT_RETIRED",
+                spawn_id = %cursor.spawn_id,
+                operation_id = %checkpoint.outbox.operation_id,
+                checkpoint_age_ns,
+                retention_ns,
+                "all exact primary rows are outside retention; bounded replay checkpoint cleared without re-journaling"
+            );
+            return Ok(AmbientProjectionCheckpointOutcome {
+                cursor,
+                revision_sha256,
+            });
+        }
+        Err(error) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(error);
+        }
+    };
+    let initial_projection_error = match live_projection {
+        Ok(()) => {
+            tracing::debug!(
+                code = "AMBIENT_PROJECTION_CHECKPOINT_VERIFIED",
+                spawn_id = %cursor.spawn_id,
+                operation_id = %checkpoint.outbox.operation_id,
+                row_count = exact_rows.len(),
+                "readback=CF_AGENT_EVENTS+AgentStateTracker edge=ambient_projection_checkpoint"
+            );
+            return Ok(AmbientProjectionCheckpointOutcome {
+                cursor,
+                revision_sha256,
+            });
+        }
+        Err(error) => error,
+    };
+    let recovery = match super::agent_state::recover_ambient_projection_from_exact_journal_rows(
+        db,
+        &cursor.spawn_id,
+        &exact_rows,
+    ) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_RECOVERY_FAILED: spawn_id={} operation_id={} initial_projection_error={initial_projection_error} recovery_error={error}; remediation=leave the checkpoint intact and repair the exact journal-to-singleton replay before restart",
+                cursor.spawn_id, checkpoint.outbox.operation_id,
+            ));
+        }
+    };
+    if let Err(error) = inspect_outbox_live_projection(&cursor, &checkpoint.outbox) {
+        AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+        return Err(format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_READBACK_FAILED: spawn_id={} operation_id={} recovered_rows={} already_current={} recovery_error={error}; remediation=leave the checkpoint intact and repair the singleton readback before restart",
+            cursor.spawn_id,
+            checkpoint.outbox.operation_id,
+            recovery.rows_applied,
+            recovery.already_current
+        ));
+    }
+    match inspect_projection_checkpoint_journal(db, &cursor, &checkpoint) {
+        Ok(AmbientProjectionCheckpointJournalState::Exact(final_rows))
+            if final_rows == exact_rows => {}
+        Ok(AmbientProjectionCheckpointJournalState::Exact(final_rows)) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_FINAL_ROWS_CHANGED: spawn_id={} operation_id={} expected_rows={} actual_rows={}; remediation=leave the checkpoint intact and reconcile the changed physical journal evidence",
+                cursor.spawn_id,
+                checkpoint.outbox.operation_id,
+                exact_rows.len(),
+                final_rows.len()
+            ));
+        }
+        Ok(AmbientProjectionCheckpointJournalState::Absent) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_FINAL_ROWS_MISSING: spawn_id={} operation_id={}; remediation=leave the checkpoint intact and reconcile the disappeared physical rows",
+                cursor.spawn_id, checkpoint.outbox.operation_id
+            ));
+        }
+        Err(error) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(error);
+        }
+    }
+    if recovery.rows_applied > 0 {
+        OUTBOX_PROJECTION_RECOVERED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::info!(
+        code = "AMBIENT_PROJECTION_CHECKPOINT_RECOVERED",
+        spawn_id = %cursor.spawn_id,
+        operation_id = %checkpoint.outbox.operation_id,
+        recovered_rows = recovery.rows_applied,
+        already_current = recovery.already_current,
+        projected_state = recovery.readback.state.as_str(),
+        projected_last_event_unix_ms = recovery.readback.last_event_unix_ms,
+        "readback=CF_AGENT_EVENTS+AgentStateTracker edge=ambient_projection_checkpoint"
+    );
+    Ok(AmbientProjectionCheckpointOutcome {
+        cursor,
+        revision_sha256,
+    })
+}
+
 fn relay_pending_event_outbox(
     db: &Db,
     spawn_id: &str,
@@ -1155,39 +1603,122 @@ fn relay_pending_event_outbox(
     };
     validate_event_outbox(&cursor, &outbox)?;
     let prior_state = inspect_outbox_journal(db, &cursor, &outbox)?;
-    if prior_state == AmbientOutboxJournalState::Absent {
-        if let Err(error) = record_agent_events(db, &outbox.records) {
+    let recovered_existing_journal = matches!(&prior_state, AmbientOutboxJournalState::Exact(_));
+    let exact_rows = match prior_state {
+        AmbientOutboxJournalState::Absent => {
+            if let Err(error) = ensure_absent_outbox_is_within_journal_retention(&cursor, &outbox) {
+                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                return Err(error);
+            }
+            if let Err(error) = record_agent_events(db, &outbox.records) {
+                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                return Err(format!(
+                    "AMBIENT_OUTBOX_EVENT_COMMIT_RECONCILIATION_REQUIRED: spawn_id={} operation_id={} checkpoint_offset_bytes={} records={} event_error={error}; remediation=leave the durable cursor outbox intact, stop the daemon, reopen Calyx so WAL truth and the agent-state projection rebuild together, then inspect CF_AGENT_EVENTS before retrying this logical operation",
+                    cursor.spawn_id,
+                    outbox.operation_id,
+                    outbox.checkpoint_offset_bytes,
+                    outbox.records.len()
+                ));
+            }
+            match inspect_outbox_journal(db, &cursor, &outbox) {
+                Ok(AmbientOutboxJournalState::Exact(rows)) => rows,
+                Ok(AmbientOutboxJournalState::Absent) => {
+                    AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                    return Err(format!(
+                        "AMBIENT_OUTBOX_RELAY_READBACK_MISSING: spawn_id={} operation_id={} event writer returned success but exact primary rows are absent; remediation=stop the daemon and reconcile CF_AGENT_EVENTS before retry",
+                        cursor.spawn_id, outbox.operation_id
+                    ));
+                }
+                Err(readback_error) => {
+                    AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                    return Err(format!(
+                        "AMBIENT_OUTBOX_RELAY_READBACK_RECONCILIATION_REQUIRED: spawn_id={} operation_id={} event writer returned success but the independent primary-row readback failed: {readback_error}; remediation=leave the durable cursor outbox intact, stop the daemon, reopen Calyx, and reconcile CF_AGENT_EVENTS before any logical retry",
+                        cursor.spawn_id, outbox.operation_id
+                    ));
+                }
+            }
+        }
+        AmbientOutboxJournalState::Exact(rows) => rows,
+    };
+    let mut projection_recovered = false;
+    if let Err(initial_projection_error) = inspect_outbox_live_projection(&cursor, &outbox) {
+        if !recovered_existing_journal {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(initial_projection_error);
+        }
+        let recovery = match super::agent_state::recover_ambient_projection_from_exact_journal_rows(
+            db,
+            &cursor.spawn_id,
+            &exact_rows,
+        ) {
+            Ok(recovery) => recovery,
+            Err(recovery_error) => {
+                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+                return Err(format!(
+                    "AMBIENT_OUTBOX_PROJECTION_RECOVERY_FAILED: spawn_id={} operation_id={} initial_projection_error={initial_projection_error} recovery_error={recovery_error}; remediation=leave the durable outbox intact and repair the exact journal-to-singleton replay path before daemon restart",
+                    cursor.spawn_id, outbox.operation_id
+                ));
+            }
+        };
+        if let Err(readback_error) = inspect_outbox_live_projection(&cursor, &outbox) {
             AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
             return Err(format!(
-                "AMBIENT_OUTBOX_EVENT_COMMIT_RECONCILIATION_REQUIRED: spawn_id={} operation_id={} checkpoint_offset_bytes={} records={} event_error={error}; remediation=leave the durable cursor outbox intact, stop the daemon, reopen Calyx so WAL truth and the agent-state projection rebuild together, then inspect CF_AGENT_EVENTS before retrying this logical operation",
+                "AMBIENT_OUTBOX_PROJECTION_RECOVERY_READBACK_FAILED: spawn_id={} operation_id={} recovered_rows={} already_current={} recovered_state={} recovery_last_event_unix_ms={} initial_projection_error={initial_projection_error} readback_error={readback_error}; remediation=leave the durable outbox intact and repair the singleton readback before daemon restart",
                 cursor.spawn_id,
                 outbox.operation_id,
-                outbox.checkpoint_offset_bytes,
-                outbox.records.len()
+                recovery.rows_applied,
+                recovery.already_current,
+                recovery.readback.state.as_str(),
+                recovery.readback.last_event_unix_ms
             ));
         }
-        match inspect_outbox_journal(db, &cursor, &outbox) {
-            Ok(AmbientOutboxJournalState::Exact) => {}
-            Ok(AmbientOutboxJournalState::Absent) => {
-                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
-                return Err(format!(
-                    "AMBIENT_OUTBOX_RELAY_READBACK_MISSING: spawn_id={} operation_id={} event writer returned success but exact primary rows are absent; remediation=stop the daemon and reconcile CF_AGENT_EVENTS before retry",
-                    cursor.spawn_id, outbox.operation_id
-                ));
-            }
-            Err(readback_error) => {
-                AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
-                return Err(format!(
-                    "AMBIENT_OUTBOX_RELAY_READBACK_RECONCILIATION_REQUIRED: spawn_id={} operation_id={} event writer returned success but the independent primary-row readback failed: {readback_error}; remediation=leave the durable cursor outbox intact, stop the daemon, reopen Calyx, and reconcile CF_AGENT_EVENTS before any logical retry",
-                    cursor.spawn_id, outbox.operation_id
-                ));
-            }
+        projection_recovered = recovery.rows_applied > 0;
+        if projection_recovered {
+            OUTBOX_PROJECTION_RECOVERED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
     }
-    if let Err(error) = inspect_outbox_live_projection(&cursor, &outbox) {
-        AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
-        return Err(error);
+    match inspect_outbox_journal(db, &cursor, &outbox) {
+        Ok(AmbientOutboxJournalState::Exact(final_rows)) if final_rows == exact_rows => {}
+        Ok(AmbientOutboxJournalState::Exact(final_rows)) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_OUTBOX_FINAL_JOURNAL_READBACK_CHANGED: spawn_id={} operation_id={} expected_rows={} actual_rows={}; remediation=leave the durable outbox intact and reconcile the changed exact journal keys/bytes before restart",
+                cursor.spawn_id,
+                outbox.operation_id,
+                exact_rows.len(),
+                final_rows.len()
+            ));
+        }
+        Ok(AmbientOutboxJournalState::Absent) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_OUTBOX_FINAL_JOURNAL_READBACK_MISSING: spawn_id={} operation_id={}; remediation=leave the durable outbox intact and reconcile the disappeared physical rows before restart",
+                cursor.spawn_id, outbox.operation_id
+            ));
+        }
+        Err(readback_error) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_OUTBOX_FINAL_JOURNAL_READBACK_FAILED: spawn_id={} operation_id={} readback_error={readback_error}; remediation=leave the durable outbox intact and repair the exact journal read before restart",
+                cursor.spawn_id, outbox.operation_id
+            ));
+        }
     }
+
+    let projection_checkpoint = match projection_checkpoint_from_exact_rows(
+        &cursor,
+        &outbox,
+        &exact_rows,
+    ) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_OUTBOX_PROJECTION_CHECKPOINT_BUILD_FAILED: spawn_id={} operation_id={} error={error}; remediation=leave the durable outbox intact and repair the exact journal-key checkpoint before acknowledgement",
+                cursor.spawn_id, outbox.operation_id
+            ));
+        }
+    };
 
     let newly_registered = outbox.acknowledge_registration && !cursor.registered;
     if outbox.acknowledge_registration {
@@ -1196,6 +1727,7 @@ fn relay_pending_event_outbox(
     if let Some(state) = &outbox.acknowledge_state {
         cursor.last_emitted_state = Some(state.clone());
     }
+    cursor.projection_checkpoint = Some(projection_checkpoint);
     cursor.pending_event_outbox = None;
     cursor.updated_ts_ns = unix_time_ns_now();
     if let Err(error) = store_cursor(db, &cursor, &mut revision_sha256) {
@@ -1209,7 +1741,7 @@ fn relay_pending_event_outbox(
         SESSIONS_REGISTERED_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
     OUTBOX_ACKNOWLEDGED_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if prior_state == AmbientOutboxJournalState::Exact {
+    if recovered_existing_journal {
         OUTBOX_RECOVERED_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
     tracing::info!(
@@ -1218,7 +1750,8 @@ fn relay_pending_event_outbox(
         session_id = %cursor.session_id,
         operation_id = %outbox.operation_id,
         record_count = outbox.records.len(),
-        recovered_existing_journal = prior_state == AmbientOutboxJournalState::Exact,
+        recovered_existing_journal,
+        projection_recovered,
         acknowledge_registration = outbox.acknowledge_registration,
         acknowledge_state = ?outbox.acknowledge_state,
         checkpoint_offset_bytes = outbox.checkpoint_offset_bytes,
@@ -1294,6 +1827,12 @@ fn ingest_session_file_with_cancel(
         cursor = relayed.cursor;
         cursor_revision_sha256 = relayed.revision_sha256;
         newly_registered |= relayed.newly_registered;
+    }
+
+    if cursor.projection_checkpoint.is_some() {
+        let reconciled = reconcile_projection_checkpoint(db, &spawn_id)?;
+        cursor = reconciled.cursor;
+        cursor_revision_sha256 = reconciled.revision_sha256;
     }
 
     if let Some(error) = &cursor.error {
@@ -1795,6 +2334,7 @@ fn seed_cursor(spawn_id: &str, session_id: &str, source_path: &Path) -> AmbientC
         registered: false,
         last_emitted_state: None,
         pending_event_outbox: None,
+        projection_checkpoint: None,
         error: None,
         updated_ts_ns: unix_time_ns_now(),
     }
