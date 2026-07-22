@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use calyx_aster::MAX_DURABLE_SLOT_ID;
 use calyx_core::{
     Asymmetry, CalyxError, CxId, LensId, Modality, Panel, PanelSlotId, QuantPolicy, Result, Slot,
     SlotId, SlotKey, SlotShape, SlotState, Ts,
@@ -104,6 +105,14 @@ pub struct AddLensOutcome {
     pub queued: usize,
 }
 
+/// Durable controls that must be chosen before a lifecycle mutation begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableAddLensOptions {
+    /// Vault-global generation already reserved for this exact operation.
+    pub next_panel_generation: u32,
+    pub backfill_priority: BackfillPriority,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleOutcome {
     pub slot_id: SlotId,
@@ -145,6 +154,7 @@ impl SwapController {
         spec: SlotSpec,
         candidates: I,
         now: Ts,
+        next_panel_generation: u32,
     ) -> Result<AddLensOutcome>
     where
         I: IntoIterator<Item = BackfillCandidate>,
@@ -166,7 +176,7 @@ impl SwapController {
         ensure_unique_slot(&self.panel, &spec)?;
         ensure_registered_lens(registry, &spec)?;
         let slot_id = next_slot_id(&self.panel)?;
-        let version = self.bump_panel(now)?;
+        let version = self.bump_panel(now, next_panel_generation)?;
         let slot = Slot {
             slot_id,
             slot_key: SlotKey::new(slot_id, spec.key),
@@ -209,7 +219,7 @@ impl SwapController {
         candidates: I,
         now: Ts,
         scheduler: &mut BackfillScheduler,
-        priority: BackfillPriority,
+        options: DurableAddLensOptions,
     ) -> Result<AddLensOutcome>
     where
         I: IntoIterator<Item = BackfillCandidate>,
@@ -218,14 +228,20 @@ impl SwapController {
         let panel_before = self.panel.clone();
         let queue_before = self.queue.clone();
         let scheduler_before = scheduler.clone();
-        let outcome = self.add_lens(registry, spec, candidates.iter().copied(), now)?;
+        let outcome = self.add_lens(
+            registry,
+            spec,
+            candidates.iter().copied(),
+            now,
+            options.next_panel_generation,
+        )?;
         if outcome.index.ready && outcome.queued == 0 {
             return Ok(outcome);
         }
         let request = BackfillRequest {
             panel_slot: PanelSlotId::new(outcome.panel_version, outcome.slot.slot_id),
             lens_id: outcome.slot.lens_id,
-            priority,
+            priority: options.backfill_priority,
             candidates: candidates.iter().map(|candidate| candidate.cx_id).collect(),
         };
         if let Err(error) = scheduler.enqueue(request) {
@@ -237,16 +253,31 @@ impl SwapController {
         Ok(outcome)
     }
 
-    pub fn park_lens(&mut self, slot_id: SlotId, now: Ts) -> Result<LifecycleOutcome> {
-        self.set_slot_state(slot_id, SlotState::Parked, now)
+    pub fn park_lens(
+        &mut self,
+        slot_id: SlotId,
+        now: Ts,
+        next_panel_generation: u32,
+    ) -> Result<LifecycleOutcome> {
+        self.set_slot_state(slot_id, SlotState::Parked, now, next_panel_generation)
     }
 
-    pub fn unpark_lens(&mut self, slot_id: SlotId, now: Ts) -> Result<LifecycleOutcome> {
-        self.set_slot_state(slot_id, SlotState::Active, now)
+    pub fn unpark_lens(
+        &mut self,
+        slot_id: SlotId,
+        now: Ts,
+        next_panel_generation: u32,
+    ) -> Result<LifecycleOutcome> {
+        self.set_slot_state(slot_id, SlotState::Active, now, next_panel_generation)
     }
 
-    pub fn retire_lens(&mut self, slot_id: SlotId, now: Ts) -> Result<LifecycleOutcome> {
-        self.set_slot_state(slot_id, SlotState::Retired, now)
+    pub fn retire_lens(
+        &mut self,
+        slot_id: SlotId,
+        now: Ts,
+        next_panel_generation: u32,
+    ) -> Result<LifecycleOutcome> {
+        self.set_slot_state(slot_id, SlotState::Retired, now, next_panel_generation)
     }
 
     fn set_slot_state(
@@ -254,6 +285,7 @@ impl SwapController {
         slot_id: SlotId,
         state: SlotState,
         now: Ts,
+        next_panel_generation: u32,
     ) -> Result<LifecycleOutcome> {
         let index = self.slot_index(slot_id)?;
         let current = self.panel.slots[index].state;
@@ -271,7 +303,7 @@ impl SwapController {
             )));
         }
         let prior_version = self.panel.version;
-        let version = self.bump_panel(now)?;
+        let version = self.bump_panel(now, next_panel_generation)?;
         self.panel.slots[index].state = state;
         if state != SlotState::Active {
             self.queue
@@ -295,12 +327,14 @@ impl SwapController {
             })
     }
 
-    fn bump_panel(&mut self, now: Ts) -> Result<u32> {
-        self.panel.version = self
-            .panel
-            .version
-            .checked_add(1)
-            .ok_or_else(|| CalyxError::lens_frozen_violation("panel version overflow"))?;
+    fn bump_panel(&mut self, now: Ts, next_panel_generation: u32) -> Result<u32> {
+        if next_panel_generation <= self.panel.version {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "allocator-issued panel generation {next_panel_generation} must be greater than current generation {}; allocate a vault-global generation before mutating lifecycle state",
+                self.panel.version
+            )));
+        }
+        self.panel.version = next_panel_generation;
         self.panel.created_at = now;
         Ok(self.panel.version)
     }
@@ -482,14 +516,19 @@ fn ensure_registered_lens(registry: &Registry, spec: &SlotSpec) -> Result<()> {
 }
 
 fn next_slot_id(panel: &Panel) -> Result<SlotId> {
-    let next = panel
+    let occupied = panel
         .slots
         .iter()
         .map(|slot| slot.slot_id.get())
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    if next == u16::MAX && panel.slots.iter().any(|slot| slot.slot_id.get() == next) {
-        return Err(CalyxError::lens_frozen_violation("slot id overflow"));
-    }
-    Ok(SlotId::new(next))
+        .collect::<std::collections::BTreeSet<_>>();
+    (0..=MAX_DURABLE_SLOT_ID)
+        .find(|candidate| !occupied.contains(candidate))
+        .map(SlotId::new)
+        .ok_or_else(|| {
+            CalyxError::lens_frozen_violation(format!(
+                "panel generation {} has exhausted all {} durable slot identifiers (0..={MAX_DURABLE_SLOT_ID}); retired identifiers remain reserved for historical decoding; create an explicitly migrated WAL CF codec before adding another lens",
+                panel.version,
+                u32::from(MAX_DURABLE_SLOT_ID) + 1
+            ))
+        })
 }

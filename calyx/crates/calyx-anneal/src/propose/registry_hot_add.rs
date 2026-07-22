@@ -62,6 +62,7 @@ impl LensHotAdder for RegistryHotAdder<'_> {
         candidate: &CandidateLens,
         corpus: &[Constellation],
         now: Ts,
+        next_panel_generation: u32,
     ) -> Result<HotAddReceipt> {
         match candidate {
             CandidateLens::Algorithmic { .. } => {
@@ -70,7 +71,7 @@ impl LensHotAdder for RegistryHotAdder<'_> {
                 if !self.registry.contains(spec.lens_id) {
                     self.registry.register_frozen(lens, contract)?;
                 }
-                add_slot(controller, self.registry, spec, now)
+                add_slot(controller, self.registry, spec, now, next_panel_generation)
             }
             CandidateLens::Commission { spec } => {
                 let target = primary_target(spec)?;
@@ -97,7 +98,13 @@ impl LensHotAdder for RegistryHotAdder<'_> {
                     retrieval_only: false,
                     excluded_from_dedup: false,
                 };
-                add_slot(controller, self.registry, slot_spec, now)
+                add_slot(
+                    controller,
+                    self.registry,
+                    slot_spec,
+                    now,
+                    next_panel_generation,
+                )
             }
         }
     }
@@ -108,8 +115,9 @@ fn add_slot(
     registry: &Registry,
     spec: SlotSpec,
     now: Ts,
+    next_panel_generation: u32,
 ) -> Result<HotAddReceipt> {
-    let outcome = controller.add_lens(registry, spec, [], now)?;
+    let outcome = controller.add_lens(registry, spec, [], now, next_panel_generation)?;
     Ok(HotAddReceipt {
         lens_id: outcome.slot.lens_id,
         panel_version: outcome.panel_version,

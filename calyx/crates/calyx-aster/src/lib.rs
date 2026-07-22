@@ -43,6 +43,12 @@ pub use dedup::{
     CompressionRatio, Domain, DomainCompressionStats, compression_ratio, domain_compression_stats,
 };
 
+/// Highest slot id encodable by Aster's durable one-byte WAL CF tag.
+///
+/// Slot identifiers are durable schema identities. Callers must allocate only
+/// within this inclusive bound and must not recycle retired identifiers.
+pub const MAX_DURABLE_SLOT_ID: u16 = 47;
+
 pub mod durable_fs {
     use std::path::Path;
 

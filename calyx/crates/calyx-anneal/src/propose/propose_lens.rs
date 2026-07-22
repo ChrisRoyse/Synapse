@@ -106,6 +106,7 @@ pub trait LensHotAdder {
         candidate: &CandidateLens,
         corpus: &[Constellation],
         now: Ts,
+        next_panel_generation: u32,
     ) -> Result<HotAddReceipt>;
 }
 
@@ -118,6 +119,8 @@ pub struct ProposeLensRequest<'a> {
     pub profiler: &'a dyn LensProfiler,
     pub nmi: &'a dyn PairNMI,
     pub corpus: &'a [Constellation],
+    /// Vault-global generation reserved before proposing this mutation.
+    pub next_panel_generation: u32,
 }
 
 pub struct ProposeLens<'a> {
@@ -229,6 +232,7 @@ impl<'a> ProposeLens<'a> {
                     &candidate,
                     request.corpus,
                     self.clock.now(),
+                    request.next_panel_generation,
                 ) {
                     Ok(receipt) => receipt,
                     Err(error) => {

@@ -149,7 +149,7 @@ pub use structured_record::{
     StructuredSlotMeasure, canonical_json_bytes, measure_structured_record,
     measure_structured_record_batch,
 };
-pub use swap::{BackfillCandidate, BackfillQueue, SlotSpec, SwapController};
+pub use swap::{BackfillCandidate, BackfillQueue, DurableAddLensOptions, SlotSpec, SwapController};
 pub use temporal::{
     DecayFunction, E2RecencyConfig, E2RecencyLens, E3PeriodicConfig, E3PeriodicLens,
     E4PositionalConfig, E4PositionalLens, MultiAnchorMode, PeriodicOptions, SequenceDirection,

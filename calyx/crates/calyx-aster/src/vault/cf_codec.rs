@@ -1,3 +1,4 @@
+use crate::MAX_DURABLE_SLOT_ID;
 use crate::cf::{ColumnFamily, SlotFamilyKind};
 use calyx_core::{CalyxError, Result, SlotId};
 
@@ -6,8 +7,6 @@ use calyx_core::{CalyxError, Result, SlotId};
 /// Tags `16..=63` are quantized slots and `64..=111` are raw slot sidecars.
 /// Static CFs occupy higher tags, so out-of-range slots must fail before
 /// durable write; otherwise slot ids alias unrelated static CF tags.
-pub(crate) const MAX_DURABLE_SLOT_ID: u16 = 47;
-
 pub(crate) fn cf_tag(cf: ColumnFamily) -> Result<u8> {
     match cf {
         ColumnFamily::Base => Ok(0),

@@ -4,6 +4,7 @@ use crate::profile::{CapabilityGateDecision, CapabilityGateEvaluation};
 use crate::spec::LensHealth;
 use crate::swap::{LifecycleOutcome, SwapController};
 use calyx_assay::store::{AssayCacheKey, AssayStore, AssaySubject};
+use calyx_aster::MAX_DURABLE_SLOT_ID;
 use calyx_core::{
     CalyxError, LensId, Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey, SlotResource,
     SlotState, Ts,
@@ -68,10 +69,11 @@ pub fn apply_panel_template(
     registry: &Registry,
     template: &PanelTemplate,
     now: Ts,
+    next_panel_generation: u32,
 ) -> calyx_core::Result<AppliedPanelTemplate> {
     let mut target = instantiate_panel(template, now);
     let resolved_lenses = resolve_registry_slots(&mut target.panel, registry, template)?;
-    let diff = swap_panel_to_target(panel, &target.panel, now);
+    let diff = swap_panel_to_target(panel, &target.panel, now, next_panel_generation)?;
     Ok(AppliedPanelTemplate {
         template_name: template.name.clone(),
         diff,
@@ -84,6 +86,7 @@ pub fn apply_capability_gate(
     slot_id: SlotId,
     evaluation: &CapabilityGateEvaluation,
     now: Ts,
+    next_panel_generation: u32,
 ) -> calyx_core::Result<PanelCapabilityGateOutcome> {
     let slot = controller
         .panel()
@@ -105,9 +108,15 @@ pub fn apply_capability_gate(
             state: slot.state,
             panel_version: controller.panel().version,
         },
-        CapabilityGateDecision::Admit => controller.unpark_lens(slot_id, now)?,
-        CapabilityGateDecision::Park => controller.park_lens(slot_id, now)?,
-        CapabilityGateDecision::Retire => controller.retire_lens(slot_id, now)?,
+        CapabilityGateDecision::Admit => {
+            controller.unpark_lens(slot_id, now, next_panel_generation)?
+        }
+        CapabilityGateDecision::Park => {
+            controller.park_lens(slot_id, now, next_panel_generation)?
+        }
+        CapabilityGateDecision::Retire => {
+            controller.retire_lens(slot_id, now, next_panel_generation)?
+        }
     };
 
     Ok(PanelCapabilityGateOutcome {
@@ -141,12 +150,34 @@ pub fn list_panel_with_assay(
         .collect()
 }
 
-pub fn swap_panel(panel: &mut Panel, template: &PanelTemplate, now: Ts) -> PanelDiff {
+pub fn swap_panel(
+    panel: &mut Panel,
+    template: &PanelTemplate,
+    now: Ts,
+    next_panel_generation: u32,
+) -> calyx_core::Result<PanelDiff> {
     let target = instantiate_panel(template, now);
-    swap_panel_to_target(panel, &target.panel, now)
+    swap_panel_to_target(panel, &target.panel, now, next_panel_generation)
 }
 
-pub fn swap_panel_to_target(panel: &mut Panel, target: &Panel, now: Ts) -> PanelDiff {
+pub fn swap_panel_to_target(
+    panel: &mut Panel,
+    target: &Panel,
+    now: Ts,
+    next_panel_generation: u32,
+) -> calyx_core::Result<PanelDiff> {
+    let mut proposed = panel.clone();
+    let diff = swap_panel_to_target_inner(&mut proposed, target, now, next_panel_generation)?;
+    *panel = proposed;
+    Ok(diff)
+}
+
+fn swap_panel_to_target_inner(
+    panel: &mut Panel,
+    target: &Panel,
+    now: Ts,
+    next_panel_generation: u32,
+) -> calyx_core::Result<PanelDiff> {
     let target_ids = target
         .slots
         .iter()
@@ -165,12 +196,11 @@ pub fn swap_panel_to_target(panel: &mut Panel, target: &Panel, now: Ts) -> Panel
         }
     }
 
-    let mut next_id = panel
+    let mut occupied = panel
         .slots
         .iter()
         .map(|slot| slot.slot_id.get())
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
+        .collect::<std::collections::BTreeSet<_>>();
     for target_slot in &target.slots {
         let exists = panel
             .slots
@@ -179,14 +209,29 @@ pub fn swap_panel_to_target(panel: &mut Panel, target: &Panel, now: Ts) -> Panel
         if exists {
             continue;
         }
-        let slot_id = SlotId::new(next_id);
-        next_id = next_id.saturating_add(1);
+        let slot_id = (0..=MAX_DURABLE_SLOT_ID)
+            .find(|candidate| !occupied.contains(candidate))
+            .map(SlotId::new)
+            .ok_or_else(|| {
+                CalyxError::lens_frozen_violation(format!(
+                    "panel generation {} has exhausted all {} durable slot identifiers (0..={MAX_DURABLE_SLOT_ID}); retired identifiers remain reserved for historical decoding",
+                    panel.version,
+                    u32::from(MAX_DURABLE_SLOT_ID) + 1
+                ))
+            })?;
+        occupied.insert(slot_id.get());
         panel.slots.push(cloned_target_slot(target_slot, slot_id));
         added.push(slot_id);
     }
 
     if !added.is_empty() || !retired.is_empty() {
-        panel.version = panel.version.saturating_add(1);
+        if next_panel_generation <= panel.version {
+            return Err(CalyxError::lens_frozen_violation(format!(
+                "allocator-issued panel generation {next_panel_generation} must be greater than current generation {}; allocate a vault-global generation before applying a panel template",
+                panel.version
+            )));
+        }
+        panel.version = next_panel_generation;
         panel.created_at = now;
         for slot in &mut panel.slots {
             if added.contains(&slot.slot_id) {
@@ -195,12 +240,12 @@ pub fn swap_panel_to_target(panel: &mut Panel, target: &Panel, now: Ts) -> Panel
         }
     }
 
-    PanelDiff {
+    Ok(PanelDiff {
         added,
         retired,
         unchanged,
         panel_version: panel.version,
-    }
+    })
 }
 
 fn resolve_registry_slots(
