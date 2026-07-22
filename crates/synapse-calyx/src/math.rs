@@ -19,6 +19,7 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 // candidate-before-handoff install impossible while a healthy daemon retains
 // its measured baseline.
 const CUDA_STARTUP_ENVELOPE_MIB: u64 = 4 * 1024;
+const CUDA_REPLACEMENT_RESERVATION_ENV: &str = "SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID";
 const PROBE_TOLERANCE: f32 = 0.0001;
 const PROBE_DIM: usize = 3;
 const PROBE_QUERY: [f32; PROBE_DIM] = [1.0, 0.0, 0.0];
@@ -311,22 +312,24 @@ fn cuda_runtime_candidate(
     })?;
     let runtime_ceiling_mib = config.vram_budget_bytes.div_ceil(BYTES_PER_MIB);
     let startup_envelope_mib = runtime_ceiling_mib.min(CUDA_STARTUP_ENVELOPE_MIB);
-    let mut reservation = reservation_store
-        .acquire(HostGpuReservationRequest::new(
-            "synapse-mcp",
-            format!("synapse-daemon-pid-{}", std::process::id()),
-            format!(
-                "synapse-mcp temporary CUDA startup envelope; envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; atomically resized after retained-footprint measurement"
-            ),
-            startup_envelope_mib,
-        ))
-        .map_err(|error| {
-            forge_error(
-                "SYNAPSE_CALYX_MATH_HOST_RESERVATION_REFUSED",
-                "atomically admit the embedded Synapse CUDA startup envelope",
-                &error,
-            )
-        })?;
+    let mut request = HostGpuReservationRequest::new(
+        "synapse-mcp",
+        format!("synapse-daemon-pid-{}", std::process::id()),
+        format!(
+            "synapse-mcp temporary CUDA startup envelope; envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; atomically resized after retained-footprint measurement"
+        ),
+        startup_envelope_mib,
+    );
+    if let Some(replacement_id) = cuda_replacement_reservation_id()? {
+        request = request.replacing(replacement_id);
+    }
+    let mut reservation = reservation_store.acquire(request).map_err(|error| {
+        forge_error(
+            "SYNAPSE_CALYX_MATH_HOST_RESERVATION_REFUSED",
+            "atomically admit the embedded Synapse CUDA startup envelope",
+            &error,
+        )
+    })?;
     let backend = match CudaBackend::new() {
         Ok(backend) => backend,
         Err(error) => {
@@ -391,6 +394,24 @@ fn cuda_runtime_candidate(
         Some(reservation),
         Some(baseline_basis),
     )
+}
+
+#[cfg(feature = "calyx-cuda")]
+fn cuda_replacement_reservation_id() -> Result<Option<String>, SynapseCalyxError> {
+    match std::env::var(CUDA_REPLACEMENT_RESERVATION_ENV) {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_GPU_REPLACEMENT_ID_INVALID",
+            format!("{CUDA_REPLACEMENT_RESERVATION_ENV} is present but empty"),
+            MATH_BACKEND_REMEDIATION,
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_GPU_REPLACEMENT_ID_INVALID",
+            format!("{CUDA_REPLACEMENT_RESERVATION_ENV} is not valid Unicode"),
+            MATH_BACKEND_REMEDIATION,
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+    }
 }
 
 #[cfg(feature = "calyx-cuda")]

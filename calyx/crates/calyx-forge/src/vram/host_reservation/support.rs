@@ -79,6 +79,17 @@ pub(super) fn validate_request(request: &HostGpuReservationRequest) -> Result<()
             "GPU reservation requested_mib must be > 0".to_string(),
         ));
     }
+    if request
+        .replaces_reservation_id
+        .as_deref()
+        .is_some_and(|value| {
+            value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(config_error(
+            "GPU replacement reservation id must be exactly 32 ASCII hex characters".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -147,11 +158,23 @@ pub(super) fn host_cap_mib() -> Result<u64> {
     }
 }
 
-pub(super) fn reserved_mib(state: &PersistedState) -> Result<u64> {
-    state.reservations.iter().try_fold(0_u64, |sum, row| {
-        sum.checked_add(row.requested_mib)
-            .ok_or_else(|| config_error("persisted reservation sum overflow".to_string()))
-    })
+pub(super) fn effective_reserved_mib(state: &PersistedState) -> Result<u64> {
+    let mut total = 0_u64;
+    for row in &state.reservations {
+        if row.replaces_reservation_id.is_some() {
+            continue;
+        }
+        let replacement = state.reservations.iter().find(|candidate| {
+            candidate.replaces_reservation_id.as_deref() == Some(row.reservation_id.as_str())
+        });
+        let requested_mib = replacement.map_or(row.requested_mib, |candidate| {
+            row.requested_mib.max(candidate.requested_mib)
+        });
+        total = total
+            .checked_add(requested_mib)
+            .ok_or_else(|| config_error("effective reservation sum overflow".to_string()))?;
+    }
+    Ok(total)
 }
 
 pub(super) fn reservation_id(request: &HostGpuReservationRequest, now: u128) -> String {
@@ -162,6 +185,9 @@ pub(super) fn reservation_id(request: &HostGpuReservationRequest, now: u128) -> 
     hasher.update(request.owner.as_bytes());
     hasher.update(request.job_id.as_bytes());
     hasher.update(request.command.as_bytes());
+    if let Some(replacement) = &request.replaces_reservation_id {
+        hasher.update(replacement.as_bytes());
+    }
     let digest = hasher.finalize();
     digest[..16]
         .iter()
@@ -191,7 +217,7 @@ pub(super) fn snapshot(
     state_path: &Path,
     bytes: &[u8],
 ) -> Result<HostGpuReservationSnapshot> {
-    let reserved_mib = reserved_mib(state)?;
+    let reserved_mib = effective_reserved_mib(state)?;
     Ok(HostGpuReservationSnapshot {
         schema_version: state.schema_version,
         state_path: state_path.to_string_lossy().into_owned(),

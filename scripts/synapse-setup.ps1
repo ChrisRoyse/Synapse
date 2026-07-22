@@ -5017,13 +5017,56 @@ function Stop-SynapseExactCandidateProcess {
     Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds 5
 }
 
+function Get-SynapseCandidateReplacementReservationId {
+    param([Parameter(Mandatory=$true)][string]$Bind)
+
+    $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    if ($listeners.Count -eq 0) { return $null }
+    if ($listeners.Count -ne 1) {
+        Die "SYNAPSE_GPU_REPLACEMENT_LISTENER_AMBIGUOUS bind=$Bind listeners=$(Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners) remediation=repair the configured daemon listener before candidate validation"
+    }
+    $listener = $listeners[0]
+    if (-not $listener.OwnerExists -or $listener.OwnerName -ine 'synapse-mcp.exe') {
+        Die "SYNAPSE_GPU_REPLACEMENT_LISTENER_INVALID bind=$Bind pid=$($listener.OwningProcess) owner=$($listener.OwnerName) remediation=the configured bind must be owned by the exact live Synapse daemon before replacement admission"
+    }
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    if ([string]::IsNullOrWhiteSpace($programData)) {
+        Die 'SYNAPSE_GPU_REPLACEMENT_ROOT_UNAVAILABLE remediation=Windows CommonApplicationData is required to verify the host GPU reservation ledger'
+    }
+    $statePath = Join-Path $programData 'Calyx\gpu-reservations\device-0\reservations.json'
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_MISSING path=$statePath live_pid=$($listener.OwningProcess) remediation=repair the live daemon GPU reservation Source of Truth before candidate validation"
+    }
+    try {
+        $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_UNREADABLE path=$statePath error=$($_.Exception.Message) remediation=repair the host GPU reservation Source of Truth before candidate validation"
+    }
+    $matches = @($state.reservations | Where-Object {
+        [int]$_.pid -eq [int]$listener.OwningProcess -and
+        [string]$_.owner -eq 'synapse-mcp' -and
+        [string]::IsNullOrWhiteSpace([string]$_.replaces_reservation_id)
+    })
+    if ($matches.Count -ne 1) {
+        Die "SYNAPSE_GPU_REPLACEMENT_RESERVATION_AMBIGUOUS path=$statePath live_pid=$($listener.OwningProcess) match_count=$($matches.Count) remediation=the live daemon must own exactly one primary device-0 reservation before candidate validation"
+    }
+    $row = $matches[0]
+    if ([string]$row.reservation_id -notmatch '^[0-9a-fA-F]{32}$' -or
+        -not (Test-Path -LiteralPath ([string]$row.lease_file) -PathType Leaf)) {
+        Die "SYNAPSE_GPU_REPLACEMENT_RESERVATION_INVALID path=$statePath live_pid=$($listener.OwningProcess) reservation_id=$($row.reservation_id) lease=$($row.lease_file) remediation=repair the exact live reservation row/lease before candidate validation"
+    }
+    Info "Candidate replacement reservation verified bind=$Bind live_pid=$($listener.OwningProcess) reservation_id=$($row.reservation_id) requested_mib=$($row.requested_mib) state_path=$statePath"
+    return [string]$row.reservation_id
+}
+
 function Test-SynapseCandidateDaemon {
     param(
         [Parameter(Mandatory=$true)][string]$CandidateExePath,
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$LogDir,
-        [AllowNull()][string]$AllowedPermissions
+        [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$ReplacementReservationId = $null
     )
 
     if (-not (Test-Path -LiteralPath $CandidateExePath)) {
@@ -5053,8 +5096,15 @@ function Test-SynapseCandidateDaemon {
     $surface = $null
     try {
         $previousShellJobRoot = Get-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
+        $replacementEnvName = 'SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID'
+        $previousReplacementId = Get-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
         try {
             $env:SYNAPSE_SHELL_JOB_ROOT = $candidateShellJobRoot
+            if ([string]::IsNullOrWhiteSpace($ReplacementReservationId)) {
+                Remove-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
+            } else {
+                Set-Item "Env:$replacementEnvName" -Value $ReplacementReservationId
+            }
             $candidateArgs = @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info')
             $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
             if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
@@ -5070,6 +5120,11 @@ function Test-SynapseCandidateDaemon {
                 $env:SYNAPSE_SHELL_JOB_ROOT = $previousShellJobRoot.Value
             } else {
                 Remove-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
+            }
+            if ($previousReplacementId) {
+                Set-Item "Env:$replacementEnvName" -Value $previousReplacementId.Value
+            } else {
+                Remove-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
             }
         }
         $deadline = (Get-Date).AddSeconds(25)
@@ -7849,7 +7904,8 @@ if ($SkipBuild) {
     $installSourcePath = $stagedBinary.Path
     $installSourceHash = $stagedBinary.Sha256
 }
-$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions
+$replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind
+$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions -ReplacementReservationId $replacementReservationId
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
 }

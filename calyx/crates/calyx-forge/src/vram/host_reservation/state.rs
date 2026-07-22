@@ -4,7 +4,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::support::{
-    PhysicalDevice, config_error, io_error, open_existing_lock_file, open_lock_file, snapshot,
+    PhysicalDevice, config_error, effective_reserved_mib, io_error, open_existing_lock_file,
+    open_lock_file, snapshot,
 };
 use super::{
     DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
@@ -141,7 +142,6 @@ impl HostGpuReservationStore {
             )));
         }
         let mut reservation_ids = BTreeSet::new();
-        let mut persisted_reserved_mib = 0_u64;
         for reservation in &state.reservations {
             validate_identity("owner", &reservation.owner)?;
             validate_identity("job_id", &reservation.job_id)?;
@@ -168,13 +168,34 @@ impl HostGpuReservationStore {
                     expected_lease.display()
                 )));
             }
-            persisted_reserved_mib = persisted_reserved_mib
-                .checked_add(reservation.requested_mib)
-                .ok_or_else(|| {
-                    config_error("persisted GPU reservation sum overflows u64".to_string())
-                })?;
         }
-        if persisted_reserved_mib > state.epoch_capacity_mib
+        let mut replacement_targets = BTreeSet::new();
+        for reservation in &state.reservations {
+            let Some(target_id) = reservation.replaces_reservation_id.as_deref() else {
+                continue;
+            };
+            let target = state
+                .reservations
+                .iter()
+                .find(|candidate| candidate.reservation_id == target_id)
+                .ok_or_else(|| {
+                    config_error(format!(
+                        "replacement reservation {} targets absent reservation {target_id}",
+                        reservation.reservation_id
+                    ))
+                })?;
+            if !replacement_targets.insert(target_id)
+                || target.owner != reservation.owner
+                || target.pid == reservation.pid
+                || target.replaces_reservation_id.is_some()
+            {
+                return Err(config_error(format!(
+                    "replacement reservation {} violates single-owner acyclic replacement invariants",
+                    reservation.reservation_id
+                )));
+            }
+        }
+        if effective_reserved_mib(state)? > state.epoch_capacity_mib
             || state.admitted_total < state.reservations.len() as u64
             || state.stale_reaped_total > state.admitted_total
         {
@@ -262,6 +283,20 @@ impl HostGpuReservationStore {
             }
         }
         state.reservations = live;
+        let live_ids = state
+            .reservations
+            .iter()
+            .map(|row| row.reservation_id.clone())
+            .collect::<BTreeSet<_>>();
+        for reservation in &mut state.reservations {
+            if reservation
+                .replaces_reservation_id
+                .as_deref()
+                .is_some_and(|target| !live_ids.contains(target))
+            {
+                reservation.replaces_reservation_id = None;
+            }
+        }
         Ok(stale)
     }
 

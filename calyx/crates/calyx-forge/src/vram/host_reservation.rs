@@ -24,9 +24,9 @@ const STATE_LOCK_FILE_NAME: &str = "reservations.lock";
 const REMEDIATION: &str = "wait for a named live reservation to release or reduce the declared measured peak; inspect `calyx gpu reservations` and never bypass admission, fall back to CPU, or kill an unrelated owner";
 
 use self::support::{
-    backpressure, config_error, create_lease_file, default_reservation_root, host_cap_mib,
-    io_error, read_physical_device, reservation_id, reservation_identities, reserved_mib, unix_ms,
-    validate_request, validate_root,
+    backpressure, config_error, create_lease_file, default_reservation_root,
+    effective_reserved_mib, host_cap_mib, io_error, read_physical_device, reservation_id,
+    reservation_identities, unix_ms, validate_request, validate_root,
 };
 
 /// Maximum aggregate Calyx reservation per device unless explicitly changed.
@@ -48,6 +48,7 @@ pub struct HostGpuReservationRequest {
     pub job_id: String,
     pub command: String,
     pub requested_mib: u64,
+    pub replaces_reservation_id: Option<String>,
 }
 
 impl HostGpuReservationRequest {
@@ -63,7 +64,17 @@ impl HostGpuReservationRequest {
             job_id: job_id.into(),
             command: command.into(),
             requested_mib,
+            replaces_reservation_id: None,
         }
+    }
+
+    /// Declares that this reservation is a live-process replacement for one
+    /// exact existing reservation. Admission counts the pair at its maximum,
+    /// while the physical-free gate still covers the new allocation in full.
+    #[must_use]
+    pub fn replacing(mut self, reservation_id: impl Into<String>) -> Self {
+        self.replaces_reservation_id = Some(reservation_id.into());
+        self
     }
 }
 
@@ -78,6 +89,8 @@ pub struct HostGpuReservationView {
     pub requested_mib: u64,
     pub acquired_unix_ms: u128,
     pub lease_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_reservation_id: Option<String>,
 }
 
 /// Last fail-closed admission decision.
@@ -205,10 +218,44 @@ impl HostGpuReservationStore {
         state.last_physical_free_mib = physical.free_mib;
         state.last_updated_unix_ms = now;
 
-        let reserved_mib = reserved_mib(&state)?;
-        let projected = reserved_mib
-            .checked_add(request.requested_mib)
-            .ok_or_else(|| backpressure("host reservation arithmetic overflow".to_string()))?;
+        let reserved_mib = effective_reserved_mib(&state)?;
+        let projected = match request.replaces_reservation_id.as_deref() {
+            Some(target_id) => {
+                let target = state
+                    .reservations
+                    .iter()
+                    .find(|row| row.reservation_id == target_id)
+                    .ok_or_else(|| {
+                        config_error(format!(
+                            "replacement target reservation {target_id} is absent"
+                        ))
+                    })?;
+                if target.owner != request.owner
+                    || target.pid == std::process::id()
+                    || target.replaces_reservation_id.is_some()
+                    || state
+                        .reservations
+                        .iter()
+                        .any(|row| row.replaces_reservation_id.as_deref() == Some(target_id))
+                {
+                    return Err(config_error(format!(
+                        "replacement target {target_id} is not an unclaimed live reservation owned by {} in another process",
+                        request.owner
+                    )));
+                }
+                reserved_mib
+                    .checked_sub(target.requested_mib)
+                    .and_then(|value| {
+                        value.checked_add(target.requested_mib.max(request.requested_mib))
+                    })
+                    .ok_or_else(|| {
+                        backpressure("replacement reservation arithmetic overflow".to_string())
+                    })?
+            }
+            None => reserved_mib
+                .checked_add(request.requested_mib)
+                .ok_or_else(|| backpressure("host reservation arithmetic overflow".to_string()))?,
+        };
         let physical_required = request
             .requested_mib
             .checked_add(DEFAULT_REQUIRED_FREE_MIB)
@@ -280,6 +327,7 @@ impl HostGpuReservationStore {
             requested_mib: request.requested_mib,
             acquired_unix_ms: now,
             lease_file: lease_path.to_string_lossy().into_owned(),
+            replaces_reservation_id: request.replaces_reservation_id,
         });
         state
             .reservations
@@ -393,14 +441,9 @@ impl HostGpuReservationStore {
             )));
         };
         let previous_mib = state.reservations[index].requested_mib;
-        let other_reserved_mib = reserved_mib(&state)?
-            .checked_sub(previous_mib)
-            .ok_or_else(|| config_error("reservation resize aggregate underflow".to_string()))?;
-        let projected = other_reserved_mib
-            .checked_add(requested_mib)
-            .ok_or_else(|| {
-                backpressure("host reservation resize arithmetic overflow".to_string())
-            })?;
+        let mut projected_state = state.clone();
+        projected_state.reservations[index].requested_mib = requested_mib;
+        let projected = effective_reserved_mib(&projected_state)?;
         let growth_mib = requested_mib.saturating_sub(previous_mib);
         let physical_required = growth_mib
             .checked_add(state.required_free_mib)
@@ -410,11 +453,11 @@ impl HostGpuReservationStore {
             })?;
         let refusal = if projected > state.epoch_capacity_mib {
             Some(format!(
-                "device={} resized reservation={} requested_mib={} + other_reserved_mib={} = {} exceeds epoch_capacity_mib={}",
+                "device={} resized reservation={} previous_mib={} requested_mib={} effective_reserved_mib={} exceeds epoch_capacity_mib={}",
                 self.device_index,
                 reservation_id,
+                previous_mib,
                 requested_mib,
-                other_reserved_mib,
                 projected,
                 state.epoch_capacity_mib
             ))
