@@ -21,12 +21,23 @@ pub fn create_ort_session(
     descriptor: &crate::ModelDescriptor,
     provider: ModelBackend,
 ) -> crate::ModelResult<ort::session::Session> {
-    use ort::{ep, session::Session};
+    use ort::{
+        ep,
+        session::{Session, builder::GraphOptimizationLevel},
+    };
 
     let mut builder = Session::builder().map_err(|err| crate::ModelError::LoadFailed {
         path: descriptor.path.clone(),
         detail: err.to_string(),
     })?;
+    if matches!(provider, Cuda | DirectMl) {
+        builder = builder
+            .with_optimization_level(GraphOptimizationLevel::Level1)
+            .map_err(|err| crate::ModelError::LoadFailed {
+                path: descriptor.path.clone(),
+                detail: format!("failed to bound GPU graph optimization to basic passes: {err}"),
+            })?;
+    }
     // DirectML requires sequential execution and does not support ORT memory
     // patterns. Configure both requirements explicitly before attaching the
     // provider so session construction never depends on ORT defaults.
