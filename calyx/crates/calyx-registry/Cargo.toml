@@ -22,10 +22,10 @@ blake3.workspace = true
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
-fastembed = { version = "=5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic", "qwen3"] }
+fastembed = { version = "=5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-native-tls", "qwen3"] }
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 memmap2.workspace = true
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native", "cuda", "api-24"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
