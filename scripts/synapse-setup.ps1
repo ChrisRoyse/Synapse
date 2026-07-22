@@ -1060,6 +1060,13 @@ function Normalize-AllowedPermissionsArgument {
     return ($tokens -join ',')
 }
 
+function Normalize-PathArgument {
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    try { return ([System.IO.Path]::GetFullPath($Value)).TrimEnd([char[]]@([char]92, [char]47)) }
+    catch { return $Value.Trim().TrimEnd([char[]]@([char]92, [char]47)) }
+}
+
 function Test-ExpectedDaemonProcess {
     param([AllowNull()][object]$ProcessInfo)
     if ($null -eq $ProcessInfo) {
@@ -1069,9 +1076,14 @@ function Test-ExpectedDaemonProcess {
         return $false
     }
     $commandLine = [string]$ProcessInfo.CommandLine
-    $baseMatches = ($commandLine.IndexOf('--mode http', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
-        ($commandLine.IndexOf($Bind, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and
-        ($commandLine.IndexOf($DbPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    $actualMode = Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--mode'
+    $actualBind = Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--bind'
+    $actualDb = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--db')
+    $actualProfiles = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
+    $baseMatches = ($actualMode -ieq 'http') -and
+        ($actualBind -ieq $Bind) -and
+        ($actualDb -ieq (Normalize-PathArgument -Value $DbPath)) -and
+        ($actualProfiles -ieq (Normalize-PathArgument -Value $ProfilesDir))
     if (-not $baseMatches) {
         return $false
     }
@@ -2519,8 +2531,14 @@ function Set-CodexSynapseClientPolicy {
     [System.IO.File]::WriteAllText($ConfigPath, $content, $utf8NoBom)
 }
 
+function Test-SynapseMcpExecutableLeafName {
+    param([AllowNull()][string]$Name)
+    return (-not [string]::IsNullOrWhiteSpace($Name) -and $Name -match '(?i)^synapse-mcp(?:-[0-9a-f]{64})?\.exe$')
+}
+
 function Get-SynapseMcpProcessSnapshot {
-    @(Get-CimInstance Win32_Process -Filter "Name='synapse-mcp.exe'" -ErrorAction SilentlyContinue |
+    @(Get-CimInstance Win32_Process -Filter "Name LIKE 'synapse-mcp%.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { Test-SynapseMcpExecutableLeafName -Name $_.Name } |
         Sort-Object ProcessId |
         Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)
 }
@@ -2767,6 +2785,91 @@ function Get-SynapseTcpBindListenerSnapshot {
             OwnerName = $owner.Name
             OwnerCommandLine = $owner.CommandLine
         }
+    }
+}
+
+function Get-SynapseInstalledDaemonIdentityReadback {
+    param(
+        [Parameter(Mandatory=$true)][int]$HealthPid,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [Parameter(Mandatory=$true)][string]$ExpectedExePath,
+        [Parameter(Mandatory=$true)][string]$ExpectedSha256,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [AllowNull()][string]$AllowedPermissions
+    )
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    if ($listeners.Count -ne 1) {
+        $failures.Add("listener_count expected=1 actual=$($listeners.Count)")
+    }
+    $listenerPid = if ($listeners.Count -eq 1) { [int]$listeners[0].OwningProcess } else { 0 }
+    if ($listenerPid -ne $HealthPid) {
+        $failures.Add("listener_pid expected=$HealthPid actual=$listenerPid")
+    }
+
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$HealthPid" -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        $failures.Add("health_process_missing pid=$HealthPid")
+    }
+
+    $expectedPath = Normalize-SynapseSetupPathForCompare -Path $ExpectedExePath
+    $actualPath = if ($null -eq $process) { '' } else { Normalize-SynapseSetupPathForCompare -Path ([string]$process.ExecutablePath) }
+    if ($actualPath -ine $expectedPath) {
+        $failures.Add("executable_path expected=$expectedPath actual=$(if ($actualPath) { $actualPath } else { '<missing>' })")
+    }
+
+    $commandLine = if ($null -eq $process) { '' } else { [string]$process.CommandLine }
+    $actualMode = Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--mode'
+    $actualBind = Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--bind'
+    $actualDb = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--db')
+    $actualProfiles = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
+    $expectedDb = Normalize-SynapseSetupPathForCompare -Path $DbPath
+    $expectedProfiles = Normalize-SynapseSetupPathForCompare -Path $ProfilesDir
+    if ($actualMode -ine 'http') { $failures.Add("mode expected=http actual=$(if ($actualMode) { $actualMode } else { '<missing>' })") }
+    if ($actualBind -ine $Bind) { $failures.Add("bind expected=$Bind actual=$(if ($actualBind) { $actualBind } else { '<missing>' })") }
+    if ($actualDb -ine $expectedDb) { $failures.Add("db expected=$expectedDb actual=$(if ($actualDb) { $actualDb } else { '<missing>' })") }
+    if ($actualProfiles -ine $expectedProfiles) { $failures.Add("profiles_dir expected=$expectedProfiles actual=$(if ($actualProfiles) { $actualProfiles } else { '<missing>' })") }
+    $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--allowed-permissions')
+    if ($actualAllowed -cne $expectedAllowed) {
+        $failures.Add("allowed_permissions expected=$(if ($expectedAllowed) { $expectedAllowed } else { '<default-read-only>' }) actual=$(if ($actualAllowed) { $actualAllowed } else { '<default-read-only>' })")
+    }
+
+    $actualSha256 = if (Test-Path -LiteralPath $ExpectedExePath -PathType Leaf) { Get-SynapseFileSha256 -Path $ExpectedExePath } else { '<missing>' }
+    if ($actualSha256 -ine $ExpectedSha256) {
+        $failures.Add("executable_sha256 expected=$ExpectedSha256 actual=$actualSha256")
+    }
+
+    $supervisorStatePath = Join-Path $LogDir 'daemon-supervisor-current.json'
+    $supervisorState = $null
+    try {
+        $supervisorState = (Get-Content -Raw -LiteralPath $supervisorStatePath -ErrorAction Stop) | ConvertFrom-Json
+    } catch {
+        $failures.Add("supervisor_state_unreadable path=$supervisorStatePath error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
+    }
+    $supervisorStatus = if ($null -eq $supervisorState) { '<missing>' } else { [string]$supervisorState.state }
+    $supervisorChildPid = if ($null -eq $supervisorState -or $null -eq $supervisorState.child_pid) { 0 } else { [int]$supervisorState.child_pid }
+    if ($supervisorStatus -notin @('running', 'adopted_existing')) {
+        $failures.Add("supervisor_state expected=running_or_adopted_existing actual=$supervisorStatus")
+    }
+    if ($supervisorChildPid -ne $HealthPid) {
+        $failures.Add("supervisor_child_pid expected=$HealthPid actual=$supervisorChildPid")
+    }
+
+    [pscustomobject]@{
+        Ok = ($failures.Count -eq 0)
+        Detail = if ($failures.Count -eq 0) { 'identity_verified' } else { $failures -join '; ' }
+        HealthPid = $HealthPid
+        ListenerPid = $listenerPid
+        ExecutablePath = if ($actualPath) { $actualPath } else { '<missing>' }
+        ExecutableSha256 = $actualSha256
+        CommandLine = if ($commandLine) { ($commandLine -replace '\s+', ' ').Trim() } else { '<missing>' }
+        SupervisorStatePath = $supervisorStatePath
+        SupervisorState = $supervisorStatus
+        SupervisorChildPid = $supervisorChildPid
     }
 }
 
@@ -5063,7 +5166,7 @@ function Stop-SynapseExactCandidateProcess {
     $current = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
     if ($current) {
         $exeLeaf = if ($current.ExecutablePath) { Split-Path -Leaf $current.ExecutablePath } else { '' }
-        if ($current.Name -inotlike 'synapse-mcp*.exe' -and $exeLeaf -inotlike 'synapse-mcp*.exe') {
+        if (-not (Test-SynapseMcpExecutableLeafName -Name $current.Name) -and -not (Test-SynapseMcpExecutableLeafName -Name $exeLeaf)) {
             Die "SYNAPSE_CANDIDATE_STOP_TARGET_MISMATCH pid=$ProcessId actual_name=$($current.Name) actual_path=$($current.ExecutablePath) remediation=PID was reused before candidate cleanup; refusing to stop it"
         }
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
@@ -5081,7 +5184,7 @@ function Get-SynapseCandidateReplacementReservationId {
         Die "SYNAPSE_GPU_REPLACEMENT_LISTENER_AMBIGUOUS bind=$Bind listeners=$(Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners) remediation=repair the configured daemon listener before candidate validation"
     }
     $listener = $listeners[0]
-    if (-not $listener.OwnerExists -or $listener.OwnerName -ine 'synapse-mcp.exe') {
+    if (-not $listener.OwnerExists -or -not (Test-SynapseMcpExecutableLeafName -Name $listener.OwnerName)) {
         Die "SYNAPSE_GPU_REPLACEMENT_LISTENER_INVALID bind=$Bind pid=$($listener.OwningProcess) owner=$($listener.OwnerName) remediation=the configured bind must be owned by the exact live Synapse daemon before replacement admission"
     }
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
@@ -7014,8 +7117,8 @@ function Assert-SynapseProcessStopTarget {
     }
 
     $exeLeaf = if ($current.ExecutablePath) { Split-Path -Leaf $current.ExecutablePath } else { '' }
-    if ($current.Name -ine 'synapse-mcp.exe' -and $exeLeaf -ine 'synapse-mcp.exe') {
-        Die ("SYNAPSE_PROCESS_STOP_TARGET_MISMATCH pid={0} expected=synapse-mcp.exe actual_name={1} actual_path={2} command_line={3} remediation=PID was reused or snapshot was not a Synapse process; refusing exact-PID stop" -f `
+    if (-not (Test-SynapseMcpExecutableLeafName -Name $current.Name) -and -not (Test-SynapseMcpExecutableLeafName -Name $exeLeaf)) {
+        Die ("SYNAPSE_PROCESS_STOP_TARGET_MISMATCH pid={0} expected=synapse-mcp.exe_or_content_addressed_name actual_name={1} actual_path={2} command_line={3} remediation=PID was reused or snapshot was not a Synapse process; refusing exact-PID stop" -f `
             $pidValue,
             $current.Name,
             $current.ExecutablePath,
@@ -7204,7 +7307,7 @@ function Stop-SynapseMcpProcesses {
                 $pidValue = [int]$_.ProcessId
                 $current = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
                 $exeLeaf = if ($current -and $current.ExecutablePath) { Split-Path -Leaf $current.ExecutablePath } else { '' }
-                $null -ne $current -and ($current.Name -ieq 'synapse-mcp.exe' -or $exeLeaf -ieq 'synapse-mcp.exe')
+                $null -ne $current -and ((Test-SynapseMcpExecutableLeafName -Name $current.Name) -or (Test-SynapseMcpExecutableLeafName -Name $exeLeaf))
             })
             if ($remainingHttpPids.Count -eq 0) {
                 Info "Synapse graceful shutdown verified reason=$Reason http_process_count=0"
@@ -7217,7 +7320,7 @@ function Stop-SynapseMcpProcesses {
             $pidValue = [int]$_.ProcessId
             $current = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
             $exeLeaf = if ($current -and $current.ExecutablePath) { Split-Path -Leaf $current.ExecutablePath } else { '' }
-            $null -ne $current -and ($current.Name -ieq 'synapse-mcp.exe' -or $exeLeaf -ieq 'synapse-mcp.exe')
+            $null -ne $current -and ((Test-SynapseMcpExecutableLeafName -Name $current.Name) -or (Test-SynapseMcpExecutableLeafName -Name $exeLeaf))
         })
         if ($remainingHttpPids.Count -gt 0) {
             $message = ("SYNAPSE_GRACEFUL_SHUTDOWN_TIMEOUT reason={0} timeout_s={1} remaining_count={2}`nremaining:`n{3}" -f `
@@ -8254,6 +8357,8 @@ Info "Task registered and started."
 Step "Verifying daemon health (http://$Bind/health)"
 $ok = $false
 $healthPid = $null
+$daemonIdentityReadback = $null
+$terminalDaemonIdentityFailure = $null
 $lastHealthError = $null
 $lastHealthSubsystemStatuses = '<none>'
 $installHealthTimeoutSeconds = $InstallHealthTimeoutSeconds
@@ -8288,7 +8393,22 @@ while ((Get-Date) -lt $installHealthDeadline) {
         $lastHealthSubsystemStatuses = Format-SynapseHealthSubsystemStatuses -Health $h
         $criticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $h
         if ($criticalReady.Ok) {
-            Info ("Daemon OK: pid={0} version={1} db={2}" -f $h.pid, $h.version, $h.subsystems.storage.db_path)
+            $daemonIdentityReadback = Get-SynapseInstalledDaemonIdentityReadback `
+                -HealthPid ([int]$h.pid) `
+                -Bind $Bind `
+                -DbPath $DbPath `
+                -ProfilesDir $ProfilesDir `
+                -ExpectedExePath $ExePath `
+                -ExpectedSha256 $installedHash `
+                -LogDir $LogDir `
+                -AllowedPermissions $AllowedPermissions
+            if (-not $daemonIdentityReadback.Ok) {
+                $terminalDaemonIdentityFailure = $daemonIdentityReadback.Detail
+                $lastHealthError = "SYNAPSE_INSTALL_DAEMON_IDENTITY_MISMATCH $terminalDaemonIdentityFailure"
+                Info "ERROR: $lastHealthError"
+                break
+            }
+            Info ("Daemon OK: pid={0} version={1} db={2} exe={3} sha256={4} supervisor_state={5} supervisor_child_pid={6}" -f $h.pid, $h.version, $h.subsystems.storage.db_path, $daemonIdentityReadback.ExecutablePath, $daemonIdentityReadback.ExecutableSha256, $daemonIdentityReadback.SupervisorState, $daemonIdentityReadback.SupervisorChildPid)
             if ($ManualInstallHealthRollbackProbe) {
                 if ($ManualInstallHealthRollbackPauseMode -eq 'require_active_ack') {
                     $candidateChromeBridge = $h.subsystems.chrome_bridge
@@ -8376,7 +8496,7 @@ if (-not $ok) {
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
     $failureStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $installHealthStartedAtUtc
     $failurePhysicalState = Format-SynapseDaemonStartupPhysicalState -DbPath $DbPath
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} hard_cap_s={5} progress_window_s={6} progress_extensions={7} last_progress_at={8} last_health_error={9} last_subsystem_statuses={10} manual_probe={11} manual_probe_pause_mode={12}`nlisteners:`n{13}`nprocesses:`n{14}`nstartup_log:`n{15}`nphysical_storage_state:`n{16}`nremediation=inspect {17} and synapse.log.* under {18} for launch / STORAGE_* / bind errors" -f `
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} hard_cap_s={5} progress_window_s={6} progress_extensions={7} last_progress_at={8} last_health_error={9} last_subsystem_statuses={10} manual_probe={11} manual_probe_pause_mode={12} terminal_identity_failure={13}`nlisteners:`n{14}`nprocesses:`n{15}`nstartup_log:`n{16}`nphysical_storage_state:`n{17}`nremediation=inspect {18} and synapse.log.* under {19} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
@@ -8390,6 +8510,7 @@ if (-not $ok) {
         $lastHealthSubsystemStatuses,
         $ManualInstallHealthRollbackProbe,
         $ManualInstallHealthRollbackPauseMode,
+        ($(if ([string]::IsNullOrWhiteSpace($terminalDaemonIdentityFailure)) { '<none>' } else { $terminalDaemonIdentityFailure })),
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
         (Format-SynapseDaemonStartupLogSignal -Signal $failureStartupLog),
