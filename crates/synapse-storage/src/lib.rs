@@ -779,6 +779,24 @@ impl Db {
             .temporal_rerank(candidates, query_time_secs, tz_offset_secs)
     }
 
+    /// Reconstructs temporal metadata from authoritative timeline or episode
+    /// source rows and atomically journals each changed Base row.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the source CF/scope is invalid, a source row cannot
+    /// be decoded, Base identity differs, or the Base-and-Ledger commit fails.
+    pub fn backfill_temporal_metadata(
+        &self,
+        source_cf: &str,
+        source_key: Option<&[u8]>,
+        after_physical: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<constellations::TemporalMetadataBackfillReport> {
+        self.backend
+            .backfill_temporal_metadata(source_cf, source_key, after_physical, max_rows)
+    }
+
     /// Returns the status of the exact process-local Calyx vault that owns
     /// Synapse storage and native intelligence rows.
     ///

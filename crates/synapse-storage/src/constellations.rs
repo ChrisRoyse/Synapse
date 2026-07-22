@@ -217,6 +217,55 @@ pub struct ConstellationPutReport {
     pub duration_us: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalMetadataBackfillReport {
+    pub source_cf: String,
+    pub examined_rows: u64,
+    pub inserted_rows: u64,
+    pub backfilled_rows: u64,
+    pub already_current_rows: u64,
+    pub latest_seq: u64,
+    pub resume_after_physical: Option<Vec<u8>>,
+    pub more: bool,
+}
+
+#[must_use]
+pub fn temporal_migration_metadata(
+    constellation: &Constellation,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let identity = [
+        META_PANEL_NAME,
+        META_SOURCE_CF,
+        META_SOURCE_KEY_HEX,
+        META_RAW_SHA256,
+        META_RAW_LEN_BYTES,
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        constellation
+            .metadata
+            .get(key)
+            .map(|value| (key.to_owned(), value.clone()))
+    })
+    .collect();
+    let temporal = [
+        METADATA_TEMPORAL_LANE_STATE,
+        METADATA_TEMPORAL_INACTIVE_REASON,
+        METADATA_SOURCE_EVENT_TIME_SECS,
+        METADATA_SOURCE_EVENT_TIME_RAW,
+        METADATA_SOURCE_SEQUENCE,
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        constellation
+            .metadata
+            .get(key)
+            .map(|value| (key.to_owned(), value.clone()))
+    })
+    .collect();
+    (identity, temporal)
+}
+
 impl ConstellationPutReport {
     #[must_use]
     pub const fn inserted(&self) -> bool {
@@ -410,6 +459,11 @@ pub fn recurrence_subject_input_bytes(kind: RecurrenceSubjectKind, subject_id: &
 ///
 /// The subject identity deliberately excludes occurrence time: every event
 /// for one app/routine must append below the same `CxId`.
+///
+/// # Errors
+///
+/// Returns a measurement error when the subject identity or generated Calyx
+/// constellation violates its schema contract.
 pub fn build_recurrence_subject_constellation(
     context: NativeConstellationContext,
     kind: RecurrenceSubjectKind,

@@ -20,6 +20,7 @@ pub(super) fn storage_response(
         anchors: None,
         temporal_panels: None,
         temporal_rerank: None,
+        temporal_backfill: None,
     };
     fill(&mut response);
     response

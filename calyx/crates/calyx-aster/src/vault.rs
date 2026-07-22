@@ -35,6 +35,7 @@ mod slot_backfill;
 mod slot_column;
 mod snapshot_lease;
 mod store;
+mod temporal_metadata;
 mod temporal_xterm;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange};
 use crate::dedup::DedupPolicy;
@@ -78,6 +79,9 @@ pub use slot_column::{
     read_materialized_slot_column,
 };
 pub use store::{PutDisposition, PutOutcome};
+pub use temporal_metadata::{
+    CALYX_TEMPORAL_METADATA_MIGRATION_MISMATCH, TemporalMetadataMigration,
+};
 pub use {
     context::VaultContext,
     durable::{RecoveryProgressHook, VaultOptions},

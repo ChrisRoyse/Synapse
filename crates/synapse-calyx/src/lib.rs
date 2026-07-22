@@ -4,7 +4,7 @@ mod async_vault;
 mod error_bridge;
 mod math;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -22,8 +22,8 @@ use calyx_aster::recurrence::{
     append_occurrence_once, read_series_readback,
 };
 use calyx_aster::vault::{
-    AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook, VaultOptions,
-    encode as vault_encode,
+    AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook,
+    TemporalMetadataMigration, VaultOptions, encode as vault_encode,
 };
 pub use calyx_core::TemporalPolicy;
 use calyx_core::{
@@ -1411,6 +1411,33 @@ impl SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxVault {
+    /// Atomically replaces only the temporal metadata fields on one legacy
+    /// Base row after exact panel and source-identity verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed Calyx error when the Base row is absent, its panel or
+    /// source identity differs, temporal metadata is invalid, or the atomic
+    /// Base-and-Ledger commit/readback fails.
+    pub fn backfill_temporal_metadata(
+        &self,
+        cx_id: CxId,
+        expected_panel_version: u32,
+        expected_identity: &BTreeMap<String, String>,
+        expected_temporal: &BTreeMap<String, String>,
+    ) -> Result<TemporalMetadataMigration, SynapseCalyxError> {
+        self.vault
+            .backfill_temporal_metadata(
+                cx_id,
+                expected_panel_version,
+                expected_identity,
+                expected_temporal,
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("backfill native Calyx temporal metadata", &error)
+            })
+    }
+
     /// Opens the configured durable Aster vault after acquiring the Synapse
     /// process lock and loading the stable vault identity.
     ///
@@ -1970,6 +1997,7 @@ impl SynapseCalyxVault {
     /// Returns a structured error for empty/oversized/duplicate candidates,
     /// invalid scores or policy, missing/malformed temporal metadata, mixed
     /// panel versions, absent Base rows, or a bound violation.
+    #[allow(clippy::too_many_lines)]
     pub fn temporal_rerank(
         &self,
         candidates: &[SynapseCalyxTemporalCandidate],
@@ -2162,7 +2190,7 @@ impl SynapseCalyxVault {
                     )
                 })?;
             let max_score = base_score * (1.0 + registration.policy.boost.post_retrieval_alpha);
-            if hit.score > max_score + (max_score.abs() * 1.0e-6) {
+            if hit.score > max_score.abs().mul_add(1.0e-6, max_score) {
                 return Err(SynapseCalyxError::new(
                     "SYNAPSE_CALYX_TEMPORAL_BOUND_VIOLATION",
                     format!(

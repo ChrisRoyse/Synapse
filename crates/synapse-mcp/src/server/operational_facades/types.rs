@@ -20,6 +20,7 @@ use crate::m3::{
     storage::{
         StorageAnchorsParams, StorageAnchorsResponse, StorageGcOnceParams, StorageGcOnceResponse,
         StorageInspectParams, StorageInspectResponse, StorageSummaryResponse,
+        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
         StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
         StorageTemporalRerankResponse,
     },
@@ -33,6 +34,7 @@ pub enum StorageOperation {
     Anchors,
     TemporalPanels,
     TemporalRerank,
+    TemporalBackfill,
 }
 
 impl StorageOperation {
@@ -44,6 +46,7 @@ impl StorageOperation {
             Self::Anchors => "anchors",
             Self::TemporalPanels => "temporal_panels",
             Self::TemporalRerank => "temporal_rerank",
+            Self::TemporalBackfill => "temporal_backfill",
         }
     }
 }
@@ -64,6 +67,8 @@ pub struct StorageParams {
     pub temporal_panels: Option<StorageTemporalPanelsParams>,
     #[serde(default)]
     pub temporal_rerank: Option<StorageTemporalRerankParams>,
+    #[serde(default)]
+    pub temporal_backfill: Option<StorageTemporalBackfillParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -84,6 +89,8 @@ pub struct StorageResponse {
     pub temporal_panels: Option<StorageTemporalPanelsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_rerank: Option<StorageTemporalRerankResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_backfill: Option<StorageTemporalBackfillResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

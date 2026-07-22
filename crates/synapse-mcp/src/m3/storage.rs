@@ -109,6 +109,18 @@ pub struct StorageTemporalRerankParams {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageTemporalBackfillParams {
+    pub source_cf: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_physical_hex: Option<String>,
+    #[schemars(range(min = 1, max = 1000))]
+    pub max_rows: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageTemporalCandidate {
     pub cx_id: String,
     pub base_score: f32,
@@ -373,6 +385,21 @@ pub struct StorageTemporalRerankResponse {
     pub hits: Vec<StorageTemporalRankedHit>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTemporalBackfillResponse {
+    pub source_cf: String,
+    pub source_scope: String,
+    pub examined_rows: u64,
+    pub inserted_rows: u64,
+    pub backfilled_rows: u64,
+    pub already_current_rows: u64,
+    pub latest_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after_physical_hex: Option<String>,
+    pub more: bool,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageTemporalRankedHit {
@@ -444,6 +471,13 @@ pub fn required_permissions_temporal_rerank(
     _params: &StorageTemporalRerankParams,
 ) -> RequiredPermissions {
     required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_temporal_backfill(
+    _params: &StorageTemporalBackfillParams,
+) -> RequiredPermissions {
+    required([Permission::WriteStorage])
 }
 
 pub fn inspect_storage(
@@ -541,6 +575,57 @@ pub fn run_temporal_rerank(
                 e4_sequence: hit.temporal_scores.e4_sequence,
             })
             .collect(),
+    })
+}
+
+pub fn run_temporal_backfill(
+    db: &synapse_storage::Db,
+    params: &StorageTemporalBackfillParams,
+) -> Result<StorageTemporalBackfillResponse, ErrorData> {
+    let key = params
+        .key_hex
+        .as_deref()
+        .map(str::trim)
+        .map(hex_decode)
+        .transpose()
+        .map_err(|detail| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("storage operation=temporal_backfill key_hex invalid: {detail}"),
+            )
+        })?;
+    let after_physical = params
+        .after_physical_hex
+        .as_deref()
+        .map(str::trim)
+        .map(hex_decode)
+        .transpose()
+        .map_err(|detail| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("storage operation=temporal_backfill after_physical_hex invalid: {detail}"),
+            )
+        })?;
+    let report = db
+        .backfill_temporal_metadata(
+            params.source_cf.trim(),
+            key.as_deref(),
+            after_physical.as_deref(),
+            params.max_rows as usize,
+        )
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageTemporalBackfillResponse {
+        source_cf: report.source_cf,
+        source_scope: key
+            .map(|key| format!("key_hex={}", hex_encode(&key)))
+            .unwrap_or_else(|| "all_rows".to_owned()),
+        examined_rows: report.examined_rows,
+        inserted_rows: report.inserted_rows,
+        backfilled_rows: report.backfilled_rows,
+        already_current_rows: report.already_current_rows,
+        latest_seq: report.latest_seq,
+        resume_after_physical_hex: report.resume_after_physical.as_deref().map(hex_encode),
+        more: report.more,
     })
 }
 

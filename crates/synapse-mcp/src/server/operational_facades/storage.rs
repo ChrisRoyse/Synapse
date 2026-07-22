@@ -213,6 +213,52 @@ pub(super) async fn handle(
                 |out| out.temporal_rerank = Some(response),
             )))
         }
+        StorageOperation::TemporalBackfill => {
+            let spec = params
+                .0
+                .temporal_backfill
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "temporal_backfill"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_temporal_backfill(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_base",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=temporal_backfill",
+                )
+            })?;
+            let response = crate::m3::storage::run_temporal_backfill(&db, &spec).map_err(
+                |error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &spec.source_cf,
+                        STORAGE_SOT,
+                        error,
+                        "inspect the exact authoritative source row and registered panel before retrying",
+                    )
+                },
+            )?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx Base temporal migration source_cf={} scope={} examined={} inserted={} changed={} current={} latest_seq={}",
+                    response.source_cf,
+                    response.source_scope,
+                    response.examined_rows,
+                    response.inserted_rows,
+                    response.backfilled_rows,
+                    response.already_current_rows,
+                    response.latest_seq
+                ),
+                |out| out.temporal_backfill = Some(response),
+            )))
+        }
         StorageOperation::GcOnce => {
             let spec = params
                 .0

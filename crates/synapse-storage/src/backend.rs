@@ -207,7 +207,7 @@ pub struct McpUsageGroundedPublicationReport {
     pub anchor: CalyxAnchorWriteReport,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CalyxRecurrenceSubjectReport {
     pub subject_kind: String,
     pub subject_id: String,
@@ -400,6 +400,14 @@ pub trait StorageBackend: Send + Sync {
         query_time_secs: i64,
         tz_offset_secs: i32,
     ) -> StorageResult<SynapseCalyxTemporalRerankReadback>;
+    #[allow(clippy::too_many_lines)]
+    fn backfill_temporal_metadata(
+        &self,
+        source_cf: &str,
+        source_key: Option<&[u8]>,
+        after_physical: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<constellations::TemporalMetadataBackfillReport>;
     fn put_timeline_constellation(
         &self,
         source_key: &[u8],
@@ -1607,6 +1615,144 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn backfill_temporal_metadata(
+        &self,
+        source_cf: &str,
+        source_key: Option<&[u8]>,
+        after_physical: Option<&[u8]>,
+        max_rows: usize,
+    ) -> StorageResult<constellations::TemporalMetadataBackfillReport> {
+        if !matches!(source_cf, cf::CF_TIMELINE | cf::CF_EPISODES) {
+            return Err(StorageError::BackendInvalidConfig {
+                value: source_cf.to_owned(),
+                detail: "temporal metadata backfill accepts only timeline or episodes".to_owned(),
+            });
+        }
+        if source_key.is_some() && after_physical.is_some() {
+            return Err(StorageError::BackendInvalidConfig {
+                value: source_cf.to_owned(),
+                detail: "exact source_key and physical page cursor are mutually exclusive"
+                    .to_owned(),
+            });
+        }
+        let (rows, resume_after_physical, more) = if let Some(key) = source_key {
+            self.get_cf(source_cf, key)?
+                .map(|value| (vec![(key.to_vec(), value)], None, false))
+                .ok_or_else(|| StorageError::ReadFailed {
+                    cf_name: source_cf.to_owned(),
+                    detail: format!(
+                        "temporal metadata backfill source row not found: key_hex={}",
+                        constellations::hex_encode(key)
+                    ),
+                })?
+        } else {
+            let page = self.scan_cf_physical_page(source_cf, after_physical, max_rows)?;
+            (page.rows, page.resume_after_physical, page.more)
+        };
+        let examined_rows = rows.len() as u64;
+        let mut inserted_rows = 0_u64;
+        let mut backfilled_rows = 0_u64;
+        let mut already_current_rows = 0_u64;
+        for (key, raw) in rows {
+            let disposition = self.with_vault(
+                "calyx_temporal_metadata_backfill",
+                "backfill Calyx temporal metadata",
+                true,
+                |vault| {
+                    let context = NativeConstellationContext {
+                        vault_id: vault.vault_id_value(),
+                        cx_id: vault.cx_id_for_input(
+                            &raw,
+                            if source_cf == cf::CF_TIMELINE {
+                                SYN_TIMELINE_PANEL_VERSION
+                            } else {
+                                SYN_EPISODE_PANEL_VERSION
+                            },
+                        ),
+                        created_at_ms: calyx_clock_now_for_write(vault, source_cf)?,
+                        next_ledger_seq: vault.latest_seq().saturating_add(1),
+                    };
+                    let expected = if source_cf == cf::CF_TIMELINE {
+                        let record: TimelineRecord =
+                            serde_json::from_slice(&raw).map_err(|error| {
+                                StorageError::ReadFailed {
+                                    cf_name: source_cf.to_owned(),
+                                    detail: format!(
+                                        "decode authoritative timeline row key_hex={}: {error}",
+                                        constellations::hex_encode(&key)
+                                    ),
+                                }
+                            })?;
+                        constellations::build_timeline_constellation(context, &key, &raw, &record)?
+                    } else {
+                        let record: EpisodeRecord =
+                            serde_json::from_slice(&raw).map_err(|error| {
+                                StorageError::ReadFailed {
+                                    cf_name: source_cf.to_owned(),
+                                    detail: format!(
+                                        "decode authoritative episode row key_hex={}: {error}",
+                                        constellations::hex_encode(&key)
+                                    ),
+                                }
+                            })?;
+                        constellations::build_episode_constellation(context, &key, &raw, &record)?
+                    };
+                    let put = vault
+                        .put_observation_constellation(expected.clone())
+                        .map_err(|error| {
+                            calyx_write_failed(
+                                "calyx_temporal_metadata_backfill",
+                                "materialize missing Calyx constellation before temporal metadata backfill",
+                                &error,
+                            )
+                        })?;
+                    let (identity, temporal) =
+                        constellations::temporal_migration_metadata(&expected);
+                    let migration = vault
+                        .backfill_temporal_metadata(
+                            expected.cx_id,
+                            expected.panel_version,
+                            &identity,
+                            &temporal,
+                        )
+                        .map_err(|error| {
+                            calyx_write_failed(
+                                "calyx_temporal_metadata_backfill",
+                                "backfill Calyx temporal metadata",
+                                &error,
+                            )
+                        })?;
+                    Ok((put.disposition, migration))
+                },
+            )?;
+            if disposition.0.inserted() {
+                inserted_rows = inserted_rows.saturating_add(1);
+            } else if disposition.1.changed() {
+                backfilled_rows = backfilled_rows.saturating_add(1);
+            } else {
+                already_current_rows = already_current_rows.saturating_add(1);
+            }
+        }
+        let latest_seq = self.with_vault(
+            "calyx_temporal_metadata_backfill",
+            "read Calyx temporal metadata backfill sequence",
+            false,
+            |vault| Ok(vault.latest_seq()),
+        )?;
+        Ok(constellations::TemporalMetadataBackfillReport {
+            source_cf: source_cf.to_owned(),
+            examined_rows,
+            inserted_rows,
+            backfilled_rows,
+            already_current_rows,
+            latest_seq,
+            resume_after_physical,
+            more,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn put_timeline_constellation(
         &self,
         source_key: &[u8],
