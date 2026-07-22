@@ -70,6 +70,7 @@ struct DetectionWorkerRequest {
     width: u32,
     height: u32,
     rgb_path: PathBuf,
+    progress_path: PathBuf,
     opts: DetectOpts,
 }
 
@@ -129,12 +130,14 @@ fn run_detection_worker(
                 error.to_string(),
             )
         })?;
+    write_worker_progress(&request.progress_path, "request_validated")?;
     let rgb = fs::read(&request.rgb_path).map_err(|error| {
         (
             "DETECTION_WORKER_FRAME_READ_FAILED".to_owned(),
             error.to_string(),
         )
     })?;
+    write_worker_progress(&request.progress_path, "frame_read")?;
     let descriptor = if request.model_id == DEFAULT_DETECTION_MODEL_ID {
         default_detection_model_descriptor()
     } else {
@@ -160,12 +163,13 @@ fn run_detection_worker(
             ),
         ));
     }
+    write_worker_progress(&request.progress_path, "model_verified")?;
     let reservation = SynapseCalyxGpuReservation::acquire(
         0,
         "synapse-mcp-detection-worker",
         format!("synapse-detection-worker-pid-{}", std::process::id()),
         format!(
-            "isolated ORT DirectML detector model={}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}",
+            "isolated ORT CUDA detector model={}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}",
             request.model_id
         ),
         DETECTION_GPU_ADMISSION_MIB,
@@ -177,10 +181,12 @@ fn run_detection_worker(
         .iter()
         .find(|row| row.pid == std::process::id())
         .map(|row| row.reservation_id.clone());
-    let loader = ModelLoader::new(vec![ModelBackend::DirectMl]);
+    write_worker_progress(&request.progress_path, "gpu_reservation_acquired")?;
+    let loader = ModelLoader::new(vec![ModelBackend::Cuda]);
     let model = loader
         .load(descriptor)
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
+    write_worker_progress(&request.progress_path, "cuda_session_loaded")?;
     let batch = model
         .infer(
             DetectionFrame {
@@ -192,6 +198,7 @@ fn run_detection_worker(
             request.opts,
         )
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
+    write_worker_progress(&request.progress_path, "inference_completed")?;
     drop(model);
     drop(reservation);
     Ok(DetectionWorkerEnvelope {
@@ -200,6 +207,15 @@ fn run_detection_worker(
         reservation_id,
         error_code: None,
         error_detail: None,
+    })
+}
+
+fn write_worker_progress(path: &std::path::Path, stage: &str) -> Result<(), (String, String)> {
+    fs::write(path, stage).map_err(|error| {
+        (
+            "DETECTION_WORKER_PROGRESS_WRITE_FAILED".to_owned(),
+            format!("write stage {stage:?} to {}: {error}", path.display()),
+        )
     })
 }
 
@@ -220,6 +236,7 @@ fn infer_in_owned_worker(
     let request_path = temp.path().join("request.json");
     let response_path = temp.path().join("response.json");
     let rgb_path = temp.path().join("frame.rgb");
+    let progress_path = temp.path().join("progress.txt");
     fs::write(&rgb_path, &frame.rgb)
         .map_err(|error| detection_infer_failed(format!("write worker RGB frame: {error}")))?;
     let request = DetectionWorkerRequest {
@@ -228,6 +245,7 @@ fn infer_in_owned_worker(
         width: frame.width,
         height: frame.height,
         rgb_path,
+        progress_path: progress_path.clone(),
         opts,
     };
     fs::write(
@@ -266,9 +284,11 @@ fn infer_in_owned_worker(
         )));
     }
     if verdict.timed_out {
+        let last_stage = fs::read_to_string(&progress_path)
+            .unwrap_or_else(|error| format!("unavailable ({error})"));
         return Err(detection_infer_failed(format!(
-            "isolated detector pid {} timed out after {DETECTION_WORKER_TIMEOUT_MS} ms and was terminated with kernel exit_code={}",
-            verdict.pid, verdict.exit_code
+            "isolated CUDA detector pid {} timed out after {DETECTION_WORKER_TIMEOUT_MS} ms at stage {:?} and was terminated with kernel exit_code={}",
+            verdict.pid, last_stage, verdict.exit_code
         )));
     }
     let response_bytes = fs::read(&response_path).map_err(|error| {

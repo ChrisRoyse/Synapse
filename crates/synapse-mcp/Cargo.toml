@@ -51,7 +51,7 @@ synapse-audio = { version = "0.1.0", path = "../synapse-audio" }
 synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
-synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["directml"] }
+synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["cuda", "directml"] }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }
