@@ -2649,10 +2649,13 @@ function Get-SynapseLiveDaemonArgumentDrift {
         [object[]]$Snapshot,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$ExpectedExePath,
+        [Parameter(Mandatory=$true)][string]$ExpectedSha256,
         [AllowNull()][string]$AllowedPermissions
     )
 
     $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    $expectedPath = Normalize-SynapseSetupPathForCompare -Path $ExpectedExePath
     $targets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot $Snapshot -Bind $Bind -DbPath $DbPath)
     $drifts = @()
     foreach ($target in $targets) {
@@ -2660,9 +2663,30 @@ function Get-SynapseLiveDaemonArgumentDrift {
             -CommandLine $target.CommandLine `
             -Name '--allowed-permissions'
         $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $actualAllowedRaw
-        if ($actualAllowed -ne $expectedAllowed) {
+        $actualPath = Normalize-SynapseSetupPathForCompare -Path ([string]$target.ExecutablePath)
+        $actualSha256 = '<not-read>'
+        $hashError = $null
+        if (-not [string]::IsNullOrWhiteSpace($actualPath) -and (Test-Path -LiteralPath $actualPath -PathType Leaf)) {
+            try {
+                $actualSha256 = Get-SynapseFileSha256 -Path $actualPath
+            } catch {
+                $hashError = ($_.Exception.Message -replace '\s+', ' ').Trim()
+                $actualSha256 = '<read-failed>'
+            }
+        } else {
+            $actualSha256 = '<missing>'
+        }
+        $pathDrift = ($actualPath -ine $expectedPath)
+        $hashDrift = ($actualSha256 -ine $ExpectedSha256)
+        $permissionDrift = ($actualAllowed -ne $expectedAllowed)
+        if ($pathDrift -or $hashDrift -or $permissionDrift) {
             $drifts += [pscustomobject]@{
                 pid = $target.ProcessId
+                expected_executable_path = $expectedPath
+                actual_executable_path = if ([string]::IsNullOrWhiteSpace($actualPath)) { '<missing>' } else { $actualPath }
+                expected_executable_sha256 = $ExpectedSha256
+                actual_executable_sha256 = $actualSha256
+                executable_hash_error = if ($hashError) { $hashError } else { '<none>' }
                 expected_allowed_permissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
                 actual_allowed_permissions = if ([string]::IsNullOrWhiteSpace($actualAllowed)) { '<default-read-only>' } else { $actualAllowed }
                 command_line = $target.CommandLine
@@ -8106,6 +8130,8 @@ if ($SkipBuild) {
             -Snapshot @(Get-SynapseMcpProcessSnapshot) `
             -Bind $Bind `
             -DbPath $DbPath `
+            -ExpectedExePath $ExePath `
+            -ExpectedSha256 $installSourceHash `
             -AllowedPermissions $AllowedPermissions
         if ($liveDaemonArgumentDrift.HasDrift) {
             Info ("SkipBuild candidate is already installed, but live daemon launch arguments drifted; setup will perform a daemon handoff. path={0} sha256={1} desired_allowed_permissions={2} drift={3}" -f `

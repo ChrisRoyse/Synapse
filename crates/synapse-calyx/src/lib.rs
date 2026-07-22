@@ -120,6 +120,27 @@ impl SynapseCalyxGpuReservation {
     }
 }
 
+/// Rereads the OS-wide GPU reservation Source of Truth and transactionally
+/// reaps lease rows whose owning process has released its file lock.
+///
+/// # Errors
+///
+/// Returns a structured integration error when the physical ledger or device
+/// state cannot be read and verified.
+pub fn readback_gpu_reservations(
+    device_index: u32,
+) -> Result<HostGpuReservationSnapshot, SynapseCalyxError> {
+    HostGpuReservationStore::from_env(device_index)
+        .and_then(|store| store.readback())
+        .map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_GPU_RESERVATION_READBACK_FAILED",
+                format!("read back device-{device_index} host GPU reservation SoT: {error}"),
+                "inspect the named Calyx GPU reservation directory and physical device state",
+            )
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SynapseCalyxSearchRawSidecar {
     pub path: PathBuf,

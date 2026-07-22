@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use rmcp::ErrorData;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, process::ExitCode, time::Instant};
-use synapse_calyx::SynapseCalyxGpuReservation;
+use synapse_calyx::{SynapseCalyxGpuReservation, readback_gpu_reservations};
 use synapse_core::{
     DetectedEntity, Detection, DetectionBatch, PerceptionMode, ProfileDetection, Rect,
     SensorStatus, entity_id, error_codes,
@@ -16,7 +16,7 @@ const DEFAULT_DETECTION_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const STALE_TRACK_MS: i64 = 3_000;
 const MIN_TRACK_MATCH_DISTANCE_PX: f32 = 96.0;
 const DETECTION_GPU_ADMISSION_MIB: u64 = 4_096;
-const DETECTION_WORKER_TIMEOUT_MS: u32 = 30_000;
+const DETECTION_WORKER_TIMEOUT_MS: u32 = 120_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectionRuntimeConfig {
@@ -249,6 +249,22 @@ fn infer_in_owned_worker(
             .map_err(|error| {
                 detection_infer_failed(format!("owned detector process failed: {error}"))
             })?;
+    let reservation_readback = readback_gpu_reservations(0).map_err(|error| {
+        detection_infer_failed(format!(
+            "isolated detector pid {} reached a terminal process state, but Calyx reservation cleanup readback failed: {error}",
+            verdict.pid
+        ))
+    })?;
+    if reservation_readback
+        .reservations
+        .iter()
+        .any(|row| row.pid == verdict.pid)
+    {
+        return Err(detection_infer_failed(format!(
+            "isolated detector pid {} reached kernel exit_code={}, but its Calyx reservation remains in {} after separate cleanup readback",
+            verdict.pid, verdict.exit_code, reservation_readback.state_path
+        )));
+    }
     if verdict.timed_out {
         return Err(detection_infer_failed(format!(
             "isolated detector pid {} timed out after {DETECTION_WORKER_TIMEOUT_MS} ms and was terminated with kernel exit_code={}",
