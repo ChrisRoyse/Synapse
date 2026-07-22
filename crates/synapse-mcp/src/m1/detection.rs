@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
+use rmcp::ErrorData;
 use std::time::Instant;
+use synapse_calyx::SynapseCalyxGpuReservation;
 use synapse_core::{
     DetectedEntity, Detection, PerceptionMode, ProfileDetection, Rect, SensorStatus, entity_id,
     error_codes,
@@ -9,12 +11,10 @@ use synapse_models::{
     default_detection_model_descriptor, detection_model_not_loaded, registered_model,
 };
 
-use crate::m1::M1State;
-
 const DEFAULT_DETECTION_CONFIDENCE_THRESHOLD: f32 = 0.5;
-const DEFAULT_DETECTION_MAX_DETECTIONS: u32 = 32;
 const STALE_TRACK_MS: i64 = 3_000;
 const MIN_TRACK_MATCH_DISTANCE_PX: f32 = 96.0;
+const DETECTION_GPU_ADMISSION_MIB: u64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectionRuntimeConfig {
@@ -42,7 +42,7 @@ impl Default for DetectionRuntimeConfig {
             model_id: None,
             classes_of_interest: Vec::new(),
             confidence_threshold: DEFAULT_DETECTION_CONFIDENCE_THRESHOLD,
-            max_detections: DEFAULT_DETECTION_MAX_DETECTIONS,
+            max_detections: 0,
         }
     }
 }
@@ -53,6 +53,7 @@ pub struct DetectionRuntime {
     loaded: Option<LoadedDetectionModel>,
     tracker: EntityTracker,
     next_frame_seq: u64,
+    gpu_reservation: Option<SynapseCalyxGpuReservation>,
 }
 
 impl DetectionRuntime {
@@ -92,7 +93,31 @@ impl DetectionRuntime {
                 descriptor.path.display()
             )));
         }
-        let model = self.loader.load(descriptor)?;
+        let acquired_reservation = self.gpu_reservation.is_none();
+        if acquired_reservation {
+            let resolved_model_id = resolved_model_id.to_owned();
+            self.gpu_reservation = Some(
+                SynapseCalyxGpuReservation::acquire(
+                    0,
+                    "synapse-mcp-detection",
+                    format!("synapse-detection-pid-{}", std::process::id()),
+                    format!(
+                        "ORT DirectML detector model={resolved_model_id}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}"
+                    ),
+                    DETECTION_GPU_ADMISSION_MIB,
+                )
+                .map_err(|error| detection_model_not_loaded(error.to_string()))?,
+            );
+        }
+        let model = match self.loader.load(descriptor) {
+            Ok(model) => model,
+            Err(error) => {
+                if acquired_reservation {
+                    self.gpu_reservation.take();
+                }
+                return Err(error);
+            }
+        };
         tracing::info!(
             code = "M1_DETECTION_MODEL_LOADED",
             model_id = %resolved_model_id,
@@ -122,35 +147,49 @@ pub fn default_detection_config() -> DetectionRuntimeConfig {
 }
 
 pub fn populate_detection_from_state(
-    state: &mut M1State,
+    runtime: &mut DetectionRuntime,
+    config: &DetectionRuntimeConfig,
+    perception_mode: PerceptionMode,
     input: &mut synapse_perception::ObservationInput,
-) {
-    let mode = input.mode_override.unwrap_or(state.perception_mode);
+) -> Result<(), ErrorData> {
+    let mode = input.mode_override.unwrap_or(perception_mode);
     if !matches!(mode, PerceptionMode::PixelOnly | PerceptionMode::Hybrid) {
         input.detection_status = SensorStatus::Disabled;
-        return;
+        return Ok(());
     }
     if input.foreground.window_bounds.w <= 0 || input.foreground.window_bounds.h <= 0 {
-        input.detection_status = SensorStatus::DegradedSensorFailed {
-            reason_code: error_codes::DETECTION_NO_FRAME.to_owned(),
-        };
-        return;
+        return Err(ErrorData::invalid_params(
+            format!(
+                "{}: detection requires positive foreground bounds, got {:?}",
+                error_codes::DETECTION_NO_FRAME,
+                input.foreground.window_bounds
+            ),
+            None,
+        ));
     }
-    if !valid_detection_config(&state.detection_config) {
-        input.detection_status = SensorStatus::DegradedSensorFailed {
-            reason_code: error_codes::DETECTION_MODEL_INFER_FAILED.to_owned(),
-        };
+    if !valid_detection_config(config) {
         tracing::warn!(
             code = "M1_DETECTION_CONFIG_INVALID",
-            confidence_threshold = state.detection_config.confidence_threshold,
-            max_detections = state.detection_config.max_detections,
+            confidence_threshold = config.confidence_threshold,
+            max_detections = config.max_detections,
             "detection configuration is invalid"
         );
-        return;
+        return Err(ErrorData::invalid_params(
+            format!(
+                "{}: confidence_threshold={} max_detections={}",
+                error_codes::DETECTION_MODEL_INFER_FAILED,
+                config.confidence_threshold,
+                config.max_detections
+            ),
+            None,
+        ));
     }
-    if state.detection_config.max_detections == 0 {
+    // GPU inference is profile-opt-in. A numeric default must never silently
+    // load the default ORT model for an ordinary productivity profile: the
+    // profile must name the exact model whose resource envelope was reviewed.
+    if config.model_id.is_none() || config.max_detections == 0 {
         input.detection_status = SensorStatus::Healthy;
-        return;
+        return Ok(());
     }
 
     let started = Instant::now();
@@ -158,74 +197,65 @@ pub fn populate_detection_from_state(
         match synapse_capture::screen_region_to_bgra_bitmap(input.foreground.window_bounds) {
             Ok(captured) => captured,
             Err(error) => {
-                input.detection_status = SensorStatus::DegradedSensorFailed {
-                    reason_code: error.code().to_owned(),
-                };
-                tracing::warn!(
+                tracing::error!(
                     code = "M1_DETECTION_CAPTURE_FAILED",
                     error = %error,
                     "foreground capture failed before detection inference"
                 );
-                return;
+                return Err(rmcp::ErrorData::internal_error(error.to_string(), None));
             }
         };
     let rgb = match bgra_to_rgb(&captured.bytes, captured.width, captured.height) {
         Ok(rgb) => rgb,
         Err(detail) => {
-            input.detection_status = SensorStatus::DegradedSensorFailed {
-                reason_code: error_codes::DETECTION_NO_FRAME.to_owned(),
-            };
-            tracing::warn!(
+            tracing::error!(
                 code = "M1_DETECTION_FRAME_INVALID",
                 detail,
                 "captured detection frame was invalid"
             );
-            return;
+            return Err(rmcp::ErrorData::invalid_params(detail, None));
         }
     };
 
     let frame = DetectionFrame {
-        frame_seq: state.detection_runtime.next_frame_seq(),
+        frame_seq: runtime.next_frame_seq(),
         width: captured.width,
         height: captured.height,
         rgb,
     };
     let opts = DetectOpts {
-        confidence_threshold: threshold_percent(state.detection_config.confidence_threshold),
-        max_detections: usize::try_from(state.detection_config.max_detections)
-            .unwrap_or(usize::MAX),
+        confidence_threshold: threshold_percent(config.confidence_threshold),
+        max_detections: usize::try_from(config.max_detections).unwrap_or(usize::MAX),
     };
-    let batch = match state
-        .detection_runtime
-        .load_model(state.detection_config.model_id.as_deref())
+    let batch = match runtime
+        .load_model(config.model_id.as_deref())
         .and_then(|model| model.infer(frame, opts))
     {
         Ok(batch) => batch,
         Err(error) => {
-            input.detection_status = SensorStatus::DegradedSensorFailed {
-                reason_code: error.code().to_owned(),
-            };
-            tracing::warn!(
+            tracing::error!(
                 code = "M1_DETECTION_INFERENCE_FAILED",
-                model_id = ?state.detection_config.model_id,
+                model_id = ?config.model_id,
                 error = %error,
                 "detection inference failed"
             );
-            return;
+            return Err(rmcp::ErrorData::internal_error(
+                format!("{}: {error}", error.code()),
+                None,
+            ));
         }
     };
-    let detections = filter_classes(batch.items, &state.detection_config.classes_of_interest);
-    let entities =
-        state
-            .detection_runtime
-            .tracker
-            .update(detections, batch.inferred_at, captured.region);
+    let detections = filter_classes(batch.items, &config.classes_of_interest);
+    let entities = runtime
+        .tracker
+        .update(detections, batch.inferred_at, captured.region);
     input.entities.extend(entities);
     input.detection_status = SensorStatus::Healthy;
     input.sensor_latency_ms.insert(
         "detection".to_owned(),
         started.elapsed().as_secs_f32() * 1000.0,
     );
+    Ok(())
 }
 
 fn valid_detection_config(config: &DetectionRuntimeConfig) -> bool {

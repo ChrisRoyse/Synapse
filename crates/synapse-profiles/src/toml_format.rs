@@ -37,7 +37,7 @@ pub struct RawProfile {
     #[serde(default)]
     capture: RawCapture,
     #[serde(default)]
-    detection: RawDetection,
+    detection: Option<RawDetection>,
     #[serde(default)]
     ocr: RawOcr,
     #[serde(default)]
@@ -97,7 +97,9 @@ impl RawProfile {
             matches,
             mode: parse_mode(&self.mode, &path)?,
             capture: self.capture.into_capture(&path)?,
-            detection: self.detection.into_detection(),
+            detection: self
+                .detection
+                .map_or_else(RawDetection::disabled, RawDetection::into_detection),
             ocr: self.ocr.into_ocr(&path)?,
             hud,
             keymap: self.keymap,
@@ -227,6 +229,15 @@ impl Default for RawDetection {
 }
 
 impl RawDetection {
+    const fn disabled() -> ProfileDetection {
+        ProfileDetection {
+            model_id: None,
+            classes_of_interest: Vec::new(),
+            confidence_threshold: default_confidence_threshold(),
+            max_detections: 0,
+        }
+    }
+
     fn into_detection(self) -> ProfileDetection {
         ProfileDetection {
             model_id: self.model_id,

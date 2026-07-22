@@ -905,15 +905,11 @@ impl SynapseService {
             let state = self.m1_state()?;
             crate::m1::M1ObservationSnapshot::from_state(&state)
         };
-        let mut input = crate::m1::build_find_input_from_snapshot(
+        let input = crate::m1::build_find_input_from_snapshot(
             &observation_snapshot,
             &find_params,
             Some(window_hwnd),
         )?;
-        {
-            let mut state = self.m1_state()?;
-            crate::m1::populate_detection_from_state(&mut state, &mut input);
-        }
         let response = crate::m1::match_find_input(&input, &find_params);
         let results = response
             .results

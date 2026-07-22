@@ -31,7 +31,10 @@ use calyx_core::{
     METADATA_SOURCE_EVENT_TIME_SECS, METADATA_TEMPORAL_LANE_STATE, Seq, SystemClock,
     TEMPORAL_LANE_ACTIVE, Ts, VaultId, VaultStore,
 };
-use calyx_forge::HostGpuReservationSnapshot;
+use calyx_forge::{
+    HostGpuReservation, HostGpuReservationRequest, HostGpuReservationSnapshot,
+    HostGpuReservationStore,
+};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 pub use calyx_registry::{
     PanelGenerationAllocation, PanelGenerationAllocatorReadback, VaultTemporalPanelRegistration,
@@ -61,6 +64,61 @@ pub use math::{
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Process-scoped admission lease for non-Forge GPU consumers embedded in Synapse.
+///
+/// DirectML/ORT and other device runtimes must acquire this before creating a
+/// device session; dropping the value releases the physical host reservation.
+pub struct SynapseCalyxGpuReservation {
+    inner: HostGpuReservation,
+}
+
+impl std::fmt::Debug for SynapseCalyxGpuReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SynapseCalyxGpuReservation")
+            .field("admitted_snapshot", self.inner.admitted_snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SynapseCalyxGpuReservation {
+    /// Acquires an OS-wide Calyx reservation before a non-Forge GPU runtime starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx integration error when the physical ledger
+    /// cannot be opened or the requested capacity is not admissible.
+    pub fn acquire(
+        device_index: u32,
+        owner: impl Into<String>,
+        job_id: impl Into<String>,
+        command: impl Into<String>,
+        requested_mib: u64,
+    ) -> Result<Self, SynapseCalyxError> {
+        let store = HostGpuReservationStore::from_env(device_index).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_GPU_RESERVATION_OPEN_FAILED",
+                format!("open device-{device_index} host GPU reservation SoT: {error}"),
+                "inspect the named Calyx GPU reservation directory and repair its permissions or state",
+            )
+        })?;
+        let request = HostGpuReservationRequest::new(owner, job_id, command, requested_mib);
+        let inner = store.acquire(request).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_GPU_RESERVATION_REFUSED",
+                format!("device-{device_index} host GPU admission refused: {error}"),
+                "wait for the named live GPU owner to release capacity or reduce a physically measured peak; never bypass admission or fall back to CPU",
+            )
+        })?;
+        Ok(Self { inner })
+    }
+
+    #[must_use]
+    pub fn admitted_snapshot(&self) -> &HostGpuReservationSnapshot {
+        self.inner.admitted_snapshot()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SynapseCalyxSearchRawSidecar {

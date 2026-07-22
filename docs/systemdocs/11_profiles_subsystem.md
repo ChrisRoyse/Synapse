@@ -59,7 +59,7 @@ Source: `crates/synapse-profiles/src/toml_format.rs` lines 21–53.
 | `keyboard_dynamics_default` | string | yes | — | Must be `"natural"` (case-insensitive). |
 | `matches` | array of tables `[[matches]]` | yes (non-empty) | — | At least one entry required, §2.7. |
 | `capture` | table `[capture]` | no | defaults | §2.4. |
-| `detection` | table `[detection]` | no | defaults | §2.5. |
+| `detection` | table `[detection]` | no | absent disables detection (`max_detections = 0`) | §2.5. |
 | `ocr` | table `[ocr]` | no | defaults | §2.6. |
 | `hud` | array of tables `[[hud]]` | no | `[]` | HUD field specs, §2.8. |
 | `keymap` | table (string→string) | no | `{}` | Action name → key chord; validated §2.9. |
@@ -119,10 +119,10 @@ Any other value → `ProfileError::Parse`.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `model_id` | optional string | `None` | Object-detection model id. |
+| `model_id` | optional string | `None` | Object-detection model id. GPU dispatch requires this field explicitly. |
 | `classes_of_interest` | array of string | `[]` | Detection classes to keep. |
 | `confidence_threshold` | f32 | `0.5` (`DEFAULT_CONFIDENCE_THRESHOLD`) | Not range-validated for detection. |
-| `max_detections` | u32 | `32` (`DEFAULT_MAX_DETECTIONS`) | |
+| `max_detections` | u32 | `32` (`DEFAULT_MAX_DETECTIONS`) when `[detection]` is present | An absent table or absent `model_id` disables detection. |
 
 ### 2.6 `[ocr]` (`RawOcr`, toml_format.rs 240–263)
 

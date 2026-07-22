@@ -186,6 +186,8 @@ $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitConti
 $script:SynapseManualInstallHealthRollbackProbe = [bool]$ManualInstallHealthRollbackProbe
 $script:SynapseManualInstallHealthRollbackPauseMode = $ManualInstallHealthRollbackPauseMode
 $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
+$script:SynapseSetupPartialState = $null
+$script:SynapseSetupPartialReadback = $null
 $script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
 $script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
 $script:SynapseBundledProfilesRollbackDirName = '.synapse-profile-reconcile-backups'
@@ -244,7 +246,7 @@ function Write-SynapsePostExitManifestState {
 
 function Write-SynapseSetupRepairManifestState {
     param(
-        [Parameter(Mandatory=$true)][ValidateSet('completed','failed','handoff_started')][string]$State,
+        [Parameter(Mandatory=$true)][ValidateSet('completed','failed','handoff_started','bridge_pending')][string]$State,
         [string]$Message = '',
         [int]$ExitCode = 0,
         [AllowNull()]$Readback,
@@ -278,6 +280,9 @@ function Write-SynapseSetupRepairManifestState {
         if (-not [string]::IsNullOrWhiteSpace($ContinuationManifestPath)) {
             $manifest | Add-Member -NotePropertyName continuation_manifest_path -NotePropertyValue $ContinuationManifestPath -Force
         }
+    } elseif ($State -eq 'bridge_pending') {
+        $manifest | Add-Member -NotePropertyName bridge_pending_at_utc -NotePropertyValue $now -Force
+        $manifest | Add-Member -NotePropertyName failure -NotePropertyValue $null -Force
     }
     if (-not [string]::IsNullOrWhiteSpace($Message)) {
         $manifest | Add-Member -NotePropertyName message -NotePropertyValue $Message -Force
@@ -321,6 +326,17 @@ function Die($m)   {
         }
     }
     throw "[synapse-setup] FATAL: $m"
+}
+
+function Die-SynapseChromeBridgePending {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [Parameter(Mandatory=$true)]$Readback
+    )
+
+    $script:SynapseSetupPartialState = 'bridge_pending'
+    $script:SynapseSetupPartialReadback = $Readback
+    throw "[synapse-setup] FATAL: $Message"
 }
 
 function Get-SynapseUnixTimeMilliseconds {
@@ -741,7 +757,7 @@ function Acquire-SynapseSetupMaintenanceLock {
 
 function Release-SynapseSetupMaintenanceLock {
     param(
-        [Parameter(Mandatory=$true)][ValidateSet('released','failed')][string]$State,
+        [Parameter(Mandatory=$true)][ValidateSet('released','failed','bridge_pending')][string]$State,
         [string]$ErrorMessage
     )
 
@@ -815,6 +831,19 @@ function Wait-SynapsePostExitParent {
 
 trap {
     $errorText = $_ | Out-String
+    if ($script:SynapseSetupPartialState -eq 'bridge_pending') {
+        try {
+            Write-SynapseSetupRepairManifestState `
+                -State 'bridge_pending' `
+                -Message (($errorText -replace '\s+', ' ').Trim()) `
+                -ExitCode 1 `
+                -Readback $script:SynapseSetupPartialReadback
+        } catch {
+            Info "WARN: could not write setup repair manifest bridge-pending state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
+        }
+        Release-SynapseSetupMaintenanceLock -State bridge_pending -ErrorMessage $errorText
+        break
+    }
     try {
         $preserveHandoff = $false
         if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath) -and (Test-Path -LiteralPath $script:SynapseSetupRepairManifestPath -PathType Leaf)) {
@@ -4179,9 +4208,35 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                 ($(if ([string]::IsNullOrWhiteSpace($lastWaitHealthError)) { '<none>' } else { $lastWaitHealthError })))
         }
         Info "Chrome bridge host still absent after alarmReconnect wait; invoking bounded existing-Chrome UI repair for the installed bridge. status=$status detail=$detail"
-        $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
-            -InstallerPath $ChromeBridgeInstallerPath `
-            -NativeHostExePath $ChromeNativeHostExePath
+        try {
+            $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
+                -InstallerPath $ChromeBridgeInstallerPath `
+                -NativeHostExePath $ChromeNativeHostExePath
+        } catch {
+            $uiRepairError = $_.Exception.Message
+            if ($uiRepairError -match 'SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW') {
+                $pendingReadback = [ordered]@{
+                    schema = 'synapse_setup_bridge_pending/v1'
+                    phase = 'chrome_bridge_activation'
+                    daemon_handoff = 'committed'
+                    daemon_pid = [int]$currentHealth.pid
+                    bind = $Bind
+                    db_path = $DbPath
+                    installed_binary_path = $ExePath
+                    installed_binary_sha256 = (Get-SynapseFileSha256 -Path $ExePath)
+                    chrome_bridge_status = $status
+                    chrome_bridge_detail = $detail
+                    chrome_process_count = @(Get-Process -Name chrome -ErrorAction SilentlyContinue).Count
+                    chrome_visible_window_count = @(Get-Process -Name chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }).Count
+                    resume_command = "pwsh -File scripts\synapse-setup.ps1 -SkipBuild -ExePath '$ExePath'"
+                    repair = 'open the existing authenticated Chrome profile, then run resume_command; setup revalidates the installed daemon bytes and does not rebuild or reinstall them'
+                }
+                Die-SynapseChromeBridgePending `
+                    -Message "SYNAPSE_SETUP_BRIDGE_PENDING daemon_handoff=committed daemon_pid=$($currentHealth.pid) bind=$Bind installed_sha256=$($pendingReadback.installed_binary_sha256) cause=[$uiRepairError] resume_command=[$($pendingReadback.resume_command)]" `
+                    -Readback $pendingReadback
+            }
+            throw
+        }
         $repairReason = [string]$uiRepairReadback.synapse_chrome_auto_install.reason
         $uiDeadlineMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]45000
         $uiAttempt = 0
@@ -7205,6 +7260,29 @@ function Stop-SynapseMcpProcesses {
             Stop-Process -Id $pidValue -Force -ErrorAction Stop
             Info "Synapse process exact-PID force stop issued pid=$pidValue reason=$Reason match_rules=$($verified.DeployTargetRules) path=$($verified.ExecutablePath) cmd=$($verified.CommandLine)"
         } catch {
+            # The verified process can exit between the CIM ownership snapshot and
+            # Stop-Process.  Treat that narrow race as success only after a fresh
+            # process-table read proves the PID is now absent.  A reused or still
+            # live PID remains a hard failure and is never stopped from stale data.
+            $afterStopError = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+            $cimDeadline = (Get-Date).AddSeconds(2)
+            do {
+                $afterStopErrorCim = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+                if (-not $afterStopErrorCim) { break }
+                Start-Sleep -Milliseconds 100
+            } while ((Get-Date) -lt $cimDeadline)
+            if (-not $afterStopError -and -not $afterStopErrorCim) {
+                Info "Synapse process exact-PID stop already satisfied pid=$pidValue reason=$Reason stop_error=$($_.Exception.Message) readback=Get-Process:absent,Win32_Process:absent"
+                continue
+            }
+            if (-not $afterStopError -and $afterStopErrorCim) {
+                Die ("SYNAPSE_PROCESS_TERMINATING_IMAGE_STILL_MAPPED pid={0} reason={1} path={2} command={3} stop_error={4} remediation=the exact verified daemon is absent from Get-Process but remains in Win32_Process/tasklist and may keep its executable image mapped; inspect the named PID and image lock, do not report it as stopped, and use a content-addressed executable handoff or restart Windows only in a coordinated maintenance window" -f `
+                    $pidValue,
+                    $Reason,
+                    $afterStopErrorCim.ExecutablePath,
+                    $afterStopErrorCim.CommandLine,
+                    $_.Exception.Message)
+            }
             Die ("SYNAPSE_PROCESS_STOP_FAILED pid={0} reason={1} error={2} remediation=setup only stops verified synapse-mcp.exe PIDs; inspect process ownership and retry after the daemon exits" -f `
                 $pidValue,
                 $Reason,
