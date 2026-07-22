@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use calyx_core::{PanelSlotId, SlotId};
+use calyx_core::{Clock, PanelSlotId, SlotId};
 
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
@@ -38,9 +38,9 @@ where
     (**progress)(event)
 }
 
-pub(super) fn rebuild_for_vault_with_progress<F>(
+pub(super) fn rebuild_for_vault_with_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     progress: F,
 ) -> CliResult
 where
@@ -49,9 +49,9 @@ where
     rebuild_for_vault_with_slot_filter(vault_dir, vault, None, None, progress)
 }
 
-pub(super) fn rebuild_for_vault_with_active_slots_progress<F>(
+pub(super) fn rebuild_for_vault_with_active_slots_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     panel_version: u32,
     active_slots: &BTreeSet<SlotId>,
     progress: F,
@@ -68,9 +68,9 @@ where
     )
 }
 
-fn rebuild_for_vault_with_slot_filter<F>(
+fn rebuild_for_vault_with_slot_filter<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     requested_panel_version: Option<u32>,
     active_slots: Option<&BTreeSet<SlotId>>,
     mut progress: F,
@@ -158,9 +158,9 @@ struct RebuildOptions<'a> {
     build_policy: DiskAnnBuildPolicy,
 }
 
-fn rebuild_from_base_with_progress<F>(
+fn rebuild_from_base_with_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     base_docs: &LoadedBaseDocs,
     options: RebuildOptions<'_>,
@@ -358,10 +358,10 @@ pub(super) fn validate_staged_manifest_artifacts(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_slot_entry<F>(
+fn build_slot_entry<C: Clock, F>(
     vault_dir: &Path,
     root: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     plan: &SlotBuildPlan,
     page_rows: usize,
@@ -458,13 +458,13 @@ use rebuild_staged::{
     write_staged_filter_artifact, write_staged_slot_artifact,
 };
 
-struct PinnedReadGuard<'a> {
-    vault: &'a AsterVault,
+struct PinnedReadGuard<'a, C: Clock> {
+    vault: &'a AsterVault<C>,
     snapshot: Snapshot,
 }
 
-impl<'a> PinnedReadGuard<'a> {
-    fn new(vault: &'a AsterVault, snapshot: Snapshot) -> Self {
+impl<'a, C: Clock> PinnedReadGuard<'a, C> {
+    fn new(vault: &'a AsterVault<C>, snapshot: Snapshot) -> Self {
         Self { vault, snapshot }
     }
 
@@ -473,7 +473,7 @@ impl<'a> PinnedReadGuard<'a> {
     }
 }
 
-impl Drop for PinnedReadGuard<'_> {
+impl<C: Clock> Drop for PinnedReadGuard<'_, C> {
     fn drop(&mut self) {
         let _ = self.vault.release_reader(self.snapshot.lease().id());
     }

@@ -22,9 +22,9 @@ use synapse_calyx::{
     SynapseCalyxGroundedObservationReadback, SynapseCalyxMultiConditionalWriteOutcome,
     SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
     SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
-    SynapseCalyxRevisionGuard, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalRerankReadback,
-    SynapseCalyxVault, SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus,
-    VaultTemporalPanelRegistration,
+    SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport, SynapseCalyxTemporalCandidate,
+    SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
+    SynapseCalyxVaultStatus, VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -375,6 +375,10 @@ pub trait StorageBackend: Send + Sync {
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus>;
+    fn rebuild_calyx_search_indexes(
+        &self,
+        expected_panel_version: u32,
+    ) -> StorageResult<SynapseCalyxSearchRebuildReport>;
     fn close_calyx_vault(
         &self,
         reason: &'static str,
@@ -1507,6 +1511,28 @@ impl StorageBackend for CalyxBackend {
 
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus> {
         self.vault.status()
+    }
+
+    fn rebuild_calyx_search_indexes(
+        &self,
+        expected_panel_version: u32,
+    ) -> StorageResult<SynapseCalyxSearchRebuildReport> {
+        self.with_vault(
+            "calyx_search",
+            "rebuild persisted Calyx search indexes",
+            true,
+            |vault| {
+                vault
+                    .rebuild_search_indexes(expected_panel_version)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_search",
+                            "rebuild persisted Calyx search indexes",
+                            &source,
+                        )
+                    })
+            },
+        )
     }
 
     fn close_calyx_vault(

@@ -73,10 +73,11 @@ impl DiskAnnSearch {
         hits: &[(u32, f32)],
         pq_scored: bool,
     ) -> Result<Vec<(u32, f32)>> {
-        if let Some(raw_dir) = &self.raw_sidecar
-            && raw_dir.is_dir()
-        {
-            return self.rescore_from_raw(query, hits);
+        // Classify the sidecar once (opening/validating the packed file if
+        // present); a corrupt packed file or a symlink fails closed here.
+        let source = self.classify_raw()?;
+        if source.has_vectors() {
+            return self.rescore_from_raw(&source, query, hits);
         }
         if pq_scored {
             return self.rescore_from_graph(graph_query, hits);

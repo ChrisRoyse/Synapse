@@ -1,7 +1,7 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
-use calyx_core::{CalyxError, CxId, PanelSlotId, SlotId, SlotState};
+use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, SlotId, SlotState};
 use rayon::prelude::*;
 
 use super::*;
@@ -59,21 +59,21 @@ impl<'a> RebuildProgress<'a> {
     }
 }
 
-pub fn rebuild_for_vault(vault_dir: &Path, vault: &AsterVault) -> CliResult {
+pub fn rebuild_for_vault<C: Clock>(vault_dir: &Path, vault: &AsterVault<C>) -> CliResult {
     rebuild_for_vault_with_progress(vault_dir, vault, |_| {})
 }
 
-pub fn rebuild_for_vault_with_panel_state(
+pub fn rebuild_for_vault_with_panel_state<C: Clock>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
 ) -> CliResult {
     rebuild_for_vault_with_panel_state_progress(vault_dir, vault, state, |_| {})
 }
 
-pub fn rebuild_for_vault_with_progress<F>(
+pub fn rebuild_for_vault_with_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     mut progress: F,
 ) -> CliResult
 where
@@ -85,9 +85,9 @@ where
     })
 }
 
-pub fn rebuild_for_vault_with_panel_state_progress<F>(
+pub fn rebuild_for_vault_with_panel_state_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
     mut progress: F,
 ) -> CliResult
@@ -100,9 +100,9 @@ where
     })
 }
 
-pub fn rebuild_for_vault_with_fallible_progress<F>(
+pub fn rebuild_for_vault_with_fallible_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     progress: F,
 ) -> CliResult
 where
@@ -111,9 +111,9 @@ where
     super::rebuild_stream::rebuild_for_vault_with_progress(vault_dir, vault, progress)
 }
 
-pub fn rebuild_for_vault_with_panel_state_fallible_progress<F>(
+pub fn rebuild_for_vault_with_panel_state_fallible_progress<C: Clock, F>(
     vault_dir: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
     progress: F,
 ) -> CliResult
@@ -172,21 +172,21 @@ pub(super) fn previous_manifest(
     Ok(Some(manifest))
 }
 
-pub fn load_docs(vault: &AsterVault) -> CliResult<BTreeMap<CxId, Constellation>> {
+pub fn load_docs<C: Clock>(vault: &AsterVault<C>) -> CliResult<BTreeMap<CxId, Constellation>> {
     let snapshot = vault.pin_reader(calyx_aster::mvcc::Freshness::FreshDerived, 300_000);
     let _guard = PinnedReadGuard::new(vault, snapshot);
     load_docs_at(vault, _guard.snapshot())
 }
 
-pub fn load_docs_at(
-    vault: &AsterVault,
+pub fn load_docs_at<C: Clock>(
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
 ) -> CliResult<BTreeMap<CxId, Constellation>> {
     load_docs_for_panel_at(vault, snapshot, None)
 }
 
-pub(crate) fn load_docs_for_panel_at(
-    vault: &AsterVault,
+pub(crate) fn load_docs_for_panel_at<C: Clock>(
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     requested_panel_version: Option<u32>,
 ) -> CliResult<BTreeMap<CxId, Constellation>> {
@@ -240,13 +240,13 @@ pub(crate) fn load_docs_for_panel_at(
     Ok(docs)
 }
 
-struct PinnedReadGuard<'a> {
-    vault: &'a AsterVault,
+struct PinnedReadGuard<'a, C: Clock> {
+    vault: &'a AsterVault<C>,
     snapshot: Snapshot,
 }
 
-impl<'a> PinnedReadGuard<'a> {
-    fn new(vault: &'a AsterVault, snapshot: Snapshot) -> Self {
+impl<'a, C: Clock> PinnedReadGuard<'a, C> {
+    fn new(vault: &'a AsterVault<C>, snapshot: Snapshot) -> Self {
         Self { vault, snapshot }
     }
 
@@ -255,7 +255,7 @@ impl<'a> PinnedReadGuard<'a> {
     }
 }
 
-impl Drop for PinnedReadGuard<'_> {
+impl<C: Clock> Drop for PinnedReadGuard<'_, C> {
     fn drop(&mut self) {
         let _ = self.vault.release_reader(self.snapshot.lease().id());
     }
@@ -271,8 +271,8 @@ fn indexed_slots(docs: &BTreeMap<CxId, Constellation>) -> Vec<SlotId> {
     slots
 }
 
-fn load_slot_rows(
-    vault: &AsterVault,
+fn load_slot_rows<C: Clock>(
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     slot: SlotId,
     docs: &mut BTreeMap<CxId, Constellation>,

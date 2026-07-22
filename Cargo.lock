@@ -726,6 +726,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "calyx-search"
+version = "0.1.0"
+dependencies = [
+ "bincode_reloaded",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-ledger",
+ "calyx-registry",
+ "calyx-sextant",
+ "calyx-ward",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "calyx-sextant"
 version = "0.1.0"
 dependencies = [
@@ -5101,10 +5119,12 @@ dependencies = [
  "calyx-forge",
  "calyx-ledger",
  "calyx-registry",
+ "calyx-search",
  "calyx-sextant",
  "fs2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",

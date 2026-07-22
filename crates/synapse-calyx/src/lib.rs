@@ -38,15 +38,17 @@ pub use calyx_registry::{
     VaultTemporalPanelRegistrationWrite,
 };
 use calyx_registry::{
-    allocate_vault_panel_generation, list_vault_temporal_panels,
+    allocate_vault_panel_generation, list_vault_temporal_panels, load_vault_panel_state,
     read_vault_panel_generation_allocator, read_vault_temporal_panel,
     register_vault_temporal_panel, reserve_vault_panel_generations,
 };
+pub use calyx_search::{PersistedSearchGeneration, PersistedSearchSlot};
 use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
 };
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use ulid::Ulid;
 
 pub use async_vault::{
@@ -59,6 +61,249 @@ pub use math::{
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxSearchRawSidecar {
+    pub path: PathBuf,
+    pub layout: String,
+    pub len_bytes: u64,
+    pub file_count: u64,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxSearchRebuildReport {
+    pub expected_panel_version: u32,
+    pub before_manifest_sha256: Option<String>,
+    pub generation: PersistedSearchGeneration,
+    pub manifest_path: PathBuf,
+    pub raw_sidecars: Vec<SynapseCalyxSearchRawSidecar>,
+}
+
+fn search_rebuild_error(action: &str, error: calyx_search::SearchError) -> SynapseCalyxError {
+    match error {
+        calyx_search::SearchError::Calyx(error) => SynapseCalyxError::from_calyx(action, &error),
+        error => SynapseCalyxError::new(
+            error.code(),
+            format!("{action}: {}", error.message()),
+            "inspect the rebuild marker, durable panel state, and named physical search artifact before retrying",
+        ),
+    }
+}
+
+fn read_optional_sha256(path: &Path) -> Result<Option<String>, SynapseCalyxError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(sha256_hex(&bytes))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+            format!("read {} for SHA-256: {error}", path.display()),
+            "repair access to the exact artifact path and retry without deleting the last known-good generation",
+        )),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn inspect_search_raw_sidecars(
+    panel_root: &Path,
+) -> Result<Vec<SynapseCalyxSearchRawSidecar>, SynapseCalyxError> {
+    let mut pending = vec![panel_root.to_path_buf()];
+    let mut raw_paths = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let entries = fs::read_dir(&dir).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                format!("read search artifact directory {}: {error}", dir.display()),
+                "inspect the published search generation and filesystem access before retrying",
+            )
+        })?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                        format!("read search artifact entry in {}: {error}", dir.display()),
+                        "inspect the published search generation and filesystem access before retrying",
+                    )
+                })?
+                .path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                    format!("inspect search artifact {}: {error}", path.display()),
+                    "repair the exact artifact and rebuild from authoritative Base rows",
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_ARTIFACT_UNSAFE",
+                    format!("search artifact {} is a symlink", path.display()),
+                    "replace the symlink with a real artifact rebuilt from authoritative Base rows",
+                ));
+            }
+            if path.extension().is_some_and(|extension| extension == "raw") {
+                raw_paths.push(path);
+            } else if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    raw_paths.sort();
+    raw_paths
+        .into_iter()
+        .map(|path| inspect_search_raw_sidecar(&path))
+        .collect()
+}
+
+fn inspect_search_raw_sidecar(
+    path: &Path,
+) -> Result<SynapseCalyxSearchRawSidecar, SynapseCalyxError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+            format!("inspect raw sidecar {}: {error}", path.display()),
+            "repair the exact artifact and rebuild from authoritative Base rows",
+        )
+    })?;
+    if metadata.is_file() {
+        let bytes = fs::read(path).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                format!("read packed raw sidecar {}: {error}", path.display()),
+                "repair the exact artifact and rebuild from authoritative Base rows",
+            )
+        })?;
+        validate_packed_raw_sidecar(path, &bytes)?;
+        return Ok(SynapseCalyxSearchRawSidecar {
+            path: path.to_path_buf(),
+            layout: "packed_v2".to_owned(),
+            len_bytes: metadata.len(),
+            file_count: 1,
+            sha256: Some(sha256_hex(&bytes)),
+        });
+    }
+    if metadata.is_dir() {
+        let mut file_count = 0_u64;
+        let mut len_bytes = 0_u64;
+        for entry in fs::read_dir(path).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                format!("read legacy raw sidecar {}: {error}", path.display()),
+                "rebuild the exact panel to migrate the legacy sidecar",
+            )
+        })? {
+            let child = entry
+                .map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                        format!("read legacy raw sidecar entry: {error}"),
+                        "rebuild the exact panel to migrate the legacy sidecar",
+                    )
+                })?
+                .path();
+            let child_metadata = fs::symlink_metadata(&child).map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_ARTIFACT_IO",
+                    format!(
+                        "inspect legacy raw sidecar row {}: {error}",
+                        child.display()
+                    ),
+                    "rebuild the exact panel to migrate the legacy sidecar",
+                )
+            })?;
+            if child_metadata.file_type().is_symlink() || !child_metadata.is_file() {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_ARTIFACT_UNSAFE",
+                    format!(
+                        "legacy raw sidecar child {} is not a real file",
+                        child.display()
+                    ),
+                    "rebuild the exact panel from authoritative Base rows",
+                ));
+            }
+            file_count = file_count.checked_add(1).ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_ARTIFACT_OVERFLOW",
+                    format!("legacy raw sidecar {} file count overflow", path.display()),
+                    "inspect the artifact tree and rebuild the exact panel",
+                )
+            })?;
+            len_bytes = len_bytes.checked_add(child_metadata.len()).ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_ARTIFACT_OVERFLOW",
+                    format!("legacy raw sidecar {} byte count overflow", path.display()),
+                    "inspect the artifact tree and rebuild the exact panel",
+                )
+            })?;
+        }
+        return Ok(SynapseCalyxSearchRawSidecar {
+            path: path.to_path_buf(),
+            layout: "legacy_v1_directory".to_owned(),
+            len_bytes,
+            file_count,
+            sha256: None,
+        });
+    }
+    Err(SynapseCalyxError::new(
+        "SYNAPSE_CALYX_SEARCH_ARTIFACT_UNSAFE",
+        format!(
+            "raw sidecar {} is neither a file nor directory",
+            path.display()
+        ),
+        "rebuild the exact panel from authoritative Base rows",
+    ))
+}
+
+fn validate_packed_raw_sidecar(path: &Path, bytes: &[u8]) -> Result<(), SynapseCalyxError> {
+    const HEADER: usize = calyx_sextant::index::RAW_SIDECAR_HEADER_SIZE;
+    if bytes.len() < HEADER || bytes[..8] != calyx_sextant::index::RAW_SIDECAR_MAGIC {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_SEARCH_ARTIFACT_CORRUPT",
+            format!(
+                "packed raw sidecar {} has a missing/invalid header",
+                path.display()
+            ),
+            "rebuild the exact panel from authoritative Base rows",
+        ));
+    }
+    let mut version_bytes = [0_u8; 4];
+    version_bytes.copy_from_slice(&bytes[8..12]);
+    let version = u32::from_le_bytes(version_bytes);
+    let mut dim_bytes = [0_u8; 4];
+    dim_bytes.copy_from_slice(&bytes[12..16]);
+    let dim = u32::from_le_bytes(dim_bytes);
+    let mut row_bytes = [0_u8; 8];
+    row_bytes.copy_from_slice(&bytes[16..24]);
+    let rows = u64::from_le_bytes(row_bytes);
+    let payload = rows
+        .checked_mul(u64::from(dim))
+        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| value.checked_add(HEADER as u64));
+    if version != calyx_sextant::index::RAW_SIDECAR_PACKED_VERSION
+        || dim == 0
+        || payload != u64::try_from(bytes.len()).ok()
+    {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_SEARCH_ARTIFACT_CORRUPT",
+            format!(
+                "packed raw sidecar {} version/dim/length contract is invalid",
+                path.display()
+            ),
+            "rebuild the exact panel from authoritative Base rows",
+        ));
+    }
+    Ok(())
+}
 
 /// One raw Calyx value plus SHA-256 of its exact plaintext physical bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1630,6 +1875,87 @@ impl SynapseCalyxVault {
     #[must_use]
     pub fn latest_seq(&self) -> Seq {
         self.vault.latest_seq()
+    }
+
+    /// Rebuilds the immutable persisted-search generation for the exact active
+    /// vault panel and then reopens the published manifest for independent
+    /// validation. The raw Base rows remain authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the durable panel state is absent/corrupt, its version
+    /// differs from `expected_panel_version`, rebuilding fails, or the
+    /// published manifest/sidecars cannot be read back.
+    pub fn rebuild_search_indexes(
+        &self,
+        expected_panel_version: u32,
+    ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
+        let state = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
+            SynapseCalyxError::from_calyx("load durable panel state for search rebuild", &error)
+        })?;
+        if state.panel.version != expected_panel_version {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
+                format!(
+                    "requested search rebuild panel {expected_panel_version}, but durable active panel is {}",
+                    state.panel.version
+                ),
+                "read the durable vault panel state and retry with its exact version",
+            ));
+        }
+        let panel_root = self
+            .config
+            .vault_dir
+            .join("idx")
+            .join("search")
+            .join(format!("panel_{expected_panel_version:010}"));
+        let manifest_path = panel_root.join("manifest.json");
+        let before_manifest_sha256 = read_optional_sha256(&manifest_path)?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_SEARCH_REBUILD_STARTED",
+            panel_version = expected_panel_version,
+            vault_dir = %self.config.vault_dir.display(),
+            before_manifest_sha256 = ?before_manifest_sha256,
+            "rebuilding persisted Calyx search indexes"
+        );
+        calyx_search::rebuild_for_vault_with_panel_state(
+            &self.config.vault_dir,
+            &self.vault,
+            &state,
+        )
+        .map_err(|error| search_rebuild_error("rebuild persisted search indexes", error))?;
+        let generation =
+            calyx_search::PersistedSearchIndexes::open(&self.config.vault_dir, state.panel.version)
+                .and_then(|indexes| indexes.generation())
+                .map_err(|error| {
+                    search_rebuild_error("reopen published search generation", error)
+                })?;
+        if generation.panel_version != expected_panel_version {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
+                format!(
+                    "published search generation panel {} != requested panel {expected_panel_version}",
+                    generation.panel_version
+                ),
+                "remove no files; inspect the rebuild marker and durable panel state before retrying",
+            ));
+        }
+        let raw_sidecars = inspect_search_raw_sidecars(&panel_root)?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_SEARCH_REBUILD_COMMITTED",
+            panel_version = expected_panel_version,
+            base_seq = generation.base_seq,
+            manifest_sha256 = %generation.manifest_sha256,
+            raw_sidecar_count = raw_sidecars.len(),
+            "persisted Calyx search generation reopened and verified"
+        );
+        Ok(SynapseCalyxSearchRebuildReport {
+            expected_panel_version,
+            before_manifest_sha256,
+            generation,
+            manifest_path,
+            raw_sidecars,
+        })
     }
 
     #[must_use]

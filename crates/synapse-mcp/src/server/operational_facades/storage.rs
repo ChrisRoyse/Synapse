@@ -259,6 +259,82 @@ pub(super) async fn handle(
                 |out| out.temporal_backfill = Some(response),
             )))
         }
+        StorageOperation::SearchRebuild => {
+            let spec = params
+                .0
+                .search_rebuild
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "search_rebuild"))?;
+            let source_id = format!("panel_{}", spec.expected_panel_version);
+            require_maintenance_profile(
+                service,
+                &request_context,
+                STORAGE_TOOL,
+                operation.as_str(),
+                &source_id,
+                STORAGE_SOT,
+            )?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_search_rebuild(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            let report = db
+                .rebuild_calyx_search_indexes(spec.expected_panel_version)
+                .map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &source_id,
+                        STORAGE_SOT,
+                        crate::m1::mcp_error(error.code(), error.to_string()),
+                        "inspect the exact durable panel state, rebuild marker, and named physical artifact before retrying",
+                    )
+                })?;
+            let response = crate::m3::storage::StorageSearchRebuildResponse {
+                panel_version: report.generation.panel_version,
+                base_seq: report.generation.base_seq,
+                before_manifest_sha256: report.before_manifest_sha256,
+                manifest_sha256: report.generation.manifest_sha256,
+                manifest_path: report.manifest_path.display().to_string(),
+                diskann_build_backend: report.generation.diskann_build_backend,
+                slots: report
+                    .generation
+                    .slots
+                    .into_iter()
+                    .map(|slot| crate::m3::storage::StorageSearchRebuildSlot {
+                        panel_version: slot.panel_slot.panel_version(),
+                        slot_id: u32::from(slot.panel_slot.slot_id().get()),
+                        kind: slot.kind,
+                        shape: format!("{:?}", slot.shape),
+                        len: slot.len,
+                        built_at_seq: slot.built_at_seq,
+                    })
+                    .collect(),
+                raw_sidecars: report
+                    .raw_sidecars
+                    .into_iter()
+                    .map(|sidecar| crate::m3::storage::StorageSearchRawSidecar {
+                        path: sidecar.path.display().to_string(),
+                        layout: sidecar.layout,
+                        len_bytes: sidecar.len_bytes,
+                        file_count: sidecar.file_count,
+                        sha256: sidecar.sha256,
+                    })
+                    .collect(),
+            };
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "panel={} base_seq={} manifest_sha256={} slots={} raw_sidecars={}",
+                    response.panel_version,
+                    response.base_seq,
+                    response.manifest_sha256,
+                    response.slots.len(),
+                    response.raw_sidecars.len()
+                ),
+                |out| out.search_rebuild = Some(response),
+            )))
+        }
         StorageOperation::GcOnce => {
             let spec = params
                 .0

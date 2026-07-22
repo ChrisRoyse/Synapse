@@ -19,10 +19,10 @@ use crate::m3::{
     },
     storage::{
         StorageAnchorsParams, StorageAnchorsResponse, StorageGcOnceParams, StorageGcOnceResponse,
-        StorageInspectParams, StorageInspectResponse, StorageSummaryResponse,
-        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
-        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
-        StorageTemporalRerankResponse,
+        StorageInspectParams, StorageInspectResponse, StorageSearchRebuildParams,
+        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
+        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
+        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -35,6 +35,7 @@ pub enum StorageOperation {
     TemporalPanels,
     TemporalRerank,
     TemporalBackfill,
+    SearchRebuild,
 }
 
 impl StorageOperation {
@@ -47,6 +48,7 @@ impl StorageOperation {
             Self::TemporalPanels => "temporal_panels",
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
+            Self::SearchRebuild => "search_rebuild",
         }
     }
 }
@@ -69,6 +71,8 @@ pub struct StorageParams {
     pub temporal_rerank: Option<StorageTemporalRerankParams>,
     #[serde(default)]
     pub temporal_backfill: Option<StorageTemporalBackfillParams>,
+    #[serde(default)]
+    pub search_rebuild: Option<StorageSearchRebuildParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -91,6 +95,8 @@ pub struct StorageResponse {
     pub temporal_rerank: Option<StorageTemporalRerankResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_backfill: Option<StorageTemporalBackfillResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_rebuild: Option<StorageSearchRebuildResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

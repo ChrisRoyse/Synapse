@@ -3,6 +3,7 @@
 mod construct;
 mod helpers;
 mod pq_support;
+mod raw_sidecar;
 mod scratch;
 mod storage;
 
@@ -27,6 +28,8 @@ use helpers::{
 };
 pub use pq_support::DiskAnnPqSearchBuild;
 use pq_support::write_pq_sidecar;
+use raw_sidecar::RawSidecarSource;
+pub use raw_sidecar::{RAW_SIDECAR_HEADER_SIZE, RAW_SIDECAR_MAGIC, RAW_SIDECAR_PACKED_VERSION};
 use storage::{build_search_graph_with_backend, read_distance_mode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,22 +126,36 @@ impl DiskAnnSearch {
         Ok(())
     }
 
-    fn rescore_from_raw(&self, query: &[f32], hits: &[(u32, f32)]) -> Result<Vec<(u32, f32)>> {
-        let Some(raw_dir) = &self.raw_sidecar else {
-            return Ok(hits.to_vec());
-        };
-        if !raw_dir.is_dir() {
-            return Ok(hits.to_vec());
+    fn classify_raw(&self) -> Result<RawSidecarSource> {
+        raw_sidecar::classify(self.raw_sidecar.as_deref(), self.dim)
+    }
+
+    fn read_raw_from_source(&self, source: &RawSidecarSource, id: u32) -> Result<Vec<f32>> {
+        match source {
+            RawSidecarSource::Packed(packed) => packed.read_vector(id),
+            RawSidecarSource::LegacyDir(dir) => self.read_raw_vector_dir(dir, id),
+            RawSidecarSource::NotConfigured | RawSidecarSource::Absent => Err(sextant_error(
+                CALYX_INDEX_IO,
+                format!("raw sidecar unavailable for diskann node {id}"),
+            )),
         }
+    }
+
+    fn rescore_from_raw(
+        &self,
+        source: &RawSidecarSource,
+        query: &[f32],
+        hits: &[(u32, f32)],
+    ) -> Result<Vec<(u32, f32)>> {
         let mut rescored = Vec::with_capacity(hits.len());
         for &(id, _) in hits {
-            let raw = self.read_raw_vector(raw_dir, id)?;
+            let raw = self.read_raw_from_source(source, id)?;
             rescored.push((id, raw_rescore_distance(query, &raw, self.distance_mode)));
         }
         Ok(sorted(rescored))
     }
 
-    fn read_raw_vector(&self, raw_dir: &Path, id: u32) -> Result<Vec<f32>> {
+    fn read_raw_vector_dir(&self, raw_dir: &Path, id: u32) -> Result<Vec<f32>> {
         let Some(path) = self.raw_path(raw_dir, id) else {
             return Err(sextant_error(
                 CALYX_INDEX_IO,
@@ -221,18 +238,38 @@ impl DiskAnnSearch {
     }
 
     fn vectors_for_rebuild(&self) -> Result<Vec<Vec<f32>>> {
-        let Some(raw_dir) = &self.raw_sidecar else {
-            return self.vectors_from_graph();
-        };
-        if !raw_dir.is_dir() {
-            return Err(sextant_error(
+        let source = self.classify_raw()?;
+        match &source {
+            RawSidecarSource::NotConfigured => self.vectors_from_graph(),
+            RawSidecarSource::Absent => Err(sextant_error(
                 CALYX_INDEX_IO,
-                format!("raw sidecar {} is not a directory", raw_dir.display()),
-            ));
+                format!(
+                    "raw sidecar {} is configured but missing; cannot rebuild from exact vectors",
+                    self.raw_sidecar
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                ),
+            )),
+            RawSidecarSource::Packed(packed) => {
+                if packed.node_count() != self.ids.len() as u64 {
+                    return Err(sextant_error(
+                        CALYX_INDEX_IO,
+                        format!(
+                            "packed raw sidecar node_count {} != index id map {}",
+                            packed.node_count(),
+                            self.ids.len()
+                        ),
+                    ));
+                }
+                (0..self.ids.len() as u32)
+                    .map(|id| self.read_raw_from_source(&source, id))
+                    .collect()
+            }
+            RawSidecarSource::LegacyDir(_) => (0..self.ids.len() as u32)
+                .map(|id| self.read_raw_from_source(&source, id))
+                .collect(),
         }
-        (0..self.ids.len() as u32)
-            .map(|id| self.read_raw_vector(raw_dir, id))
-            .collect()
     }
 }
 
@@ -349,9 +386,9 @@ impl SextantIndex for DiskAnnSearch {
 
     fn vector(&self, cx_id: CxId) -> Option<SlotVector> {
         let id = *self.positions.get(&cx_id)?;
-        if let Some(raw_dir) = &self.raw_sidecar
-            && raw_dir.is_dir()
-            && let Ok(vector) = self.read_raw_vector(raw_dir, id)
+        if let Ok(source) = self.classify_raw()
+            && source.has_vectors()
+            && let Ok(vector) = self.read_raw_from_source(&source, id)
         {
             return Some(SlotVector::Dense {
                 dim: self.dim,

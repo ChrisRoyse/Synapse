@@ -90,6 +90,43 @@ pub struct StorageGcOnceParams {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageSearchRebuildParams {
+    pub expected_panel_version: u32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageSearchRebuildSlot {
+    pub panel_version: u32,
+    pub slot_id: u32,
+    pub kind: String,
+    pub shape: String,
+    pub len: usize,
+    pub built_at_seq: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageSearchRawSidecar {
+    pub path: String,
+    pub layout: String,
+    pub len_bytes: u64,
+    pub file_count: u64,
+    pub sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageSearchRebuildResponse {
+    pub panel_version: u32,
+    pub base_seq: u64,
+    pub before_manifest_sha256: Option<String>,
+    pub manifest_sha256: String,
+    pub manifest_path: String,
+    pub diskann_build_backend: Option<String>,
+    pub slots: Vec<StorageSearchRebuildSlot>,
+    pub raw_sidecars: Vec<StorageSearchRawSidecar>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StoragePressureSampleParams {
     pub free_bytes: u64,
 }
@@ -452,6 +489,13 @@ pub fn required_permissions_put(_params: &StoragePutProbeRowsParams) -> Required
 #[must_use]
 pub fn required_permissions_gc(_params: &StorageGcOnceParams) -> RequiredPermissions {
     required([Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_search_rebuild(
+    _params: &StorageSearchRebuildParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
 #[must_use]

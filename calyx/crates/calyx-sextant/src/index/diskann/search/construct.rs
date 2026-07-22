@@ -32,8 +32,10 @@ impl DiskAnnSearch {
             )));
         }
         let raw_sidecar = raw_sidecar.or_else(|| {
+            // Accept both the packed v2 file and a legacy v1 directory; the read
+            // path classifies and fails closed on anything else (#1990).
             let path = default_raw_sidecar(&graph_path);
-            path.is_dir().then_some(path)
+            (path.is_file() || path.is_dir()).then_some(path)
         });
         let pq = DiskAnnPqIndex::read_if_exists(&default_pq_sidecar(&graph_path))?;
         let graph_file = prefetch_file_for_graph(&graph_path, &reader)?;

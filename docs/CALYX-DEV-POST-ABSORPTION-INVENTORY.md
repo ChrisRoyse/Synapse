@@ -15,6 +15,14 @@ Each commit is represented exactly once below. Classification uses the commit's 
 
 An **applicable** row is inventory evidence, not acceptance evidence. It remains open work until its behavior/invariants have been compared, ported or rejected with a concrete rationale, compiled/linted, and manually FSV-proven through the real wired Synapse MCP with separate physical Source-of-Truth readback under D1.
 
+## Incremental audit checkpoint — 2026-07-22
+
+- Authenticated upstream head re-read after fetch: `55b95e7063668facbba5ab911ef88aa582e8be2f` (108 commits after the ledger head above).
+- Upstream `198a6c73` (`fix(sextant): pack DiskANN raw sidecars into one durable file`) is applicable and selectively ported in the current #1760 change.
+- The native port retains legacy-directory reads for the deployed v1 on-disk format, writes only packed v2, validates dense IDs/dimensions/header/length/finiteness, fsyncs the staged file, rejects symlink/reparse-point staging, and preserves/restores the prior generation around Windows publication failures.
+- The audit exposed a separate operational gap: persisted search rebuild existed only as a library API and was fixed to `AsterVault<SystemClock>`. Issue #1782 tracks the new maintenance-gated MCP operation and clock-generic rebuild boundary required to exercise the port against the real Synapse vault.
+- This is an incremental checkpoint, not coverage of the remaining 107 new upstream commits. The 283-row ledger and its summary remain scoped to `313860bc`; the ledger must be extended before #1760 can close.
+
 ## Coverage summary
 
 | Classification | Commits |
@@ -343,4 +351,3 @@ git -C C:\code\Calyx-Dev rev-list --count 9894f84f..313860bc
 ```
 
 Expected result for the recorded head is `283`. The commit ledger is an inventory of source-history reality. It does not claim that the 135 applicable commits are shipped or manually verified. Issue #1760 remains open until each applicable row receives an evidence-backed terminal decision and every reachable native port has D1 manual FSV evidence.
-

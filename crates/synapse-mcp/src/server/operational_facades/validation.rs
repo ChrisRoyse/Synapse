@@ -23,6 +23,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("temporal_panels", params.temporal_panels.is_some()),
             ("temporal_rerank", params.temporal_rerank.is_some()),
             ("temporal_backfill", params.temporal_backfill.is_some()),
+            ("search_rebuild", params.search_rebuild.is_some()),
         ],
     )
 }

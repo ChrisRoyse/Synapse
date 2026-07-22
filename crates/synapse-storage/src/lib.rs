@@ -807,6 +807,22 @@ impl Db {
         self.backend.calyx_vault_status()
     }
 
+    /// Rebuilds and independently reopens the persisted Calyx search
+    /// generation for the exact durable active panel.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the vault is unavailable, the
+    /// panel precondition fails, rebuilding fails, or physical artifact
+    /// readback cannot validate the published generation.
+    pub fn rebuild_calyx_search_indexes(
+        &self,
+        expected_panel_version: u32,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchRebuildReport> {
+        self.backend
+            .rebuild_calyx_search_indexes(expected_panel_version)
+    }
+
     /// Flushes and explicitly closes the sole process-local Calyx vault.
     ///
     /// # Errors

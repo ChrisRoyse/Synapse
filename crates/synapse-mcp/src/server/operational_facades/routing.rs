@@ -13,7 +13,7 @@ use super::{
 #[tool_router(router = operational_facade_tool_router, vis = "pub(in crate::server)")]
 impl SynapseService {
     #[tool(
-        description = "Public storage facade for the <=40 MCP surface. operation=inspect/summary are read-only Calyx vault reports; operation=anchors decodes physical Calyx Anchors CF rows for an exact source row; operation=gc_once is maintenance-gated and returns separate CF row-count/readback evidence. Synthetic probe-row writes are debug-only raw routes and are not part of this production facade. Unknown operations and mismatched operation payloads fail closed."
+        description = "Public storage facade for the <=40 MCP surface. operation=inspect/summary are read-only Calyx vault reports; operation=anchors decodes physical Calyx Anchors CF rows for an exact source row; operation=search_rebuild rebuilds and independently reopens the exact-panel persisted search generation; operation=gc_once is maintenance-gated and returns separate CF row-count/readback evidence. Mutating operations require the maintenance capability. Synthetic probe-row writes are debug-only raw routes and are not part of this production facade. Unknown operations and mismatched operation payloads fail closed."
     )]
     pub async fn storage(
         &self,

@@ -31,5 +31,8 @@ pub use pq::{
     DISKANN_PQ_SMALL_CORPUS_ROWS, DiskAnnPqBuildDiagnostics, DiskAnnPqBuildExecution,
     DiskAnnPqBuildParams, DiskAnnPqIndex,
 };
-pub use search::{DiskAnnPqSearchBuild, DiskAnnSearch, DiskAnnSearchParams};
+pub use search::{
+    DiskAnnPqSearchBuild, DiskAnnSearch, DiskAnnSearchParams, RAW_SIDECAR_HEADER_SIZE,
+    RAW_SIDECAR_MAGIC, RAW_SIDECAR_PACKED_VERSION,
+};
 pub use token::TokenDiskAnnMaxSim;

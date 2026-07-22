@@ -37,7 +37,8 @@ pub use diskann::{
     DiskAnnGraphReader, DiskAnnGraphWriter, DiskAnnHeader, DiskAnnNodeRef,
     DiskAnnPqBuildDiagnostics, DiskAnnPqBuildExecution, DiskAnnPqBuildParams, DiskAnnPqIndex,
     DiskAnnPqSearchBuild, DiskAnnSearch, DiskAnnSearchParams, DualDiskAnnSearch,
-    TokenDiskAnnMaxSim, build_diskann_graph, build_diskann_graph_with_backend,
+    RAW_SIDECAR_HEADER_SIZE, RAW_SIDECAR_MAGIC, RAW_SIDECAR_PACKED_VERSION, TokenDiskAnnMaxSim,
+    build_diskann_graph, build_diskann_graph_with_backend,
     build_diskann_graph_with_backend_and_progress, build_dual, build_dual_with_search,
     dual_graph_path, node_block_size, open_diskann_graph, open_dual,
 };

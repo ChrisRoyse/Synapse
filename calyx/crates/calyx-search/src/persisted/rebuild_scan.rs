@@ -7,7 +7,7 @@ use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::{
     EncodedSlotVectorShape, decode_constellation_base, decode_slot_vector, inspect_slot_vector,
 };
-use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
+use calyx_core::{CalyxError, Clock, Constellation, CxId, SlotId, SlotVector};
 use rayon::prelude::*;
 
 use super::super::rebuild::RebuildProgress;
@@ -22,8 +22,8 @@ use super::{SharedRebuildProgress, emit_shared_progress};
 // multiply that hard memory bound.
 const SLOT_POINT_READ_ROWS: usize = 1;
 
-pub(super) fn load_base_docs_at<F>(
-    vault: &AsterVault,
+pub(super) fn load_base_docs_at<C: Clock, F>(
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     page_rows: usize,
     requested_panel_version: Option<u32>,
@@ -170,10 +170,10 @@ enum SlotRowShape {
     Multi,
 }
 
-pub(super) fn collect_or_build_slot_from_cf<F>(
+pub(super) fn collect_or_build_slot_from_cf<C: Clock, F>(
     vault_dir: &Path,
     root: &Path,
-    vault: &AsterVault,
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     plan: &SlotBuildPlan,
     page_rows: usize,
