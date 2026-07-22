@@ -5123,10 +5123,82 @@ function New-SynapseSetupRunDirectory {
     return $path
 }
 
+function Get-SynapseOrtRuntimeCompanions {
+    param([Parameter(Mandatory=$true)][string]$ExecutablePath)
+
+    $directory = Split-Path -Parent $ExecutablePath
+    $required = @('onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'onnxruntime_providers_cuda.dll')
+    $files = @()
+    foreach ($name in $required) {
+        $path = Join-Path $directory $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Die "SYNAPSE_ORT_RUNTIME_COMPANION_MISSING executable=$ExecutablePath companion=$path remediation=the CUDA-enabled daemon is a runtime bundle; build or install the named ONNX Runtime provider DLL beside the executable"
+        }
+        $files += [pscustomobject]@{
+            Name = $name
+            Path = $path
+            Sha256 = Get-SynapseFileSha256 -Path $path
+        }
+    }
+    return @($files)
+}
+
+function Install-SynapsePinnedOrtGpuRuntime {
+    param([Parameter(Mandatory=$true)][string]$Root)
+
+    $version = '1.27.1'
+    $packageSha256 = '07AD9D174F19BA47C13BF1989EE0C9A8D4832481E2EB51A16DD659A71162381F'
+    $expectedFiles = [ordered]@{
+        'onnxruntime.dll' = '75BBF0C47CB90E17F566DA46F50ECAAB4A0DA978E6D8C2B58FBB89708EA067DE'
+        'onnxruntime_providers_shared.dll' = '3D8EF56BABC5D581153CB032DE6841CFBCC884533A3C74038CEB6DFB6CCB05AE'
+        'onnxruntime_providers_cuda.dll' = '46766BA4A7F971A2D5F01569EA6CCFD501F5CF578F2257734CFD578DC28CAD2E'
+    }
+    $versionRoot = Join-Path $Root $version
+    $packagePath = Join-Path $versionRoot "Microsoft.ML.OnnxRuntime.Gpu.Windows.$version.nupkg"
+    $extractRoot = Join-Path $versionRoot 'package'
+    $nativeDir = Join-Path $extractRoot 'runtimes\win-x64\native'
+    New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
+    if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+        $downloadPath = "$packagePath.download-$PID"
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Gpu.Windows/$version" -OutFile $downloadPath
+        $downloadHash = Get-SynapseFileSha256 -Path $downloadPath
+        if ($downloadHash -ne $packageSha256) {
+            Die "SYNAPSE_ORT_RUNTIME_PACKAGE_HASH_MISMATCH path=$downloadPath expected_sha256=$packageSha256 actual_sha256=$downloadHash remediation=do not install an unverified ONNX Runtime package; inspect the authoritative Microsoft NuGet release"
+        }
+        Move-Item -LiteralPath $downloadPath -Destination $packagePath
+    }
+    $packageReadback = Get-SynapseFileSha256 -Path $packagePath
+    if ($packageReadback -ne $packageSha256) {
+        Die "SYNAPSE_ORT_RUNTIME_PACKAGE_HASH_MISMATCH path=$packagePath expected_sha256=$packageSha256 actual_sha256=$packageReadback remediation=delete only this corrupt cached package and rerun setup to reacquire it from Microsoft NuGet"
+    }
+    if (-not (Test-Path -LiteralPath $nativeDir -PathType Container)) {
+        $zipPath = Join-Path $versionRoot "package-$PID.zip"
+        $extractAttempt = Join-Path $versionRoot "extract-$PID"
+        Copy-Item -LiteralPath $packagePath -Destination $zipPath -Force
+        New-Item -ItemType Directory -Force -Path $extractAttempt | Out-Null
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractAttempt
+        Move-Item -LiteralPath $extractAttempt -Destination $extractRoot
+        Remove-Item -LiteralPath $zipPath -Force
+    }
+    foreach ($entry in $expectedFiles.GetEnumerator()) {
+        $path = Join-Path $nativeDir $entry.Key
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            Die "SYNAPSE_ORT_RUNTIME_FILE_MISSING path=$path package=$packagePath remediation=the pinned Microsoft ONNX Runtime package did not contain its declared Windows x64 runtime bundle"
+        }
+        $actual = Get-SynapseFileSha256 -Path $path
+        if ($actual -ne $entry.Value) {
+            Die "SYNAPSE_ORT_RUNTIME_FILE_HASH_MISMATCH path=$path expected_sha256=$($entry.Value) actual_sha256=$actual remediation=the extracted runtime differs from the pinned Microsoft package; refuse the build and reacquire the exact package"
+        }
+    }
+    Info "Pinned Microsoft ONNX Runtime GPU bundle verified version=$version package_sha256=$packageReadback native_dir=$nativeDir"
+    return [pscustomobject]@{ Version = $version; NativeDir = $nativeDir; PackagePath = $packagePath; PackageSha256 = $packageReadback }
+}
+
 function New-SynapseStagedDaemonBinary {
     param(
         [Parameter(Mandatory=$true)][string]$BuiltPath,
-        [Parameter(Mandatory=$true)][string]$LogDir
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$RuntimeDir
     )
 
     $stagingRoot = Join-Path $LogDir 'setup-staging'
@@ -5138,11 +5210,22 @@ function New-SynapseStagedDaemonBinary {
     if ($stagedHash -ne $builtHash) {
         Die "SYNAPSE_STAGED_BINARY_HASH_MISMATCH built=$BuiltPath staged=$stagedPath built_hash=$builtHash staged_hash=$stagedHash remediation=inspect disk/storage; refusing to install an unverified binary"
     }
+    $runtimeFiles = @()
+    foreach ($companion in @(Get-SynapseOrtRuntimeCompanions -ExecutablePath (Join-Path $RuntimeDir 'synapse-mcp.exe'))) {
+        $stagedCompanion = Join-Path $stagingDir $companion.Name
+        Copy-Item -LiteralPath $companion.Path -Destination $stagedCompanion -Force
+        $stagedCompanionHash = Get-SynapseFileSha256 -Path $stagedCompanion
+        if ($stagedCompanionHash -ne $companion.Sha256) {
+            Die "SYNAPSE_STAGED_RUNTIME_COMPANION_HASH_MISMATCH source=$($companion.Path) staged=$stagedCompanion expected_sha256=$($companion.Sha256) actual_sha256=$stagedCompanionHash remediation=inspect disk/storage; refusing to install an incoherent ONNX Runtime bundle"
+        }
+        $runtimeFiles += [pscustomobject]@{ Name = $companion.Name; Path = $stagedCompanion; Sha256 = $stagedCompanionHash }
+    }
     Info "Staged daemon binary path=$stagedPath sha256=$stagedHash"
     return [pscustomobject]@{
         Path = $stagedPath
         Sha256 = $stagedHash
         SourcePath = $BuiltPath
+        RuntimeFiles = @($runtimeFiles)
     }
 }
 
@@ -7903,6 +7986,11 @@ if (-not $SkipBuild) {
 # 2. Build (local source -> persistent target) and verify the binary
 # ---------------------------------------------------------------------------
 Set-SynapseCudaBuildEnvironment
+$ortRuntimeRoot = Join-Path $env:LOCALAPPDATA 'synapse\runtime\onnxruntime-gpu'
+$ortRuntime = Install-SynapsePinnedOrtGpuRuntime -Root $ortRuntimeRoot
+$env:ORT_LIB_LOCATION = $ortRuntime.NativeDir
+$env:ORT_PREFER_DYNAMIC_LINK = '1'
+Info "ONNX Runtime build linkage configured mode=dynamic ORT_LIB_LOCATION=$($env:ORT_LIB_LOCATION) version=$($ortRuntime.Version)"
 
 if (-not $SkipBuild) {
     Step "Building synapse-mcp (release) from $SourceDir"
@@ -8105,10 +8193,13 @@ if ($SkipBuild) {
     $installSourceHash = Get-SynapseFileSha256 -Path $ExePath
     Info "SkipBuild candidate binary path=$ExePath sha256=$installSourceHash"
 } else {
-    $stagedBinary = New-SynapseStagedDaemonBinary -BuiltPath $built -LogDir $LogDir
+    $stagedBinary = New-SynapseStagedDaemonBinary -BuiltPath $built -LogDir $LogDir -RuntimeDir $ortRuntime.NativeDir
     $installSourcePath = $stagedBinary.Path
     $installSourceHash = $stagedBinary.Sha256
 }
+$candidateRuntimeFiles = @(Get-SynapseOrtRuntimeCompanions -ExecutablePath $installSourcePath)
+$candidateRuntimeSummary = ($candidateRuntimeFiles | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Sha256 }) -join ','
+Info "Candidate ONNX Runtime bundle verified files=$candidateRuntimeSummary"
 $replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind
 $candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions -ReplacementReservationId $replacementReservationId
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
@@ -8200,6 +8291,7 @@ if (-not $liveDaemonHandoffRequired) {
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
 $backupPath = $null
 $oldInstalledHash = $null
+$runtimeCompanionBackups = @()
 if ($installedBinaryAlreadyVerified) {
     $oldInstalledHash = $installSourceHash
     Info "Installed binary already matches verified SkipBuild candidate; no backup/copy needed. path=$ExePath sha256=$oldInstalledHash"
@@ -8229,6 +8321,35 @@ if (-not (Test-Path -LiteralPath $ExePath)) {
 $installedHash = Get-SynapseFileSha256 -Path $ExePath
 if ($installedHash -ne $installSourceHash) {
     Die "SYNAPSE_INSTALLED_BINARY_HASH_MISMATCH path=$ExePath expected_sha256=$installSourceHash actual_sha256=$installedHash remediation=installed daemon bytes do not match the candidate that passed health preflight"
+}
+$runtimeInstallDir = Split-Path -Parent $ExePath
+foreach ($companion in $candidateRuntimeFiles) {
+    $destination = Join-Path $runtimeInstallDir $companion.Name
+    $sourceResolved = [System.IO.Path]::GetFullPath($companion.Path)
+    $destinationResolved = [System.IO.Path]::GetFullPath($destination)
+    if ($sourceResolved -ine $destinationResolved) {
+        $backup = [pscustomobject]@{
+            Path = $destination
+            BackupPath = "$destination.bak"
+            Existed = (Test-Path -LiteralPath $destination -PathType Leaf)
+            Sha256 = $null
+        }
+        if ($backup.Existed) {
+            $backup.Sha256 = Get-SynapseFileSha256 -Path $destination
+            Copy-Item -LiteralPath $destination -Destination $backup.BackupPath -Force
+            $backupReadback = Get-SynapseFileSha256 -Path $backup.BackupPath
+            if ($backupReadback -ne $backup.Sha256) {
+                Die "SYNAPSE_RUNTIME_COMPANION_BACKUP_HASH_MISMATCH path=$destination backup=$($backup.BackupPath) expected_sha256=$($backup.Sha256) actual_sha256=$backupReadback remediation=runtime bundle backup changed during copy; refusing handoff"
+            }
+        }
+        $runtimeCompanionBackups += $backup
+        Copy-Item -LiteralPath $companion.Path -Destination $destination -Force
+    }
+    $runtimeReadback = Get-SynapseFileSha256 -Path $destination
+    if ($runtimeReadback -ne $companion.Sha256) {
+        Die "SYNAPSE_INSTALLED_RUNTIME_COMPANION_HASH_MISMATCH path=$destination expected_sha256=$($companion.Sha256) actual_sha256=$runtimeReadback remediation=installed ONNX Runtime bundle is incoherent; daemon start is refused"
+    }
+    Info "Installed ONNX Runtime companion verified path=$destination sha256=$runtimeReadback"
 }
 $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
@@ -8568,6 +8689,20 @@ if (-not $ok) {
         $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
         if ($rollbackHash -ne $oldInstalledHash) {
             Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_HASH_MISMATCH expected_sha256=$oldInstalledHash actual_sha256=$rollbackHash backup=$backupPath install_path=$ExePath original_failure=[$failureDetail]"
+        }
+        foreach ($runtimeBackup in $runtimeCompanionBackups) {
+            if ($runtimeBackup.Existed) {
+                Copy-Item -LiteralPath $runtimeBackup.BackupPath -Destination $runtimeBackup.Path -Force
+                $runtimeRollbackHash = Get-SynapseFileSha256 -Path $runtimeBackup.Path
+                if ($runtimeRollbackHash -ne $runtimeBackup.Sha256) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_RUNTIME_ROLLBACK_HASH_MISMATCH path=$($runtimeBackup.Path) expected_sha256=$($runtimeBackup.Sha256) actual_sha256=$runtimeRollbackHash original_failure=[$failureDetail]"
+                }
+            } elseif (Test-Path -LiteralPath $runtimeBackup.Path -PathType Leaf) {
+                Remove-Item -LiteralPath $runtimeBackup.Path -Force
+                if (Test-Path -LiteralPath $runtimeBackup.Path) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_RUNTIME_ROLLBACK_REMOVE_FAILED path=$($runtimeBackup.Path) original_failure=[$failureDetail]"
+                }
+            }
         }
         if ($ManualInstallHealthRollbackProbe) {
             New-HiddenDaemonLauncher `
