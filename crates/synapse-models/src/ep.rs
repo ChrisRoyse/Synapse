@@ -90,8 +90,9 @@ pub fn create_ort_session(
         Ok(builder) => builder,
         Err(err) => {
             tracing::warn!(backend = ?provider, error = %err, "execution provider unavailable");
-            return Err(crate::ModelError::BackendUnavailable {
-                attempted: vec![provider],
+            return Err(crate::ModelError::LoadFailed {
+                path: descriptor.path.clone(),
+                detail: format!("{provider:?} execution provider registration failed: {err}"),
             });
         }
     };

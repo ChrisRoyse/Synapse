@@ -54,7 +54,7 @@ impl From<ModelError> for AudioError {
                 actual,
             },
             ModelError::LoadFailed { path, detail } => Self::ModelLoadFailed { path, detail },
-            ModelError::BackendUnavailable { attempted } => {
+            ModelError::BackendUnavailable { attempted, .. } => {
                 Self::ModelBackendUnavailable { attempted }
             }
             other => Self::ModelLoadFailed {

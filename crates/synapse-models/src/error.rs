@@ -19,8 +19,11 @@ pub enum ModelError {
     },
     #[error("model load failed for {path}: {detail}")]
     LoadFailed { path: PathBuf, detail: String },
-    #[error("no model backend was available; attempted {attempted:?}")]
-    BackendUnavailable { attempted: Vec<ModelBackend> },
+    #[error("no model backend was available; attempted {attempted:?}; failures: {failures:?}")]
+    BackendUnavailable {
+        attempted: Vec<ModelBackend>,
+        failures: Vec<(ModelBackend, String)>,
+    },
     #[error("detection model is not loaded: {detail}")]
     DetectionModelNotLoaded { detail: String },
     #[error("no detection frame available: {detail}")]

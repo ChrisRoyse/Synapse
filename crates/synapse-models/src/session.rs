@@ -449,6 +449,10 @@ impl SessionFactory for OrtSessionFactory {
     ) -> ModelResult<SessionBuildResult> {
         Err(ModelError::BackendUnavailable {
             attempted: providers.to_vec(),
+            failures: vec![(
+                ModelBackend::Cpu,
+                "this build does not include the ONNX Runtime feature".to_owned(),
+            )],
         })
     }
 }
@@ -463,6 +467,7 @@ impl SessionFactory for OrtSessionFactory {
         if providers.is_empty() {
             return Err(ModelError::BackendUnavailable {
                 attempted: Vec::new(),
+                failures: Vec::new(),
             });
         }
 
@@ -490,6 +495,7 @@ impl SessionFactory for OrtSessionFactory {
         tracing::warn!(failures = ?backend_failures, "all model backends failed");
         Err(ModelError::BackendUnavailable {
             attempted: providers.to_vec(),
+            failures: backend_failures,
         })
     }
 }
