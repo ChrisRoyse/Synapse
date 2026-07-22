@@ -388,6 +388,19 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
             continue;
         }
 
+        // This collector owns only the daily rolling files created above.
+        // The directory also contains setup-owned daemon launchers, supervisor
+        // state, and durable diagnostic ledgers. Applying age or byte-budget
+        // retention to those foreign files can remove restart authority while
+        // Task Scheduler still points at it.
+        let managed_log = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name == "synapse.log" || name.starts_with("synapse.log."));
+        if !managed_log {
+            continue;
+        }
+
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if now.duration_since(modified).unwrap_or_default() > keep {
             fs::remove_file(entry.path()).map_err(|err| err.to_string())?;
