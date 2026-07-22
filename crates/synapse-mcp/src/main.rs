@@ -108,6 +108,8 @@ enum Mode {
     ApprovalProtocol,
     /// Internal child process bound to a hidden desktop for UIA/PrintWindow work.
     DesktopWorker,
+    /// Internal kill-contained ORT/DirectML inference child.
+    DetectionWorker,
     /// Enumerate/classify synapse-mcp processes; with --kill-stray, clean them.
     Doctor,
     /// Run a registry-backed local model as a Synapse MCP client/agent.
@@ -227,6 +229,10 @@ struct Cli {
     desktop_worker_json: Option<PathBuf>,
     #[arg(long, hide = true)]
     desktop_worker_bgra: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    detection_worker_request: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    detection_worker_response: Option<PathBuf>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_MODEL", value_name = "NAME")]
     local_agent_model: Option<String>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_TASK", value_name = "TEXT")]
@@ -422,6 +428,14 @@ async fn run() -> anyhow::Result<ExitCode> {
         drop(telemetry_guard);
         return Ok(code);
     }
+    if matches!(cli.mode, Mode::DetectionWorker) {
+        let code = m1::run_detection_worker_from_cli(
+            cli.detection_worker_request.clone(),
+            cli.detection_worker_response.clone(),
+        )?;
+        drop(telemetry_guard);
+        return Ok(code);
+    }
     if matches!(cli.mode, Mode::LocalAgent) {
         let result = local_agent::run_from_cli(local_agent::LocalAgentCli {
             model_name: cli.local_agent_model.clone(),
@@ -524,10 +538,11 @@ async fn run() -> anyhow::Result<ExitCode> {
         | Mode::ChromeNativeHost
         | Mode::ApprovalProtocol
         | Mode::DesktopWorker
+        | Mode::DetectionWorker
         | Mode::Doctor
         | Mode::LocalAgent => {
             unreachable!(
-                "connect, chrome-native-host, approval-protocol, desktop-worker, doctor, and local-agent modes are handled before daemon setup"
+                "connect, chrome-native-host, approval-protocol, desktop-worker, detection-worker, doctor, and local-agent modes are handled before daemon setup"
             )
         }
     }

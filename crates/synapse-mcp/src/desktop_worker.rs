@@ -910,6 +910,95 @@ struct WorkerProcessVerdict {
     exit_code: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OwnedWorkerVerdict {
+    pub pid: u32,
+    pub timed_out: bool,
+    pub exit_code: u32,
+}
+
+/// Runs this executable as a suspended, current-desktop worker after assigning
+/// it to a verified kill-on-close Job Object. The returned verdict is backed
+/// by a separate kernel wait and exit-code readback; timeout cleanup is complete
+/// before this function returns.
+#[cfg(windows)]
+pub(crate) fn run_owned_current_exe_worker(
+    args: &[String],
+    timeout_ms: u32,
+) -> Result<OwnedWorkerVerdict, String> {
+    use windows::{
+        Win32::System::Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            PROCESS_INFORMATION, STARTUPINFOW,
+        },
+        core::{PCWSTR, PWSTR},
+    };
+
+    retry_retained_worker_process_handles()?;
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("resolve current executable for owned worker failed: {error}"))?;
+    let command_line = std::iter::once(exe.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .map(|arg| quote_windows_arg(&arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut command_line_wide = wide_null(&command_line);
+    let startup_info = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    let job = create_worker_kill_on_close_job()?;
+    let mut process_info = PROCESS_INFORMATION::default();
+    if let Err(error) = unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(command_line_wide.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            None,
+            PCWSTR::null(),
+            &raw const startup_info,
+            &raw mut process_info,
+        )
+    } {
+        let close = close_or_retain_standalone_worker_job(job, "owned_worker_create_failed");
+        return Err(format!(
+            "CreateProcessW for owned worker failed: {error}; job_close_readback={close:?}"
+        ));
+    }
+
+    let mut handles = WorkerProcessHandles::from_process_info(process_info, job);
+    if let Err(error) = assign_worker_job_and_resume(&mut handles) {
+        let termination = terminate_worker_process_and_readback(&mut handles, 0);
+        let finalization =
+            finalize_worker_process_handles(&mut handles, "owned_worker_start_failure");
+        return Err(format!(
+            "owned worker pid {} failed verified job assignment/resume: {error}; termination={termination:?}; finalization_failures={:?}; retained={}",
+            handles.pid, finalization.failures, finalization.retained
+        ));
+    }
+    let result = wait_for_worker_process(&mut handles, timeout_ms);
+    let finalization = finalize_worker_process_handles(&mut handles, "owned_worker_result_cleanup");
+    let verdict = result?;
+    if !finalization.failures.is_empty() {
+        return Err(format!(
+            "owned worker pid {} reached exit_code={} timed_out={}, but handle finalization failed: {}; retained={}",
+            verdict.pid,
+            verdict.exit_code,
+            verdict.timed_out,
+            finalization.failures.join("; "),
+            finalization.retained
+        ));
+    }
+    Ok(OwnedWorkerVerdict {
+        pid: verdict.pid,
+        timed_out: verdict.timed_out,
+        exit_code: verdict.exit_code,
+    })
+}
+
 #[cfg(windows)]
 fn report_worker_process_lifecycle_failure(
     code: &'static str,

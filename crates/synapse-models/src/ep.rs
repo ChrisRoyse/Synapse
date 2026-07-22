@@ -27,6 +27,24 @@ pub fn create_ort_session(
         path: descriptor.path.clone(),
         detail: err.to_string(),
     })?;
+    // DirectML requires sequential execution and does not support ORT memory
+    // patterns. Configure both requirements explicitly before attaching the
+    // provider so session construction never depends on ORT defaults.
+    if provider == DirectMl {
+        builder = builder.with_parallel_execution(false).map_err(|err| {
+            crate::ModelError::LoadFailed {
+                path: descriptor.path.clone(),
+                detail: format!("failed to require sequential DirectML execution: {err}"),
+            }
+        })?;
+        builder =
+            builder
+                .with_memory_pattern(false)
+                .map_err(|err| crate::ModelError::LoadFailed {
+                    path: descriptor.path.clone(),
+                    detail: format!("failed to disable DirectML memory patterns: {err}"),
+                })?;
+    }
     if descriptor.id == "whisper_tiny_int8" {
         if let Some(library) = crate::download::local_ort_extensions_library() {
             builder = builder.with_operator_library(&library).map_err(|err| {

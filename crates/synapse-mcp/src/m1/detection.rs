@@ -1,20 +1,22 @@
 use chrono::{DateTime, Utc};
 use rmcp::ErrorData;
-use std::time::Instant;
+use serde::{Deserialize, Serialize};
+use std::{fs, path::PathBuf, process::ExitCode, time::Instant};
 use synapse_calyx::SynapseCalyxGpuReservation;
 use synapse_core::{
-    DetectedEntity, Detection, PerceptionMode, ProfileDetection, Rect, SensorStatus, entity_id,
-    error_codes,
+    DetectedEntity, Detection, DetectionBatch, PerceptionMode, ProfileDetection, Rect,
+    SensorStatus, entity_id, error_codes,
 };
 use synapse_models::{
-    DEFAULT_DETECTION_MODEL_ID, DetectOpts, DetectionFrame, Detector, LoadedModel, ModelLoader,
-    default_detection_model_descriptor, detection_model_not_loaded, registered_model,
+    DEFAULT_DETECTION_MODEL_ID, DetectOpts, DetectionFrame, Detector, ModelBackend, ModelLoader,
+    default_detection_model_descriptor, registered_model,
 };
 
 const DEFAULT_DETECTION_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const STALE_TRACK_MS: i64 = 3_000;
 const MIN_TRACK_MATCH_DISTANCE_PX: f32 = 96.0;
 const DETECTION_GPU_ADMISSION_MIB: u64 = 4_096;
+const DETECTION_WORKER_TIMEOUT_MS: u32 = 30_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectionRuntimeConfig {
@@ -49,11 +51,8 @@ impl Default for DetectionRuntimeConfig {
 
 #[derive(Debug, Default)]
 pub struct DetectionRuntime {
-    loader: ModelLoader,
-    loaded: Option<LoadedDetectionModel>,
     tracker: EntityTracker,
     next_frame_seq: u64,
-    gpu_reservation: Option<SynapseCalyxGpuReservation>,
 }
 
 impl DetectionRuntime {
@@ -61,85 +60,229 @@ impl DetectionRuntime {
         self.next_frame_seq = self.next_frame_seq.saturating_add(1);
         self.next_frame_seq
     }
-
-    fn load_model(&mut self, model_id: Option<&str>) -> synapse_models::ModelResult<&LoadedModel> {
-        let resolved_model_id = model_id.unwrap_or(DEFAULT_DETECTION_MODEL_ID);
-        if self
-            .loaded
-            .as_ref()
-            .is_some_and(|loaded| loaded.model_id == resolved_model_id)
-        {
-            return self
-                .loaded
-                .as_ref()
-                .map(|loaded| &loaded.model)
-                .ok_or_else(|| detection_model_not_loaded("detection model cache was empty"));
-        }
-
-        let descriptor = if resolved_model_id == DEFAULT_DETECTION_MODEL_ID {
-            default_detection_model_descriptor()
-        } else {
-            registered_model(resolved_model_id)
-                .ok_or_else(|| {
-                    detection_model_not_loaded(format!(
-                        "detection model id {resolved_model_id:?} is not registered"
-                    ))
-                })?
-                .descriptor()
-        };
-        if !descriptor.path.exists() {
-            return Err(detection_model_not_loaded(format!(
-                "side-load {} before requesting detection model {resolved_model_id}",
-                descriptor.path.display()
-            )));
-        }
-        let acquired_reservation = self.gpu_reservation.is_none();
-        if acquired_reservation {
-            let resolved_model_id = resolved_model_id.to_owned();
-            self.gpu_reservation = Some(
-                SynapseCalyxGpuReservation::acquire(
-                    0,
-                    "synapse-mcp-detection",
-                    format!("synapse-detection-pid-{}", std::process::id()),
-                    format!(
-                        "ORT DirectML detector model={resolved_model_id}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}"
-                    ),
-                    DETECTION_GPU_ADMISSION_MIB,
-                )
-                .map_err(|error| detection_model_not_loaded(error.to_string()))?,
-            );
-        }
-        let model = match self.loader.load(descriptor) {
-            Ok(model) => model,
-            Err(error) => {
-                if acquired_reservation {
-                    self.gpu_reservation.take();
-                }
-                return Err(error);
-            }
-        };
-        tracing::info!(
-            code = "M1_DETECTION_MODEL_LOADED",
-            model_id = %resolved_model_id,
-            backend = ?model.selected_backend(),
-            session_id = model.session_id(),
-            "detection model loaded"
-        );
-        self.loaded = Some(LoadedDetectionModel {
-            model_id: resolved_model_id.to_owned(),
-            model,
-        });
-        self.loaded
-            .as_ref()
-            .map(|loaded| &loaded.model)
-            .ok_or_else(|| detection_model_not_loaded("detection model cache was empty after load"))
-    }
 }
 
-#[derive(Debug)]
-struct LoadedDetectionModel {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DetectionWorkerRequest {
     model_id: String,
-    model: LoadedModel,
+    frame_seq: u64,
+    width: u32,
+    height: u32,
+    rgb_path: PathBuf,
+    opts: DetectOpts,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DetectionWorkerEnvelope {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    batch: Option<DetectionBatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
+}
+
+pub(crate) fn run_detection_worker_from_cli(
+    request_path: Option<PathBuf>,
+    response_path: Option<PathBuf>,
+) -> anyhow::Result<ExitCode> {
+    let request_path =
+        request_path.ok_or_else(|| anyhow::anyhow!("--detection-worker-request is required"))?;
+    let response_path =
+        response_path.ok_or_else(|| anyhow::anyhow!("--detection-worker-response is required"))?;
+    let envelope = run_detection_worker(&request_path).unwrap_or_else(|(code, detail)| {
+        DetectionWorkerEnvelope {
+            ok: false,
+            batch: None,
+            reservation_id: None,
+            error_code: Some(code),
+            error_detail: Some(detail),
+        }
+    });
+    let bytes = serde_json::to_vec(&envelope)?;
+    fs::write(&response_path, bytes)?;
+    Ok(if envelope.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn run_detection_worker(
+    request_path: &std::path::Path,
+) -> Result<DetectionWorkerEnvelope, (String, String)> {
+    let request_bytes = fs::read(request_path).map_err(|error| {
+        (
+            "DETECTION_WORKER_REQUEST_READ_FAILED".to_owned(),
+            error.to_string(),
+        )
+    })?;
+    let request: DetectionWorkerRequest =
+        serde_json::from_slice(&request_bytes).map_err(|error| {
+            (
+                "DETECTION_WORKER_REQUEST_INVALID".to_owned(),
+                error.to_string(),
+            )
+        })?;
+    let rgb = fs::read(&request.rgb_path).map_err(|error| {
+        (
+            "DETECTION_WORKER_FRAME_READ_FAILED".to_owned(),
+            error.to_string(),
+        )
+    })?;
+    let descriptor = if request.model_id == DEFAULT_DETECTION_MODEL_ID {
+        default_detection_model_descriptor()
+    } else {
+        registered_model(&request.model_id)
+            .ok_or_else(|| {
+                (
+                    error_codes::DETECTION_MODEL_NOT_LOADED.to_owned(),
+                    format!(
+                        "detection model id {:?} is not registered",
+                        request.model_id
+                    ),
+                )
+            })?
+            .descriptor()
+    };
+    if !descriptor.path.exists() {
+        return Err((
+            error_codes::DETECTION_MODEL_NOT_LOADED.to_owned(),
+            format!(
+                "side-load {} before requesting detection model {}",
+                descriptor.path.display(),
+                request.model_id
+            ),
+        ));
+    }
+    let reservation = SynapseCalyxGpuReservation::acquire(
+        0,
+        "synapse-mcp-detection-worker",
+        format!("synapse-detection-worker-pid-{}", std::process::id()),
+        format!(
+            "isolated ORT DirectML detector model={}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}",
+            request.model_id
+        ),
+        DETECTION_GPU_ADMISSION_MIB,
+    )
+    .map_err(|error| (error.code.to_owned(), error.to_string()))?;
+    let reservation_id = reservation
+        .admitted_snapshot()
+        .reservations
+        .iter()
+        .find(|row| row.pid == std::process::id())
+        .map(|row| row.reservation_id.clone());
+    let loader = ModelLoader::new(vec![ModelBackend::DirectMl]);
+    let model = loader
+        .load(descriptor)
+        .map_err(|error| (error.code().to_owned(), error.to_string()))?;
+    let batch = model
+        .infer(
+            DetectionFrame {
+                frame_seq: request.frame_seq,
+                width: request.width,
+                height: request.height,
+                rgb,
+            },
+            request.opts,
+        )
+        .map_err(|error| (error.code().to_owned(), error.to_string()))?;
+    drop(model);
+    drop(reservation);
+    Ok(DetectionWorkerEnvelope {
+        ok: true,
+        batch: Some(batch),
+        reservation_id,
+        error_code: None,
+        error_detail: None,
+    })
+}
+
+#[cfg(windows)]
+fn infer_in_owned_worker(
+    model_id: &str,
+    frame: DetectionFrame,
+    opts: DetectOpts,
+) -> synapse_models::ModelResult<DetectionBatch> {
+    use synapse_models::{detection_infer_failed, detection_model_not_loaded};
+
+    let temp = tempfile::Builder::new()
+        .prefix("synapse-detection-worker-")
+        .tempdir()
+        .map_err(|error| {
+            detection_infer_failed(format!("create worker temp directory: {error}"))
+        })?;
+    let request_path = temp.path().join("request.json");
+    let response_path = temp.path().join("response.json");
+    let rgb_path = temp.path().join("frame.rgb");
+    fs::write(&rgb_path, &frame.rgb)
+        .map_err(|error| detection_infer_failed(format!("write worker RGB frame: {error}")))?;
+    let request = DetectionWorkerRequest {
+        model_id: model_id.to_owned(),
+        frame_seq: frame.frame_seq,
+        width: frame.width,
+        height: frame.height,
+        rgb_path,
+        opts,
+    };
+    fs::write(
+        &request_path,
+        serde_json::to_vec(&request)
+            .map_err(|error| detection_infer_failed(format!("encode worker request: {error}")))?,
+    )
+    .map_err(|error| detection_infer_failed(format!("write worker request: {error}")))?;
+    let args = vec![
+        "--mode".to_owned(),
+        "detection-worker".to_owned(),
+        "--detection-worker-request".to_owned(),
+        request_path.to_string_lossy().into_owned(),
+        "--detection-worker-response".to_owned(),
+        response_path.to_string_lossy().into_owned(),
+    ];
+    let verdict =
+        crate::desktop_worker::run_owned_current_exe_worker(&args, DETECTION_WORKER_TIMEOUT_MS)
+            .map_err(|error| {
+                detection_infer_failed(format!("owned detector process failed: {error}"))
+            })?;
+    if verdict.timed_out {
+        return Err(detection_infer_failed(format!(
+            "isolated detector pid {} timed out after {DETECTION_WORKER_TIMEOUT_MS} ms and was terminated with kernel exit_code={}",
+            verdict.pid, verdict.exit_code
+        )));
+    }
+    let response_bytes = fs::read(&response_path).map_err(|error| {
+        detection_infer_failed(format!(
+            "isolated detector pid {} exited {} without readable response: {error}",
+            verdict.pid, verdict.exit_code
+        ))
+    })?;
+    let response: DetectionWorkerEnvelope =
+        serde_json::from_slice(&response_bytes).map_err(|error| {
+            detection_infer_failed(format!(
+                "isolated detector pid {} returned invalid response JSON: {error}",
+                verdict.pid
+            ))
+        })?;
+    if verdict.exit_code != 0 || !response.ok {
+        return Err(detection_model_not_loaded(format!(
+            "isolated detector pid {} failed exit_code={} code={} detail={}",
+            verdict.pid,
+            verdict.exit_code,
+            response.error_code.as_deref().unwrap_or("<missing>"),
+            response.error_detail.as_deref().unwrap_or("<missing>")
+        )));
+    }
+    response.batch.ok_or_else(|| {
+        detection_infer_failed(format!(
+            "isolated detector pid {} returned ok without a detection batch",
+            verdict.pid
+        ))
+    })
 }
 
 pub fn default_detection_config() -> DetectionRuntimeConfig {
@@ -227,10 +370,20 @@ pub fn populate_detection_from_state(
         confidence_threshold: threshold_percent(config.confidence_threshold),
         max_detections: usize::try_from(config.max_detections).unwrap_or(usize::MAX),
     };
-    let batch = match runtime
-        .load_model(config.model_id.as_deref())
-        .and_then(|model| model.infer(frame, opts))
-    {
+    #[cfg(windows)]
+    let inference = infer_in_owned_worker(
+        config
+            .model_id
+            .as_deref()
+            .unwrap_or(DEFAULT_DETECTION_MODEL_ID),
+        frame,
+        opts,
+    );
+    #[cfg(not(windows))]
+    let inference = Err(synapse_models::detection_model_not_loaded(
+        "isolated DirectML detection worker is only available on Windows",
+    ));
+    let batch = match inference {
         Ok(batch) => batch,
         Err(error) => {
             tracing::error!(
