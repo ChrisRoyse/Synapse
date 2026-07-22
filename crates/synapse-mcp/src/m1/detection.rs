@@ -114,6 +114,24 @@ pub(crate) fn run_detection_worker_from_cli(
     })
 }
 
+pub(crate) fn run_detection_worker_from_process_args() -> Option<anyhow::Result<ExitCode>> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mode = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--mode").then(|| pair[1].to_string_lossy().into_owned()));
+    if mode.as_deref() != Some("detection-worker") {
+        return None;
+    }
+    let value_after = |flag: &str| {
+        args.windows(2)
+            .find_map(|pair| (pair[0] == flag).then(|| PathBuf::from(&pair[1])))
+    };
+    Some(run_detection_worker_from_cli(
+        value_after("--detection-worker-request"),
+        value_after("--detection-worker-response"),
+    ))
+}
+
 fn run_detection_worker(
     request_path: &std::path::Path,
 ) -> Result<DetectionWorkerEnvelope, (String, String)> {

@@ -340,6 +340,15 @@ fn parse_env_list(name: &str) -> Vec<String> {
 }
 
 fn main() -> ExitCode {
+    if let Some(result) = m1::run_detection_worker_from_process_args() {
+        return match result {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("synapse-mcp detection worker error: {error:#}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

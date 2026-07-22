@@ -1,5 +1,5 @@
 mod detection;
-pub(crate) use detection::run_detection_worker_from_cli;
+pub(crate) use detection::{run_detection_worker_from_cli, run_detection_worker_from_process_args};
 mod ocr;
 mod search;
 mod sources;
