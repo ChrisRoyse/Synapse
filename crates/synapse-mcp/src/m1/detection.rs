@@ -182,6 +182,8 @@ fn run_detection_worker(
         .find(|row| row.pid == std::process::id())
         .map(|row| row.reservation_id.clone());
     write_worker_progress(&request.progress_path, "gpu_reservation_acquired")?;
+    configure_cuda_runtime_dlls()?;
+    write_worker_progress(&request.progress_path, "cuda_runtime_verified")?;
     let loader = ModelLoader::new(vec![ModelBackend::Cuda]);
     let model = loader
         .load(descriptor)
@@ -208,6 +210,87 @@ fn run_detection_worker(
         error_code: None,
         error_detail: None,
     })
+}
+
+#[cfg(windows)]
+fn configure_cuda_runtime_dlls() -> Result<(), (String, String)> {
+    use windows::{Win32::System::LibraryLoader::LoadLibraryW, core::PCWSTR};
+
+    const REQUIRED: &[&str] = &[
+        "cudart64_12.dll",
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+        "cufft64_11.dll",
+        "cudnn64_9.dll",
+    ];
+    let mut bins = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let python_root = PathBuf::from(appdata).join("Python");
+        if let Ok(versions) = fs::read_dir(python_root) {
+            for version in versions.flatten() {
+                let nvidia = version.path().join("site-packages").join("nvidia");
+                if let Ok(packages) = fs::read_dir(nvidia) {
+                    for package in packages.flatten() {
+                        let bin = package.path().join("bin");
+                        if bin.is_dir() {
+                            bins.push(bin);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(cuda_path) = std::env::var_os("CUDA_PATH_V12_9") {
+        let bin = PathBuf::from(cuda_path).join("bin");
+        if bin.is_dir() {
+            bins.push(bin);
+        }
+    }
+    bins.sort();
+    bins.dedup();
+    let missing = REQUIRED
+        .iter()
+        .filter(|name| !bins.iter().any(|bin| bin.join(name).is_file()))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err((
+            "DETECTION_CUDA_RUNTIME_MISSING".to_owned(),
+            format!(
+                "ONNX Runtime CUDA requires CUDA 12.x + cuDNN 9; missing DLLs [{}] across discovered runtime bins [{}]",
+                missing.join(", "),
+                bins.iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = bins.clone();
+    paths.extend(std::env::split_paths(&inherited));
+    let joined = std::env::join_paths(paths).map_err(|error| {
+        (
+            "DETECTION_CUDA_RUNTIME_PATH_INVALID".to_owned(),
+            error.to_string(),
+        )
+    })?;
+    // The detection worker is a dedicated single-threaded process at this
+    // point, before ORT creates any threads or reads PATH.
+    unsafe { std::env::set_var("PATH", joined) };
+    for name in REQUIRED {
+        let wide = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }.map_err(|error| {
+            (
+                "DETECTION_CUDA_RUNTIME_LOAD_FAILED".to_owned(),
+                format!("LoadLibraryW({name}) failed after verified discovery: {error}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn write_worker_progress(path: &std::path::Path, stage: &str) -> Result<(), (String, String)> {
