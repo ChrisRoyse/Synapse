@@ -24,8 +24,22 @@ pub(super) fn facade_policy_error(
     source_id: &str,
     profile: ToolProfileKind,
     source_of_truth: &'static str,
+    required_capability: &'static str,
+    valid_target_profiles: &[&'static str],
+    unmet_prerequisites: &[&'static str],
     remediation: &'static str,
 ) -> ErrorData {
+    tracing::warn!(
+        code = error_codes::TOOL_PROFILE_POLICY_DENIED,
+        tool,
+        operation,
+        source_id,
+        current_profile = profile.as_str(),
+        required_capability,
+        valid_target_profiles = ?valid_target_profiles,
+        unmet_prerequisites = ?unmet_prerequisites,
+        "facade operation denied by tool-profile capability policy"
+    );
     ErrorData::new(
         ErrorCode(-32099),
         format!(
@@ -38,6 +52,10 @@ pub(super) fn facade_policy_error(
             "operation": operation,
             "source_id": source_id,
             "profile": profile.as_str(),
+            "current_profile": profile.as_str(),
+            "required_capability": required_capability,
+            "valid_target_profiles": valid_target_profiles,
+            "unmet_prerequisites": unmet_prerequisites,
             "source_of_truth": source_of_truth,
             "remediation": remediation,
         })),

@@ -2310,6 +2310,8 @@ pub(crate) enum ToolProfileKind {
 }
 
 impl ToolProfileKind {
+    pub(crate) const MAINTENANCE_AUTHORIZED: [Self; 2] = [Self::BreakGlass, Self::FullCapability];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NormalAgent => "normal_agent",
@@ -2327,6 +2329,21 @@ impl ToolProfileKind {
     /// proof (#999/#1219).
     pub(crate) const fn allows_foreground_tier(self) -> bool {
         matches!(self, Self::BreakGlass | Self::FullCapability)
+    }
+
+    pub(crate) const fn allows_maintenance_mutation(self) -> bool {
+        matches!(self, Self::BreakGlass | Self::FullCapability)
+    }
+
+    const fn explicit_activation_requires_confirmation(self) -> bool {
+        matches!(
+            self,
+            Self::BrowserDebugger | Self::BreakGlass | Self::FullCapability
+        )
+    }
+
+    const fn explicit_activation_requires_foreground_lease(self) -> bool {
+        self.allows_maintenance_mutation()
     }
 
     fn label(self) -> &'static str {
@@ -3831,12 +3848,7 @@ fn validate_profile_set_policy(
     confirm_break_glass: bool,
     lease_proof: &ToolProfileLeaseProof,
 ) -> Result<(), ErrorData> {
-    if !matches!(
-        profile,
-        ToolProfileKind::BrowserDebugger
-            | ToolProfileKind::BreakGlass
-            | ToolProfileKind::FullCapability
-    ) {
+    if !profile.explicit_activation_requires_confirmation() {
         return Ok(());
     }
     let profile_label = profile.as_str();
@@ -3852,7 +3864,7 @@ fn validate_profile_set_policy(
             format!("explicit profile={profile_label} requires a non-empty reason"),
         ));
     }
-    if profile == ToolProfileKind::BrowserDebugger {
+    if !profile.explicit_activation_requires_foreground_lease() {
         return Ok(());
     }
     // The break_glass and full_capability policy profiles, when requested
