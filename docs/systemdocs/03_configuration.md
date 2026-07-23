@@ -229,7 +229,6 @@ The CUDA Source of Truth is `%ProgramData%\Calyx\gpu-reservations\device-0\reser
 | `SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY` | `safety.rs` | bool (1/true/yes/on) | off | Run without the kill-switch hotkey. |
 | `SYNAPSE_MCP_REQUIRE_OPERATOR_HOTKEY` | `safety.rs` | bool | off | Hard startup failure if hotkey cannot arm. |
 | `SYNAPSE_APPROVAL_GATE_TIMEOUT_MS` | `server/permission_gate.rs` | u64 (ms, `>=1000`) | `1500000` (25 min) | Approval-gate blocking timeout. |
-| `SYNAPSE_ENFORCE_SUPPORTED_USE` | `server/target_policy.rs` | bool (1/true/yes/y/on) | off | Restore legacy supported-use (game-profile) gating. |
 | `SYNAPSE_ALLOW_SHELL_ANY` | `m4.rs` | bool (falsey to restrict) | **on** (permissive) | Allow any shell command unless explicitly disabled. |
 | `SYNAPSE_ALLOW_LAUNCH_ANY` | `m4.rs` | bool (falsey to restrict) | **on** (permissive) | Allow any launch target unless explicitly disabled. |
 | `SYNAPSE_AGENT_SPAWN_SHELL` | `server/m4_tools.rs` (`AGENT_SPAWN_SHELL_ENV_VAR`) | string | none | Override shell used for spawned agents. |

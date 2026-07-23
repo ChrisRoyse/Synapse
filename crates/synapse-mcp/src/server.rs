@@ -276,7 +276,6 @@ pub(crate) mod session_registry;
 mod session_tools;
 pub(crate) mod suggestions;
 pub(crate) mod target_claims;
-mod target_policy;
 pub(crate) mod terminal_capture;
 pub(crate) mod timeline_digest;
 mod timeline_facades;

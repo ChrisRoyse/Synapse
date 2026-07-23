@@ -5,8 +5,8 @@ use synapse_core::Rect;
 
 use crate::{PerceptionError, PerceptionResult};
 
-pub const MINECRAFT_STATUS_SLOTS: u32 = 10;
-pub const MINECRAFT_STATUS_MAX_VALUE: u32 = 20;
+pub const DEFAULT_TEMPLATE_COUNTER_SLOTS: u32 = 10;
+pub const DEFAULT_TEMPLATE_COUNTER_MAX_VALUE: u32 = 20;
 pub const DEFAULT_MIN_TEMPLATE_CONFIDENCE: f64 = 0.85;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,9 +69,9 @@ pub struct TemplateCounterConfig {
 impl Default for TemplateCounterConfig {
     fn default() -> Self {
         Self {
-            slots: MINECRAFT_STATUS_SLOTS,
+            slots: DEFAULT_TEMPLATE_COUNTER_SLOTS,
             min_confidence: DEFAULT_MIN_TEMPLATE_CONFIDENCE,
-            max_value: MINECRAFT_STATUS_MAX_VALUE,
+            max_value: DEFAULT_TEMPLATE_COUNTER_MAX_VALUE,
         }
     }
 }

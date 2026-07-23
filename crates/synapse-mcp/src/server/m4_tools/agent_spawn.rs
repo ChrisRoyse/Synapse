@@ -1253,7 +1253,7 @@ pub(super) fn prepare_agent_spawn_files(
 
 /// Derives the push-telemetry ingress endpoint from the MCP URL the spawned
 /// agent is wired to. The daemon serves both from one origin, so anything
-/// other than a `/mcp`-suffixed URL is a caller error, not a guessing game.
+/// other than a `/mcp`-suffixed URL is a caller error, not an inferred route.
 pub(super) fn agent_event_ingress_url(
     spawn_id: &str,
     mcp_url: &str,

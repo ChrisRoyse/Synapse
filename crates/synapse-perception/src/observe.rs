@@ -419,20 +419,16 @@ pub fn assemble_from_input(input: ObservationInput) -> PerceptionResult<Observat
 }
 
 #[must_use]
-pub fn auto_mode(foreground: &ForegroundContext) -> PerceptionMode {
-    if is_known_game_process(&foreground.process_name) {
-        PerceptionMode::Hybrid
-    } else {
-        PerceptionMode::A11yOnly
-    }
+pub const fn auto_mode(_foreground: &ForegroundContext) -> PerceptionMode {
+    PerceptionMode::A11yOnly
 }
 
 #[must_use]
-pub fn auto_mode_with_a11y(
-    foreground: &ForegroundContext,
+pub const fn auto_mode_with_a11y(
+    _foreground: &ForegroundContext,
     summary: &A11yTreeSummary,
 ) -> PerceptionMode {
-    if is_known_game_process(&foreground.process_name) || summary.is_sparse() {
+    if summary.is_sparse() {
         PerceptionMode::Hybrid
     } else {
         PerceptionMode::A11yOnly
@@ -462,20 +458,6 @@ pub fn bounded_sensor_latency(input: BTreeMap<String, f32>) -> BTreeMap<String, 
         .into_iter()
         .filter(|(key, value)| SENSOR_KEYS.contains(&key.as_str()) && value.is_finite())
         .collect()
-}
-
-#[must_use]
-pub fn is_known_game_process(process_name: &str) -> bool {
-    matches!(
-        process_name.to_ascii_lowercase().as_str(),
-        "eldenring.exe"
-            | "fortniteclient-win64-shipping.exe"
-            | "game.exe"
-            | "minecraft.exe"
-            | "overwatch.exe"
-            | "starfield.exe"
-            | "valorant.exe"
-    )
 }
 
 fn filter_elements(

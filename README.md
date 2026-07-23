@@ -5,7 +5,7 @@
 <h1 align="center">Synapse</h1>
 
 <p align="center">
-  <strong>Turn opportunity into a numbers game.</strong><br>
+  <strong>Turn opportunity into grounded action.</strong><br>
   Give any AI model a real body on your Windows PC — so it can find, chase, and win
   opportunities around the clock while you keep your mouse.
 </p>
@@ -801,7 +801,7 @@ and the time to keep shipping. Thank you! 🙏
 ---
 
 <p align="center">
-  <em>Your AI has a brain. Now give it a body — and turn opportunity into a numbers game.</em><br>
+  <em>Your AI has a brain. Now give it a body — and turn opportunity into grounded action.</em><br>
   <strong>⭐ Star the repo if Synapse is useful to you.</strong>
 </p>
 

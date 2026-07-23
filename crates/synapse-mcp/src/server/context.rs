@@ -287,8 +287,6 @@ impl SynapseService {
         }
         ensure_profile_scope_allows_action(&runtime, tool, self.allow_unknown_profile()?)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
-        super::target_policy::ensure_supported_use_allows(&runtime, &foreground, tool)
-            .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         if enforce_operator_panic_admission {
             crate::m2::ensure_operator_panic_action_admission(
                 tool,
@@ -1235,13 +1233,6 @@ impl ReflexActionGate for ReflexScopeActionGate {
                 TOOL,
                 self.allow_unknown_profile,
             )
-            .and_then(|()| {
-                super::target_policy::ensure_supported_use_allows(
-                    &self.profile_runtime,
-                    &foreground,
-                    TOOL,
-                )
-            })
         })()
         .map_err(|error| reflex_denial_from_error(&error))
     }

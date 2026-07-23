@@ -1805,7 +1805,7 @@ fn log_source_ref(observation: &Observation) -> Result<Option<SourceRef>, ErrorD
                 "start_offset": start_offset,
                 "next_offset": next_offset,
             }))?),
-            summary: format!("game log cursor next_offset={next_offset:?}"),
+            summary: format!("application log cursor next_offset={next_offset:?}"),
         }));
     }
     Ok(None)

@@ -191,15 +191,7 @@ $script:SynapseSetupPartialReadback = $null
 $script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
 $script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
 $script:SynapseBundledProfilesRollbackDirName = '.synapse-profile-reconcile-backups'
-$script:SynapseLegacyRetiredBundledProfiles = @(
-    [pscustomobject]@{
-        relative_path = 'everquest.live.toml'
-        sha256 = 'B921FB8298F5939AD40902360B4E478205827DE5113CD6F2D8ADD1DDA23254BD'
-        retired_by = '95f8e986051468bdd62ed82a6713b1a1167b2d94'
-        issue = '#1544/#1641'
-        reason = 'legacy bundled profile removed before setup had an ownership manifest'
-    }
-)
+$script:SynapseLegacyRetiredBundledProfiles = @()
 function Write-SynapsePostExitManifestState {
     param(
         [Parameter(Mandatory=$true)][string]$State,

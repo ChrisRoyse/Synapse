@@ -64,12 +64,11 @@ The pipeline is driven by `ObservationAssembler::assemble(include, input)`. Step
 | `ObservationAssembler::assemble(&self, include: ObserveInclude, input: ObservationInput) -> PerceptionResult<Observation>` | core fusion |
 | `assemble(include: ObserveInclude, input: ObservationInput) -> PerceptionResult<Observation>` | fresh seq counter per call |
 | `assemble_from_input(input: ObservationInput) -> PerceptionResult<Observation>` | uses `ObserveInclude::default()` |
-| `auto_mode(foreground: &ForegroundContext) -> PerceptionMode` | `Hybrid` for known game process, else `A11yOnly` |
-| `auto_mode_with_a11y(foreground: &ForegroundContext, summary: &A11yTreeSummary) -> PerceptionMode` | `Hybrid` if known game OR `summary.is_sparse()`, else `A11yOnly` |
+| `auto_mode(foreground: &ForegroundContext) -> PerceptionMode` | `A11yOnly` |
+| `auto_mode_with_a11y(foreground: &ForegroundContext, summary: &A11yTreeSummary) -> PerceptionMode` | `Hybrid` if `summary.is_sparse()`, else `A11yOnly` |
 | `parse_perception_mode(value: &str) -> PerceptionResult<PerceptionMode>` | see table below |
 | `bounded_sensor_latency(input: BTreeMap<String, f32>) -> BTreeMap<String, f32>` | keeps only finite values for keys in `SENSOR_KEYS` |
 | `is_interactable_node(node: &AccessibleNode) -> bool` | role/pattern based interactability test |
-| `is_known_game_process(process_name: &str) -> bool` | hardcoded process allowlist |
 | `A11yTreeSummary::from_nodes(nodes: &[AccessibleNode]) -> Self` | |
 | `A11yTreeSummary::is_sparse(&self) -> bool` | `node_count < 2 || max_depth < 1` |
 | `ObservationInput::new(foreground: ForegroundContext) -> Self` | all sensors default unavailable/disabled |
@@ -96,8 +95,6 @@ The pipeline is driven by `ObservationAssembler::assemble(include, input)`. Step
 | `hybrid` | `PerceptionMode::Hybrid` |
 | `auto` | `PerceptionMode::Auto` |
 | other | `Err(PerceptionModeInvalid { value })` |
-
-`is_known_game_process` allowlist (lowercased match): `eldenring.exe`, `fortniteclient-win64-shipping.exe`, `game.exe`, `minecraft.exe`, `overwatch.exe`, `starfield.exe`, `valorant.exe`.
 
 ### 2.4 `is_interactable_node` logic
 
@@ -273,8 +270,8 @@ Slot reading `x` is `slot_x + best.x` (screen/region-relative within the cropped
 
 | Constant / default | Value |
 |---|---|
-| `MINECRAFT_STATUS_SLOTS` | `10` |
-| `MINECRAFT_STATUS_MAX_VALUE` | `20` |
+| `DEFAULT_TEMPLATE_COUNTER_SLOTS` | `10` |
+| `DEFAULT_TEMPLATE_COUNTER_MAX_VALUE` | `20` |
 | `DEFAULT_MIN_TEMPLATE_CONFIDENCE` | `0.85` |
 | `TemplateCounterConfig::default()` | `{ slots: 10, min_confidence: 0.85, max_value: 20 }` |
 

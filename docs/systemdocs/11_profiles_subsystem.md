@@ -21,7 +21,7 @@ See [03_configuration.md](03_configuration.md) for how the profiles directory an
 
 ## 1. Overview
 
-A **profile** is a TOML document describing how Synapse perceives and acts on one foreground application or game. Each profile declares:
+A **profile** is a TOML document describing how Synapse perceives and acts on one foreground application. Each profile declares:
 
 - which windows it applies to (`[[matches]]`),
 - a `use_scope` (the safety/governance scope of automation),
@@ -194,7 +194,7 @@ Each `EventExtension` (deserialized by `synapse_core`):
 - `from_filter` must pass `EventExtension::from_filter.validate()`.
 - `from_filter` must not be trivially always true (`is_trivially_always_true()` → reject).
 
-See the Luanti profile (`crates/synapse-profiles/profiles/luanti.minetest.toml` lines 113–177) for filter syntax (`op`, `args`, `source`, `kind`, `data`/`path`/`predicate`).
+Filter syntax is defined by the generic `EventExtension` contract (`op`, `args`, `source`, `kind`, `data`, `path`, and `predicate`).
 
 ### 2.12 `ScreenBounds` (parser.rs 39–52)
 
@@ -477,7 +477,7 @@ pad_default = "auto"
 "registry.compatibility_target" = "vscode.windows"
 ```
 
-A game profile adds `[detection]`, `[ocr]`, `[[hud]]`, and `[[event_extensions]]` — see `crates/synapse-profiles/profiles/luanti.minetest.toml` for a full example (pixel mode, HUD contrast fields with `fraction_of_window` regions and `color_ratio` extractors, and process/perception/action event extensions).
+A rich application profile may add `[detection]`, `[ocr]`, `[[hud]]`, and `[[event_extensions]]`.
 
 ### 7.1 Package manifest example
 
@@ -486,16 +486,16 @@ A profile package manifest (`crates/synapse-profiles/tests/fixtures/profile_regi
 ```toml
 schema_version = 1
 kind = "profile_package"
-package_id = "profile.luanti.minetest"
+package_id = "profile.sample.desktop"
 package_version = "0.1.0"
-profile_id = "luanti.minetest"
+profile_id = "sample.desktop"
 profile_version = "1.0.0"
 created_at = "2026-05-27T09:30:00Z"
 
 [author]
 name = "Synapse Agent"
 contact = "synthetic@example.invalid"
-attribution = "Synthetic Luanti benchmark package fixture for Synapse issue #456."
+attribution = "Synthetic desktop application package example."
 
 [source]
 kind = "bundled"
@@ -505,17 +505,17 @@ built_by = "codex"
 generated_by = "synapse-profile-package-manifest-v1"
 
 [[targets]]
-target_id = "luanti.minetest"
-target_kind = "game"
-app_id = "luanti"
-process_name = "luanti.exe"
-title_regex = "^Luanti 5\\.16\\.[0-9]+ \\[(Singleplayer|Multiplayer)\\].*"
+target_id = "sample.desktop"
+target_kind = "application"
+app_id = "sample"
+process_name = "sample.exe"
+title_regex = "^Sample Desktop.*"
 app_version = "5.16.1"
 
 [assumptions]
 os = "windows"
 synapse_schema_version = 1
-benchmark_ids = ["luanti.minetest"]
+benchmark_ids = ["sample.desktop"]
 
 [assumptions.display]
 min_width = 1280
@@ -527,7 +527,7 @@ dpi_scale_max = 2.0
 backends = ["software", "vigem"]
 
 [[input.models]]
-id = "minecraft_like_local_world_v0"
+id = "sample_visual_detector_v0"
 version = "0.1.0"
 digest = "sha256:bbbb...bbbb"   # 64 hex chars
 
@@ -547,13 +547,13 @@ share_audit_allowed = false
 [[changelog]]
 version = "0.1.0"
 at = "2026-05-27T09:30:00Z"
-summary = "Initial synthetic Luanti package manifest."
+summary = "Initial synthetic desktop application package manifest."
 
 [hashes]
 profile_toml_sha256 = "sha256:7fde...98b3"  # 64 hex chars
 package_sha256 = "sha256:dddd...dddd"
 
 [files]
-profile_toml = "crates/synapse-profiles/profiles/luanti.minetest.toml"
+profile_toml = "crates/synapse-profiles/profiles/sample.desktop.toml"
 assets = ["..."]
 ```

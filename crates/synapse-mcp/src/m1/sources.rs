@@ -13,8 +13,8 @@ use sha2::{Digest as _, Sha256};
 use synapse_action::{ClipboardFormat, read_clipboard_text};
 use synapse_core::{
     AccessibleNode, AudioContext, ClipboardSummary, DetectedEntity, FocusedElement,
-    ForegroundContext, FsEvent, FsEventKind, HudReading, HudReadings, HudValue, PerceptionMode,
-    Rect, SensorStatus, UiaPattern, element_id, entity_id,
+    ForegroundContext, FsEvent, FsEventKind, HudReadings, PerceptionMode, Rect, SensorStatus,
+    UiaPattern, element_id, entity_id,
 };
 use synapse_perception::ObservationInput;
 
@@ -1391,9 +1391,6 @@ fn populate_window_capture_baseline(input: &mut ObservationInput) {
                 "capture".to_owned(),
                 started.elapsed().as_secs_f32() * 1000.0,
             );
-            if is_luanti_foreground(&input.foreground) {
-                populate_luanti_visible_baseline(input);
-            }
         }
         Err(error) => {
             tracing::debug!(
@@ -1409,88 +1406,6 @@ fn populate_window_capture_baseline(input: &mut ObservationInput) {
 }
 
 #[cfg(windows)]
-fn populate_luanti_visible_baseline(input: &mut ObservationInput) {
-    let Some(crosshair_region) = centered_region(input.foreground.window_bounds, 48, 48) else {
-        return;
-    };
-    if let Some(reading) = contrast_reading("luanti.crosshair_contrast", crosshair_region) {
-        let confidence = reading.confidence;
-        input
-            .hud
-            .by_name
-            .insert("luanti.crosshair_contrast".to_owned(), reading);
-        input.entities.push(DetectedEntity {
-            entity_id: entity_id(10_001),
-            track_id: 10_001,
-            class_label: "luanti_crosshair_region".to_owned(),
-            bbox: crosshair_region,
-            confidence,
-            first_seen_at: Utc::now(),
-            last_seen_at: Utc::now(),
-            velocity_px_per_s: None,
-        });
-    }
-
-    let Some(hotbar_region) = hotbar_region(input.foreground.window_bounds) else {
-        return;
-    };
-    if let Some(reading) = contrast_reading("luanti.hotbar_contrast", hotbar_region) {
-        let confidence = reading.confidence;
-        input
-            .hud
-            .by_name
-            .insert("luanti.hotbar_contrast".to_owned(), reading);
-        input.entities.push(DetectedEntity {
-            entity_id: entity_id(10_002),
-            track_id: 10_002,
-            class_label: "luanti_hotbar_region".to_owned(),
-            bbox: hotbar_region,
-            confidence,
-            first_seen_at: Utc::now(),
-            last_seen_at: Utc::now(),
-            velocity_px_per_s: None,
-        });
-    }
-}
-
-#[cfg(windows)]
-fn contrast_reading(name: &str, region: Rect) -> Option<HudReading> {
-    let captured = synapse_capture::screen_region_to_bgra_bitmap(region).ok()?;
-    let score = bgra_contrast_score(&captured.bytes);
-    Some(HudReading {
-        raw_text: format!(
-            "{name} contrast={score:.3} region={}x{}@{},{}",
-            captured.width, captured.height, captured.region.x, captured.region.y
-        ),
-        parsed: HudValue::Number(f64::from(score)),
-        confidence: score.clamp(0.0, 1.0),
-        stale_ms: 0,
-    })
-}
-
-#[cfg(windows)]
-fn bgra_contrast_score(bytes: &[u8]) -> f32 {
-    let mut count = 0.0_f32;
-    let mut sum = 0.0_f32;
-    let mut sum_sq = 0.0_f32;
-    for pixel in bytes.chunks_exact(4) {
-        let b = f32::from(pixel[0]);
-        let g = f32::from(pixel[1]);
-        let r = f32::from(pixel[2]);
-        let luma = 0.0722_f32.mul_add(b, 0.7152_f32.mul_add(g, 0.2126_f32 * r));
-        count += 1.0;
-        sum += luma;
-        sum_sq = luma.mul_add(luma, sum_sq);
-    }
-    if count <= 0.0 {
-        return 0.0;
-    }
-    let mean = sum / count;
-    let variance = mean.mul_add(-mean, sum_sq / count).max(0.0);
-    (variance.sqrt() / 128.0).clamp(0.0, 1.0)
-}
-
-#[cfg(windows)]
 fn one_pixel_region(bounds: Rect) -> Option<Rect> {
     (bounds.w > 0 && bounds.h > 0).then_some(Rect {
         x: bounds.x,
@@ -1498,48 +1413,6 @@ fn one_pixel_region(bounds: Rect) -> Option<Rect> {
         w: 1,
         h: 1,
     })
-}
-
-#[cfg(windows)]
-const fn centered_region(bounds: Rect, w: i32, h: i32) -> Option<Rect> {
-    if bounds.w < w || bounds.h < h || w <= 0 || h <= 0 {
-        return None;
-    }
-    Some(Rect {
-        x: bounds.x + ((bounds.w - w) / 2),
-        y: bounds.y + ((bounds.h - h) / 2),
-        w,
-        h,
-    })
-}
-
-#[cfg(windows)]
-fn hotbar_region(bounds: Rect) -> Option<Rect> {
-    if bounds.w <= 0 || bounds.h <= 0 {
-        return None;
-    }
-    let w = (bounds.w / 3).clamp(180, 520).min(bounds.w);
-    let h = (bounds.h / 12).clamp(48, 96).min(bounds.h);
-    centered_bottom_region(bounds, w, h, 28)
-}
-
-#[cfg(windows)]
-fn centered_bottom_region(bounds: Rect, w: i32, h: i32, y_offset: i32) -> Option<Rect> {
-    if bounds.w < w || bounds.h < h || w <= 0 || h <= 0 {
-        return None;
-    }
-    Some(Rect {
-        x: bounds.x + ((bounds.w - w) / 2),
-        y: bounds.y + bounds.h - h - y_offset.clamp(0, bounds.h - h),
-        w,
-        h,
-    })
-}
-
-#[cfg(windows)]
-fn is_luanti_foreground(foreground: &ForegroundContext) -> bool {
-    foreground.process_name.eq_ignore_ascii_case("luanti.exe")
-        && foreground.window_title.starts_with("Luanti ")
 }
 
 #[cfg(windows)]
