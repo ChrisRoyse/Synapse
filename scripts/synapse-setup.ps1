@@ -8186,37 +8186,91 @@ function Stop-SynapseMcpProcesses {
         $verified = Assert-SynapseProcessStopTarget -SnapshotProcess $proc -Bind $Bind -DbPath $DbPath
         if (-not $verified) { continue }
         $pidValue = [int]$verified.ProcessId
+        # Capture the exact verified daemon identity BEFORE the stop attempt so a
+        # readback can distinguish a natural exit / terminating-image ghost / PID
+        # reuse from a still-live verified daemon.  CreationDate (the OS process
+        # start time) is the canonical PID-reuse discriminator: a reused PID is
+        # always created strictly later than the process we verified.
+        $verifiedCreationDate = $verified.CreationDate
+        $verifiedExecutablePath = [string]$verified.ExecutablePath
+        $verifiedExecutablePathNorm = Normalize-SynapseSetupPathForCompare -Path $verifiedExecutablePath
+        $verifiedCreationText = if ($verifiedCreationDate) { $verifiedCreationDate.ToString('o') } else { '<unknown>' }
         try {
             Stop-Process -Id $pidValue -Force -ErrorAction Stop
             Info "Synapse process exact-PID force stop issued pid=$pidValue reason=$Reason match_rules=$($verified.DeployTargetRules) path=$($verified.ExecutablePath) cmd=$($verified.CommandLine)"
         } catch {
             # The verified process can exit between the CIM ownership snapshot and
-            # Stop-Process.  Treat that narrow race as success only after a fresh
-            # process-table read proves the PID is now absent.  A reused or still
-            # live PID remains a hard failure and is never stopped from stale data.
+            # Stop-Process (e.g. Stop-Process returns "Cannot find a process with
+            # the process identifier N").  Resolve that race by re-reading the exact
+            # PID identity: accept success ONLY when the exact verified identity is
+            # confirmed absent (PID fully gone, or the PID is now held by a
+            # different process = reuse, which proves the original exited).  A live
+            # or terminating-image process that still matches the verified identity
+            # remains a hard stop failure and a reused live PID is never stopped
+            # from stale data.
+            $stopError = ($_.Exception.Message -replace '\s+', ' ').Trim()
             $afterStopError = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+            # Bounded reread window (race resolution, not a stop retry): give a
+            # terminating image time to clear from Win32_Process before deciding.
             $cimDeadline = (Get-Date).AddSeconds(2)
             do {
                 $afterStopErrorCim = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
                 if (-not $afterStopErrorCim) { break }
                 Start-Sleep -Milliseconds 100
             } while ((Get-Date) -lt $cimDeadline)
-            if (-not $afterStopError -and -not $afterStopErrorCim) {
-                Info "Synapse process exact-PID stop already satisfied pid=$pidValue reason=$Reason stop_error=$($_.Exception.Message) readback=Get-Process:absent,Win32_Process:absent"
+            $getProcessPresence = if ($afterStopError) { 'present' } else { 'absent' }
+
+            if (-not $afterStopErrorCim) {
+                if (-not $afterStopError) {
+                    # Exact verified PID is fully gone from both process tables.
+                    Info ("Synapse process exact-PID stop already satisfied pid={0} reason={1} stop_error={2} readback=Get-Process:absent,Win32_Process:absent verified_creation={3} identity=verified-target-gone" -f `
+                        $pidValue, $Reason, $stopError, $verifiedCreationText)
+                    continue
+                }
+                # Get-Process still lists the PID but Win32_Process has no row: the
+                # identity cannot be re-proven, so fail closed rather than assume exit.
+                Die ("SYNAPSE_PROCESS_STOP_FAILED pid={0} reason={1} error={2} readback=Get-Process:present,Win32_Process:absent verified_creation={3} remediation=the exact verified PID is still listed by Get-Process while Win32_Process reports no row; setup cannot re-prove the verified identity is gone, refuses to assume exit, and only stops verified synapse-mcp.exe PIDs; inspect process ownership and retry after the daemon exits" -f `
+                    $pidValue, $Reason, $stopError, $verifiedCreationText)
+            }
+
+            # A Win32_Process row exists for the PID.  Compare its identity to the
+            # exact daemon we verified before the stop attempt.
+            $observedCreationDate = $afterStopErrorCim.CreationDate
+            $observedCreationText = if ($observedCreationDate) { $observedCreationDate.ToString('o') } else { '<unknown>' }
+            $observedExecutablePath = [string]$afterStopErrorCim.ExecutablePath
+            $observedExecutablePathNorm = Normalize-SynapseSetupPathForCompare -Path $observedExecutablePath
+            $identityMatches = ($null -ne $verifiedCreationDate) -and ($null -ne $observedCreationDate) -and `
+                ($observedCreationDate -eq $verifiedCreationDate) -and `
+                ($observedExecutablePathNorm -ieq $verifiedExecutablePathNorm)
+
+            if (-not $identityMatches) {
+                # PID reuse: the PID now (or still) belongs to a different process
+                # image / start time, which proves the exact verified daemon exited.
+                # The reused PID may be a live unrelated process and must NEVER be
+                # stopped from stale data, nor counted as our daemon still running.
+                Info ("Synapse process exact-PID stop already satisfied pid={0} reason={1} stop_error={2} readback=Get-Process:{3},Win32_Process:present identity=pid-reused verified_creation={4} observed_creation={5} verified_path={6} observed_path={7} observed_name={8} => exact verified daemon absent; leaving reused PID untouched" -f `
+                    $pidValue, $Reason, $stopError, $getProcessPresence, $verifiedCreationText, $observedCreationText, $verifiedExecutablePath, $observedExecutablePath, $afterStopErrorCim.Name)
                 continue
             }
-            if (-not $afterStopError -and $afterStopErrorCim) {
-                Die ("SYNAPSE_PROCESS_TERMINATING_IMAGE_STILL_MAPPED pid={0} reason={1} path={2} command={3} stop_error={4} remediation=the exact verified daemon is absent from Get-Process but remains in Win32_Process/tasklist and may keep its executable image mapped; inspect the named PID and image lock, do not report it as stopped, and use a content-addressed executable handoff or restart Windows only in a coordinated maintenance window" -f `
+
+            # The Win32_Process row matches the exact verified identity.
+            if (-not $afterStopError) {
+                Die ("SYNAPSE_PROCESS_TERMINATING_IMAGE_STILL_MAPPED pid={0} reason={1} path={2} command={3} stop_error={4} readback=Get-Process:absent,Win32_Process:present identity=verified-target-terminating verified_creation={5} observed_creation={6} remediation=the exact verified daemon is absent from Get-Process but remains in Win32_Process/tasklist with a matching start time and image path and may keep its executable image mapped; inspect the named PID and image lock, do not report it as stopped, and use a content-addressed executable handoff or restart Windows only in a coordinated maintenance window" -f `
                     $pidValue,
                     $Reason,
-                    $afterStopErrorCim.ExecutablePath,
+                    $observedExecutablePath,
                     $afterStopErrorCim.CommandLine,
-                    $_.Exception.Message)
+                    $stopError,
+                    $verifiedCreationText,
+                    $observedCreationText)
             }
-            Die ("SYNAPSE_PROCESS_STOP_FAILED pid={0} reason={1} error={2} remediation=setup only stops verified synapse-mcp.exe PIDs; inspect process ownership and retry after the daemon exits" -f `
+            Die ("SYNAPSE_PROCESS_STOP_FAILED pid={0} reason={1} error={2} readback=Get-Process:present,Win32_Process:present identity=verified-target-live verified_creation={3} observed_creation={4} path={5} remediation=the exact verified daemon is still live with a matching start time and image path; setup only stops verified synapse-mcp.exe PIDs; inspect process ownership and retry after the daemon exits" -f `
                 $pidValue,
                 $Reason,
-                $_.Exception.Message)
+                $stopError,
+                $verifiedCreationText,
+                $observedCreationText,
+                $observedExecutablePath)
         }
     }
 
