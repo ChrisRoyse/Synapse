@@ -864,8 +864,44 @@ impl Drop for CalyxVaultRuntime {
 impl CalyxBackend {
     pub fn open(path: &Path, schema_version: u32) -> StorageResult<Self> {
         let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
-        let vault = SynapseCalyxVault::open_latest_readback(config)
-            .map_err(|source| calyx_open_failed(path, &source))?;
+        // Coherent multi-page scans pin an MVCC sequence while writers continue
+        // advancing the vault. The writable backend must therefore restore
+        // historical rows; latest-only recovery cannot honor those leases.
+        let vault = match SynapseCalyxVault::open(config.clone()) {
+            Ok(vault) => vault,
+            Err(source) if source.source_code == Some("CALYX_ASTER_ROUTER_ONLY_ROWS") => {
+                tracing::warn!(
+                    code = "STORAGE_CALYX_ROUTER_ONLY_ROWS_ADOPTION_START",
+                    storage_path = %path.display(),
+                    detail = %source.message,
+                    "adopting legacy router-only rows into the commit domain before retrying the required full-MVCC open"
+                );
+                let adoption = SynapseCalyxVault::open_latest_readback(config.clone())
+                    .map_err(|adoption_error| calyx_open_failed(path, &adoption_error))?;
+                adoption
+                    .purge_kv_tombstones()
+                    .map_err(|adoption_error| calyx_open_failed(path, &adoption_error))?;
+                let close = adoption
+                    .close("router_only_row_adoption")
+                    .map_err(|adoption_error| calyx_open_failed(path, &adoption_error))?;
+                if !close.safe_to_unlock {
+                    return Err(StorageError::OpenFailed {
+                        path: path.to_path_buf(),
+                        detail: "CALYX_ROUTER_ONLY_ROW_ADOPTION_CLOSE_UNSAFE: adoption vault did not prove safe lock release before full-MVCC reopen".to_owned(),
+                    });
+                }
+                let reopened = SynapseCalyxVault::open(config)
+                    .map_err(|reopen_error| calyx_open_failed(path, &reopen_error))?;
+                tracing::info!(
+                    code = "STORAGE_CALYX_ROUTER_ONLY_ROWS_ADOPTION_DONE",
+                    storage_path = %path.display(),
+                    latest_seq = reopened.latest_seq(),
+                    "adopted router-only rows and proved the required full-MVCC reopen"
+                );
+                reopened
+            }
+            Err(source) => return Err(calyx_open_failed(path, &source)),
+        };
         prepare_calyx_open_fanout(&vault, path, "before_schema_and_migration")?;
         verify_calyx_schema_version(&vault, path, schema_version)?;
         ensure_calyx_ordered_key_migration(&vault, path)?;
