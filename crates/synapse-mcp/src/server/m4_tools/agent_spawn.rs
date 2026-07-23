@@ -1926,6 +1926,7 @@ pub(super) fn agent_spawn_powershell_script(
     AppServerStderrPath = {app_stderr_path}\n\
     WorkingDir = {working_dir}\n\
     McpUrl = {mcp_url}\n\
+    ReadinessTimeoutMs = {readiness_timeout_ms}\n\
     NotifyScriptPath = {notify_script_path}\n\
 }}\n\
 {model_arg}\
@@ -1939,6 +1940,7 @@ pub(super) fn agent_spawn_powershell_script(
                 app_stderr_path = ps_single_quoted_path(app_stderr_path),
                 working_dir = working_dir,
                 mcp_url = ps_single_quote(&params.mcp_url),
+                readiness_timeout_ms = params.wait_timeout_ms,
                 notify_script_path = ps_single_quoted_path(notify_script_path),
                 model_arg = model_arg,
                 approval_gate_arg = approval_gate_arg,
@@ -2577,7 +2579,22 @@ pub(super) fn read_spawned_agent_control_artifact(
     if control.protocol != "codex_app_server_ws" {
         validation_errors.push("protocol mismatch");
     }
-    if !control.endpoint.starts_with("ws://127.0.0.1:") {
+    let expected_http_origin = control
+        .endpoint
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .map(|port| format!("http://127.0.0.1:{port}"));
+    if let Some(expected_http_origin) = expected_http_origin {
+        let expected_ready_url = format!("{expected_http_origin}/readyz");
+        let expected_health_url = format!("{expected_http_origin}/healthz");
+        if control.app_server_ready_url.as_deref() != Some(expected_ready_url.as_str()) {
+            validation_errors.push("app_server_ready_url does not match endpoint");
+        }
+        if control.app_server_health_url.as_deref() != Some(expected_health_url.as_str()) {
+            validation_errors.push("app_server_health_url does not match endpoint");
+        }
+    } else {
         validation_errors.push("endpoint must be loopback ws://127.0.0.1:<port>");
     }
     if control.control_path != path.display().to_string() {
@@ -2591,6 +2608,78 @@ pub(super) fn read_spawned_agent_control_artifact(
     }
     if control.app_server_process_id == 0 {
         validation_errors.push("app_server_process_id missing");
+    }
+    if control.app_server_readiness_status.as_deref() != Some("healthy") {
+        validation_errors.push("app_server_readiness_status must be healthy");
+    }
+    if control
+        .app_server_readiness_timeout_ms
+        .is_none_or(|value| value == 0)
+    {
+        validation_errors.push("app_server_readiness_timeout_ms missing");
+    }
+    if !matches!(control.app_server_readyz_status_code, Some(200..=299)) {
+        validation_errors.push("app_server_readyz_status_code must be successful");
+    }
+    if !matches!(control.app_server_healthz_status_code, Some(200..=299)) {
+        validation_errors.push("app_server_healthz_status_code must be successful");
+    }
+    if control.app_server_readyz_elapsed_ms.is_none() {
+        validation_errors.push("app_server_readyz_elapsed_ms missing");
+    }
+    if control.app_server_readiness_elapsed_ms.is_none() {
+        validation_errors.push("app_server_readiness_elapsed_ms missing");
+    }
+    if matches!(
+        (
+            control.app_server_readyz_elapsed_ms,
+            control.app_server_readiness_elapsed_ms,
+        ),
+        (Some(readyz_elapsed), Some(readiness_elapsed)) if readyz_elapsed > readiness_elapsed
+    ) {
+        validation_errors.push("readyz elapsed time exceeds total readiness time");
+    }
+    if matches!(
+        (
+            control.app_server_readiness_elapsed_ms,
+            control.app_server_readiness_timeout_ms,
+        ),
+        (Some(elapsed), Some(timeout)) if elapsed > timeout
+    ) {
+        validation_errors.push("readiness elapsed time exceeds caller budget");
+    }
+    if control
+        .app_server_ready_attempts
+        .is_none_or(|value| value == 0)
+    {
+        validation_errors.push("app_server_ready_attempts missing");
+    }
+    if control
+        .app_server_health_attempts
+        .is_none_or(|value| value == 0)
+    {
+        validation_errors.push("app_server_health_attempts missing");
+    }
+    if control.app_server_websocket_status.as_deref() != Some("open") {
+        validation_errors.push("app_server_websocket_status must be open");
+    }
+    if control
+        .app_server_websocket_opened_at_unix_ms
+        .is_none_or(|value| value == 0)
+    {
+        validation_errors.push("app_server_websocket_opened_at_unix_ms missing");
+    }
+    if control.app_server_websocket_error.is_some() {
+        validation_errors.push("app_server_websocket_error present");
+    }
+    if control.app_server_readiness_failure_json.is_some() {
+        validation_errors.push("app_server_readiness_failure_json present");
+    }
+    if control.last_error.is_some() {
+        validation_errors.push("last_error present");
+    }
+    if control.turn_status == "runner_error" {
+        validation_errors.push("turn_status is runner_error");
     }
     if !validation_errors.is_empty() {
         return Err(json!({
@@ -2777,18 +2866,6 @@ pub(super) fn task_start_session_id_for_spawn(
         .and_then(Value::as_str)
         .filter(|session_id| !session_id.is_empty())
         .map(str::to_owned)
-}
-
-pub(super) fn spawn_session_identity_matches_from_read(
-    registry: &SessionRegistryRead,
-    agent_kind: ActSpawnAgentCli,
-    before_session_ids: &BTreeSet<String>,
-    launched_at_unix_ms: u64,
-) -> bool {
-    !before_session_ids.contains(&registry.session_id)
-        && registry.lifecycle == "live"
-        && registry.started_at_unix_ms + 2_000 >= launched_at_unix_ms
-        && registry_matches_cli(registry, agent_kind)
 }
 
 pub(super) fn registry_matches_cli(registry: &SessionRegistryRead, cli: ActSpawnAgentCli) -> bool {

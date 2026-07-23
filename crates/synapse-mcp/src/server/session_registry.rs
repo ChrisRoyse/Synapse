@@ -110,6 +110,52 @@ pub(crate) struct SpawnedAgentControlRead {
     pub sandbox_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_server_request_bridge_url: Option<String>,
+    // These fields are persisted readiness diagnostics for the strict
+    // codex-control.json reader. They remain file-only evidence rather than
+    // expanding the public agent tool schema/response; callers read the exact
+    // control path when detailed startup diagnosis is needed.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_ready_url: Option<String>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_health_url: Option<String>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_readiness_status: Option<String>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_readiness_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_readyz_status_code: Option<u16>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_readyz_elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_healthz_status_code: Option<u16>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_readiness_elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_ready_attempts: Option<u64>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_health_attempts: Option<u64>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_websocket_status: Option<String>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_websocket_opened_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_websocket_error: Option<String>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub app_server_readiness_failure_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_app_server_request_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

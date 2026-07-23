@@ -85,16 +85,13 @@ fn build_spawn_manifest(
 ) -> Result<Value, ErrorData> {
     let agent_kind = params.effective_cli()?;
     let effective_working_dir = working_dir.display().to_string();
-    Ok(json!({
+    let mut manifest = json!({
         "version": AGENT_SPAWN_MANIFEST_VERSION,
         "spawn_id": spawn_id,
         "cli": agent_kind.as_str(),
         "kind": agent_kind.as_str(),
-        "model": params.model_for_spawn_manifest(agent_kind),
-        "model_ref": params.local_model_ref(),
         "working_dir": effective_working_dir,
         "effective_working_dir": effective_working_dir,
-        "requested_working_dir": params.working_dir.as_deref(),
         "require_approval_gate": params.require_approval_gate,
         "approval_gate_effective": params.require_approval_gate && agent_kind.uses_approval_gate(),
         "local_model_autonomous_tool_calls": agent_kind.is_local_model(),
@@ -104,17 +101,46 @@ fn build_spawn_manifest(
             .prompt
             .as_deref()
             .is_some_and(|prompt| !prompt.trim().is_empty()),
-        // Spawn-template provenance (#909): the exact template version + config
-        // hash this spawn was rendered from, or null for a direct spawn. The
-        // manifest is the physical source of truth for run reproducibility.
-        "template_id": params.template_id.as_deref(),
-        "template_version": params.template_version,
-        "template_config_hash": params.template_config_hash.as_deref(),
         "created_unix_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
-    }))
+    });
+    let object = manifest.as_object_mut().ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_spawn_agent internal error: spawn manifest literal was not an object",
+        )
+    })?;
+    if let Some(model) = params.model_for_spawn_manifest(agent_kind) {
+        object.insert("model".to_owned(), json!(model));
+    }
+    if let Some(model_ref) = params.local_model_ref() {
+        object.insert("model_ref".to_owned(), json!(model_ref));
+    }
+    if let Some(requested_working_dir) = params.working_dir.as_deref() {
+        object.insert(
+            "requested_working_dir".to_owned(),
+            json!(requested_working_dir),
+        );
+    }
+    // Spawn-template provenance (#909): the exact template version + config
+    // hash this spawn was rendered from. Absent fields are omitted, never
+    // serialized as null; the manifest is the physical source of truth for run
+    // reproducibility and its consumers reject present-but-invalid values.
+    if let Some(template_id) = params.template_id.as_deref() {
+        object.insert("template_id".to_owned(), json!(template_id));
+    }
+    if let Some(template_version) = params.template_version {
+        object.insert("template_version".to_owned(), json!(template_version));
+    }
+    if let Some(template_config_hash) = params.template_config_hash.as_deref() {
+        object.insert(
+            "template_config_hash".to_owned(),
+            json!(template_config_hash),
+        );
+    }
+    Ok(manifest)
 }
 const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
 const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
@@ -2426,7 +2452,7 @@ impl SynapseService {
         timing.mark_session_wait_started();
         let session_wait_deadline =
             agent_spawn_wait_deadline_from(Instant::now(), params.wait_timeout_ms)?;
-        let mut matched = match await_agent_spawn_phase_under_operator_panic_guard(
+        let matched = match await_agent_spawn_phase_under_operator_panic_guard(
             in_flight,
             "while_waiting_for_spawned_agent_session",
             self.wait_for_spawned_agent_session(
@@ -2510,9 +2536,7 @@ impl SynapseService {
                 &params,
                 agent_kind,
                 &spawn_id,
-                &mut matched,
-                &before_session_ids,
-                launched_at_unix_ms,
+                &matched,
                 launch_response.pid,
                 &files,
                 task_wait_deadline,
@@ -2984,18 +3008,11 @@ impl SynapseService {
                         "data": error.data,
                     })
                 })?;
-            let mut matched_session = None;
             let session_count = candidates.len();
             let mut sessions_json = Vec::new();
             let mut readiness_reason_counts: BTreeMap<String, u64> = BTreeMap::new();
             let mut candidate_readiness = Vec::new();
             let explicit_task_session_id = task_start_session_id_for_spawn(files, spawn_id);
-            let mut explicit_task_session_match = None;
-            let mut ready_candidates = Vec::new();
-            // Sessions that are a new + in-window + CLI match for this spawn but
-            // have not (yet) issued a daemon MCP tool call. They are identified
-            // as ours; we bind one only with independent proof of task progress.
-            let mut lenient_candidates: Vec<String> = Vec::new();
             for candidate in &candidates {
                 let readiness = spawn_session_candidate_readiness_from_read(
                     &candidate.registry,
@@ -3011,26 +3028,11 @@ impl SynapseService {
                     .unwrap_or("unknown")
                     .to_owned();
                 *readiness_reason_counts.entry(reason.clone()).or_default() += 1;
-                if reason == "tool_call_not_observed" {
-                    lenient_candidates.push(candidate.registry.session_id.clone());
-                }
                 if explicit_task_session_id.as_deref()
                     == Some(candidate.registry.session_id.as_str())
-                    && spawn_session_identity_matches_from_read(
-                        &candidate.registry,
-                        agent_kind,
-                        before_session_ids,
-                        launched_at_unix_ms,
-                    )
+                    && readiness.get("ready").and_then(Value::as_bool) == Some(true)
                 {
-                    explicit_task_session_match = Some(MatchedSpawnSession {
-                        session_id: candidate.registry.session_id.clone(),
-                        registered_at_unix_ms: unix_time_ms_now(),
-                        agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
-                    });
-                }
-                if readiness.get("ready").and_then(Value::as_bool) == Some(true) {
-                    ready_candidates.push(MatchedSpawnSession {
+                    return Ok(MatchedSpawnSession {
                         session_id: candidate.registry.session_id.clone(),
                         registered_at_unix_ms: unix_time_ms_now(),
                         agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
@@ -3052,60 +3054,22 @@ impl SynapseService {
                 }
             }
             last_observed = json!({
-                "reason": "candidate_not_ready",
+                "reason": if explicit_task_session_id.is_some() {
+                    "task_start_session_not_ready"
+                } else {
+                    "task_start_artifact_not_observed"
+                },
                 "session_count": session_count,
                 "sessions_recorded": sessions_json.len(),
                 "readiness_reason_counts": readiness_reason_counts,
                 "candidate_readiness_recorded": candidate_readiness.len(),
                 "candidate_readiness": candidate_readiness,
                 "explicit_task_session_id": explicit_task_session_id.clone(),
-                "ready_candidate_count": ready_candidates.len(),
                 "sessions": sessions_json,
                 "readiness_files": agent_spawn_readiness_file_readback(files),
-                "read_model": "session_registry + per-session logical foreground target only; skips full session_list attached process/window scan",
+                "identity_model": "exact spawn-bound task-start artifact session_id + live session registry identity; temporal/kind/tool-call candidates are diagnostic only",
+                "read_model": "task-started.json + session registry + per-session logical foreground target only; skips full session_list attached process/window scan",
             });
-
-            if let Some(matched) = explicit_task_session_match {
-                return Ok(matched);
-            }
-            if explicit_task_session_id.is_none() && ready_candidates.len() == 1 {
-                matched_session = ready_candidates.pop();
-            }
-            if let Some(matched) = matched_session {
-                return Ok(matched);
-            }
-
-            // Robust fallback for the agent-cooperative readiness protocol: a
-            // session that registered, matches this spawn's CLI, and started in
-            // the launch window is ours even if it never issued a daemon MCP
-            // tool call (codex drives its own app-server tools; any agent may
-            // skip the injected ceremony). Bind it only when the daemon
-            // INDEPENDENTLY observes the task is underway, and only when the
-            // candidate is unambiguous — fan_out disambiguates via the agent's
-            // self-named session in the task-start artifact.
-            if !lenient_candidates.is_empty()
-                && agent_spawn_observed_task_progress(files, agent_kind).is_some()
-            {
-                let bind = if lenient_candidates.len() == 1 {
-                    Some(lenient_candidates[0].clone())
-                } else {
-                    read_json_file_lossy(&files.task_started_path)
-                        .and_then(|value| {
-                            value
-                                .get("session_id")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        })
-                        .filter(|session_id| lenient_candidates.contains(session_id))
-                };
-                if let Some(session_id) = bind {
-                    return Ok(MatchedSpawnSession {
-                        session_id,
-                        registered_at_unix_ms: unix_time_ms_now(),
-                        agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
-                    });
-                }
-            }
 
             if process_has_exited(launcher_pid) {
                 return Err(json!({
@@ -3128,9 +3092,7 @@ impl SynapseService {
         params: &ActSpawnAgentParams,
         agent_kind: ActSpawnAgentCli,
         spawn_id: &str,
-        matched: &mut MatchedSpawnSession,
-        before_session_ids: &BTreeSet<String>,
-        launched_at_unix_ms: u64,
+        matched: &MatchedSpawnSession,
         launcher_pid: u32,
         files: &AgentSpawnFiles,
         deadline: Instant,
@@ -3143,44 +3105,14 @@ impl SynapseService {
             if let Err(liveness_error) =
                 self.require_spawned_agent_session_live(&matched.session_id, files, agent_kind)
             {
-                match self.rebind_spawned_agent_session_for_task_start(
-                    params,
-                    agent_kind,
-                    spawn_id,
-                    before_session_ids,
-                    launched_at_unix_ms,
-                    launcher_pid,
-                    files,
-                    &liveness_error,
-                )? {
-                    Some(rebound) => {
-                        *matched = rebound;
-                    }
-                    None => {
-                        last_observed = json!({
-                            "reason": "matched_session_not_live_waiting_for_replacement",
-                            "matched_session_id": matched.session_id,
-                            "task_started_path": files.task_started_path.display().to_string(),
-                            "session_liveness_error": liveness_error,
-                            "readiness_files": agent_spawn_readiness_file_readback(files),
-                            "observed_task_progress": agent_spawn_observed_task_progress(files, agent_kind),
-                        });
-                        if process_has_exited(launcher_pid) {
-                            return Err(json!({
-                                "reason": "launcher_process_exited_after_matched_session_closed",
-                                "launcher_process_id": launcher_pid,
-                                "task_started_path": files.task_started_path.display().to_string(),
-                                "completion_status": read_json_file_lossy(&files.completion_status_path),
-                                "stdout_tail": tail_file_lossy(&files.stdout_path, AGENT_SPAWN_LOG_TAIL_BYTES),
-                                "stderr_tail": tail_file_lossy(&files.stderr_path, AGENT_SPAWN_LOG_TAIL_BYTES),
-                                "final_message_tail": tail_file_lossy(&files.final_message_path, AGENT_SPAWN_LOG_TAIL_BYTES),
-                                "last_observed": last_observed,
-                            }));
-                        }
-                        sleep_agent_spawn_poll(deadline).await;
-                        continue;
-                    }
-                }
+                return Err(json!({
+                    "reason": "task_start_artifact_session_not_live",
+                    "matched_session_id": matched.session_id,
+                    "task_started_path": files.task_started_path.display().to_string(),
+                    "session_liveness_error": liveness_error,
+                    "readiness_files": agent_spawn_readiness_file_readback(files),
+                    "observed_task_progress": agent_spawn_observed_task_progress(files, agent_kind),
+                }));
             }
             match read_agent_spawn_task_start_artifact(
                 files, params, agent_kind, spawn_id, matched,
@@ -3223,105 +3155,6 @@ impl SynapseService {
             "reason": "task_start_artifact_timeout",
             "task_started_path": files.task_started_path.display().to_string(),
             "last_observed": last_observed,
-        }))
-    }
-
-    fn rebind_spawned_agent_session_for_task_start(
-        &self,
-        params: &ActSpawnAgentParams,
-        agent_kind: ActSpawnAgentCli,
-        spawn_id: &str,
-        before_session_ids: &BTreeSet<String>,
-        launched_at_unix_ms: u64,
-        launcher_pid: u32,
-        files: &AgentSpawnFiles,
-        liveness_error: &serde_json::Value,
-    ) -> Result<Option<MatchedSpawnSession>, serde_json::Value> {
-        let candidates = self
-            .spawn_session_candidates_for_readiness(params.target.is_some())
-            .map_err(|error| {
-                json!({
-                    "reason": "spawn_rebind_candidate_read_failed",
-                    "error": error.message,
-                    "data": error.data,
-                    "session_liveness_error": liveness_error,
-                })
-            })?;
-        let explicit_task_session_id = task_start_session_id_for_spawn(files, spawn_id);
-        let observed_task_progress = agent_spawn_observed_task_progress(files, agent_kind);
-        let mut ready_candidates = Vec::new();
-        let mut lenient_candidates = Vec::new();
-        let mut candidate_readiness = Vec::new();
-        for candidate in &candidates {
-            let readiness = spawn_session_candidate_readiness_from_read(
-                &candidate.registry,
-                candidate.active_target.as_ref(),
-                agent_kind,
-                params.target.as_ref(),
-                before_session_ids,
-                launched_at_unix_ms,
-            );
-            let reason = readiness
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            if candidate_readiness.len() < AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT
-                && reason != "session_existed_before_spawn"
-            {
-                candidate_readiness.push(json!({
-                    "session_id": candidate.registry.session_id,
-                    "started_at_unix_ms": candidate.registry.started_at_unix_ms,
-                    "last_action": candidate.registry.last_action,
-                    "active_target": candidate.active_target,
-                    "readiness": readiness.clone(),
-                }));
-            }
-            if explicit_task_session_id.as_deref() == Some(candidate.registry.session_id.as_str())
-                && spawn_session_identity_matches_from_read(
-                    &candidate.registry,
-                    agent_kind,
-                    before_session_ids,
-                    launched_at_unix_ms,
-                )
-            {
-                return Ok(Some(MatchedSpawnSession {
-                    session_id: candidate.registry.session_id.clone(),
-                    registered_at_unix_ms: unix_time_ms_now(),
-                    agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
-                }));
-            }
-            if readiness.get("ready").and_then(Value::as_bool) == Some(true) {
-                ready_candidates.push(candidate.registry.session_id.clone());
-            } else if reason == "tool_call_not_observed" && observed_task_progress.is_some() {
-                lenient_candidates.push(candidate.registry.session_id.clone());
-            }
-        }
-
-        let bind = if ready_candidates.len() == 1 {
-            Some(ready_candidates[0].clone())
-        } else if ready_candidates.is_empty() && lenient_candidates.len() == 1 {
-            Some(lenient_candidates[0].clone())
-        } else if ready_candidates.len() + lenient_candidates.len() > 1 {
-            return Err(json!({
-                "reason": "spawn_rebind_ambiguous",
-                "explicit_task_session_id": explicit_task_session_id,
-                "ready_candidate_count": ready_candidates.len(),
-                "lenient_candidate_count": lenient_candidates.len(),
-                "ready_candidates": ready_candidates,
-                "lenient_candidates": lenient_candidates,
-                "candidate_readiness": candidate_readiness,
-                "session_liveness_error": liveness_error,
-                "readiness_files": agent_spawn_readiness_file_readback(files),
-                "observed_task_progress": observed_task_progress,
-            }));
-        } else {
-            None
-        };
-
-        Ok(bind.map(|session_id| MatchedSpawnSession {
-            session_id,
-            registered_at_unix_ms: unix_time_ms_now(),
-            agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
         }))
     }
 
