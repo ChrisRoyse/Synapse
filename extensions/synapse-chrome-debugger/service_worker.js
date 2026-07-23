@@ -1852,6 +1852,7 @@ function isMutationCapableCommand(kind) {
     "operatorPanicCloseTab",
     "operatorPanicReadback",
     "operatorPanicEnable",
+    "maintenancePauseReconnect",
     "listTabs"
   ].includes(String(kind || ""));
 }

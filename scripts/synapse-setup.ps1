@@ -193,6 +193,10 @@ $SynapseChromeBridgeMaintenancePostStartWaitMs = $SynapseChromeBridgeMaintenance
 $SynapseBindFinalDeadOwnerSettleSeconds = 15
 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
 $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
+$script:SynapseChromeBridgeMaintenancePausePrepared = $false
+$script:SynapseChromeBridgeMaintenancePausePreparedBind = $null
+$script:SynapseChromeBridgeMaintenancePausePreparedReason = $null
+$script:SynapseChromeBridgeMaintenancePausePreparedResult = $null
 $script:SynapseBindPostExitContinuationRequired = $false
 $script:SynapseBindPostExitContinuationDetail = $null
 $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitContinuationReason -eq 'dead_owner_bind_after_install')
@@ -7348,9 +7352,21 @@ function Request-SynapseGracefulShutdown {
 function Read-SynapseHttpErrorResponseBody {
     param([Parameter(Mandatory=$true)]$ErrorRecord)
 
+    $errorDetailsBody = [string]$ErrorRecord.ErrorDetails.Message
+    if (-not [string]::IsNullOrWhiteSpace($errorDetailsBody)) {
+        return $errorDetailsBody
+    }
+
     $response = $ErrorRecord.Exception.Response
     if ($null -eq $response) {
         return $null
+    }
+    if ($null -ne $response.Content) {
+        try {
+            return $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        } catch {
+            return "SYNAPSE_HTTP_ERROR_BODY_READ_FAILED source=http_response_content error=$($_.Exception.Message)"
+        }
     }
     try {
         $stream = $response.GetResponseStream()
@@ -7364,7 +7380,7 @@ function Read-SynapseHttpErrorResponseBody {
             $reader.Dispose()
         }
     } catch {
-        return "SYNAPSE_HTTP_ERROR_BODY_READ_FAILED error=$($_.Exception.Message)"
+        return "SYNAPSE_HTTP_ERROR_BODY_READ_FAILED source=response_stream error=$($_.Exception.Message)"
     }
 }
 
@@ -7696,6 +7712,115 @@ function Request-SynapseChromeBridgeMaintenancePause {
     }
 }
 
+function Enter-SynapseChromeBridgeMaintenancePause {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [switch]$AllowUnacknowledgedChromeBridgePauseForRollback
+    )
+
+    if ($script:SynapseChromeBridgeMaintenancePausePrepared) {
+        if ($script:SynapseChromeBridgeMaintenancePausePreparedBind -cne $Bind -or
+            $script:SynapseChromeBridgeMaintenancePausePreparedReason -cne $Reason) {
+            Die ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PREPARED_SCOPE_MISMATCH prepared_bind={0} requested_bind={1} prepared_reason={2} requested_reason={3} remediation=a maintenance pause acknowledgement is scoped to one daemon handoff; start a fresh setup run instead of reusing it for another bind or reason" -f `
+                $script:SynapseChromeBridgeMaintenancePausePreparedBind,
+                $Bind,
+                $script:SynapseChromeBridgeMaintenancePausePreparedReason,
+                $Reason)
+        }
+        if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
+            Assert-SynapseChromeBridgeMaintenancePauseBudget -Reason $Reason -Bind $Bind -Phase 'prepared_pause_reuse'
+        }
+        Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PREPARED_REUSED reason={0} bind={1} pause_until_unix_ms={2} resume_probe_after_unix_ms={3}" -f `
+            $Reason,
+            $Bind,
+            ($(if ($null -eq $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) { '<skipped-no-active-host>' } else { $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs })),
+            ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })))
+        return $script:SynapseChromeBridgeMaintenancePausePreparedResult
+    }
+
+    $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
+    $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
+    $pause = Request-SynapseChromeBridgeMaintenancePause `
+        -Bind $Bind `
+        -Token $Token `
+        -Reason $Reason `
+        -PauseMs $SynapseChromeBridgeMaintenancePauseMs `
+        -ResumeProbeAfterMs $SynapseChromeBridgeMaintenanceResumeProbeAfterMs
+    if (-not $pause.Ok) {
+        if ($AllowUnacknowledgedChromeBridgePauseForRollback -and $Reason -eq 'install_health_failed_rollback') {
+            Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_UNACKNOWLEDGED_ROLLBACK_CONTINUING reason={0} bind={1} code={2} error={3} detail={4} response={5} remediation=install health already failed after replacing the daemon binary, so rollback must restore the previous verified daemon instead of stranding the failed candidate; setup will continue only through authenticated shutdown or exact verified synapse-mcp.exe PID stop, then separately verify the restored daemon and Chrome bridge Source of Truth." -f `
+                $Reason,
+                $Bind,
+                $pause.Code,
+                $pause.Error,
+                $pause.Detail,
+                ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
+            return $pause
+        }
+        Die ("{0} reason={1} bind={2} error={3} detail={4} response={5} remediation=forced daemon maintenance requires the already-open Chrome bridge to acknowledge a bounded reconnect pause before shutdown when an active bridge host exists. Inspect the exact extension error code/detail in this response and daemon CHROME_DEBUGGER_RESPONSE_ACCEPTED log; setup keeps restart authority intact until this prepare gate succeeds." -f `
+            $pause.Code,
+            $Reason,
+            $Bind,
+            $pause.Error,
+            $pause.Detail,
+            ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
+    }
+
+    if ($pause.Skipped) {
+        Info ("FORCE_RESTART: {0} reason={1} bind={2} detail={3}" -f `
+            $pause.Code,
+            $Reason,
+            $Bind,
+            $pause.Detail)
+    } else {
+        $pauseUntil = $pause.Response.pause.pause_until_unix_ms
+        $resumeProbeAfter = $pause.Response.pause.resume_probe_after_unix_ms
+        try {
+            $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = [int64]$pauseUntil
+            $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = [int64]$resumeProbeAfter
+        } catch {
+            Die ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_ACK_TIME_INVALID reason={0} bind={1} pause_until_unix_ms={2} resume_probe_after_unix_ms={3} error={4} remediation=the bridge acknowledgement did not contain exact integer lease timestamps; restart authority remains intact and setup refuses the handoff" -f `
+                $Reason,
+                $Bind,
+                $pauseUntil,
+                $resumeProbeAfter,
+                $_.Exception.Message)
+        }
+        if ($script:SynapseChromeBridgeMaintenancePauseUntilUnixMs -le 0 -or
+            $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs -le 0) {
+            Die ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_ACK_TIME_INVALID reason={0} bind={1} pause_until_unix_ms={2} resume_probe_after_unix_ms={3} remediation=the bridge acknowledgement returned non-positive lease timestamps; restart authority remains intact and setup refuses the handoff" -f `
+                $Reason,
+                $Bind,
+                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
+                $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs)
+        }
+        Assert-SynapseChromeBridgeMaintenancePauseBudget -Reason $Reason -Bind $Bind -Phase 'pause_prepare'
+        Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_ACK reason={0} bind={1} pause={2}" -f `
+            $Reason,
+            $Bind,
+            ($pause.Response.pause | ConvertTo-Json -Compress -Depth 8))
+        $webSocketClose = $pause.Response.pause.websocket_close
+        if ($webSocketClose -and $webSocketClose.had_socket -eq $true -and $webSocketClose.close_requested -eq $true) {
+            Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SOCKET_DRAIN_WAIT reason={0} bind={1} wait_ms={2} had_socket={3} close_requested={4} close_deferred={5} remediation=the bridge intentionally sends the pause response before closing its active WebSocket, so setup waits for the bounded response-drain window before daemon shutdown." -f `
+                $Reason,
+                $Bind,
+                $SynapseChromeBridgeMaintenanceCloseDrainMs,
+                $webSocketClose.had_socket,
+                $webSocketClose.close_requested,
+                ($(if ($null -eq $webSocketClose.close_deferred) { '<missing>' } else { $webSocketClose.close_deferred })))
+            Start-Sleep -Milliseconds $SynapseChromeBridgeMaintenanceCloseDrainMs
+        }
+    }
+
+    $script:SynapseChromeBridgeMaintenancePausePrepared = $true
+    $script:SynapseChromeBridgeMaintenancePausePreparedBind = $Bind
+    $script:SynapseChromeBridgeMaintenancePausePreparedReason = $Reason
+    $script:SynapseChromeBridgeMaintenancePausePreparedResult = $pause
+    return $pause
+}
+
 function Get-SynapseActiveSessionCount {
     param([Parameter(Mandatory=$true)]$Health)
 
@@ -7975,67 +8100,11 @@ function Stop-SynapseMcpProcesses {
         } else {
             $expectedPids = @($httpProcesses | ForEach-Object { [int]$_.ProcessId })
             if ($ForceRestart) {
-                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
-                $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
-                $pause = Request-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $tokenRead.Token -Reason $Reason -PauseMs $SynapseChromeBridgeMaintenancePauseMs -ResumeProbeAfterMs $SynapseChromeBridgeMaintenanceResumeProbeAfterMs
-                if (-not $pause.Ok) {
-                    if ($AllowUnacknowledgedChromeBridgePauseForRollback -and $Reason -eq 'install_health_failed_rollback') {
-                        Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_UNACKNOWLEDGED_ROLLBACK_CONTINUING reason={0} bind={1} code={2} error={3} detail={4} response={5} remediation=install health already failed after replacing the daemon binary, so rollback must restore the previous verified daemon instead of stranding the failed candidate; setup will continue only through authenticated shutdown or exact verified synapse-mcp.exe PID stop, then separately verify the restored daemon and Chrome bridge Source of Truth." -f `
-                            $Reason,
-                            $Bind,
-                            $pause.Code,
-                            $pause.Error,
-                            $pause.Detail,
-                            ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
-                    } else {
-                        Die ("{0} reason={1} bind={2} error={3} detail={4} response={5} remediation=forced daemon maintenance requires the already-open Chrome bridge to acknowledge a bounded reconnect pause before shutdown when an active bridge host exists. Reload the installed bridge through the existing Chrome profile or inspect daemon/extension logs; setup will not chase an unbounded stream of recreated Chrome NetworkService peers." -f `
-                            $pause.Code,
-                            $Reason,
-                            $Bind,
-                            $pause.Error,
-                            $pause.Detail,
-                            ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
-                    }
-                }
-                if ($pause.Ok -and $pause.Skipped) {
-                    Info ("FORCE_RESTART: {0} reason={1} bind={2} detail={3}" -f `
-                        $pause.Code,
-                        $Reason,
-                        $Bind,
-                        $pause.Detail)
-                } elseif ($pause.Ok) {
-                    $pauseUntil = $pause.Response.pause.pause_until_unix_ms
-                    if ($null -ne $pauseUntil) {
-                        try {
-                            $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = [int64]$pauseUntil
-                        } catch {
-                            $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
-                        }
-                    }
-                    $resumeProbeAfter = $pause.Response.pause.resume_probe_after_unix_ms
-                    if ($null -ne $resumeProbeAfter) {
-                        try {
-                            $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = [int64]$resumeProbeAfter
-                        } catch {
-                            $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
-                        }
-                    }
-                    Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_ACK reason={0} bind={1} pause={2}" -f `
-                        $Reason,
-                        $Bind,
-                        ($pause.Response.pause | ConvertTo-Json -Compress -Depth 8))
-                    $webSocketClose = $pause.Response.pause.websocket_close
-                    if ($webSocketClose -and $webSocketClose.had_socket -eq $true -and $webSocketClose.close_requested -eq $true) {
-                        Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SOCKET_DRAIN_WAIT reason={0} bind={1} wait_ms={2} had_socket={3} close_requested={4} close_deferred={5} remediation=the bridge intentionally sends the pause response before closing its active WebSocket, so setup waits for the bounded response-drain window before daemon shutdown." -f `
-                            $Reason,
-                            $Bind,
-                            $SynapseChromeBridgeMaintenanceCloseDrainMs,
-                            $webSocketClose.had_socket,
-                            $webSocketClose.close_requested,
-                            ($(if ($null -eq $webSocketClose.close_deferred) { '<missing>' } else { $webSocketClose.close_deferred })))
-                        Start-Sleep -Milliseconds $SynapseChromeBridgeMaintenanceCloseDrainMs
-                    }
-                }
+                $null = Enter-SynapseChromeBridgeMaintenancePause `
+                    -Bind $Bind `
+                    -Token $tokenRead.Token `
+                    -Reason $Reason `
+                    -AllowUnacknowledgedChromeBridgePauseForRollback:$AllowUnacknowledgedChromeBridgePauseForRollback
             }
             $shutdown = Request-SynapseGracefulShutdown -Bind $Bind -Token $tokenRead.Token -ExpectedPids $expectedPids -Reason $Reason
             if (-not $shutdown.Ok) {
@@ -8255,7 +8324,7 @@ function Stop-SynapseDaemonSupervisorProcessesForInstallHandoff {
         (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $remaining))
 }
 
-function Remove-SynapseDaemonTaskRestartAuthority {
+function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
     param(
         [Parameter(Mandatory=$true)][string]$TaskName,
         [Parameter(Mandatory=$true)][string]$SupervisorPath,
@@ -8264,9 +8333,8 @@ function Remove-SynapseDaemonTaskRestartAuthority {
 
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
-        Info "Synapse daemon scheduled task already absent before restart-authority removal: task=$TaskName reason=$Reason"
-        Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $SupervisorPath
-        return
+        Info "Synapse daemon scheduled task identity preflight: task=$TaskName reason=$Reason task_present=false"
+        return $null
     }
 
     $logDir = Split-Path -Parent $SupervisorPath
@@ -8302,6 +8370,27 @@ function Remove-SynapseDaemonTaskRestartAuthority {
             $action.Arguments,
             $expectedWorkingDirectory,
             $action.WorkingDirectory)
+    }
+
+    Info "Synapse daemon scheduled task identity preflight verified: task=$TaskName state=$($task.State) reason=$Reason"
+    return $task
+}
+
+function Remove-SynapseDaemonTaskRestartAuthority {
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$SupervisorPath,
+        [Parameter(Mandatory=$true)][string]$Reason
+    )
+
+    $task = Assert-SynapseDaemonTaskRestartAuthorityIdentity `
+        -TaskName $TaskName `
+        -SupervisorPath $SupervisorPath `
+        -Reason $Reason
+    if (-not $task) {
+        Info "Synapse daemon scheduled task already absent before restart-authority removal: task=$TaskName reason=$Reason"
+        Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $SupervisorPath
+        return
     }
 
     Info "Removing Synapse daemon Task Scheduler restart authority before process drain: task=$TaskName state=$($task.State) reason=$Reason"
@@ -8967,8 +9056,16 @@ if (-not $liveDaemonHandoffRequired) {
     Step "Draining live daemon and installing verified binary -> $ExePath"
     Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
     $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+    $null = Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'install_binary'
+    if ($ForceRestart) {
+        $null = Enter-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $token -Reason 'install_binary'
+    }
     Remove-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'install_binary'
     Stop-SynapseMcpProcessesForInstallHandoff -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
+    $script:SynapseChromeBridgeMaintenancePausePrepared = $false
+    $script:SynapseChromeBridgeMaintenancePausePreparedBind = $null
+    $script:SynapseChromeBridgeMaintenancePausePreparedReason = $null
+    $script:SynapseChromeBridgeMaintenancePausePreparedResult = $null
     Assert-SynapseInstallPathUnlocked -Path $ExePath -Bind $Bind -DbPath $DbPath -TimeoutSeconds 30
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null

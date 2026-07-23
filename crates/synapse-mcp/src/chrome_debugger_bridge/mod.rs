@@ -5436,12 +5436,24 @@ impl ChromeDebuggerBridge {
                 };
                 let readback_summary =
                     chrome_response_readback_summary(&pending.kind, response.result.as_ref());
+                let response_error_code = response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.code.as_deref())
+                    .unwrap_or_default();
+                let response_error_detail = response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.detail.as_deref())
+                    .unwrap_or_default();
                 tracing::info!(
                     code = "CHROME_DEBUGGER_RESPONSE_ACCEPTED",
                     host_id = %request.host_id,
                     command_id = %id,
                     command_kind = %pending.kind,
                     response_ok = response.ok,
+                    response_error_code,
+                    response_error_detail,
                     readback = %readback_summary.as_deref().unwrap_or(""),
                     "Chrome debugger response accepted"
                 );
@@ -5870,7 +5882,7 @@ impl ChromeDebuggerBridge {
                     host_id: host_id.clone(),
                     kind: kind.to_owned(),
                     sender: Some(sender),
-                    mutation_capable: true,
+                    mutation_capable: kind != MAINTENANCE_RECONNECT_PAUSE_COMMAND,
                     delivered: false,
                     caller_timed_out: false,
                     transport_lost: false,
