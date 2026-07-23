@@ -8042,6 +8042,13 @@ function Stop-SynapseMcpProcesses {
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [switch]$ForceRestart,
         [switch]$AllowUnacknowledgedChromeBridgePauseForRollback,
+        # Install-handoff escalation (#1800): when graceful shutdown times out,
+        # proceed to the identity-verified exact-PID force stop instead of dying.
+        # By that point the daemon has already closed its listener and committed
+        # to exit (retained-owner fail-closed state); aborting the deploy only
+        # leaves a zombie window until the daemon's own 90s shutdown watchdog
+        # forces the same termination without installing the new binary.
+        [switch]$EscalateAfterGracefulTimeout,
         [int]$TimeoutSeconds = 15
     )
 
@@ -8157,6 +8164,9 @@ function Stop-SynapseMcpProcesses {
                 (Format-SynapseMcpProcessSnapshot -Snapshot $remainingHttpPids))
             if ($ForceRestart) {
                 Info "FORCE_RESTART: $message"
+            } elseif ($EscalateAfterGracefulTimeout) {
+                Info "GRACEFUL_TIMEOUT_ESCALATION: $message"
+                Info "GRACEFUL_TIMEOUT_ESCALATION: escalating to identity-verified exact-PID force stop reason=$Reason (the daemon has closed its listener and retained-owner evidence is preserved in the daemon log)"
             } else {
                 Die $message
             }
@@ -8171,7 +8181,7 @@ function Stop-SynapseMcpProcesses {
         return
     }
 
-    if (-not $ForceRestart) {
+    if (-not $ForceRestart -and -not $EscalateAfterGracefulTimeout) {
         Die ("SYNAPSE_PROCESS_STOP_INCOMPLETE reason={0} remaining_count={1} remaining=`n{2}" -f `
             $Reason,
             $remaining.Count,
@@ -8484,6 +8494,7 @@ function Stop-SynapseMcpProcessesForInstallHandoff {
             -DbPath $DbPath `
             -TokenPath $TokenPath `
             -ForceRestart:$ForceRestart `
+            -EscalateAfterGracefulTimeout `
             -TimeoutSeconds ([Math]::Min(60, $remainingBudget))
 
         Start-Sleep -Milliseconds 500
