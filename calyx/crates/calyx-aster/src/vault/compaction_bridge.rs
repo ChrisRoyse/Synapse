@@ -155,6 +155,23 @@ where
     /// Total CF bytes are telemetry, not debt: this flat immutable-file layer
     /// cannot reduce a healthy large dataset merely by rewriting it.
     pub fn compact_native_fanout_once(&self) -> Result<Vec<CompactionResult>> {
+        self.compact_fanout_pass(false)
+    }
+
+    /// Open-time readiness pass (#1812): compacts ONLY the CFs whose file
+    /// count has reached `LIVE_COMPACTION_TRIGGER_FILES` — the same threshold
+    /// at which `ensure_cf_write_fanout_admitted` refuses writes
+    /// (`CALYX_ASTER_SST_FANOUT_WRITE_STALL`) — and still verifies every CF
+    /// ends below the hard range-page source limit. This is the minimum
+    /// maintenance a booting daemon needs to accept its first write (the
+    /// activity recorder writes CF_TIMELINE immediately at startup); the
+    /// routine and tiny-file drain lanes stay owned by the periodic GC task,
+    /// so a steady-state boot pays only the catalog scan here.
+    pub fn compact_write_stall_readiness_once(&self) -> Result<Vec<CompactionResult>> {
+        self.compact_fanout_pass(true)
+    }
+
+    fn compact_fanout_pass(&self, readiness_only: bool) -> Result<Vec<CompactionResult>> {
         let Some(durable) = &self.durable else {
             return Ok(Vec::new());
         };
@@ -189,12 +206,16 @@ where
                 .then_with(|| right.1.pending_files.cmp(&left.1.pending_files))
                 .then_with(|| left.0.name().cmp(&right.0.name()))
         });
-        let routine_cfs = candidates
-            .iter()
-            .filter(|(_cf, debt)| debt.pending_files < LIVE_COMPACTION_TRIGGER_FILES)
-            .take(ROUTINE_COMPACTION_CFS_PER_PASS)
-            .map(|(cf, _debt)| *cf)
-            .collect::<Vec<_>>();
+        let routine_cfs = if readiness_only {
+            Vec::new()
+        } else {
+            candidates
+                .iter()
+                .filter(|(_cf, debt)| debt.pending_files < LIVE_COMPACTION_TRIGGER_FILES)
+                .take(ROUTINE_COMPACTION_CFS_PER_PASS)
+                .map(|(cf, _debt)| *cf)
+                .collect::<Vec<_>>()
+        };
         let selected = candidates
             .into_iter()
             .filter(|(cf, debt)| {
@@ -206,6 +227,7 @@ where
             durable_seq,
             commit_lock_hold_us,
             catalog_scan_ms,
+            readiness_only,
             selected_cfs = selected.len(),
             max_input_files_per_cf = LIVE_COMPACTION_MAX_INPUT_FILES,
             max_input_bytes_per_cf = LIVE_COMPACTION_MAX_INPUT_BYTES,

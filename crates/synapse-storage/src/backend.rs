@@ -1296,34 +1296,45 @@ fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> St
     Ok(())
 }
 
-/// Open-time durability preparation: materialize staged checkpoint batches and
-/// advance the manifest floor, WITHOUT running native-CF compaction inline.
+/// Open-time durability + writability preparation, WITHOUT a full-vault
+/// compaction pass.
 ///
 /// 2026-07-23 cold-start root cause: this previously called
 /// `compact_native_fanout_once`, which performs a full catalog scan over every
 /// SST plus per-CF compaction and exclusive router refresh — minutes of work
 /// serialized on the open path *before the daemon could bind its socket*
 /// (observed 14-minute cold start; the `RocksDB` "Speed Up DB Open" guidance is
-/// explicit that compaction belongs after open). The checkpoint here preserves
-/// the #1132 invariant (durable-batch SSTs exist before any manifest advance
-/// can strand them); compaction remains owned by the periodic GC task, which
-/// runs on the blocking maintenance pool after the server is serving.
+/// explicit that compaction belongs after open). A checkpoint-only replacement
+/// then failed differently on a backlogged vault: the first startup write
+/// (activity recorder → `CF_TIMELINE`) hit `CALYX_ASTER_SST_FANOUT_WRITE_STALL`
+/// because the inline pass had been the thing clearing write-stall debt. The
+/// readiness pass used here is the exact middle ground: it checkpoints staged
+/// batches (preserving the #1132 invariant), compacts ONLY CFs at/above the
+/// write-stall trigger, and verifies the hard range-page source limit — a
+/// steady-state boot pays one catalog scan; routine/tiny-file drain lanes stay
+/// owned by the periodic GC task on the blocking maintenance pool.
 fn prepare_calyx_open_fanout(
     vault: &SynapseCalyxVault,
     path: &Path,
     phase: &'static str,
 ) -> StorageResult<()> {
-    vault.checkpoint().map_err(|source| {
-        calyx_open_failed_detail(
-            path,
-            format!("checkpoint staged durable batches during {phase}: {source}"),
-        )
-    })?;
+    let readiness = vault
+        .compact_write_stall_readiness_once()
+        .map_err(|source| {
+            calyx_open_failed_detail(
+                path,
+                format!("checkpoint + write-stall readiness compaction during {phase}: {source}"),
+            )
+        })?;
     tracing::info!(
         code = "STORAGE_CALYX_OPEN_CHECKPOINT_READY",
         phase,
-        "checkpointed staged durable batches during storage open; native-CF \
-         compaction deferred to the periodic GC task"
+        attempted_cfs = readiness.attempted_cfs,
+        compacted_cfs = readiness.compacted_cfs,
+        reclaimed_input_files = readiness.reclaimed_input_files,
+        compacted_cf_names = ?readiness.compacted_cf_names,
+        "checkpointed staged durable batches and cleared write-stalled CFs during \
+         storage open; routine native-CF compaction deferred to the periodic GC task"
     );
     Ok(())
 }

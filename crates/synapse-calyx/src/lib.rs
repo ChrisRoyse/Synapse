@@ -3282,6 +3282,36 @@ impl SynapseCalyxVault {
         let results = self.vault.compact_native_fanout_once().map_err(|error| {
             SynapseCalyxError::from_calyx("compact native Calyx CF fan-out", &error)
         })?;
+        Ok(Self::native_fanout_readback(results))
+    }
+
+    /// Open-time readiness variant (#1812): compacts only the CFs whose file
+    /// count has reached the write-stall trigger, so a booting daemon can
+    /// accept its first write (the activity recorder writes `CF_TIMELINE`
+    /// immediately at startup) without paying a full-vault fan-out pass. The
+    /// routine and tiny-file drain lanes stay owned by the periodic GC task.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if manifest coverage cannot be
+    /// proven, an SST is malformed, output publication fails, router refresh
+    /// fails, or any proven superseded input cannot be reclaimed.
+    pub fn compact_write_stall_readiness_once(
+        &self,
+    ) -> Result<SynapseCalyxNativeFanoutReadback, SynapseCalyxError> {
+        let results = self
+            .vault
+            .compact_write_stall_readiness_once()
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "compact write-stalled Calyx CFs for open readiness",
+                    &error,
+                )
+            })?;
+        Ok(Self::native_fanout_readback(results))
+    }
+
+    fn native_fanout_readback(results: Vec<CompactionResult>) -> SynapseCalyxNativeFanoutReadback {
         let attempted_cfs = results.len();
         let mut compacted_cfs = 0_usize;
         let mut reclaimed_input_files = 0_usize;
@@ -3298,7 +3328,7 @@ impl SynapseCalyxVault {
                 compacted_cf_names.push(report.cf.name().clone());
             }
         }
-        Ok(SynapseCalyxNativeFanoutReadback {
+        SynapseCalyxNativeFanoutReadback {
             attempted_cfs,
             compacted_cfs,
             skipped_cfs: attempted_cfs.saturating_sub(compacted_cfs),
@@ -3306,7 +3336,7 @@ impl SynapseCalyxVault {
             input_bytes,
             output_bytes,
             compacted_cf_names,
-        })
+        }
     }
 
     /// Prunes durable MVCC tombstones from the Synapse KV storage CF.
