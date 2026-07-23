@@ -324,6 +324,58 @@ fn launch_setup_repair(
 }
 
 async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
+    match chrome_debugger_bridge::wait_for_active_bridge_host(250).await {
+        Ok(host)
+            if !host.extension_stale
+                && host.extension_service_worker_sha256_status.as_deref() == Some("ok")
+                && host
+                    .extension_service_worker_sha256
+                    .as_deref()
+                    .is_some_and(|actual| {
+                        !actual.is_empty()
+                            && host.expected_service_worker_sha256.as_deref() == Some(actual)
+                    })
+                && host.extension_debugger_api_available == Some(true)
+                && host
+                    .extension_capabilities
+                    .iter()
+                    .any(|capability| capability == "maintenancePauseReconnect") =>
+        {
+            return Ok(format!(
+                "chrome_bridge_preflight=current_host_verified host_id={} service_worker_sha256={} service_worker_sha256_status={} maintenance_pause_capability=true",
+                host.host_id,
+                host.extension_service_worker_sha256
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+                host.extension_service_worker_sha256_status
+                    .as_deref()
+                    .unwrap_or("<missing>")
+            ));
+        }
+        Ok(_stale_or_incomplete_host) => {}
+        Err(error)
+            if error.code() == error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE
+                && error.detail().contains("no_active_chrome_bridge_host") =>
+        {
+            return Ok(
+                "chrome_bridge_preflight=reload_bridge_skipped reason=no_active_chrome_bridge_host"
+                    .to_owned(),
+            );
+        }
+        Err(error) => {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_REPAIR_CHROME_BRIDGE_READBACK_FAILED",
+                "chrome_bridge_host_readback",
+                format!(
+                    "setup repair could not read the active Chrome bridge identity before external maintenance handoff; code={} detail={}",
+                    error.code(),
+                    error.detail()
+                ),
+                "repair the exact bridge host readback failure and retry setup repair; setup did not launch or alter daemon restart authority",
+            ));
+        }
+    }
+
     match chrome_debugger_bridge::reload_bridge(30_000).await {
         Ok(result) => Ok(format!(
             "chrome_bridge_preflight=reload_bridge_ok before_host={} after_host={} reconnected={} waited_ms={}",
