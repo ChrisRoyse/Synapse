@@ -6,7 +6,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use calyx_aster::{
@@ -90,6 +90,14 @@ const CALYX_ORDERED_KEY_MIGRATION_PAGE_ROWS: usize = 512;
 const CALYX_GC_CF: &str = "storage_gc";
 const CALYX_GC_WAL_RECYCLE_MAX_SEGMENTS: usize = 8;
 const CALYX_GC_WAL_RECYCLE_FSYNC_BUDGET: usize = 8;
+const CALYX_CHECKPOINT_CF: &str = "storage_checkpoint";
+/// Cadence of the checkpoint-only maintenance task (2026-07-23 cold-start
+/// fix). Bounds the crash-stranded WAL tail — and therefore restart WAL
+/// replay plus idempotent SST republish — to at most one interval of commits,
+/// instead of one 5-minute GC interval (~20k sequences / minutes of replay
+/// observed). Each tick's cost is proportional to the commits staged since the
+/// previous tick plus a single manifest publish.
+const CALYX_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 /// Tombstone-purge pacing: a full-CF streaming tombstone purge rewrites the
 /// entire KV CF (hundreds of MB) with an unlimited compaction throttle, so it
 /// must not fire on every GC tick just because a handful of rows were evicted.
@@ -395,6 +403,7 @@ pub trait StorageBackend: Send + Sync {
         hard_cap_rows: u64,
     ) -> StorageResult<gc::GcReport>;
     fn spawn_gc_task(&self) -> StorageResult<gc::GcTask>;
+    fn spawn_checkpoint_task(&self) -> StorageResult<gc::GcTask>;
     fn pressure_level(&self) -> pressure::DiskPressureLevel;
     fn pressure_permits_write(&self, cf_name: &str) -> bool;
     fn pressure_transition_codes(&self) -> StorageResult<Vec<&'static str>>;
@@ -1275,28 +1284,34 @@ fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> St
     Ok(())
 }
 
+/// Open-time durability preparation: materialize staged checkpoint batches and
+/// advance the manifest floor, WITHOUT running native-CF compaction inline.
+///
+/// 2026-07-23 cold-start root cause: this previously called
+/// `compact_native_fanout_once`, which performs a full catalog scan over every
+/// SST plus per-CF compaction and exclusive router refresh — minutes of work
+/// serialized on the open path *before the daemon could bind its socket*
+/// (observed 14-minute cold start; the `RocksDB` "Speed Up DB Open" guidance is
+/// explicit that compaction belongs after open). The checkpoint here preserves
+/// the #1132 invariant (durable-batch SSTs exist before any manifest advance
+/// can strand them); compaction remains owned by the periodic GC task, which
+/// runs on the blocking maintenance pool after the server is serving.
 fn prepare_calyx_open_fanout(
     vault: &SynapseCalyxVault,
     path: &Path,
     phase: &'static str,
 ) -> StorageResult<()> {
-    let readiness = vault.compact_native_fanout_once().map_err(|source| {
+    vault.checkpoint().map_err(|source| {
         calyx_open_failed_detail(
             path,
-            format!("prepare native Calyx SST fan-out during {phase}: {source}"),
+            format!("checkpoint staged durable batches during {phase}: {source}"),
         )
     })?;
     tracing::info!(
-        code = "STORAGE_CALYX_OPEN_FANOUT_READY",
+        code = "STORAGE_CALYX_OPEN_CHECKPOINT_READY",
         phase,
-        attempted_cfs = readiness.attempted_cfs,
-        compacted_cfs = readiness.compacted_cfs,
-        skipped_cfs = readiness.skipped_cfs,
-        reclaimed_input_files = readiness.reclaimed_input_files,
-        input_bytes = readiness.input_bytes,
-        output_bytes = readiness.output_bytes,
-        compacted_cf_names = ?readiness.compacted_cf_names,
-        "prepared and physically verified native Calyx SST fan-out during storage open"
+        "checkpointed staged durable batches during storage open; native-CF \
+         compaction deferred to the periodic GC task"
     );
     Ok(())
 }
@@ -1332,6 +1347,42 @@ impl pressure::PressureMaintenance for CalyxPressureMaintenance {
                 }
             },
         )
+    }
+}
+
+/// Periodic checkpoint-only runner (2026-07-23 cold-start fix): advances the
+/// manifest `durable_seq` floor every `CALYX_CHECKPOINT_INTERVAL` so a daemon
+/// kill strands at most one interval of WAL tail instead of one 5-minute GC
+/// interval (~20k sequences observed, replaying for minutes on every boot).
+/// Checkpointing writes only the batches staged since the previous flush plus
+/// one manifest publish — it never scans catalogs or compacts.
+struct CalyxCheckpointRunner {
+    vault: Arc<CalyxVaultRuntime>,
+}
+
+impl CalyxCheckpointRunner {
+    const fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
+        Self { vault }
+    }
+}
+
+impl gc::GcRunner for CalyxCheckpointRunner {
+    fn run_once(&self) -> StorageResult<gc::GcReport> {
+        self.vault.with_vault(
+            CALYX_CHECKPOINT_CF,
+            "periodic durable checkpoint",
+            true,
+            |vault| {
+                vault.checkpoint().map_err(|source| {
+                    calyx_write_failed(
+                        CALYX_CHECKPOINT_CF,
+                        "materialize staged durable checkpoints and advance manifest floor",
+                        &source,
+                    )
+                })
+            },
+        )?;
+        Ok(gc::GcReport::default())
     }
 }
 
@@ -1687,6 +1738,13 @@ impl StorageBackend for CalyxBackend {
         gc::spawn_runner(
             Arc::new(CalyxGcRunner::new(Arc::clone(&self.vault))),
             config.interval(),
+        )
+    }
+
+    fn spawn_checkpoint_task(&self) -> StorageResult<gc::GcTask> {
+        gc::spawn_runner(
+            Arc::new(CalyxCheckpointRunner::new(Arc::clone(&self.vault))),
+            CALYX_CHECKPOINT_INTERVAL,
         )
     }
 

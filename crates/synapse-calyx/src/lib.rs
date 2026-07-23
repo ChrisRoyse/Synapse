@@ -3874,6 +3874,26 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("sync Calyx Aster WAL", &error))
     }
 
+    /// Materializes pending durable checkpoints and advances the manifest
+    /// `durable_seq` floor without running compaction.
+    ///
+    /// 2026-07-23 cold-start root cause: `durable_seq` previously advanced only
+    /// on the 5-minute GC tick or a clean close, so a daemon kill stranded up
+    /// to ~20k WAL sequences whose recovery replayed for minutes (one
+    /// idempotent SST republish + directory flush per staged batch). A
+    /// periodic caller of this method bounds the crash-stranded WAL tail to
+    /// one checkpoint interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the checkpoint SST writes or
+    /// the manifest advance fail.
+    pub fn checkpoint(&self) -> Result<(), SynapseCalyxError> {
+        self.vault
+            .checkpoint()
+            .map_err(|error| SynapseCalyxError::from_calyx("checkpoint Calyx Aster vault", &error))
+    }
+
     /// Flushes and closes the durable vault, then proves the lock can be
     /// reacquired before reporting a safe shutdown readback.
     ///

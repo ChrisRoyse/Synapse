@@ -306,6 +306,9 @@ pub struct M3State {
     /// a second open of the same path within this process.
     pub db: Option<Arc<Db>>,
     pub storage_gc_task: Option<GcTask>,
+    /// Checkpoint-only maintenance task (2026-07-23 cold-start fix): bounds
+    /// the crash-stranded WAL tail to ~30s of commits.
+    pub storage_checkpoint_task: Option<GcTask>,
     pub storage_pressure_task: Option<PressureTask>,
     pub storage_last_error: Option<String>,
     pub storage_maintenance_unsupported: Option<String>,
@@ -532,6 +535,7 @@ impl M3State {
             calyx_vault_status,
             db: None,
             storage_gc_task: None,
+            storage_checkpoint_task: None,
             storage_pressure_task: None,
             storage_last_error: None,
             storage_maintenance_unsupported: None,
@@ -700,6 +704,18 @@ impl M3State {
                 }
                 Err(error) => {
                     self.storage_last_error = Some(format!("storage GC task start: {error}"));
+                    return Err(error);
+                }
+            }
+        }
+        if self.storage_checkpoint_task.is_none() {
+            match db.spawn_checkpoint_task() {
+                Ok(task) => {
+                    self.storage_checkpoint_task = Some(task);
+                }
+                Err(error) => {
+                    self.storage_last_error =
+                        Some(format!("storage checkpoint task start: {error}"));
                     return Err(error);
                 }
             }

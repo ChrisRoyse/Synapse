@@ -34,6 +34,41 @@ pub const LIVE_COMPACTION_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 pub const LIVE_COMPACTION_TRIGGER_FILES: usize =
     crate::sst::MAX_INTERSECTING_SST_PAGE_SOURCES * 3 / 4;
 
+/// Tiny-file fan-out admission floor (2026-07-23 cold-start fix). The debt
+/// score (`pending_files * 1000 / DEFAULT_COMPACTION_TARGET_FILES`) reaches
+/// the 1000-milli admission bar only at 256 files, so a CF made of hundreds
+/// of ~114-byte per-batch checkpoint SSTs could sit below the bar forever —
+/// the physical vault reached 7,801 SSTs across ~96 CFs (most CFs pinned at
+/// 200-360 tiny files), inflating catalog scans, router loads, and recovery
+/// preflight to minutes. A CF whose *average* file size is far below the
+/// rolled-output target is pure fan-out debt regardless of its total bytes,
+/// so it is admitted once it holds at least this many files.
+pub const TINY_FILE_COMPACTION_MIN_FILES: usize = 32;
+
+/// Average-file-size ceiling (bytes) below which a CF's fan-out counts as
+/// tiny-file debt for `TINY_FILE_COMPACTION_MIN_FILES` admission. One MiB is
+/// 1/64th of `DEFAULT_COMPACTION_TARGET_BYTES`: healthy rolled outputs never
+/// average below it, per-batch checkpoint SSTs (bytes to a few KiB) always do.
+pub const TINY_FILE_COMPACTION_AVG_BYTES_CEILING: u64 = 1024 * 1024;
+
+/// Below-trigger ("routine") CFs folded per maintenance pass. The previous
+/// single-CF routine lane could never drain a wide vault: with ~96 CFs and
+/// one pass per 5-minute GC tick, a full sweep took ~8 hours while new
+/// checkpoint SSTs accumulated faster — the backlog only ever grew. Eight per
+/// pass drains the same vault in under an hour; each CF fold is bounded by
+/// `LIVE_COMPACTION_MAX_INPUT_FILES`/`_BYTES` and runs off the commit lock.
+pub const ROUTINE_COMPACTION_CFS_PER_PASS: usize = 8;
+
+/// Whether a CF's pending fan-out qualifies as tiny-file debt: enough files to
+/// matter and an average file size far below one rolled output.
+fn is_tiny_file_fanout_debt(pending_files: usize, pending_bytes: u64) -> bool {
+    if pending_files < TINY_FILE_COMPACTION_MIN_FILES {
+        return false;
+    }
+    let files = u64::try_from(pending_files).unwrap_or(u64::MAX).max(1);
+    pending_bytes / files < TINY_FILE_COMPACTION_AVG_BYTES_CEILING
+}
+
 #[derive(Debug)]
 pub struct VaultCompactionScheduler {
     catalog: Arc<CompactionCatalog>,
@@ -141,7 +176,10 @@ where
             .column_families()
             .into_iter()
             .map(|cf| (cf, catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES)))
-            .filter(|(_cf, debt)| debt.score_milli >= 1_000)
+            .filter(|(_cf, debt)| {
+                debt.score_milli >= 1_000
+                    || is_tiny_file_fanout_debt(debt.pending_files, debt.pending_bytes)
+            })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             right
@@ -151,15 +189,16 @@ where
                 .then_with(|| right.1.pending_files.cmp(&left.1.pending_files))
                 .then_with(|| left.0.name().cmp(&right.0.name()))
         });
-        let first_routine = candidates
+        let routine_cfs = candidates
             .iter()
-            .find(|(_cf, debt)| debt.pending_files < LIVE_COMPACTION_TRIGGER_FILES)
-            .map(|(cf, _debt)| *cf);
+            .filter(|(_cf, debt)| debt.pending_files < LIVE_COMPACTION_TRIGGER_FILES)
+            .take(ROUTINE_COMPACTION_CFS_PER_PASS)
+            .map(|(cf, _debt)| *cf)
+            .collect::<Vec<_>>();
         let selected = candidates
             .into_iter()
             .filter(|(cf, debt)| {
-                debt.pending_files >= LIVE_COMPACTION_TRIGGER_FILES
-                    || first_routine.is_some_and(|routine| routine == *cf)
+                debt.pending_files >= LIVE_COMPACTION_TRIGGER_FILES || routine_cfs.contains(cf)
             })
             .collect::<Vec<_>>();
         tracing::info!(

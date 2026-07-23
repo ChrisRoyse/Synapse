@@ -630,6 +630,19 @@ impl Db {
         self.backend.spawn_gc_task()
     }
 
+    /// Spawns the periodic checkpoint-only maintenance task (2026-07-23
+    /// cold-start fix): advances the durable manifest floor every ~30s so a
+    /// daemon kill strands seconds — not a 5-minute GC interval — of WAL tail
+    /// for restart replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the selected backend cannot spawn the task.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn spawn_checkpoint_task(&self) -> StorageResult<GcTask> {
+        self.backend.spawn_checkpoint_task()
+    }
+
     /// Returns the current DB-volume disk-pressure level.
     #[must_use]
     pub fn pressure_level(&self) -> DiskPressureLevel {
