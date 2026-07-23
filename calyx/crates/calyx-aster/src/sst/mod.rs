@@ -17,6 +17,49 @@ pub use reader_cache::{invalidate_reader, shared_reader};
 /// cannot drift from the read-side bound it must protect.
 pub const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
 
+/// Upper bound on decoded key+value bytes a single [`SstReader`] range scan will
+/// materialize into memory before failing closed.
+///
+/// SSTs target `DEFAULT_COMPACTION_TARGET_BYTES` (64 MiB) on disk, so a single
+/// reader materializing more than 1 GiB of decoded bytes is pathological — a
+/// runaway/oversized value, a corrupt record count, or an unexpectedly wide
+/// scan. Left unbounded, the accumulating `Vec` drives allocation into
+/// `handle_alloc_error`, which calls `abort()` (`__fastfail`, exit 0xC0000409)
+/// and takes down the whole process instead of returning an error the LSM query
+/// path can quarantine. Under rayon fan-out (`Level::range` scans every
+/// intersecting SST in parallel) the risk is multiplied across worker threads.
+/// See issue #1809: two daemon crashes at the shared abort trampoline, both with
+/// `SstReader::range` -> `RawVec::grow_one` -> `handle_alloc_error` on the
+/// faulting rayon worker.
+const MAX_RANGE_SCAN_BYTES: usize = 1 << 30;
+
+/// Fail-closed error for a range scan that would exceed [`MAX_RANGE_SCAN_BYTES`].
+fn scan_budget_exceeded(scanned: usize, next_record: usize) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
+        message: format!(
+            "SST range scan exceeded the {MAX_RANGE_SCAN_BYTES}-byte materialization budget \
+             (accumulated={scanned} bytes, next_record={next_record} bytes); refusing to \
+             allocate further to avoid an allocator abort"
+        ),
+        remediation: "narrow the key range or split the query; a single-SST scan this large \
+                      indicates a runaway value or corrupt record and is refused fail-closed",
+    }
+}
+
+/// Fail-closed error when growing the scan buffer fails allocation.
+///
+/// Converts what would otherwise be an infallible `Vec` growth (aborting the
+/// process via `handle_alloc_error`) into a propagable structured error.
+fn scan_reserve_failed(err: std::collections::TryReserveError) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_SCAN_ALLOC",
+        message: format!("SST range scan could not reserve memory for the next record: {err}"),
+        remediation: "the host is out of memory for this query; narrow the range or free memory \
+                      — the scan fails closed instead of aborting the daemon",
+    }
+}
+
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;
 use calyx_core::{CalyxError, Result};
@@ -219,11 +262,19 @@ impl SstReader {
             .index
             .partition_point(|entry| entry.key.as_slice() < start);
         let mut rows = Vec::new();
+        let mut scanned_bytes: usize = 0;
         for entry in &self.index[start_at..] {
             if entry.key.as_slice() >= end {
                 break;
             }
-            rows.push(read_record(self.column.as_bytes(), entry.offset)?);
+            let record = read_record(self.column.as_bytes(), entry.offset)?;
+            let record_bytes = record.key.len().saturating_add(record.value.len());
+            scanned_bytes = scanned_bytes.saturating_add(record_bytes);
+            if scanned_bytes > MAX_RANGE_SCAN_BYTES {
+                return Err(scan_budget_exceeded(scanned_bytes, record_bytes));
+            }
+            rows.try_reserve(1).map_err(scan_reserve_failed)?;
+            rows.push(record);
         }
         Ok(rows)
     }
@@ -267,11 +318,17 @@ impl SstReader {
             .index
             .partition_point(|entry| entry.key.as_slice() < start);
         let mut rows = Vec::new();
+        let mut scanned_bytes: usize = 0;
         for entry in &self.index[start_at..] {
             if end.is_some_and(|end| entry.key.as_slice() >= end) {
                 break;
             }
             let record = read_record_ref(self.column.as_bytes(), entry.offset)?;
+            scanned_bytes = scanned_bytes.saturating_add(record.key.len());
+            if scanned_bytes > MAX_RANGE_SCAN_BYTES {
+                return Err(scan_budget_exceeded(scanned_bytes, record.key.len()));
+            }
+            rows.try_reserve(1).map_err(scan_reserve_failed)?;
             rows.push(SstKeyState {
                 key: record.key.to_vec(),
                 is_tombstone: crate::mvcc::is_tombstone_value(record.value),

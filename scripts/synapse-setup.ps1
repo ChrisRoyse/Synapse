@@ -1232,22 +1232,43 @@ while ($true) {
     $env:SYNAPSE_BEARER_TOKEN = $token
     $env:SYNAPSE_LOG_DIR = $DaemonLogDir
 
+    # Capture child stderr to a per-generation rotating file. Rust writes its
+    # crash diagnostics here before __fastfail/abort (e.g. "memory allocation of
+    # N bytes failed", "thread '<name>' has overflowed its stack", or a panic
+    # message). Without this redirect those lines are lost and a 0xC0000409 exit
+    # is unattributable (see issue #1809). Keep the most recent 10 files.
+    $stderrLog = Join-Path $DaemonLogDir ('daemon-stderr-gen{0}-{1}.log' -f $generation, (Get-Date -Format 'yyyyMMddHHmmss'))
+    try {
+        $staleStderr = @(Get-ChildItem -LiteralPath $DaemonLogDir -Filter 'daemon-stderr-gen*.log' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 9)
+        foreach ($old in $staleStderr) { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue }
+    } catch { }
+
     Write-LogLine "SYNAPSE_DAEMON_LAUNCH_START generation=$generation command=$ExePath $DaemonArgumentText"
-    Write-SupervisorEvent 'launch_start' @{ generation = $generation; exe_path = $ExePath; arguments = $DaemonArgumentText }
+    Write-SupervisorEvent 'launch_start' @{ generation = $generation; exe_path = $ExePath; arguments = $DaemonArgumentText; stderr_log = $stderrLog }
     Write-SupervisorState -State 'launching' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Starting synapse-mcp daemon.'
 
     $startTime = Get-Date
-    $process = Start-Process -FilePath $ExePath -ArgumentList $DaemonArgumentText -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -PassThru
-    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id)"
-    Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id }
+    $process = Start-Process -FilePath $ExePath -ArgumentList $DaemonArgumentText -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -RedirectStandardError $stderrLog -PassThru
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) stderr_log=$stderrLog"
+    Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id; stderr_log = $stderrLog }
     Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon child process is running.'
 
     $process.WaitForExit()
     $endTime = Get-Date
     $exitCode = $process.ExitCode
     $runtimeMs = [int64](($endTime - $startTime).TotalMilliseconds)
-    Write-LogLine "SYNAPSE_DAEMON_EXIT generation=$generation pid=$($process.Id) exit_code=$exitCode runtime_ms=$runtimeMs"
-    Write-SupervisorEvent 'child_exit' @{ generation = $generation; child_pid = $process.Id; exit_code = $exitCode; runtime_ms = $runtimeMs }
+    $stderrTail = ''
+    try {
+        if (Test-Path -LiteralPath $stderrLog -PathType Leaf) {
+            $stderrTail = ((Get-Content -LiteralPath $stderrLog -Tail 40 -ErrorAction SilentlyContinue) -join ' | ').Trim()
+        }
+    } catch { }
+    Write-LogLine "SYNAPSE_DAEMON_EXIT generation=$generation pid=$($process.Id) exit_code=$exitCode runtime_ms=$runtimeMs stderr_log=$stderrLog"
+    if ($exitCode -ne 0 -and -not [string]::IsNullOrWhiteSpace($stderrTail)) {
+        Write-LogLine "SYNAPSE_DAEMON_STDERR generation=$generation pid=$($process.Id) exit_code=$exitCode tail=$stderrTail"
+    }
+    Write-SupervisorEvent 'child_exit' @{ generation = $generation; child_pid = $process.Id; exit_code = $exitCode; runtime_ms = $runtimeMs; stderr_log = $stderrLog; stderr_tail = $stderrTail }
     Write-SupervisorState -State 'child_exited' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode -Message "Daemon child exited after ${runtimeMs}ms."
 
     Stop-IfSetupMaintenanceActive -Phase 'post_child_exit' -Generation $generation -ChildPid $process.Id -ExitCode $exitCode
