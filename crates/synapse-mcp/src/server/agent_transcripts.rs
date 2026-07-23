@@ -2647,6 +2647,10 @@ pub(crate) fn spawn_periodic_transcript_ingest(
             // materializer takes the single rollup admission permit (skipping
             // when an operator backfill holds it), so it never races.
             run_cost_rollup_maintenance(&m3_state);
+            // #1688 (telemetry half): materialize telemetry rollups off-runtime
+            // and emit a rollup-served health-trend readback for the last sealed
+            // hour, so telemetry/health trends never scan the sample stream.
+            run_telemetry_rollup_maintenance(&m3_state);
             delay = std::time::Duration::from_secs(interval_secs);
         }
     });
@@ -2697,6 +2701,76 @@ fn run_cost_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
                 "periodic cost rollup materialization failed; will retry next cycle"
             );
         }
+    }
+}
+
+/// Materializes the #1688 telemetry rollups off-runtime and reads back a bounded
+/// health trend for the last sealed hour from the rollups (never a sample scan).
+/// Failures are logged, never fatal to the ingest loop.
+fn run_telemetry_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
+    use super::operational_facades::telemetry_rollup;
+    const NANOS_PER_HOUR: u64 = 60 * 60 * 1_000_000_000;
+    let db = {
+        let mut guard = match m3_state.lock() {
+            Ok(guard) => guard,
+            Err(_poisoned) => return,
+        };
+        match guard.ensure_storage() {
+            Ok(db) => db,
+            Err(_error) => return,
+        }
+    };
+    let report = match telemetry_rollup::materialize_telemetry_rollups_if_idle(&db) {
+        None => return,
+        Some(Ok(report)) => report,
+        Some(Err(error)) => {
+            tracing::warn!(
+                code = "TELEMETRY_ROLLUP_MAINTENANCE_FAILED",
+                error = %error.message,
+                "periodic telemetry rollup materialization failed; will retry next cycle"
+            );
+            return;
+        }
+    };
+    tracing::debug!(
+        code = "TELEMETRY_ROLLUP_MAINTENANCE_OK",
+        built_at_ns = report.built_at_ns,
+        sealed_horizon_ns = report.sealed_horizon_ns,
+        materialized_through_ns = report.materialized_through_ns,
+        points_scanned = report.points_scanned,
+        cells_written = report.cells_written,
+        "periodic telemetry rollup materialization completed"
+    );
+    let through = report.materialized_through_ns;
+    let Some(last_hour_start) = through.checked_sub(NANOS_PER_HOUR) else {
+        return;
+    };
+    // Rollup-served readback: the last sealed hour's agent-event totals/errors.
+    let total = telemetry_rollup::telemetry_trend(
+        &db,
+        telemetry_rollup::METRIC_AGENT_EVENTS_TOTAL,
+        last_hour_start,
+        through,
+        0,
+    );
+    let errors = telemetry_rollup::telemetry_trend(
+        &db,
+        telemetry_rollup::METRIC_AGENT_EVENTS_ERROR,
+        last_hour_start,
+        through,
+        0,
+    );
+    if let (Ok(total), Ok(errors)) = (total, errors) {
+        let total_events: u64 = total.windows.iter().map(|window| window.count).sum();
+        let error_events: u64 = errors.windows.iter().map(|window| window.count).sum();
+        tracing::info!(
+            code = "TELEMETRY_HEALTH_TREND",
+            window_start_ns = last_hour_start,
+            window_end_ns = through,
+            total_events,
+            error_events,
+            "sealed-hour agent-event health trend served from telemetry rollups"
+        );
     }
 }
 

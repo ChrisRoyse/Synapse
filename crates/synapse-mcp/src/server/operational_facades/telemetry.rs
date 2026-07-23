@@ -76,6 +76,10 @@ pub(super) async fn handle(
         agent_event_ingress: ingress,
         cf_row_counts,
     };
+    // #1688 (telemetry half): capture the live tool-surface gauges as telemetry
+    // series points at ingest (best-effort). The forward materializer turns
+    // these into bounded hour/day sum/count/mean trend rollups.
+    capture_status_telemetry_samples(service, &status);
     Ok(Json(TelemetryResponse {
         operation,
         source_of_truth: TELEMETRY_SOT.to_owned(),
@@ -83,6 +87,37 @@ pub(super) async fn handle(
             "tool profile snapshot + storage backend summary + ingress counters".to_owned(),
         status,
     }))
+}
+
+/// Records the live tool-surface gauges as #1688 telemetry samples. Best-effort:
+/// storage being unavailable or a capture error never fails a telemetry read.
+fn capture_status_telemetry_samples(service: &SynapseService, status: &TelemetryStatusResponse) {
+    let Ok(db) = service.m3_storage() else {
+        return;
+    };
+    let now_ns = crate::server::agent_events::unix_time_ns_now();
+    let samples = [
+        (
+            "telemetry.visible_tool_count",
+            status.tool_surface.visible_tool_count as f64,
+        ),
+        (
+            "telemetry.tool_payload_bytes",
+            status.tool_surface.model_payload.openai_tools_bytes as f64,
+        ),
+    ];
+    for (metric, value) in samples {
+        if let Err(error) =
+            super::telemetry_rollup::record_telemetry_sample(&db, metric, value, now_ns)
+        {
+            tracing::warn!(
+                code = "TELEMETRY_SAMPLE_CAPTURE_FAILED",
+                metric,
+                error = %error.message,
+                "telemetry gauge sample capture failed"
+            );
+        }
+    }
 }
 
 fn agent_ingress_stats() -> AgentEventIngressStats {

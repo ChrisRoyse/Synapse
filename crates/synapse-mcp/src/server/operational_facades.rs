@@ -7,6 +7,7 @@ mod routing;
 mod setup;
 mod storage;
 mod telemetry;
+pub(crate) mod telemetry_rollup;
 mod types;
 mod validation;
 

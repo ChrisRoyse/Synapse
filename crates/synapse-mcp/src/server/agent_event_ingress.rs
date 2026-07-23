@@ -315,7 +315,33 @@ pub(crate) fn ingest_agent_event(
         seq = readback.seq,
         "readback=CF_AGENT_EVENTS edge=ingress"
     );
+    // #1688: capture telemetry metric samples at ingest (best-effort; a rollup
+    // capture failure must never fail an accepted agent event). The forward
+    // materializer turns these into bounded hour/day trend rollups.
+    capture_agent_event_telemetry(db, &record);
     Ok((readback, record))
+}
+
+/// Records the #1688 telemetry metric samples for one accepted agent event.
+/// Best-effort: a capture failure is logged and swallowed so it can never fail
+/// an event that was already durably written to `CF_AGENT_EVENTS`.
+fn capture_agent_event_telemetry(db: &Db, record: &AgentEventRecord) {
+    use super::operational_facades::telemetry_rollup;
+    let mut samples: Vec<&'static str> = vec![telemetry_rollup::METRIC_AGENT_EVENTS_TOTAL];
+    if record.end_state == Some(AgentEndState::Error) {
+        samples.push(telemetry_rollup::METRIC_AGENT_EVENTS_ERROR);
+    }
+    for metric in samples {
+        if let Err(error) = telemetry_rollup::record_telemetry_sample(db, metric, 1.0, record.ts_ns)
+        {
+            tracing::warn!(
+                code = "TELEMETRY_SAMPLE_CAPTURE_FAILED",
+                metric,
+                error = %error.message,
+                "telemetry sample capture failed for an accepted agent event"
+            );
+        }
+    }
 }
 
 /// Counted refusal for a body that could not be read within the size cap
