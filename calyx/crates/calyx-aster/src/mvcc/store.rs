@@ -21,6 +21,13 @@ use std::sync::{Arc, RwLock};
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
 
+/// Structured-warning budget for how long the exclusive CF-router write lock may
+/// be held during a compaction reclaim+refresh swap. The streaming compaction
+/// itself runs without this lock; the lock covers only input reclaim plus the
+/// serving-view refresh, so exceeding this budget means reads on the affected
+/// CFs were blocked longer than intended and warrants investigation (#1798).
+const EXCLUSIVE_ROUTER_RECLAIM_WARN_MS: u64 = 250;
+
 /// Hard row-request ceiling for one atomic latest-range page.
 ///
 /// The implementation merges one bounded lookahead candidate in addition to
@@ -185,14 +192,27 @@ impl VersionedCfStore {
         let refresh_result = router.load_existing_cfs_with_lookup_policy(&unique, eager_lookup);
         match (reclaim_result, refresh_result) {
             (Ok(value), Ok(())) => {
+                let elapsed = started_at.elapsed();
+                let elapsed_ms = elapsed.as_millis();
                 tracing::info!(
                     code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_DONE",
                     operation,
                     cfs = %cf_names,
                     eager_lookup_on_refresh = eager_lookup,
-                    elapsed_ms = started_at.elapsed().as_millis(),
+                    elapsed_ms,
+                    exclusive_hold_warn_ms = EXCLUSIVE_ROUTER_RECLAIM_WARN_MS,
                     "completed exclusive Calyx router reclaim refresh"
                 );
+                if elapsed_ms > u128::from(EXCLUSIVE_ROUTER_RECLAIM_WARN_MS) {
+                    tracing::warn!(
+                        code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_SLOW",
+                        operation,
+                        cfs = %cf_names,
+                        elapsed_ms,
+                        exclusive_hold_warn_ms = EXCLUSIVE_ROUTER_RECLAIM_WARN_MS,
+                        "exclusive Calyx router write lock was held beyond the maintenance budget during reclaim+refresh; reads on these CFs were blocked for the duration"
+                    );
+                }
                 Ok(value)
             }
             (Err(error), Ok(())) => {

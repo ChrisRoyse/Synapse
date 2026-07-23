@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -78,6 +81,23 @@ const CALYX_ORDERED_KEY_MIGRATION_PAGE_ROWS: usize = 512;
 const CALYX_GC_CF: &str = "storage_gc";
 const CALYX_GC_WAL_RECYCLE_MAX_SEGMENTS: usize = 8;
 const CALYX_GC_WAL_RECYCLE_FSYNC_BUDGET: usize = 8;
+/// Tombstone-purge pacing: a full-CF streaming tombstone purge rewrites the
+/// entire KV CF (hundreds of MB) with an unlimited compaction throttle, so it
+/// must not fire on every GC tick just because a handful of rows were evicted.
+/// It runs only once the deferred logical-delete backlog crosses this row
+/// floor, or the max-defer interval below elapses. Deferring is always safe:
+/// the tombstones are already committed logical deletes; only physical space
+/// reclamation is postponed, and urgent reclamation still flows through the
+/// disk-pressure compaction path.
+const CALYX_GC_TOMBSTONE_PURGE_ROW_THRESHOLD: u64 = 4_096;
+/// Upper bound on how long a non-empty tombstone backlog may be deferred before
+/// a full-CF purge is forced regardless of the row floor.
+const CALYX_GC_TOMBSTONE_PURGE_MAX_DEFER_MS: u64 = 30 * 60 * 1_000;
+/// Deferred (committed but not yet physically purged) KV tombstone rows.
+static CALYX_GC_PENDING_TOMBSTONE_ROWS: AtomicU64 = AtomicU64::new(0);
+/// Vault-clock millisecond stamp of the last full-CF tombstone purge, `0` until
+/// the first purge runs.
+static CALYX_GC_LAST_TOMBSTONE_PURGE_MS: AtomicU64 = AtomicU64::new(0);
 const CALYX_GC_PROTECTED_CF_POLICY_SKIPPED: &str = "protected_cf_policy_skipped";
 const CALYX_GC_CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
 const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
@@ -6832,14 +6852,45 @@ fn run_calyx_gc_budgets(
         let tombstone_rows =
             calyx_len_to_u64(CALYX_GC_CF, "Calyx GC tombstones", tombstones.len())?;
         commit_calyx_rows_to_vault(vault, CALYX_GC_CF, tombstones)?;
-        vault.purge_kv_tombstones().map_err(|source| {
-            calyx_write_failed(CALYX_GC_CF, "purge Calyx KV tombstones after GC", &source)
-        })?;
-        tracing::info!(
-            code = "STORAGE_CALYX_GC_TOMBSTONES_PURGED",
-            tombstone_rows,
-            "Calyx storage GC purged committed KV tombstones"
-        );
+        // Accumulate the newly committed logical deletes and pace the expensive
+        // full-CF physical purge (issue #1798): only rewrite the whole KV CF once
+        // the deferred backlog crosses a row floor or the max-defer interval
+        // elapses, instead of on every tick that evicted any row.
+        let pending = CALYX_GC_PENDING_TOMBSTONE_ROWS
+            .fetch_add(tombstone_rows, Ordering::AcqRel)
+            .saturating_add(tombstone_rows);
+        let last_purge_ms = CALYX_GC_LAST_TOMBSTONE_PURGE_MS.load(Ordering::Acquire);
+        let since_last_purge_ms = now_ms.saturating_sub(last_purge_ms);
+        let force_after_defer =
+            last_purge_ms != 0 && since_last_purge_ms >= CALYX_GC_TOMBSTONE_PURGE_MAX_DEFER_MS;
+        let should_purge = pending >= CALYX_GC_TOMBSTONE_PURGE_ROW_THRESHOLD
+            || last_purge_ms == 0
+            || force_after_defer;
+        if should_purge {
+            vault.purge_kv_tombstones().map_err(|source| {
+                calyx_write_failed(CALYX_GC_CF, "purge Calyx KV tombstones after GC", &source)
+            })?;
+            CALYX_GC_PENDING_TOMBSTONE_ROWS.store(0, Ordering::Release);
+            CALYX_GC_LAST_TOMBSTONE_PURGE_MS.store(now_ms, Ordering::Release);
+            tracing::info!(
+                code = "STORAGE_CALYX_GC_TOMBSTONES_PURGED",
+                tombstone_rows,
+                purged_backlog_rows = pending,
+                since_last_purge_ms,
+                forced_after_defer = force_after_defer,
+                "Calyx storage GC purged committed KV tombstones"
+            );
+        } else {
+            tracing::info!(
+                code = "STORAGE_CALYX_GC_TOMBSTONE_PURGE_DEFERRED",
+                tombstone_rows,
+                pending_tombstone_rows = pending,
+                purge_row_threshold = CALYX_GC_TOMBSTONE_PURGE_ROW_THRESHOLD,
+                since_last_purge_ms,
+                max_defer_ms = CALYX_GC_TOMBSTONE_PURGE_MAX_DEFER_MS,
+                "deferring full-CF Calyx KV tombstone purge under pacing hysteresis; logical deletes already committed"
+            );
+        }
     }
 
     let native_fanout = vault.compact_native_fanout_once().map_err(|source| {

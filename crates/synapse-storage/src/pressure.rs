@@ -257,12 +257,28 @@ fn spawn_with_probe(
             tokio::select! {
                 _ = interval.tick() => {
                     let started = mark_pressure_probe_started(&state);
-                    let result = match probe.available_space(&path) {
-                        Ok(free_bytes) => {
-                            apply_free_bytes(&state, &config, free_bytes, maintenance.as_ref())
-                        }
-                        Err(error) => Err(error),
-                    };
+                    // A pressure transition can trigger a KV compaction that
+                    // runs for minutes. Admit the probe-and-apply pass onto the
+                    // dedicated blocking pool so it never parks a runtime worker
+                    // serving MCP requests (#1798).
+                    let tick_state = Arc::clone(&state);
+                    let tick_config = config.clone();
+                    let tick_probe = Arc::clone(&probe);
+                    let tick_maintenance = Arc::clone(&maintenance);
+                    let tick_path = path.clone();
+                    let result = crate::maintenance::run_admitted_maintenance(
+                        "storage_disk_pressure",
+                        move || match tick_probe.available_space(&tick_path) {
+                            Ok(free_bytes) => apply_free_bytes(
+                                &tick_state,
+                                &tick_config,
+                                free_bytes,
+                                tick_maintenance.as_ref(),
+                            ),
+                            Err(error) => Err(error),
+                        },
+                    )
+                    .await;
                     mark_pressure_probe_completed(&state, started, result.as_ref());
                     if let Err(error) = result {
                         tracing::warn!(error = %error, "storage disk-pressure tick failed");

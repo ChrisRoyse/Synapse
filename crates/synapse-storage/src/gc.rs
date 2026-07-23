@@ -133,7 +133,16 @@ pub fn spawn_runner(runner: Arc<dyn GcRunner>, interval: Duration) -> StorageRes
             tokio::select! {
                 _ = interval.tick() => {
                     let started = mark_gc_tick_started(&task_state);
-                    let result = runner.run_once();
+                    // The GC pass is synchronous and can run for minutes over
+                    // hundreds of megabytes (native-CF compaction, tombstone
+                    // purge). Admit it onto the dedicated blocking pool so it
+                    // never parks a runtime worker serving MCP requests (#1798).
+                    let tick_runner = Arc::clone(&runner);
+                    let result = crate::maintenance::run_admitted_maintenance(
+                        "storage_gc",
+                        move || tick_runner.run_once(),
+                    )
+                    .await;
                     mark_gc_tick_completed(&task_state, started, &result);
                     if let Err(error) = result {
                         tracing::warn!(error = %error, "storage GC tick failed");
