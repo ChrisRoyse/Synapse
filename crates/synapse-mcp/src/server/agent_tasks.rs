@@ -3063,6 +3063,47 @@ impl SynapseService {
         &self,
         params: TaskCancelParams,
     ) -> Result<TaskMutationResponse, ErrorData> {
+        let db = self.agent_task_db()?;
+        // Terminal re-cancel is a read-only idempotent no-op. `Cancelled` is a
+        // transition-matrix sink, so `Cancelled -> Cancelled` carries no state
+        // delta; delegating to the guarded update path would still commit a write
+        // (bumping the queue mutation_generation and moving updated_unix_ms on a
+        // terminal row), leaving a misleading audit trail for a request that
+        // changed nothing. Short-circuit with a read-only readback instead. A
+        // `Cancelled` row can never leave that state, so this early observation
+        // can never be stale in a way that hides a pending transition.
+        //
+        // Every non-cancelled state (including the other terminal state, `done`)
+        // falls through to `task_update_impl`, where the transition matrix still
+        // rejects `Done -> Cancelled` with AGENT_TASK_INVALID_TRANSITION and
+        // performs the guarded write for live states.
+        let existing = Self::read_task_row_revisioned(&db, &params.task_id)?
+            .ok_or_else(|| task_not_found(&params.task_id))?;
+        if existing.task.state == TaskState::Cancelled {
+            let row_key = String::from_utf8(existing.key).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!("agent task physical key is not UTF-8: {error}"),
+                )
+            })?;
+            let value_len_bytes = encode_task(&existing.task)?.len() as u64;
+            tracing::info!(
+                code = "AGENT_TASK_CANCEL_NOOP",
+                task_id = %existing.task.task_id,
+                state = existing.task.state.as_str(),
+                mutation_generation = existing.task.mutation_generation,
+                "readback=agent_tasks edge=cancel_noop terminal re-cancel is a read-only idempotent success"
+            );
+            return Ok(TaskMutationResponse {
+                ok: true,
+                task: existing.task,
+                written_row: TaskRowReadback {
+                    cf_name: cf::CF_KV.to_owned(),
+                    row_key,
+                    value_len_bytes,
+                },
+            });
+        }
         self.task_update_impl(TaskUpdateParams {
             task_id: params.task_id,
             state: Some(TaskState::Cancelled),
@@ -4252,7 +4293,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Cancel an agent task (move it to the terminal cancelled state), settling any live attempt as failed. Errors AGENT_TASK_INVALID_TRANSITION if already terminal."
+        description = "Cancel an agent task (move it to the terminal cancelled state), settling any live attempt as failed. Re-cancelling an already-cancelled task is an idempotent read-only no-op (no generation bump, no updated_unix_ms change). Errors AGENT_TASK_INVALID_TRANSITION for any other terminal state (e.g. done)."
     )]
     pub async fn task_cancel(
         &self,
