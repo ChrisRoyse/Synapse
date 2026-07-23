@@ -1848,6 +1848,9 @@ fn choose_causality_streams(
     Ok((ranked[0].0.clone(), ranked[1].0.clone()))
 }
 
+/// One activity stream as consecutive `(bin_index, event_count)` samples.
+type BinnedStream = Vec<(u64, f32)>;
+
 /// Builds two aligned integer-bin count streams over the union time range so the
 /// transfer-entropy lag operates on consecutive bins (value 0 bins are kept so
 /// the estimator's history lookups never straddle a gap).
@@ -1855,7 +1858,7 @@ fn paired_binned_streams(
     a_times: &[f64],
     b_times: &[f64],
     bin: f64,
-) -> (Vec<(u64, f32)>, Vec<(u64, f32)>) {
+) -> (BinnedStream, BinnedStream) {
     let min_t = a_times
         .iter()
         .chain(b_times)
