@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
 use calyx_aster::{cf::ColumnFamily, vault::encode::decode_constellation_base};
-use calyx_core::{Constellation, CxId, SlotVector};
+use calyx_core::{Clock, Constellation, CxId, SlotVector};
 use calyx_sextant::{FreshnessTag, Hit};
 
 use super::{SEARCH_READER_LEASE_MS, SearchFreshness};
@@ -34,13 +34,13 @@ pub(super) fn index_freshness_tag(
     }
 }
 
-pub(super) struct SearchReadSnapshot<'a> {
-    vault: &'a AsterVault,
+pub(super) struct SearchReadSnapshot<'a, C: Clock> {
+    vault: &'a AsterVault<C>,
     snapshot: Snapshot,
 }
 
-impl<'a> SearchReadSnapshot<'a> {
-    pub(super) fn pin(vault: &'a AsterVault) -> Self {
+impl<'a, C: Clock> SearchReadSnapshot<'a, C> {
+    pub(super) fn pin(vault: &'a AsterVault<C>) -> Self {
         Self {
             vault,
             snapshot: vault.pin_reader(Freshness::FreshDerived, SEARCH_READER_LEASE_MS),
@@ -74,7 +74,7 @@ impl<'a> SearchReadSnapshot<'a> {
     }
 }
 
-impl Drop for SearchReadSnapshot<'_> {
+impl<C: Clock> Drop for SearchReadSnapshot<'_, C> {
     fn drop(&mut self) {
         let _ = self.vault.release_reader(self.snapshot.lease().id());
     }
@@ -84,8 +84,8 @@ pub(super) fn is_stale_derived(error: &crate::error::SearchError) -> bool {
     matches!(error, crate::error::SearchError::Calyx(inner) if inner.code == "CALYX_STALE_DERIVED")
 }
 
-pub(super) fn vault_base_count_at(
-    vault: &AsterVault,
+pub(super) fn vault_base_count_at<C: Clock>(
+    vault: &AsterVault<C>,
     snapshot: Snapshot,
     panel_version: u32,
 ) -> CliResult<usize> {

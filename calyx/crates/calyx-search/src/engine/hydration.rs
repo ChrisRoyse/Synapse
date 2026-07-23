@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{Constellation, CxId};
+use calyx_core::{Clock, Constellation, CxId};
 use calyx_sextant::{FreshnessTag, Hit};
 
 use crate::engine_trace::SearchTracer;
@@ -16,8 +16,8 @@ use super::support::{SearchReadSnapshot, index_freshness_tag};
 use super::{SearchBudget, SearchFreshness};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn hydrate_hit_docs_with_bounded_readbacks(
-    vault: &AsterVault,
+pub(super) fn hydrate_hit_docs_with_bounded_readbacks<C: Clock>(
+    vault: &AsterVault<C>,
     vault_dir: &Path,
     indexes: &PersistedSearchIndexes,
     hits: &[Hit],
@@ -139,13 +139,13 @@ fn hit_slots_key(hit: &Hit) -> String {
         .join(",")
 }
 
-fn pin_search_readback<'a>(
-    vault: &'a AsterVault,
+fn pin_search_readback<'a, C: Clock>(
+    vault: &'a AsterVault<C>,
     trace: &mut SearchTracer<'_>,
     phase: &'static str,
     cx_id: Option<CxId>,
     hit_ordinal: usize,
-) -> SearchReadSnapshot<'a> {
+) -> SearchReadSnapshot<'a, C> {
     trace.emit_detail(
         "snapshot.pin.start",
         None,
@@ -175,9 +175,9 @@ fn pin_search_readback<'a>(
     read
 }
 
-fn verify_index_freshness(
+fn verify_index_freshness<C: Clock>(
     indexes: &PersistedSearchIndexes,
-    read: &SearchReadSnapshot<'_>,
+    read: &SearchReadSnapshot<'_, C>,
     freshness: SearchFreshness,
     trace: &mut SearchTracer<'_>,
 ) -> CliResult<FreshnessTag> {
@@ -206,11 +206,11 @@ fn verify_index_freshness(
     Ok(freshness_tag)
 }
 
-fn contextualize_hit_hydration_error(
+fn contextualize_hit_hydration_error<C: Clock>(
     error: crate::error::SearchError,
     hit: &Hit,
     hit_index: usize,
-    read: &SearchReadSnapshot<'_>,
+    read: &SearchReadSnapshot<'_, C>,
 ) -> crate::error::SearchError {
     if error.code() != "CALYX_READER_LEASE_EXPIRED" {
         return error;

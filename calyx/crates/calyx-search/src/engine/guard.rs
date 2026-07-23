@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::AsterVault;
 use calyx_core::CalyxError;
-use calyx_core::{Constellation, CxId, SlotId, SlotVector, VaultStore};
+use calyx_core::{Clock, Constellation, CxId, SlotId, SlotVector, VaultStore};
 use calyx_sextant::Hit;
 use calyx_ward::GuardProfile;
 
@@ -38,8 +38,8 @@ pub(super) enum ResolvedGuard {
 /// calibrated Ward profile is loaded from the Guard CF and fails closed when
 /// absent/uncalibrated/panel-mismatched. Never silently clamp or default
 /// (issues #1088, #1094).
-pub(super) fn resolve_guard(
-    vault: &AsterVault,
+pub(super) fn resolve_guard<C: Clock>(
+    vault: &AsterVault<C>,
     guard: GuardChoice,
     guard_tau: Option<f32>,
     guard_panel_version: Option<u32>,
@@ -69,8 +69,8 @@ pub(super) fn resolve_guard(
 /// The caller must have opened the vault with [`ColumnFamily::Guard`]
 /// selected: reading an unselected CF silently returns `None`, which would
 /// masquerade as a missing profile (#1094).
-fn load_default_guard_profile(
-    vault: &AsterVault,
+fn load_default_guard_profile<C: Clock>(
+    vault: &AsterVault<C>,
     guard_panel_version: Option<u32>,
 ) -> CliResult<GuardProfile> {
     let Some(bytes) = vault.read_cf_at(

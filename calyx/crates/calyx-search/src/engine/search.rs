@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Panel, SlotId, SlotVector, VaultStore};
+use calyx_core::{CalyxError, Clock, Panel, SlotId, SlotVector, VaultStore};
 use calyx_sextant::FusionContext;
 use calyx_sextant::{apply_in_region_guard_to_hits, fusion};
 
@@ -25,8 +25,8 @@ use super::support::{
 use super::{FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchOutcome};
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn search_outcome_with_measured_slots(
-    vault: &AsterVault,
+pub(super) fn search_outcome_with_measured_slots<C: Clock>(
+    vault: &AsterVault<C>,
     vault_dir: &Path,
     query_vectors: &[(SlotId, SlotVector)],
     k: usize,

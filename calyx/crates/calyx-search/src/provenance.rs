@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use calyx_aster::ledger_view::read_ledger_seqs_traced;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Constellation, CxId, LedgerRef};
+use calyx_core::{CalyxError, Clock, Constellation, CxId, LedgerRef};
 use calyx_ledger::{EntryKind, LedgerEntry, SubjectId, decode};
 use calyx_sextant::{
     CALYX_SEXTANT_PROVENANCE_MISSING, FreshnessTag, Hit, ProvenanceSource, sextant_error,
@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::error::CliResult;
 
-pub(crate) fn hit_docs_at(
-    vault: &AsterVault,
+pub(crate) fn hit_docs_at<C: Clock>(
+    vault: &AsterVault<C>,
     hits: &[Hit],
     snapshot: Snapshot,
     hydrate_slots: bool,

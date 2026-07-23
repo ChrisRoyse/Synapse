@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{SlotId, SlotVector};
+use calyx_core::{Clock, SlotId, SlotVector};
 
 use crate::engine_measure::measure_query_vectors_with_slots_traced;
 pub use crate::engine_measure::{measure_query_vectors, measure_query_vectors_with_slots};
@@ -48,8 +48,8 @@ const SEARCH_READER_LEASE_MS: u64 = 300_000;
 /// a query with no indexable lens vectors, or stored vectors that don't match
 /// the active query lenses, is a structured error (no silent empty result).
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome(
-    vault: &AsterVault,
+pub fn search_outcome<C: Clock>(
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
     vault_dir: &Path,
     query: &str,
@@ -77,8 +77,8 @@ pub fn search_outcome(
 /// indexes; `StaleOk` permits lag only while tagging every hit with the index
 /// build seq and current Base snapshot seq.
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome_with_freshness(
-    vault: &AsterVault,
+pub fn search_outcome_with_freshness<C: Clock>(
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
     vault_dir: &Path,
     query: &str,
@@ -98,8 +98,8 @@ pub fn search_outcome_with_freshness(
 /// active text lens, but matrix/probe callers sometimes need a physically exact
 /// subset: only those slots may be measured, searched, fused, and guarded.
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome_with_slots(
-    vault: &AsterVault,
+pub fn search_outcome_with_slots<C: Clock>(
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
     vault_dir: &Path,
     query: &str,
@@ -129,8 +129,8 @@ pub fn search_outcome_with_slots(
 
 /// Slot-scoped search with optional structured phase events.
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome_with_slots_traced(
-    vault: &AsterVault,
+pub fn search_outcome_with_slots_traced<C: Clock>(
+    vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
     vault_dir: &Path,
     query: &str,
@@ -169,8 +169,8 @@ pub fn search_outcome_with_slots_traced(
 /// resident-service callers so query embedding does not cold-load GPU runtimes
 /// inside the search process.
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome_with_query_vectors(
-    vault: &AsterVault,
+pub fn search_outcome_with_query_vectors<C: Clock>(
+    vault: &AsterVault<C>,
     vault_dir: &Path,
     panel: &calyx_core::Panel,
     query_vectors: &[(SlotId, SlotVector)],
@@ -198,8 +198,8 @@ pub fn search_outcome_with_query_vectors(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome_with_query_vectors_freshness(
-    vault: &AsterVault,
+pub fn search_outcome_with_query_vectors_freshness<C: Clock>(
+    vault: &AsterVault<C>,
     vault_dir: &Path,
     panel: &calyx_core::Panel,
     query_vectors: &[(SlotId, SlotVector)],
@@ -240,8 +240,8 @@ pub fn search_outcome_with_query_vectors_freshness(
 /// `guard_panel_version` is supplied) calibrated for a different panel
 /// version (#1094). There is no silent default tau.
 #[allow(clippy::too_many_arguments)]
-pub fn search_outcome_with_query_vectors_freshness_cached(
-    vault: &AsterVault,
+pub fn search_outcome_with_query_vectors_freshness_cached<C: Clock>(
+    vault: &AsterVault<C>,
     vault_dir: &Path,
     panel: &calyx_core::Panel,
     query_vectors: &[(SlotId, SlotVector)],
