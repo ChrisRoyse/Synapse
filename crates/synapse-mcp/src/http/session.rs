@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -143,11 +146,11 @@ pub(super) async fn require_mcp_session(
         return next.run(request).await;
     }
     let session_id = session_id_from_header(&request);
-    let request = match enforce_session_header(request).await {
-        Ok(request) => request,
+    let (request, method_from_enforce) = match enforce_session_header(request).await {
+        Ok(pair) => pair,
         Err(response) => return response,
     };
-    let request = match session_id.as_deref() {
+    let (request, jsonrpc_method) = match session_id.as_deref() {
         Some(session_id) => {
             if session_is_terminated(&state.terminated_sessions, session_id) {
                 if request.method() == Method::DELETE {
@@ -169,12 +172,32 @@ pub(super) async fn require_mcp_session(
                 return session_invalid_for(SessionFailure::Terminated, Some(session_id));
             }
             match record_session_request(&state.session_registry, session_id, request).await {
-                Ok(request) => request,
+                Ok(pair) => pair,
                 Err(response) => return response,
             }
         }
-        None => request,
+        None => (request, method_from_enforce),
     };
+
+    // #1773 handshake attribution: emit a structured edge for the two
+    // handshake-phase JSON-RPC messages (initialize, notifications/initialized)
+    // so any future 30s client timeout can be attributed from the daemon log
+    // alone. The `received` edge is the proof the request arrived at all; the
+    // `responded` edge carries `elapsed_ms` — the exact slice of the client's
+    // handshake budget the daemon spent producing the response.
+    let handshake_phase = jsonrpc_method.as_deref().and_then(handshake_phase_label);
+    if let Some(phase) = handshake_phase {
+        tracing::info!(
+            code = "MCP_HANDSHAKE_EDGE",
+            edge = "received",
+            phase,
+            transport = "http",
+            session_id = session_id.as_deref().unwrap_or(""),
+            "handshake message received at HTTP transport"
+        );
+    }
+    let handshake_started = handshake_phase.map(|_| Instant::now());
+
     let diagnostic_session_id = session_id.clone();
     CURRENT_MCP_SESSION_ID
         .scope(session_id, async move {
@@ -185,9 +208,43 @@ pub(super) async fn require_mcp_session(
                     diagnostic_session_id.as_deref(),
                 );
             }
+            if let (Some(phase), Some(started)) = (handshake_phase, handshake_started) {
+                // For `initialize` the session id is assigned in the response
+                // header; prefer it, falling back to any request-scoped id.
+                let assigned_session_id = response
+                    .headers()
+                    .get(SESSION_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| diagnostic_session_id.clone());
+                tracing::info!(
+                    code = "MCP_HANDSHAKE_EDGE",
+                    edge = "responded",
+                    phase,
+                    transport = "http",
+                    status = response.status().as_u16(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    session_id = assigned_session_id.as_deref().unwrap_or(""),
+                    "handshake message handled by HTTP transport"
+                );
+            }
             response
         })
         .await
+}
+
+/// Map a JSON-RPC method to its handshake phase label, or `None` when the
+/// message is not part of the initialize handshake. Only these two messages
+/// participate in the client's bounded handshake window; every other method is
+/// a post-handshake tool/protocol call and is not attributed here.
+fn handshake_phase_label(method: &str) -> Option<&'static str> {
+    match method {
+        "initialize" => Some("initialize"),
+        "notifications/initialized" => Some("notifications_initialized"),
+        _ => None,
+    }
 }
 
 pub(super) async fn release_held_inputs_on_delete(
@@ -290,16 +347,20 @@ fn parse_idle_timeout(raw: &str) -> anyhow::Result<u64> {
     Ok(seconds)
 }
 
-async fn enforce_session_header(request: Request<Body>) -> Result<Request<Body>, Response> {
+async fn enforce_session_header(
+    request: Request<Body>,
+) -> Result<(Request<Body>, Option<String>), Response> {
     if has_session_header(&request) {
-        return Ok(request);
+        // The JSON-RPC method for a session-bearing POST is resolved later in
+        // `record_session_request`, which already consumes the body once.
+        return Ok((request, None));
     }
     if request.method() == Method::POST {
         allow_initialize_without_session(request).await
     } else if request.method() == Method::GET || request.method() == Method::DELETE {
         Err(session_invalid(SessionFailure::Missing))
     } else {
-        Ok(request)
+        Ok((request, None))
     }
 }
 
@@ -319,16 +380,20 @@ fn session_id_from_header(request: &Request<Body>) -> Option<String> {
 
 async fn allow_initialize_without_session(
     request: Request<Body>,
-) -> Result<Request<Body>, Response> {
+) -> Result<(Request<Body>, Option<String>), Response> {
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
     let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
-    let is_initialize = parsed.as_ref().is_ok_and(jsonrpc_method_is_initialize);
+    let method = parsed
+        .as_ref()
+        .ok()
+        .and_then(|value| jsonrpc_method(value).map(ToOwned::to_owned));
+    let is_initialize = method.as_deref() == Some("initialize");
     let request = Request::from_parts(parts, Body::from(bytes));
     if parsed.is_err() || is_initialize {
-        Ok(request)
+        Ok((request, method))
     } else {
         Err(session_invalid(SessionFailure::Missing))
     }
@@ -338,21 +403,23 @@ async fn record_session_request(
     session_registry: &crate::server::session_registry::SharedSessionRegistry,
     session_id: &str,
     request: Request<Body>,
-) -> Result<Request<Body>, Response> {
+) -> Result<(Request<Body>, Option<String>), Response> {
     if request.method() != Method::POST {
         record_session_heartbeat(session_registry, session_id, None)?;
-        return Ok(request);
+        return Ok((request, None));
     }
 
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
-    let action = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| jsonrpc_action_label(&value));
+    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let action = parsed.as_ref().and_then(jsonrpc_action_label);
+    let method = parsed
+        .as_ref()
+        .and_then(|value| jsonrpc_method(value).map(ToOwned::to_owned));
     record_session_heartbeat(session_registry, session_id, action)?;
-    Ok(Request::from_parts(parts, Body::from(bytes)))
+    Ok((Request::from_parts(parts, Body::from(bytes)), method))
 }
 
 fn record_session_heartbeat(
@@ -392,11 +459,8 @@ fn jsonrpc_action_label(value: &serde_json::Value) -> Option<String> {
     Some(method.to_owned())
 }
 
-fn jsonrpc_method_is_initialize(value: &serde_json::Value) -> bool {
-    value
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|method| method == "initialize")
+fn jsonrpc_method(value: &serde_json::Value) -> Option<&str> {
+    value.get("method").and_then(serde_json::Value::as_str)
 }
 
 fn is_mcp_endpoint(path: &str) -> bool {

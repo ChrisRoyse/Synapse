@@ -1850,6 +1850,70 @@ impl AsyncWrite for TrackedTcpStream {
     }
 }
 
+/// A single startup phase whose wall time exceeds this bound emits an
+/// incremental `MCP_STARTUP_PHASE_SLOW` warn edge at the moment it completes,
+/// so a slow cold start (dominated by Calyx vault open, see #1798) is
+/// attributable from the daemon log without waiting for the readiness summary.
+const STARTUP_SLOW_PHASE_THRESHOLD_MS: u128 = 3_000;
+
+fn wall_clock_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|delta| delta.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Monotonic per-phase startup stopwatch (#1773). `serve` marks each startup
+/// milestone (single-instance lock, vault open, listener bind, …); every mark
+/// returns the phase delta and slow phases are logged incrementally, while the
+/// full breakdown is emitted once as `MCP_STARTUP_PHASES_READY` at readiness.
+/// This is attribution only — no timeout or control-flow behavior changes.
+struct StartupPhaseTimer {
+    started: Instant,
+    last: Instant,
+    started_wall_ms: u64,
+    listener_bound: bool,
+}
+
+impl StartupPhaseTimer {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            started_wall_ms: wall_clock_millis_now(),
+            listener_bound: false,
+        }
+    }
+
+    /// Close out the phase that ended now, returning its elapsed milliseconds.
+    /// Emits `MCP_STARTUP_PHASE_SLOW` incrementally when the phase overran the
+    /// threshold, tagged with whether the production listener was already bound
+    /// so a pre-bind stall is never confused with a post-bind one.
+    fn mark(&mut self, phase: &'static str) -> u64 {
+        let now = Instant::now();
+        let phase_ms = now.duration_since(self.last).as_millis();
+        let total_ms = now.duration_since(self.started).as_millis();
+        self.last = now;
+        if phase_ms >= STARTUP_SLOW_PHASE_THRESHOLD_MS {
+            tracing::warn!(
+                code = "MCP_STARTUP_PHASE_SLOW",
+                phase,
+                phase_ms = phase_ms as u64,
+                total_ms = total_ms as u64,
+                threshold_ms = STARTUP_SLOW_PHASE_THRESHOLD_MS as u64,
+                listener_bound = self.listener_bound,
+                "startup phase exceeded the slow threshold; a client handshake overlapping this window can time out"
+            );
+        }
+        phase_ms as u64
+    }
+
+    fn total_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
 pub(super) async fn serve(
     bind: &str,
     allow_non_loopback: bool,
@@ -1858,6 +1922,7 @@ pub(super) async fn serve(
     m4_config: M4ServiceConfig,
 ) -> anyhow::Result<ExitCode> {
     synapse_action::install_panic_hook();
+    let mut startup_timer = StartupPhaseTimer::new();
 
     // Validate the bind address first — a pure argument check with no side
     // effects. Doing this before acquiring the single-instance lock means a
@@ -1914,6 +1979,7 @@ pub(super) async fn serve(
             return Err(anyhow::Error::new(err)).context("acquire daemon single-instance lock");
         }
     };
+    let startup_single_instance_ms = startup_timer.mark("single_instance_lock");
 
     let shell_job_root = match crate::m4::shell_job_root_dir() {
         Ok(root) => root,
@@ -1997,6 +2063,8 @@ pub(super) async fn serve(
         );
     }
 
+    let startup_shell_job_lock_ms = startup_timer.mark("shell_job_store_lock");
+
     let lifecycle_paths =
         crate::daemon_lifecycle::configure(crate::daemon_lifecycle::DaemonLifecycleConfig {
             mode: "http",
@@ -2013,6 +2081,7 @@ pub(super) async fn serve(
         exit_events_path = %lifecycle_paths.exit_events_path,
         "daemon lifecycle ledger ready"
     );
+    let startup_lifecycle_ledger_ms = startup_timer.mark("lifecycle_ledger");
 
     // #1568: corrupt durable shell-job evidence is a startup safety gate. Run
     // it after the independent shell-job lifetime lock proves this process owns
@@ -2046,6 +2115,8 @@ pub(super) async fn serve(
         return Ok(ExitCode::from(4));
     }
 
+    let startup_shell_job_reap_ms = startup_timer.mark("shell_job_reap");
+
     let shutdown_cancel = CancellationToken::new();
     let connection_closed_cancel = CancellationToken::new();
     let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
@@ -2060,6 +2131,7 @@ pub(super) async fn serve(
     .context("initialize shared HTTP service state")?;
     let m3_state_for_recorder = service.m3_state_handle();
     let m2_emitter_owner = take_m2_emitter_owner(&service);
+    let startup_service_init_ms = startup_timer.mark("service_init");
 
     // Eager storage and Calyx vault open: validate lock/schema/vault state
     // before the production TCP listener is bound. A bound listener before
@@ -2152,6 +2224,9 @@ pub(super) async fn serve(
             "daemon storage and Calyx vault opened eagerly at startup"
         );
     }
+    // Vault open dominates cold start (#1798): capture its isolated cost so a
+    // handshake that overlaps a slow cold open is attributable to this phase.
+    let startup_storage_calyx_open_ms = startup_timer.mark("storage_calyx_open");
 
     // Always-on activity recorder (#837): started eagerly so the operator
     // timeline records whenever the daemon runs, before any tool call can
@@ -2219,6 +2294,7 @@ pub(super) async fn serve(
             "activity recorder started eagerly at startup"
         );
     }
+    let startup_activity_recorder_ms = startup_timer.mark("activity_recorder");
 
     if !addr.ip().is_loopback() {
         tracing::warn!(
@@ -2227,7 +2303,20 @@ pub(super) async fn serve(
             "non-loopback HTTP bind allowed by explicit operator flag"
         );
     }
+    // Pre-bind marker (#1773): everything above ran with NO listener bound. If
+    // this edge is present in the log but MCP_HTTP_BIND_NORMAL is not, the port
+    // was never bound (matches the issue's `NO_TCP_7700_ENDPOINT` readback) —
+    // the process either stalled in, or died before completing, the bind below.
+    tracing::info!(
+        code = "MCP_HTTP_PRE_BIND",
+        bind = %addr,
+        startup_elapsed_ms = startup_timer.total_ms(),
+        listener_bound = false,
+        "about to bind the production HTTP listener; no listener is bound at this point in startup"
+    );
     let listener = bind_http_listener(addr).await?;
+    startup_timer.listener_bound = true;
+    let startup_listener_bind_ms = startup_timer.mark("listener_bind");
     let local_addr = listener
         .local_addr()
         .context("read HTTP listener address")?;
@@ -2262,6 +2351,7 @@ pub(super) async fn serve(
             .await;
         }
     };
+    let startup_runtime_start_ms = startup_timer.mark("runtime_start");
 
     {
         let maintenance_result = match m3_state_for_recorder.lock() {
@@ -2332,7 +2422,34 @@ pub(super) async fn serve(
             "daemon storage maintenance started after HTTP readiness prerequisites completed"
         );
     }
+    let startup_maintenance_start_ms = startup_timer.mark("maintenance_start");
     let m2_emitter_done = m2_emitter_owner.done_receiver();
+
+    // #1773: single structured readiness record attributing where startup time
+    // went, phase by phase, in one line. Vault open (`storage_calyx_open_ms`)
+    // dominates cold start; `listener_bind_at_wall_ms` is the exact wall-clock
+    // moment the port became bound so a client that timed out can be placed
+    // before or after bind from the daemon log alone.
+    tracing::info!(
+        code = "MCP_STARTUP_PHASES_READY",
+        bind = %local_addr,
+        listener_bound = true,
+        total_ms = startup_timer.total_ms(),
+        startup_began_at_wall_ms = startup_timer.started_wall_ms,
+        listener_bind_at_wall_ms = wall_clock_millis_now(),
+        single_instance_lock_ms = startup_single_instance_ms,
+        shell_job_store_lock_ms = startup_shell_job_lock_ms,
+        lifecycle_ledger_ms = startup_lifecycle_ledger_ms,
+        shell_job_reap_ms = startup_shell_job_reap_ms,
+        service_init_ms = startup_service_init_ms,
+        storage_calyx_open_ms = startup_storage_calyx_open_ms,
+        activity_recorder_ms = startup_activity_recorder_ms,
+        listener_bind_ms = startup_listener_bind_ms,
+        runtime_start_ms = startup_runtime_start_ms,
+        maintenance_start_ms = startup_maintenance_start_ms,
+        slow_phase_threshold_ms = STARTUP_SLOW_PHASE_THRESHOLD_MS as u64,
+        "daemon startup reached readiness; per-phase startup timings attributed"
+    );
 
     tracing::info!(
         code = "MCP_HTTP_STARTED",
@@ -2848,9 +2965,14 @@ async fn bind_http_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind HTTP MCP transport to {addr}"))?;
+    // #1773: record the exact wall-clock instant the port became bound. The
+    // issue's independent readback saw no listener on 7700; this edge is the
+    // definitive proof-of-bind (and its absence, definitive proof of no-bind).
     tracing::info!(
         code = "MCP_HTTP_BIND_NORMAL",
         bind = %addr,
+        bound_at_wall_ms = wall_clock_millis_now(),
+        listener_bound = true,
         "HTTP listener bound with normal bind path"
     );
     Ok(listener)
