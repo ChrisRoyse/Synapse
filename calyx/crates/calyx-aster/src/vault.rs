@@ -26,6 +26,7 @@ mod ledger_anchor_batch;
 mod ledger_append;
 mod ledger_hook;
 mod open;
+mod orphan_slot_gc;
 mod prepared;
 pub mod quota;
 mod retention_horizon;
@@ -79,6 +80,9 @@ pub use keyspace::{
 pub use layer_commit::CfLedgerEntry;
 pub use ledger_anchor_batch::MultiCxAnchorBatchOutcome;
 pub use ledger_append::{AsterLedgerChainVerification, AsterProvenanceReproduction};
+pub use orphan_slot_gc::{
+    AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
+};
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,

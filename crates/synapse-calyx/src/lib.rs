@@ -28,6 +28,9 @@ use calyx_aster::recurrence::{
     OccurrenceContext, RecurrenceAppendDisposition, RecurrenceSeriesReadback, RetentionPolicy,
     append_occurrence_once, read_series_readback,
 };
+pub use calyx_aster::vault::{
+    AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
+};
 use calyx_aster::vault::{
     AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook,
     TemporalMetadataMigration, VaultOptions, encode as vault_encode,
@@ -2409,6 +2412,22 @@ impl SynapseCalyxVault {
             panel_ref: write.panel_ref.logical_path,
             registry_ref: Some(write.registry_ref.logical_path),
             readback_panel_version: state.panel.version,
+        })
+    }
+
+    /// Retires orphaned physical `cf/slot_*` column families that no live panel
+    /// references (issue #1776). Orphan-ness is derived from live Base
+    /// membership (never a hardcoded slot range); each drop is fail-closed with
+    /// readback, idempotent, and bounds its durable-lock hold to one CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the pass cannot derive the legitimate
+    /// slot set, a candidate still resolves to a live Base row, or a physical
+    /// removal/readback fails.
+    pub fn retire_orphan_slot_cfs(&self) -> Result<AsterOrphanSlotGcReport, SynapseCalyxError> {
+        self.vault.retire_orphan_slot_cfs().map_err(|error| {
+            SynapseCalyxError::from_calyx("retire orphan physical slot column families", &error)
         })
     }
 

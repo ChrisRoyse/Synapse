@@ -917,6 +917,21 @@ impl Db {
             .rebuild_calyx_search_indexes(expected_panel_version)
     }
 
+    /// Retires orphaned physical `cf/slot_*` column families that no live panel
+    /// references (issue #1776), deriving orphan-ness from live Base membership.
+    /// Fail-closed with readback, idempotent, and per-CF durable-lock bounded.
+    /// The blocking pass should be admitted off the runtime workers by the
+    /// caller (see `CalyxBackend::retire_orphan_slot_cfs_off_runtime`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the vault is unavailable, the
+    /// legitimate slot set cannot be derived, a candidate still resolves to a
+    /// live Base row, or a physical removal/readback fails.
+    pub fn retire_orphan_slot_cfs(&self) -> StorageResult<synapse_calyx::AsterOrphanSlotGcReport> {
+        self.backend.retire_orphan_slot_cfs()
+    }
+
     /// Weaves the native Loom base associations for one panel: within-record
     /// cross-terms, the slot-pair agreement graph, and the between-record
     /// nearest-neighbor graph, persisted to the native `XTerm`/`Graph` CFs and

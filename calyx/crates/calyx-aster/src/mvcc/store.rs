@@ -3,7 +3,7 @@
 mod gc;
 mod read;
 mod scan_pages;
-use crate::cf::{CfRouter, ColumnFamily, KeyRange};
+use crate::cf::{CfRouter, ColumnFamily, KeyRange, RetiredCfPhysical};
 use crate::gc::{SnapshotGcCounters, SnapshotGcReclaimer, SnapshotGcTick};
 use crate::mvcc::{
     Freshness, ReadBarrier, ReaderLease, SeqAllocator, Snapshot, read_barrier::first_blocking,
@@ -12,12 +12,13 @@ use crate::resource::{
     LeaseRegistry, LeaseView, MemtableCfStatus, MemtableStatus, ResourceCounters,
 };
 use crate::sst::SstSummary;
-use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
-use std::collections::BTreeMap;
+use calyx_core::{CalyxError, Clock, Result, Seq, SlotId, Ts};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
 
@@ -256,6 +257,48 @@ impl VersionedCfStore {
                 )))
             }
         }
+    }
+
+    /// Lists the physical `SlotId`s present as `cf/slot_*` directories.
+    pub(crate) fn present_slot_cf_ids(&self) -> Result<BTreeSet<SlotId>> {
+        let router = self.router.read().expect("mvcc router poisoned");
+        let Some(router) = router.as_ref() else {
+            return Err(CalyxError::aster_corrupt_shard(
+                "slot CF enumeration requires a live CF router",
+            ));
+        };
+        router.present_slot_cf_ids()
+    }
+
+    /// Retires one column family under the exclusive router write lock,
+    /// mirroring the compaction reclaim hold-warn budget so an over-long
+    /// exclusive hold is surfaced. The lock is taken per call, so a caller
+    /// retiring several CFs bounds each exclusive hold to one CF (#1806).
+    pub(crate) fn retire_router_cf(
+        &self,
+        cf: ColumnFamily,
+        operation: &'static str,
+    ) -> Result<RetiredCfPhysical> {
+        let started_at = Instant::now();
+        let mut router = self.router.write().expect("mvcc router poisoned");
+        let Some(router) = router.as_mut() else {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "{operation}: physical CF retire requires a live CF router"
+            )));
+        };
+        let physical = router.retire_cf(cf)?;
+        let elapsed_ms = started_at.elapsed().as_millis();
+        if elapsed_ms > u128::from(EXCLUSIVE_ROUTER_RECLAIM_WARN_MS) {
+            tracing::warn!(
+                code = "CALYX_ASTER_ROUTER_RETIRE_SLOW",
+                operation,
+                cf = cf.name(),
+                elapsed_ms,
+                exclusive_hold_warn_ms = EXCLUSIVE_ROUTER_RECLAIM_WARN_MS,
+                "exclusive Calyx router write lock was held beyond the maintenance budget during CF retire; reads on this CF were blocked for the duration"
+            );
+        }
+        Ok(physical)
     }
 
     /// Latest committed sequence.

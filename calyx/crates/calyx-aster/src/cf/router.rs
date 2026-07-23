@@ -8,7 +8,7 @@ use crate::security::value_crypto::{
 use crate::sst::level::SstLevel;
 use crate::sst::{SstEntry, SstSummary};
 use crate::storage_names::flush_sst_file_name;
-use calyx_core::{CalyxError, Result};
+use calyx_core::{CalyxError, Result, SlotId};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -469,4 +469,110 @@ impl CfRouter {
         }
         roots
     }
+
+    /// Lists the distinct quantized-slot `SlotId`s that physically exist as
+    /// `cf/slot_*` directories under any CF root. Raw sidecars (`slot_*.raw`)
+    /// share the slot's identity and are folded into the same id.
+    pub(crate) fn present_slot_cf_ids(&self) -> Result<BTreeSet<SlotId>> {
+        let mut ids = BTreeSet::new();
+        for root in self.cf_roots() {
+            if !root.exists() {
+                continue;
+            }
+            let entries = fs::read_dir(&root).map_err(|error| {
+                CalyxError::disk_pressure(format!("read CF root for slot enumeration: {error}"))
+            })?;
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| CalyxError::disk_pressure(format!("read CF entry: {error}")))?
+                    .path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if let Some(ColumnFamily::Slot { slot, .. }) = ColumnFamily::from_name(name) {
+                    ids.insert(slot);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Retires one column family: drops its in-memory serving state (releasing
+    /// SST file handles before any unlink so the physical removal succeeds on
+    /// Windows) and removes its directory under every CF root. Fail-closed
+    /// readback proves no root still contains the directory. Idempotent: an
+    /// already-absent CF returns `was_present == false` with zero removals.
+    pub(crate) fn retire_cf(&mut self, cf: ColumnFamily) -> Result<RetiredCfPhysical> {
+        let mut physical = RetiredCfPhysical::default();
+        for root in self.cf_roots() {
+            let dir = root.join(cf.name());
+            match fs::read_dir(&dir) {
+                Ok(entries) => {
+                    physical.was_present = true;
+                    for entry in entries {
+                        let path = entry
+                            .map_err(|error| {
+                                CalyxError::disk_pressure(format!(
+                                    "read CF dir for retire: {error}"
+                                ))
+                            })?
+                            .path();
+                        if path.extension().and_then(|value| value.to_str()) == Some("sst") {
+                            physical.removed_sst_files =
+                                physical.removed_sst_files.saturating_add(1);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(CalyxError::disk_pressure(format!(
+                        "stat CF dir {} for retire: {error}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        // Drop in-memory serving state first so no SST handle keeps the files
+        // mapped when the directory is unlinked.
+        self.memtables.remove(&cf);
+        self.levels.remove(&cf);
+        self.next_file.remove(&cf);
+        for root in self.cf_roots() {
+            let dir = root.join(cf.name());
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => physical.removed_dirs.push(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CalyxError::disk_pressure(format!(
+                        "remove CF dir {} during retire: {error}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        for root in self.cf_roots() {
+            if root.join(cf.name()).exists() {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "CF {} directory still present under {} after retire",
+                    cf.name(),
+                    root.display()
+                )));
+            }
+        }
+        Ok(physical)
+    }
+}
+
+/// Physical outcome of retiring one column family directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetiredCfPhysical {
+    /// True when at least one CF root physically held the directory.
+    pub was_present: bool,
+    /// Count of `*.sst` files removed with the directory.
+    pub removed_sst_files: usize,
+    /// Directories that were physically removed.
+    pub removed_dirs: Vec<PathBuf>,
 }

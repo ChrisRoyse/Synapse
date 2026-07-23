@@ -19,16 +19,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
-    SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams, SynapseCalyxBackupReport,
-    SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
-    SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
-    SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxDriftReport,
-    SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxGroundedObservationReadback,
-    SynapseCalyxGroundingGapReport, SynapseCalyxHazardReport, SynapseCalyxLedgerEntryReadback,
-    SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
-    SynapseCalyxObservationPutReadback, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
-    SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    AsterOrphanSlotGcReport, SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback,
+    SynapseCalyxAnchorReadback, SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
+    SynapseCalyxBackupReport, SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams,
+    SynapseCalyxBlindSpotReport, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
+    SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
+    SynapseCalyxDriftReport, SynapseCalyxErasureReport, SynapseCalyxError,
+    SynapseCalyxGroundedObservationReadback, SynapseCalyxGroundingGapReport,
+    SynapseCalyxHazardReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
+    SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
+    SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPeriodicityReport,
+    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
@@ -406,6 +407,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         expected_panel_version: u32,
     ) -> StorageResult<SynapseCalyxSearchRebuildReport>;
+    fn retire_orphan_slot_cfs(&self) -> StorageResult<AsterOrphanSlotGcReport>;
     fn close_calyx_vault(
         &self,
         reason: &'static str,
@@ -1026,6 +1028,25 @@ impl CalyxBackend {
         self.vault.with_vault(cf_name, operation, write, f)
     }
 
+    /// Runs orphan physical slot-CF retirement off the async runtime workers on
+    /// the dedicated blocking maintenance pool. The pass can scan Base and hold
+    /// the exclusive router lock per CF drop, so it must never park a runtime
+    /// worker serving MCP requests (issues #1798, #1806).
+    ///
+    /// # Errors
+    ///
+    /// Returns the pass error, or a structured storage error if maintenance
+    /// admission failed.
+    pub async fn retire_orphan_slot_cfs_off_runtime(
+        &self,
+    ) -> StorageResult<AsterOrphanSlotGcReport> {
+        let vault = Arc::clone(&self.vault);
+        crate::maintenance::run_admitted_maintenance("orphan_slot_cf_gc", move || {
+            retire_orphan_slot_cfs_on_vault(&vault)
+        })
+        .await
+    }
+
     fn commit_rows(&self, cf_name: &str, rows: Vec<SynapseCalyxCfWrite>) -> StorageResult<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1129,7 +1150,7 @@ fn ensure_builtin_temporal_panel_registrations(vault: &SynapseCalyxVault) -> Sto
 ///
 /// The manifest holds exactly one active panel; the primary constellation panel
 /// (timeline) is published here from its authoritative registered contract, and
-/// [`CalyxStorageBackend::rebuild_calyx_search_indexes`] republishes the exact
+/// [`CalyxBackend::rebuild_calyx_search_indexes`] republishes the exact
 /// requested panel before a rebuild. `publish_active_panel` is idempotent, so
 /// this is a no-op once the version is published and never churns `manifest_seq`.
 fn ensure_active_panel_published(vault: &SynapseCalyxVault) -> StorageResult<()> {
@@ -1158,6 +1179,30 @@ fn ensure_active_panel_published(vault: &SynapseCalyxVault) -> StorageResult<()>
         "ensured active durable Calyx panel snapshot is published to the manifest"
     );
     Ok(())
+}
+
+/// Runs one orphan physical slot-CF retirement pass against a vault runtime
+/// under a write guard. The pass itself derives orphan-ness from live Base
+/// membership, logs exact row/SST counts, removes fail-closed with readback,
+/// and bounds its durable-lock holds to one CF drop at a time (issue #1776,
+/// #1806).
+fn retire_orphan_slot_cfs_on_vault(
+    vault: &CalyxVaultRuntime,
+) -> StorageResult<AsterOrphanSlotGcReport> {
+    vault.with_vault(
+        "<orphan-slot-gc>",
+        "retire orphan physical slot column families",
+        true,
+        |vault| {
+            vault.retire_orphan_slot_cfs().map_err(|source| {
+                calyx_write_failed(
+                    "<orphan-slot-gc>",
+                    "retire orphan physical slot column families",
+                    &source,
+                )
+            })
+        },
+    )
 }
 
 fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> StorageResult<()> {
@@ -1726,6 +1771,10 @@ impl StorageBackend for CalyxBackend {
                     })
             },
         )
+    }
+
+    fn retire_orphan_slot_cfs(&self) -> StorageResult<AsterOrphanSlotGcReport> {
+        retire_orphan_slot_cfs_on_vault(&self.vault)
     }
 
     fn close_calyx_vault(

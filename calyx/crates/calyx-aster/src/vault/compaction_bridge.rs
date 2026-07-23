@@ -508,7 +508,7 @@ where
     }
 }
 
-fn try_acquire_native_compaction_guard(
+pub(super) fn try_acquire_native_compaction_guard(
     durable: &DurableVault,
 ) -> Result<crate::file_lock::FileLockGuard> {
     let path = durable.native_compaction_lock_path();
