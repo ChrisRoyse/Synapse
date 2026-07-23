@@ -1,15 +1,28 @@
+use std::sync::{Arc, LazyLock};
+
 use rmcp::{RoleServer, service::RequestContext};
+use synapse_core::error_codes;
+use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::server::{ErrorData, Json, Parameters, SynapseService};
 
 use super::{
     STORAGE_SOT, STORAGE_TOOL,
-    errors::{facade_delegate_error, missing_spec},
+    errors::{facade_conflict_error, facade_delegate_error, missing_spec},
     policy::require_maintenance_profile,
     response::storage_response,
     types::{StorageOperation, StorageParams, StorageResponse},
     validation::validate_storage_params,
 };
+
+/// At most one persisted search-index rebuild may execute at a time. A rebuild
+/// reloads the whole Base panel, builds DiskANN/id-map/raw-sidecar artifacts,
+/// and republishes the exact-panel generation directory; a second concurrent
+/// rebuild of the same vault is a staging/publish corruption hazard. Admission
+/// is therefore bounded to a single permit and a concurrent caller fails closed
+/// (`try_acquire`) rather than silently queueing behind the in-flight rebuild.
+static SEARCH_REBUILD_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
 pub(super) async fn handle(
     service: &SynapseService,
     params: Parameters<StorageParams>,
@@ -278,18 +291,67 @@ pub(super) async fn handle(
                 &crate::m3::storage::required_permissions_search_rebuild(&spec),
             )?;
             let db = service.m3_storage()?;
-            let report = db
-                .rebuild_calyx_search_indexes(spec.expected_panel_version)
-                .map_err(|error| {
-                    facade_delegate_error(
+            // Fail closed if a rebuild is already in flight. A single admission
+            // permit both bounds blocking-pool pressure and rejects a concurrent
+            // rebuild of the same vault instead of serializing behind it.
+            let permit = Arc::clone(&SEARCH_REBUILD_PERMITS)
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    TryAcquireError::NoPermits => facade_conflict_error(
                         STORAGE_TOOL,
                         operation.as_str(),
                         &source_id,
                         STORAGE_SOT,
-                        crate::m1::mcp_error(error.code(), error.to_string()),
-                        "inspect the exact durable panel state, rebuild marker, and named physical artifact before retrying",
-                    )
+                        error_codes::STORAGE_SEARCH_REBUILD_IN_PROGRESS,
+                        "a persisted search-index rebuild is already in progress for this vault"
+                            .to_owned(),
+                        "wait for the in-flight storage operation=search_rebuild to publish its generation, then retry",
+                    ),
+                    TryAcquireError::Closed => facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &source_id,
+                        STORAGE_SOT,
+                        crate::m1::mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            "search-rebuild admission semaphore was unexpectedly closed".to_owned(),
+                        ),
+                        "restart the daemon; the search-rebuild admission gate is no longer available",
+                    ),
                 })?;
+            // The rebuild is strictly blocking, CPU/IO-bound work that must not
+            // occupy a Tokio runtime worker serving MCP requests. Offload it to
+            // the blocking pool and hold the admission permit for the task's
+            // lifetime so a concurrent caller keeps failing closed until publish.
+            let expected_panel_version = spec.expected_panel_version;
+            let report = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                db.rebuild_calyx_search_indexes(expected_panel_version)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("search-rebuild blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs for the SYNAPSE_CALYX_SEARCH_REBUILD phase records; the rebuild task terminated abnormally",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect the exact durable panel state, rebuild marker, and named physical artifact before retrying",
+                )
+            })?;
             let response = crate::m3::storage::StorageSearchRebuildResponse {
                 panel_version: report.generation.panel_version,
                 base_seq: report.generation.base_seq,

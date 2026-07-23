@@ -62,6 +62,36 @@ pub(super) fn facade_policy_error(
     )
 }
 
+pub(super) fn facade_conflict_error(
+    tool: &'static str,
+    operation: &'static str,
+    source_id: &str,
+    source_of_truth: &'static str,
+    code: &'static str,
+    message: String,
+    remediation: &'static str,
+) -> ErrorData {
+    tracing::warn!(
+        code,
+        tool,
+        operation,
+        source_id,
+        "facade operation refused: conflicting in-flight operation on the same source of truth"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("{tool} operation={operation} refused for {source_id}: {message}"),
+        Some(json!({
+            "code": code,
+            "tool": tool,
+            "operation": operation,
+            "source_id": source_id,
+            "source_of_truth": source_of_truth,
+            "remediation": remediation,
+        })),
+    )
+}
+
 pub(super) fn facade_delegate_error(
     tool: &'static str,
     operation: &'static str,
