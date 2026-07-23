@@ -6380,6 +6380,63 @@ fn linked_approval_terminal_rows(
     })
 }
 
+fn verify_linked_approval_terminal(
+    db: &Db,
+    item: &EscalationItem,
+    operation: &str,
+) -> Result<(), ErrorData> {
+    let approval_key = approval_item_key(&item.approval_id);
+    let revisioned = db
+        .get_cf_revisioned(cf::CF_KV, &approval_key)
+        .map_err(storage_error)?;
+    if item.approval_suppressed_reason.is_some() {
+        if revisioned.is_some() {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "{operation} found a physical approval row for approval-suppressed escalation {}: approval_id={} key={}",
+                    item.escalation_id,
+                    item.approval_id,
+                    hex_bytes(&approval_key)
+                ),
+            ));
+        }
+        return Ok(());
+    }
+    let revisioned = revisioned.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "{operation} lost the linked approval row for escalation {}: approval_id={} key={}",
+                item.escalation_id,
+                item.approval_id,
+                hex_bytes(&approval_key)
+            ),
+        )
+    })?;
+    let approval_value = live_revisioned_value(
+        &revisioned,
+        &format!("{operation} linked approval {}", item.approval_id),
+    )?;
+    let approval = validate_linked_approval_item_identity(&approval_key, approval_value)?;
+    validate_linked_approval_for_escalation(item, &approval)?;
+    if !approval_status_is_terminal(approval.status) {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "{operation} left linked approval non-terminal: escalation_id={} item_status={} approval_id={} approval_status={:?} key={} approval_revision={}",
+                item.escalation_id,
+                item.status.as_str(),
+                item.approval_id,
+                approval.status,
+                hex_bytes(&approval_key),
+                hex_bytes(&revisioned.revision_sha256)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Quiet hours
 // ---------------------------------------------------------------------------
@@ -8155,11 +8212,101 @@ fn ack_escalation_locked(
             )
         })?;
         if current.item.status != EscalationStatus::Pending {
-            // Already acked/resolved/expired — honest idempotent report.
-            return Ok(AckEscalationOutcome {
-                escalation: current.item,
-                newly_acked: false,
-            });
+            // Idempotence is only honest when the linked approval and, for a
+            // closed item, the deterministic open index agree with the item.
+            // Older builds could commit the item alone; repair that split
+            // state with the same multi-key revision guards used by the live
+            // acknowledgment path.
+            let existing_status = current.item.status;
+            let mut repaired_item = current.item.clone();
+            repaired_item.updated_at_unix_ms =
+                linearized_at_unix_ms.max(repaired_item.updated_at_unix_ms);
+            let mut repair_rows = linked_approval_terminal_rows(
+                db,
+                &repaired_item,
+                "linked_escalation_ack_reconciled",
+                format!(
+                    "linked escalation {} was already {}; terminal approval invariant reconciled by {via}",
+                    repaired_item.escalation_id,
+                    existing_status.as_str()
+                ),
+            )?;
+            if !existing_status.is_open() {
+                repair_rows.extend(terminal_open_index_row(db, &repaired_item)?);
+            }
+            if repair_rows.is_empty() {
+                verify_linked_approval_terminal(
+                    db,
+                    &current.item,
+                    "idempotent escalation acknowledgment readback",
+                )?;
+                return Ok(AckEscalationOutcome {
+                    escalation: current.item,
+                    newly_acked: false,
+                });
+            }
+            match write_item_and_audit_with_extra_rows_if_revision(
+                db,
+                &repaired_item,
+                "ack_terminal_invariant_reconciled",
+                json!({
+                    "via": via,
+                    "note": note,
+                    "existing_status": existing_status.as_str(),
+                }),
+                repair_rows,
+                current.revision_sha256,
+            )? {
+                ItemWriteOutcome::Applied { committed_seq, .. } => {
+                    let readback = read_item(db, escalation_id)?.ok_or_else(|| {
+                        mcp_error(
+                            error_codes::STORAGE_READ_FAILED,
+                            format!(
+                                "reconciled escalation {escalation_id} disappeared after committed_seq={committed_seq}"
+                            ),
+                        )
+                    })?;
+                    if readback.status == EscalationStatus::Pending {
+                        return Err(mcp_error(
+                            error_codes::STORAGE_CORRUPTED,
+                            format!(
+                                "terminal-invariant reconciliation resurrected escalation {escalation_id} as pending after committed_seq={committed_seq}"
+                            ),
+                        ));
+                    }
+                    verify_linked_approval_terminal(
+                        db,
+                        &readback,
+                        "reconciled escalation acknowledgment readback",
+                    )?;
+                    tracing::warn!(
+                        code = "ESCALATION_ACK_TERMINAL_INVARIANT_RECONCILED",
+                        escalation_id,
+                        via,
+                        existing_status = existing_status.as_str(),
+                        committed_seq,
+                        ack_revision_attempt = attempt,
+                        "readback=CF_KV repaired a pre-existing split escalation/approval/index state with one revision-guarded batch"
+                    );
+                    return Ok(AckEscalationOutcome {
+                        escalation: readback,
+                        newly_acked: false,
+                    });
+                }
+                ItemWriteOutcome::Conflict { observed_seq, .. } => {
+                    tracing::info!(
+                        code = "ESCALATION_ACK_REVISION_RETRY",
+                        escalation_id,
+                        via,
+                        attempt,
+                        max_attempts = ACK_REVISION_MAX_ATTEMPTS,
+                        observed_seq,
+                        phase = "terminal_invariant_reconciliation",
+                        "idempotent acknowledgment lost an item/approval/index revision race; rereading every authority"
+                    );
+                    continue;
+                }
+            }
         }
         let acknowledged_at_unix_ms = linearized_at_unix_ms.max(current.item.updated_at_unix_ms);
         current.item.status = EscalationStatus::Acked;
@@ -8167,11 +8314,21 @@ fn ack_escalation_locked(
         current.item.acked_at_unix_ms = Some(acknowledged_at_unix_ms);
         current.item.acked_via = Some(via.to_owned());
         current.item.next_escalate_at_unix_ms = None;
-        match write_item_and_audit_if_revision(
+        let linked_rows = linked_approval_terminal_rows(
+            db,
+            &current.item,
+            "linked_escalation_acked",
+            format!(
+                "linked escalation {} acknowledged via {via}",
+                current.item.escalation_id
+            ),
+        )?;
+        match write_item_and_audit_with_extra_rows_if_revision(
             db,
             &current.item,
             "acked",
             json!({ "via": via, "note": note }),
+            linked_rows,
             current.revision_sha256,
         )? {
             ItemWriteOutcome::Applied { committed_seq, .. } => {
@@ -8191,6 +8348,11 @@ fn ack_escalation_locked(
                         ),
                     ));
                 }
+                verify_linked_approval_terminal(
+                    db,
+                    &readback,
+                    "new escalation acknowledgment readback",
+                )?;
                 tracing::info!(
                     code = "ESCALATION_ACKED",
                     escalation_id,
@@ -8198,7 +8360,7 @@ fn ack_escalation_locked(
                     committed_seq,
                     ack_revision_attempt = attempt,
                     readback_status = readback.status.as_str(),
-                    "readback=CF_KV escalation acknowledged; ladder stopped"
+                    "readback=CF_KV escalation and linked approval acknowledged atomically; ladder stopped"
                 );
                 return Ok(AckEscalationOutcome {
                     escalation: readback,
