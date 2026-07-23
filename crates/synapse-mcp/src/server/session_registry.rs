@@ -285,6 +285,33 @@ impl SessionRegistry {
         }
     }
 
+    /// #1800: refresh an existing live session's activity timestamp on a real
+    /// MCP request. Unlike `record_seen` this never fabricates a row and never
+    /// resurrects a closed session, so it is safe to call on the per-request hot
+    /// path: it only advances `last_seen` for sessions that already initialized
+    /// and are still open. Returns `true` when an existing live row was touched.
+    /// This is what makes `last_seen_ms_ago` a true request-idle signal for the
+    /// abandoned-session reaper (rmcp's own store `load`/`store` only fire on
+    /// session hydration, not per tool call, so they cannot supply idle age).
+    pub(crate) fn touch_seen_if_present(
+        &mut self,
+        session_id: &str,
+        action: Option<String>,
+        now_unix_ms: u64,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(session_id) else {
+            return false;
+        };
+        if entry.closed_at_unix_ms.is_some() {
+            return false;
+        }
+        entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
+        if let Some(action) = action {
+            entry.last_action = Some(action);
+        }
+        true
+    }
+
     pub(crate) fn record_closed(&mut self, session_id: &str, now_unix_ms: u64) -> bool {
         self.record_closed_with_reason(session_id, now_unix_ms, None)
     }

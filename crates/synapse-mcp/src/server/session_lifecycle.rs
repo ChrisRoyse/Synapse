@@ -43,6 +43,21 @@ const DAEMON_RESTART_BROWSER_CONTINUITY_GRACE: Duration = Duration::from_mins(30
 pub(crate) const HTTP_STALE_REASON: &str = "http_stale";
 pub(crate) const SPAWN_COMPLETED_REASON: &str = "spawn_completed";
 pub(crate) const SPAWNED_AGENT_PROCESS_EXITED_REASON: &str = "spawned_agent_process_exited";
+/// #1800 teardown reason for an rmcp-registered but idle-abandoned HTTP session.
+pub(crate) const ABANDONED_IDLE_REASON: &str = "session_abandoned_idle";
+
+/// #1800: an abandoned Streamable-HTTP session identified for proactive reaping,
+/// carrying exactly the fields the reaper structured-logs (session id, total age,
+/// idle age, and last activity) so accumulation is attributable per session.
+#[derive(Clone, Debug)]
+pub(crate) struct AbandonedHttpSession {
+    pub session_id: String,
+    pub age_ms: u64,
+    pub last_seen_ms_ago: u64,
+    pub last_action: Option<String>,
+    pub client_name: Option<String>,
+    pub agent_kind: String,
+}
 
 pub(crate) type SharedSessionProcessResources =
     Arc<Mutex<BTreeMap<String, BTreeMap<u32, SessionProcessResource>>>>;
@@ -1410,6 +1425,61 @@ impl SessionLifecycleState {
         candidates
     }
 
+    /// #1800: identify Streamable-HTTP sessions that are still registered in the
+    /// rmcp session manager (so `stale_session_candidates` treats them as "live"
+    /// and never reaps them) yet have made no MCP request for longer than
+    /// `abandon_after_ms`. These are abandoned client/FSV sessions: the client
+    /// vanished without a DELETE, so the only other expiry is the rmcp
+    /// keep-alive/idle timeout (24h by default). Left unreaped they accumulate
+    /// (54 live at the 2026-07-23T11:03 shutdown) and every one becomes shutdown
+    /// work. A session backing a still-live spawned agent is excluded via the
+    /// real process probe (#1238), exactly as the stale-candidate scan does, so
+    /// an agent doing native work between MCP calls is never reaped.
+    pub(crate) fn abandoned_http_session_candidates(
+        &self,
+        active_sessions: &BTreeSet<String>,
+        abandon_after_ms: u64,
+        now_unix_ms: u64,
+    ) -> Vec<AbandonedHttpSession> {
+        let reads = match self.session_registry.lock() {
+            Ok(registry) => registry.reads(now_unix_ms),
+            Err(_poisoned) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned during abandoned-session scan; skipping this pass"
+                );
+                return Vec::new();
+            }
+        };
+        let live_spawn_sessions = live_spawned_session_ids(&reads, &|pid| m4::process_exists(pid));
+        let mut candidates = Vec::new();
+        for read in &reads {
+            if read.closed_at_unix_ms.is_some() {
+                continue;
+            }
+            // Only reap sessions the rmcp manager still holds; orphaned resource
+            // ledgers are the existing stale-candidate path's responsibility.
+            if !active_sessions.contains(&read.session_id) {
+                continue;
+            }
+            if live_spawn_sessions.contains(&read.session_id) {
+                continue;
+            }
+            if read.last_seen_ms_ago <= abandon_after_ms {
+                continue;
+            }
+            candidates.push(AbandonedHttpSession {
+                session_id: read.session_id.clone(),
+                age_ms: now_unix_ms.saturating_sub(read.started_at_unix_ms),
+                last_seen_ms_ago: read.last_seen_ms_ago,
+                last_action: read.last_action.clone(),
+                client_name: read.client_name.clone(),
+                agent_kind: read.agent_kind.clone(),
+            });
+        }
+        candidates
+    }
+
     pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
         let registry_reads = match self.session_registry.lock() {
             Ok(registry) => registry.reads(unix_time_ms_now()),
@@ -2382,11 +2452,31 @@ fn is_chrome_bridge_endpoint(endpoint: &str) -> bool {
         && (endpoint.ends_with("/chrome.tabs") || endpoint.ends_with("/chrome.debugger"))
 }
 
+/// A CDP target the Chrome bridge no longer knows about is already in the desired
+/// closed state, so a close attempt that fails *because the tab is gone* is an
+/// already-absent success, not a teardown failure. The runtime bridge surfaces
+/// this as `"targetIdHint <id> did not match a live chrome.tabs tab id: No tab
+/// with id: <n>"` (Chrome's own `No tab with id` runtime error). An earlier
+/// bridge build phrased it `"did not match any chrome.tabs tab id"`. #1800: the
+/// classifier only matched the *legacy* "any" phrasing, so every current
+/// "a live"/"No tab with id" close was mis-scored `failed`, teardown returned
+/// `Err`, and the 250 ms stale-session sweep retried the same dead tab forever
+/// (~48.9k ERROR/day on 2026-07-23) — a session with a closed tab could never
+/// finish teardown. Match the stable "tab gone" markers instead of one exact
+/// sentence. This deliberately does NOT absorb the operator-panic
+/// mutation-admission refusal (the tab may still be open there): that stays a
+/// genuine fail-closed retention.
 #[cfg(windows)]
 fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
+    // Chrome's definitive "the tab does not exist" runtime error.
+    if detail.contains("No tab with id") {
+        return true;
+    }
+    // Bridge wrapper phrasings ("a live" today, "any" on legacy builds).
     detail.contains("targetIdHint")
         && detail.contains(target_id)
-        && detail.contains("did not match any chrome.tabs tab id")
+        && detail.contains("chrome.tabs tab id")
+        && detail.contains("did not match")
 }
 
 #[cfg(not(windows))]

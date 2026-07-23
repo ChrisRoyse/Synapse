@@ -79,6 +79,24 @@ use crate::{
 type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>;
 type HttpBackgroundTaskOwner = (&'static str, ShutdownTaskOwner<()>);
 const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
+/// How often the abandoned-session reaper scans (#1800). Distinct from the 250ms
+/// held-input cleanup: reaping evicts whole rmcp sessions, so it runs on a
+/// coarser cadence to bound the process-probe/registry cost while still catching
+/// abandonment orders of magnitude sooner than the 24h rmcp idle timeout.
+const ABANDONED_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
+/// Env override (seconds) for how long an rmcp-registered HTTP session may make
+/// no MCP request before it is treated as abandoned and reaped. `0` disables the
+/// reaper. See `abandoned_session_reap_after`.
+const ABANDONED_SESSION_REAP_AFTER_ENV: &str = "SYNAPSE_HTTP_SESSION_ABANDON_REAP_SECS";
+/// Default idle-abandonment budget (#1800). The 2026-07-23 shutdown showed 54
+/// live sessions, most abandoned FSV/client sessions hours old, none reaped —
+/// the only other expiry is the 24h rmcp idle timeout. 30 minutes reaps a
+/// vanished client long before it becomes shutdown work while comfortably
+/// exceeding any realistic gap between an interactive agent's tool calls;
+/// live spawned agents are protected by the OS process probe regardless of
+/// request idleness (#1238). A reaped session is fully recoverable: the client's
+/// next request gets a session-expired 404 and recreates + rebinds its target.
+const ABANDONED_SESSION_REAP_AFTER_DEFAULT: Duration = Duration::from_mins(30);
 const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3264,9 +3282,19 @@ fn spawn_stale_session_input_cleanup(
     session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
     shutdown_cancel: CancellationToken,
 ) -> JoinHandle<()> {
+    let reap_after = abandoned_session_reap_after();
     tokio::spawn(async move {
         let mut interval = time::interval(STALE_SESSION_INPUT_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut reap_interval = time::interval(ABANDONED_SESSION_REAP_INTERVAL);
+        reap_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        tracing::info!(
+            code = "MCP_HTTP_SESSION_ABANDONED_REAPER_STARTED",
+            reap_after_ms = reap_after.map(|d| d.as_millis() as u64),
+            scan_interval_ms = ABANDONED_SESSION_REAP_INTERVAL.as_millis() as u64,
+            enabled = reap_after.is_some(),
+            "abandoned HTTP session reaper running"
+        );
         loop {
             tokio::select! {
                 _ = shutdown_cancel.cancelled() => {
@@ -3282,9 +3310,120 @@ fn spawn_stale_session_input_cleanup(
                         &session_manager,
                     ).await;
                 }
+                _ = reap_interval.tick() => {
+                    if let Some(reap_after) = reap_after {
+                        reap_abandoned_http_sessions_once(
+                            &session_lifecycle,
+                            &session_manager,
+                            reap_after,
+                        ).await;
+                    }
+                }
             }
         }
     })
+}
+
+/// Resolve the idle-abandonment budget for HTTP session reaping. `Some(0)` from
+/// the operator disables the reaper; an invalid value falls back to the
+/// evidence-derived default. See `ABANDONED_SESSION_REAP_AFTER_DEFAULT`.
+fn abandoned_session_reap_after() -> Option<Duration> {
+    match std::env::var(ABANDONED_SESSION_REAP_AFTER_ENV) {
+        Err(_) => Some(ABANDONED_SESSION_REAP_AFTER_DEFAULT),
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                tracing::warn!(
+                    code = "MCP_HTTP_SESSION_ABANDON_REAP_ENV_INVALID",
+                    env = ABANDONED_SESSION_REAP_AFTER_ENV,
+                    raw = %raw,
+                    default_secs = ABANDONED_SESSION_REAP_AFTER_DEFAULT.as_secs(),
+                    "invalid abandoned-session reap override; using evidence-derived default"
+                );
+                Some(ABANDONED_SESSION_REAP_AFTER_DEFAULT)
+            }
+        },
+    }
+}
+
+/// #1800: proactively evict rmcp-registered HTTP sessions that have made no MCP
+/// request for longer than `reap_after`, so abandoned client/FSV sessions never
+/// accumulate into shutdown work. Each reap removes the session from the rmcp
+/// manager (closing its transport), tears down its lifecycle-owned resources,
+/// and emits one structured record naming the session, its age, its idle age,
+/// and its last activity. Live spawned-agent sessions are excluded by the
+/// candidate scan's process probe.
+async fn reap_abandoned_http_sessions_once(
+    session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
+    session_manager: &LocalSessionManager,
+    reap_after: Duration,
+) {
+    let now = crate::server::session_registry::unix_time_ms_now();
+    let reap_after_ms = reap_after.as_millis() as u64;
+    let active_sessions = active_http_session_ids(session_manager).await;
+    if active_sessions.is_empty() {
+        return;
+    }
+    let candidates =
+        session_lifecycle.abandoned_http_session_candidates(&active_sessions, reap_after_ms, now);
+    for candidate in candidates {
+        // Remove the session from the rmcp manager first so no new request can
+        // route to it while we tear its resources down; closing the handle is a
+        // trigger that flushes the private session worker.
+        let handle = {
+            let mut guard = session_manager.sessions.write().await;
+            guard.remove(candidate.session_id.as_str())
+        };
+        let close_outcome = match handle {
+            None => "not_in_manager".to_owned(),
+            Some(handle) => match time::timeout(MCP_SESSION_CLOSE_TIMEOUT, handle.close()).await {
+                Ok(Ok(())) => "closed".to_owned(),
+                Ok(Err(SessionError::SessionServiceTerminated)) => "already_terminated".to_owned(),
+                Ok(Err(error)) => format!("close_failed: {error}"),
+                Err(_elapsed) => {
+                    format!("close_timeout_ms={}", MCP_SESSION_CLOSE_TIMEOUT.as_millis())
+                }
+            },
+        };
+        emit_http_active_sessions(active_http_session_ids(session_manager).await.len());
+        match session_lifecycle
+            .teardown_session(
+                &candidate.session_id,
+                crate::server::session_lifecycle::ABANDONED_IDLE_REASON,
+            )
+            .await
+        {
+            Ok(report) => {
+                tracing::warn!(
+                    code = "MCP_HTTP_SESSION_ABANDONED_REAPED",
+                    session_id = %candidate.session_id,
+                    age_ms = candidate.age_ms,
+                    last_seen_ms_ago = candidate.last_seen_ms_ago,
+                    reap_after_ms,
+                    last_action = ?candidate.last_action,
+                    client_name = ?candidate.client_name,
+                    agent_kind = %candidate.agent_kind,
+                    close_outcome = %close_outcome,
+                    report = ?report,
+                    "reaped abandoned HTTP session that had no MCP request within the idle budget"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "MCP_HTTP_SESSION_ABANDONED_REAP_TEARDOWN_FAILED",
+                    session_id = %candidate.session_id,
+                    age_ms = candidate.age_ms,
+                    last_seen_ms_ago = candidate.last_seen_ms_ago,
+                    close_outcome = %close_outcome,
+                    detail = %error.message,
+                    data = ?error.data,
+                    "abandoned HTTP session removed from rmcp manager but lifecycle teardown failed"
+                );
+            }
+        }
+    }
 }
 
 /// #898 liveness sweep: periodically cross-checks heartbeat silence with the

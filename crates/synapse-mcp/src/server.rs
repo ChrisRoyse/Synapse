@@ -334,7 +334,25 @@ pub(crate) type SharedCdpTargetOwners = Arc<Mutex<HashMap<String, CdpTargetOwner
 /// resolved, so reconnect/session churn cannot grow it without bound.
 type SharedSessionAuthorityGates = Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
 
-const AUTHORITY_CANCELLATION_GRACE: Duration = Duration::from_secs(1);
+/// Environment override (milliseconds) for the cooperative authority-transaction
+/// cancellation grace. See `authority_cancellation_grace`.
+const AUTHORITY_CANCELLATION_GRACE_ENV: &str = "SYNAPSE_AUTHORITY_CANCELLATION_GRACE_MS";
+/// Evidence-derived default cancellation grace (#1800). A healthy storage-backed
+/// terminal readback (Calyx/RocksDB commit + audit) completes in single-digit
+/// milliseconds in the production logs (`CALYX_ASTER_LEDGER_HOOK_COMMIT_LOCK_READY`
+/// measured 0-9 ms on 2026-07-23), so 3 s is >300x headroom for that same
+/// readback under storage contention. The prior 1 s value gave a cooperative
+/// owner and a drop-safe task the same single deadline and could spuriously flag
+/// a slow-but-live readback. This budget is deliberately NOT sized to "rescue" an
+/// owner wedged on an unbounded external wait (an `act`/`act_foreground` holding
+/// the foreground input lease for up to its 30 s ttl, a browser/CDP action, an
+/// agent-readiness poll): those are correctly retained fail-closed and are now
+/// named by the per-transaction drain diagnostics. 3 s keeps the whole authority
+/// drain far under the 90 s HTTP shutdown watchdog.
+const AUTHORITY_CANCELLATION_GRACE_DEFAULT: Duration = Duration::from_secs(3);
+/// Hard ceiling for the env override so a misconfiguration cannot push the drain
+/// grace past the point where it would collide with the 90 s shutdown watchdog.
+const AUTHORITY_CANCELLATION_GRACE_MAX: Duration = Duration::from_mins(1);
 const AUTHORITY_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const AUTHORITY_TASK_PHASE_REGISTERED: u8 = 0;
 const AUTHORITY_TASK_PHASE_RUNNING: u8 = 1;
@@ -362,12 +380,64 @@ impl AuthorityCancellationPolicy {
     }
 }
 
+/// Resolve the cooperative authority-transaction cancellation grace, honouring an
+/// operator override (`SYNAPSE_AUTHORITY_CANCELLATION_GRACE_MS`) for evidence
+/// tuning while clamping it into a sane range. See `AUTHORITY_CANCELLATION_GRACE_DEFAULT`.
+fn authority_cancellation_grace() -> Duration {
+    let Ok(raw) = std::env::var(AUTHORITY_CANCELLATION_GRACE_ENV) else {
+        return AUTHORITY_CANCELLATION_GRACE_DEFAULT;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(ms) if ms >= 1 => Duration::from_millis(ms).min(AUTHORITY_CANCELLATION_GRACE_MAX),
+        _ => {
+            tracing::warn!(
+                code = "AUTHORITY_CANCELLATION_GRACE_ENV_INVALID",
+                env = AUTHORITY_CANCELLATION_GRACE_ENV,
+                raw = %raw,
+                default_ms = AUTHORITY_CANCELLATION_GRACE_DEFAULT.as_millis() as u64,
+                "invalid authority cancellation grace override; using evidence-derived default"
+            );
+            AUTHORITY_CANCELLATION_GRACE_DEFAULT
+        }
+    }
+}
+
+/// Human-attributable identity for a supervised authority transaction, captured
+/// at spawn so a shutdown drain miss can name the exact operation and MCP session
+/// that held the daemon lifetime locks past the cancellation grace (#1800).
+/// Without this the retention logs carried only an opaque `task_id` + `phase`,
+/// leaving every miss (e.g. task_ids 190/207-211 at 2026-07-23T11:03) impossible
+/// to attribute to a tool, session, or elapsed hold.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthorityTransactionDescriptor {
+    operation: String,
+    session_id: Option<String>,
+}
+
+impl AuthorityTransactionDescriptor {
+    pub(crate) fn new(operation: impl Into<String>, session_id: Option<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            session_id,
+        }
+    }
+
+    fn session_id_field(&self) -> &str {
+        self.session_id.as_deref().unwrap_or("<none>")
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AuthorityTaskControl {
     abort_handle: tokio::task::AbortHandle,
     cancellation: CancellationToken,
     cancellation_policy: AuthorityCancellationPolicy,
     phase: Arc<AtomicU8>,
+    /// Operation/session identity for drain-miss attribution (#1800).
+    descriptor: Arc<AuthorityTransactionDescriptor>,
+    /// Wall-clock spawn instant, used to report how long a retained owner held
+    /// its exact task and lifetime locks at drain time.
+    registered_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -950,6 +1020,7 @@ impl SynapseService {
         self.spawn_authority_transaction_with_policy(
             |_cancellation| future,
             AuthorityCancellationPolicy::DropFutureAfterSignal,
+            AuthorityTransactionDescriptor::new("drop_safe_authority_transaction", None),
         )
     }
 
@@ -961,6 +1032,7 @@ impl SynapseService {
     /// daemon lifetime locks cannot be released over live authority.
     pub(crate) fn spawn_cooperative_authority_transaction<M, F>(
         &self,
+        descriptor: AuthorityTransactionDescriptor,
         make_future: M,
     ) -> Result<
         impl Future<Output = Result<F::Output, AuthorityTransactionJoinError>> + Send + 'static,
@@ -974,6 +1046,7 @@ impl SynapseService {
         self.spawn_authority_transaction_with_policy(
             make_future,
             AuthorityCancellationPolicy::CooperativeTerminalReadback,
+            descriptor,
         )
     }
 
@@ -981,6 +1054,7 @@ impl SynapseService {
         &self,
         make_future: M,
         cancellation_policy: AuthorityCancellationPolicy,
+        descriptor: AuthorityTransactionDescriptor,
     ) -> Result<
         impl Future<Output = Result<F::Output, AuthorityTransactionJoinError>> + Send + 'static,
         ErrorData,
@@ -1190,6 +1264,8 @@ impl SynapseService {
                 cancellation,
                 cancellation_policy,
                 phase,
+                descriptor: Arc::new(descriptor),
+                registered_at: Instant::now(),
             },
         );
 
@@ -1349,23 +1425,26 @@ impl SynapseService {
                 task_id,
                 phase = authority_task_phase_name(control.phase.load(Ordering::Acquire)),
                 cancellation_policy = control.cancellation_policy.as_str(),
+                operation = %control.descriptor.operation,
+                session_id = %control.descriptor.session_id_field(),
+                held_ms = control.registered_at.elapsed().as_millis() as u64,
                 "signalling cancellation to a supervised authority transaction"
             );
             control.cancellation.cancel();
         }
         let cancellation_signals_sent = controls.len();
+        let cancellation_grace = authority_cancellation_grace();
         let mut abort_requests_sent = 0_usize;
-        if tokio::time::timeout(
-            AUTHORITY_CANCELLATION_GRACE,
-            self.authority_finalizers.tasks.wait(),
-        )
-        .await
-        .is_err()
+        if tokio::time::timeout(cancellation_grace, self.authority_finalizers.tasks.wait())
+            .await
+            .is_err()
         {
             let (remaining_before_abort, remaining_controls) =
                 snapshot_authority_controls(&self.authority_finalizers.transactions, &mut errors);
             let mut cooperative_owners_retained = 0_usize;
             for (task_id, control) in remaining_controls {
+                let phase = authority_task_phase_name(control.phase.load(Ordering::Acquire));
+                let held_ms = control.registered_at.elapsed().as_millis() as u64;
                 if control.cancellation_policy
                     == AuthorityCancellationPolicy::CooperativeTerminalReadback
                 {
@@ -1374,25 +1453,44 @@ impl SynapseService {
                         code = error_codes::ACTION_POSTCONDITION_FAILED,
                         detail_code = "AUTHORITY_TRANSACTION_COOPERATIVE_OWNER_RETAINED",
                         task_id,
-                        phase = authority_task_phase_name(control.phase.load(Ordering::Acquire)),
+                        phase,
                         cancellation_policy = control.cancellation_policy.as_str(),
+                        operation = %control.descriptor.operation,
+                        session_id = %control.descriptor.session_id_field(),
+                        held_ms,
+                        grace_ms = cancellation_grace.as_millis() as u64,
                         "storage-backed authority owner did not reach terminal readback inside cancellation grace; retaining its exact task and daemon lifetime locks"
                     );
+                    errors.push(format!(
+                        "retained cooperative owner task_id={task_id} operation={} session={} phase={phase} held_ms={held_ms}",
+                        control.descriptor.operation,
+                        control.descriptor.session_id_field(),
+                    ));
                     continue;
                 }
                 tracing::error!(
                     code = error_codes::TOOL_INTERNAL_ERROR,
                     detail_code = "AUTHORITY_TRANSACTION_ABORT_REQUIRED",
                     task_id,
-                    phase = authority_task_phase_name(control.phase.load(Ordering::Acquire)),
+                    phase,
                     cancellation_policy = control.cancellation_policy.as_str(),
+                    operation = %control.descriptor.operation,
+                    session_id = %control.descriptor.session_id_field(),
+                    held_ms,
+                    grace_ms = cancellation_grace.as_millis() as u64,
                     "authority transaction did not join inside cancellation grace; aborting its exact owned Tokio task"
                 );
+                errors.push(format!(
+                    "aborted drop-safe owner task_id={task_id} operation={} session={} phase={phase} held_ms={held_ms}",
+                    control.descriptor.operation,
+                    control.descriptor.session_id_field(),
+                ));
                 control.abort_handle.abort();
                 abort_requests_sent += 1;
             }
             errors.push(format!(
-                "authority cancellation grace expired with {remaining_before_abort} transaction(s) still registered; aborted {abort_requests_sent} drop-safe task(s) and retained {cooperative_owners_retained} storage-backed owner(s)"
+                "authority cancellation grace ({} ms) expired with {remaining_before_abort} transaction(s) still registered; aborted {abort_requests_sent} drop-safe task(s) and retained {cooperative_owners_retained} storage-backed owner(s)",
+                cancellation_grace.as_millis() as u64
             ));
             if abort_requests_sent > 0
                 && tokio::time::timeout(
@@ -1506,6 +1604,21 @@ impl SynapseService {
 
     pub(crate) fn session_registry_handle(&self) -> SharedSessionRegistry {
         Arc::clone(&self.session_registry)
+    }
+
+    /// #1800: stamp real request activity onto an existing live HTTP session so
+    /// `last_seen` reflects the last MCP call, giving the abandoned-session
+    /// reaper a true request-idle signal. Best-effort: a poisoned registry lock
+    /// or an unknown/closed session id is a no-op (the reaper fails safe by only
+    /// reaping rows it can positively prove idle and rmcp-registered).
+    pub(crate) fn record_session_request_activity(&self, session_id: &str, tool_name: &str) {
+        if let Ok(mut registry) = self.session_registry.lock() {
+            registry.touch_seen_if_present(
+                session_id,
+                Some(tool_name.to_owned()),
+                session_registry::unix_time_ms_now(),
+            );
+        }
     }
 
     pub(crate) const fn session_registry_ref(&self) -> &SharedSessionRegistry {

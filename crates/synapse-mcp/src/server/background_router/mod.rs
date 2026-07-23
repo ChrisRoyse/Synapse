@@ -1809,8 +1809,13 @@ impl SynapseService {
             None
         };
         let service = self.clone();
-        let handle =
-            self.spawn_cooperative_authority_transaction(move |cancellation| async move {
+        let act_descriptor = crate::server::AuthorityTransactionDescriptor::new(
+            format!("act:{}", act_operation_name(operation)),
+            actor_session_id.clone(),
+        );
+        let handle = self.spawn_cooperative_authority_transaction(
+            act_descriptor,
+            move |cancellation| async move {
                 let transaction = service.run_act_supervised_transaction(
                     params,
                     request_context,
@@ -1825,7 +1830,8 @@ impl SynapseService {
                     ),
                 )
                 .await
-            })?;
+            },
+        )?;
         match handle.await {
             Ok(result) => result,
             Err(join_error) => {
@@ -2860,8 +2866,13 @@ impl SynapseService {
                 "raw_act_foreground_before_authority_transaction_spawn",
             )?;
         let service = self.clone();
-        let handle =
-            self.spawn_cooperative_authority_transaction(move |cancellation| async move {
+        let act_foreground_descriptor = crate::server::AuthorityTransactionDescriptor::new(
+            "act_foreground",
+            Some(session_id.clone()),
+        );
+        let handle = self.spawn_cooperative_authority_transaction(
+            act_foreground_descriptor,
+            move |cancellation| async move {
                 let transaction = async move {
                     let _authority_gate = tokio::select! {
                         biased;
@@ -2897,7 +2908,8 @@ impl SynapseService {
                     ),
                 )
                 .await
-            })?;
+            },
+        )?;
         match handle.await {
             Ok(result) => result,
             Err(join_error) => {

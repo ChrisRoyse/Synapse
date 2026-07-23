@@ -23,6 +23,11 @@ impl ServerHandler for SynapseService {
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
+        // #1800: stamp request activity so idle-abandoned sessions become
+        // reapable before shutdown. Only refreshes an existing live row.
+        if let Some(session_id) = mcp_session_id.as_deref() {
+            self.record_session_request_activity(session_id, &tool_name);
+        }
         let argument_shape =
             super::mcp_usage::argument_shape_from_arguments(request.arguments.as_ref());
         let operation = tool_operation_from_arguments(&tool_name, request.arguments.as_ref());
@@ -136,6 +141,7 @@ impl ServerHandler for SynapseService {
         let child_argument_shape = argument_shape.clone();
         let (result_sender, mut result_receiver) = oneshot::channel();
         let authority_completion = match self.spawn_cooperative_authority_transaction(
+            super::AuthorityTransactionDescriptor::new(tool_name.clone(), mcp_session_id.clone()),
             move |supervisor_cancellation| async move {
                 let lifecycle_guard = child_lifecycle_owner
                     .lock()
