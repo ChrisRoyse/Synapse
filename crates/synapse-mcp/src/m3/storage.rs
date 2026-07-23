@@ -534,6 +534,10 @@ pub enum StorageIntelligenceOperation {
     Bits,
     Sufficiency,
     Redundancy,
+    Causality,
+    Periodicity,
+    Drift,
+    Hazard,
 }
 
 impl StorageIntelligenceOperation {
@@ -545,20 +549,20 @@ impl StorageIntelligenceOperation {
             Self::Bits => "bits",
             Self::Sufficiency => "sufficiency",
             Self::Redundancy => "redundancy",
+            Self::Causality => "causality",
+            Self::Periodicity => "periodicity",
+            Self::Drift => "drift",
+            Self::Hazard => "hazard",
         }
     }
 
     #[must_use]
     pub const fn mutates_state(self) -> bool {
-        // Abundance is a pure read; weave persists XTerm/Graph rows and the
-        // assay operations persist Assay rows.
+        // Abundance is a pure read; every other operation persists derived rows
+        // (weave: XTerm/Graph; assay: Assay; temporal: Graph/TemporalXTerm).
         !matches!(self, Self::Abundance)
     }
 
-    #[must_use]
-    pub const fn requires_anchor(self) -> bool {
-        matches!(self, Self::Bits | Self::Sufficiency)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -584,6 +588,36 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 32))]
     pub ksg_k: Option<u32>,
+    /// Metadata key partitioning the panel into activity streams (the
+    /// app/agent/tool identifier). Required for `causality`; optional filter
+    /// dimension for `periodicity`/`drift`/`hazard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<String>,
+    /// Causality source-stream value under `group_key` (defaults to the most
+    /// frequent stream when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_a: Option<String>,
+    /// Causality target-stream value under `group_key` (defaults to the second
+    /// most frequent stream when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_b: Option<String>,
+    /// Restricts `periodicity`/`drift`/`hazard` to one `group_key` stream value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_value: Option<String>,
+    /// Occurrence-count bin width in seconds (causality/periodicity/drift).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub bin_seconds: Option<f64>,
+    /// Maximum transfer-entropy lag in bins (causality only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 64))]
+    pub max_lag: Option<u32>,
+    /// Reference "now" (Unix seconds) for the overdue-hazard elapsed time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_secs: Option<i64>,
+    /// Survival threshold below which the next occurrence is overdue (hazard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overdue_alpha: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
@@ -724,6 +758,124 @@ pub struct StorageIntelligenceRedundancyReport {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalityLag {
+    pub lag: u32,
+    pub t_a_to_b: f32,
+    pub t_b_to_a: f32,
+    pub difference_ci_low: f32,
+    pub difference_ci_high: f32,
+    pub direction: String,
+    pub n_samples: u64,
+    pub provisional: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalityReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub group_key: String,
+    pub group_a: String,
+    pub group_b: String,
+    pub bin_seconds: f64,
+    pub n_bins: u64,
+    pub events_a: u64,
+    pub events_b: u64,
+    pub best_lag: u32,
+    pub t_a_to_b: f32,
+    pub t_b_to_a: f32,
+    pub difference_ci_low: f32,
+    pub difference_ci_high: f32,
+    pub dominant_direction: String,
+    pub grounded: bool,
+    pub lags: Vec<StorageIntelligenceCausalityLag>,
+    pub graph_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligencePeriodogramPeak {
+    pub period_seconds: f64,
+    pub frequency: f64,
+    pub power: f64,
+    pub false_alarm_probability: f64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligencePeriodicityReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_value: Option<String>,
+    pub bin_seconds: f64,
+    pub n_samples: u64,
+    pub time_span_seconds: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_period_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_power: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_false_alarm_probability: Option<f64>,
+    pub significant: bool,
+    pub peaks: Vec<StorageIntelligencePeriodogramPeak>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acf_dominant_period_seconds: Option<f64>,
+    pub temporal_xterm_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceDriftReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_value: Option<String>,
+    pub n_gaps: u64,
+    pub baseline_mean_gap: f64,
+    pub baseline_sigma: f64,
+    pub cusum_change_detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cusum_change_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cusum_change_time_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cusum_direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cusum_statistic: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmd_split_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmd_p_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmd_significant: Option<bool>,
+    pub temporal_xterm_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceHazardReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_value: Option<String>,
+    pub n_gaps: u64,
+    pub mean_gap_seconds: f64,
+    pub coefficient_of_variation: f64,
+    pub deterministic: bool,
+    pub elapsed_seconds: f64,
+    pub survival: f64,
+    pub hazard: f64,
+    pub empirical_survival: f64,
+    pub expected_next_seconds: f64,
+    pub overdue_threshold_seconds: f64,
+    pub alpha: f64,
+    pub overdue: bool,
+    pub temporal_xterm_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceResponse {
     pub operation: StorageIntelligenceOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -736,6 +888,14 @@ pub struct StorageIntelligenceResponse {
     pub sufficiency: Option<StorageIntelligenceSufficiencyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<StorageIntelligenceRedundancyReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causality: Option<StorageIntelligenceCausalityReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub periodicity: Option<StorageIntelligencePeriodicityReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<StorageIntelligenceDriftReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hazard: Option<StorageIntelligenceHazardReport>,
 }
 
 #[must_use]
@@ -1162,6 +1322,164 @@ pub fn run_intelligence_redundancy(
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
+    })
+}
+
+fn temporal_params(
+    params: &StorageIntelligenceParams,
+) -> synapse_calyx::SynapseCalyxTemporalParams {
+    let mut temporal = synapse_calyx::SynapseCalyxTemporalParams::new(params.panel_version);
+    temporal.max_records = clamp_intelligence_records(params.max_records);
+    temporal.group_key = params.group_key.clone();
+    temporal.group_a = params.group_a.clone();
+    temporal.group_b = params.group_b.clone();
+    temporal.filter_value = params.filter_value.clone();
+    if let Some(bin) = params.bin_seconds {
+        temporal.bin_seconds = bin;
+    }
+    if let Some(lag) = params.max_lag {
+        temporal.max_lag = lag as usize;
+    }
+    temporal.now_secs = params.now_secs;
+    if let Some(alpha) = params.overdue_alpha {
+        temporal.overdue_alpha = alpha;
+    }
+    temporal
+}
+
+/// Measures directed transfer entropy between two activity streams and persists
+/// the dominant directed edge to the native Graph CF.
+pub fn run_intelligence_causality(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceCausalityReport, ErrorData> {
+    let report = db
+        .temporal_causality_intelligence(&temporal_params(params))
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceCausalityReport {
+        source_of_truth: "Calyx Graph CF rows",
+        panel_version: report.panel_version,
+        group_key: report.group_key,
+        group_a: report.group_a,
+        group_b: report.group_b,
+        bin_seconds: report.bin_seconds,
+        n_bins: report.n_bins as u64,
+        events_a: report.events_a as u64,
+        events_b: report.events_b as u64,
+        best_lag: report.best_lag as u32,
+        t_a_to_b: report.t_a_to_b,
+        t_b_to_a: report.t_b_to_a,
+        difference_ci_low: report.difference_ci_low,
+        difference_ci_high: report.difference_ci_high,
+        dominant_direction: report.dominant_direction,
+        grounded: report.grounded,
+        lags: report
+            .lags
+            .into_iter()
+            .map(|lag| StorageIntelligenceCausalityLag {
+                lag: lag.lag as u32,
+                t_a_to_b: lag.t_a_to_b,
+                t_b_to_a: lag.t_b_to_a,
+                difference_ci_low: lag.difference_ci_low,
+                difference_ci_high: lag.difference_ci_high,
+                direction: lag.direction,
+                n_samples: lag.n_samples as u64,
+                provisional: lag.provisional,
+            })
+            .collect(),
+        graph_cf_rows_after: report.graph_cf_rows_after as u64,
+    })
+}
+
+/// Runs the Lomb-Scargle periodogram + slotted-autocorrelation cross-check and
+/// persists the result to the native TemporalXTerm CF.
+pub fn run_intelligence_periodicity(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligencePeriodicityReport, ErrorData> {
+    let report = db
+        .temporal_periodicity_intelligence(&temporal_params(params))
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligencePeriodicityReport {
+        source_of_truth: "Calyx TemporalXTerm CF rows",
+        panel_version: report.panel_version,
+        filter_value: report.filter_value,
+        bin_seconds: report.bin_seconds,
+        n_samples: report.n_samples as u64,
+        time_span_seconds: report.time_span_seconds,
+        dominant_period_seconds: report.dominant_period_seconds,
+        dominant_power: report.dominant_power,
+        dominant_false_alarm_probability: report.dominant_false_alarm_probability,
+        significant: report.significant,
+        peaks: report
+            .peaks
+            .into_iter()
+            .map(|peak| StorageIntelligencePeriodogramPeak {
+                period_seconds: peak.period_seconds,
+                frequency: peak.frequency,
+                power: peak.power,
+                false_alarm_probability: peak.false_alarm_probability,
+            })
+            .collect(),
+        acf_dominant_period_seconds: report.acf_dominant_period_seconds,
+        temporal_xterm_cf_rows_after: report.temporal_xterm_cf_rows_after as u64,
+    })
+}
+
+/// Detects recurrence-rate change (CUSUM) and distribution drift (MMD) and
+/// persists the result to the native TemporalXTerm CF.
+pub fn run_intelligence_drift(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceDriftReport, ErrorData> {
+    let report = db
+        .temporal_drift_intelligence(&temporal_params(params))
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceDriftReport {
+        source_of_truth: "Calyx TemporalXTerm CF rows",
+        panel_version: report.panel_version,
+        filter_value: report.filter_value,
+        n_gaps: report.n_gaps as u64,
+        baseline_mean_gap: report.baseline_mean_gap,
+        baseline_sigma: report.baseline_sigma,
+        cusum_change_detected: report.cusum_change_detected,
+        cusum_change_index: report.cusum_change_index.map(|index| index as u64),
+        cusum_change_time_seconds: report.cusum_change_time_seconds,
+        cusum_direction: report.cusum_direction,
+        cusum_statistic: report.cusum_statistic,
+        mmd_split_index: report.mmd_split_index.map(|index| index as u64),
+        mmd_p_value: report.mmd_p_value,
+        mmd_significant: report.mmd_significant,
+        temporal_xterm_cf_rows_after: report.temporal_xterm_cf_rows_after as u64,
+    })
+}
+
+/// Fits the Gamma-renewal inter-event overdue hazard and persists the result to
+/// the native TemporalXTerm CF.
+pub fn run_intelligence_hazard(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceHazardReport, ErrorData> {
+    let report = db
+        .temporal_hazard_intelligence(&temporal_params(params))
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceHazardReport {
+        source_of_truth: "Calyx TemporalXTerm CF rows",
+        panel_version: report.panel_version,
+        filter_value: report.filter_value,
+        n_gaps: report.n_gaps as u64,
+        mean_gap_seconds: report.mean_gap_seconds,
+        coefficient_of_variation: report.coefficient_of_variation,
+        deterministic: report.deterministic,
+        elapsed_seconds: report.elapsed_seconds,
+        survival: report.survival,
+        hazard: report.hazard,
+        empirical_survival: report.empirical_survival,
+        expected_next_seconds: report.expected_next_seconds,
+        overdue_threshold_seconds: report.overdue_threshold_seconds,
+        alpha: report.alpha,
+        overdue: report.overdue,
+        temporal_xterm_cf_rows_after: report.temporal_xterm_cf_rows_after as u64,
     })
 }
 

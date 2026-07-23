@@ -63,6 +63,9 @@ pub(super) fn hygiene_response(
         scan_storage: None,
         flags: None,
         report: None,
+        grounding_gap: None,
+        blind_spot: None,
+        drift: None,
     };
     fill(&mut response);
     response

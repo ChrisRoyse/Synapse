@@ -579,6 +579,10 @@ pub(super) async fn handle(
                     bits: None,
                     sufficiency: None,
                     redundancy: None,
+                    causality: None,
+                    periodicity: None,
+                    drift: None,
+                    hazard: None,
                 };
                 match sub_operation {
                     StorageIntelligenceOperation::Weave => {
@@ -620,6 +624,38 @@ pub(super) async fn handle(
                                 ..base
                             },
                         )
+                    }
+                    StorageIntelligenceOperation::Causality => {
+                        crate::m3::storage::run_intelligence_causality(&db, &spec).map(
+                            |causality| StorageIntelligenceResponse {
+                                causality: Some(causality),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::Periodicity => {
+                        crate::m3::storage::run_intelligence_periodicity(&db, &spec).map(
+                            |periodicity| StorageIntelligenceResponse {
+                                periodicity: Some(periodicity),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::Drift => {
+                        crate::m3::storage::run_intelligence_drift(&db, &spec).map(|drift| {
+                            StorageIntelligenceResponse {
+                                drift: Some(drift),
+                                ..base
+                            }
+                        })
+                    }
+                    StorageIntelligenceOperation::Hazard => {
+                        crate::m3::storage::run_intelligence_hazard(&db, &spec).map(|hazard| {
+                            StorageIntelligenceResponse {
+                                hazard: Some(hazard),
+                                ..base
+                            }
+                        })
                     }
                 }
             })
@@ -691,6 +727,49 @@ pub(super) async fn handle(
                     redundancy.pairs_evaluated,
                     redundancy.redundant_pairs.len(),
                     redundancy.assay_cf_rows_after,
+                )
+            } else if let Some(causality) = &response.causality {
+                format!(
+                    "intelligence causality panel={} a={} b={} best_lag={} t_a_to_b={:.4} t_b_to_a={:.4} direction={} grounded={} graph_rows={}",
+                    causality.panel_version,
+                    causality.group_a,
+                    causality.group_b,
+                    causality.best_lag,
+                    causality.t_a_to_b,
+                    causality.t_b_to_a,
+                    causality.dominant_direction,
+                    causality.grounded,
+                    causality.graph_cf_rows_after,
+                )
+            } else if let Some(periodicity) = &response.periodicity {
+                format!(
+                    "intelligence periodicity panel={} n_samples={} dominant_period_seconds={:?} significant={} peaks={} temporal_xterm_rows={}",
+                    periodicity.panel_version,
+                    periodicity.n_samples,
+                    periodicity.dominant_period_seconds,
+                    periodicity.significant,
+                    periodicity.peaks.len(),
+                    periodicity.temporal_xterm_cf_rows_after,
+                )
+            } else if let Some(drift) = &response.drift {
+                format!(
+                    "intelligence drift panel={} n_gaps={} cusum_change_detected={} direction={:?} mmd_p_value={:?} temporal_xterm_rows={}",
+                    drift.panel_version,
+                    drift.n_gaps,
+                    drift.cusum_change_detected,
+                    drift.cusum_direction,
+                    drift.mmd_p_value,
+                    drift.temporal_xterm_cf_rows_after,
+                )
+            } else if let Some(hazard) = &response.hazard {
+                format!(
+                    "intelligence hazard panel={} n_gaps={} survival={:.4} overdue={} expected_next_seconds={:.1} temporal_xterm_rows={}",
+                    hazard.panel_version,
+                    hazard.n_gaps,
+                    hazard.survival,
+                    hazard.overdue,
+                    hazard.expected_next_seconds,
+                    hazard.temporal_xterm_cf_rows_after,
                 )
             } else {
                 "intelligence".to_owned()

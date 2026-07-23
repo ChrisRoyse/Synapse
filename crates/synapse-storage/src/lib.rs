@@ -993,6 +993,112 @@ impl Db {
         self.backend.assay_redundancy_intelligence(params)
     }
 
+    /// Measures directed transfer entropy (KSG, lag sweep) between two activity
+    /// streams over a panel and persists the dominant directed edge to the native
+    /// Graph CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when a stream is empty, the Base CF
+    /// cannot be scanned, or the Graph write/readback fails.
+    pub fn temporal_causality_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxTemporalParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxCausalityReport> {
+        self.backend.temporal_causality_intelligence(params)
+    }
+
+    /// Runs the Lomb-Scargle periodogram (with permutation false-alarm
+    /// probability) and a slotted-autocorrelation cross-check over a panel's
+    /// occurrence series and persists the result to the native TemporalXTerm CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the series is too short, the
+    /// estimator fails closed, or the CF write/readback fails.
+    pub fn temporal_periodicity_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxTemporalParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPeriodicityReport> {
+        self.backend.temporal_periodicity_intelligence(params)
+    }
+
+    /// Detects recurrence-rate change (CUSUM) and distribution drift (MMD) over a
+    /// panel's occurrence series and persists the result to the native
+    /// TemporalXTerm CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the gap series is too short, an
+    /// estimator fails closed, or the CF write/readback fails.
+    pub fn temporal_drift_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxTemporalParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxDriftReport> {
+        self.backend.temporal_drift_intelligence(params)
+    }
+
+    /// Fits the Gamma-renewal inter-event overdue hazard over a panel's
+    /// occurrence series and persists the result to the native TemporalXTerm CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the occurrence series is too
+    /// short, the estimator fails closed, or the CF write/readback fails.
+    pub fn temporal_hazard_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxTemporalParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxHazardReport> {
+        self.backend.temporal_hazard_intelligence(params)
+    }
+
+    /// Reports the grounding gaps for one panel (domain): per-anchor-kind and
+    /// per-lens grounded coverage, the largest ungrounded regions, and the
+    /// domain's provisional verdict. Read-only physical `Base` CF readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the `Base` CF cannot be scanned
+    /// or a constellation row fails to decode.
+    pub fn grounding_gap_intelligence(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxGroundingGapReport> {
+        self.backend
+            .grounding_gap_intelligence(panel_version, max_records)
+    }
+
+    /// Scans a panel for cross-lens blind spots (records where one lens is
+    /// confident a record is close to a neighbor while a second lens disagrees),
+    /// calibrated for a bounded false-positive rate. Read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the corpus cannot be read, the
+    /// math backend is unavailable, or the calibrated detector fails closed.
+    pub fn blind_spot_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxBlindSpotParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxBlindSpotReport> {
+        self.backend.blind_spot_intelligence(params)
+    }
+
+    /// Measures per-lens MMD distribution drift between a reference and a recent
+    /// window, persists every finding to the native `Reactive` CF, and reads it
+    /// back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the corpus cannot be read, the
+    /// MMD estimator hard-fails, or the `Reactive` CF write/readback fails.
+    pub fn panel_drift_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxPanelDriftParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelDriftReport> {
+        self.backend.panel_drift_intelligence(params)
+    }
+
     /// Flushes and explicitly closes the sole process-local Calyx vault.
     ///
     /// # Errors

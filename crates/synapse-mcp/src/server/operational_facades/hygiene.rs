@@ -161,5 +161,158 @@ pub(super) async fn handle(
                 |out| out.report = Some(response),
             )))
         }
+        HygieneOperation::GroundingGap => {
+            let spec = params
+                .0
+                .grounding_gap
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "grounding_gap"))?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_grounding_gap(&spec),
+            )?;
+            // Grounding-gap is a read-only scan of the whole Base panel: blocking
+            // CPU/IO work that must not occupy a runtime worker serving MCP.
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_lodestar",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene grounding_gap operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::hygiene::run_grounding_gap(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("grounding_gap blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the grounding-gap task terminated abnormally",
+                )
+            })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "grounded_fraction={:.4} provisional={} ungrounded_records={} base_cf_rows={}",
+                    response.grounded_fraction,
+                    response.provisional,
+                    response.ungrounded_records,
+                    response.base_cf_rows
+                ),
+                |out| out.grounding_gap = Some(response),
+            )))
+        }
+        HygieneOperation::BlindSpot => {
+            let spec = params
+                .0
+                .blind_spot
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "blind_spot"))?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_blind_spot(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_loom",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene blind_spot operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let response =
+                tokio::task::spawn_blocking(move || crate::m3::hygiene::run_blind_spot(&db, &spec))
+                    .await
+                    .map_err(|error| {
+                        facade_delegate_error(
+                            HYGIENE_TOOL,
+                            operation.as_str(),
+                            &source_id,
+                            HYGIENE_SOT,
+                            crate::m1::mcp_error(
+                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                format!("blind_spot blocking task failed to join: {error}"),
+                            ),
+                            "inspect daemon logs; the blind-spot task terminated abnormally",
+                        )
+                    })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "alerts_total={} slot_pairs_evaluated={} n_lenses={}",
+                    response.alerts_total, response.slot_pairs_evaluated, response.n_lenses
+                ),
+                |out| out.blind_spot = Some(response),
+            )))
+        }
+        HygieneOperation::Drift => {
+            let spec = params
+                .0
+                .drift
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "drift"))?;
+            // Drift persists findings to the native Reactive CF: maintenance-gated
+            // exactly like the other mutating hygiene operations.
+            require_maintenance_profile(
+                service,
+                &request_context,
+                HYGIENE_TOOL,
+                operation.as_str(),
+                &format!("panel_{}", spec.panel_version),
+                HYGIENE_SOT,
+            )?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_drift(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_assay",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene drift operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let response =
+                tokio::task::spawn_blocking(move || crate::m3::hygiene::run_drift(&db, &spec))
+                    .await
+                    .map_err(|error| {
+                        facade_delegate_error(
+                            HYGIENE_TOOL,
+                            operation.as_str(),
+                            &source_id,
+                            HYGIENE_SOT,
+                            crate::m1::mcp_error(
+                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                format!("drift blocking task failed to join: {error}"),
+                            ),
+                            "inspect daemon logs; the MMD drift task terminated abnormally",
+                        )
+                    })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "drifted_lenses={} drift_rows_persisted={} reactive_cf_rows_after={}",
+                    response.drifted_lenses,
+                    response.drift_rows_persisted,
+                    response.reactive_cf_rows_after
+                ),
+                |out| out.drift = Some(response),
+            )))
+        }
     }
 }

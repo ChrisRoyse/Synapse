@@ -2,7 +2,10 @@
 
 mod async_vault;
 pub mod backup;
+mod drift;
 mod error_bridge;
+mod find;
+mod grounding;
 mod intelligence;
 pub mod lowering;
 mod math;
@@ -66,14 +69,34 @@ pub use backup::{
     SynapseCalyxBackupFile, SynapseCalyxBackupReport, SynapseCalyxVerifyReport,
     verify_vault_restore,
 };
+pub use drift::{
+    SYNAPSE_BLIND_SPOT_ALPHA, SYNAPSE_BLIND_SPOT_MAX_ALERTS, SYNAPSE_BLIND_SPOT_MIN_SAMPLES,
+    SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION, SYNAPSE_DRIFT_MAX_WINDOW, SYNAPSE_DRIFT_MIN_WINDOW,
+    SynapseCalyxBlindSpotAlert, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
+    SynapseCalyxLensDrift, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
+};
+pub use find::{
+    SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_K, SynapseCalyxFindFusion, SynapseCalyxFindHit,
+    SynapseCalyxFindLensContribution, SynapseCalyxFindParams, SynapseCalyxFindQuery,
+    SynapseCalyxFindReport, SynapseCalyxFindTemporal,
+};
+pub use grounding::{
+    SYNAPSE_GROUNDING_COVERAGE_FLOOR, SYNAPSE_GROUNDING_MAX_UNGROUNDED_SLOTS,
+    SynapseCalyxAnchorKindCoverage, SynapseCalyxDomainGroundingVerdict,
+    SynapseCalyxGroundingGapReport, SynapseCalyxSlotGroundingCoverage,
+};
 pub use intelligence::{
     SYNAPSE_ASSAY_BIT_FLOOR, SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES,
     SYNAPSE_INTELLIGENCE_MAX_RECORDS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
-    SYNAPSE_KSG_DEFAULT_K, SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge,
-    SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport,
-    SynapseCalyxNeffEstimate, SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport,
-    SynapseCalyxSlotBits, SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport,
-    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    SYNAPSE_KSG_DEFAULT_K, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS, SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG,
+    SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS, SynapseCalyxAbundanceReport,
+    SynapseCalyxAgreementEdge, SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge,
+    SynapseCalyxBitsReport, SynapseCalyxCausalityLag, SynapseCalyxCausalityReport,
+    SynapseCalyxDriftReport, SynapseCalyxHazardReport, SynapseCalyxNeffEstimate,
+    SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak, SynapseCalyxRedundancyPair,
+    SynapseCalyxRedundancyReport, SynapseCalyxSlotBits, SynapseCalyxSufficiencyDeficit,
+    SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams, SynapseCalyxWeaveParams,
+    SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,

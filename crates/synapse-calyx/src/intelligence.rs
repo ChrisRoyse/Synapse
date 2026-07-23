@@ -12,13 +12,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
-    AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, SlotAttribution, TrustTag,
-    bits_report_with_anchor, entropy_bits, ksg_mi_continuous_discrete,
-    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution, stable_rank,
+    AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, DEFAULT_TE_LAGS,
+    Direction, EstimatorKind, InterEventHazardReport, MiEstimate, MmdConfig, PeriodogramConfig,
+    RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution, TEResult, TrustTag, autocorrelation,
+    bin_event_counts, bits_report_with_anchor, entropy_bits, inter_event_hazard_with_alpha,
+    ksg_mi_continuous_discrete, lomb_scargle_with_config, mmd_change_point,
+    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution,
+    recurrence_rate_cusum, stable_rank, transfer_entropy_sweep,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
-use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, SlotId, SlotVector};
+use calyx_core::{
+    Anchor, AnchorKind, AnchorValue, Constellation, CxId, SlotId, SlotVector, SystemClock, Ts,
+};
 use calyx_forge::{Backend, KnnMetric};
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
@@ -1226,4 +1232,772 @@ fn parse_anchor_kind(raw: &str) -> AnchorKind {
         "recurrence" => AnchorKind::Recurrence,
         other => AnchorKind::Label(other.to_owned()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal intelligence (#1673)
+//
+// Turn correlation into arrows and cadence into confidence over the panel's
+// source-event-time series:
+//   * causality  — KSG transfer entropy with a lag sweep between two activity
+//                  streams (which app/agent/tool activity drives which).
+//   * periodicity — Lomb-Scargle GLS periodogram with permutation false-alarm
+//                  probability plus a slotted autocorrelation cross-check.
+//   * drift      — Page two-sided CUSUM rate change-points plus an MMD two-
+//                  sample drift test over the activity-count distribution.
+//   * hazard     — Gamma-renewal inter-event overdue hazard ("overdue" anomaly).
+//
+// Every estimator is wired from the calyx-assay substrate (no reimplementation).
+// Derived rows persist to the native TemporalXTerm CF (periodicity/drift/hazard)
+// and the Graph CF (directed causality edge) and are read back so every returned
+// count is proven against the bytes, matching the Loom/Assay persistence idioms
+// above. Series are read from the physical Base CF `source_event_time_secs`
+// (inactive temporal lanes are suppressed, never storage-time-substituted).
+// ---------------------------------------------------------------------------
+
+/// Minimum event occurrences before a temporal estimator runs rather than
+/// failing closed. Below this a series cannot carry a trusted temporal statistic.
+pub const SYNAPSE_TEMPORAL_MIN_EVENTS: usize = 8;
+/// Default occurrence-count bin width (seconds) for the Lomb-Scargle and
+/// transfer-entropy binned series: one hour, matching operator-cadence scales.
+pub const SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS: f64 = 3_600.0;
+/// Default maximum lag (in bins) swept by the transfer-entropy estimator.
+pub const SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG: usize = 8;
+/// Cap on reported periodogram peaks.
+pub const SYNAPSE_TEMPORAL_MAX_PEAKS: usize = 4;
+
+const GRAPH_CAUSALITY_PREFIX: &[u8; 5] = b"GTE01";
+const TEMPORAL_PERIODICITY_PREFIX: &[u8; 5] = b"TPER1";
+const TEMPORAL_DRIFT_PREFIX: &[u8; 5] = b"TDRF1";
+const TEMPORAL_HAZARD_PREFIX: &[u8; 5] = b"THAZ1";
+
+/// Bounded request describing one temporal-intelligence pass over a panel.
+#[derive(Clone, Debug)]
+pub struct SynapseCalyxTemporalParams {
+    pub panel_version: u32,
+    pub max_records: usize,
+    /// Metadata key that partitions the panel into activity streams (e.g. the
+    /// app/agent/tool identifier). Required for causality; optional filter for
+    /// periodicity/drift/hazard.
+    pub group_key: Option<String>,
+    /// Causality source-stream value under `group_key` (defaults to the most
+    /// frequent stream when absent).
+    pub group_a: Option<String>,
+    /// Causality target-stream value under `group_key` (defaults to the second
+    /// most frequent stream when absent).
+    pub group_b: Option<String>,
+    /// Restricts periodicity/drift/hazard to one `group_key` stream value.
+    pub filter_value: Option<String>,
+    /// Occurrence-count bin width in seconds.
+    pub bin_seconds: f64,
+    /// Maximum transfer-entropy lag (bins) in the sweep.
+    pub max_lag: usize,
+    /// Reference "now" (Unix seconds) for the overdue-hazard elapsed time.
+    pub now_secs: Option<i64>,
+    /// Survival threshold below which the next occurrence is overdue.
+    pub overdue_alpha: f64,
+}
+
+impl SynapseCalyxTemporalParams {
+    #[must_use]
+    pub fn new(panel_version: u32) -> Self {
+        Self {
+            panel_version,
+            max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
+            group_key: None,
+            group_a: None,
+            group_b: None,
+            filter_value: None,
+            bin_seconds: SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS,
+            max_lag: SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG,
+            now_secs: None,
+            overdue_alpha: calyx_assay::DEFAULT_OVERDUE_ALPHA,
+        }
+    }
+}
+
+/// One transfer-entropy lag result surfaced from the sweep.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxCausalityLag {
+    pub lag: usize,
+    pub t_a_to_b: f32,
+    pub t_b_to_a: f32,
+    pub difference_ci_low: f32,
+    pub difference_ci_high: f32,
+    pub direction: String,
+    pub n_samples: usize,
+    pub provisional: bool,
+}
+
+/// Directed transfer-entropy result between two activity streams with the
+/// physical Graph CF readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxCausalityReport {
+    pub panel_version: u32,
+    pub group_key: String,
+    pub group_a: String,
+    pub group_b: String,
+    pub bin_seconds: f64,
+    pub n_bins: usize,
+    pub events_a: usize,
+    pub events_b: usize,
+    pub best_lag: usize,
+    pub t_a_to_b: f32,
+    pub t_b_to_a: f32,
+    pub difference_ci_low: f32,
+    pub difference_ci_high: f32,
+    pub dominant_direction: String,
+    pub grounded: bool,
+    pub lags: Vec<SynapseCalyxCausalityLag>,
+    pub graph_cf_rows_after: usize,
+}
+
+/// One periodogram peak surfaced with its permutation false-alarm probability.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxPeriodogramPeak {
+    pub period_seconds: f64,
+    pub frequency: f64,
+    pub power: f64,
+    pub false_alarm_probability: f64,
+}
+
+/// Lomb-Scargle periodicity result plus slotted-autocorrelation cross-check,
+/// with the physical TemporalXTerm CF readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxPeriodicityReport {
+    pub panel_version: u32,
+    pub filter_value: Option<String>,
+    pub bin_seconds: f64,
+    pub n_samples: usize,
+    pub time_span_seconds: f64,
+    pub dominant_period_seconds: Option<f64>,
+    pub dominant_power: Option<f64>,
+    pub dominant_false_alarm_probability: Option<f64>,
+    pub significant: bool,
+    pub peaks: Vec<SynapseCalyxPeriodogramPeak>,
+    pub acf_dominant_period_seconds: Option<f64>,
+    pub temporal_xterm_cf_rows_after: usize,
+}
+
+/// CUSUM + MMD drift result with the physical TemporalXTerm CF readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxDriftReport {
+    pub panel_version: u32,
+    pub filter_value: Option<String>,
+    pub n_gaps: usize,
+    pub baseline_mean_gap: f64,
+    pub baseline_sigma: f64,
+    pub cusum_change_detected: bool,
+    pub cusum_change_index: Option<usize>,
+    pub cusum_change_time_seconds: Option<f64>,
+    pub cusum_direction: Option<String>,
+    pub cusum_statistic: Option<f64>,
+    pub mmd_split_index: Option<usize>,
+    pub mmd_p_value: Option<f64>,
+    pub mmd_significant: Option<bool>,
+    pub temporal_xterm_cf_rows_after: usize,
+}
+
+/// Gamma-renewal overdue-hazard result with the physical TemporalXTerm CF
+/// readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxHazardReport {
+    pub panel_version: u32,
+    pub filter_value: Option<String>,
+    pub n_gaps: usize,
+    pub mean_gap_seconds: f64,
+    pub coefficient_of_variation: f64,
+    pub deterministic: bool,
+    pub elapsed_seconds: f64,
+    pub survival: f64,
+    pub hazard: f64,
+    pub empirical_survival: f64,
+    pub expected_next_seconds: f64,
+    pub overdue_threshold_seconds: f64,
+    pub alpha: f64,
+    pub overdue: bool,
+    pub temporal_xterm_cf_rows_after: usize,
+}
+
+/// One panel record reduced to its source event time and stream group.
+struct EventRecord {
+    secs: f64,
+    group: Option<String>,
+}
+
+impl SynapseCalyxVault {
+    /// Measures directed transfer entropy (KSG, lag sweep) between two activity
+    /// streams partitioned by a metadata `group_key`, persists the dominant
+    /// directed edge to the native Graph CF, and reads the Graph CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when `group_key` is absent, either stream is
+    /// empty, the Base CF cannot be scanned, a constellation fails to decode, or
+    /// the Graph write/readback fails.
+    pub fn temporal_causality(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> Result<SynapseCalyxCausalityReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("temporal_causality");
+        let group_key = params
+            .group_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let group_key = group_key.ok_or_else(|| {
+            temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_GROUP_KEY_REQUIRED",
+                "transfer-entropy causality requires a group_key partitioning the panel into activity streams",
+                "supply group_key (the app/agent/tool metadata field) so two directed streams can be built",
+            )
+        })?;
+        let records = self.load_panel_event_records(params, Some(group_key))?;
+        let mut by_group: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for record in &records {
+            if let Some(group) = &record.group {
+                by_group.entry(group.clone()).or_default().push(record.secs);
+            }
+        }
+        let (a_val, b_val) = choose_causality_streams(params, &by_group)?;
+        let a_times = by_group.get(&a_val).cloned().unwrap_or_default();
+        let b_times = by_group.get(&b_val).cloned().unwrap_or_default();
+        if a_times.len() < SYNAPSE_TEMPORAL_MIN_EVENTS
+            || b_times.len() < SYNAPSE_TEMPORAL_MIN_EVENTS
+        {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_INSUFFICIENT_EVENTS",
+                "one or both activity streams have fewer than the minimum occurrences for transfer entropy",
+                "widen the record window or pick two active streams (>= 8 occurrences each) under group_key",
+            ));
+        }
+
+        let bin = validated_bin_seconds(params.bin_seconds)?;
+        let (stream_a, stream_b) = paired_binned_streams(&a_times, &b_times, bin);
+        let n_bins = stream_a.len();
+        let mut lags: Vec<usize> = DEFAULT_TE_LAGS
+            .iter()
+            .copied()
+            .filter(|lag| *lag <= params.max_lag.max(1))
+            .collect();
+        if lags.is_empty() {
+            lags.push(1);
+        }
+        let clock = SystemClock;
+        let results = transfer_entropy_sweep(&stream_a, &stream_b, &lags, &clock);
+        let best = choose_dominant_te(&results).ok_or_else(|| {
+            temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_TE_UNRESOLVED",
+                "transfer-entropy sweep returned no usable lag (all provisional or errored)",
+                "increase the binned series length (more occurrences or a smaller bin) so a lag reaches quorum",
+            )
+        })?;
+
+        let dominant_direction = direction_label(best.dominant_direction);
+        let grounded = !best.provisional;
+        let key = causality_edge_key(params.panel_version, &a_val, &b_val);
+        let out_edge = serde_json::json!({
+            "panel_version": params.panel_version,
+            "group_key": group_key,
+            "group_a": a_val,
+            "group_b": b_val,
+            "bin_seconds": bin,
+            "best_lag": best.lag,
+            "t_a_to_b": best.t_a_to_b,
+            "t_b_to_a": best.t_b_to_a,
+            "dominant_direction": dominant_direction,
+            "provisional": best.provisional,
+        });
+        self.persist_temporal_row(ColumnFamily::Graph, key, &out_edge)?;
+        let graph_cf_rows_after = self.scan_cf_latest(ColumnFamily::Graph)?.len();
+
+        Ok(SynapseCalyxCausalityReport {
+            panel_version: params.panel_version,
+            group_key: group_key.to_owned(),
+            group_a: a_val,
+            group_b: b_val,
+            bin_seconds: bin,
+            n_bins,
+            events_a: a_times.len(),
+            events_b: b_times.len(),
+            best_lag: best.lag,
+            t_a_to_b: best.t_a_to_b,
+            t_b_to_a: best.t_b_to_a,
+            difference_ci_low: best.difference_ci_95.0,
+            difference_ci_high: best.difference_ci_95.1,
+            dominant_direction,
+            grounded,
+            lags: results.iter().map(causality_lag).collect(),
+            graph_cf_rows_after,
+        })
+    }
+
+    /// Runs the Lomb-Scargle GLS periodogram (with permutation false-alarm
+    /// probability) and a slotted-autocorrelation cross-check over the panel's
+    /// occurrence-count series, persists the result to the native TemporalXTerm
+    /// CF, and reads it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the series is too short, the estimator
+    /// fails closed, or the CF write/readback fails.
+    pub fn temporal_periodicity(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> Result<SynapseCalyxPeriodicityReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("temporal_periodicity");
+        let times = self.filtered_event_times(params)?;
+        let bin = validated_bin_seconds(params.bin_seconds)?;
+        let (centers, counts) = bin_event_counts(&times, bin)
+            .map_err(|error| loom_math_error("bin occurrence counts", &error))?;
+        let config = PeriodogramConfig {
+            max_peaks: SYNAPSE_TEMPORAL_MAX_PEAKS,
+            ..PeriodogramConfig::default()
+        };
+        let report = lomb_scargle_with_config(&centers, &counts, &config)
+            .map_err(|error| loom_math_error("Lomb-Scargle periodogram", &error))?;
+        let acf_dominant = autocorrelation(&centers, &counts)
+            .ok()
+            .and_then(|acf| acf.dominant_period);
+
+        let dominant = report.dominant().copied();
+        let significant = !report.significant_peaks(SIGNIFICANT_PEAK_FAP).is_empty();
+        let peaks: Vec<SynapseCalyxPeriodogramPeak> = report
+            .peaks
+            .iter()
+            .map(|peak| SynapseCalyxPeriodogramPeak {
+                period_seconds: peak.period,
+                frequency: peak.frequency,
+                power: peak.power,
+                false_alarm_probability: peak.false_alarm_probability,
+            })
+            .collect();
+
+        let out = serde_json::json!({
+            "panel_version": params.panel_version,
+            "filter_value": params.filter_value,
+            "bin_seconds": bin,
+            "n_samples": report.n_samples,
+            "time_span_seconds": report.time_span,
+            "dominant_period_seconds": dominant.map(|peak| peak.period),
+            "dominant_false_alarm_probability": dominant.map(|peak| peak.false_alarm_probability),
+            "significant": significant,
+            "acf_dominant_period_seconds": acf_dominant,
+        });
+        let key = temporal_report_key(
+            TEMPORAL_PERIODICITY_PREFIX,
+            params.panel_version,
+            params.filter_value.as_deref(),
+        );
+        self.persist_temporal_row(ColumnFamily::TemporalXTerm, key, &out)?;
+        let temporal_xterm_cf_rows_after = self.scan_cf_latest(ColumnFamily::TemporalXTerm)?.len();
+
+        Ok(SynapseCalyxPeriodicityReport {
+            panel_version: params.panel_version,
+            filter_value: params.filter_value.clone(),
+            bin_seconds: bin,
+            n_samples: report.n_samples,
+            time_span_seconds: report.time_span,
+            dominant_period_seconds: dominant.map(|peak| peak.period),
+            dominant_power: dominant.map(|peak| peak.power),
+            dominant_false_alarm_probability: dominant.map(|peak| peak.false_alarm_probability),
+            significant,
+            peaks,
+            acf_dominant_period_seconds: acf_dominant,
+            temporal_xterm_cf_rows_after,
+        })
+    }
+
+    /// Detects recurrence-rate change (Page two-sided CUSUM over the gap series)
+    /// and distribution drift (MMD two-sample over the activity-count series),
+    /// persists the result to the native TemporalXTerm CF, and reads it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the gap series is too short, an estimator
+    /// fails closed, or the CF write/readback fails.
+    pub fn temporal_drift(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> Result<SynapseCalyxDriftReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("temporal_drift");
+        let times = self.filtered_event_times(params)?;
+        let cusum: CusumReport = recurrence_rate_cusum(&times)
+            .map_err(|error| loom_math_error("CUSUM rate change-point", &error))?;
+
+        let bin = validated_bin_seconds(params.bin_seconds)?;
+        let mmd = match bin_event_counts(&times, bin) {
+            Ok((_, counts)) => temporal_mmd_change_point(&counts),
+            Err(_) => None,
+        };
+
+        let change = cusum.change_point;
+        let out = serde_json::json!({
+            "panel_version": params.panel_version,
+            "filter_value": params.filter_value,
+            "n_gaps": cusum.n_gaps,
+            "baseline_mean_gap": cusum.baseline_mean_gap,
+            "baseline_sigma": cusum.baseline_sigma,
+            "cusum_change_detected": change.is_some(),
+            "cusum_change_index": change.map(|point| point.occurrence_index),
+            "cusum_direction": change.map(|point| rate_shift_label(point.direction)),
+            "mmd_p_value": mmd.as_ref().map(|report| report.report.p_value),
+        });
+        let key = temporal_report_key(
+            TEMPORAL_DRIFT_PREFIX,
+            params.panel_version,
+            params.filter_value.as_deref(),
+        );
+        self.persist_temporal_row(ColumnFamily::TemporalXTerm, key, &out)?;
+        let temporal_xterm_cf_rows_after = self.scan_cf_latest(ColumnFamily::TemporalXTerm)?.len();
+
+        Ok(SynapseCalyxDriftReport {
+            panel_version: params.panel_version,
+            filter_value: params.filter_value.clone(),
+            n_gaps: cusum.n_gaps,
+            baseline_mean_gap: cusum.baseline_mean_gap,
+            baseline_sigma: cusum.baseline_sigma,
+            cusum_change_detected: change.is_some(),
+            cusum_change_index: change.map(|point| point.occurrence_index),
+            cusum_change_time_seconds: change.map(|point| point.change_time),
+            cusum_direction: change.map(|point| rate_shift_label(point.direction)),
+            cusum_statistic: change.map(|point| point.statistic),
+            mmd_split_index: mmd.as_ref().map(|report| report.split_index),
+            mmd_p_value: mmd.as_ref().map(|report| report.report.p_value),
+            mmd_significant: mmd.as_ref().map(|report| report.report.significant),
+            temporal_xterm_cf_rows_after,
+        })
+    }
+
+    /// Fits the Gamma-renewal inter-event hazard and evaluates the overdue
+    /// survival at `now`, persists the result to the native TemporalXTerm CF, and
+    /// reads it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the occurrence series is too short, the
+    /// estimator fails closed, or the CF write/readback fails.
+    pub fn temporal_hazard(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> Result<SynapseCalyxHazardReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("temporal_hazard");
+        let times = self.filtered_event_times(params)?;
+        let last = *times.last().ok_or_else(|| {
+            temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_INSUFFICIENT_EVENTS",
+                "the occurrence series is empty; overdue hazard needs a recent occurrence",
+                "capture more occurrences for this stream before requesting overdue hazard",
+            )
+        })?;
+        let now = resolve_now_secs(params.now_secs, self.clock_now_ms().ok(), last);
+        let report: InterEventHazardReport =
+            inter_event_hazard_with_alpha(&times, now, params.overdue_alpha)
+                .map_err(|error| loom_math_error("inter-event overdue hazard", &error))?;
+
+        let out = serde_json::json!({
+            "panel_version": params.panel_version,
+            "filter_value": params.filter_value,
+            "n_gaps": report.n_gaps,
+            "mean_gap_seconds": report.mean_gap,
+            "coefficient_of_variation": report.coefficient_of_variation,
+            "elapsed_seconds": report.elapsed,
+            "survival": report.survival,
+            "expected_next_seconds": report.expected_next,
+            "overdue": report.overdue,
+            "alpha": report.alpha,
+        });
+        let key = temporal_report_key(
+            TEMPORAL_HAZARD_PREFIX,
+            params.panel_version,
+            params.filter_value.as_deref(),
+        );
+        self.persist_temporal_row(ColumnFamily::TemporalXTerm, key, &out)?;
+        let temporal_xterm_cf_rows_after = self.scan_cf_latest(ColumnFamily::TemporalXTerm)?.len();
+
+        Ok(SynapseCalyxHazardReport {
+            panel_version: params.panel_version,
+            filter_value: params.filter_value.clone(),
+            n_gaps: report.n_gaps,
+            mean_gap_seconds: report.mean_gap,
+            coefficient_of_variation: report.coefficient_of_variation,
+            deterministic: report.deterministic,
+            elapsed_seconds: report.elapsed,
+            survival: report.survival,
+            hazard: report.hazard,
+            empirical_survival: report.empirical_survival,
+            expected_next_seconds: report.expected_next,
+            overdue_threshold_seconds: report.overdue_threshold_secs,
+            alpha: report.alpha,
+            overdue: report.overdue,
+            temporal_xterm_cf_rows_after,
+        })
+    }
+
+    /// Loads the panel's ascending source-event-time series (seconds) with the
+    /// optional stream group. Records without an active source event time are
+    /// suppressed (never storage-time-substituted).
+    fn load_panel_event_records(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+        group_key: Option<&str>,
+    ) -> Result<Vec<EventRecord>, SynapseCalyxError> {
+        let max_records = params
+            .max_records
+            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
+        let mut records = Vec::new();
+        for (_, value) in rows {
+            let constellation = decode_constellation_base(&value).map_err(|error| {
+                SynapseCalyxError::from_calyx("decode Base constellation", &error)
+            })?;
+            if constellation.panel_version != params.panel_version {
+                continue;
+            }
+            let Some(secs) = constellation.source_event_time_secs() else {
+                continue;
+            };
+            let group =
+                group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
+            records.push(EventRecord {
+                secs: secs as f64,
+                group,
+            });
+            if records.len() >= max_records {
+                break;
+            }
+        }
+        records.sort_by(|a, b| a.secs.total_cmp(&b.secs));
+        Ok(records)
+    }
+
+    /// Ascending occurrence-time series (seconds) for periodicity/drift/hazard,
+    /// optionally restricted to one `group_key` stream value.
+    fn filtered_event_times(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> Result<Vec<f64>, SynapseCalyxError> {
+        let group_key = params
+            .group_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let records = self.load_panel_event_records(params, group_key)?;
+        let times: Vec<f64> = records
+            .iter()
+            .filter(|record| match (group_key, &params.filter_value) {
+                (Some(_), Some(value)) => record.group.as_deref() == Some(value.as_str()),
+                _ => true,
+            })
+            .map(|record| record.secs)
+            .collect();
+        if times.len() < SYNAPSE_TEMPORAL_MIN_EVENTS {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_INSUFFICIENT_EVENTS",
+                "the filtered occurrence series has fewer than the minimum occurrences for a temporal estimate",
+                "widen the record window, drop the filter, or capture more occurrences (>= 8) for this stream",
+            ));
+        }
+        Ok(times)
+    }
+
+    /// Persists one JSON temporal report row to a native CF and flushes it.
+    fn persist_temporal_row(
+        &self,
+        cf: ColumnFamily,
+        key: Vec<u8>,
+        value: &serde_json::Value,
+    ) -> Result<(), SynapseCalyxError> {
+        self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            cf,
+            key,
+            value: encode_json(value)?,
+        }])?;
+        self.flush()
+    }
+}
+
+/// Chooses the two causality streams: explicit `group_a`/`group_b` when given,
+/// else the two most frequent streams under the group key.
+fn choose_causality_streams(
+    params: &SynapseCalyxTemporalParams,
+    by_group: &BTreeMap<String, Vec<f64>>,
+) -> Result<(String, String), SynapseCalyxError> {
+    if let (Some(a), Some(b)) = (&params.group_a, &params.group_b) {
+        if a == b {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_STREAMS_IDENTICAL",
+                "group_a and group_b name the same stream; transfer entropy needs two distinct streams",
+                "pick two distinct group_key values for the directed causality test",
+            ));
+        }
+        return Ok((a.clone(), b.clone()));
+    }
+    let mut ranked: Vec<(&String, usize)> = by_group
+        .iter()
+        .map(|(name, times)| (name, times.len()))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    if ranked.len() < 2 {
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_STREAMS_INSUFFICIENT",
+            "fewer than two activity streams exist under group_key; transfer entropy needs a lead/lag pair",
+            "supply group_a/group_b explicitly or capture activity for at least two distinct streams",
+        ));
+    }
+    Ok((ranked[0].0.clone(), ranked[1].0.clone()))
+}
+
+/// Builds two aligned integer-bin count streams over the union time range so the
+/// transfer-entropy lag operates on consecutive bins (value 0 bins are kept so
+/// the estimator's history lookups never straddle a gap).
+fn paired_binned_streams(
+    a_times: &[f64],
+    b_times: &[f64],
+    bin: f64,
+) -> (Vec<(u64, f32)>, Vec<(u64, f32)>) {
+    let min_t = a_times
+        .iter()
+        .chain(b_times)
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let max_t = a_times
+        .iter()
+        .chain(b_times)
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !min_t.is_finite() || !max_t.is_finite() || max_t < min_t {
+        return (Vec::new(), Vec::new());
+    }
+    let n_bins = (((max_t - min_t) / bin).floor() as usize) + 1;
+    let mut a_counts = vec![0.0_f32; n_bins];
+    let mut b_counts = vec![0.0_f32; n_bins];
+    for &time in a_times {
+        let index = (((time - min_t) / bin).floor() as usize).min(n_bins - 1);
+        a_counts[index] += 1.0;
+    }
+    for &time in b_times {
+        let index = (((time - min_t) / bin).floor() as usize).min(n_bins - 1);
+        b_counts[index] += 1.0;
+    }
+    let stream_a = a_counts
+        .into_iter()
+        .enumerate()
+        .map(|(index, count)| (index as u64, count))
+        .collect();
+    let stream_b = b_counts
+        .into_iter()
+        .enumerate()
+        .map(|(index, count)| (index as u64, count))
+        .collect();
+    (stream_a, stream_b)
+}
+
+/// Picks the transfer-entropy lag with the largest absolute directed asymmetry
+/// among non-provisional results, preferring a resolved direction.
+fn choose_dominant_te(results: &[TEResult]) -> Option<TEResult> {
+    results
+        .iter()
+        .filter(|result| !result.provisional && result.error_code.is_none())
+        .max_by(|left, right| {
+            (left.t_a_to_b - left.t_b_to_a)
+                .abs()
+                .total_cmp(&(right.t_a_to_b - right.t_b_to_a).abs())
+        })
+        .or_else(|| results.iter().find(|result| result.error_code.is_none()))
+        .cloned()
+}
+
+/// Runs an MMD change-point over the 1-D activity-count series when it is long
+/// enough for a two-sided split; returns `None` (never fabricates) otherwise.
+fn temporal_mmd_change_point(counts: &[f64]) -> Option<ChangePointReport> {
+    let samples: Vec<Vec<f64>> = counts.iter().map(|count| vec![*count]).collect();
+    if samples.len() < calyx_assay::mmd::MIN_MMD_SAMPLES * 2 {
+        return None;
+    }
+    mmd_change_point(
+        &samples,
+        calyx_assay::mmd::MIN_MMD_SAMPLES,
+        &MmdConfig::default(),
+    )
+    .ok()
+}
+
+fn causality_lag(result: &TEResult) -> SynapseCalyxCausalityLag {
+    SynapseCalyxCausalityLag {
+        lag: result.lag,
+        t_a_to_b: result.t_a_to_b,
+        t_b_to_a: result.t_b_to_a,
+        difference_ci_low: result.difference_ci_95.0,
+        difference_ci_high: result.difference_ci_95.1,
+        direction: direction_label(result.dominant_direction),
+        n_samples: result.n_samples,
+        provisional: result.provisional,
+    }
+}
+
+fn direction_label(direction: Direction) -> String {
+    match direction {
+        Direction::AToB => "a_to_b".to_owned(),
+        Direction::BToA => "b_to_a".to_owned(),
+        Direction::Unclear => "unclear".to_owned(),
+    }
+}
+
+fn rate_shift_label(shift: RateShift) -> String {
+    match shift {
+        RateShift::SpeedUp => "speed_up".to_owned(),
+        RateShift::SlowDown => "slow_down".to_owned(),
+    }
+}
+
+/// Chooses the overdue-hazard reference `now`: the explicit request, else the
+/// vault clock, clamped forward to the last occurrence (elapsed must be >= 0).
+#[allow(clippy::cast_precision_loss)]
+fn resolve_now_secs(now_secs: Option<i64>, clock_ms: Option<Ts>, last: f64) -> f64 {
+    let candidate = now_secs
+        .map(|secs| secs as f64)
+        .or_else(|| clock_ms.map(|ms| ms as f64 / 1_000.0))
+        .unwrap_or(last);
+    candidate.max(last)
+}
+
+fn validated_bin_seconds(bin_seconds: f64) -> Result<f64, SynapseCalyxError> {
+    if bin_seconds.is_finite() && bin_seconds > 0.0 {
+        Ok(bin_seconds)
+    } else {
+        Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_BIN_INVALID",
+            "bin_seconds must be finite and positive",
+            "supply a positive occurrence-count bin width in seconds",
+        ))
+    }
+}
+
+fn causality_edge_key(panel_version: u32, group_a: &str, group_b: &str) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(GRAPH_CAUSALITY_PREFIX.len() + 5 + group_a.len() + group_b.len());
+    key.extend_from_slice(GRAPH_CAUSALITY_PREFIX);
+    key.extend_from_slice(&panel_version.to_be_bytes());
+    key.extend_from_slice(group_a.as_bytes());
+    key.push(0x00);
+    key.extend_from_slice(group_b.as_bytes());
+    key
+}
+
+fn temporal_report_key(prefix: &[u8; 5], panel_version: u32, filter: Option<&str>) -> Vec<u8> {
+    let filter = filter.unwrap_or("");
+    let mut key = Vec::with_capacity(prefix.len() + 4 + filter.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&panel_version.to_be_bytes());
+    key.extend_from_slice(filter.as_bytes());
+    key
+}
+
+fn temporal_error(
+    code: &'static str,
+    message: &'static str,
+    remediation: &'static str,
+) -> SynapseCalyxError {
+    SynapseCalyxError::new(code, message.to_owned(), remediation)
 }

@@ -55,6 +55,9 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("scan_storage", params.scan_storage.is_some()),
             ("flags", params.flags.is_some()),
             ("report", params.report.is_some()),
+            ("grounding_gap", params.grounding_gap.is_some()),
+            ("blind_spot", params.blind_spot.is_some()),
+            ("drift", params.drift.is_some()),
         ],
     )
 }

@@ -21,14 +21,17 @@ use sha2::{Digest, Sha256};
 use synapse_calyx::{
     SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
     SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams, SynapseCalyxBackupReport,
-    SynapseCalyxBitsReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
-    SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxErasureReport,
-    SynapseCalyxError, SynapseCalyxGroundedObservationReadback, SynapseCalyxLedgerEntryReadback,
+    SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
+    SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
+    SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxDriftReport,
+    SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxGroundedObservationReadback,
+    SynapseCalyxGroundingGapReport, SynapseCalyxHazardReport, SynapseCalyxLedgerEntryReadback,
     SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
-    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
-    SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
-    SynapseCalyxRedundancyReport, SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard,
-    SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
+    SynapseCalyxObservationPutReadback, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
+    SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
+    SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
+    SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
     SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
     SynapseCalyxVaultStatus, SynapseCalyxVerifyReport, SynapseCalyxWeaveParams,
     SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
@@ -640,6 +643,35 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: &SynapseCalyxAssayParams,
     ) -> StorageResult<SynapseCalyxRedundancyReport>;
+    fn temporal_causality_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxCausalityReport>;
+    fn temporal_periodicity_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxPeriodicityReport>;
+    fn temporal_drift_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxDriftReport>;
+    fn temporal_hazard_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxHazardReport>;
+    fn grounding_gap_intelligence(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> StorageResult<SynapseCalyxGroundingGapReport>;
+    fn blind_spot_intelligence(
+        &self,
+        params: &SynapseCalyxBlindSpotParams,
+    ) -> StorageResult<SynapseCalyxBlindSpotReport>;
+    fn panel_drift_intelligence(
+        &self,
+        params: &SynapseCalyxPanelDriftParams,
+    ) -> StorageResult<SynapseCalyxPanelDriftReport>;
 }
 
 pub struct CalyxBackend {
@@ -1921,6 +1953,145 @@ impl StorageBackend for CalyxBackend {
                     calyx_write_failed(
                         "calyx_assay",
                         "measure native Calyx lens redundancy",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn temporal_causality_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxCausalityReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx temporal causality",
+            true,
+            |vault| {
+                vault.temporal_causality(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx temporal causality",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn temporal_periodicity_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxPeriodicityReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx temporal periodicity",
+            true,
+            |vault| {
+                vault.temporal_periodicity(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx temporal periodicity",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn temporal_drift_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxDriftReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx temporal drift",
+            true,
+            |vault| {
+                vault.temporal_drift(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx temporal drift",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn temporal_hazard_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> StorageResult<SynapseCalyxHazardReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx temporal overdue hazard",
+            true,
+            |vault| {
+                vault.temporal_hazard(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx temporal overdue hazard",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn grounding_gap_intelligence(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> StorageResult<SynapseCalyxGroundingGapReport> {
+        self.with_vault(
+            "calyx_lodestar",
+            "report native Calyx grounding gaps",
+            false,
+            |vault| {
+                vault
+                    .grounding_gap_report(panel_version, max_records)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_lodestar",
+                            "report native Calyx grounding gaps",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn blind_spot_intelligence(
+        &self,
+        params: &SynapseCalyxBlindSpotParams,
+    ) -> StorageResult<SynapseCalyxBlindSpotReport> {
+        self.with_vault(
+            "calyx_loom",
+            "scan native Calyx blind spots",
+            false,
+            |vault| {
+                vault.blind_spot_scan(params).map_err(|source| {
+                    calyx_write_failed("calyx_loom", "scan native Calyx blind spots", &source)
+                })
+            },
+        )
+    }
+
+    fn panel_drift_intelligence(
+        &self,
+        params: &SynapseCalyxPanelDriftParams,
+    ) -> StorageResult<SynapseCalyxPanelDriftReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx panel MMD drift",
+            true,
+            |vault| {
+                vault.mmd_panel_drift(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx panel MMD drift",
                         &source,
                     )
                 })

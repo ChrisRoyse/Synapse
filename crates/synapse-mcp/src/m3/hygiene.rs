@@ -402,6 +402,351 @@ pub fn required_permissions_report(_params: &HygieneReportParams) -> RequiredPer
     required([Permission::ReadStorage])
 }
 
+/// Upper bound on records scanned in one Calyx-intelligence hygiene pass. Mirrors
+/// `synapse_calyx::SYNAPSE_INTELLIGENCE_MAX_RECORDS`; the vault re-clamps.
+const MAX_INTELLIGENCE_HYGIENE_RECORDS: u32 = 20_000;
+
+fn clamp_intelligence_hygiene_records(requested: Option<u32>) -> usize {
+    requested
+        .unwrap_or(MAX_INTELLIGENCE_HYGIENE_RECORDS)
+        .clamp(1, MAX_INTELLIGENCE_HYGIENE_RECORDS) as usize
+}
+
+/// Grounding-gap report request over one panel (domain) (#1670).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGroundingGapParams {
+    /// Panel/domain to report grounding coverage for.
+    pub panel_version: u32,
+    /// Optional cap on records scanned (defaults to the vault maximum).
+    #[serde(default)]
+    pub max_records: Option<u32>,
+}
+
+/// Per-anchor-kind grounded coverage row in the grounding-gap report.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneAnchorKindCoverage {
+    pub anchor_kind: String,
+    pub grounded_records: u64,
+    pub coverage_fraction: f32,
+}
+
+/// Per-lens grounded coverage row in the grounding-gap report.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneSlotGroundingCoverage {
+    pub slot: u32,
+    pub records_present: u64,
+    pub grounded_records: u64,
+    pub ungrounded_records: u64,
+    pub coverage_fraction: f32,
+    /// True when this lens is under-anchored: results read from it are provisional.
+    pub provisional: bool,
+}
+
+/// Grounding-gap report over one panel with the physical `Base` CF readback.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGroundingGapResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub records_scanned: u64,
+    pub records_measured: u64,
+    pub grounded_records: u64,
+    pub ungrounded_records: u64,
+    pub grounded_fraction: f32,
+    pub coverage_floor: f32,
+    /// The load-bearing control-doctrine marker: true when the domain is
+    /// under-anchored, so any assay/oracle result over it must be tagged
+    /// provisional (may advise, never control).
+    pub provisional: bool,
+    pub provisional_reason: Option<String>,
+    pub distinct_anchor_kinds: u64,
+    pub anchor_kind_coverage: Vec<HygieneAnchorKindCoverage>,
+    pub slot_coverage: Vec<HygieneSlotGroundingCoverage>,
+    pub largest_ungrounded_slots: Vec<HygieneSlotGroundingCoverage>,
+    pub base_cf_rows: u64,
+}
+
+#[must_use]
+pub fn required_permissions_grounding_gap(
+    _params: &HygieneGroundingGapParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+fn map_slot_grounding(
+    coverage: synapse_calyx::SynapseCalyxSlotGroundingCoverage,
+) -> HygieneSlotGroundingCoverage {
+    HygieneSlotGroundingCoverage {
+        slot: u32::from(coverage.slot),
+        records_present: coverage.records_present as u64,
+        grounded_records: coverage.grounded_records as u64,
+        ungrounded_records: coverage.ungrounded_records as u64,
+        coverage_fraction: coverage.coverage_fraction,
+        provisional: coverage.provisional,
+    }
+}
+
+/// Reports grounding gaps for one panel: per-anchor-kind and per-lens grounded
+/// coverage, the largest ungrounded regions, and the domain's provisional
+/// verdict. Read-only physical `Base` CF readback.
+///
+/// # Errors
+///
+/// Returns a structured error when the `Base` CF cannot be scanned or a
+/// constellation row fails to decode.
+pub fn run_grounding_gap(
+    db: &Db,
+    params: &HygieneGroundingGapParams,
+) -> Result<HygieneGroundingGapResponse, ErrorData> {
+    let max_records = clamp_intelligence_hygiene_records(params.max_records);
+    let report = db
+        .grounding_gap_intelligence(params.panel_version, max_records)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneGroundingGapResponse {
+        source_of_truth: "Calyx Base CF anchors",
+        panel_version: report.panel_version,
+        records_scanned: report.records_scanned as u64,
+        records_measured: report.records_measured as u64,
+        grounded_records: report.grounded_records as u64,
+        ungrounded_records: report.ungrounded_records as u64,
+        grounded_fraction: report.grounded_fraction,
+        coverage_floor: report.coverage_floor,
+        provisional: report.provisional,
+        provisional_reason: report.provisional_reason,
+        distinct_anchor_kinds: report.distinct_anchor_kinds as u64,
+        anchor_kind_coverage: report
+            .anchor_kind_coverage
+            .into_iter()
+            .map(|coverage| HygieneAnchorKindCoverage {
+                anchor_kind: coverage.anchor_kind,
+                grounded_records: coverage.grounded_records as u64,
+                coverage_fraction: coverage.coverage_fraction,
+            })
+            .collect(),
+        slot_coverage: report
+            .slot_coverage
+            .into_iter()
+            .map(map_slot_grounding)
+            .collect(),
+        largest_ungrounded_slots: report
+            .largest_ungrounded_slots
+            .into_iter()
+            .map(map_slot_grounding)
+            .collect(),
+        base_cf_rows: report.base_cf_rows as u64,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Blind-spot and MMD drift detection (#1674)
+// ---------------------------------------------------------------------------
+
+/// Blind-spot scan request over one panel (#1674).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneBlindSpotParams {
+    pub panel_version: u32,
+    #[serde(default)]
+    pub max_records: Option<u32>,
+    /// Optional cap on alerts returned (defaults to the vault maximum).
+    #[serde(default)]
+    pub max_alerts: Option<u32>,
+}
+
+/// One flagged cross-lens blind-spot anomaly in the hygiene report.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneBlindSpotAlert {
+    pub cx_id: String,
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub lens_a_similarity: f32,
+    pub lens_b_neighbor_mean: f32,
+    pub delta: f32,
+    pub severity: String,
+    pub calibration_sample_count: u64,
+    pub calibration_alpha: f32,
+    pub calibration_p_value: f32,
+    pub calibration_percentile: f32,
+    pub threshold_delta: f32,
+}
+
+/// Blind-spot scan report over one panel.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneBlindSpotResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub records_scanned: u64,
+    pub records_measured: u64,
+    pub n_lenses: u64,
+    pub slot_pairs_evaluated: u64,
+    pub slot_pairs_uncalibrated: u64,
+    pub alerts_total: u64,
+    pub alerts: Vec<HygieneBlindSpotAlert>,
+}
+
+/// MMD lens-drift scan request over one panel (#1674).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneDriftParams {
+    pub panel_version: u32,
+    #[serde(default)]
+    pub max_records: Option<u32>,
+    /// Fraction of the most-recent records forming the recent window (0.05..0.95).
+    #[serde(default)]
+    pub recent_fraction: Option<f32>,
+    /// MMD permutation count for the null distribution.
+    #[serde(default)]
+    pub permutations: Option<u32>,
+}
+
+/// One lens's MMD reference-vs-recent drift measurement in the hygiene report.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneLensDrift {
+    pub slot: u32,
+    pub dimension: u64,
+    pub reference_n: u64,
+    pub recent_n: u64,
+    pub mmd2: f64,
+    pub p_value: f64,
+    pub bandwidth: f64,
+    pub significant: bool,
+    pub persisted: bool,
+}
+
+/// MMD lens-drift scan report over one panel with the `Reactive` CF readback.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneDriftResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub records_scanned: u64,
+    pub records_measured: u64,
+    pub recent_fraction: f32,
+    pub permutations: u64,
+    pub lenses_evaluated: u64,
+    pub lenses_insufficient: u64,
+    pub drifted_lenses: u64,
+    pub lens_drift: Vec<HygieneLensDrift>,
+    pub reactive_cf_rows_after: u64,
+    pub drift_rows_persisted: u64,
+}
+
+#[must_use]
+pub fn required_permissions_blind_spot(_params: &HygieneBlindSpotParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_drift(_params: &HygieneDriftParams) -> RequiredPermissions {
+    // Drift persists findings to the native Reactive CF for #1677/#1681.
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+/// Scans a panel for cross-lens blind spots and lists the flagged records with
+/// the disagreeing lens pair and calibration evidence. Read-only.
+///
+/// # Errors
+///
+/// Returns a structured error when the corpus cannot be read, the math backend
+/// is unavailable, or the calibrated detector fails closed.
+pub fn run_blind_spot(
+    db: &Db,
+    params: &HygieneBlindSpotParams,
+) -> Result<HygieneBlindSpotResponse, ErrorData> {
+    let mut spec = synapse_calyx::SynapseCalyxBlindSpotParams::new(params.panel_version);
+    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    if let Some(max_alerts) = params.max_alerts {
+        spec.max_alerts = max_alerts.max(1) as usize;
+    }
+    let report = db
+        .blind_spot_intelligence(&spec)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneBlindSpotResponse {
+        source_of_truth: "Calyx Base CF lens vectors",
+        panel_version: report.panel_version,
+        records_scanned: report.records_scanned as u64,
+        records_measured: report.records_measured as u64,
+        n_lenses: report.n_lenses as u64,
+        slot_pairs_evaluated: report.slot_pairs_evaluated as u64,
+        slot_pairs_uncalibrated: report.slot_pairs_uncalibrated as u64,
+        alerts_total: report.alerts_total as u64,
+        alerts: report
+            .alerts
+            .into_iter()
+            .map(|alert| HygieneBlindSpotAlert {
+                cx_id: alert.cx_id,
+                slot_a: u32::from(alert.slot_a),
+                slot_b: u32::from(alert.slot_b),
+                lens_a_similarity: alert.lens_a_similarity,
+                lens_b_neighbor_mean: alert.lens_b_neighbor_mean,
+                delta: alert.delta,
+                severity: alert.severity,
+                calibration_sample_count: alert.calibration_sample_count as u64,
+                calibration_alpha: alert.calibration_alpha,
+                calibration_p_value: alert.calibration_p_value,
+                calibration_percentile: alert.calibration_percentile,
+                threshold_delta: alert.threshold_delta,
+            })
+            .collect(),
+    })
+}
+
+/// Measures per-lens MMD distribution drift between a reference and a recent
+/// window, persisting each finding to the native `Reactive` CF for downstream
+/// consumers, then reads the CF back.
+///
+/// # Errors
+///
+/// Returns a structured error when the corpus cannot be read, the MMD estimator
+/// hard-fails, or the `Reactive` CF write/readback fails.
+pub fn run_drift(db: &Db, params: &HygieneDriftParams) -> Result<HygieneDriftResponse, ErrorData> {
+    let mut spec = synapse_calyx::SynapseCalyxPanelDriftParams::new(params.panel_version);
+    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    if let Some(recent_fraction) = params.recent_fraction {
+        spec.recent_fraction = recent_fraction;
+    }
+    if let Some(permutations) = params.permutations {
+        spec.permutations = permutations.max(1) as usize;
+    }
+    let report = db
+        .panel_drift_intelligence(&spec)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneDriftResponse {
+        source_of_truth: "Calyx Reactive CF drift findings",
+        panel_version: report.panel_version,
+        records_scanned: report.records_scanned as u64,
+        records_measured: report.records_measured as u64,
+        recent_fraction: report.recent_fraction,
+        permutations: report.permutations as u64,
+        lenses_evaluated: report.lenses_evaluated as u64,
+        lenses_insufficient: report.lenses_insufficient as u64,
+        drifted_lenses: report.drifted_lenses as u64,
+        lens_drift: report
+            .lens_drift
+            .into_iter()
+            .map(|drift| HygieneLensDrift {
+                slot: u32::from(drift.slot),
+                dimension: drift.dimension as u64,
+                reference_n: drift.reference_n as u64,
+                recent_n: drift.recent_n as u64,
+                mmd2: drift.mmd2,
+                p_value: drift.p_value,
+                bandwidth: drift.bandwidth,
+                significant: drift.significant,
+                persisted: drift.persisted,
+            })
+            .collect(),
+        reactive_cf_rows_after: report.reactive_cf_rows_after as u64,
+        drift_rows_persisted: report.drift_rows_persisted as u64,
+    })
+}
+
 pub fn scan_text_tool(
     runtime: &Arc<Mutex<ReflexRuntime>>,
     params: &HygieneScanTextParams,

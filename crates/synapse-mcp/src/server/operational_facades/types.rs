@@ -7,7 +7,9 @@ use crate::server::tool_profiles::CodexClientSurfaceSnapshot;
 
 use crate::m3::{
     hygiene::{
-        HygieneFlagsParams, HygieneFlagsResponse, HygieneReportParams, HygieneReportResponse,
+        HygieneBlindSpotParams, HygieneBlindSpotResponse, HygieneDriftParams, HygieneDriftResponse,
+        HygieneFlagsParams, HygieneFlagsResponse, HygieneGroundingGapParams,
+        HygieneGroundingGapResponse, HygieneReportParams, HygieneReportResponse,
         HygieneScanStorageParams, HygieneScanStorageResponse, HygieneScanTextParams,
         HygieneScanTextResponse,
     },
@@ -210,6 +212,9 @@ pub enum HygieneOperation {
     ScanStorage,
     Flags,
     Report,
+    GroundingGap,
+    BlindSpot,
+    Drift,
 }
 
 impl HygieneOperation {
@@ -219,6 +224,9 @@ impl HygieneOperation {
             Self::ScanStorage => "scan_storage",
             Self::Flags => "flags",
             Self::Report => "report",
+            Self::GroundingGap => "grounding_gap",
+            Self::BlindSpot => "blind_spot",
+            Self::Drift => "drift",
         }
     }
 }
@@ -235,6 +243,12 @@ pub struct HygieneParams {
     pub flags: Option<HygieneFlagsParams>,
     #[serde(default)]
     pub report: Option<HygieneReportParams>,
+    #[serde(default)]
+    pub grounding_gap: Option<HygieneGroundingGapParams>,
+    #[serde(default)]
+    pub blind_spot: Option<HygieneBlindSpotParams>,
+    #[serde(default)]
+    pub drift: Option<HygieneDriftParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -251,6 +265,12 @@ pub struct HygieneResponse {
     pub flags: Option<HygieneFlagsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<HygieneReportResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_gap: Option<HygieneGroundingGapResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blind_spot: Option<HygieneBlindSpotResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<HygieneDriftResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
