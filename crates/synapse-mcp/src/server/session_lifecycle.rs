@@ -351,6 +351,7 @@ pub struct SessionCdpCleanupReport {
     pub closed: usize,
     pub already_absent: usize,
     pub endpoint_unreachable: usize,
+    pub stale_prior_session_owner_reclaimed: usize,
     pub persisted_rows_deleted: usize,
     pub failed: usize,
     pub target_ids: Vec<String>,
@@ -2336,6 +2337,10 @@ async fn cleanup_session_cdp_targets(
                     CdpCleanupCloseOutcome::EndpointUnreachable => {
                         report.endpoint_unreachable = report.endpoint_unreachable.saturating_add(1);
                     }
+                    CdpCleanupCloseOutcome::StalePriorSessionOwnerReclaimed => {
+                        report.stale_prior_session_owner_reclaimed =
+                            report.stale_prior_session_owner_reclaimed.saturating_add(1);
+                    }
                 }
                 tracing::info!(
                     code = "MCP_SESSION_CDP_TARGET_CLEANUP",
@@ -2379,6 +2384,13 @@ enum CdpCleanupCloseOutcome {
     Closed,
     AlreadyAbsent,
     EndpointUnreachable,
+    /// The bridge refused the close because the persisted owner belongs to a
+    /// *prior* Chrome browser session (`browser_session_continuity_matched=false`
+    /// / "durable owners belong to a prior browser session"). Chrome tab ids are
+    /// not stable across browser restarts, so this tab id can never be closed by
+    /// any future retry — the owner row is reclaimed as terminally unclosable
+    /// instead of re-failing the 250 ms stale sweep forever.
+    StalePriorSessionOwnerReclaimed,
 }
 
 impl CdpCleanupCloseOutcome {
@@ -2387,6 +2399,7 @@ impl CdpCleanupCloseOutcome {
             Self::Closed => "closed",
             Self::AlreadyAbsent => "already_absent",
             Self::EndpointUnreachable => "endpoint_unreachable",
+            Self::StalePriorSessionOwnerReclaimed => "stale_prior_session_owner_reclaimed",
         }
     }
 }
@@ -2422,6 +2435,20 @@ async fn close_cdp_target_for_cleanup(
             .or_else(|error| {
                 if chrome_bridge_close_target_already_absent(error.detail(), target_id) {
                     Ok(CdpCleanupCloseOutcome::AlreadyAbsent)
+                } else if chrome_bridge_close_refused_for_stale_prior_browser_session(
+                    error.detail(),
+                ) {
+                    tracing::warn!(
+                        code = "MCP_SESSION_CDP_STALE_PRIOR_SESSION_OWNER_RECLAIMED",
+                        hwnd = owner.window_hwnd,
+                        endpoint = %owner.endpoint,
+                        cdp_target_id = %owner.cdp_target_id,
+                        detail = %error.detail(),
+                        "session lifecycle reclaimed persisted CDP owner row whose tab id \
+                         belongs to a dead prior Chrome browser session; the bridge \
+                         mutation gate proves it can never be closed by retrying"
+                    );
+                    Ok(CdpCleanupCloseOutcome::StalePriorSessionOwnerReclaimed)
                 } else {
                     Err(error.detail().to_owned())
                 }
@@ -2463,9 +2490,12 @@ fn is_chrome_bridge_endpoint(endpoint: &str) -> bool {
 /// `Err`, and the 250 ms stale-session sweep retried the same dead tab forever
 /// (~48.9k ERROR/day on 2026-07-23) — a session with a closed tab could never
 /// finish teardown. Match the stable "tab gone" markers instead of one exact
-/// sentence. This deliberately does NOT absorb the operator-panic
+/// sentence. This deliberately does NOT absorb the plain operator-panic
 /// mutation-admission refusal (the tab may still be open there): that stays a
-/// genuine fail-closed retention.
+/// genuine fail-closed retention. The one proven-terminal refusal —
+/// stale-prior-browser-session continuity, where the tab id itself is dead —
+/// is classified separately by
+/// `chrome_bridge_close_refused_for_stale_prior_browser_session`.
 #[cfg(windows)]
 fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
     // Chrome's definitive "the tab does not exist" runtime error.
@@ -2477,6 +2507,25 @@ fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> b
         && detail.contains(target_id)
         && detail.contains("chrome.tabs tab id")
         && detail.contains("did not match")
+}
+
+/// Terminal-refusal classifier for the 2026-07-23 session-leak livelock: the
+/// bridge refuses `closeTab` because its durable owner ledger belongs to a
+/// *prior* Chrome browser session (a worker restart stranded an in-flight
+/// mutation the stale-owner repair structurally cannot clear, so the mutation
+/// gate stays closed). Chrome tab ids are meaningless across browser restarts,
+/// therefore no retry can ever close this tab id — retaining the persisted
+/// owner row only re-fails teardown every 250 ms forever (the exact
+/// `MCP_SESSION_TEARDOWN_FAILED` → `TOOL_INTERNAL_ERROR` storm observed at
+/// `active_session_count=12`). Both markers are emitted by the bridge's
+/// storage-state readback inside the refusal detail; require the refusal
+/// itself plus at least one continuity proof so a live-tab operator-panic
+/// refusal (no continuity mismatch) stays fail-closed.
+#[cfg(windows)]
+fn chrome_bridge_close_refused_for_stale_prior_browser_session(detail: &str) -> bool {
+    detail.contains("refusing closeTab")
+        && (detail.contains("durable owners belong to a prior browser session")
+            || detail.contains("browser_session_continuity_matched=false"))
 }
 
 #[cfg(not(windows))]

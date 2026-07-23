@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Write as _,
     fs,
     io::{self, Read as _},
@@ -3410,6 +3410,7 @@ fn spawn_stale_session_input_cleanup(
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut reap_interval = time::interval(ABANDONED_SESSION_REAP_INTERVAL);
         reap_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut teardown_backoff = StaleTeardownBackoff::default();
         tracing::info!(
             code = "MCP_HTTP_SESSION_ABANDONED_REAPER_STARTED",
             reap_after_ms = reap_after.map(|d| d.as_millis() as u64),
@@ -3430,6 +3431,7 @@ fn spawn_stale_session_input_cleanup(
                     cleanup_stale_session_resources_once(
                         &session_lifecycle,
                         &session_manager,
+                        &mut teardown_backoff,
                     ).await;
                 }
                 _ = reap_interval.tick() => {
@@ -3601,19 +3603,85 @@ fn spawn_agent_liveness_sweep(
     })
 }
 
+/// Per-session exponential backoff for stale-session teardowns that keep
+/// failing. Without this, one permanently-unrepairable sub-resource re-fails
+/// teardown on every 250 ms sweep — the 2026-07-23 storm logged ~48.9k
+/// identical `TOOL_INTERNAL_ERROR` lines/day and kept the daemon's cleanup
+/// path busy while agents were handshaking. The retry never gives up (no
+/// silent drop): it decays 250 ms → 500 ms → … → capped 60 s, still logging
+/// every real attempt, and resets the moment a teardown succeeds.
+#[derive(Default)]
+struct StaleTeardownBackoff {
+    entries: HashMap<String, StaleTeardownBackoffEntry>,
+}
+
+struct StaleTeardownBackoffEntry {
+    consecutive_failures: u32,
+    next_attempt_at: Instant,
+}
+
+const STALE_TEARDOWN_BACKOFF_CAP: Duration = Duration::from_mins(1);
+
+impl StaleTeardownBackoff {
+    fn should_attempt(&self, session_id: &str, now: Instant) -> bool {
+        self.entries
+            .get(session_id)
+            .is_none_or(|entry| now >= entry.next_attempt_at)
+    }
+
+    fn record_success(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+
+    fn record_failure(&mut self, session_id: &str, now: Instant) -> (u32, Duration) {
+        let failures = self
+            .entries
+            .get(session_id)
+            .map_or(0, |entry| entry.consecutive_failures)
+            .saturating_add(1);
+        let exponent = failures.saturating_sub(1).min(8);
+        let delay = STALE_SESSION_INPUT_CLEANUP_INTERVAL
+            .saturating_mul(1_u32 << exponent)
+            .min(STALE_TEARDOWN_BACKOFF_CAP);
+        self.entries.insert(
+            session_id.to_owned(),
+            StaleTeardownBackoffEntry {
+                consecutive_failures: failures,
+                next_attempt_at: now + delay,
+            },
+        );
+        (failures, delay)
+    }
+
+    /// Drop tracking for sessions that are no longer stale candidates (cleaned
+    /// up by another path) so the map cannot grow without bound.
+    fn retain_candidates(&mut self, candidates: &BTreeSet<String>) {
+        self.entries
+            .retain(|session_id, _| candidates.contains(session_id));
+    }
+}
+
 async fn cleanup_stale_session_resources_once(
     session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
     session_manager: &LocalSessionManager,
+    teardown_backoff: &mut StaleTeardownBackoff,
 ) {
     let active_sessions = active_http_session_ids(session_manager).await;
     session_lifecycle.cleanup_expired_lease_inputs_once().await;
     let stale_sessions = session_lifecycle.stale_session_candidates(&active_sessions);
+    let candidate_ids = stale_sessions.keys().cloned().collect::<BTreeSet<_>>();
+    teardown_backoff.retain_candidates(&candidate_ids);
+    let now = Instant::now();
     for (session_id, reason) in stale_sessions {
+        if !teardown_backoff.should_attempt(&session_id, now) {
+            continue;
+        }
         match session_lifecycle
             .teardown_session(&session_id, reason)
             .await
         {
             Ok(report) => {
+                teardown_backoff.record_success(&session_id);
                 tracing::info!(
                     code = "MCP_HTTP_SESSION_STALE_LIFECYCLE_CLEANUP",
                     session_id = %session_id,
@@ -3624,14 +3692,18 @@ async fn cleanup_stale_session_resources_once(
                 );
             }
             Err(error) => {
+                let (consecutive_failures, retry_after) =
+                    teardown_backoff.record_failure(&session_id, now);
                 tracing::error!(
                     code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
                     session_id = %session_id,
                     reason,
                     active_session_count = active_sessions.len(),
+                    consecutive_failures,
+                    retry_after_ms = retry_after.as_millis() as u64,
                     detail = %error.message,
                     data = ?error.data,
-                    "HTTP MCP stale-session lifecycle cleanup failed"
+                    "HTTP MCP stale-session lifecycle cleanup failed; retrying with backoff"
                 );
             }
         }
