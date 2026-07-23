@@ -8195,15 +8195,17 @@ if (-not $SkipBuild) {
     New-Item -ItemType Directory -Force -Path $CargoTarget, $LogDir | Out-Null
     $env:CARGO_TARGET_DIR = $CargoTarget
     if (-not $env:CARGO_BUILD_JOBS) {
-        # Full-machine parallelism even when setup runs directly (not via
-        # synapse-update.ps1). The env var outranks any `[build] jobs = N` cap
-        # in a user/repo cargo config.toml that would otherwise silently
-        # serialize the build; cargo forwards it to build scripts as NUM_JOBS,
-        # which parallelizes native dependency compilation. RAM-guarded (~1.5 GB per
-        # heavy rustc/cl.exe job) so low-memory machines don't swap.
+        # Cargo defaults to logical CPU count, but the shipping graph combines
+        # LLVM thin-LTO, rust-lld, CUDA/native build scripts, and a 260+ MB
+        # embedded-model executable. On this 32-thread/128-GB Windows host the
+        # final rustc process physically crashed with STATUS_ACCESS_VIOLATION at
+        # 32 jobs while 75+ GB remained free; the identical build completed at
+        # 8. Cap the evidence-backed automatic choice while preserving an
+        # explicit CARGO_BUILD_JOBS operator override.
         $logicalCpus = [Environment]::ProcessorCount
         $ramGb = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-        $env:CARGO_BUILD_JOBS = [string][int][math]::Min($logicalCpus, [math]::Max(1, [math]::Floor($ramGb / 1.5)))
+        $memoryJobs = [math]::Max(1, [math]::Floor($ramGb / 1.5))
+        $env:CARGO_BUILD_JOBS = [string][int][math]::Min(8, [math]::Min($logicalCpus, $memoryJobs))
     }
     Info "Build parallelism: CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) (logical CPUs: $([Environment]::ProcessorCount))"
     $buildLog = Join-Path $LogDir 'setup-build.log'

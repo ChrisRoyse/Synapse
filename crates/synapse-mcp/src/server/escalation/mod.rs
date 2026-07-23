@@ -98,6 +98,8 @@ const ITEM_PREFIX: &str = "escalation/v1/item/";
 const AUDIT_PREFIX: &str = "escalation/v1/audit/";
 const OUTBOX_PREFIX: &str = "escalation/v1/outbox/";
 const OPEN_INDEX_PREFIX: &str = "escalation/v1/open/";
+const RECENT_INDEX_PREFIX: &str = "escalation/v2/recent/";
+const RECENT_INDEX_MIGRATION_KEY: &str = "escalation/v2/recent_migration/v1";
 const PROJECTION_WATERMARK_PREFIX: &str = "escalation/v2/projection/";
 const PENDING_PROJECTION_INDEX_PREFIX: &str = "escalation/v2/projection_pending/";
 const PENDING_PROJECTION_INDEX_MIGRATION_KEY: &str =
@@ -119,6 +121,9 @@ const ESCALATION_ID_PREFIX: &str = "esc1-";
 const ESCALATION_ID_HEX_LEN: usize = 32;
 const ESCALATION_ID_LEN: usize = ESCALATION_ID_PREFIX.len() + ESCALATION_ID_HEX_LEN;
 const ITEM_KEY_LEN: usize = ITEM_PREFIX.len() + ESCALATION_ID_LEN;
+const RECENT_INDEX_KEY_LEN: usize = RECENT_INDEX_PREFIX.len() + 16 + 1 + ESCALATION_ID_LEN;
+const OPEN_INDEX_KEY_LEN: usize = OPEN_INDEX_PREFIX.len() + 64;
+const LIST_INDEX_PAGE_ROWS: usize = 64;
 const APPROVAL_ITEM_PREFIX: &str = "approval/v1/item/";
 const APPROVAL_AUDIT_PREFIX: &str = "approval/v1/audit/";
 
@@ -802,6 +807,26 @@ pub(crate) struct EscalationItem {
 
 fn item_key(escalation_id: &str) -> Vec<u8> {
     format!("{ITEM_PREFIX}{escalation_id}").into_bytes()
+}
+
+fn recent_index_key_parts(created_at_unix_ms: u64, escalation_id: &str) -> Vec<u8> {
+    format!(
+        "{RECENT_INDEX_PREFIX}{:016x}/{}",
+        u64::MAX - created_at_unix_ms,
+        escalation_id
+    )
+    .into_bytes()
+}
+
+fn recent_index_key(item: &EscalationItem) -> Vec<u8> {
+    recent_index_key_parts(item.created_at_unix_ms, &item.escalation_id)
+}
+
+fn recent_index_row(item: &EscalationItem) -> (Vec<u8>, Vec<u8>) {
+    (
+        recent_index_key(item),
+        item.escalation_id.as_bytes().to_vec(),
+    )
 }
 
 fn audit_key(escalation_id: &str, at_unix_ms: u64, event_id: &str) -> Vec<u8> {
@@ -3530,6 +3555,16 @@ struct PendingProjectionIndexMigrationReadback {
     revision_sha256: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecentIndexMigrationRecord {
+    schema_version: u32,
+    migration_version: u32,
+    completed_at_unix_ms: u64,
+    indexed_rows: u64,
+    audit_sha256: String,
+}
+
 #[derive(Clone, Debug)]
 struct RevisionedTransitionProjectionWatermark {
     record: TransitionProjectionWatermark,
@@ -3690,6 +3725,7 @@ fn write_item_and_audit_guarded(
     let mut rows = vec![
         (item_key.clone(), item_value.clone()),
         (audit_key.clone(), audit_value.clone()),
+        recent_index_row(item),
     ];
     rows.extend(extra_rows.iter().cloned());
     let expected_revision_sha256 = match guard {
@@ -3816,6 +3852,28 @@ fn write_item_and_audit_guarded(
                 item.escalation_id,
                 event,
                 hex_bytes(&audit_key),
+                outcome.committed_seq
+            ),
+        ));
+    }
+    let (recent_key, recent_value) = recent_index_row(item);
+    let recent_readback = read_exact_row(db, &recent_key)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "escalation recent index absent immediately after write: escalation_id={} key={}",
+                item.escalation_id,
+                hex_bytes(&recent_key)
+            ),
+        )
+    })?;
+    if recent_readback != recent_value {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "escalation recent index bytes differed immediately after write: escalation_id={} key={} committed_seq={}",
+                item.escalation_id,
+                hex_bytes(&recent_key),
                 outcome.committed_seq
             ),
         ));
@@ -4670,6 +4728,7 @@ async fn scan_item_rows_cancellable(
 struct TerminalItemDeleteCandidate {
     key: Vec<u8>,
     escalation_id: String,
+    created_at_unix_ms: u64,
     scanned_updated_at_unix_ms: u64,
 }
 
@@ -4985,14 +5044,50 @@ fn delete_terminal_candidate_chunk(
         if shutdown.is_some_and(CancellationToken::is_cancelled) {
             return Ok(None);
         }
-        let guards = pending
-            .iter()
-            .map(|(_candidate, guard)| guard.clone())
-            .collect::<Vec<_>>();
-        let keys = pending
-            .iter()
-            .map(|(candidate, _guard)| candidate.key.clone())
-            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(pending.len() * 2);
+        let mut keys = Vec::with_capacity(pending.len() * 2);
+        for (candidate, item_guard) in &pending {
+            let recent_key =
+                recent_index_key_parts(candidate.created_at_unix_ms, &candidate.escalation_id);
+            let recent = db
+                .get_cf_revisioned(cf::CF_KV, &recent_key)
+                .map_err(storage_error)?
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "terminal escalation recent index is absent before atomic retention delete: escalation_id={} key={}",
+                            candidate.escalation_id,
+                            hex_bytes(&recent_key)
+                        ),
+                    )
+                })?;
+            let recent_value = live_revisioned_value(
+                &recent,
+                &format!(
+                    "terminal escalation recent index {}",
+                    candidate.escalation_id
+                ),
+            )?;
+            if recent_value != candidate.escalation_id.as_bytes() {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "terminal escalation recent index identity mismatch before retention delete: escalation_id={} key={}",
+                        candidate.escalation_id,
+                        hex_bytes(&recent_key)
+                    ),
+                ));
+            }
+            guards.push(item_guard.clone());
+            guards.push(RevisionGuard::new(
+                recent_key.clone(),
+                Some(recent.revision_sha256),
+            ));
+            keys.push(candidate.key.clone());
+            keys.push(recent_key);
+        }
+        let deleted_items = pending.len();
         let outcome = db
             .mutate_batch_if_revisions_pressure_bypass(
                 cf::CF_KV,
@@ -5048,7 +5143,7 @@ fn delete_terminal_candidate_chunk(
                 last_key = %keys.last().map_or_else(|| "none".to_owned(), |key| hex_bytes(key)),
                 "readback=CF_KV every revision-guarded terminal row is absent"
             );
-            return Ok(Some(keys.len()));
+            return Ok(Some(deleted_items));
         }
 
         let conflict = outcome.conflict.ok_or_else(|| {
@@ -5059,9 +5154,15 @@ fn delete_terminal_candidate_chunk(
                 ),
             )
         })?;
-        if conflict.guard_index >= pending.len()
-            || pending[conflict.guard_index].0.key != conflict.key
-        {
+        let conflict_candidate_index = conflict.guard_index / 2;
+        let expected_conflict_key = pending.get(conflict_candidate_index).map(|(candidate, _)| {
+            if conflict.guard_index % 2 == 0 {
+                candidate.key.clone()
+            } else {
+                recent_index_key_parts(candidate.created_at_unix_ms, &candidate.escalation_id)
+            }
+        });
+        if expected_conflict_key.as_deref() != Some(conflict.key.as_slice()) {
             return Err(mcp_error(
                 error_codes::STORAGE_WRITE_FAILED,
                 format!(
@@ -5072,9 +5173,9 @@ fn delete_terminal_candidate_chunk(
                 ),
             ));
         }
-        let (candidate, _stale_guard) = pending.remove(conflict.guard_index);
+        let (candidate, _stale_guard) = pending.remove(conflict_candidate_index);
         if let Some(refreshed_guard) = current_terminal_delete_guard(db, &candidate)? {
-            pending.insert(conflict.guard_index, (candidate, refreshed_guard));
+            pending.insert(conflict_candidate_index, (candidate, refreshed_guard));
         }
         tracing::info!(
             code = "ESCALATION_TERMINAL_DELETE_REVISION_RETRY",
@@ -5152,6 +5253,7 @@ fn terminal_item_delete_keys(
                 TerminalItemDeleteCandidate {
                     key: row.key.clone(),
                     escalation_id: row.item.escalation_id.clone(),
+                    created_at_unix_ms: row.item.created_at_unix_ms,
                     scanned_updated_at_unix_ms: row.item.updated_at_unix_ms,
                 },
             )
@@ -5229,6 +5331,282 @@ async fn prune_terminal_item_rows_cancellable(
 /// the queue fail closed at the historical row limit.
 fn scan_items(db: &Db) -> Result<Vec<EscalationItem>, ErrorData> {
     scan_item_rows(db).map(|rows| rows.into_iter().map(|row| row.item).collect())
+}
+
+fn fixed_prefix_bounds(prefix: &str, key_len: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut start = prefix.as_bytes().to_vec();
+    start.resize(key_len, 0);
+    let mut end = prefix.as_bytes().to_vec();
+    for byte in end.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            end.resize(key_len, 0);
+            return (start, end);
+        }
+        *byte = 0;
+    }
+    unreachable!("ASCII storage prefix always has a lexicographic successor")
+}
+
+fn read_recent_index_migration(db: &Db) -> Result<Option<RecentIndexMigrationRecord>, ErrorData> {
+    let Some(value) = read_exact_row(db, RECENT_INDEX_MIGRATION_KEY.as_bytes())? else {
+        return Ok(None);
+    };
+    let record = decode_json::<RecentIndexMigrationRecord>(&value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("recent escalation index migration sentinel decode failed: {error}"),
+        )
+    })?;
+    if record.schema_version != SCHEMA_VERSION
+        || record.migration_version != 1
+        || record.completed_at_unix_ms == 0
+        || !is_lower_hex_exact(&record.audit_sha256, 64)
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("recent escalation index migration sentinel invariant failed: {record:?}"),
+        ));
+    }
+    Ok(Some(record))
+}
+
+fn ensure_recent_index_migration_locked(db: &Db) -> Result<(), ErrorData> {
+    if read_recent_index_migration(db)?.is_some() {
+        return Ok(());
+    }
+    let items = scan_items(db)?;
+    let mut audit = Sha256::new();
+    audit.update(b"synapse.escalation.recent-index-migration.v1\0");
+    for item in &items {
+        let (key, value) = recent_index_row(item);
+        match read_exact_row(db, &key)? {
+            Some(existing) if existing == value => {}
+            Some(existing) => {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "recent escalation index conflicts with authoritative item: escalation_id={} key={} expected_sha256={} actual_sha256={}",
+                        item.escalation_id,
+                        hex_bytes(&key),
+                        hex_bytes(&Sha256::digest(&value)),
+                        hex_bytes(&Sha256::digest(&existing))
+                    ),
+                ));
+            }
+            None => {
+                let outcome = db
+                    .put_batch_if_revision_pressure_bypass(
+                        cf::CF_KV,
+                        &key,
+                        None,
+                        [(key.clone(), value.clone())],
+                    )
+                    .map_err(storage_error)?;
+                if !outcome.applied {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_WRITE_FAILED,
+                        format!(
+                            "recent escalation index migration raced another writer: escalation_id={} key={} observed_seq={}",
+                            item.escalation_id,
+                            hex_bytes(&key),
+                            outcome.committed_seq
+                        ),
+                    ));
+                }
+                let readback = read_exact_row(db, &key)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "recent escalation index disappeared after migration: key={}",
+                            hex_bytes(&key)
+                        ),
+                    )
+                })?;
+                if readback != value {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "recent escalation index readback differed after migration: key={}",
+                            hex_bytes(&key)
+                        ),
+                    ));
+                }
+            }
+        }
+        audit.update((key.len() as u64).to_be_bytes());
+        audit.update(&key);
+        audit.update((value.len() as u64).to_be_bytes());
+        audit.update(&value);
+    }
+    let record = RecentIndexMigrationRecord {
+        schema_version: SCHEMA_VERSION,
+        migration_version: 1,
+        completed_at_unix_ms: unix_time_ms_now(),
+        indexed_rows: items.len() as u64,
+        audit_sha256: hex_bytes(&audit.finalize()),
+    };
+    let value = encode_json(&record).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("recent escalation index migration sentinel encode failed: {error}"),
+        )
+    })?;
+    let key = RECENT_INDEX_MIGRATION_KEY.as_bytes();
+    let outcome = db
+        .put_batch_if_revision_pressure_bypass(cf::CF_KV, key, None, [(key.to_vec(), value)])
+        .map_err(storage_error)?;
+    if !outcome.applied || read_recent_index_migration(db)?.as_ref() != Some(&record) {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            "recent escalation index migration sentinel did not pass independent readback",
+        ));
+    }
+    tracing::info!(
+        code = "ESCALATION_RECENT_INDEX_MIGRATION_COMPLETED",
+        indexed_rows = record.indexed_rows,
+        audit_sha256 = %record.audit_sha256,
+        committed_seq = outcome.committed_seq,
+        "durable newest-first escalation index was built and independently read back"
+    );
+    Ok(())
+}
+
+fn ensure_recent_index_migration(db: &Db) -> Result<(), ErrorData> {
+    super::agent_state::with_transition_pipeline_lock(|| ensure_recent_index_migration_locked(db))
+        .map_err(|detail| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!("recent escalation index migration lock failed: {detail}"),
+        )
+    })?
+}
+
+fn count_open_index_rows(db: &Db) -> Result<usize, ErrorData> {
+    let (start, end) = fixed_prefix_bounds(OPEN_INDEX_PREFIX, OPEN_INDEX_KEY_LEN);
+    let mut lease = db
+        .pin_cf_fixed_width_range_scan(
+            cf::CF_KV,
+            &start,
+            &end,
+            synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS,
+        )
+        .map_err(storage_error)?;
+    let mut total = 0usize;
+    let scan_result = (|| -> Result<(), ErrorData> {
+        loop {
+            let page = db
+                .scan_cf_fixed_width_range_page_coherent(&mut lease, LIST_INDEX_PAGE_ROWS)
+                .map_err(storage_error)?;
+            for (key, value) in page.rows {
+                if key.len() != OPEN_INDEX_KEY_LEN || !key.starts_with(OPEN_INDEX_PREFIX.as_bytes())
+                {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "open escalation index returned malformed key: key={}",
+                            hex_bytes(&key)
+                        ),
+                    ));
+                }
+                let record = decode_json::<OpenEscalationIndexRecord>(&value).map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "open escalation index decode failed: key={} error={error}",
+                            hex_bytes(&key)
+                        ),
+                    )
+                })?;
+                validate_open_index_record(&key, &record)?;
+                total = total.saturating_add(usize::from(record.is_open));
+            }
+            if !page.more {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    finish_coherent_scan(db, &mut lease, "ESCALATION_OPEN_INDEX_COUNT", scan_result)?;
+    Ok(total)
+}
+
+fn list_recent_items(
+    db: &Db,
+    status: Option<EscalationStatus>,
+    anchor: Option<&str>,
+    limit: usize,
+) -> Result<Vec<EscalationItem>, ErrorData> {
+    ensure_recent_index_migration(db)?;
+    let (start, end) = fixed_prefix_bounds(RECENT_INDEX_PREFIX, RECENT_INDEX_KEY_LEN);
+    let mut lease = db
+        .pin_cf_fixed_width_range_scan(
+            cf::CF_KV,
+            &start,
+            &end,
+            synapse_storage::COHERENT_SCAN_DEFAULT_MAX_AGE_MS,
+        )
+        .map_err(storage_error)?;
+    let mut out = Vec::with_capacity(limit);
+    let scan_result = (|| -> Result<(), ErrorData> {
+        while out.len() < limit {
+            let page = db
+                .scan_cf_fixed_width_range_page_coherent(
+                    &mut lease,
+                    LIST_INDEX_PAGE_ROWS.min(limit.max(1)),
+                )
+                .map_err(storage_error)?;
+            for (key, value) in page.rows {
+                if key.len() != RECENT_INDEX_KEY_LEN
+                    || !key.starts_with(RECENT_INDEX_PREFIX.as_bytes())
+                {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "recent escalation index returned malformed key: key={}",
+                            hex_bytes(&key)
+                        ),
+                    ));
+                }
+                let id = std::str::from_utf8(&value).map_err(|error| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "recent escalation index value is not UTF-8: key={} error={error}",
+                            hex_bytes(&key)
+                        ),
+                    )
+                })?;
+                validate_escalation_id(id)?;
+                let item = read_item(db, id)?.ok_or_else(|| {
+                    mcp_error(error_codes::STORAGE_CORRUPTED, format!("recent escalation index points to missing item: escalation_id={id} key={}", hex_bytes(&key)))
+                })?;
+                if recent_index_key(&item) != key {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "recent escalation index key is not bound to authoritative item: escalation_id={id} key={}",
+                            hex_bytes(&key)
+                        ),
+                    ));
+                }
+                if status.is_none_or(|expected| expected == item.status)
+                    && anchor.is_none_or(|expected| expected == item.anchor)
+                {
+                    out.push(item);
+                    if out.len() == limit {
+                        break;
+                    }
+                }
+            }
+            if !page.more {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    finish_coherent_scan(db, &mut lease, "ESCALATION_RECENT_INDEX_LIST", scan_result)?;
+    Ok(out)
 }
 
 fn open_items_for_anchor(db: &Db, anchor: &str) -> Result<Vec<EscalationItem>, ErrorData> {
@@ -13757,22 +14135,9 @@ impl SynapseService {
     ) -> Result<Json<EscalationListResponse>, ErrorData> {
         let params = params.0;
         let db = self.m3_storage()?;
-        let mut items = scan_items(&db)?;
-        items.sort_by_key(|item| std::cmp::Reverse(item.created_at_unix_ms));
-        let total_open = items.iter().filter(|item| item.status.is_open()).count();
         let limit = params.limit.unwrap_or(50).min(500) as usize;
-        let filtered: Vec<EscalationItem> = items
-            .into_iter()
-            .filter(|item| params.status.map(|s| s == item.status).unwrap_or(true))
-            .filter(|item| {
-                params
-                    .anchor
-                    .as_deref()
-                    .map(|a| a == item.anchor)
-                    .unwrap_or(true)
-            })
-            .take(limit)
-            .collect();
+        let total_open = count_open_index_rows(&db)?;
+        let filtered = list_recent_items(&db, params.status, params.anchor.as_deref(), limit)?;
         Ok(Json(EscalationListResponse {
             returned: filtered.len(),
             total_open,

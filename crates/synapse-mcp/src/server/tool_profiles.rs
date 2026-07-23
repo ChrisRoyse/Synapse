@@ -1473,7 +1473,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "list",
                 false,
                 false,
-                "CF_KV escalation item prefix scan",
+                "CF_KV escalation recent/open indexes",
                 None,
                 error_codes::TOOL_INTERNAL_ERROR,
                 "inspect status/anchor filters and item rows",

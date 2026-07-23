@@ -422,7 +422,7 @@ impl SynapseService {
                 Ok(Json(escalation_response(
                     operation,
                     format!(
-                        "CF_KV escalation item prefix scan returned={} total_open={}",
+                        "CF_KV escalation recent/open indexes returned={} total_open={}",
                         response.returned, response.total_open
                     ),
                     |out| out.list = Some(response),
