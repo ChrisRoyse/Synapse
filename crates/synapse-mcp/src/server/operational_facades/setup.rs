@@ -7,7 +7,7 @@ use std::{
 
 use rmcp::model::ErrorCode;
 use rmcp::{RoleServer, service::RequestContext};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
@@ -85,8 +85,16 @@ pub(super) async fn handle(
                 "synapse_setup_repair",
                 SETUP_SOT,
             )?;
-            let chrome_bridge_preflight = preflight_setup_repair_chrome_bridge().await?;
-            let launched = launch_setup_repair(service, &spec.reason, &chrome_bridge_preflight)?;
+            let plan = setup_repair_plan()?;
+            let chrome_bridge_preflight = match &plan {
+                SetupRepairPlan::Full => preflight_setup_repair_chrome_bridge().await?,
+                SetupRepairPlan::ResumeChromeBridge { .. } => {
+                    "chrome_bridge_preflight=deferred_to_checkpointed_chrome_bridge_activation"
+                        .to_owned()
+                }
+            };
+            let launched =
+                launch_setup_repair(service, &spec.reason, &chrome_bridge_preflight, &plan)?;
             let status = setup_status(service).map_err(|error| {
                 facade_delegate_error(
                     SETUP_TOOL,
@@ -118,6 +126,7 @@ struct SetupRepairLaunchReadback {
     setup_script_path: PathBuf,
     source_dir: PathBuf,
     launcher_path: PathBuf,
+    repair_mode: &'static str,
     chrome_bridge_preflight: String,
     child_pid: u32,
 }
@@ -125,9 +134,10 @@ struct SetupRepairLaunchReadback {
 impl SetupRepairLaunchReadback {
     fn readback_source_of_truth(&self) -> String {
         format!(
-            "external setup repair launched; run_id={} child_pid={} launcher={} source_dir={} setup_script={} run_dir={} manifest={} stdout_log={} stderr_log={} {}",
+            "external setup repair launched; run_id={} child_pid={} repair_mode={} launcher={} source_dir={} setup_script={} run_dir={} manifest={} stdout_log={} stderr_log={} {}",
             self.run_id,
             self.child_pid,
+            self.repair_mode,
             self.launcher_path.display(),
             self.source_dir.display(),
             self.setup_script_path.display(),
@@ -156,14 +166,42 @@ struct SetupRepairRunManifest<'a> {
     started_at_unix_ms: u128,
     command_args: Vec<String>,
     active_issue: Option<String>,
+    repair_mode: &'static str,
     chrome_bridge_preflight: String,
     remediation: &'static str,
+}
+
+#[derive(Debug)]
+enum SetupRepairPlan {
+    Full,
+    ResumeChromeBridge {
+        checkpoint_path: PathBuf,
+        maintenance_lock_path: PathBuf,
+    },
+}
+
+impl SetupRepairPlan {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ResumeChromeBridge { .. } => "resume_chrome_bridge",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SetupBridgeCheckpointEnvelope {
+    schema: String,
+    state: String,
+    phase: String,
+    maintenance_lock_path: String,
 }
 
 fn launch_setup_repair(
     service: &SynapseService,
     reason: &str,
     chrome_bridge_preflight: &str,
+    plan: &SetupRepairPlan,
 ) -> Result<SetupRepairLaunchReadback, ErrorData> {
     let bind = service.m3_bind_addr()?;
     let source_dir = setup_source_dir()?;
@@ -188,7 +226,7 @@ fn launch_setup_repair(
     let manifest_path = run_dir.join("repair-run.json");
     let stdout_path = run_dir.join("stdout.log");
     let stderr_path = run_dir.join("stderr.log");
-    let args = setup_repair_command_args(&setup_script_path, &source_dir, &bind);
+    let args = setup_repair_command_args(&setup_script_path, &source_dir, &bind, plan);
     let active_issue = setup_repair_active_issue_from_reason(reason);
 
     write_setup_repair_manifest(
@@ -208,6 +246,7 @@ fn launch_setup_repair(
             started_at_unix_ms,
             command_args: args.clone(),
             active_issue: active_issue.clone(),
+            repair_mode: plan.mode(),
             chrome_bridge_preflight: chrome_bridge_preflight.to_owned(),
             remediation: "inspect stdout/stderr and daemon process/socket readback after the external setup process exits",
         },
@@ -263,6 +302,7 @@ fn launch_setup_repair(
             started_at_unix_ms,
             command_args: args,
             active_issue,
+            repair_mode: plan.mode(),
             chrome_bridge_preflight: chrome_bridge_preflight.to_owned(),
             remediation: "inspect stdout/stderr and daemon process/socket readback after the external setup process exits",
         },
@@ -277,6 +317,7 @@ fn launch_setup_repair(
         setup_script_path,
         source_dir,
         launcher_path,
+        repair_mode: plan.mode(),
         chrome_bridge_preflight: chrome_bridge_preflight.to_owned(),
         child_pid,
     })
@@ -314,19 +355,126 @@ fn setup_repair_command_args(
     setup_script_path: &Path,
     source_dir: &Path,
     bind: &str,
+    plan: &SetupRepairPlan,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-NoProfile".to_owned(),
         "-ExecutionPolicy".to_owned(),
         "Bypass".to_owned(),
         "-File".to_owned(),
         setup_script_path.display().to_string(),
-        "-SourceDir".to_owned(),
-        source_dir.display().to_string(),
-        "-Bind".to_owned(),
-        bind.to_owned(),
-        "-ForceRestart".to_owned(),
-    ]
+    ];
+    match plan {
+        SetupRepairPlan::Full => {
+            args.extend([
+                "-SourceDir".to_owned(),
+                source_dir.display().to_string(),
+                "-Bind".to_owned(),
+                bind.to_owned(),
+                "-ForceRestart".to_owned(),
+            ]);
+        }
+        SetupRepairPlan::ResumeChromeBridge {
+            checkpoint_path,
+            maintenance_lock_path,
+        } => {
+            args.extend([
+                "-ResumeChromeBridgePending".to_owned(),
+                "-ChromeBridgePendingPath".to_owned(),
+                checkpoint_path.display().to_string(),
+                "-MaintenanceLockPath".to_owned(),
+                maintenance_lock_path.display().to_string(),
+            ]);
+        }
+    }
+    args
+}
+
+fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
+    let checkpoint_path = localappdata_path(["synapse", "setup-chrome-bridge-pending.json"]);
+    let bytes = match fs::read(&checkpoint_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SetupRepairPlan::Full);
+        }
+        Err(error) => {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READ_FAILED",
+                "chrome_bridge_checkpoint",
+                format!(
+                    "setup repair could not read Chrome bridge checkpoint path={} error={}",
+                    checkpoint_path.display(),
+                    error
+                ),
+                "repair checkpoint file permissions, inspect its contents, and retry setup repair",
+            ));
+        }
+    };
+    let checkpoint: SetupBridgeCheckpointEnvelope =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            setup_repair_error(
+                "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_JSON_INVALID",
+                "chrome_bridge_checkpoint",
+                format!(
+                    "setup repair found an unreadable Chrome bridge checkpoint path={} error={}",
+                    checkpoint_path.display(),
+                    error
+                ),
+                "inspect and repair the checkpoint JSON; setup refuses to replace a possibly pending phase with an unrelated full repair",
+            )
+        })?;
+    if checkpoint.schema != "synapse_setup_bridge_pending/v2" {
+        return Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found unsupported Chrome bridge checkpoint schema={} path={}",
+                checkpoint.schema,
+                checkpoint_path.display()
+            ),
+            "inspect the checkpoint and resume it with the repo version that wrote its exact schema",
+        ));
+    }
+    if checkpoint.phase != "chrome_bridge_activation" {
+        return Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_PHASE_INVALID",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found unsupported Chrome bridge checkpoint phase={} path={}",
+                checkpoint.phase,
+                checkpoint_path.display()
+            ),
+            "inspect the checkpoint phase; setup refuses to infer or replay an unknown continuation",
+        ));
+    }
+    if checkpoint.maintenance_lock_path.trim().is_empty() {
+        return Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_MAINTENANCE_LOCK_MISSING",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found a Chrome bridge checkpoint without maintenance_lock_path path={}",
+                checkpoint_path.display()
+            ),
+            "inspect the checkpoint; a phase resume must reacquire the exact setup maintenance lock that protected the committed daemon handoff",
+        ));
+    }
+    match checkpoint.state.as_str() {
+        "pending" => Ok(SetupRepairPlan::ResumeChromeBridge {
+            checkpoint_path,
+            maintenance_lock_path: PathBuf::from(checkpoint.maintenance_lock_path),
+        }),
+        "completed" => Ok(SetupRepairPlan::Full),
+        state => Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_STATE_INVALID",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found unsupported Chrome bridge checkpoint state={} path={}",
+                state,
+                checkpoint_path.display()
+            ),
+            "inspect the checkpoint state; only pending can resume and completed permits a new full repair",
+        )),
+    }
 }
 
 fn setup_repair_active_issue_from_reason(reason: &str) -> Option<String> {
@@ -510,7 +658,9 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
     let bind = service.m3_bind_addr()?;
     let source_dir = setup_source_dir()?;
     let setup_script = setup_script_path(&source_dir)?;
-    let setup_repair_command_args = setup_repair_command_args(&setup_script, &source_dir, &bind);
+    let plan = setup_repair_plan()?;
+    let setup_repair_command_args =
+        setup_repair_command_args(&setup_script, &source_dir, &bind, &plan);
     let token_file = file_readback(appdata_path(["synapse", "token.txt"]));
     let daemon_run_file = active_daemon_run_file()?;
     let shared_daemon_run_file = file_readback(shared_daemon_run_file_path());

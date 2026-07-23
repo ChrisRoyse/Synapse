@@ -135,6 +135,17 @@
   spend several minutes in startup preflights before the HTTP listener is bound.
   Setup still fails closed after the deadline and prints process/socket/startup
   log readbacks before rollback.
+
+.PARAMETER ResumeChromeBridgePending
+  Resume only a previously checkpointed chrome_bridge_activation phase. The
+  checkpoint must match the installed binary, live daemon PID/path/arguments,
+  daemon-run ledger, bearer-token bytes, setup/bridge installer bytes, and
+  scheduled-task definition. This mode never builds, copies, drains, registers
+  a task, or rewires clients.
+
+.PARAMETER ChromeBridgePendingPath
+  Durable, versioned Source-of-Truth file for a pending or completed
+  chrome_bridge_activation phase.
 #>
 [CmdletBinding()]
 param(
@@ -152,6 +163,7 @@ param(
     [string]$ActiveIssue = $env:SYNAPSE_ACTIVE_ISSUE,
     [string]$TaskName    = 'SynapseMcpDaemon',
     [string]$MaintenanceLockPath = "$env:LOCALAPPDATA\synapse\setup-maintenance.lock.json",
+    [string]$ChromeBridgePendingPath = "$env:LOCALAPPDATA\synapse\setup-chrome-bridge-pending.json",
     [ValidateRange(1, 1440)][int]$BuildTimeoutMinutes = 90,
     [int]$PostExitParentPid = 0,
     [string]$PostExitContinuationReason = '',
@@ -163,6 +175,7 @@ param(
     [switch]$ManualInstallHealthRollbackProbe,
     [ValidateSet('normal','require_active_ack','force_unacknowledged')]
     [string]$ManualInstallHealthRollbackPauseMode = 'normal',
+    [switch]$ResumeChromeBridgePending,
     [switch]$SkipClientWiring,
     [switch]$Remove,
     [switch]$Purge
@@ -186,6 +199,7 @@ $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitConti
 $script:SynapseManualInstallHealthRollbackProbe = [bool]$ManualInstallHealthRollbackProbe
 $script:SynapseManualInstallHealthRollbackPauseMode = $ManualInstallHealthRollbackPauseMode
 $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
+$script:SynapseChromeBridgePendingPath = $ChromeBridgePendingPath
 $script:SynapseSetupPartialState = $null
 $script:SynapseSetupPartialReadback = $null
 $script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
@@ -326,6 +340,16 @@ function Die-SynapseChromeBridgePending {
         [Parameter(Mandatory=$true)]$Readback
     )
 
+    try {
+        $checkpointFile = Write-SynapseChromeBridgeCheckpoint `
+            -Path $script:SynapseChromeBridgePendingPath `
+            -Checkpoint $Readback
+        $Readback['checkpoint_path'] = $checkpointFile.Path
+        $Readback['checkpoint_sha256'] = $checkpointFile.Sha256
+        $Readback['checkpoint_len_bytes'] = $checkpointFile.LenBytes
+    } catch {
+        throw "[synapse-setup] FATAL: $Message ; SYNAPSE_SETUP_BRIDGE_CHECKPOINT_WRITE_FAILED path=$script:SynapseChromeBridgePendingPath error=$($_.Exception.Message) remediation=repair the checkpoint directory permissions; setup cannot report a resumable phase without durable state"
+    }
     $script:SynapseSetupPartialState = 'bridge_pending'
     $script:SynapseSetupPartialReadback = $Readback
     throw "[synapse-setup] FATAL: $Message"
@@ -4422,21 +4446,49 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         } catch {
             $uiRepairError = $_.Exception.Message
             if ($uiRepairError -match 'SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW') {
+                $checkpointDaemonPid = [int]$currentHealth.pid
+                $checkpointDaemonProcess = Get-SynapseDaemonProcessIdentity -ProcessId $checkpointDaemonPid
+                $checkpointTask = Get-SynapseScheduledTaskIdentity -Name $TaskName
+                $checkpointSetupScript = [System.IO.Path]::GetFullPath($PSCommandPath)
+                $checkpointBridgeInstaller = [System.IO.Path]::GetFullPath($ChromeBridgeInstallerPath)
+                $checkpointDaemonRun = Join-Path $DbPath 'daemon-run-current.json'
+                $checkpointPath = [System.IO.Path]::GetFullPath($script:SynapseChromeBridgePendingPath)
+                $checkpointResumeCommand = "pwsh -NoProfile -File $(Quote-PowerShellSingleQuotedString -Value $checkpointSetupScript) -ResumeChromeBridgePending -ChromeBridgePendingPath $(Quote-PowerShellSingleQuotedString -Value $checkpointPath) -MaintenanceLockPath $(Quote-PowerShellSingleQuotedString -Value ([System.IO.Path]::GetFullPath($MaintenanceLockPath)))"
                 $pendingReadback = [ordered]@{
-                    schema = 'synapse_setup_bridge_pending/v1'
+                    schema = 'synapse_setup_bridge_pending/v2'
+                    state = 'pending'
                     phase = 'chrome_bridge_activation'
                     daemon_handoff = 'committed'
-                    daemon_pid = [int]$currentHealth.pid
+                    daemon_pid = $checkpointDaemonPid
                     bind = $Bind
                     db_path = $DbPath
                     installed_binary_path = $ExePath
                     installed_binary_sha256 = (Get-SynapseFileSha256 -Path $ExePath)
+                    daemon_process_executable_path = $checkpointDaemonProcess.ExecutablePath
+                    daemon_process_command_line = $checkpointDaemonProcess.CommandLine
+                    daemon_run_current_path = $checkpointDaemonRun
+                    daemon_run_current_sha256 = (Get-SynapseFileSha256 -Path $checkpointDaemonRun)
+                    token_path = $TokenPath
+                    token_sha256 = (Get-SynapseFileSha256 -Path $TokenPath)
+                    setup_script_path = $checkpointSetupScript
+                    setup_script_sha256 = (Get-SynapseFileSha256 -Path $checkpointSetupScript)
+                    chrome_bridge_installer_path = $checkpointBridgeInstaller
+                    chrome_bridge_installer_sha256 = (Get-SynapseFileSha256 -Path $checkpointBridgeInstaller)
+                    chrome_native_host_exe_path = $ChromeNativeHostExePath
+                    task_name = $TaskName
+                    task_state = $checkpointTask.State
+                    task_definition_sha256 = $checkpointTask.DefinitionSha256
+                    task_action_execute = $checkpointTask.ActionExecute
+                    task_action_arguments = $checkpointTask.ActionArguments
+                    task_action_working_directory = $checkpointTask.ActionWorkingDirectory
+                    maintenance_lock_path = [System.IO.Path]::GetFullPath($MaintenanceLockPath)
                     chrome_bridge_status = $status
                     chrome_bridge_detail = $detail
                     chrome_process_count = @(Get-Process -Name chrome -ErrorAction SilentlyContinue).Count
                     chrome_visible_window_count = @(Get-Process -Name chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }).Count
-                    resume_command = "pwsh -File scripts\synapse-setup.ps1 -SkipBuild -ExePath '$ExePath'"
-                    repair = 'open the existing authenticated Chrome profile, then run resume_command; setup revalidates the installed daemon bytes and does not rebuild or reinstall them'
+                    resume_attempt_count = 0
+                    resume_command = $checkpointResumeCommand
+                    repair = 'open the existing authenticated Chrome profile, then run resume_command; the phase-specific resume validates every recorded identity and performs only Chrome bridge activation'
                 }
                 Die-SynapseChromeBridgePending `
                     -Message "SYNAPSE_SETUP_BRIDGE_PENDING daemon_handoff=committed daemon_pid=$($currentHealth.pid) bind=$Bind installed_sha256=$($pendingReadback.installed_binary_sha256) cause=[$uiRepairError] resume_command=[$($pendingReadback.resume_command)]" `
@@ -5961,6 +6013,347 @@ function Write-SynapseUtf8NoBomFile {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $encoding = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($Path, $Text, $encoding)
+}
+
+function Write-SynapseChromeBridgeCheckpoint {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][System.Collections.IDictionary]$Checkpoint
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'SYNAPSE_SETUP_BRIDGE_CHECKPOINT_PATH_EMPTY remediation=provide an absolute checkpoint path under the configured host local appdata directory'
+    }
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path -Parent $resolvedPath
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DIRECTORY_EMPTY path=$resolvedPath remediation=provide a checkpoint path with a parent directory"
+    }
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+
+    $now = [DateTime]::UtcNow.ToString('o')
+    $Checkpoint['schema'] = 'synapse_setup_bridge_pending/v2'
+    $Checkpoint['phase'] = 'chrome_bridge_activation'
+    if (-not $Checkpoint.Contains('created_at_utc') -or [string]::IsNullOrWhiteSpace([string]$Checkpoint['created_at_utc'])) {
+        $Checkpoint['created_at_utc'] = $now
+    }
+    $Checkpoint['updated_at_utc'] = $now
+    $Checkpoint['checkpoint_path'] = $resolvedPath
+
+    $temporaryPath = "$resolvedPath.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+    $replacementBackupPath = "$resolvedPath.replace-backup.$PID.$([guid]::NewGuid().ToString('N'))"
+    $replacementCompleted = $false
+    try {
+        Write-SynapseUtf8NoBomFile `
+            -Path $temporaryPath `
+            -Text (($Checkpoint | ConvertTo-Json -Depth 40) + "`n")
+        if (Test-Path -LiteralPath $resolvedPath -PathType Leaf) {
+            [System.IO.File]::Replace($temporaryPath, $resolvedPath, $replacementBackupPath, $true)
+            $replacementCompleted = $true
+        } else {
+            [System.IO.File]::Move($temporaryPath, $resolvedPath)
+            $replacementCompleted = $true
+        }
+    } catch {
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_ATOMIC_WRITE_FAILED path=$resolvedPath temp=$temporaryPath recovery_backup=$replacementBackupPath replacement_completed=$replacementCompleted error=$($_.Exception.Message) remediation=repair checkpoint directory permissions and free space; preserve any named recovery backup for inspection because a resumable phase is never reported without an atomic durable write"
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($replacementCompleted -and (Test-Path -LiteralPath $replacementBackupPath -PathType Leaf)) {
+        try {
+            Remove-Item -LiteralPath $replacementBackupPath -Force -ErrorAction Stop
+        } catch {
+            throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_BACKUP_CLEANUP_FAILED path=$resolvedPath recovery_backup=$replacementBackupPath error=$($_.Exception.Message) remediation=the new checkpoint is committed, but its exact replace backup could not be removed; repair permissions and remove only the named backup"
+        }
+        if (Test-Path -LiteralPath $replacementBackupPath) {
+            throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_BACKUP_STILL_PRESENT path=$resolvedPath recovery_backup=$replacementBackupPath remediation=the new checkpoint is committed, but the exact replace backup still exists; repair storage state before accepting resume"
+        }
+    }
+
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($resolvedPath)
+        $readback = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    } catch {
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=inspect the checkpoint storage device; the atomically written JSON could not be read back"
+    }
+    if ([string]$readback.schema -ne 'synapse_setup_bridge_pending/v2' -or
+        [string]$readback.phase -ne 'chrome_bridge_activation' -or
+        [string]$readback.state -ne [string]$Checkpoint['state']) {
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_MISMATCH path=$resolvedPath expected_schema=synapse_setup_bridge_pending/v2 actual_schema=$($readback.schema) expected_phase=chrome_bridge_activation actual_phase=$($readback.phase) expected_state=$($Checkpoint['state']) actual_state=$($readback.state) remediation=repair the checkpoint storage path before retrying"
+    }
+    return [pscustomobject]([ordered]@{
+        Path = $resolvedPath
+        Sha256 = Get-SynapseFileSha256 -Path $resolvedPath
+        LenBytes = $bytes.Length
+        State = [string]$readback.state
+    })
+}
+
+function Read-SynapseChromeBridgeCheckpoint {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        Die 'SYNAPSE_SETUP_BRIDGE_CHECKPOINT_PATH_EMPTY remediation=-ResumeChromeBridgePending requires the durable checkpoint path'
+    }
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_MISSING path=$resolvedPath remediation=resume only a physically present bridge_pending checkpoint; run ordinary setup repair when no phase is pending"
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($resolvedPath)
+    } catch {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READ_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=repair checkpoint file permissions before retrying resume"
+    }
+    if ($bytes.Length -eq 0) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_EMPTY path=$resolvedPath remediation=inspect the interrupted checkpoint write; resume refuses to infer state from an empty file"
+    }
+    try {
+        $checkpoint = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    } catch {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_JSON_INVALID path=$resolvedPath error=$($_.Exception.Message) remediation=inspect the checkpoint bytes; resume refuses to infer state from malformed JSON"
+    }
+
+    if ([string]$checkpoint.schema -ne 'synapse_setup_bridge_pending/v2') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID path=$resolvedPath expected=synapse_setup_bridge_pending/v2 actual=$($checkpoint.schema) remediation=resume the checkpoint with the repo version that wrote its exact schema"
+    }
+    if ([string]$checkpoint.phase -ne 'chrome_bridge_activation') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_PHASE_INVALID path=$resolvedPath expected=chrome_bridge_activation actual=$($checkpoint.phase) remediation=resume refuses to infer or replay an unknown phase"
+    }
+    if ([string]$checkpoint.state -notin @('pending','completed')) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_STATE_INVALID path=$resolvedPath expected=pending_or_completed actual=$($checkpoint.state) remediation=inspect the checkpoint state before retrying"
+    }
+    foreach ($required in @(
+        'daemon_handoff',
+        'daemon_pid',
+        'bind',
+        'db_path',
+        'installed_binary_path',
+        'installed_binary_sha256',
+        'daemon_process_executable_path',
+        'daemon_process_command_line',
+        'daemon_run_current_path',
+        'daemon_run_current_sha256',
+        'token_path',
+        'token_sha256',
+        'setup_script_path',
+        'setup_script_sha256',
+        'chrome_bridge_installer_path',
+        'chrome_bridge_installer_sha256',
+        'task_name',
+        'task_definition_sha256',
+        'task_action_execute',
+        'task_action_arguments',
+        'maintenance_lock_path'
+    )) {
+        $property = $checkpoint.PSObject.Properties[$required]
+        if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_FIELD_MISSING path=$resolvedPath field=$required remediation=resume requires a complete identity-bound checkpoint and never guesses missing state"
+        }
+    }
+    if ([string]$checkpoint.daemon_handoff -ne 'committed') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_HANDOFF_UNCOMMITTED path=$resolvedPath actual=$($checkpoint.daemon_handoff) remediation=only a physically committed daemon handoff can resume at Chrome activation"
+    }
+    $checkpoint | Add-Member -NotePropertyName checkpoint_file_path -NotePropertyValue $resolvedPath -Force
+    $checkpoint | Add-Member -NotePropertyName checkpoint_file_sha256 -NotePropertyValue (Get-SynapseFileSha256 -Path $resolvedPath) -Force
+    $checkpoint | Add-Member -NotePropertyName checkpoint_file_len_bytes -NotePropertyValue $bytes.Length -Force
+    return $checkpoint
+}
+
+function Get-SynapseScheduledTaskIdentity {
+    param([Parameter(Mandatory=$true)][string]$Name)
+
+    $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    if ($null -eq $task) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TASK_MISSING task=$Name remediation=restore the exact scheduled task that owns the committed daemon before resuming Chrome activation"
+    }
+    try {
+        $xml = Export-ScheduledTask -TaskName $Name -ErrorAction Stop
+    } catch {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TASK_EXPORT_FAILED task=$Name error=$($_.Exception.Message) remediation=repair Task Scheduler access before resuming Chrome activation"
+    }
+    $actions = @($task.Actions)
+    if ($actions.Count -ne 1) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TASK_ACTION_COUNT_INVALID task=$Name expected=1 actual=$($actions.Count) remediation=repair the Synapse daemon task definition before resuming Chrome activation"
+    }
+    return [pscustomobject]([ordered]@{
+        Name = $Name
+        State = [string]$task.State
+        DefinitionSha256 = Get-SynapseSha256Hex -Text ([string]$xml)
+        ActionExecute = [string]$actions[0].Execute
+        ActionArguments = [string]$actions[0].Arguments
+        ActionWorkingDirectory = [string]$actions[0].WorkingDirectory
+    })
+}
+
+function Get-SynapseDaemonProcessIdentity {
+    param([Parameter(Mandatory=$true)][int]$ProcessId)
+
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_PROCESS_MISSING pid=$ProcessId remediation=the checkpointed daemon is no longer live; perform a new full setup repair instead of resuming stale Chrome activation"
+    }
+    if (-not (Test-SynapseMcpExecutableLeafName -Name ([string]$process.Name))) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_PROCESS_NAME_INVALID pid=$ProcessId name=$($process.Name) remediation=the checkpoint PID was reused by a non-Synapse process; perform a new full setup repair"
+    }
+    return [pscustomobject]([ordered]@{
+        Pid = [int]$process.ProcessId
+        ParentPid = [int]$process.ParentProcessId
+        Name = [string]$process.Name
+        ExecutablePath = [string]$process.ExecutablePath
+        CommandLine = [string]$process.CommandLine
+    })
+}
+
+function Assert-SynapseChromeBridgeCheckpointFileIdentity {
+    param(
+        [Parameter(Mandatory=$true)][string]$Kind,
+        [Parameter(Mandatory=$true)][string]$ExpectedPath,
+        [Parameter(Mandatory=$true)][string]$ExpectedSha256
+    )
+
+    $resolvedExpectedPath = [System.IO.Path]::GetFullPath($ExpectedPath)
+    if (-not (Test-Path -LiteralPath $resolvedExpectedPath -PathType Leaf)) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_${Kind}_MISSING path=$resolvedExpectedPath remediation=restore the exact checkpointed file or perform a new full setup repair"
+    }
+    $actualSha256 = Get-SynapseFileSha256 -Path $resolvedExpectedPath
+    if ($actualSha256 -ine $ExpectedSha256) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_${Kind}_DRIFT path=$resolvedExpectedPath expected_sha256=$ExpectedSha256 actual_sha256=$actualSha256 remediation=the checkpointed phase belongs to different bytes; perform a new full setup repair"
+    }
+    return [pscustomobject]([ordered]@{
+        Path = $resolvedExpectedPath
+        Sha256 = $actualSha256
+    })
+}
+
+function Invoke-SynapseChromeBridgePendingResume {
+    param([Parameter(Mandatory=$true)][string]$CheckpointPath)
+
+    if ($Remove -or $Purge -or $ForceRestart -or $SkipBuild -or $SkipClientWiring -or
+        $ManualInstallHealthRollbackProbe -or $script:SynapsePostExitStartOnly) {
+        Die "SYNAPSE_SETUP_BRIDGE_RESUME_MODE_CONFLICT remove=$Remove purge=$Purge force_restart=$ForceRestart skip_build=$SkipBuild skip_client_wiring=$SkipClientWiring rollback_probe=$ManualInstallHealthRollbackProbe post_exit=$script:SynapsePostExitStartOnly remediation=-ResumeChromeBridgePending is a complete phase-specific mode; remove all full-setup/remove/rollback switches"
+    }
+
+    Step 'Resuming checkpointed Chrome bridge activation'
+    $checkpoint = Read-SynapseChromeBridgeCheckpoint -Path $CheckpointPath
+    $script:SynapseChromeBridgePendingPath = [string]$checkpoint.checkpoint_file_path
+
+    $checkpointLockPath = [System.IO.Path]::GetFullPath([string]$checkpoint.maintenance_lock_path)
+    $actualLockPath = [System.IO.Path]::GetFullPath($MaintenanceLockPath)
+    if ($checkpointLockPath -ine $actualLockPath) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_MAINTENANCE_LOCK_DRIFT expected=$checkpointLockPath actual=$actualLockPath remediation=resume must reacquire the exact maintenance lock recorded by the committed setup"
+    }
+
+    $scriptIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
+        -Kind 'SETUP_SCRIPT' `
+        -ExpectedPath ([string]$checkpoint.setup_script_path) `
+        -ExpectedSha256 ([string]$checkpoint.setup_script_sha256)
+    $runningScriptPath = [System.IO.Path]::GetFullPath($PSCommandPath)
+    if ($runningScriptPath -ine $scriptIdentity.Path) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SETUP_SCRIPT_PATH_DRIFT expected=$($scriptIdentity.Path) actual=$runningScriptPath remediation=invoke the exact setup script that wrote the checkpoint"
+    }
+    $installerIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
+        -Kind 'CHROME_INSTALLER' `
+        -ExpectedPath ([string]$checkpoint.chrome_bridge_installer_path) `
+        -ExpectedSha256 ([string]$checkpoint.chrome_bridge_installer_sha256)
+    $binaryIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
+        -Kind 'INSTALLED_BINARY' `
+        -ExpectedPath ([string]$checkpoint.installed_binary_path) `
+        -ExpectedSha256 ([string]$checkpoint.installed_binary_sha256)
+    $tokenIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
+        -Kind 'TOKEN' `
+        -ExpectedPath ([string]$checkpoint.token_path) `
+        -ExpectedSha256 ([string]$checkpoint.token_sha256)
+    $daemonRunIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
+        -Kind 'DAEMON_RUN_LEDGER' `
+        -ExpectedPath ([string]$checkpoint.daemon_run_current_path) `
+        -ExpectedSha256 ([string]$checkpoint.daemon_run_current_sha256)
+
+    $Bind = [string]$checkpoint.bind
+    $DbPath = [string]$checkpoint.db_path
+    $ExePath = $binaryIdentity.Path
+    $TokenPath = $tokenIdentity.Path
+    $TaskName = [string]$checkpoint.task_name
+    $ChromeNativeHostExePath = [string]$checkpoint.chrome_native_host_exe_path
+
+    $token = (Get-Content -Raw -LiteralPath $TokenPath).Trim()
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TOKEN_EMPTY path=$TokenPath remediation=restore the exact non-empty checkpointed bearer token or perform a new full setup repair"
+    }
+    $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $token -TimeoutSec 30
+    if (-not $healthRead.Ok) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_HEALTH_UNREACHABLE bind=$Bind error=$($healthRead.Error) remediation=restore the exact checkpointed daemon before resuming Chrome activation"
+    }
+    $health = $healthRead.Health
+    $expectedPid = [int]$checkpoint.daemon_pid
+    $actualPid = [int]$health.pid
+    if ($actualPid -ne $expectedPid) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_PID_DRIFT expected=$expectedPid actual=$actualPid bind=$Bind remediation=the checkpointed daemon identity is stale; perform a new full setup repair"
+    }
+    $daemonProcess = Get-SynapseDaemonProcessIdentity -ProcessId $actualPid
+    if ([System.IO.Path]::GetFullPath($daemonProcess.ExecutablePath) -ine [System.IO.Path]::GetFullPath([string]$checkpoint.daemon_process_executable_path)) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_PATH_DRIFT pid=$actualPid expected=$($checkpoint.daemon_process_executable_path) actual=$($daemonProcess.ExecutablePath) remediation=the checkpointed daemon identity is stale; perform a new full setup repair"
+    }
+    if ($daemonProcess.CommandLine -cne [string]$checkpoint.daemon_process_command_line) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_ARGUMENT_DRIFT pid=$actualPid expected=[$($checkpoint.daemon_process_command_line)] actual=[$($daemonProcess.CommandLine)] remediation=the live daemon arguments changed after the checkpoint; perform a new full setup repair"
+    }
+
+    $taskIdentity = Get-SynapseScheduledTaskIdentity -Name $TaskName
+    if ($taskIdentity.State -ne 'Running') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TASK_NOT_RUNNING task=$TaskName actual_state=$($taskIdentity.State) remediation=restore the scheduled task instance that owns the checkpointed daemon before resuming Chrome activation"
+    }
+    if ($taskIdentity.DefinitionSha256 -ine [string]$checkpoint.task_definition_sha256 -or
+        $taskIdentity.ActionExecute -cne [string]$checkpoint.task_action_execute -or
+        $taskIdentity.ActionArguments -cne [string]$checkpoint.task_action_arguments) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TASK_DRIFT task=$TaskName expected_definition_sha256=$($checkpoint.task_definition_sha256) actual_definition_sha256=$($taskIdentity.DefinitionSha256) expected_execute=[$($checkpoint.task_action_execute)] actual_execute=[$($taskIdentity.ActionExecute)] expected_arguments=[$($checkpoint.task_action_arguments)] actual_arguments=[$($taskIdentity.ActionArguments)] remediation=the task definition changed after the checkpoint; perform a new full setup repair"
+    }
+
+    $health = Assert-SynapseChromeBridgeLiveAfterSetup `
+        -Bind $Bind `
+        -Token $token `
+        -Health $health `
+        -ChromeBridgeInstallerPath $installerIdentity.Path `
+        -ChromeNativeHostExePath $ChromeNativeHostExePath
+    $toolSurface = Read-SynapseDaemonToolSurface -Bind $Bind -Token $token -Health $health
+    $bridge = $health.subsystems.chrome_bridge
+    $completion = [ordered]@{
+        completed_at_utc = [DateTime]::UtcNow.ToString('o')
+        daemon_pid = $actualPid
+        bind = $Bind
+        installed_binary_path = $binaryIdentity.Path
+        installed_binary_sha256 = $binaryIdentity.Sha256
+        daemon_process_command_line = $daemonProcess.CommandLine
+        daemon_run_current_path = $daemonRunIdentity.Path
+        daemon_run_current_sha256 = $daemonRunIdentity.Sha256
+        token_sha256 = $tokenIdentity.Sha256
+        setup_script_sha256 = $scriptIdentity.Sha256
+        chrome_bridge_installer_sha256 = $installerIdentity.Sha256
+        task_definition_sha256 = $taskIdentity.DefinitionSha256
+        chrome_bridge_status = [string]$bridge.status
+        chrome_bridge_detail = [string]$bridge.detail
+        tool_count = $toolSurface.tool_count
+        tool_surface_sha256 = $toolSurface.tool_surface_sha256
+    }
+    $checkpointMap = [ordered]@{}
+    foreach ($property in $checkpoint.PSObject.Properties) {
+        if ($property.Name -notin @('checkpoint_file_path','checkpoint_file_sha256','checkpoint_file_len_bytes')) {
+            $checkpointMap[$property.Name] = $property.Value
+        }
+    }
+    $checkpointMap['state'] = 'completed'
+    $checkpointMap['resume_attempt_count'] = ([int]$checkpoint.resume_attempt_count) + 1
+    $checkpointMap['completion'] = $completion
+    $checkpointFile = Write-SynapseChromeBridgeCheckpoint -Path $checkpoint.checkpoint_file_path -Checkpoint $checkpointMap
+    $completion['checkpoint_path'] = $checkpointFile.Path
+    $completion['checkpoint_sha256'] = $checkpointFile.Sha256
+    $completion['checkpoint_len_bytes'] = $checkpointFile.LenBytes
+    Write-SynapseSetupRepairManifestState `
+        -State 'completed' `
+        -Message 'checkpointed Chrome bridge activation completed without replaying daemon installation or task registration' `
+        -ExitCode 0 `
+        -Readback $completion
+    Info "SYNAPSE_SETUP_BRIDGE_RESUME_COMPLETED checkpoint=$($checkpointFile.Path) checkpoint_sha256=$($checkpointFile.Sha256) daemon_pid=$actualPid tool_count=$($toolSurface.tool_count) tool_surface_sha256=$($toolSurface.tool_surface_sha256)"
 }
 
 function Get-SynapseHandoffGitReadback {
@@ -8116,9 +8509,15 @@ function Stop-SynapseChromeNativeHostProcesses {
 # ---------------------------------------------------------------------------
 # Uninstall path
 # ---------------------------------------------------------------------------
-$maintenanceReason = if ($Remove) { 'remove' } else { 'setup' }
+$maintenanceReason = if ($Remove) { 'remove' } elseif ($ResumeChromeBridgePending) { 'resume_chrome_bridge' } else { 'setup' }
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
+
+if ($ResumeChromeBridgePending) {
+    Invoke-SynapseChromeBridgePendingResume -CheckpointPath $ChromeBridgePendingPath
+    Release-SynapseSetupMaintenanceLock -State released
+    return
+}
 
 if ($Remove) {
     Step "Removing scheduled task '$TaskName'"
