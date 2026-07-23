@@ -26,7 +26,8 @@ use synapse_calyx::{
     SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
     SynapseCalyxDriftReport, SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxFindParams,
     SynapseCalyxFindReport, SynapseCalyxGroundedObservationReadback,
-    SynapseCalyxGroundingGapReport, SynapseCalyxHazardReport, SynapseCalyxLedgerEntryReadback,
+    SynapseCalyxGroundingGapReport, SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport,
+    SynapseCalyxKernelParams, SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback,
     SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
     SynapseCalyxObservationPutReadback, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
     SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
@@ -665,6 +666,16 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: &SynapseCalyxTemporalParams,
     ) -> StorageResult<SynapseCalyxHazardReport>;
+    fn build_domain_kernel_intelligence(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> StorageResult<SynapseCalyxKernelReport>;
+    fn kernel_answer_intelligence(
+        &self,
+        params: &SynapseCalyxKernelParams,
+        query_cx_id: &str,
+        max_hops: usize,
+    ) -> StorageResult<SynapseCalyxKernelAnswerReport>;
     fn grounding_gap_intelligence(
         &self,
         panel_version: u32,
@@ -2169,6 +2180,50 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn build_domain_kernel_intelligence(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> StorageResult<SynapseCalyxKernelReport> {
+        self.with_vault(
+            "calyx_lodestar",
+            "build native Calyx grounding kernel",
+            true,
+            |vault| {
+                vault.build_domain_kernel(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_lodestar",
+                        "build native Calyx grounding kernel",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn kernel_answer_intelligence(
+        &self,
+        params: &SynapseCalyxKernelParams,
+        query_cx_id: &str,
+        max_hops: usize,
+    ) -> StorageResult<SynapseCalyxKernelAnswerReport> {
+        self.with_vault(
+            "calyx_lodestar",
+            "answer grounded query through native Calyx kernel",
+            false,
+            |vault| {
+                vault
+                    .kernel_answer(params, query_cx_id, max_hops)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_lodestar",
+                            "answer grounded query through native Calyx kernel",
+                            &source,
+                        )
+                    })
             },
         )
     }

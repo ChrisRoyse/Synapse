@@ -1085,6 +1085,41 @@ impl Db {
         self.backend.temporal_hazard_intelligence(params)
     }
 
+    /// Builds the per-domain grounding kernel for one panel, enforces the recall
+    /// gate (an ungrounded kernel is a structured error), and persists the kernel
+    /// with its corpus fingerprint to the native Kernel CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the panel has too few embedded or
+    /// no anchored concepts, the substrate kernel/recall math fails closed, the
+    /// recall gate is not met, or the Kernel CF write/readback fails.
+    pub fn build_domain_kernel_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxKernelParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxKernelReport> {
+        self.backend.build_domain_kernel_intelligence(params)
+    }
+
+    /// Answers a grounded query through the domain kernel, returning the evidence
+    /// path with hop scores, or a structured refusal that names the grounding gap
+    /// (ungrounded kernel, unembedded query record, or no anchored path).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the kernel is ungrounded, the
+    /// query record is missing/unembedded, no grounded path exists, or the
+    /// substrate math fails closed.
+    pub fn kernel_answer_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxKernelParams,
+        query_cx_id: &str,
+        max_hops: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxKernelAnswerReport> {
+        self.backend
+            .kernel_answer_intelligence(params, query_cx_id, max_hops)
+    }
+
     /// Reports the grounding gaps for one panel (domain): per-anchor-kind and
     /// per-lens grounded coverage, the largest ungrounded regions, and the
     /// domain's provisional verdict. Read-only physical `Base` CF readback.

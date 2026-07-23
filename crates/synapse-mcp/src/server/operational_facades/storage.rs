@@ -747,6 +747,8 @@ pub(super) async fn handle(
                     periodicity: None,
                     drift: None,
                     hazard: None,
+                    kernel: None,
+                    kernel_answer: None,
                 };
                 match sub_operation {
                     StorageIntelligenceOperation::Weave => {
@@ -820,6 +822,22 @@ pub(super) async fn handle(
                                 ..base
                             }
                         })
+                    }
+                    StorageIntelligenceOperation::Kernel => {
+                        crate::m3::storage::run_intelligence_kernel(&db, &spec).map(|kernel| {
+                            StorageIntelligenceResponse {
+                                kernel: Some(kernel),
+                                ..base
+                            }
+                        })
+                    }
+                    StorageIntelligenceOperation::KernelAnswer => {
+                        crate::m3::storage::run_intelligence_kernel_answer(&db, &spec).map(
+                            |kernel_answer| StorageIntelligenceResponse {
+                                kernel_answer: Some(kernel_answer),
+                                ..base
+                            },
+                        )
                     }
                 }
             })
@@ -934,6 +952,28 @@ pub(super) async fn handle(
                     hazard.overdue,
                     hazard.expected_next_seconds,
                     hazard.temporal_xterm_cf_rows_after,
+                )
+            } else if let Some(kernel) = &response.kernel {
+                format!(
+                    "intelligence kernel panel={} content_slot={} kernel_id={} members={} recall_ratio={:.4} grounded={} kernel_rows={}",
+                    kernel.panel_version,
+                    kernel.content_slot,
+                    kernel.kernel_id,
+                    kernel.members,
+                    kernel.recall_ratio,
+                    kernel.grounded,
+                    kernel.kernel_cf_rows_after,
+                )
+            } else if let Some(kernel_answer) = &response.kernel_answer {
+                format!(
+                    "intelligence kernel_answer panel={} query={} grounded={} anchor={} hops={} total_score={:.4} recall_ratio={:.4}",
+                    kernel_answer.panel_version,
+                    kernel_answer.query_cx_id,
+                    kernel_answer.grounded,
+                    kernel_answer.anchor_kernel_node,
+                    kernel_answer.hop_count,
+                    kernel_answer.total_score,
+                    kernel_answer.recall_ratio,
                 )
             } else {
                 "intelligence".to_owned()

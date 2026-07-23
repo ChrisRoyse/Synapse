@@ -679,6 +679,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "calyx-lodestar"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-ledger",
+ "calyx-loom",
+ "calyx-mincut",
+ "calyx-paths",
+ "calyx-sextant",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "calyx-loom"
 version = "0.1.0"
 dependencies = [
@@ -690,6 +709,17 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "calyx-mincut"
+version = "0.1.0"
+dependencies = [
+ "calyx-core",
+ "calyx-paths",
+ "rayon",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5119,7 +5149,9 @@ dependencies = [
  "calyx-core",
  "calyx-forge",
  "calyx-ledger",
+ "calyx-lodestar",
  "calyx-loom",
+ "calyx-paths",
  "calyx-registry",
  "calyx-search",
  "calyx-sextant",

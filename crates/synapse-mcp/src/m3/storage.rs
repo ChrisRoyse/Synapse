@@ -686,6 +686,8 @@ pub enum StorageIntelligenceOperation {
     Periodicity,
     Drift,
     Hazard,
+    Kernel,
+    KernelAnswer,
 }
 
 impl StorageIntelligenceOperation {
@@ -701,14 +703,17 @@ impl StorageIntelligenceOperation {
             Self::Periodicity => "periodicity",
             Self::Drift => "drift",
             Self::Hazard => "hazard",
+            Self::Kernel => "kernel",
+            Self::KernelAnswer => "kernel_answer",
         }
     }
 
     #[must_use]
     pub const fn mutates_state(self) -> bool {
-        // Abundance is a pure read; every other operation persists derived rows
-        // (weave: XTerm/Graph; assay: Assay; temporal: Graph/TemporalXTerm).
-        !matches!(self, Self::Abundance)
+        // Abundance and kernel_answer are pure reads; every other operation
+        // persists derived rows (weave: XTerm/Graph; assay: Assay; temporal:
+        // Graph/TemporalXTerm; kernel: Kernel CF).
+        !matches!(self, Self::Abundance | Self::KernelAnswer)
     }
 }
 
@@ -765,6 +770,26 @@ pub struct StorageIntelligenceParams {
     /// Survival threshold below which the next occurrence is overdue (hazard).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overdue_alpha: Option<f64>,
+    /// Dense semantic-lens slot id read per concept as the kernel embedding
+    /// (`kernel`/`kernel_answer`). Required for those operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_slot: Option<u32>,
+    /// Cosine floor for a kernel-graph association edge (`kernel`/`kernel_answer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_cos_threshold: Option<f32>,
+    /// Kernel-only recall gate ratio (`kernel`/`kernel_answer`); default ~0.95.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 1))]
+    pub min_recall_ratio: Option<f32>,
+    /// Existing query record cx_id (32-hex) answered through the kernel
+    /// (`kernel_answer`). Required for that operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_cx_id: Option<String>,
+    /// Maximum hops walked from an anchored kernel node to the query
+    /// (`kernel_answer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 64))]
+    pub max_hops: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
@@ -1023,6 +1048,57 @@ pub struct StorageIntelligenceHazardReport {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceKernelReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub content_slot: u32,
+    pub kernel_id: String,
+    pub corpus_fingerprint: String,
+    pub members: u64,
+    pub kernel_graph_nodes: u64,
+    pub corpus_size: u64,
+    pub vault_corpus_size: u64,
+    pub recall_kernel_only: f32,
+    pub recall_ratio: f32,
+    pub min_recall_ratio: f32,
+    pub grounded: bool,
+    pub reached_anchor: f32,
+    pub unanchored_members: u64,
+    pub anchored_members: u64,
+    pub member_cx_ids: Vec<String>,
+    pub kernel_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceKernelAnswerHop {
+    pub from: String,
+    pub to: String,
+    pub edge_weight: f32,
+    pub hop_index: u32,
+    pub hop_score: f32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceKernelAnswerReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub content_slot: u32,
+    pub query_cx_id: String,
+    pub grounded: bool,
+    pub kernel_id: String,
+    pub anchor_kernel_node: String,
+    pub total_score: f32,
+    pub hop_count: u64,
+    pub hops: Vec<StorageIntelligenceKernelAnswerHop>,
+    pub kernel_members: u64,
+    pub recall_ratio: f32,
+    pub min_recall_ratio: f32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceResponse {
     pub operation: StorageIntelligenceOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1043,6 +1119,10 @@ pub struct StorageIntelligenceResponse {
     pub drift: Option<StorageIntelligenceDriftReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hazard: Option<StorageIntelligenceHazardReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<StorageIntelligenceKernelReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_answer: Option<StorageIntelligenceKernelAnswerReport>,
 }
 
 #[must_use]
@@ -1846,6 +1926,128 @@ pub fn run_intelligence_hazard(
         alpha: report.alpha,
         overdue: report.overdue,
         temporal_xterm_cf_rows_after: report.temporal_xterm_cf_rows_after as u64,
+    })
+}
+
+fn kernel_params(
+    params: &StorageIntelligenceParams,
+) -> Result<synapse_calyx::SynapseCalyxKernelParams, ErrorData> {
+    let content_slot = params.content_slot.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=intelligence sub_operation={} requires content_slot (the dense semantic-lens slot id)",
+                params.operation.as_str()
+            ),
+        )
+    })?;
+    let content_slot = u16::try_from(content_slot).map_err(|_| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("content_slot {content_slot} exceeds the 16-bit slot id range"),
+        )
+    })?;
+    let mut kernel =
+        synapse_calyx::SynapseCalyxKernelParams::new(params.panel_version, content_slot);
+    kernel.max_records = clamp_intelligence_records(params.max_records);
+    if let Some(knn) = params.knn_k {
+        kernel.knn = knn as usize;
+    }
+    if let Some(threshold) = params.edge_cos_threshold {
+        kernel.edge_cos_threshold = threshold;
+    }
+    if let Some(min_recall) = params.min_recall_ratio {
+        kernel.min_recall_ratio = min_recall;
+    }
+    kernel.anchor_kind = params
+        .anchor_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Ok(kernel)
+}
+
+/// Builds the per-domain grounding kernel and persists it (with fingerprint) to
+/// the native Kernel CF (mutating).
+pub fn run_intelligence_kernel(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceKernelReport, ErrorData> {
+    let report = db
+        .build_domain_kernel_intelligence(&kernel_params(params)?)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceKernelReport {
+        source_of_truth: "Calyx Kernel CF rows",
+        panel_version: report.panel_version,
+        content_slot: u32::from(report.content_slot),
+        kernel_id: report.kernel_id,
+        corpus_fingerprint: report.corpus_fingerprint,
+        members: report.members as u64,
+        kernel_graph_nodes: report.kernel_graph_nodes as u64,
+        corpus_size: report.corpus_size as u64,
+        vault_corpus_size: report.vault_corpus_size as u64,
+        recall_kernel_only: report.recall_kernel_only,
+        recall_ratio: report.recall_ratio,
+        min_recall_ratio: report.min_recall_ratio,
+        grounded: report.grounded,
+        reached_anchor: report.reached_anchor,
+        unanchored_members: report.unanchored_members as u64,
+        anchored_members: report.anchored_members as u64,
+        member_cx_ids: report.member_cx_ids,
+        kernel_cf_rows_after: report.kernel_cf_rows_after as u64,
+    })
+}
+
+/// Answers a grounded query through the domain kernel (read-only), or returns a
+/// structured refusal naming the grounding gap.
+pub fn run_intelligence_kernel_answer(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceKernelAnswerReport, ErrorData> {
+    let query_cx_id = params
+        .query_cx_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "storage operation=intelligence sub_operation=kernel_answer requires query_cx_id"
+                    .to_owned(),
+            )
+        })?;
+    let max_hops = params
+        .max_hops
+        .unwrap_or(synapse_calyx::SYNAPSE_KERNEL_DEFAULT_MAX_HOPS as u32)
+        as usize;
+    let report = db
+        .kernel_answer_intelligence(&kernel_params(params)?, query_cx_id, max_hops)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceKernelAnswerReport {
+        source_of_truth: "Calyx Kernel CF + Base CF rows",
+        panel_version: report.panel_version,
+        content_slot: u32::from(report.content_slot),
+        query_cx_id: report.query_cx_id,
+        grounded: report.grounded,
+        kernel_id: report.kernel_id,
+        anchor_kernel_node: report.anchor_kernel_node,
+        total_score: report.total_score,
+        hop_count: report.hop_count as u64,
+        hops: report
+            .hops
+            .into_iter()
+            .map(|hop| StorageIntelligenceKernelAnswerHop {
+                from: hop.from,
+                to: hop.to,
+                edge_weight: hop.edge_weight,
+                hop_index: hop.hop_index,
+                hop_score: hop.hop_score,
+            })
+            .collect(),
+        kernel_members: report.kernel_members as u64,
+        recall_ratio: report.recall_ratio,
+        min_recall_ratio: report.min_recall_ratio,
     })
 }
 

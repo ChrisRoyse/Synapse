@@ -23,14 +23,22 @@ use calyx_assay::{
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
-    Anchor, AnchorKind, AnchorValue, Constellation, CxId, SlotId, SlotVector, SystemClock, Ts,
+    Anchor, AnchorKind, AnchorValue, Constellation, CxId, PanelSlotId, SlotId, SlotVector,
+    SystemClock, Ts,
 };
 use calyx_forge::{Backend, KnnMetric};
+use calyx_lodestar::{
+    AnswerDerivation, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelGraphParams, KernelIndex,
+    KernelParams, LodestarError, LpRoundParams, RecallEvalParams, RecallQuery, build_kernel_index,
+    build_kernel_pipeline, derive_kernel_answer, measure_kernel_recall,
+};
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
     StaticPairGainGate, plan_cross_terms,
 };
+use calyx_paths::AssocGraph;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault};
 
@@ -2003,4 +2011,583 @@ fn temporal_error(
     remediation: &'static str,
 ) -> SynapseCalyxError {
     SynapseCalyxError::new(code, message.to_owned(), remediation)
+}
+
+// ---------------------------------------------------------------------------
+// Grounding kernel + grounded kernel_answer (#1675)
+//
+// Phase-5 "Compose": per-domain (per-panel) grounding kernel — the minimal
+// generating core (~feedback-vertex-set on the embedding-proximity association
+// graph, greedy on 0.40*degree + 0.40*betweenness + 0.20*groundedness), MEASURED
+// against the corpus with the recall gate (~0.95). An ungrounded kernel is a
+// structured error, never silently served. The kernel doubles as index and
+// answer path (hop score = edge_weight * 0.9^hop): `kernel_answer` walks the
+// kernel from the query record to its nearest anchored kernel node and returns
+// the evidence path with hop scores. The honesty gate is load-bearing:
+//   grounded (recall gate met AND an anchored path exists) => answer;
+//   insufficient grounding => a structured refusal naming the gap, NEVER a
+//   confabulated answer.
+//
+// Every estimator is wired from the calyx-lodestar substrate (kernel selection,
+// recall measurement, answer derivation — no reimplementation). The selected
+// kernel persists to the native Kernel CF with a corpus fingerprint and is read
+// back so oracle (#1678)/ward (#1677)/hygiene can consume it. Answers rebuild the
+// kernel inputs from the vault (the sole source of truth — no side store) and
+// derive the grounded path fresh, bounded and off-runtime.
+// ---------------------------------------------------------------------------
+
+/// Default k for the embedding-proximity association graph the kernel selects on.
+pub const SYNAPSE_KERNEL_DEFAULT_KNN: usize = 8;
+/// Default cosine floor for an association edge in the kernel graph.
+pub const SYNAPSE_KERNEL_DEFAULT_EDGE_COS: f32 = 0.25;
+/// Default kernel-only recall gate ratio (the epic's ~0.95).
+pub const SYNAPSE_KERNEL_DEFAULT_MIN_RECALL: f32 = 0.95;
+/// Default maximum hops walked from an anchored kernel node to the query.
+pub const SYNAPSE_KERNEL_DEFAULT_MAX_HOPS: usize = 4;
+/// Cap on member cx_ids echoed in a kernel report (the full set persists to CF).
+pub const SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS: usize = 256;
+
+const KERNEL_ROW_PREFIX: &[u8; 5] = b"KERN1";
+
+/// Bounded request describing one grounding-kernel build or grounded answer.
+#[derive(Clone, Debug)]
+pub struct SynapseCalyxKernelParams {
+    pub panel_version: u32,
+    /// Dense semantic-lens slot id read per concept as the kernel embedding.
+    pub content_slot: u16,
+    pub max_records: usize,
+    pub knn: usize,
+    pub edge_cos_threshold: f32,
+    pub min_recall_ratio: f32,
+    /// Optional grounded outcome anchor kind stamped onto the kernel identity.
+    pub anchor_kind: Option<String>,
+}
+
+impl SynapseCalyxKernelParams {
+    #[must_use]
+    pub const fn new(panel_version: u32, content_slot: u16) -> Self {
+        Self {
+            panel_version,
+            content_slot,
+            max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
+            knn: SYNAPSE_KERNEL_DEFAULT_KNN,
+            edge_cos_threshold: SYNAPSE_KERNEL_DEFAULT_EDGE_COS,
+            min_recall_ratio: SYNAPSE_KERNEL_DEFAULT_MIN_RECALL,
+            anchor_kind: None,
+        }
+    }
+}
+
+/// A derived per-domain grounding kernel with its measured recall and the
+/// physical Kernel CF readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxKernelReport {
+    pub panel_version: u32,
+    pub content_slot: u16,
+    pub kernel_id: String,
+    /// Corpus fingerprint (sha256 over the sorted embedded cx_ids) proving which
+    /// corpus this kernel was selected against.
+    pub corpus_fingerprint: String,
+    pub members: usize,
+    pub kernel_graph_nodes: usize,
+    pub corpus_size: usize,
+    pub vault_corpus_size: usize,
+    pub recall_kernel_only: f32,
+    pub recall_ratio: f32,
+    pub min_recall_ratio: f32,
+    pub grounded: bool,
+    pub reached_anchor: f32,
+    pub unanchored_members: usize,
+    pub anchored_members: usize,
+    pub member_cx_ids: Vec<String>,
+    pub kernel_cf_rows_after: usize,
+}
+
+/// One hop on a grounded answer's evidence path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxKernelAnswerHop {
+    pub from: String,
+    pub to: String,
+    pub edge_weight: f32,
+    pub hop_index: u32,
+    pub hop_score: f32,
+}
+
+/// A grounded kernel answer: the evidence path from the query record to its
+/// nearest anchored kernel node, with hop scores and grounding tags.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxKernelAnswerReport {
+    pub panel_version: u32,
+    pub content_slot: u16,
+    pub query_cx_id: String,
+    pub grounded: bool,
+    pub kernel_id: String,
+    pub anchor_kernel_node: String,
+    pub total_score: f32,
+    pub hop_count: usize,
+    pub hops: Vec<SynapseCalyxKernelAnswerHop>,
+    pub kernel_members: usize,
+    pub recall_ratio: f32,
+    pub min_recall_ratio: f32,
+}
+
+/// The reusable kernel inputs assembled from the vault: the embedding rows, the
+/// proximity association graph, the selected kernel, its measured recall, and the
+/// kernel index — everything a build or an answer needs.
+struct DomainKernelInputs {
+    rows: Vec<RecallQuery>,
+    anchors: Vec<CxId>,
+    graph: AssocGraph,
+    kernel: Kernel,
+    kernel_index: KernelIndex,
+    recall_kernel_only: f32,
+    recall_ratio: f32,
+    corpus_size: usize,
+    vault_corpus_size: usize,
+    corpus_fingerprint: String,
+}
+
+impl SynapseCalyxVault {
+    /// Builds the per-domain grounding kernel for one panel, enforces the recall
+    /// gate (an ungrounded kernel is a structured error, never served), persists
+    /// the kernel with its corpus fingerprint to the native Kernel CF, and reads
+    /// the Kernel CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the panel has fewer than two embedded
+    /// concepts, no anchored concept, the substrate kernel/recall math fails
+    /// closed, the recall gate is not met, or the Kernel CF write/readback fails.
+    pub fn build_domain_kernel(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<SynapseCalyxKernelReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("build_domain_kernel");
+        let inputs = self.build_domain_kernel_inputs(params)?;
+        // The honesty gate: an ungrounded kernel (recall below the gate) is a
+        // structured error, never persisted or served.
+        if inputs.recall_ratio < params.min_recall_ratio {
+            return Err(SynapseCalyxError::new(
+                LodestarError::RecallBelowGate {
+                    ratio: inputs.recall_ratio,
+                    min: params.min_recall_ratio,
+                }
+                .code(),
+                format!(
+                    "domain kernel recall {:.4} is below the gate {:.4} for panel {} slot {}; the kernel does not explain the corpus",
+                    inputs.recall_ratio,
+                    params.min_recall_ratio,
+                    params.panel_version,
+                    params.content_slot
+                ),
+                "widen the corpus, raise knn/lower edge_cos_threshold, or lower min_recall_ratio only with justification; never serve an ungrounded kernel",
+            ));
+        }
+
+        let anchored_members = inputs
+            .kernel
+            .members
+            .iter()
+            .filter(|member| inputs.anchors.contains(member))
+            .count();
+        let member_cx_ids: Vec<String> = inputs
+            .kernel
+            .members
+            .iter()
+            .take(SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS)
+            .map(CxId::to_string)
+            .collect();
+
+        let row = serde_json::json!({
+            "panel_version": params.panel_version,
+            "content_slot": params.content_slot,
+            "kernel_id": inputs.kernel.kernel_id.to_string(),
+            "corpus_fingerprint": inputs.corpus_fingerprint,
+            "anchor_kind": inputs.kernel.anchor_kind,
+            "members": inputs.kernel.members.iter().map(CxId::to_string).collect::<Vec<_>>(),
+            "kernel_graph": inputs.kernel.kernel_graph.iter().map(CxId::to_string).collect::<Vec<_>>(),
+            "recall_kernel_only": inputs.recall_kernel_only,
+            "recall_ratio": inputs.recall_ratio,
+            "min_recall_ratio": params.min_recall_ratio,
+            "reached_anchor": inputs.kernel.groundedness.reached_anchor,
+            "built_at_millis": inputs.kernel.built_at_millis,
+            "estimator_provenance": inputs.kernel.estimator_provenance,
+        });
+        self.persist_temporal_row(
+            ColumnFamily::Kernel,
+            kernel_row_key(params.panel_version, params.content_slot),
+            &row,
+        )?;
+        let kernel_cf_rows_after = self.scan_cf_latest(ColumnFamily::Kernel)?.len();
+
+        Ok(SynapseCalyxKernelReport {
+            panel_version: params.panel_version,
+            content_slot: params.content_slot,
+            kernel_id: inputs.kernel.kernel_id.to_string(),
+            corpus_fingerprint: inputs.corpus_fingerprint,
+            members: inputs.kernel.members.len(),
+            kernel_graph_nodes: inputs.kernel.kernel_graph.len(),
+            corpus_size: inputs.corpus_size,
+            vault_corpus_size: inputs.vault_corpus_size,
+            recall_kernel_only: inputs.recall_kernel_only,
+            recall_ratio: inputs.recall_ratio,
+            min_recall_ratio: params.min_recall_ratio,
+            grounded: true,
+            reached_anchor: inputs.kernel.groundedness.reached_anchor,
+            unanchored_members: inputs.kernel.groundedness.unanchored_members.len(),
+            anchored_members,
+            member_cx_ids,
+            kernel_cf_rows_after,
+        })
+    }
+
+    /// Answers a grounded query through the domain kernel: rebuilds the kernel
+    /// inputs from the vault, enforces the recall gate, then walks the kernel from
+    /// the query record to its nearest anchored kernel node and returns the
+    /// evidence path with hop scores. Insufficient grounding (recall below gate,
+    /// query record without an embedding, or no anchored path within `max_hops`)
+    /// is a structured refusal that names the gap — never a confabulated answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured refusal when the kernel is ungrounded, the query
+    /// record is missing/unembedded, or no grounded path exists; or a structured
+    /// error when the substrate math or a CF scan fails closed.
+    pub fn kernel_answer(
+        &self,
+        params: &SynapseCalyxKernelParams,
+        query_cx_id: &str,
+        max_hops: usize,
+    ) -> Result<SynapseCalyxKernelAnswerReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("kernel_answer");
+        let query_cx = crate::parse_cx_id(query_cx_id)?;
+        let inputs = self.build_domain_kernel_inputs(params)?;
+        if inputs.recall_ratio < params.min_recall_ratio {
+            return Err(SynapseCalyxError::new(
+                LodestarError::RecallBelowGate {
+                    ratio: inputs.recall_ratio,
+                    min: params.min_recall_ratio,
+                }
+                .code(),
+                format!(
+                    "cannot answer: domain kernel recall {:.4} is below the gate {:.4}; the kernel does not explain the corpus",
+                    inputs.recall_ratio, params.min_recall_ratio
+                ),
+                "rebuild the kernel over a wider corpus or repair the panel embeddings before answering grounded queries",
+            ));
+        }
+        // The query embedding is the query record's own dense content-slot vector
+        // (encoders only — there is no query embedder). A query record without an
+        // embedding in this panel is a named refusal, never a guessed vector.
+        let query_vec = inputs
+            .rows
+            .iter()
+            .find(|row| row.cx_id == query_cx)
+            .map(|row| row.vector.clone())
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_QUERY_UNEMBEDDED",
+                    format!(
+                        "query record {query_cx} has no embedding in panel {} slot {}; it is not a grounded concept in this domain",
+                        params.panel_version, params.content_slot
+                    ),
+                    "supply a query cx_id that exists in this panel and carries the content-slot embedding",
+                )
+            })?;
+        let anchored_kernel_nodes: Vec<CxId> = inputs
+            .kernel
+            .members
+            .iter()
+            .copied()
+            .filter(|member| inputs.anchors.contains(member))
+            .collect();
+        if anchored_kernel_nodes.is_empty() {
+            return Err(SynapseCalyxError::new(
+                LodestarError::KernelNoAnchoredNode.code(),
+                format!(
+                    "cannot answer: kernel for panel {} slot {} has no anchored member to ground an answer",
+                    params.panel_version, params.content_slot
+                ),
+                "anchor at least one kernel concept (a grounded outcome) before answering grounded queries",
+            ));
+        }
+
+        let max_hops = max_hops.clamp(1, 64);
+        let derivation: AnswerDerivation = derive_kernel_answer(
+            &inputs.kernel_index,
+            &inputs.graph,
+            query_cx,
+            &query_vec,
+            &anchored_kernel_nodes,
+            max_hops,
+        )
+        .map_err(|error| kernel_refusal("derive grounded kernel answer", &error))?;
+
+        let hops: Vec<SynapseCalyxKernelAnswerHop> = derivation
+            .hops
+            .iter()
+            .map(|hop| SynapseCalyxKernelAnswerHop {
+                from: hop.from.to_string(),
+                to: hop.to.to_string(),
+                edge_weight: hop.edge_weight,
+                hop_index: hop.hop_index,
+                hop_score: hop.hop_score,
+            })
+            .collect();
+
+        Ok(SynapseCalyxKernelAnswerReport {
+            panel_version: params.panel_version,
+            content_slot: params.content_slot,
+            query_cx_id: query_cx.to_string(),
+            grounded: true,
+            kernel_id: derivation.kernel_id.to_string(),
+            anchor_kernel_node: derivation.anchor_kernel_node.to_string(),
+            total_score: derivation.total_score,
+            hop_count: hops.len(),
+            hops,
+            kernel_members: inputs.kernel.members.len(),
+            recall_ratio: inputs.recall_ratio,
+            min_recall_ratio: params.min_recall_ratio,
+        })
+    }
+
+    /// Assembles the kernel inputs from the vault: scans the panel's Base CF for
+    /// the content-slot embedding, builds the embedding-proximity kNN association
+    /// graph (GPU-preferred/CPU-fallback cosine), selects the kernel via the
+    /// substrate MFVS pipeline, builds the kernel index, and measures kernel-only
+    /// recall against the full corpus.
+    #[allow(clippy::too_many_lines)]
+    fn build_domain_kernel_inputs(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<DomainKernelInputs, SynapseCalyxError> {
+        let max_records = params
+            .max_records
+            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+        let content_slot = PanelSlotId::new(params.panel_version, SlotId::new(params.content_slot));
+        let mut rows: Vec<RecallQuery> = Vec::new();
+        let mut anchors: Vec<CxId> = Vec::new();
+        let mut vault_corpus_size = 0usize;
+        for (_, value) in self.scan_cf_latest(ColumnFamily::Base)? {
+            let constellation = decode_constellation_base(&value).map_err(|error| {
+                SynapseCalyxError::from_calyx("decode Base constellation", &error)
+            })?;
+            if constellation.panel_version != params.panel_version {
+                continue;
+            }
+            vault_corpus_size += 1;
+            let Some(vector) = constellation
+                .slots
+                .get(&content_slot.slot_id())
+                .and_then(dense_vector)
+            else {
+                // A record without the dense content-slot embedding is simply not
+                // a grounded concept in this domain; it is excluded, never faked.
+                continue;
+            };
+            let has_anchor = constellation
+                .anchors
+                .iter()
+                .any(|anchor| anchor.confidence > 0.0);
+            let cx_id = constellation.cx_id;
+            rows.push(RecallQuery { cx_id, vector });
+            if has_anchor {
+                anchors.push(cx_id);
+            }
+            if rows.len() >= max_records {
+                break;
+            }
+        }
+        if rows.len() < 2 {
+            return Err(SynapseCalyxError::new(
+                LodestarError::KernelEmptyResult.code(),
+                format!(
+                    "panel {} slot {} has {} embedded concept(s); a kernel needs at least two",
+                    params.panel_version,
+                    params.content_slot,
+                    rows.len()
+                ),
+                "capture more grounded concepts with the content-slot embedding for this domain",
+            ));
+        }
+        if anchors.is_empty() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_NO_ANCHOR",
+                format!(
+                    "panel {} slot {} has no anchored concept; a grounded kernel needs at least one outcome anchor",
+                    params.panel_version, params.content_slot
+                ),
+                "anchor at least one concept (a grounded outcome) in this domain before building a kernel",
+            ));
+        }
+
+        let graph = self.build_kernel_assoc_graph(&rows, params)?;
+        let corpus_fingerprint = corpus_fingerprint(&rows);
+        let kernel_params = KernelParams {
+            panel_version: params.panel_version,
+            anchor_kind: params.anchor_kind.clone(),
+            corpus_shard_hash: corpus_hash_bytes(&rows),
+            built_at_millis: self.clock_now_ms().unwrap_or(0),
+            kernel_graph: KernelGraphParams::default(),
+            lp_round: LpRoundParams::default(),
+        };
+        let kernel = build_kernel_pipeline(&graph, &anchors, &kernel_params)
+            .map_err(|error| kernel_math_error("select domain kernel", &error))?;
+        if kernel.members.is_empty() {
+            return Err(SynapseCalyxError::new(
+                LodestarError::KernelEmptyResult.code(),
+                format!(
+                    "kernel selection produced no members for panel {} slot {}",
+                    params.panel_version, params.content_slot
+                ),
+                "inspect the association graph density (knn/edge_cos_threshold) and the anchored set",
+            ));
+        }
+        let embeddings: BTreeMap<CxId, Vec<f32>> = rows
+            .iter()
+            .map(|row| (row.cx_id, row.vector.clone()))
+            .collect();
+        let kernel_index = build_kernel_index(&kernel, &embeddings)
+            .map_err(|error| kernel_math_error("build kernel index", &error))?;
+        let full = InMemoryAnnIndex::new(rows.clone())
+            .map_err(|error| kernel_math_error("build full-corpus index", &error))?;
+        let corpus_size = rows.len();
+        let corpus = InMemoryCorpus::new("synapse-domain-kernel", rows.clone());
+        let recall_params = RecallEvalParams {
+            min_recall_ratio: params.min_recall_ratio,
+            ..RecallEvalParams::default()
+        };
+        let recall = measure_kernel_recall(&kernel_index, &full, &corpus, &recall_params)
+            .map_err(|error| kernel_math_error("measure kernel-only recall", &error))?;
+
+        Ok(DomainKernelInputs {
+            rows,
+            anchors,
+            graph,
+            kernel,
+            kernel_index,
+            recall_kernel_only: recall.kernel_only,
+            recall_ratio: recall.ratio,
+            corpus_size,
+            vault_corpus_size,
+            corpus_fingerprint,
+        })
+    }
+
+    /// Builds the embedding-proximity association graph: a node per embedded
+    /// concept, an edge to each of its `knn` cosine-nearest neighbours at or above
+    /// `edge_cos_threshold` (GPU-preferred/CPU-fallback Forge kNN).
+    fn build_kernel_assoc_graph(
+        &self,
+        rows: &[RecallQuery],
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<AssocGraph, SynapseCalyxError> {
+        let mut builder = AssocGraph::builder();
+        for row in rows {
+            builder
+                .add_node(row.cx_id, 1.0)
+                .map_err(|error| paths_error("add kernel graph node", &error))?;
+        }
+        let knn = params.knn.clamp(1, 64);
+        // Only equal-dimension vectors can be compared by cosine; group by dim.
+        let mut by_dim: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (index, row) in rows.iter().enumerate() {
+            by_dim.entry(row.vector.len()).or_default().push(index);
+        }
+        let backend = self.math_runtime.backend();
+        for (dim, group) in by_dim {
+            if dim == 0 || group.len() < 2 {
+                continue;
+            }
+            let count = group.len();
+            let mut flat = Vec::with_capacity(count * dim);
+            for &index in &group {
+                flat.extend_from_slice(&rows[index].vector);
+            }
+            let k = (knn + 1).min(count);
+            let batch = backend
+                .knn(&flat, &flat, count, dim, k, KnnMetric::Cosine)
+                .map_err(|error| forge_math_error("kernel-graph kNN", &error))?;
+            for (query_offset, &query_index) in group.iter().enumerate() {
+                let base = query_offset * batch.k;
+                let mut added = 0usize;
+                for slot in 0..batch.k {
+                    let candidate_offset = batch.indices[base + slot];
+                    if candidate_offset == query_offset {
+                        continue;
+                    }
+                    let score = batch.scores[base + slot];
+                    if score < params.edge_cos_threshold {
+                        continue;
+                    }
+                    let candidate_index = group[candidate_offset];
+                    builder
+                        .add_edge(rows[query_index].cx_id, rows[candidate_index].cx_id, score)
+                        .map_err(|error| paths_error("add kernel graph edge", &error))?;
+                    added += 1;
+                    if added >= knn {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(builder.build())
+    }
+}
+
+/// Content fingerprint of the embedded corpus: sha256 over the sorted cx_id
+/// bytes, hex-encoded — proves which concepts the kernel was selected against.
+fn corpus_fingerprint(rows: &[RecallQuery]) -> String {
+    let bytes = corpus_hash_bytes(rows);
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        hex.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    hex
+}
+
+fn corpus_hash_bytes(rows: &[RecallQuery]) -> [u8; 32] {
+    let mut ids: Vec<[u8; 16]> = rows.iter().map(|row| row.cx_id.to_bytes()).collect();
+    ids.sort_unstable();
+    let mut hasher = Sha256::new();
+    for id in ids {
+        hasher.update(id);
+    }
+    hasher.finalize().into()
+}
+
+fn kernel_row_key(panel_version: u32, content_slot: u16) -> Vec<u8> {
+    let mut key = Vec::with_capacity(KERNEL_ROW_PREFIX.len() + 6);
+    key.extend_from_slice(KERNEL_ROW_PREFIX);
+    key.extend_from_slice(&panel_version.to_be_bytes());
+    key.extend_from_slice(&content_slot.to_be_bytes());
+    key
+}
+
+fn kernel_math_error(action: &str, error: &LodestarError) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        error.code(),
+        format!("{action}: {error}"),
+        "inspect the panel embeddings, anchored set, and kernel parameters at the vault, then retry",
+    )
+}
+
+/// Maps a substrate answer-derivation failure to a structured refusal that names
+/// the grounding gap (no anchored node reachable / no path within the hop budget)
+/// — the honesty gate's refusal branch, never a confabulated answer.
+fn kernel_refusal(action: &str, error: &LodestarError) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        error.code(),
+        format!("refused: {action}: {error}: the query is not grounded through the kernel"),
+        "the query record does not reach a grounded anchor within the hop budget; widen the kernel/hops or accept the refusal — never a confabulated answer",
+    )
+}
+
+fn paths_error(action: &str, error: &calyx_paths::PathsError) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_GRAPH",
+        format!("{action}: kernel association graph failed: {error}"),
+        "inspect the embedded concept set for duplicate or invalid ids before retrying",
+    )
 }

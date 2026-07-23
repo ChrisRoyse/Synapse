@@ -18,7 +18,9 @@ calyx-aster = { path = "../../calyx/crates/calyx-aster" }
 calyx-core = { path = "../../calyx/crates/calyx-core" }
 calyx-forge = { path = "../../calyx/crates/calyx-forge" }
 calyx-ledger = { path = "../../calyx/crates/calyx-ledger" }
+calyx-lodestar = { path = "../../calyx/crates/calyx-lodestar" }
 calyx-loom = { path = "../../calyx/crates/calyx-loom" }
+calyx-paths = { path = "../../calyx/crates/calyx-paths" }
 calyx-registry = { path = "../../calyx/crates/calyx-registry" }
 calyx-search = { path = "../../calyx/crates/calyx-search" }
 calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }

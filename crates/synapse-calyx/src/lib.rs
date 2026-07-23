@@ -91,16 +91,19 @@ pub use grounding::{
 };
 pub use intelligence::{
     SYNAPSE_ASSAY_BIT_FLOOR, SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES,
-    SYNAPSE_INTELLIGENCE_MAX_RECORDS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
+    SYNAPSE_INTELLIGENCE_MAX_RECORDS, SYNAPSE_KERNEL_DEFAULT_EDGE_COS, SYNAPSE_KERNEL_DEFAULT_KNN,
+    SYNAPSE_KERNEL_DEFAULT_MAX_HOPS, SYNAPSE_KERNEL_DEFAULT_MIN_RECALL,
+    SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
     SYNAPSE_KSG_DEFAULT_K, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS, SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG,
     SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS, SynapseCalyxAbundanceReport,
     SynapseCalyxAgreementEdge, SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge,
     SynapseCalyxBitsReport, SynapseCalyxCausalityLag, SynapseCalyxCausalityReport,
-    SynapseCalyxDriftReport, SynapseCalyxHazardReport, SynapseCalyxNeffEstimate,
-    SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak, SynapseCalyxRedundancyPair,
-    SynapseCalyxRedundancyReport, SynapseCalyxSlotBits, SynapseCalyxSufficiencyDeficit,
-    SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams, SynapseCalyxWeaveParams,
-    SynapseCalyxWeaveReport,
+    SynapseCalyxDriftReport, SynapseCalyxHazardReport, SynapseCalyxKernelAnswerHop,
+    SynapseCalyxKernelAnswerReport, SynapseCalyxKernelParams, SynapseCalyxKernelReport,
+    SynapseCalyxNeffEstimate, SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak,
+    SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport, SynapseCalyxSlotBits,
+    SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams,
+    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
