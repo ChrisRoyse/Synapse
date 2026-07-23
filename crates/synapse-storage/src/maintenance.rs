@@ -34,8 +34,11 @@ use crate::{StorageError, StorageResult};
 /// urgent pressure pass proceed alongside a routine GC pass.
 const MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS: usize = 2;
 
-static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS)));
+static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS,
+    ))
+});
 
 /// In-flight admitted maintenance passes, published as queue-depth telemetry.
 static STORAGE_MAINTENANCE_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
@@ -51,27 +54,26 @@ static STORAGE_MAINTENANCE_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 ///
 /// Returns the closure's error, or a structured storage error if the admission
 /// semaphore was closed or the blocking task failed to join.
-pub async fn run_admitted_maintenance<T, F>(
-    operation: &'static str,
-    work: F,
-) -> StorageResult<T>
+pub async fn run_admitted_maintenance<T, F>(operation: &'static str, work: F) -> StorageResult<T>
 where
     F: FnOnce() -> StorageResult<T> + Send + 'static,
     T: Send + 'static,
 {
     let semaphore = Arc::clone(&STORAGE_MAINTENANCE_PERMITS);
-    let waiters_before = MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS
-        .saturating_sub(semaphore.available_permits());
+    let waiters_before =
+        MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS.saturating_sub(semaphore.available_permits());
     let admission_started = Instant::now();
-    let permit = semaphore.acquire_owned().await.map_err(|_closed| {
-        StorageError::WriteFailed {
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_closed| StorageError::WriteFailed {
             cf_name: "storage_maintenance".to_owned(),
             detail: format!(
                 "{operation}: storage maintenance admission semaphore was unexpectedly closed"
             ),
-        }
-    })?;
-    let admission_wait_ms = u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        })?;
+    let admission_wait_ms =
+        u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let in_flight = STORAGE_MAINTENANCE_IN_FLIGHT
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
