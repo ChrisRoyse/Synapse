@@ -24,12 +24,12 @@ use synapse_calyx::{
     SynapseCalyxBackupReport, SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams,
     SynapseCalyxBlindSpotReport, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
     SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
-    SynapseCalyxDriftReport, SynapseCalyxErasureReport, SynapseCalyxError,
-    SynapseCalyxGroundedObservationReadback, SynapseCalyxGroundingGapReport,
-    SynapseCalyxHazardReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
-    SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
-    SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPeriodicityReport,
-    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxDriftReport, SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxFindParams,
+    SynapseCalyxFindReport, SynapseCalyxGroundedObservationReadback,
+    SynapseCalyxGroundingGapReport, SynapseCalyxHazardReport, SynapseCalyxLedgerEntryReadback,
+    SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
+    SynapseCalyxObservationPutReadback, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
+    SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
@@ -407,6 +407,10 @@ pub trait StorageBackend: Send + Sync {
         &self,
         expected_panel_version: u32,
     ) -> StorageResult<SynapseCalyxSearchRebuildReport>;
+    fn find_similar(
+        &self,
+        params: &SynapseCalyxFindParams,
+    ) -> StorageResult<SynapseCalyxFindReport>;
     fn retire_orphan_slot_cfs(&self) -> StorageResult<AsterOrphanSlotGcReport>;
     fn close_calyx_vault(
         &self,
@@ -1769,6 +1773,26 @@ impl StorageBackend for CalyxBackend {
                             &source,
                         )
                     })
+            },
+        )
+    }
+
+    fn find_similar(
+        &self,
+        params: &SynapseCalyxFindParams,
+    ) -> StorageResult<SynapseCalyxFindReport> {
+        self.with_vault(
+            "calyx_search",
+            "run fused Calyx find-similar search",
+            false,
+            |vault| {
+                vault.find_similar(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_search",
+                        "run fused Calyx find-similar search",
+                        &source,
+                    )
+                })
             },
         )
     }

@@ -24,6 +24,11 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("temporal_rerank", params.temporal_rerank.is_some()),
             ("temporal_backfill", params.temporal_backfill.is_some()),
             ("search_rebuild", params.search_rebuild.is_some()),
+            ("find_similar", params.find_similar.is_some()),
+            (
+                "retire_orphan_slot_cfs",
+                params.retire_orphan_slot_cfs.is_some(),
+            ),
             ("backup", params.backup.is_some()),
             ("restore_verify", params.restore_verify.is_some()),
             ("intelligence", params.intelligence.is_some()),

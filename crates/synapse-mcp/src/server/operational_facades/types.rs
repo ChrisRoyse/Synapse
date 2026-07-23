@@ -21,12 +21,14 @@ use crate::m3::{
     },
     storage::{
         StorageAnchorsParams, StorageAnchorsResponse, StorageBackupParams, StorageBackupResponse,
-        StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
+        StorageFindSimilarParams, StorageFindSimilarResponse, StorageGcOnceParams,
+        StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
         StorageIntelligenceParams, StorageIntelligenceResponse, StorageRestoreVerifyParams,
-        StorageRestoreVerifyResponse, StorageSearchRebuildParams, StorageSearchRebuildResponse,
-        StorageSummaryResponse, StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
-        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
-        StorageTemporalRerankResponse,
+        StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
+        StorageRetireOrphanSlotCfsResponse, StorageSearchRebuildParams,
+        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
+        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
+        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -40,6 +42,8 @@ pub enum StorageOperation {
     TemporalRerank,
     TemporalBackfill,
     SearchRebuild,
+    FindSimilar,
+    RetireOrphanSlotCfs,
     Backup,
     RestoreVerify,
     Intelligence,
@@ -56,6 +60,8 @@ impl StorageOperation {
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
             Self::SearchRebuild => "search_rebuild",
+            Self::FindSimilar => "find_similar",
+            Self::RetireOrphanSlotCfs => "retire_orphan_slot_cfs",
             Self::Backup => "backup",
             Self::RestoreVerify => "restore_verify",
             Self::Intelligence => "intelligence",
@@ -83,6 +89,10 @@ pub struct StorageParams {
     pub temporal_backfill: Option<StorageTemporalBackfillParams>,
     #[serde(default)]
     pub search_rebuild: Option<StorageSearchRebuildParams>,
+    #[serde(default)]
+    pub find_similar: Option<StorageFindSimilarParams>,
+    #[serde(default)]
+    pub retire_orphan_slot_cfs: Option<StorageRetireOrphanSlotCfsParams>,
     #[serde(default)]
     pub backup: Option<StorageBackupParams>,
     #[serde(default)]
@@ -113,6 +123,10 @@ pub struct StorageResponse {
     pub temporal_backfill: Option<StorageTemporalBackfillResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_rebuild: Option<StorageSearchRebuildResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub find_similar: Option<StorageFindSimilarResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_orphan_slot_cfs: Option<StorageRetireOrphanSlotCfsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<StorageBackupResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

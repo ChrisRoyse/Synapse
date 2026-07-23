@@ -125,6 +125,154 @@ pub struct StorageSearchRebuildResponse {
     pub raw_sidecars: Vec<StorageSearchRawSidecar>,
 }
 
+// ---------------------------------------------------------------------------
+// Fused find-similar search (#1676): per-slot recall -> RRF fusion -> bounded
+// temporal boost -> agree/disagree evidence over the persisted per-slot
+// indexes. Read-only; runs off the runtime on the blocking pool.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFindSimilarParams {
+    /// `by_example` (a record key -> its own stored slot vectors) or `by_text`
+    /// (measured through the active panel's text lenses).
+    pub query_mode: String,
+    /// Content-addressed example record id; required when `query_mode=by_example`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cx_id: Option<String>,
+    /// Query text; required when `query_mode=by_text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Maximum fused hits to return.
+    #[schemars(range(min = 1, max = 1000))]
+    pub k: u32,
+    /// Rank-level fusion: `rrf`, `weighted_rrf`, or `single_slot`.
+    pub fusion: String,
+    /// Slot id to isolate when `fusion=single_slot` (pure vector or pure BM25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 65535))]
+    pub single_slot: Option<u32>,
+    /// Optional Sextant filter expression (time-range / app).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Attach the per-lens explain breakdown to each hit.
+    #[serde(default)]
+    pub explain: bool,
+    /// Optional bounded temporal post-boost (#1667).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<StorageFindTemporalParams>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFindTemporalParams {
+    pub query_time_secs: i64,
+    pub tz_offset_secs: i32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindLensContribution {
+    pub slot: u32,
+    pub rank: u64,
+    pub raw_score: f32,
+    pub weight: f32,
+    pub contribution: f32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindTemporalScores {
+    pub e2_recency: f32,
+    pub e3_periodic: f32,
+    pub e4_sequence: f32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindHit {
+    pub cx_id: String,
+    pub rank: u64,
+    pub score: f32,
+    pub per_lens: Vec<StorageFindLensContribution>,
+    /// Consulted lenses that ranked this record (support).
+    pub agree_slots: Vec<u32>,
+    /// Consulted lenses that did not rank this record (dissent).
+    pub disagree_slots: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_scores: Option<StorageFindTemporalScores>,
+    pub provenance_seq: u64,
+    pub provenance_hash: String,
+    pub freshness_built_at_seq: u64,
+    pub freshness_base_seq: u64,
+    pub freshness_policy: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindGeneration {
+    pub panel_version: u32,
+    pub base_seq: u64,
+    pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diskann_build_backend: Option<String>,
+    pub slots: Vec<StorageSearchRebuildSlot>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindSimilarResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub fusion: String,
+    pub query_kind: String,
+    pub k: u32,
+    pub rrf_k: u32,
+    pub consulted_slots: Vec<u32>,
+    pub temporal_applied: bool,
+    pub guard_note: String,
+    pub maxsim_note: String,
+    pub grounding_note: String,
+    pub generation: StorageFindGeneration,
+    pub hits: Vec<StorageFindHit>,
+}
+
+// ---------------------------------------------------------------------------
+// Orphan physical slot-CF retirement (#1776) as a maintenance-gated facade op,
+// gated exactly like search_rebuild (maintenance profile + single admission).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRetireOrphanSlotCfsParams {}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageRetiredOrphanSlotCf {
+    pub slot_id: u32,
+    pub quantized_rows: u64,
+    pub quantized_sst_files: u64,
+    pub raw_rows: u64,
+    pub raw_sst_files: u64,
+    pub removed_dirs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageSkippedLiveSlotCf {
+    pub slot_id: u32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageRetireOrphanSlotCfsResponse {
+    pub source_of_truth: &'static str,
+    pub base_rows_scanned: u64,
+    /// Slot ids referenced by at least one live Base row (the legitimate set).
+    pub live_slot_ids: Vec<u32>,
+    /// Physical `cf/slot_*` ids discovered on disk.
+    pub present_slot_ids: Vec<u32>,
+    pub retired: Vec<StorageRetiredOrphanSlotCf>,
+    /// Candidate orphans refused because a key still resolved to a live Base
+    /// row (fail-closed) — empty on a healthy vault.
+    pub skipped_live: Vec<StorageSkippedLiveSlotCf>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageBackupParams {
@@ -942,6 +1090,225 @@ pub fn required_permissions_search_rebuild(
     _params: &StorageSearchRebuildParams,
 ) -> RequiredPermissions {
     required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_find_similar(
+    _params: &StorageFindSimilarParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_retire_orphan_slot_cfs(
+    _params: &StorageRetireOrphanSlotCfsParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+/// Runs one fused find-similar pass and maps the physical Calyx report onto the
+/// MCP response. Fusion / query-mode strings are validated here; the heavy
+/// index work happens in the caller's blocking-pool offload.
+///
+/// # Errors
+///
+/// Returns a structured MCP error for an invalid query mode / fusion strategy,
+/// a missing required field, or any fail-closed Calyx find error (missing/stale
+/// index, cross-panel example, temporal boost unavailable).
+pub fn run_find_similar(
+    db: &synapse_storage::Db,
+    params: &StorageFindSimilarParams,
+) -> Result<StorageFindSimilarResponse, ErrorData> {
+    let query = match params.query_mode.trim() {
+        "by_example" => {
+            let cx_id = params
+                .cx_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "storage operation=find_similar query_mode=by_example requires a non-empty cx_id".to_owned(),
+                    )
+                })?;
+            synapse_calyx::SynapseCalyxFindQuery::ByExample { cx_id }
+        }
+        "by_text" => {
+            let text = params
+                .text
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "storage operation=find_similar query_mode=by_text requires non-empty text"
+                            .to_owned(),
+                    )
+                })?;
+            synapse_calyx::SynapseCalyxFindQuery::ByText { text }
+        }
+        other => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "storage operation=find_similar query_mode {other:?} must be by_example or by_text"
+                ),
+            ));
+        }
+    };
+    let fusion = match params.fusion.trim() {
+        "rrf" => synapse_calyx::SynapseCalyxFindFusion::Rrf,
+        "weighted_rrf" => synapse_calyx::SynapseCalyxFindFusion::WeightedRrf,
+        "single_slot" => {
+            let slot = params.single_slot.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "storage operation=find_similar fusion=single_slot requires single_slot"
+                        .to_owned(),
+                )
+            })?;
+            let slot = u16::try_from(slot).map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("storage operation=find_similar single_slot {slot} exceeds the u16 slot id range"),
+                )
+            })?;
+            synapse_calyx::SynapseCalyxFindFusion::SingleSlot { slot }
+        }
+        other => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "storage operation=find_similar fusion {other:?} must be rrf, weighted_rrf, or single_slot"
+                ),
+            ));
+        }
+    };
+    let temporal =
+        params
+            .temporal
+            .as_ref()
+            .map(|temporal| synapse_calyx::SynapseCalyxFindTemporal {
+                query_time_secs: temporal.query_time_secs,
+                tz_offset_secs: temporal.tz_offset_secs,
+            });
+    let find_params = synapse_calyx::SynapseCalyxFindParams {
+        query,
+        k: params.k as usize,
+        fusion,
+        filter: params.filter.clone(),
+        explain: params.explain,
+        temporal,
+    };
+    let report = db
+        .find_similar(&find_params)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(storage_find_similar_response(report))
+}
+
+fn storage_find_similar_response(
+    report: synapse_calyx::SynapseCalyxFindReport,
+) -> StorageFindSimilarResponse {
+    let generation = StorageFindGeneration {
+        panel_version: report.generation.panel_version,
+        base_seq: report.generation.base_seq,
+        manifest_sha256: report.generation.manifest_sha256,
+        diskann_build_backend: report.generation.diskann_build_backend,
+        slots: report
+            .generation
+            .slots
+            .into_iter()
+            .map(|slot| StorageSearchRebuildSlot {
+                panel_version: slot.panel_slot.panel_version(),
+                slot_id: u32::from(slot.panel_slot.slot_id().get()),
+                kind: slot.kind,
+                shape: format!("{:?}", slot.shape),
+                len: slot.len,
+                built_at_seq: slot.built_at_seq,
+            })
+            .collect(),
+    };
+    let hits = report
+        .hits
+        .into_iter()
+        .map(|hit| StorageFindHit {
+            cx_id: hit.cx_id,
+            rank: hit.rank as u64,
+            score: hit.score,
+            per_lens: hit
+                .per_lens
+                .into_iter()
+                .map(|lens| StorageFindLensContribution {
+                    slot: u32::from(lens.slot),
+                    rank: lens.rank as u64,
+                    raw_score: lens.raw_score,
+                    weight: lens.weight,
+                    contribution: lens.contribution,
+                })
+                .collect(),
+            agree_slots: hit.agree_slots.into_iter().map(u32::from).collect(),
+            disagree_slots: hit.disagree_slots.into_iter().map(u32::from).collect(),
+            event_time_secs: hit.event_time_secs,
+            temporal_scores: hit.temporal_scores.map(|scores| StorageFindTemporalScores {
+                e2_recency: scores.e2_recency,
+                e3_periodic: scores.e3_periodic,
+                e4_sequence: scores.e4_sequence,
+            }),
+            provenance_seq: hit.provenance_seq,
+            provenance_hash: hit.provenance_hash,
+            freshness_built_at_seq: hit.freshness_built_at_seq,
+            freshness_base_seq: hit.freshness_base_seq,
+            freshness_policy: hit.freshness_policy,
+        })
+        .collect();
+    StorageFindSimilarResponse {
+        source_of_truth: "calyx_vault",
+        panel_version: report.panel_version,
+        fusion: report.fusion,
+        query_kind: report.query_kind,
+        k: report.k as u32,
+        rrf_k: report.rrf_k,
+        consulted_slots: report.consulted_slots.into_iter().map(u32::from).collect(),
+        temporal_applied: report.temporal_applied,
+        guard_note: report.guard_note,
+        maxsim_note: report.maxsim_note,
+        grounding_note: report.grounding_note,
+        generation,
+        hits,
+    }
+}
+
+/// Maps a physical orphan slot-CF retirement report onto the MCP response.
+#[must_use]
+pub fn storage_orphan_slot_gc_response(
+    report: synapse_calyx::AsterOrphanSlotGcReport,
+) -> StorageRetireOrphanSlotCfsResponse {
+    StorageRetireOrphanSlotCfsResponse {
+        source_of_truth: "calyx_vault",
+        base_rows_scanned: report.base_rows_scanned as u64,
+        live_slot_ids: report.live_slot_ids.into_iter().map(u32::from).collect(),
+        present_slot_ids: report.present_slot_ids.into_iter().map(u32::from).collect(),
+        retired: report
+            .retired
+            .into_iter()
+            .map(|retired| StorageRetiredOrphanSlotCf {
+                slot_id: u32::from(retired.slot_id),
+                quantized_rows: retired.quantized_rows as u64,
+                quantized_sst_files: retired.quantized_sst_files as u64,
+                raw_rows: retired.raw_rows as u64,
+                raw_sst_files: retired.raw_sst_files as u64,
+                removed_dirs: retired.removed_dirs,
+            })
+            .collect(),
+        skipped_live: report
+            .skipped_live
+            .into_iter()
+            .map(|skip| StorageSkippedLiveSlotCf {
+                slot_id: u32::from(skip.slot_id),
+                reason: skip.reason,
+            })
+            .collect(),
+    }
 }
 
 #[must_use]

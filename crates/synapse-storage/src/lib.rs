@@ -917,6 +917,24 @@ impl Db {
             .rebuild_calyx_search_indexes(expected_panel_version)
     }
 
+    /// Runs one fused Calyx find-similar pass (per-slot recall, RRF fusion,
+    /// optional bounded temporal boost, agree/disagree evidence) over the
+    /// persisted per-slot indexes for the active panel. Read-only; the heavy
+    /// index work should be admitted off the runtime workers by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the vault is unavailable, the
+    /// persisted search generation is missing/stale (naming the rebuild
+    /// remediation), the example record is absent or on another panel, or the
+    /// requested temporal boost cannot be applied.
+    pub fn find_similar(
+        &self,
+        params: &synapse_calyx::SynapseCalyxFindParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxFindReport> {
+        self.backend.find_similar(params)
+    }
+
     /// Retires orphaned physical `cf/slot_*` column families that no live panel
     /// references (issue #1776), deriving orphan-ness from live Base membership.
     /// Fail-closed with readback, idempotent, and per-CF durable-lock bounded.

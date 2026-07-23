@@ -31,6 +31,15 @@ static SEARCH_REBUILD_PERMITS: LazyLock<Arc<Semaphore>> =
 /// fails closed (`try_acquire`) rather than serializing behind the in-flight
 /// backup.
 static BACKUP_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+/// At most one orphan physical slot-CF retirement may execute at a time. The
+/// pass scans Base to derive the legitimate slot set and holds the exclusive
+/// router lock per CF drop; a second concurrent pass would contend on that lock
+/// and could race two removals. Admission is a single permit and a concurrent
+/// caller fails closed (`try_acquire`) rather than serializing behind the
+/// in-flight pass.
+static ORPHAN_SLOT_GC_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
 pub(super) async fn handle(
     service: &SynapseService,
     params: Parameters<StorageParams>,
@@ -403,6 +412,161 @@ pub(super) async fn handle(
                     response.raw_sidecars.len()
                 ),
                 |out| out.search_rebuild = Some(response),
+            )))
+        }
+        StorageOperation::FindSimilar => {
+            let spec = params
+                .0
+                .find_similar
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "find_similar"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_find_similar(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_search",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=find_similar",
+                )
+            })?;
+            // Fused find opens the persisted per-slot indexes and runs
+            // DiskANN/BM25 recall — CPU/IO-bound work that must not park a runtime
+            // worker serving MCP requests. Offload to the blocking pool.
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::storage::run_find_similar(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_search",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("find-similar blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the find-similar task terminated abnormally",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_search",
+                    STORAGE_SOT,
+                    error,
+                    "rebuild the panel search indexes if the persisted generation is missing/stale, or correct the query_mode/fusion/example before retrying",
+                )
+            })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx find-similar panel={} fusion={} query={} hits={} temporal_applied={}",
+                    response.panel_version,
+                    response.fusion,
+                    response.query_kind,
+                    response.hits.len(),
+                    response.temporal_applied
+                ),
+                |out| out.find_similar = Some(response),
+            )))
+        }
+        StorageOperation::RetireOrphanSlotCfs => {
+            let spec = params
+                .0
+                .retire_orphan_slot_cfs
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "retire_orphan_slot_cfs"))?;
+            let source_id = "orphan_slot_cf_gc";
+            require_maintenance_profile(
+                service,
+                &request_context,
+                STORAGE_TOOL,
+                operation.as_str(),
+                source_id,
+                STORAGE_SOT,
+            )?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_retire_orphan_slot_cfs(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            // Fail closed if a retirement pass is already in flight. A single
+            // admission permit bounds blocking-pool pressure and rejects a
+            // concurrent orphan GC of the same vault instead of serializing.
+            let permit = Arc::clone(&ORPHAN_SLOT_GC_PERMITS)
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    TryAcquireError::NoPermits => facade_conflict_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        source_id,
+                        STORAGE_SOT,
+                        error_codes::STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS,
+                        "an orphan slot-CF retirement is already in progress for this vault"
+                            .to_owned(),
+                        "wait for the in-flight storage operation=retire_orphan_slot_cfs to finish, then retry",
+                    ),
+                    TryAcquireError::Closed => facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        source_id,
+                        STORAGE_SOT,
+                        crate::m1::mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            "orphan slot-CF GC admission semaphore was unexpectedly closed"
+                                .to_owned(),
+                        ),
+                        "restart the daemon; the orphan slot-CF GC admission gate is no longer available",
+                    ),
+                })?;
+            // The pass scans Base and holds the exclusive router lock per CF
+            // drop: strictly blocking, CPU/IO-bound work that must not occupy a
+            // Tokio runtime worker. Offload it and hold the permit for the task's
+            // lifetime so a concurrent caller keeps failing closed until it ends.
+            let report = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                db.retire_orphan_slot_cfs()
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("orphan slot-CF GC blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the orphan slot-CF GC task terminated abnormally",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect the vault slot-CF tree and live Base membership before retrying",
+                )
+            })?;
+            let response = crate::m3::storage::storage_orphan_slot_gc_response(report);
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx orphan slot-CF retirement base_rows_scanned={} present={} retired={} skipped_live={}",
+                    response.base_rows_scanned,
+                    response.present_slot_ids.len(),
+                    response.retired.len(),
+                    response.skipped_live.len()
+                ),
+                |out| out.retire_orphan_slot_cfs = Some(response),
             )))
         }
         StorageOperation::Backup => {
