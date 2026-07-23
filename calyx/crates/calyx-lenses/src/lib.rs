@@ -60,7 +60,18 @@ pub enum AlgorithmicEncoder {
     SynCross { dim: u32 },
     /// Dense deterministic aggregation summary over structured numerics.
     SynAggregation { dim: u32 },
+    /// Frozen dense graph-structural position signature (degree/betweenness/
+    /// eigenvector/PageRank/clustering) over a fingerprinted graph snapshot.
+    /// The `snapshot` fingerprint pins the lens id so a new snapshot yields a
+    /// new frozen lens version rather than silent drift.
+    SynGraphSignature { snapshot: u64 },
+    /// Frozen dense path/hierarchy position signature (depth/sibling-rank/
+    /// subtree/ancestor/path-length) over a fingerprinted hierarchy snapshot.
+    SynPathSignature { snapshot: u64 },
 }
+
+/// Fixed output dimension of the graph-structural and path-hierarchy signatures.
+const SIGNATURE_DIM: u32 = 8;
 
 impl AlgorithmicEncoder {
     /// Returns the primary output dimension.
@@ -90,6 +101,7 @@ impl AlgorithmicEncoder {
                 }
             }
             Self::SynTokenSlots { token_dim } => token_dim,
+            Self::SynGraphSignature { .. } | Self::SynPathSignature { .. } => SIGNATURE_DIM,
         }
     }
 
@@ -261,6 +273,22 @@ impl AlgorithmicLens {
         Self::new(name, modality, AlgorithmicEncoder::SynAggregation { dim })
     }
 
+    pub fn syn_graph_signature(name: impl Into<String>, modality: Modality, snapshot: u64) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynGraphSignature { snapshot },
+        )
+    }
+
+    pub fn syn_path_signature(name: impl Into<String>, modality: Modality, snapshot: u64) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynPathSignature { snapshot },
+        )
+    }
+
     /// Creates a Syn* algorithmic lens from an encoder.
     pub fn new(name: impl Into<String>, modality: Modality, encoder: AlgorithmicEncoder) -> Self {
         let name = name.into();
@@ -311,6 +339,12 @@ impl AlgorithmicLens {
             AlgorithmicEncoder::SynRate { scale_micros } => syn::rate(&input.bytes, scale_micros)?,
             AlgorithmicEncoder::SynCross { dim } => syn::cross(&input.bytes, dim)?,
             AlgorithmicEncoder::SynAggregation { dim } => syn::aggregation(&input.bytes, dim)?,
+            AlgorithmicEncoder::SynGraphSignature { snapshot } => {
+                syn::graph_signature(&input.bytes, snapshot)?
+            }
+            AlgorithmicEncoder::SynPathSignature { snapshot } => {
+                syn::path_signature(&input.bytes, snapshot)?
+            }
         })
     }
 }

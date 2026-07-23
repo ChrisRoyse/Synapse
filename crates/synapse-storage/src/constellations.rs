@@ -49,6 +49,17 @@ pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
 pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_691_001;
 pub const SYN_RECURRENCE_SUBJECT_PANEL_NAME: &str = "syn-recurrence-subject-v1";
 pub const SYN_RECURRENCE_SUBJECT_PANEL_VERSION: u32 = 1_667_001;
+// Graph-structural / hierarchy encoder panels (#1685). These are derived panels
+// built off-line from a fingerprinted graph/hierarchy snapshot, not per source
+// row. The version constant is the family's first (snapshot-0) generation; a new
+// snapshot allocates a fresh vault-global generation via the #1668 lifecycle
+// allocator, so `panel_version` is a builder parameter here.
+pub const SYN_GRAPHPOS_APP_PANEL_NAME: &str = "syn-graphpos-app-v1";
+pub const SYN_GRAPHPOS_APP_PANEL_VERSION: u32 = 1_685_001;
+pub const SYN_GRAPHPOS_PROCESS_PANEL_NAME: &str = "syn-graphpos-process-v1";
+pub const SYN_GRAPHPOS_PROCESS_PANEL_VERSION: u32 = 1_685_002;
+pub const SYN_PATH_HIERARCHY_PANEL_NAME: &str = "syn-path-hierarchy-v1";
+pub const SYN_PATH_HIERARCHY_PANEL_VERSION: u32 = 1_685_003;
 pub const SYN_MCP_USAGE_KEY_PREFIX: &[u8] = b"mcp-usage/v1/";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_SAMPLE_EVERY_N";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
@@ -185,6 +196,21 @@ const MU_SLOT_RECORD_VECTOR: SlotId = SlotId::new(12);
 
 const RS_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
 const RS_SLOT_SUBJECT_HASH: SlotId = SlotId::new(2);
+
+// Graph-position panels (app / process). Slot 1 is the frozen dense structural
+// signature; slot 2 is the hashed neighbour-label histogram.
+const GP_SLOT_SIGNATURE: SlotId = SlotId::new(1);
+const GP_SLOT_NEIGHBORS: SlotId = SlotId::new(2);
+
+// Path-hierarchy panel. Slot 1 is the frozen dense path signature; slot 2 is the
+// ancestor-set multi-hot; slot 3 is the leaf path hash.
+const PH_SLOT_SIGNATURE: SlotId = SlotId::new(1);
+const PH_SLOT_ANCESTORS: SlotId = SlotId::new(2);
+const PH_SLOT_PATH_HASH: SlotId = SlotId::new(3);
+
+const GP_NEIGHBOR_HISTOGRAM_DIM: u32 = 2048;
+const PH_ANCESTOR_DIM: u32 = 2048;
+const PH_PATH_HASH_DIM: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecurrenceSubjectKind {
@@ -528,6 +554,372 @@ pub fn build_recurrence_subject_constellation(
         BTreeMap::new(),
         metadata,
     )
+}
+
+/// Which graph-position panel a node signature belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphPositionKind {
+    /// App-transition graph (timeline focus changes).
+    App,
+    /// Process parent/child + spawn tree.
+    Process,
+}
+
+impl GraphPositionKind {
+    #[must_use]
+    pub const fn panel_name(self) -> &'static str {
+        match self {
+            Self::App => SYN_GRAPHPOS_APP_PANEL_NAME,
+            Self::Process => SYN_GRAPHPOS_PROCESS_PANEL_NAME,
+        }
+    }
+
+    #[must_use]
+    pub const fn base_panel_version(self) -> u32 {
+        match self {
+            Self::App => SYN_GRAPHPOS_APP_PANEL_VERSION,
+            Self::Process => SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
+        }
+    }
+
+    const fn identity_tag(self) -> &'static [u8] {
+        match self {
+            Self::App => b"synapse-graphpos-app-v1",
+            Self::Process => b"synapse-graphpos-process-v1",
+        }
+    }
+}
+
+/// One node's structural position in a fingerprinted graph snapshot.
+///
+/// Computed by the `calyx-mincut` substrate (`structural_signatures`). Degrees
+/// are raw counts; the four centralities are normalized to `[0, 1]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphPositionSignature {
+    pub in_degree: u64,
+    pub out_degree: u64,
+    pub total_degree: u64,
+    pub betweenness: f64,
+    pub eigenvector: f64,
+    pub pagerank: f64,
+    pub clustering: f64,
+    /// Labels of the node's graph neighbours, for the neighbour-label histogram.
+    pub neighbor_labels: Vec<String>,
+}
+
+/// One record's position in a fingerprinted document/URL/process/spawn hierarchy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathPositionSignature {
+    pub depth: u64,
+    pub sibling_rank: u64,
+    pub sibling_count: u64,
+    pub subtree_size: u64,
+    pub ancestor_count: u64,
+    pub path_len: u64,
+    pub is_root: bool,
+    pub is_leaf: bool,
+    /// Ordered ancestor path components, for the ancestor-set multi-hot.
+    pub ancestor_components: Vec<String>,
+    /// Stable leaf path key, for the path hash slot.
+    pub path_hash_key: String,
+}
+
+#[derive(Serialize)]
+struct GraphSignatureLensInput {
+    in_degree: u64,
+    out_degree: u64,
+    total_degree: u64,
+    betweenness: f64,
+    eigenvector: f64,
+    pagerank: f64,
+    clustering: f64,
+}
+
+#[derive(Serialize)]
+struct PathSignatureLensInput {
+    depth: u64,
+    sibling_rank: u64,
+    sibling_count: u64,
+    subtree_size: u64,
+    ancestor_count: u64,
+    path_len: u64,
+    is_root: bool,
+    is_leaf: bool,
+}
+
+/// Deterministic 64-bit fingerprint of a graph/hierarchy snapshot.
+///
+/// Derived from the aggregated `(src, dst, count)` transitions. A different
+/// snapshot yields a different fingerprint, which pins both the frozen lens id
+/// and the derived panel generation so structural values can never silently
+/// drift.
+#[must_use]
+pub fn graph_snapshot_fingerprint(transitions: &[(String, String, u64)]) -> u64 {
+    let mut sorted: Vec<&(String, String, u64)> = transitions.iter().collect();
+    sorted.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-graph-snapshot-v1");
+    for (src, dst, count) in sorted {
+        hasher.update((src.len() as u64).to_be_bytes());
+        hasher.update(src.as_bytes());
+        hasher.update((dst.len() as u64).to_be_bytes());
+        hasher.update(dst.as_bytes());
+        hasher.update(count.to_be_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(prefix)
+}
+
+/// Stable identity bytes for a graph-position node in one snapshot.
+///
+/// The snapshot is part of the identity so re-measuring a node under a new
+/// snapshot lands in a new Base generation rather than mutating the old
+/// constellation.
+#[must_use]
+pub fn graph_position_identity_bytes(
+    kind: GraphPositionKind,
+    snapshot: u64,
+    node_id: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(kind.identity_tag().len() + node_id.len() + 24);
+    append_framed(&mut out, kind.identity_tag());
+    append_framed(&mut out, &snapshot.to_be_bytes());
+    append_framed(&mut out, node_id.as_bytes());
+    out
+}
+
+/// Stable identity bytes for a path-hierarchy record in one snapshot.
+#[must_use]
+pub fn path_position_identity_bytes(snapshot: u64, node_key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b"synapse-path-hierarchy-v1".len() + node_key.len() + 24);
+    append_framed(&mut out, b"synapse-path-hierarchy-v1");
+    append_framed(&mut out, &snapshot.to_be_bytes());
+    append_framed(&mut out, node_key.as_bytes());
+    out
+}
+
+/// Builds the derived graph-position constellation for one node in a snapshot.
+///
+/// `panel_version` is the vault-global generation allocated for this snapshot by
+/// the #1668 lifecycle allocator (`kind.base_panel_version()` for the first
+/// generation). The frozen [`AlgorithmicLens::syn_graph_signature`] is pinned to
+/// `snapshot`, so a new snapshot produces a new lens id — never silent drift.
+///
+/// # Errors
+///
+/// Returns a measurement error when the node id is empty, a centrality is not
+/// finite, or a Syn* lens rejects its input.
+pub fn build_graph_position_constellation(
+    context: NativeConstellationContext,
+    kind: GraphPositionKind,
+    panel_version: u32,
+    snapshot: u64,
+    node_id: &str,
+    signature: &GraphPositionSignature,
+) -> StorageResult<Constellation> {
+    let node_id = non_empty(node_id)
+        .ok_or_else(|| measurement_error("empty graph-position node id", kind.panel_name()))?;
+    let panel_name = kind.panel_name();
+    let lens_input = GraphSignatureLensInput {
+        in_degree: signature.in_degree,
+        out_degree: signature.out_degree,
+        total_degree: signature.total_degree,
+        betweenness: clamp_unit(signature.betweenness, "betweenness")?,
+        eigenvector: clamp_unit(signature.eigenvector, "eigenvector")?,
+        pagerank: clamp_unit(signature.pagerank, "pagerank")?,
+        clustering: clamp_unit(signature.clustering, "clustering")?,
+    };
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        GP_SLOT_SIGNATURE,
+        measure_json(
+            panel_name,
+            AlgorithmicLens::syn_graph_signature(
+                "syn.graphpos.signature.v1",
+                Modality::Structured,
+                snapshot,
+            ),
+            &lens_input,
+        )?,
+    );
+    slots.insert(
+        GP_SLOT_NEIGHBORS,
+        optional_json_slice_slot(
+            panel_name,
+            AlgorithmicLens::syn_multi_hot(
+                "syn.graphpos.neighbor_histogram.v1",
+                Modality::Structured,
+                GP_NEIGHBOR_HISTOGRAM_DIM,
+            ),
+            &signature.neighbor_labels,
+        )?,
+    );
+
+    let identity = graph_position_identity_bytes(kind, snapshot, node_id);
+    let identity_hash = sha256_hex(&identity);
+    let mut metadata = common_metadata(
+        panel_name,
+        "CALYX_GRAPHPOS",
+        identity_hash.as_bytes(),
+        &identity,
+    );
+    metadata.insert("graph_snapshot".to_owned(), snapshot.to_string());
+    metadata.insert("graph_node_id".to_owned(), truncate_metadata(node_id));
+    insert_graph_position_readback(&mut metadata, signature);
+    constellation(
+        context,
+        panel_version,
+        format!("synapse://graphpos/{panel_name}/{snapshot:016x}/{identity_hash}"),
+        &identity,
+        slots,
+        BTreeMap::new(),
+        metadata,
+    )
+}
+
+/// Builds the derived path-hierarchy constellation for one record in a snapshot.
+///
+/// # Errors
+///
+/// Returns a measurement error when the node key is empty, a field is invalid,
+/// or a Syn* lens rejects its input.
+pub fn build_path_hierarchy_constellation(
+    context: NativeConstellationContext,
+    panel_version: u32,
+    snapshot: u64,
+    node_key: &str,
+    signature: &PathPositionSignature,
+) -> StorageResult<Constellation> {
+    let node_key = non_empty(node_key).ok_or_else(|| {
+        measurement_error(
+            "empty path-hierarchy node key",
+            SYN_PATH_HIERARCHY_PANEL_NAME,
+        )
+    })?;
+    let panel_name = SYN_PATH_HIERARCHY_PANEL_NAME;
+    let lens_input = PathSignatureLensInput {
+        depth: signature.depth,
+        sibling_rank: signature.sibling_rank,
+        sibling_count: signature.sibling_count,
+        subtree_size: signature.subtree_size,
+        ancestor_count: signature.ancestor_count,
+        path_len: signature.path_len,
+        is_root: signature.is_root,
+        is_leaf: signature.is_leaf,
+    };
+    let mut slots = BTreeMap::new();
+    slots.insert(
+        PH_SLOT_SIGNATURE,
+        measure_json(
+            panel_name,
+            AlgorithmicLens::syn_path_signature(
+                "syn.path_hierarchy.signature.v1",
+                Modality::Structured,
+                snapshot,
+            ),
+            &lens_input,
+        )?,
+    );
+    slots.insert(
+        PH_SLOT_ANCESTORS,
+        optional_json_slice_slot(
+            panel_name,
+            AlgorithmicLens::syn_multi_hot(
+                "syn.path_hierarchy.ancestor_set.v1",
+                Modality::Structured,
+                PH_ANCESTOR_DIM,
+            ),
+            &signature.ancestor_components,
+        )?,
+    );
+    slots.insert(
+        PH_SLOT_PATH_HASH,
+        optional_hash_slot(
+            panel_name,
+            "syn.path_hierarchy.path_hash.v1",
+            non_empty(&signature.path_hash_key),
+            PH_PATH_HASH_DIM,
+        )?,
+    );
+
+    let identity = path_position_identity_bytes(snapshot, node_key);
+    let identity_hash = sha256_hex(&identity);
+    let mut metadata = common_metadata(
+        panel_name,
+        "CALYX_PATH_HIERARCHY",
+        identity_hash.as_bytes(),
+        &identity,
+    );
+    metadata.insert("graph_snapshot".to_owned(), snapshot.to_string());
+    metadata.insert("path_node_key".to_owned(), truncate_metadata(node_key));
+    metadata.insert("path_depth".to_owned(), signature.depth.to_string());
+    metadata.insert(
+        "path_sibling_rank".to_owned(),
+        signature.sibling_rank.to_string(),
+    );
+    metadata.insert(
+        "path_subtree_size".to_owned(),
+        signature.subtree_size.to_string(),
+    );
+    constellation(
+        context,
+        panel_version,
+        format!("synapse://path-hierarchy/{snapshot:016x}/{identity_hash}"),
+        &identity,
+        slots,
+        BTreeMap::new(),
+        metadata,
+    )
+}
+
+fn insert_graph_position_readback(
+    metadata: &mut BTreeMap<String, String>,
+    signature: &GraphPositionSignature,
+) {
+    metadata.insert(
+        "graph_in_degree".to_owned(),
+        signature.in_degree.to_string(),
+    );
+    metadata.insert(
+        "graph_out_degree".to_owned(),
+        signature.out_degree.to_string(),
+    );
+    metadata.insert(
+        "graph_total_degree".to_owned(),
+        signature.total_degree.to_string(),
+    );
+    metadata.insert(
+        "graph_betweenness".to_owned(),
+        signature.betweenness.to_string(),
+    );
+    metadata.insert(
+        "graph_eigenvector".to_owned(),
+        signature.eigenvector.to_string(),
+    );
+    metadata.insert("graph_pagerank".to_owned(), signature.pagerank.to_string());
+    metadata.insert(
+        "graph_clustering".to_owned(),
+        signature.clustering.to_string(),
+    );
+}
+
+/// Clamps a centrality into `[0, 1]`, tolerating floating-point overshoot from
+/// the substrate while rejecting non-finite values fail-closed.
+fn clamp_unit(value: f64, field: &str) -> StorageResult<f64> {
+    if !value.is_finite() {
+        return Err(measurement_error(
+            "non-finite graph centrality",
+            format!("{field}={value}"),
+        ));
+    }
+    Ok(value.clamp(0.0, 1.0))
 }
 
 /// Build the Calyx constellation for a timeline record.
