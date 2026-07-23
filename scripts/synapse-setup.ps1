@@ -5194,6 +5194,184 @@ function Install-SynapsePinnedOrtGpuRuntime {
     return [pscustomobject]@{ Version = $version; NativeDir = $nativeDir; PackagePath = $packagePath; PackageSha256 = $packageReadback }
 }
 
+function Install-SynapsePinnedDetectionModels {
+    param([Parameter(Mandatory=$true)][string]$Root)
+
+    $models = @(
+        [pscustomobject]@{
+            Name = 'gpu'
+            FileName = 'rtdetr_v2_s_coco.onnx'
+            Url = 'https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model.onnx'
+            Sha256 = '583A236AC21C95A7FD94F284FC21485E42355BFEF82C27011BA78FBC09EE87E2'
+            Length = [int64]81057510
+        },
+        [pscustomobject]@{
+            Name = 'cpu'
+            FileName = 'rtdetr_v2_s_coco_int8_cpu.onnx'
+            Url = 'https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model_int8.onnx'
+            Sha256 = 'FED736D2593CF2AB099F665EEEB6D315D909783EEA830F80A807FC1AC1C1B2EC'
+            Length = [int64]20991219
+        },
+        [pscustomobject]@{
+            Name = 'whisper'
+            FileName = 'whisper-tiny-int8.onnx'
+            SourcePath = Join-Path $env:LOCALAPPDATA 'synapse\models\whisper-tiny-int8.onnx'
+            Sha256 = '147AFAC751F89AD8E8F82133464EDC81ECFF9391E98CCDCAE2474384BE68EC86'
+            Length = [int64]77356651
+        }
+    )
+    New-Item -ItemType Directory -Force -Path $Root | Out-Null
+    foreach ($model in $models) {
+        $path = Join-Path $Root $model.FileName
+        $valid = (Test-Path -LiteralPath $path -PathType Leaf) -and
+            ((Get-Item -LiteralPath $path).Length -eq $model.Length) -and
+            ((Get-SynapseFileSha256 -Path $path) -eq $model.Sha256)
+        if (-not $valid) {
+            $download = "$path.download-$PID"
+            if ($model.Url) {
+                Invoke-WebRequest -Uri $model.Url -OutFile $download
+            } elseif ($model.SourcePath -and (Test-Path -LiteralPath $model.SourcePath -PathType Leaf)) {
+                Copy-Item -LiteralPath $model.SourcePath -Destination $download
+            } else {
+                Die "SYNAPSE_EMBEDDED_MODEL_SOURCE_MISSING model=$($model.Name) source=$($model.SourcePath) remediation=the build host must retain the pinned verified source artifact until it has been packaged into the executable"
+            }
+            $actualLength = (Get-Item -LiteralPath $download).Length
+            $actualHash = Get-SynapseFileSha256 -Path $download
+            if ($actualLength -ne $model.Length -or $actualHash -ne $model.Sha256) {
+                Die "SYNAPSE_EMBEDDED_MODEL_DOWNLOAD_INVALID model=$($model.Name) path=$download expected_length=$($model.Length) actual_length=$actualLength expected_sha256=$($model.Sha256) actual_sha256=$actualHash remediation=refuse unverified model bytes; inspect the pinned upstream artifact"
+            }
+            Move-Item -LiteralPath $download -Destination $path -Force
+        }
+        $model | Add-Member -NotePropertyName Path -NotePropertyValue $path -Force
+        Info "Pinned embedded runtime model verified model=$($model.Name) path=$path length=$($model.Length) sha256=$($model.Sha256)"
+    }
+    return @($models)
+}
+
+function Get-SynapseExecutableModelBundle {
+    param([Parameter(Mandatory=$true)][string]$ExecutablePath)
+
+    $magic = [System.Text.Encoding]::ASCII.GetBytes('SYNMODEL_BUNDLE1')
+    $stream = [System.IO.File]::Open($ExecutablePath, 'Open', 'Read', 'ReadWrite')
+    try {
+        if ($stream.Length -lt 40) {
+            return $null
+        }
+        $stream.Position = $stream.Length - 40
+        $trailer = New-Object byte[] 40
+        if ($stream.Read($trailer, 0, 40) -ne 40) {
+            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_READ_FAILED path=$ExecutablePath remediation=inspect filesystem integrity; the executable trailer could not be read"
+        }
+        for ($index = 0; $index -lt 16; $index++) {
+            if ($trailer[24 + $index] -ne $magic[$index]) {
+                return $null
+            }
+        }
+        $gpuLength = [BitConverter]::ToInt64($trailer, 0)
+        $cpuLength = [BitConverter]::ToInt64($trailer, 8)
+        $whisperLength = [BitConverter]::ToInt64($trailer, 16)
+        if ($gpuLength -le 0 -or $cpuLength -le 0 -or $whisperLength -le 0 -or $gpuLength -gt ($stream.Length - 40) -or $cpuLength -gt ($stream.Length - 40 - $gpuLength) -or $whisperLength -gt ($stream.Length - 40 - $gpuLength - $cpuLength)) {
+            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_INVALID path=$ExecutablePath executable_length=$($stream.Length) gpu_length=$gpuLength cpu_length=$cpuLength whisper_length=$whisperLength remediation=the executable advertises impossible model payload lengths; rebuild and repackage it"
+        }
+        return [pscustomobject]@{
+            BaseLength = [int64]($stream.Length - 40 - $gpuLength - $cpuLength - $whisperLength)
+            GpuLength = [int64]$gpuLength
+            CpuLength = [int64]$cpuLength
+            WhisperLength = [int64]$whisperLength
+            TotalLength = [int64]$stream.Length
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Get-SynapseExecutableRangeSha256 {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExecutablePath,
+        [Parameter(Mandatory=$true)][int64]$Offset,
+        [Parameter(Mandatory=$true)][int64]$Length
+    )
+
+    $stream = [System.IO.File]::Open($ExecutablePath, 'Open', 'Read', 'ReadWrite')
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream.Position = $Offset
+        $remaining = $Length
+        $buffer = New-Object byte[] (1024 * 1024)
+        while ($remaining -gt 0) {
+            $wanted = [int][Math]::Min($buffer.Length, $remaining)
+            $read = $stream.Read($buffer, 0, $wanted)
+            if ($read -le 0) {
+                Die "SYNAPSE_EMBEDDED_MODEL_PAYLOAD_TRUNCATED path=$ExecutablePath offset=$Offset length=$Length remaining=$remaining remediation=rebuild and repackage the executable"
+            }
+            [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+            $remaining -= $read
+        }
+        [void]$sha.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        return ($sha.Hash | ForEach-Object { $_.ToString('X2') }) -join ''
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Assert-SynapseExecutableModelBundle {
+    param([Parameter(Mandatory=$true)][string]$ExecutablePath)
+
+    $bundle = Get-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath
+    if (-not $bundle) {
+        Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_MISSING path=$ExecutablePath remediation=build through synapse-setup.ps1 so the pinned GPU and CPU models are packaged into the executable"
+    }
+    $expectedGpuLength = [int64]81057510
+    $expectedCpuLength = [int64]20991219
+    $expectedWhisperLength = [int64]77356651
+    $expectedGpuHash = '583A236AC21C95A7FD94F284FC21485E42355BFEF82C27011BA78FBC09EE87E2'
+    $expectedCpuHash = 'FED736D2593CF2AB099F665EEEB6D315D909783EEA830F80A807FC1AC1C1B2EC'
+    $expectedWhisperHash = '147AFAC751F89AD8E8F82133464EDC81ECFF9391E98CCDCAE2474384BE68EC86'
+    $gpuHash = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset $bundle.BaseLength -Length $bundle.GpuLength
+    $cpuHash = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset ($bundle.BaseLength + $bundle.GpuLength) -Length $bundle.CpuLength
+    $whisperHash = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset ($bundle.BaseLength + $bundle.GpuLength + $bundle.CpuLength) -Length $bundle.WhisperLength
+    if ($bundle.GpuLength -ne $expectedGpuLength -or $bundle.CpuLength -ne $expectedCpuLength -or $bundle.WhisperLength -ne $expectedWhisperLength -or $gpuHash -ne $expectedGpuHash -or $cpuHash -ne $expectedCpuHash -or $whisperHash -ne $expectedWhisperHash) {
+        Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_INVALID path=$ExecutablePath gpu_length=$($bundle.GpuLength) cpu_length=$($bundle.CpuLength) whisper_length=$($bundle.WhisperLength) gpu_sha256=$gpuHash cpu_sha256=$cpuHash whisper_sha256=$whisperHash remediation=the executable does not contain the exact pinned models; rebuild and repackage it"
+    }
+    Info "Executable model bundle verified path=$ExecutablePath base_length=$($bundle.BaseLength) total_length=$($bundle.TotalLength) gpu_sha256=$gpuHash cpu_sha256=$cpuHash whisper_sha256=$whisperHash"
+    return $bundle
+}
+
+function Add-SynapseExecutableModelBundle {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExecutablePath,
+        [Parameter(Mandatory=$true)]$GpuModel,
+        [Parameter(Mandatory=$true)]$CpuModel,
+        [Parameter(Mandatory=$true)]$WhisperModel
+    )
+
+    $existing = Get-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath
+    if ($existing) {
+        $stream = [System.IO.File]::Open($ExecutablePath, 'Open', 'Write', 'None')
+        try { $stream.SetLength($existing.BaseLength) } finally { $stream.Dispose() }
+    }
+    $output = [System.IO.File]::Open($ExecutablePath, 'Append', 'Write', 'None')
+    try {
+        foreach ($model in @($GpuModel, $CpuModel, $WhisperModel)) {
+            $input = [System.IO.File]::OpenRead($model.Path)
+            try { $input.CopyTo($output) } finally { $input.Dispose() }
+        }
+        $gpuLengthBytes = [BitConverter]::GetBytes([int64]$GpuModel.Length)
+        $cpuLengthBytes = [BitConverter]::GetBytes([int64]$CpuModel.Length)
+        $whisperLengthBytes = [BitConverter]::GetBytes([int64]$WhisperModel.Length)
+        $magic = [System.Text.Encoding]::ASCII.GetBytes('SYNMODEL_BUNDLE1')
+        $output.Write($gpuLengthBytes, 0, $gpuLengthBytes.Length)
+        $output.Write($cpuLengthBytes, 0, $cpuLengthBytes.Length)
+        $output.Write($whisperLengthBytes, 0, $whisperLengthBytes.Length)
+        $output.Write($magic, 0, $magic.Length)
+        $output.Flush($true)
+    } finally {
+        $output.Dispose()
+    }
+    return Assert-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath
+}
+
 function New-SynapseStagedDaemonBinary {
     param(
         [Parameter(Mandatory=$true)][string]$BuiltPath,
@@ -8131,6 +8309,15 @@ if (-not $SkipBuild) {
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
+    $embeddedModelRoot = Join-Path $env:LOCALAPPDATA 'synapse\build-models'
+    $embeddedModels = @(Install-SynapsePinnedDetectionModels -Root $embeddedModelRoot)
+    $embeddedGpuModel = @($embeddedModels | Where-Object { $_.Name -eq 'gpu' })[0]
+    $embeddedCpuModel = @($embeddedModels | Where-Object { $_.Name -eq 'cpu' })[0]
+    $embeddedWhisperModel = @($embeddedModels | Where-Object { $_.Name -eq 'whisper' })[0]
+    if (-not $embeddedGpuModel -or -not $embeddedCpuModel -or -not $embeddedWhisperModel) {
+        Die "SYNAPSE_EMBEDDED_MODEL_SELECTION_FAILED root=$embeddedModelRoot remediation=the pinned model acquisition did not return GPU detection, CPU detection, and CPU Whisper artifacts"
+    }
+    [void](Add-SynapseExecutableModelBundle -ExecutablePath $built -GpuModel $embeddedGpuModel -CpuModel $embeddedCpuModel -WhisperModel $embeddedWhisperModel)
 }
 
 # ---------------------------------------------------------------------------
@@ -8190,6 +8377,7 @@ if ($SkipBuild) {
     if (-not (Test-Path -LiteralPath $ExePath)) {
         Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$ExePath remediation=-SkipBuild requires a real local synapse-mcp.exe at -ExePath before setup can touch the live daemon"
     }
+    [void](Assert-SynapseExecutableModelBundle -ExecutablePath $ExePath)
     $installSourceHash = Get-SynapseFileSha256 -Path $ExePath
     Info "SkipBuild candidate binary path=$ExePath sha256=$installSourceHash"
 } else {

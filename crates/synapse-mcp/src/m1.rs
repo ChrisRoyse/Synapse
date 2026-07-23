@@ -1,5 +1,8 @@
 mod detection;
-pub(crate) use detection::{run_detection_worker_from_cli, run_detection_worker_from_process_args};
+pub(crate) use detection::{
+    detection_health_readback, run_detection_worker_from_cli,
+    run_detection_worker_from_process_args,
+};
 mod ocr;
 mod search;
 mod sources;

@@ -942,13 +942,23 @@ impl SynapseService {
 
     fn perception_health(&self) -> SubsystemHealth {
         match self.m1_state.try_lock() {
-            Ok(state) => SubsystemHealth {
-                status: "ok".to_owned(),
-                detail: Some("perception runtime initialized".to_owned()),
-                perception_mode: Some(state.perception_mode),
-                capture_config: Some(state.active_capture_config.clone()),
-                capture_runtime: Some(state.capture_runtime_readback()),
-                ..SubsystemHealth::default()
+            Ok(state) => match crate::m1::detection_health_readback() {
+                Ok(detection) => SubsystemHealth {
+                    status: "ok".to_owned(),
+                    detail: Some(format!("perception runtime initialized; {detection}")),
+                    perception_mode: Some(state.perception_mode),
+                    capture_config: Some(state.active_capture_config.clone()),
+                    capture_runtime: Some(state.capture_runtime_readback()),
+                    ..SubsystemHealth::default()
+                },
+                Err((code, detail)) => SubsystemHealth {
+                    status: "error".to_owned(),
+                    detail: Some(format!("{code}: {detail}")),
+                    perception_mode: Some(state.perception_mode),
+                    capture_config: Some(state.active_capture_config.clone()),
+                    capture_runtime: Some(state.capture_runtime_readback()),
+                    ..SubsystemHealth::default()
+                },
             },
             Err(error) => state_lock_unavailable_health("M1", error),
         }

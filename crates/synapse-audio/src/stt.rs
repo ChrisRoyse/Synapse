@@ -10,7 +10,8 @@ use ort::session::Session;
 use ort::value::{PrimitiveTensorElementType, Tensor};
 use serde::{Deserialize, Serialize};
 use synapse_models::{
-    LoadedModel, ModelBackend, ModelDescriptor, ModelLoader, SessionHandle, default_model_dir,
+    LoadedModel, ModelBackend, ModelDescriptor, ModelLoader, SessionHandle, WHISPER_TINY_INT8_ONNX,
+    default_model_dir,
 };
 
 mod window;
@@ -193,10 +194,21 @@ impl WhisperTinyStt {
                 detail: "STT model cache lock was poisoned".to_owned(),
             })?;
         if loaded.is_none() {
-            if !self.descriptor.path.exists() {
+            if self.descriptor.path == default_model_path() {
+                let materialized = WHISPER_TINY_INT8_ONNX
+                    .materialize_embedded()
+                    .map_err(AudioError::from)?;
+                if materialized.path != self.descriptor.path {
+                    return Err(AudioError::ModelLoadFailed {
+                        path: materialized.path,
+                        detail: "embedded Whisper model materialized at an unexpected path"
+                            .to_owned(),
+                    });
+                }
+            } else if !self.descriptor.path.exists() {
                 return Err(AudioError::SttModelNotLoaded {
                     detail: format!(
-                        "side-load {} before calling audio STT",
+                        "STT model does not exist at {}",
                         self.descriptor.path.display()
                     ),
                 });

@@ -234,8 +234,9 @@ impl SynapseCalyxMathRuntime {
 ///
 /// Returns a structured error when config is invalid or the selected runtime
 /// cannot initialize, reserve its physical GPU capacity, or pass the startup
-/// probe. `auto` is strict when CUDA is compiled: it selects CUDA and never
-/// degrades to CPU. CPU execution requires the explicit `cpu` selection.
+/// probe. `auto` prefers CUDA and selects CPU only when the failure proves
+/// that no supported CUDA device/runtime exists. A present-but-broken GPU,
+/// admission failure, or CUDA execution failure remains a hard error.
 pub fn math_backend(
     config: &SynapseCalyxTuningConfig,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
@@ -246,10 +247,39 @@ pub fn math_backend(
         SynapseCalyxMathBackend::Cpu => {
             runtime_from_backend(config, cpu_reference, cpu_readback, None, None)
         }
-        SynapseCalyxMathBackend::Auto | SynapseCalyxMathBackend::Cuda => {
-            cuda_runtime_candidate(config, cpu_readback)
+        SynapseCalyxMathBackend::Cuda => cuda_runtime_candidate(config, cpu_readback),
+        SynapseCalyxMathBackend::Auto => {
+            match cuda_runtime_candidate(config, cpu_readback.clone()) {
+                Ok(runtime) => Ok(runtime),
+                Err(error) if error_proves_cuda_absent(&error) => {
+                    let mut runtime =
+                        runtime_from_backend(config, cpu_reference, cpu_readback, None, None)?;
+                    runtime.status.fallback_code =
+                        Some("SYNAPSE_CALYX_MATH_AUTO_CPU_NO_CUDA_DEVICE".to_owned());
+                    runtime.status.fallback_source_code = Some(error.code.to_owned());
+                    runtime.status.fallback_error = Some(error.to_string());
+                    tracing::warn!(
+                        code = "SYNAPSE_CALYX_MATH_AUTO_CPU_NO_CUDA_DEVICE",
+                        source_code = error.code,
+                        source_error = %error,
+                        cpu_simd_path = runtime.status.cpu_simd_path,
+                        "auto selected the explicit CPU runtime because no supported CUDA device exists"
+                    );
+                    Ok(runtime)
+                }
+                Err(error) => Err(error),
+            }
         }
     }
+}
+
+fn error_proves_cuda_absent(error: &SynapseCalyxError) -> bool {
+    let detail = error.message.to_ascii_lowercase();
+    detail.contains("cuda_error_no_device")
+        || detail.contains("no cuda-capable device is detected")
+        || detail.contains("nvml init failed loading nvml.dll")
+        || (detail.contains("nvml device_by_index(0) failed")
+            && (detail.contains("not found") || detail.contains("no device")))
 }
 
 #[derive(Clone, Debug)]
