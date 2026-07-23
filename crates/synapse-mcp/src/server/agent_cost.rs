@@ -120,6 +120,7 @@ pub enum CostOperation {
     PriceList,
     PricePut,
     PriceDelete,
+    RollupBackfill,
 }
 
 impl CostOperation {
@@ -129,6 +130,7 @@ impl CostOperation {
             Self::PriceList => "price_list",
             Self::PricePut => "price_put",
             Self::PriceDelete => "price_delete",
+            Self::RollupBackfill => "rollup_backfill",
         }
     }
 
@@ -138,6 +140,7 @@ impl CostOperation {
             "price_list" => Ok(Self::PriceList),
             "price_put" => Ok(Self::PricePut),
             "price_delete" => Ok(Self::PriceDelete),
+            "rollup_backfill" => Ok(Self::RollupBackfill),
             other => Err(cost_invalid_operation(other)),
         }
     }
@@ -156,12 +159,14 @@ pub struct CostParams {
     pub price_put: Option<AgentCostPricePutParams>,
     #[serde(default)]
     pub price_delete: Option<AgentCostPriceDeleteParams>,
+    #[serde(default)]
+    pub rollup_backfill: Option<AgentCostRollupBackfillParams>,
 }
 
 fn cost_operation_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
-        "enum": ["summarize", "price_list", "price_put", "price_delete"]
+        "enum": ["summarize", "price_list", "price_put", "price_delete", "rollup_backfill"]
     })
 }
 
@@ -179,6 +184,8 @@ pub struct CostResponse {
     pub price_put: Option<AgentCostPricePutResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_delete: Option<AgentCostPriceDeleteResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup_backfill: Option<AgentCostRollupBackfillResponse>,
 }
 
 // ----------------------------------------------------------------------------
@@ -531,6 +538,26 @@ pub struct AgentCostResponse {
     /// `CF_AGENT_EVENTS` rows scanned to build the spawn→template join. `0` when
     /// `group_by` did not request a template rollup.
     pub scanned_event_rows: u64,
+    /// TimeSeries rollup window rows read for a bounded fleet answer (#1688).
+    /// Present only when the answer was served from materialized rollups; it is
+    /// the number of hour-window rollup cells read, independent of corpus size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup_windows_read: Option<u64>,
+    /// Rollup tier the fleet answer read (`hour`). Present only for rollup reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup_tier: Option<String>,
+    /// Hour-aligned effective window the rollup answer actually covers, after
+    /// snapping the request to rollup window boundaries and clamping the upper
+    /// bound to the sealed horizon. Present only for rollup reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_since_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_until_ns: Option<u64>,
+    /// The materializer's sealed horizon (unix ns): rollup windows strictly
+    /// before this are stable and complete. Activity at/after it is deliberately
+    /// excluded from a rollup answer rather than reported half-materialized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup_sealed_horizon_ns: Option<u64>,
     pub fleet: AgentFleetCost,
     pub per_model: Vec<AgentModelCost>,
     pub per_spawn: Vec<AgentSpawnCost>,
@@ -594,7 +621,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Roll up token usage and cost for one spawn_id from durable agent transcripts. Fleet cost rollups are fail-closed until #1688 TimeSeries/OLAP rollups replace scan-bound transcript analytics. Unpriced models surface as `unpriced`; Claude's own total_cost is surfaced for cross-check."
+        description = "Roll up token usage and cost from durable agent transcripts. A spawn_id gives a bounded exact spawn-prefix read; a fleet (no spawn_id) call is answered from the #1688 materialized TimeSeries hour-window rollups with a bounded read, never a full transcript scan. Unpriced models surface as `unpriced`; Claude's own total_cost is surfaced for cross-check."
     )]
     pub async fn agent_cost(
         &self,
@@ -612,7 +639,7 @@ impl SynapseService {
 #[tool_router(router = cost_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public cost facade for the <=40 MCP surface. operation=summarize is bounded to one spawn_id until #1688 rollups replace scan-bound fleet analytics; price_list reads CF_KV price rows; price_put/price_delete are maintenance-gated mutations with exact CF_KV readback."
+        description = "Public cost facade for the <=40 MCP surface. operation=summarize answers a spawn_id from an exact spawn-prefix read and a fleet window from the #1688 TimeSeries hour-window rollups (bounded, no full scan); rollup_backfill materializes those rollups off-runtime (maintenance-gated); price_list reads CF_KV price rows; price_put/price_delete are maintenance-gated mutations with exact CF_KV readback."
     )]
     pub async fn cost(
         &self,
@@ -657,6 +684,7 @@ impl SynapseService {
                     price_list: None,
                     price_put: None,
                     price_delete: None,
+                    rollup_backfill: None,
                 }))
             }
             CostOperation::PriceList => {
@@ -683,6 +711,7 @@ impl SynapseService {
                     price_list: Some(response),
                     price_put: None,
                     price_delete: None,
+                    rollup_backfill: None,
                 }))
             }
             CostOperation::PricePut => {
@@ -717,6 +746,7 @@ impl SynapseService {
                     price_list: None,
                     price_put: Some(response),
                     price_delete: None,
+                    rollup_backfill: None,
                 }))
             }
             CostOperation::PriceDelete => {
@@ -751,6 +781,40 @@ impl SynapseService {
                     price_list: None,
                     price_put: None,
                     price_delete: Some(response),
+                    rollup_backfill: None,
+                }))
+            }
+            CostOperation::RollupBackfill => {
+                require_cost_maintenance_profile(
+                    self,
+                    &request_context,
+                    operation.as_str(),
+                    "CF_KV agent-cost/rollup/v1",
+                )?;
+                let rollup_backfill = params
+                    .0
+                    .rollup_backfill
+                    .ok_or_else(|| cost_missing_spec("rollup_backfill"))?;
+                let response = self
+                    .agent_cost_rollup_backfill_impl(rollup_backfill)
+                    .await
+                    .map_err(|error| {
+                        cost_delegate_error(
+                            operation.as_str(),
+                            "agent_cost_rollup_backfill",
+                            error,
+                            "inspect the transcript corpus and CF_KV agent-cost/rollup/v1 rows; repair corrupt transcript rows before retrying rollup materialization",
+                        )
+                    })?;
+                Ok(Json(CostResponse {
+                    operation,
+                    source_of_truth: COST_SOURCE_OF_TRUTH.to_owned(),
+                    readback_source_of_truth: response.readback_source_of_truth.clone(),
+                    summarize: None,
+                    price_list: None,
+                    price_put: None,
+                    price_delete: None,
+                    rollup_backfill: Some(response),
                 }))
             }
         }
@@ -973,17 +1037,89 @@ impl SynapseService {
 
     fn agent_cost_impl(&self, params: AgentCostParams) -> Result<AgentCostResponse, ErrorData> {
         if params.spawn_id.is_none() {
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "AGENT_COST_FLEET_ROLLUP_UNAVAILABLE: fleet cost summarize is disabled until \
-                 #1688 lands TimeSeries/OLAP rollups. The retained transcript corpus is too \
-                 large for a raw or timestamp-index scan to complete inside the MCP tools/call \
-                 budget, and a timed-out partial scan would hide an incomplete answer. Pass \
-                 spawn_id for a bounded exact spawn-prefix cost read.",
-            ));
+            // #1688: fleet cost analytics are answered from the materialized
+            // TimeSeries rollups (bounded window-cell reads), never a scan over
+            // the whole transcript corpus. `all_history=true` remains an explicit,
+            // operator-intended exact full scan (not a silent fallback); every
+            // other fleet shape reads the aggregates and fails closed when they
+            // are absent instead of quietly re-scanning.
+            if params.all_history {
+                let plan = AgentCostQueryPlan::from_params(params)?;
+                return self.agent_cost_impl_scoped(plan, None);
+            }
+            let now_ns = unix_time_ns_now();
+            let until_ns = params.until_ns.unwrap_or(now_ns);
+            let since_ns = params
+                .since_ns
+                .unwrap_or_else(|| until_ns.saturating_sub(DEFAULT_FLEET_WINDOW_NS));
+            if since_ns >= until_ns {
+                return Err(invalid_params(format!(
+                    "AGENT_COST_RANGE_INVALID: since_ns {since_ns} must be < until_ns {until_ns}"
+                )));
+            }
+            let db = self.agent_cost_db()?;
+            let default_window_applied = params.since_ns.is_none();
+            return summarize_fleet_from_rollups(
+                &db,
+                since_ns,
+                until_ns,
+                now_ns,
+                default_window_applied,
+            );
         }
         let plan = AgentCostQueryPlan::from_params(params)?;
         self.agent_cost_impl_scoped(plan, None)
+    }
+
+    /// Materializes the cost TimeSeries rollups off the MCP tokio runtime.
+    ///
+    /// The pass is CPU/IO-heavy over the whole transcript corpus, so it runs on
+    /// the blocking pool via `spawn_blocking` under a single admission permit —
+    /// never on a runtime worker serving MCP requests (the 3df5fc9c pattern) —
+    /// and a concurrent call fails closed rather than stacking a second full
+    /// materialization onto the pool.
+    async fn agent_cost_rollup_backfill_impl(
+        &self,
+        params: AgentCostRollupBackfillParams,
+    ) -> Result<AgentCostRollupBackfillResponse, ErrorData> {
+        let db = self.agent_cost_db()?;
+        let reset = params.reset;
+        let permit = COST_ROLLUP_MATERIALIZE_PERMITS
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "AGENT_COST_ROLLUP_MATERIALIZE_IN_PROGRESS: a cost rollup materialization is \
+                     already running for this vault; wait for it to publish before retrying",
+                )
+            })?;
+        let report = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            materialize_cost_rollups(&db, reset)
+        })
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("cost rollup materialization blocking task failed to join: {error}"),
+            )
+        })??;
+        Ok(AgentCostRollupBackfillResponse {
+            ok: true,
+            schema_version: ROLLUP_SCHEMA_VERSION,
+            reset,
+            spawns_examined: report.spawns_examined,
+            spawns_changed: report.spawns_changed,
+            transcript_rows_scanned: report.transcript_rows_scanned,
+            cells_written: report.cells_written,
+            cells_deleted: report.cells_deleted,
+            built_at_ns: report.built_at_ns,
+            sealed_horizon_ns: report.sealed_horizon_ns,
+            readback_source_of_truth: format!(
+                "CF_KV {ROLLUP_META_KEY} + {ROLLUP_KEY_PREFIX}cell/ hour rollup cells + {ROLLUP_KEY_PREFIX}mark/ per-spawn contribution markers"
+            ),
+        })
     }
 
     /// `agent_cost` rollup with an optional restriction to a fixed set of spawn
@@ -1375,6 +1511,11 @@ impl SynapseService {
             until_ns: params.until_ns,
             scanned_rows,
             scanned_event_rows,
+            rollup_windows_read: None,
+            rollup_tier: None,
+            effective_since_ns: None,
+            effective_until_ns: None,
+            rollup_sealed_horizon_ns: None,
             fleet,
             per_model: per_model_vec,
             per_spawn,
@@ -1406,6 +1547,11 @@ fn validate_cost_params(params: &CostParams) -> Result<CostOperation, ErrorData>
             CostOperation::PriceDelete,
             params.price_delete.is_some(),
             "price_delete",
+        ),
+        (
+            CostOperation::RollupBackfill,
+            params.rollup_backfill.is_some(),
+            "rollup_backfill",
         ),
     ];
     let supplied = matches
@@ -2614,4 +2760,986 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
+}
+
+// ============================================================================
+// #1688 — Cost TimeSeries rollups (retire scan-bound fleet cost queries)
+// ============================================================================
+//
+// Fleet cost analytics used to fail closed (`AGENT_COST_FLEET_ROLLUP_UNAVAILABLE`)
+// because a raw or timestamp-index scan over the whole `CF_AGENT_TRANSCRIPTS`
+// corpus cannot complete inside the MCP `tools/call` budget. This section
+// materializes **continuous hour-window rollups** over the same transcript rows
+// and answers the fleet `summarize` from those aggregates with a bounded read
+// whose cost is O(windows x models), independent of transcript count.
+//
+// Substrate & doctrine
+// --------------------
+// The rollups live in the vault (the single source of truth) as ordered KV rows
+// under `agent-cost/rollup/v1/` in the GC-protected `CF_KV` family — the same
+// place the cost price table and the transcript timestamp index already live.
+// This mirrors how aster itself encodes native TimeSeries rows: ordered KV under
+// a discriminant with per-window rollup tuples. There is no side store; every
+// rollup cell is a pure, rebuildable function of the transcript rows it sums, so
+// it reconciles exactly with a brute-force recomputation over the same window.
+//
+// Exactness
+// ---------
+// A spawn is resolved **globally** (over all its transcript rows) through the
+// exact same `SpawnAccumulator`/`resolve()` path the scan uses, then its
+// resolved usage is attributed to the single hour-window containing its
+// authoritative row's ingestion timestamp. Cost is *not* stored (prices are
+// operator-mutable); only the immutable billable-token sums and spawn counts
+// are. The query re-applies the *current* price table to the summed tokens, so
+// the answer tracks price edits and equals `price(sum_of_tokens)` — identical to
+// a fleet brute-force over the same hour-aligned window.
+//
+// Idempotent + resumable materialization
+// --------------------------------------
+// Each spawn carries a `mark/<spawn_id>` marker recording the exact set of cell
+// contributions it currently accounts for. A materialization pass recomputes a
+// spawn's contribution; if it is unchanged the spawn is skipped, otherwise the
+// old contribution is subtracted and the new one added (read-modify-write on the
+// affected cells) and the marker is rewritten. This makes re-runs, crashes, and
+// still-growing spawns all correct: a spawn is folded exactly once, and folding
+// it again is a no-op. A `__progress` cursor lets a long pass resume its scan
+// without redoing prior spawns; because the marker fold is idempotent, resuming
+// is always safe even if the cursor is stale.
+
+/// `CF_KV` namespace for the cost rollup family. Cells live under `…/cell/`,
+/// per-spawn contribution markers under `…/mark/`, and the two control rows are
+/// `__meta` / `__progress`.
+const ROLLUP_KEY_PREFIX: &str = "agent-cost/rollup/v1/";
+const ROLLUP_META_KEY: &str = "agent-cost/rollup/v1/__meta";
+const ROLLUP_PROGRESS_KEY: &str = "agent-cost/rollup/v1/__progress";
+const ROLLUP_CELL_INFIX: &[u8] = b"cell/";
+const ROLLUP_MARK_INFIX: &[u8] = b"mark/";
+const ROLLUP_SCHEMA_VERSION: u32 = 1;
+/// Only the hour tier is materialized today; the tier byte in the cell key
+/// reserves room for a coarser day tier without a format change.
+const ROLLUP_TIER_HOUR: u8 = 0;
+const ROLLUP_NANOS_PER_HOUR: u64 = 60 * 60 * 1_000_000_000;
+/// A window is sealed (stable, complete) once it is older than this grace period
+/// — comfortably longer than any spawn's lifetime plus ingestion lag, so no new
+/// transcript row can still land in it. Fleet answers clamp their upper bound to
+/// the sealed horizon rather than report a half-materialized recent window.
+const ROLLUP_SEAL_GRACE_NS: u64 = 2 * ROLLUP_NANOS_PER_HOUR;
+/// Refuse an absurdly wide fleet window (> ~1 year of hour cells) rather than
+/// read tens of thousands of cells; the caller must narrow the window.
+const ROLLUP_MAX_QUERY_WINDOWS: u64 = 366 * 24;
+/// Checkpoint the resumable scan cursor every this many flushed spawns.
+const ROLLUP_CHECKPOINT_SPAWNS: u64 = 512;
+
+/// Single-permit admission gate: one cost rollup materialization at a time per
+/// process. The MCP `rollup_backfill` op and the periodic maintenance hook both
+/// acquire it, so their read-modify-write passes never race on the same cells.
+static COST_ROLLUP_MATERIALIZE_PERMITS: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCostRollupBackfillParams {
+    /// Delete every existing rollup cell/marker/control row and rebuild from
+    /// scratch. Default `false`: an incremental, idempotent pass that only
+    /// rewrites cells for spawns whose transcript contribution changed.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCostRollupBackfillResponse {
+    pub ok: bool,
+    pub schema_version: u32,
+    pub reset: bool,
+    /// Spawns whose full transcript prefix was resolved this pass.
+    pub spawns_examined: u64,
+    /// Of those, spawns whose contribution differed from their stored marker and
+    /// so rewrote rollup cells.
+    pub spawns_changed: u64,
+    /// `CF_AGENT_TRANSCRIPTS` rows read to resolve the examined spawns.
+    pub transcript_rows_scanned: u64,
+    pub cells_written: u64,
+    pub cells_deleted: u64,
+    /// When this pass published `__meta`, unix ns.
+    pub built_at_ns: u64,
+    /// Sealed horizon published for fleet reads: rollup windows strictly before
+    /// this are stable and complete.
+    pub sealed_horizon_ns: u64,
+    pub readback_source_of_truth: String,
+}
+
+/// Materialization pass outcome, surfaced by the backfill response and the
+/// periodic maintenance log.
+#[derive(Clone, Debug)]
+pub(crate) struct RollupMaterializeReport {
+    pub spawns_examined: u64,
+    pub spawns_changed: u64,
+    pub transcript_rows_scanned: u64,
+    pub cells_written: u64,
+    pub cells_deleted: u64,
+    pub built_at_ns: u64,
+    pub sealed_horizon_ns: u64,
+}
+
+/// Per-window / per-model rollup counters. Meta cells (model = `None`) use the
+/// spawn counts; per-model cells use `model_spawns` + `usage` + reported cost.
+/// All fields are summed field-wise; a marker update subtracts the old
+/// contribution before adding the new one, so counts stay exact.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollupCounters {
+    #[serde(default)]
+    spawns_total: u64,
+    #[serde(default)]
+    spawns_complete: u64,
+    #[serde(default)]
+    spawns_incomplete: u64,
+    #[serde(default)]
+    model_spawns: u64,
+    #[serde(default)]
+    usage: BillableUsage,
+    #[serde(default)]
+    source_reported_micro_usd: u64,
+}
+
+impl RollupCounters {
+    fn add_assign(&mut self, other: &Self) {
+        self.spawns_total = self.spawns_total.saturating_add(other.spawns_total);
+        self.spawns_complete = self.spawns_complete.saturating_add(other.spawns_complete);
+        self.spawns_incomplete = self
+            .spawns_incomplete
+            .saturating_add(other.spawns_incomplete);
+        self.model_spawns = self.model_spawns.saturating_add(other.model_spawns);
+        add_usage(&mut self.usage, &other.usage);
+        self.source_reported_micro_usd = self
+            .source_reported_micro_usd
+            .saturating_add(other.source_reported_micro_usd);
+    }
+
+    fn sub_assign(&mut self, other: &Self) {
+        self.spawns_total = self.spawns_total.saturating_sub(other.spawns_total);
+        self.spawns_complete = self.spawns_complete.saturating_sub(other.spawns_complete);
+        self.spawns_incomplete = self
+            .spawns_incomplete
+            .saturating_sub(other.spawns_incomplete);
+        self.model_spawns = self.model_spawns.saturating_sub(other.model_spawns);
+        sub_usage(&mut self.usage, &other.usage);
+        self.source_reported_micro_usd = self
+            .source_reported_micro_usd
+            .saturating_sub(other.source_reported_micro_usd);
+    }
+
+    fn is_zero(&self) -> bool {
+        self.spawns_total == 0
+            && self.spawns_complete == 0
+            && self.spawns_incomplete == 0
+            && self.model_spawns == 0
+            && self.usage.is_zero()
+            && self.source_reported_micro_usd == 0
+    }
+}
+
+/// One cell contribution: the addressed cell (`tier`, `window_start`, `model`)
+/// plus the counters to fold in. A spawn's marker is the ordered list of these.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollupContribCell {
+    tier: u8,
+    window_start_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    counters: RollupCounters,
+}
+
+/// Stored cell value. `tier`/`window_start`/`model` echo the key for physical
+/// readback during manual FSV.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollupCell {
+    schema_version: u32,
+    tier: u8,
+    window_start_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    counters: RollupCounters,
+}
+
+/// Per-spawn contribution marker enabling idempotent subtract-then-add updates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnRollupMark {
+    schema_version: u32,
+    cells: Vec<RollupContribCell>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CostRollupMeta {
+    schema_version: u32,
+    built_at_ns: u64,
+    sealed_horizon_ns: u64,
+    spawns_marked: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CostRollupProgress {
+    schema_version: u32,
+    resume_after_key_hex: String,
+    spawns_examined: u64,
+}
+
+fn sub_usage(acc: &mut BillableUsage, sub: &BillableUsage) {
+    acc.input_tokens = acc.input_tokens.saturating_sub(sub.input_tokens);
+    acc.output_tokens = acc.output_tokens.saturating_sub(sub.output_tokens);
+    acc.cache_read_tokens = acc.cache_read_tokens.saturating_sub(sub.cache_read_tokens);
+    acc.cache_creation_tokens = acc
+        .cache_creation_tokens
+        .saturating_sub(sub.cache_creation_tokens);
+    acc.cache_creation_5m_tokens = acc
+        .cache_creation_5m_tokens
+        .saturating_sub(sub.cache_creation_5m_tokens);
+    acc.cache_creation_1h_tokens = acc
+        .cache_creation_1h_tokens
+        .saturating_sub(sub.cache_creation_1h_tokens);
+}
+
+fn rollup_floor_hour(ts_ns: u64) -> u64 {
+    ts_ns - (ts_ns % ROLLUP_NANOS_PER_HOUR)
+}
+
+fn rollup_ceil_hour(ts_ns: u64) -> u64 {
+    let remainder = ts_ns % ROLLUP_NANOS_PER_HOUR;
+    if remainder == 0 {
+        ts_ns
+    } else {
+        ts_ns
+            .saturating_sub(remainder)
+            .saturating_add(ROLLUP_NANOS_PER_HOUR)
+    }
+}
+
+fn rollup_cell_scan_prefix() -> Vec<u8> {
+    let mut key = ROLLUP_KEY_PREFIX.as_bytes().to_vec();
+    key.extend_from_slice(ROLLUP_CELL_INFIX);
+    key
+}
+
+/// `…/cell/ || tier(1) || window_start_be(8) || model_utf8`. A meta (fleet) cell
+/// has no model bytes, so it sorts before that window's per-model cells.
+fn rollup_cell_key(tier: u8, window_start_ns: u64, model: Option<&str>) -> Vec<u8> {
+    let mut key = rollup_cell_scan_prefix();
+    key.push(tier);
+    key.extend_from_slice(&window_start_ns.to_be_bytes());
+    if let Some(model) = model {
+        key.extend_from_slice(model.as_bytes());
+    }
+    key
+}
+
+/// Inclusive lower-bound seek key for a hour-tier window range scan.
+fn rollup_cell_seek(tier: u8, window_start_ns: u64) -> Vec<u8> {
+    let mut key = rollup_cell_scan_prefix();
+    key.push(tier);
+    key.extend_from_slice(&window_start_ns.to_be_bytes());
+    key
+}
+
+fn decode_rollup_cell_key(key: &[u8]) -> Option<(u8, u64, Option<String>)> {
+    let prefix = rollup_cell_scan_prefix();
+    let rest = key.strip_prefix(prefix.as_slice())?;
+    let tier = *rest.first()?;
+    let window_bytes = rest.get(1..9)?;
+    let window_start_ns = u64::from_be_bytes(window_bytes.try_into().ok()?);
+    let model_bytes = &rest[9..];
+    let model = if model_bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8(model_bytes.to_vec()).ok()?)
+    };
+    Some((tier, window_start_ns, model))
+}
+
+fn rollup_mark_key(spawn_id: &str) -> Vec<u8> {
+    let mut key = ROLLUP_KEY_PREFIX.as_bytes().to_vec();
+    key.extend_from_slice(ROLLUP_MARK_INFIX);
+    key.extend_from_slice(spawn_id.as_bytes());
+    key
+}
+
+fn read_rollup_meta(db: &Db) -> Result<Option<CostRollupMeta>, ErrorData> {
+    let Some(value) = db
+        .get_cf(cf::CF_KV, ROLLUP_META_KEY.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let meta: CostRollupMeta = serde_json::from_slice(&value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("AGENT_COST_ROLLUP_META_CORRUPT: {ROLLUP_META_KEY}: {error}"),
+        )
+    })?;
+    if meta.schema_version != ROLLUP_SCHEMA_VERSION {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_SCHEMA_UNSUPPORTED: {ROLLUP_META_KEY} version {} != expected {ROLLUP_SCHEMA_VERSION}; run cost rollup_backfill with reset=true",
+                meta.schema_version
+            ),
+        ));
+    }
+    Ok(Some(meta))
+}
+
+fn read_rollup_cell(db: &Db, key: &[u8]) -> Result<Option<RollupCell>, ErrorData> {
+    let Some(value) = db
+        .get_cf(cf::CF_KV, key)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let cell: RollupCell = serde_json::from_slice(&value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("AGENT_COST_ROLLUP_CELL_CORRUPT: cost rollup cell failed to decode: {error}"),
+        )
+    })?;
+    if cell.schema_version != ROLLUP_SCHEMA_VERSION {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_SCHEMA_UNSUPPORTED: rollup cell version {} != expected {ROLLUP_SCHEMA_VERSION}; run cost rollup_backfill with reset=true",
+                cell.schema_version
+            ),
+        ));
+    }
+    Ok(Some(cell))
+}
+
+fn read_spawn_mark(db: &Db, spawn_id: &str) -> Result<Option<Vec<RollupContribCell>>, ErrorData> {
+    let Some(value) = db
+        .get_cf(cf::CF_KV, &rollup_mark_key(spawn_id))
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let mark: SpawnRollupMark = serde_json::from_slice(&value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_MARK_CORRUPT: spawn {spawn_id} marker failed to decode: {error}"
+            ),
+        )
+    })?;
+    if mark.schema_version != ROLLUP_SCHEMA_VERSION {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_SCHEMA_UNSUPPORTED: spawn {spawn_id} marker version {} != expected {ROLLUP_SCHEMA_VERSION}; run cost rollup_backfill with reset=true",
+                mark.schema_version
+            ),
+        ));
+    }
+    Ok(Some(mark.cells))
+}
+
+fn write_kv_row(db: &Db, key: Vec<u8>, value: Vec<u8>) -> Result<(), ErrorData> {
+    db.put_batch_pressure_bypass(cf::CF_KV, [(key, value)])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+fn encode_json_row<T: Serialize>(value: &T) -> Result<Vec<u8>, ErrorData> {
+    serde_json::to_vec(value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("AGENT_COST_ROLLUP_ENCODE_FAILED: {error}"),
+        )
+    })
+}
+
+/// Folds one contribution cell into (or out of) its stored rollup cell. A cell
+/// that reaches all-zero is deleted so an empty window leaves no residue.
+fn apply_rollup_contrib(
+    db: &Db,
+    contrib: &RollupContribCell,
+    add: bool,
+    cells_written: &mut u64,
+    cells_deleted: &mut u64,
+) -> Result<(), ErrorData> {
+    if contrib.counters.is_zero() {
+        return Ok(());
+    }
+    let key = rollup_cell_key(
+        contrib.tier,
+        contrib.window_start_ns,
+        contrib.model.as_deref(),
+    );
+    let mut counters = read_rollup_cell(db, &key)?
+        .map(|cell| cell.counters)
+        .unwrap_or_default();
+    if add {
+        counters.add_assign(&contrib.counters);
+    } else {
+        counters.sub_assign(&contrib.counters);
+    }
+    if counters.is_zero() {
+        db.delete_batch(cf::CF_KV, [key])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        *cells_deleted = cells_deleted.saturating_add(1);
+    } else {
+        let stored = RollupCell {
+            schema_version: ROLLUP_SCHEMA_VERSION,
+            tier: contrib.tier,
+            window_start_ns: contrib.window_start_ns,
+            model: contrib.model.clone(),
+            counters,
+        };
+        write_kv_row(db, key, encode_json_row(&stored)?)?;
+        *cells_written = cells_written.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Resolves one spawn globally (all its transcript rows) and returns its rollup
+/// contribution cells: one meta cell plus one per resolved model for a complete
+/// spawn, or a single incomplete meta cell otherwise. Identical resolution logic
+/// to the scan path, so a cell reconciles exactly with a brute-force sum.
+fn spawn_rollup_contribution(
+    spawn_id: &str,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<RollupContribCell>, ErrorData> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut acc = SpawnAccumulator::default();
+    let mut ts_by_line: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut latest_ts: u64 = 0;
+    for (_key, value) in rows {
+        let record: AgentTranscriptRecord = serde_json::from_slice(value).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("TRANSCRIPT_ROW_CORRUPT: spawn {spawn_id} row failed to decode: {error}"),
+            )
+        })?;
+        ts_by_line.insert(record.line_no, record.ts_ns);
+        latest_ts = latest_ts.max(record.ts_ns);
+        acc.observe(&record)?;
+    }
+
+    let Some(resolved) = acc.resolve()? else {
+        // Still-running / no authoritative usage: count one active, incomplete
+        // spawn in the window of its most recent row. Zero tokens, zero cost.
+        let window_start_ns = rollup_floor_hour(latest_ts);
+        return Ok(vec![RollupContribCell {
+            tier: ROLLUP_TIER_HOUR,
+            window_start_ns,
+            model: None,
+            counters: RollupCounters {
+                spawns_total: 1,
+                spawns_incomplete: 1,
+                ..RollupCounters::default()
+            },
+        }]);
+    };
+
+    let authoritative_ts = *ts_by_line.get(&resolved.line_no).ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_AUTH_TS_MISSING: spawn {spawn_id} authoritative line {} has no timestamp among its rows",
+                resolved.line_no
+            ),
+        )
+    })?;
+    let window_start_ns = rollup_floor_hour(authoritative_ts);
+
+    let mut cells = Vec::with_capacity(1 + resolved.models.len());
+    cells.push(RollupContribCell {
+        tier: ROLLUP_TIER_HOUR,
+        window_start_ns,
+        model: None,
+        counters: RollupCounters {
+            spawns_total: 1,
+            spawns_complete: 1,
+            usage: resolved.usage,
+            source_reported_micro_usd: resolved.source_reported_micro_usd.unwrap_or(0),
+            ..RollupCounters::default()
+        },
+    });
+
+    // Aggregate per-model contributions by label so the marker is canonical and
+    // its equality check is stable across passes.
+    let mut per_model: BTreeMap<String, RollupCounters> = BTreeMap::new();
+    for model in &resolved.models {
+        let label = model.model.clone().unwrap_or_else(|| "unknown".to_owned());
+        let entry = per_model.entry(label).or_default();
+        entry.model_spawns = entry.model_spawns.saturating_add(1);
+        add_usage(&mut entry.usage, &model.usage);
+        entry.source_reported_micro_usd = entry
+            .source_reported_micro_usd
+            .saturating_add(model.source_reported_micro_usd.unwrap_or(0));
+    }
+    for (label, counters) in per_model {
+        cells.push(RollupContribCell {
+            tier: ROLLUP_TIER_HOUR,
+            window_start_ns,
+            model: Some(label),
+            counters,
+        });
+    }
+    Ok(cells)
+}
+
+/// Processes one spawn: recomputes its contribution and, if it differs from the
+/// stored marker, subtracts the old contribution, adds the new, and rewrites the
+/// marker. Returns whether the spawn changed the rollups.
+fn process_spawn_rollup(
+    db: &Db,
+    spawn_id: &str,
+    rows: &[(Vec<u8>, Vec<u8>)],
+    cells_written: &mut u64,
+    cells_deleted: &mut u64,
+) -> Result<bool, ErrorData> {
+    let new_cells = spawn_rollup_contribution(spawn_id, rows)?;
+    let old_cells = read_spawn_mark(db, spawn_id)?;
+    if old_cells.as_deref() == Some(new_cells.as_slice()) {
+        return Ok(false);
+    }
+    if let Some(old_cells) = &old_cells {
+        for contrib in old_cells {
+            apply_rollup_contrib(db, contrib, false, cells_written, cells_deleted)?;
+        }
+    }
+    for contrib in &new_cells {
+        apply_rollup_contrib(db, contrib, true, cells_written, cells_deleted)?;
+    }
+    let mark_key = rollup_mark_key(spawn_id);
+    if new_cells.is_empty() {
+        db.delete_batch(cf::CF_KV, [mark_key])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    } else {
+        let mark = SpawnRollupMark {
+            schema_version: ROLLUP_SCHEMA_VERSION,
+            cells: new_cells,
+        };
+        write_kv_row(db, mark_key, encode_json_row(&mark)?)?;
+    }
+    Ok(true)
+}
+
+/// Deletes every `agent-cost/rollup/v1/` row (cells, markers, control rows) for
+/// a `reset=true` rebuild.
+fn purge_all_rollup_rows(db: &Db) -> Result<(), ErrorData> {
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, ROLLUP_KEY_PREFIX.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    for chunk in rows.chunks(SCAN_CHUNK_ROWS) {
+        let keys: Vec<Vec<u8>> = chunk.iter().map(|(key, _value)| key.clone()).collect();
+        db.delete_batch(cf::CF_KV, keys)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Materializes the cost rollups over the whole `CF_AGENT_TRANSCRIPTS` corpus.
+///
+/// Transcript rows are spawn-contiguous by key, so a single forward scan yields
+/// each spawn's rows together; the spawn is resolved and folded once, then the
+/// resumable cursor advances. Every write is idempotent (marker subtract/add),
+/// so a re-run rewrites only changed spawns and re-running never double-counts.
+pub(crate) fn materialize_cost_rollups(
+    db: &Db,
+    reset: bool,
+) -> Result<RollupMaterializeReport, ErrorData> {
+    let built_at_ns = unix_time_ns_now();
+    let sealed_horizon_ns = rollup_floor_hour(built_at_ns.saturating_sub(ROLLUP_SEAL_GRACE_NS));
+
+    if reset {
+        purge_all_rollup_rows(db)?;
+    }
+
+    // Resume from the checkpointed cursor when present (and not resetting).
+    let mut start: Vec<u8> = Vec::new();
+    let mut spawns_examined: u64 = 0;
+    if !reset
+        && let Some(value) = db
+            .get_cf(cf::CF_KV, ROLLUP_PROGRESS_KEY.as_bytes())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+    {
+        match serde_json::from_slice::<CostRollupProgress>(&value) {
+            Ok(progress) if progress.schema_version == ROLLUP_SCHEMA_VERSION => {
+                if let Some(resume_after) = hex_decode(&progress.resume_after_key_hex) {
+                    start = key_after(&resume_after);
+                    spawns_examined = progress.spawns_examined;
+                }
+            }
+            // A corrupt/foreign progress row is a resumption hint only; ignore it
+            // and restart the scan. Marker idempotency keeps this correct.
+            _ => {}
+        }
+    }
+
+    let mut spawns_changed: u64 = 0;
+    let mut transcript_rows_scanned: u64 = 0;
+    let mut cells_written: u64 = 0;
+    let mut cells_deleted: u64 = 0;
+    let mut current_spawn: Option<String> = None;
+    let mut current_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut last_flushed_key: Option<Vec<u8>> = None;
+    let mut spawns_since_checkpoint: u64 = 0;
+
+    loop {
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_AGENT_TRANSCRIPTS, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            transcript_rows_scanned = transcript_rows_scanned.saturating_add(1);
+            let (spawn_id, _line_no) = decode_agent_transcript_key(key)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            match &current_spawn {
+                Some(current) if current == &spawn_id => {}
+                _ => {
+                    if let Some(previous) = current_spawn.take() {
+                        let changed = process_spawn_rollup(
+                            db,
+                            &previous,
+                            &current_rows,
+                            &mut cells_written,
+                            &mut cells_deleted,
+                        )?;
+                        spawns_examined = spawns_examined.saturating_add(1);
+                        if changed {
+                            spawns_changed = spawns_changed.saturating_add(1);
+                        }
+                        if let Some((last_key, _last_value)) = current_rows.last() {
+                            last_flushed_key = Some(last_key.clone());
+                        }
+                        spawns_since_checkpoint = spawns_since_checkpoint.saturating_add(1);
+                        if spawns_since_checkpoint >= ROLLUP_CHECKPOINT_SPAWNS
+                            && let Some(cursor) = &last_flushed_key
+                        {
+                            checkpoint_rollup_progress(db, cursor, spawns_examined)?;
+                            spawns_since_checkpoint = 0;
+                        }
+                    }
+                    current_spawn = Some(spawn_id);
+                    current_rows = Vec::new();
+                }
+            }
+            current_rows.push((key.clone(), value.clone()));
+        }
+        let Some((last_key, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last_key);
+        if !more {
+            break;
+        }
+    }
+
+    // Flush the final spawn.
+    if let Some(previous) = current_spawn.take() {
+        let changed = process_spawn_rollup(
+            db,
+            &previous,
+            &current_rows,
+            &mut cells_written,
+            &mut cells_deleted,
+        )?;
+        spawns_examined = spawns_examined.saturating_add(1);
+        if changed {
+            spawns_changed = spawns_changed.saturating_add(1);
+        }
+    }
+
+    // Publish meta and clear the resume cursor: the pass is complete.
+    let meta = CostRollupMeta {
+        schema_version: ROLLUP_SCHEMA_VERSION,
+        built_at_ns,
+        sealed_horizon_ns,
+        spawns_marked: spawns_examined,
+    };
+    write_kv_row(
+        db,
+        ROLLUP_META_KEY.as_bytes().to_vec(),
+        encode_json_row(&meta)?,
+    )?;
+    db.delete_batch(cf::CF_KV, [ROLLUP_PROGRESS_KEY.as_bytes().to_vec()])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+
+    tracing::info!(
+        code = "AGENT_COST_ROLLUP_MATERIALIZED",
+        reset,
+        spawns_examined,
+        spawns_changed,
+        transcript_rows_scanned,
+        cells_written,
+        cells_deleted,
+        built_at_ns,
+        sealed_horizon_ns,
+        "materialized cost TimeSeries rollups off the MCP runtime"
+    );
+
+    Ok(RollupMaterializeReport {
+        spawns_examined,
+        spawns_changed,
+        transcript_rows_scanned,
+        cells_written,
+        cells_deleted,
+        built_at_ns,
+        sealed_horizon_ns,
+    })
+}
+
+fn checkpoint_rollup_progress(
+    db: &Db,
+    resume_after_key: &[u8],
+    spawns_examined: u64,
+) -> Result<(), ErrorData> {
+    let progress = CostRollupProgress {
+        schema_version: ROLLUP_SCHEMA_VERSION,
+        resume_after_key_hex: hex_encode(resume_after_key),
+        spawns_examined,
+    };
+    write_kv_row(
+        db,
+        ROLLUP_PROGRESS_KEY.as_bytes().to_vec(),
+        encode_json_row(&progress)?,
+    )
+}
+
+/// Runs an incremental rollup pass only if no other materialization holds the
+/// admission permit. Returns `None` when a pass is already in flight. Used by
+/// the periodic transcript-ingest maintenance hook so rollups stay current
+/// without an operator call.
+pub(crate) fn materialize_cost_rollups_if_idle(
+    db: &Db,
+) -> Option<Result<RollupMaterializeReport, ErrorData>> {
+    let permit = COST_ROLLUP_MATERIALIZE_PERMITS.try_acquire().ok()?;
+    let _permit = permit;
+    Some(materialize_cost_rollups(db, false))
+}
+
+/// Answers a fleet cost `summarize` from the materialized hour-window rollups
+/// with a bounded read (O(windows x models)), independent of corpus size.
+fn summarize_fleet_from_rollups(
+    db: &Db,
+    since_ns: u64,
+    until_ns: u64,
+    now_ns: u64,
+    default_window_applied: bool,
+) -> Result<AgentCostResponse, ErrorData> {
+    let Some(meta) = read_rollup_meta(db)? else {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "AGENT_COST_ROLLUP_NOT_MATERIALIZED: no cost rollups exist yet. Fleet cost analytics \
+             are served from materialized TimeSeries rollups, never a full transcript scan. Run \
+             `cost` operation=rollup_backfill (maintenance profile) to materialize them, then \
+             retry; or pass a spawn_id for a bounded exact spawn-prefix cost read.",
+        ));
+    };
+    let prices = load_price_table(db)?;
+
+    let effective_since_ns = rollup_floor_hour(since_ns);
+    let mut effective_until_ns = rollup_ceil_hour(until_ns).min(meta.sealed_horizon_ns);
+    if effective_until_ns <= effective_since_ns {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_WINDOW_UNSEALED: the requested window [{since_ns}, {until_ns}) \
+                 lies at or after the rollup sealed horizon {sealed}; recent activity is not yet \
+                 stable in the rollups. Query a window that ends before the sealed horizon, or run \
+                 `cost` operation=rollup_backfill after the window seals (grace {grace_ns} ns).",
+                sealed = meta.sealed_horizon_ns,
+                grace_ns = ROLLUP_SEAL_GRACE_NS,
+            ),
+        ));
+    }
+    let window_count = (effective_until_ns - effective_since_ns) / ROLLUP_NANOS_PER_HOUR;
+    if window_count > ROLLUP_MAX_QUERY_WINDOWS {
+        return Err(invalid_params(format!(
+            "AGENT_COST_ROLLUP_WINDOW_TOO_WIDE: effective window spans {window_count} hour cells \
+             (> {ROLLUP_MAX_QUERY_WINDOWS}); narrow since_ns/until_ns"
+        )));
+    }
+
+    let mut fleet = AgentFleetCost {
+        spawns_total: 0,
+        spawns_complete: 0,
+        spawns_incomplete: 0,
+        usage: BillableUsage::default(),
+        total_tokens: 0,
+        computed_micro_usd: 0,
+        source_reported_micro_usd: 0,
+        unpriced_models: Vec::new(),
+    };
+    let mut per_model_usage: BTreeMap<String, RollupCounters> = BTreeMap::new();
+    let mut windows_read: u64 = 0;
+
+    let mut start = rollup_cell_seek(ROLLUP_TIER_HOUR, effective_since_ns);
+    'scan: loop {
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            let Some((tier, window_start_ns, model)) = decode_rollup_cell_key(key) else {
+                break 'scan;
+            };
+            if tier != ROLLUP_TIER_HOUR || window_start_ns >= effective_until_ns {
+                break 'scan;
+            }
+            if window_start_ns < effective_since_ns {
+                continue;
+            }
+            let cell: RollupCell = serde_json::from_slice(value).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "AGENT_COST_ROLLUP_CELL_CORRUPT: cost rollup cell failed to decode: {error}"
+                    ),
+                )
+            })?;
+            if cell.schema_version != ROLLUP_SCHEMA_VERSION {
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "AGENT_COST_ROLLUP_SCHEMA_UNSUPPORTED: rollup cell version {} != expected {ROLLUP_SCHEMA_VERSION}; run cost rollup_backfill with reset=true",
+                        cell.schema_version
+                    ),
+                ));
+            }
+            windows_read = windows_read.saturating_add(1);
+            match model {
+                None => {
+                    fleet.spawns_total = fleet.spawns_total.saturating_add(
+                        usize::try_from(cell.counters.spawns_total).unwrap_or(usize::MAX),
+                    );
+                    fleet.spawns_complete = fleet.spawns_complete.saturating_add(
+                        usize::try_from(cell.counters.spawns_complete).unwrap_or(usize::MAX),
+                    );
+                    fleet.spawns_incomplete = fleet.spawns_incomplete.saturating_add(
+                        usize::try_from(cell.counters.spawns_incomplete).unwrap_or(usize::MAX),
+                    );
+                    add_usage(&mut fleet.usage, &cell.counters.usage);
+                    fleet.total_tokens = fleet
+                        .total_tokens
+                        .saturating_add(cell.counters.usage.total_tokens());
+                    fleet.source_reported_micro_usd = fleet
+                        .source_reported_micro_usd
+                        .saturating_add(cell.counters.source_reported_micro_usd);
+                }
+                Some(label) => {
+                    let entry = per_model_usage.entry(label).or_default();
+                    entry.add_assign(&cell.counters);
+                }
+            }
+        }
+        let Some((last_key, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last_key);
+        if !more {
+            break;
+        }
+    }
+
+    // Price each model's summed tokens with the CURRENT price table. Pricing is
+    // linear in usage, so the per-model priced sum equals a per-spawn priced sum
+    // over the same tokens; an unpriced model is surfaced, never guessed.
+    let mut per_model: Vec<AgentModelCost> = Vec::with_capacity(per_model_usage.len());
+    let mut unpriced_set: BTreeSet<String> = BTreeSet::new();
+    for (label, counters) in per_model_usage {
+        let lookup = ModelPrice::normalize_id(&label);
+        let priced = prices.get(&lookup);
+        let total_tokens = counters.usage.total_tokens();
+        let (computed, priced_flag) = match priced {
+            Some(price) => {
+                let breakdown = price
+                    .cost_micro_usd(&counters.usage)
+                    .map_err(|detail| mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail))?;
+                fleet.computed_micro_usd = fleet
+                    .computed_micro_usd
+                    .saturating_add(breakdown.total_micro_usd);
+                (Some(breakdown.total_micro_usd), true)
+            }
+            None => {
+                unpriced_set.insert(label.clone());
+                (None, false)
+            }
+        };
+        per_model.push(AgentModelCost {
+            model: label,
+            priced: priced_flag,
+            spawns: usize::try_from(counters.model_spawns).unwrap_or(usize::MAX),
+            usage: counters.usage,
+            total_tokens,
+            computed_micro_usd: computed,
+            source_reported_micro_usd: (counters.source_reported_micro_usd > 0)
+                .then_some(counters.source_reported_micro_usd),
+        });
+    }
+    fleet.unpriced_models = unpriced_set.into_iter().collect();
+
+    // Clamp reported effective_until back to a window boundary (it was min'd with
+    // the sealed horizon, itself hour-aligned) for an honest, exact echo.
+    effective_until_ns = rollup_floor_hour(effective_until_ns);
+
+    Ok(AgentCostResponse {
+        ok: true,
+        now_ns,
+        query_strategy: "timeseries_rollup_window_read".to_owned(),
+        default_window_applied,
+        completeness: "exact".to_owned(),
+        transcript_index_version: None,
+        scanned_index_rows: 0,
+        since_ns: Some(since_ns),
+        until_ns: Some(until_ns),
+        scanned_rows: 0,
+        scanned_event_rows: 0,
+        rollup_windows_read: Some(windows_read),
+        rollup_tier: Some("hour".to_owned()),
+        effective_since_ns: Some(effective_since_ns),
+        effective_until_ns: Some(effective_until_ns),
+        rollup_sealed_horizon_ns: Some(meta.sealed_horizon_ns),
+        fleet,
+        per_model,
+        per_spawn: Vec::new(),
+        per_template: None,
+        per_task: None,
+    })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = char::from(bytes[index]).to_digit(16)?;
+        let low = char::from(bytes[index + 1]).to_digit(16)?;
+        out.push(u8::try_from(high * 16 + low).ok()?);
+        index += 2;
+    }
+    Some(out)
 }

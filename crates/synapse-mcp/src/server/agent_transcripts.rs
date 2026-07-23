@@ -2642,10 +2642,62 @@ pub(crate) fn spawn_periodic_transcript_ingest(
                 return;
             }
             run_cycle(&m3_state, &root, &cancel);
+            // #1688: keep the cost TimeSeries rollups current off the async
+            // runtime. This loop already runs on the blocking pool, and the
+            // materializer takes the single rollup admission permit (skipping
+            // when an operator backfill holds it), so it never races.
+            run_cost_rollup_maintenance(&m3_state);
             delay = std::time::Duration::from_secs(interval_secs);
         }
     });
     Ok(Some(handle))
+}
+
+/// Runs one incremental cost-rollup materialization pass after a transcript
+/// ingest cycle (#1688). Failures are logged, never fatal to the ingest loop:
+/// the rollups are a rebuildable derived view and the next cycle retries.
+fn run_cost_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
+    let db = {
+        let mut guard = match m3_state.lock() {
+            Ok(guard) => guard,
+            Err(_poisoned) => {
+                tracing::warn!(
+                    code = "AGENT_COST_ROLLUP_MAINTENANCE_SKIPPED",
+                    reason = "m3_state_lock_poisoned",
+                    "skipping periodic cost rollup materialization"
+                );
+                return;
+            }
+        };
+        match guard.ensure_storage() {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::warn!(
+                    code = "AGENT_COST_ROLLUP_MAINTENANCE_SKIPPED",
+                    reason = "storage_unavailable",
+                    error = %error,
+                    "skipping periodic cost rollup materialization"
+                );
+                return;
+            }
+        }
+    };
+    match super::agent_cost::materialize_cost_rollups_if_idle(&db) {
+        None => {
+            tracing::debug!(
+                code = "AGENT_COST_ROLLUP_MAINTENANCE_BUSY",
+                "cost rollup materialization already in progress; periodic pass skipped"
+            );
+        }
+        Some(Ok(_report)) => {}
+        Some(Err(error)) => {
+            tracing::warn!(
+                code = "AGENT_COST_ROLLUP_MAINTENANCE_FAILED",
+                error = %error.message,
+                "periodic cost rollup materialization failed; will retry next cycle"
+            );
+        }
+    }
 }
 
 fn configured_db_path(m3_state: &Arc<Mutex<M3State>>) -> anyhow::Result<PathBuf> {
