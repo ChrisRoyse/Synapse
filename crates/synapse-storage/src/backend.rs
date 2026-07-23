@@ -986,7 +986,19 @@ impl Drop for CalyxVaultRuntime {
 
 impl CalyxBackend {
     pub fn open(path: &Path, schema_version: u32) -> StorageResult<Self> {
-        let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
+        // Honor the documented `--calyx-config` / `SYNAPSE_CALYX_CONFIG`
+        // tuning override at the authoritative vault open. 2026-07-23: the
+        // parsed tuning previously only reached the m3-side config object —
+        // this open always used default tuning, so an operator selecting
+        // `math_backend = "cpu"` (e.g. while the GPU is fully committed to
+        // another workload) was silently ignored and the daemon fail-closed
+        // on CUDA admission with no working escape hatch. Config read/parse
+        // failures abort the open loudly instead of falling back to defaults.
+        let config = SynapseCalyxConfig::from_optional_vault_dir_and_config_path(
+            Some(path.to_path_buf()),
+            std::env::var_os("SYNAPSE_CALYX_CONFIG").map(std::path::PathBuf::from),
+        )
+        .map_err(|source| calyx_open_failed(path, &source))?;
         // Coherent multi-page scans pin an MVCC sequence while writers continue
         // advancing the vault. The writable backend must therefore restore
         // historical rows; latest-only recovery cannot honor those leases.
