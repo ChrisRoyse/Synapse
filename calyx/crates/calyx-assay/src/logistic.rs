@@ -1,7 +1,9 @@
 //! Binary outcome logistic-probe MI estimator.
 
 mod calibration;
+mod conditioning;
 mod cuda;
+mod pipeline;
 mod train;
 
 use calyx_core::{Anchor, CalyxError, Result};
@@ -12,30 +14,53 @@ use crate::calibration::{
 };
 #[cfg(not(feature = "cuda"))]
 use crate::cuda_strict::cuda_unavailable;
-use crate::cuda_strict::strict_cuda_requested;
-use crate::estimate::{EstimateReliability, EstimatorKind, MiEstimate, TrustTag, trust_for_anchor};
-use crate::group_split::{GroupSplit, group_holdout_split, row_groups};
+use crate::estimate::{MiEstimate, TrustTag, trust_for_anchor};
 use crate::ksg::MIN_ASSAY_SAMPLES;
-use crate::samples::validate_rectangular_finite;
 
 use self::calibration::{logistic_power_calibration, logistic_power_calibration_cuda_strict};
-use self::cuda::{
-    LogisticCudaInputs, flatten_logistic_samples, logistic_summaries_cuda_strict_impl,
-    split_buffers_for_cuda,
+pub(crate) use self::conditioning::LogisticBlock;
+pub(crate) use self::conditioning::validate_conditioning_provenance;
+pub use self::conditioning::{
+    LOGISTIC_CONDITIONING_METHOD, LOGISTIC_CONDITIONING_SCHEMA_VERSION, LogisticConditioningBlock,
+    LogisticConditioningProvenance, LogisticConditioningScale, LogisticFoldConditioning,
 };
-use self::train::{LogisticSummary, logistic_heldout_summary, mean, sample_sigma, seed_ci};
+pub(crate) use self::pipeline::{
+    logistic_probe_mi_multiseed_blocks, logistic_probe_mi_multiseed_calibrated_blocks,
+};
+use self::pipeline::{
+    logistic_probe_mi_multiseed_blocks_with_trust_and_min_samples,
+    logistic_probe_mi_multiseed_blocks_with_trust_and_min_samples_cuda_strict,
+    logistic_probe_mi_multiseed_calibrated_with_trust,
+    logistic_probe_mi_multiseed_calibrated_with_trust_cuda_strict,
+    logistic_probe_mi_multiseed_with_trust_and_min_samples,
+    logistic_probe_mi_multiseed_with_trust_and_min_samples_cuda_strict,
+};
 
 pub const DEFAULT_ASSAY_SEEDS: [u64; 5] = [20_260_612, 7, 101, 2_024, 99_999];
 pub const DEFAULT_HOLDOUT_FRACTION: f32 = 0.2;
-const LOGISTIC_STEPS: usize = 96;
-const LOGISTIC_LR: f32 = 0.35;
+const LOGISTIC_MAX_ITERATIONS: usize = 2_048;
+const LOGISTIC_CONVERGENCE_CHECK_INTERVAL: usize = 16;
+const LOGISTIC_PROVENANCE_PPM_SCALE: u32 = 1_000_000;
+const LOGISTIC_RELATIVE_PARAMETER_TOLERANCE_PPM: u32 = 1_000;
+const LOGISTIC_RELATIVE_PARAMETER_EVIDENCE_MAX_PPM: u32 =
+    LOGISTIC_RELATIVE_PARAMETER_TOLERANCE_PPM + 1;
+const LOGISTIC_RELATIVE_PARAMETER_TOLERANCE: f32 =
+    LOGISTIC_RELATIVE_PARAMETER_TOLERANCE_PPM as f32 / LOGISTIC_PROVENANCE_PPM_SCALE as f32;
+const LOGISTIC_LEARNING_RATE_CAP: f32 = 0.35;
+const LOGISTIC_LIPSCHITZ_SAFETY: f32 = 0.95;
 const LOGISTIC_L2: f32 = 1.0e-4;
+
+fn logistic_learning_rate(block_count: usize) -> f32 {
+    let smoothness_bound = 0.25 * block_count.max(1) as f32 + LOGISTIC_L2;
+    LOGISTIC_LEARNING_RATE_CAP.min(LOGISTIC_LIPSCHITZ_SAFETY / smoothness_bound)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogisticProbeReport {
     pub estimate: MiEstimate,
     pub accuracy: f32,
     pub selected_field: &'static str,
+    pub conditioning: LogisticConditioningProvenance,
 }
 
 pub fn logistic_probe_mi(samples: &[Vec<f32>], labels: &[bool]) -> Result<LogisticProbeReport> {
@@ -246,181 +271,6 @@ fn logistic_probe_mi_multiseed_with_trust(
         trust,
         MIN_ASSAY_SAMPLES,
     )
-}
-
-fn logistic_probe_mi_multiseed_with_trust_and_min_samples(
-    samples: &[Vec<f32>],
-    labels: &[bool],
-    groups: Option<&[String]>,
-    trust: TrustTag,
-    min_samples: usize,
-) -> Result<LogisticProbeReport> {
-    if strict_cuda_requested() {
-        return logistic_probe_mi_multiseed_with_trust_and_min_samples_cuda_strict(
-            samples,
-            labels,
-            groups,
-            trust,
-            min_samples,
-        );
-    }
-    if samples.len() != labels.len() || samples.len() < min_samples {
-        return Err(CalyxError::assay_insufficient_samples(format!(
-            "need at least {min_samples} labeled samples"
-        )));
-    }
-    let dim = validate_rectangular_finite("logistic", samples)?;
-    let owned_groups;
-    let groups = match groups {
-        Some(groups) => groups,
-        None => {
-            owned_groups = row_groups(labels.len());
-            &owned_groups
-        }
-    };
-    let mut seed_summaries = Vec::with_capacity(DEFAULT_ASSAY_SEEDS.len());
-    for seed in DEFAULT_ASSAY_SEEDS {
-        let split = group_holdout_split(labels, groups, DEFAULT_HOLDOUT_FRACTION, seed)?;
-        seed_summaries.push(logistic_heldout_summary(samples, labels, dim, &split));
-    }
-    report_from_seed_summaries(seed_summaries, labels.len(), trust)
-}
-
-fn logistic_probe_mi_multiseed_with_trust_and_min_samples_cuda_strict(
-    samples: &[Vec<f32>],
-    labels: &[bool],
-    groups: Option<&[String]>,
-    trust: TrustTag,
-    min_samples: usize,
-) -> Result<LogisticProbeReport> {
-    if samples.len() != labels.len() || samples.len() < min_samples {
-        return Err(CalyxError::assay_insufficient_samples(format!(
-            "need at least {min_samples} labeled samples"
-        )));
-    }
-    let dim = validate_rectangular_finite("logistic", samples)?;
-    let owned_groups;
-    let groups = match groups {
-        Some(groups) => groups,
-        None => {
-            owned_groups = row_groups(labels.len());
-            &owned_groups
-        }
-    };
-    let mut splits = Vec::with_capacity(DEFAULT_ASSAY_SEEDS.len());
-    for seed in DEFAULT_ASSAY_SEEDS {
-        splits.push(group_holdout_split(
-            labels,
-            groups,
-            DEFAULT_HOLDOUT_FRACTION,
-            seed,
-        )?);
-    }
-    let flat = flatten_logistic_samples(samples, dim)?;
-    let cuda_labels = labels
-        .iter()
-        .map(|label| i32::from(*label))
-        .collect::<Vec<_>>();
-    let (train_offsets, train_indices, test_offsets, test_indices) =
-        split_buffers_for_cuda(&splits, labels.len())?;
-    let summaries = logistic_summaries_cuda_strict_impl(LogisticCudaInputs {
-        samples: &flat,
-        labels: &cuda_labels,
-        rows: labels.len(),
-        dim,
-        train_offsets: &train_offsets,
-        train_indices: &train_indices,
-        test_offsets: &test_offsets,
-        test_indices: &test_indices,
-    })?;
-    if summaries.bits.len() != DEFAULT_ASSAY_SEEDS.len()
-        || summaries.accuracy.len() != DEFAULT_ASSAY_SEEDS.len()
-    {
-        return Err(CalyxError::forge_numerical_invariant(format!(
-            "logistic CUDA returned {} bits and {} accuracies for {} seeds",
-            summaries.bits.len(),
-            summaries.accuracy.len(),
-            DEFAULT_ASSAY_SEEDS.len()
-        )));
-    }
-    let seed_summaries = summaries
-        .bits
-        .iter()
-        .zip(summaries.accuracy.iter())
-        .map(|(&bits, &accuracy)| LogisticSummary { bits, accuracy })
-        .collect::<Vec<_>>();
-    report_from_seed_summaries(seed_summaries, labels.len(), trust)
-}
-
-fn report_from_seed_summaries(
-    seed_summaries: Vec<LogisticSummary>,
-    n_samples: usize,
-    trust: TrustTag,
-) -> Result<LogisticProbeReport> {
-    let seed_bits = seed_summaries
-        .iter()
-        .map(|summary| summary.bits)
-        .collect::<Vec<_>>();
-    let bits = mean(&seed_bits);
-    let seed_sigma = sample_sigma(&seed_bits);
-    let (ci_low, ci_high) = seed_ci(bits, seed_sigma, seed_bits.len());
-    let reliability =
-        EstimateReliability::new(seed_bits.len(), seed_sigma, seed_sigma >= bits.abs())?;
-    Ok(LogisticProbeReport {
-        estimate: MiEstimate::new(
-            bits,
-            ci_low,
-            ci_high,
-            n_samples,
-            EstimatorKind::LogisticProbe,
-            trust,
-        )
-        .with_reliability(reliability),
-        accuracy: mean(
-            &seed_summaries
-                .iter()
-                .map(|summary| summary.accuracy)
-                .collect::<Vec<_>>(),
-        ),
-        selected_field: "logistic_probe_multiseed_group_holdout",
-    })
-}
-
-fn logistic_probe_mi_multiseed_calibrated_with_trust(
-    samples: &[Vec<f32>],
-    labels: &[bool],
-    groups: Option<&[String]>,
-    trust: TrustTag,
-) -> Result<LogisticProbeReport> {
-    if strict_cuda_requested() {
-        return logistic_probe_mi_multiseed_calibrated_with_trust_cuda_strict(
-            samples, labels, groups, trust,
-        );
-    }
-    ensure_informative_binary_labels(labels)?;
-    let calibration = logistic_power_calibration(samples, labels, groups, trust)?;
-    let mut report = logistic_probe_mi_multiseed_with_trust(samples, labels, groups, trust)?;
-    report.estimate = report.estimate.with_power_calibration(calibration);
-    Ok(report)
-}
-
-fn logistic_probe_mi_multiseed_calibrated_with_trust_cuda_strict(
-    samples: &[Vec<f32>],
-    labels: &[bool],
-    groups: Option<&[String]>,
-    trust: TrustTag,
-) -> Result<LogisticProbeReport> {
-    ensure_informative_binary_labels(labels)?;
-    let calibration = logistic_power_calibration_cuda_strict(samples, labels, groups, trust)?;
-    let mut report = logistic_probe_mi_multiseed_with_trust_and_min_samples_cuda_strict(
-        samples,
-        labels,
-        groups,
-        trust,
-        MIN_ASSAY_SAMPLES,
-    )?;
-    report.estimate = report.estimate.with_power_calibration(calibration);
-    Ok(report)
 }
 
 fn logistic_probe_mi_with_trust_and_min_samples(

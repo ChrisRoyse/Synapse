@@ -6,7 +6,10 @@ use crate::attribution::per_sensor_attribution;
 use crate::estimate::TrustTag;
 use crate::formulas::marginal_value;
 use crate::ksg::MIN_ASSAY_SAMPLES;
-use crate::logistic::{logistic_probe_mi_multiseed, logistic_probe_mi_multiseed_calibrated};
+use crate::logistic::{
+    LogisticBlock, logistic_probe_mi_multiseed_blocks,
+    logistic_probe_mi_multiseed_calibrated_blocks,
+};
 use crate::sufficiency::{PanelSufficiency, entropy_bits, panel_sufficiency_from_estimate};
 
 use super::a37::a37_diversity_gate;
@@ -125,6 +128,7 @@ fn build_card(
         n_eff,
         sufficient: sufficiency.sufficient,
         deficit_bits: sufficiency.deficit_bits,
+        conditioning: panel.conditioning.clone(),
         a37_diversity,
         redundancy_method: Some(redundancy.method.clone()),
         deficit_proposal: deficit_proposal(&sufficiency, &lens_values),
@@ -247,7 +251,12 @@ fn lens_estimates(
 ) -> Result<Vec<crate::LogisticProbeReport>> {
     lenses
         .iter()
-        .map(|lens| logistic_probe_mi_multiseed_calibrated(&lens.vectors, labels, groups))
+        .map(|lens| {
+            let blocks = [LogisticBlock::new(&lens.name, lens.slot, &lens.vectors)];
+            logistic_probe_mi_multiseed_calibrated_blocks(&blocks, labels, groups).map_err(
+                |error| assay_context(error, format!("solo lens {} slot {}", lens.name, lens.slot)),
+            )
+        })
         .collect()
 }
 
@@ -256,7 +265,8 @@ fn estimate_panel(
     labels: &[bool],
     groups: Option<&[String]>,
 ) -> Result<crate::LogisticProbeReport> {
-    logistic_probe_mi_multiseed_calibrated(&concat_lenses(lenses, None), labels, groups)
+    logistic_probe_mi_multiseed_calibrated_blocks(&lens_blocks(lenses, None), labels, groups)
+        .map_err(|error| assay_context(error, "full panel"))
 }
 
 fn estimate_panel_without(
@@ -265,7 +275,20 @@ fn estimate_panel_without(
     groups: Option<&[String]>,
     excluded: usize,
 ) -> Result<crate::LogisticProbeReport> {
-    logistic_probe_mi_multiseed_calibrated(&concat_lenses(lenses, Some(excluded)), labels, groups)
+    logistic_probe_mi_multiseed_calibrated_blocks(
+        &lens_blocks(lenses, Some(excluded)),
+        labels,
+        groups,
+    )
+    .map_err(|error| {
+        assay_context(
+            error,
+            format!(
+                "panel without lens {} slot {}",
+                lenses[excluded].name, lenses[excluded].slot
+            ),
+        )
+    })
 }
 
 fn pair_values(
@@ -278,8 +301,21 @@ fn pair_values(
     let mut pairs = Vec::new();
     for a in 0..lenses.len() {
         for b in (a + 1)..lenses.len() {
-            let pair_rows = concat_pair(&lenses[a], &lenses[b]);
-            let pair = logistic_probe_mi_multiseed(&pair_rows, labels, groups)?;
+            let pair_blocks = [
+                LogisticBlock::new(&lenses[a].name, lenses[a].slot, &lenses[a].vectors),
+                LogisticBlock::new(&lenses[b].name, lenses[b].slot, &lenses[b].vectors),
+            ];
+            let pair = logistic_probe_mi_multiseed_blocks(&pair_blocks, labels, groups).map_err(
+                |error| {
+                    assay_context(
+                        error,
+                        format!(
+                            "pair {} slot {} + {} slot {}",
+                            lenses[a].name, lenses[a].slot, lenses[b].name, lenses[b].slot
+                        ),
+                    )
+                },
+            )?;
             let evidence = redundancy
                 .pairs
                 .iter()
@@ -312,25 +348,19 @@ fn pair_values(
     Ok(pairs)
 }
 
-fn concat_lenses(lenses: &[EnsembleLensInput], excluded: Option<usize>) -> Vec<Vec<f32>> {
-    let rows = lenses.first().map(|lens| lens.vectors.len()).unwrap_or(0);
-    let mut joint = vec![Vec::new(); rows];
-    for (idx, lens) in lenses.iter().enumerate() {
-        if excluded == Some(idx) {
-            continue;
-        }
-        for (sample, row) in lens.vectors.iter().enumerate() {
-            joint[sample].extend_from_slice(row);
-        }
+fn assay_context(error: CalyxError, context: impl AsRef<str>) -> CalyxError {
+    CalyxError {
+        message: format!("{}: {}", context.as_ref(), error.message),
+        ..error
     }
-    joint
 }
 
-fn concat_pair(a: &EnsembleLensInput, b: &EnsembleLensInput) -> Vec<Vec<f32>> {
-    a.vectors
+fn lens_blocks(lenses: &[EnsembleLensInput], excluded: Option<usize>) -> Vec<LogisticBlock<'_>> {
+    lenses
         .iter()
-        .zip(&b.vectors)
-        .map(|(left, right)| left.iter().chain(right).copied().collect())
+        .enumerate()
+        .filter(|(idx, _)| Some(*idx) != excluded)
+        .map(|(_, lens)| LogisticBlock::new(&lens.name, lens.slot, &lens.vectors))
         .collect()
 }
 

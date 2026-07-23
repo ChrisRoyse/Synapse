@@ -151,6 +151,11 @@ pub fn validate_ensemble_card_redundancy(card: &EnsembleCard) -> Result<()> {
     })?;
     let mut roster = BTreeMap::new();
     let mut names = BTreeSet::new();
+    let conditioning_roster = card
+        .lenses
+        .iter()
+        .map(|lens| (lens.slot, lens.name.as_str()))
+        .collect::<Vec<_>>();
     for lens in &card.lenses {
         if roster.insert(lens.slot, lens.name.as_str()).is_some()
             || !names.insert(lens.name.as_str())
@@ -160,6 +165,11 @@ pub fn validate_ensemble_card_redundancy(card: &EnsembleCard) -> Result<()> {
             ));
         }
     }
+    crate::logistic::validate_conditioning_provenance(
+        &card.conditioning,
+        &conditioning_roster,
+        card.n_samples,
+    )?;
     let mut pairs = Vec::with_capacity(card.pairs.len());
     for pair in &card.pairs {
         let linear_cka = pair.redundancy.clone().ok_or_else(|| {

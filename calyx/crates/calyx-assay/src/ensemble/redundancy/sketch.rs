@@ -151,19 +151,19 @@ fn delete_block_standard_error(
 }
 
 fn checked_cosine((cross, self_a, self_b): (f64, f64, f64)) -> Result<f64> {
-    if !cross.is_finite()
-        || !self_a.is_finite()
-        || !self_b.is_finite()
-        || self_a <= 0.0
-        || self_b <= 0.0
-    {
+    if !cross.is_finite() || !self_a.is_finite() || !self_b.is_finite() {
+        return Err(CalyxError::forge_numerical_invariant(
+            "linear CKA accumulated non-finite energy",
+        ));
+    }
+    if self_a <= 0.0 || self_b <= 0.0 {
         return Err(CalyxError::assay_degenerate_input(
             "linear CKA has unresolved self energy",
         ));
     }
     let value = cross / (self_a * self_b).sqrt();
     if !value.is_finite() {
-        return Err(CalyxError::assay_degenerate_input(
+        return Err(CalyxError::forge_numerical_invariant(
             "linear CKA normalization was non-finite",
         ));
     }
@@ -250,7 +250,12 @@ impl CenteredEnergy {
             energy.add(*value);
         }
         let energy = energy.total();
-        if !energy.is_finite() || energy <= 0.0 {
+        if !energy.is_finite() {
+            return Err(CalyxError::forge_numerical_invariant(
+                "linear CKA centered energy was non-finite",
+            ));
+        }
+        if energy <= 0.0 {
             return Err(CalyxError::assay_degenerate_input(
                 "linear CKA representation has zero centered energy",
             ));
@@ -267,7 +272,7 @@ fn validate_row(row: &[f32], dimension: usize, index: usize) -> Result<()> {
         )));
     }
     if row.iter().any(|value| !value.is_finite()) {
-        return Err(CalyxError::assay_degenerate_input(format!(
+        return Err(CalyxError::forge_numerical_invariant(format!(
             "linear CKA row {index} contains non-finite values"
         )));
     }
@@ -289,7 +294,7 @@ pub(super) fn tuple_z(rows: [&[f32]; 4], inverse_energy: f64) -> Result<[f64; 3]
     let s = s.total() * inverse_energy;
     let values = [(r + s) / 6.0, (-2.0 * r + s) / 6.0, (r - 2.0 * s) / 6.0];
     if values.iter().any(|value| !value.is_finite()) {
-        return Err(CalyxError::assay_degenerate_input(
+        return Err(CalyxError::forge_numerical_invariant(
             "linear CKA tuple sketch was non-finite",
         ));
     }

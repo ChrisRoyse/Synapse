@@ -155,10 +155,13 @@ pub use ksg::{
     ksg_mi_continuous_with_anchor, ksg_mi_continuous_with_anchor_cuda_strict,
 };
 pub use logistic::{
-    DEFAULT_ASSAY_SEEDS, DEFAULT_HOLDOUT_FRACTION, LogisticProbeReport, logistic_probe_mi,
-    logistic_probe_mi_calibrated, logistic_probe_mi_calibrated_cuda_strict,
-    logistic_probe_mi_cuda_strict, logistic_probe_mi_multiseed,
-    logistic_probe_mi_multiseed_calibrated, logistic_probe_mi_multiseed_calibrated_cuda_strict,
+    DEFAULT_ASSAY_SEEDS, DEFAULT_HOLDOUT_FRACTION, LOGISTIC_CONDITIONING_METHOD,
+    LOGISTIC_CONDITIONING_SCHEMA_VERSION, LogisticConditioningBlock,
+    LogisticConditioningProvenance, LogisticConditioningScale, LogisticFoldConditioning,
+    LogisticProbeReport, logistic_probe_mi, logistic_probe_mi_calibrated,
+    logistic_probe_mi_calibrated_cuda_strict, logistic_probe_mi_cuda_strict,
+    logistic_probe_mi_multiseed, logistic_probe_mi_multiseed_calibrated,
+    logistic_probe_mi_multiseed_calibrated_cuda_strict,
     logistic_probe_mi_multiseed_calibrated_with_anchor,
     logistic_probe_mi_multiseed_calibrated_with_anchor_cuda_strict,
     logistic_probe_mi_multiseed_cuda_strict, logistic_probe_mi_multiseed_with_anchor,

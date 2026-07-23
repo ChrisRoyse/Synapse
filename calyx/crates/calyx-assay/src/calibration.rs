@@ -74,8 +74,14 @@ impl PowerCalibration {
             return Ok(());
         }
         Err(underpowered(format!(
-            "planted signal recovered {:.6}/{:.6} bits ({:.3}) below required ratio {:.3}",
-            self.recovered_bits, self.planted_bits, self.recovery_ratio, self.min_recovery_ratio
+            "planted signal recovered {:.6}/{:.6} bits ({:.3}) below required ratio {:.3}; samples={} calibrated_features={} diagnostic_column={}",
+            self.recovered_bits,
+            self.planted_bits,
+            self.recovery_ratio,
+            self.min_recovery_ratio,
+            self.n_samples,
+            self.n_features,
+            self.planted_column
         )))
     }
 }

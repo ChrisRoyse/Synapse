@@ -55,6 +55,9 @@ pub struct CudaCcmPredictions {
 pub struct CudaLogisticSummaries {
     pub bits: Vec<f32>,
     pub accuracy: Vec<f32>,
+    pub iterations: Vec<usize>,
+    pub final_relative_parameter_changes: Vec<f32>,
+    pub converged: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

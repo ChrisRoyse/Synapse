@@ -1,26 +1,42 @@
+use crate::group_split::GroupSplit;
+
 use super::*;
 
-pub(super) fn flatten_logistic_samples(samples: &[Vec<f32>], dim: usize) -> Result<Vec<f32>> {
-    let capacity = samples
-        .len()
-        .checked_mul(dim)
+pub(super) fn flatten_logistic_blocks(
+    blocks: &[LogisticBlock<'_>],
+    rows: usize,
+    total_dim: usize,
+) -> Result<Vec<f32>> {
+    let capacity = rows
+        .checked_mul(total_dim)
         .ok_or_else(|| CalyxError::forge_vram_budget("logistic CUDA flat sample overflow"))?;
     let mut flat = Vec::with_capacity(capacity);
-    for (row_idx, row) in samples.iter().enumerate() {
-        if row.len() != dim {
-            return Err(CalyxError::assay_insufficient_samples(format!(
-                "logistic CUDA row {row_idx} has dim {}, expected {dim}",
-                row.len()
-            )));
-        }
-        for (col_idx, &value) in row.iter().enumerate() {
-            if !value.is_finite() {
-                return Err(CalyxError::forge_numerical_invariant(format!(
-                    "logistic CUDA sample row {row_idx} col {col_idx} is non-finite: {value}"
+    for block in blocks {
+        let dim = block.dim();
+        for (row_idx, row) in block.vectors.iter().enumerate() {
+            if row.len() != dim {
+                return Err(CalyxError::lens_dim_mismatch(format!(
+                    "logistic CUDA lens block {} row {row_idx} has dim {}, expected {dim}",
+                    block.name,
+                    row.len()
                 )));
             }
-            flat.push(value);
+            for (col_idx, &value) in row.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(CalyxError::forge_numerical_invariant(format!(
+                        "logistic CUDA lens block {} row {row_idx} col {col_idx} is non-finite: {value}",
+                        block.name
+                    )));
+                }
+                flat.push(value);
+            }
         }
+    }
+    if flat.len() != capacity {
+        return Err(CalyxError::lens_dim_mismatch(format!(
+            "logistic CUDA block-major values {} != rows {rows} * total_dim {total_dim}",
+            flat.len()
+        )));
     }
     Ok(flat)
 }
@@ -98,6 +114,8 @@ pub(super) struct LogisticCudaInputs<'a> {
     pub(super) labels: &'a [i32],
     pub(super) rows: usize,
     pub(super) dim: usize,
+    pub(super) blocks: &'a [LogisticBlock<'a>],
+    pub(super) block_scales: &'a [Vec<f32>],
     pub(super) train_offsets: &'a [i32],
     pub(super) train_indices: &'a [i32],
     pub(super) test_offsets: &'a [i32],
@@ -108,15 +126,22 @@ pub(super) struct LogisticCudaInputs<'a> {
 pub(super) fn logistic_summaries_cuda_strict_impl(
     input: LogisticCudaInputs<'_>,
 ) -> Result<calyx_forge::CudaLogisticSummaries> {
+    let (block_value_offsets, block_feature_offsets, block_dims) =
+        cuda_block_layout(input.blocks, input.rows)?;
+    let block_scales = flatten_block_scales(input.block_scales, input.blocks.len())?;
     let backend = calyx_forge::CudaBackend::new()
         .map_err(|err| crate::cuda_strict::forge_to_calyx("logistic probe", err))?;
-    calyx_forge::logistic_summaries_host(
+    let summaries = calyx_forge::logistic_summaries_host(
         backend.context(),
         calyx_forge::CudaLogisticDataset {
             samples: input.samples,
             labels: input.labels,
             rows: input.rows,
             dim: input.dim,
+            block_value_offsets: &block_value_offsets,
+            block_feature_offsets: &block_feature_offsets,
+            block_dims: &block_dims,
+            block_scales: &block_scales,
         },
         calyx_forge::CudaLogisticSplits {
             train_offsets: input.train_offsets,
@@ -125,12 +150,102 @@ pub(super) fn logistic_summaries_cuda_strict_impl(
             test_indices: input.test_indices,
         },
         calyx_forge::CudaLogisticConfig {
-            steps: LOGISTIC_STEPS,
-            learning_rate: LOGISTIC_LR,
+            max_iterations: LOGISTIC_MAX_ITERATIONS,
+            convergence_check_interval: LOGISTIC_CONVERGENCE_CHECK_INTERVAL,
+            relative_parameter_tolerance: LOGISTIC_RELATIVE_PARAMETER_TOLERANCE,
+            learning_rate: logistic_learning_rate(input.blocks.len()),
             l2_penalty: LOGISTIC_L2,
         },
     )
-    .map_err(|err| crate::cuda_strict::forge_to_calyx("logistic probe", err))
+    .map_err(|err| crate::cuda_strict::forge_to_calyx("logistic probe", err))?;
+    if summaries.iterations.len() != summaries.converged.len()
+        || summaries.iterations.len() != summaries.final_relative_parameter_changes.len()
+    {
+        return Err(CalyxError::forge_numerical_invariant(format!(
+            "logistic CUDA convergence readback lengths disagree: iterations={} flags={} gradients={}",
+            summaries.iterations.len(),
+            summaries.converged.len(),
+            summaries.final_relative_parameter_changes.len()
+        )));
+    }
+    for fit in 0..summaries.iterations.len() {
+        if !summaries.converged[fit] {
+            let seed = DEFAULT_ASSAY_SEEDS.get(fit).copied().unwrap_or_default();
+            return Err(crate::calibration::underpowered(format!(
+                "logistic CUDA seed {seed} fit {fit} did not converge: final max relative parameter change {:.9} exceeds tolerance {:.9} after {} iterations; lens_blocks={} total_features={}",
+                summaries.final_relative_parameter_changes[fit],
+                LOGISTIC_RELATIVE_PARAMETER_TOLERANCE,
+                summaries.iterations[fit],
+                input.blocks.len(),
+                input.dim
+            )));
+        }
+    }
+    Ok(summaries)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_block_layout(
+    blocks: &[LogisticBlock<'_>],
+    rows: usize,
+) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    let mut value_offsets = Vec::with_capacity(blocks.len() + 1);
+    let mut feature_offsets = Vec::with_capacity(blocks.len() + 1);
+    let mut dims = Vec::with_capacity(blocks.len());
+    value_offsets.push(0);
+    feature_offsets.push(0);
+    let mut values = 0_usize;
+    let mut features = 0_usize;
+    for block in blocks {
+        let dim = block.dim();
+        values = values
+            .checked_add(rows.checked_mul(dim).ok_or_else(|| {
+                CalyxError::forge_vram_budget("logistic CUDA block value span overflow")
+            })?)
+            .ok_or_else(|| {
+                CalyxError::forge_vram_budget("logistic CUDA block value offset overflow")
+            })?;
+        features = features.checked_add(dim).ok_or_else(|| {
+            CalyxError::forge_vram_budget("logistic CUDA block feature offset overflow")
+        })?;
+        dims.push(usize_to_i32_for_cuda(dim, "logistic block dimension")?);
+        value_offsets.push(usize_to_i32_for_cuda(
+            values,
+            "logistic block value offset",
+        )?);
+        feature_offsets.push(usize_to_i32_for_cuda(
+            features,
+            "logistic block feature offset",
+        )?);
+    }
+    Ok((value_offsets, feature_offsets, dims))
+}
+
+#[cfg(feature = "cuda")]
+fn flatten_block_scales(scales: &[Vec<f32>], block_count: usize) -> Result<Vec<f32>> {
+    let mut flat = Vec::with_capacity(
+        scales
+            .len()
+            .checked_mul(block_count)
+            .ok_or_else(|| CalyxError::forge_vram_budget("logistic CUDA scale span overflow"))?,
+    );
+    for (fit, fit_scales) in scales.iter().enumerate() {
+        if fit_scales.len() != block_count {
+            return Err(CalyxError::assay_degenerate_input(format!(
+                "logistic CUDA fit {fit} scale count {} != block count {block_count}",
+                fit_scales.len()
+            )));
+        }
+        for (block, &scale) in fit_scales.iter().enumerate() {
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(CalyxError::forge_numerical_invariant(format!(
+                    "logistic CUDA fit {fit} block {block} has invalid scale {scale}"
+                )));
+            }
+            flat.push(scale);
+        }
+    }
+    Ok(flat)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -138,9 +253,11 @@ pub(super) fn logistic_summaries_cuda_strict_impl(
     input: LogisticCudaInputs<'_>,
 ) -> Result<UnavailableCudaLogisticSummaries> {
     Err(cuda_unavailable(&format!(
-        "logistic probe (rows={}, dim={}, sample_values={}, labels={}, train_offsets={}, train_indices={}, test_offsets={}, test_indices={})",
+        "logistic probe (rows={}, dim={}, blocks={}, block_scale_fits={}, sample_values={}, labels={}, train_offsets={}, train_indices={}, test_offsets={}, test_indices={})",
         input.rows,
         input.dim,
+        input.blocks.len(),
+        input.block_scales.len(),
         input.samples.len(),
         input.labels.len(),
         input.train_offsets.len(),
@@ -154,4 +271,7 @@ pub(super) fn logistic_summaries_cuda_strict_impl(
 pub(super) struct UnavailableCudaLogisticSummaries {
     pub(super) bits: Vec<f32>,
     pub(super) accuracy: Vec<f32>,
+    pub(super) iterations: Vec<usize>,
+    pub(super) final_relative_parameter_changes: Vec<f32>,
+    pub(super) converged: Vec<bool>,
 }

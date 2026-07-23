@@ -1,11 +1,12 @@
 use calyx_core::SlotId;
 use serde::{Deserialize, Serialize};
 
+use crate::LogisticConditioningProvenance;
 use crate::sufficiency::PanelSufficiency;
 
 use super::a37::A37DiversityGate;
 
-pub const ENSEMBLE_CARD_SCHEMA_VERSION: u32 = 2;
+pub const ENSEMBLE_CARD_SCHEMA_VERSION: u32 = 3;
 pub const ENSEMBLE_CARD_PID_METHOD: &str = "bounded_decision_surrogate_v1";
 pub const MIN_ENSEMBLE_PANEL_LENSES: usize = 3;
 pub const DEFAULT_GATE_PANEL_LENSES: usize = 10;
@@ -85,6 +86,8 @@ pub struct EnsembleCard {
     pub n_eff: f32,
     pub sufficient: bool,
     pub deficit_bits: f32,
+    #[serde(default)]
+    pub conditioning: LogisticConditioningProvenance,
     pub a37_diversity: A37DiversityGate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy_method: Option<EnsembleRedundancyMethod>,

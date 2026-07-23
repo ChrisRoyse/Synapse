@@ -7,7 +7,6 @@
 
 #define ASSAY_THREADS 256
 #define ASSAY_MAX_K 32
-#define ASSAY_LOGISTIC_MAX_DIM 1024
 #define ASSAY_LINALG_MAX_D 64
 #define ASSAY_GRANGER_MAX_LAGS 32
 #define ASSAY_GRANGER_MAX_K (2 * ASSAY_GRANGER_MAX_LAGS + 1)
@@ -63,6 +62,16 @@ __device__ __forceinline__ void reduce_float_sum(float *values, unsigned int *ba
     for (int stride = ASSAY_THREADS / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             values[tid] += values[tid + stride];
+            bad[tid] |= bad[tid + stride];
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void reduce_float_max(float *values, unsigned int *bad, int tid) {
+    for (int stride = ASSAY_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            values[tid] = fmaxf(values[tid], values[tid + stride]);
             bad[tid] |= bad[tid + stride];
         }
         __syncthreads();
@@ -1152,6 +1161,11 @@ extern "C" __global__ void assay_granger_lag_summaries_f32(
 extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summaries_f32(
     const float *samples,
     const int *labels,
+    const int *block_value_offsets,
+    const int *block_feature_offsets,
+    const int *block_dims,
+    const float *block_scales,
+    int block_count,
     const int *train_offsets,
     const int *train_indices,
     const int *test_offsets,
@@ -1159,33 +1173,53 @@ extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summa
     int fit_count,
     int n,
     int dim,
-    int steps,
+    int max_iterations,
+    int convergence_check_interval,
+    float relative_parameter_tolerance,
     float lr,
     float l2,
+    float *weights_workspace,
+    float *gradient_workspace,
     float *bits,
     float *accuracy,
+    int *iterations,
+    float *final_relative_parameter_changes,
+    int *converged,
     unsigned int *flags) {
-    __shared__ float weights[ASSAY_LOGISTIC_MAX_DIM];
-    __shared__ float gradient[ASSAY_LOGISTIC_MAX_DIM];
     __shared__ float sums[ASSAY_THREADS];
     __shared__ unsigned int bad[ASSAY_THREADS];
     __shared__ float shared_error;
+    __shared__ float shared_max_parameter_change;
+    __shared__ float shared_max_parameter_magnitude;
+    __shared__ int shared_converged;
 
     const int fit = blockIdx.x;
     const int tid = threadIdx.x;
     unsigned int local_bad =
-        (fit >= fit_count || fit_count <= 0 || n <= 0 || dim <= 0 || dim > ASSAY_LOGISTIC_MAX_DIM ||
-         steps <= 0 || !(isfinite(lr) && isfinite(l2)) || !(lr > 0.0f) || l2 < 0.0f)
+        (fit >= fit_count || fit_count <= 0 || n <= 0 || dim <= 0 || block_count <= 0 ||
+         max_iterations <= 0 || convergence_check_interval <= 0 ||
+         convergence_check_interval > max_iterations ||
+         max_iterations % convergence_check_interval != 0 ||
+         !(isfinite(relative_parameter_tolerance) && relative_parameter_tolerance > 0.0f) ||
+         !(isfinite(lr) && isfinite(l2)) || !(lr > 0.0f) || l2 < 0.0f)
             ? ASSAY_FLAG_INVALID_INDEX
             : 0u;
+    float *weights = weights_workspace + (size_t)fit * (size_t)dim;
+    float *gradient = gradient_workspace + (size_t)fit * (size_t)dim;
 
-    for (int d = tid; d < dim && d < ASSAY_LOGISTIC_MAX_DIM; d += blockDim.x) {
+    for (int d = tid; d < dim; d += blockDim.x) {
         weights[d] = 0.0f;
         gradient[d] = 0.0f;
     }
     __shared__ float bias;
     if (tid == 0) {
         bias = 0.0f;
+        shared_max_parameter_change = INFINITY;
+        shared_max_parameter_magnitude = 0.0f;
+        shared_converged = 0;
+        iterations[fit] = 0;
+        final_relative_parameter_changes[fit] = INFINITY;
+        converged[fit] = 0;
     }
     __syncthreads();
 
@@ -1199,7 +1233,9 @@ extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summa
         }
         const int train_n = train_end - train_start;
 
-        for (int step = 0; step < steps && local_bad == 0u; step++) {
+        for (int iteration = 1;
+             iteration <= max_iterations && local_bad == 0u && shared_converged == 0;
+             iteration++) {
             for (int d = tid; d < dim; d += blockDim.x) {
                 gradient[d] = 0.0f;
             }
@@ -1213,14 +1249,22 @@ extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summa
                 }
                 float partial = 0.0f;
                 if (local_bad == 0u) {
-                    const int base = row * dim;
-                    for (int d = tid; d < dim; d += blockDim.x) {
-                        const float value = samples[base + d];
-                        const float weight = weights[d];
-                        if (!(isfinite(value) && isfinite(weight))) {
+                    for (int block = 0; block < block_count; block++) {
+                        const int block_dim = block_dims[block];
+                        const int value_base = block_value_offsets[block] + row * block_dim;
+                        const int feature_base = block_feature_offsets[block];
+                        const float scale = block_scales[fit * block_count + block];
+                        if (block_dim <= 0 || !(isfinite(scale) && scale > 0.0f)) {
                             local_bad |= ASSAY_FLAG_NONFINITE;
                         }
-                        partial += value * weight;
+                        for (int col = tid; col < block_dim; col += blockDim.x) {
+                            const float value = samples[value_base + col] / scale;
+                            const float weight = weights[feature_base + col];
+                            if (!(isfinite(value) && isfinite(weight))) {
+                                local_bad |= ASSAY_FLAG_NONFINITE;
+                            }
+                            partial += value * weight;
+                        }
                     }
                 }
                 sums[tid] = partial;
@@ -1241,9 +1285,15 @@ extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summa
                 __syncthreads();
                 local_bad |= bad[0];
                 if (local_bad == 0u) {
-                    const int base = row * dim;
-                    for (int d = tid; d < dim; d += blockDim.x) {
-                        gradient[d] += shared_error * samples[base + d];
+                    for (int block = 0; block < block_count; block++) {
+                        const int block_dim = block_dims[block];
+                        const int value_base = block_value_offsets[block] + row * block_dim;
+                        const int feature_base = block_feature_offsets[block];
+                        const float scale = block_scales[fit * block_count + block];
+                        for (int col = tid; col < block_dim; col += blockDim.x) {
+                            gradient[feature_base + col] +=
+                                shared_error * (samples[value_base + col] / scale);
+                        }
                     }
                     if (tid == 0) {
                         bias_grad += shared_error;
@@ -1254,20 +1304,81 @@ extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summa
 
             if (local_bad == 0u) {
                 const float inv_n = 1.0f / (float)train_n;
+                float local_max_parameter_change = 0.0f;
+                float local_max_parameter_magnitude = 0.0f;
                 for (int d = tid; d < dim; d += blockDim.x) {
-                    const float update = lr * (gradient[d] * inv_n + l2 * weights[d]);
-                    weights[d] -= update;
+                    const float regularized_gradient = gradient[d] * inv_n + l2 * weights[d];
+                    gradient[d] = regularized_gradient;
+                    if (!isfinite(regularized_gradient)) {
+                        local_bad |= ASSAY_FLAG_NONFINITE;
+                    }
+                    const float parameter_change = lr * regularized_gradient;
+                    weights[d] -= parameter_change;
                     if (!isfinite(weights[d])) {
                         local_bad |= ASSAY_FLAG_NONFINITE;
                     }
+                    local_max_parameter_change =
+                        fmaxf(local_max_parameter_change, fabsf(parameter_change));
+                    local_max_parameter_magnitude =
+                        fmaxf(local_max_parameter_magnitude, fabsf(weights[d]));
                 }
                 if (tid == 0) {
-                    bias -= lr * bias_grad * inv_n;
+                    const float normalized_bias_gradient = bias_grad * inv_n;
+                    if (!isfinite(normalized_bias_gradient)) {
+                        local_bad |= ASSAY_FLAG_NONFINITE;
+                    }
+                    const float bias_change = lr * normalized_bias_gradient;
+                    bias -= bias_change;
                     if (!isfinite(bias)) {
                         local_bad |= ASSAY_FLAG_NONFINITE;
                     }
+                    local_max_parameter_change =
+                        fmaxf(local_max_parameter_change, fabsf(bias_change));
+                    local_max_parameter_magnitude =
+                        fmaxf(local_max_parameter_magnitude, fabsf(bias));
                 }
+                sums[tid] = local_max_parameter_change;
+                bad[tid] = local_bad;
+                __syncthreads();
+                reduce_float_max(sums, bad, tid);
+                if (tid == 0) {
+                    shared_max_parameter_change = sums[0];
+                }
+                __syncthreads();
+                local_bad |= bad[0];
+                sums[tid] = local_max_parameter_magnitude;
+                bad[tid] = local_bad;
+                __syncthreads();
+                reduce_float_max(sums, bad, tid);
+                if (tid == 0) {
+                    shared_max_parameter_magnitude = sums[0];
+                    const float relative_change =
+                        shared_max_parameter_magnitude > 0.0f
+                            ? shared_max_parameter_change / shared_max_parameter_magnitude
+                            : (shared_max_parameter_change == 0.0f ? 0.0f : INFINITY);
+                    iterations[fit] = iteration;
+                    final_relative_parameter_changes[fit] = relative_change;
+                    if (!isfinite(relative_change)) {
+                        bad[0] |= ASSAY_FLAG_NONFINITE;
+                    } else {
+                        const bool checkpoint =
+                            iteration % convergence_check_interval == 0 ||
+                            iteration == max_iterations;
+                        if (checkpoint &&
+                            relative_change <= relative_parameter_tolerance) {
+                            shared_converged = 1;
+                            converged[fit] = 1;
+                        }
+                    }
+                }
+                __syncthreads();
+                local_bad |= bad[0];
             }
+            sums[tid] = 0.0f;
+            bad[tid] = local_bad;
+            __syncthreads();
+            reduce_float_sum(sums, bad, tid);
+            local_bad |= bad[0];
             __syncthreads();
         }
 
@@ -1277,21 +1388,31 @@ extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_logistic_summa
         int joint10 = 0;
         int joint11 = 0;
         const int test_n = test_end - test_start;
-        for (int pos = test_start; pos < test_end && local_bad == 0u; pos++) {
+        for (int pos = test_start;
+             pos < test_end && local_bad == 0u && shared_converged != 0;
+             pos++) {
             const int row = test_indices[pos];
             if (row < 0 || row >= n) {
                 local_bad |= ASSAY_FLAG_INVALID_INDEX;
             }
             float partial = 0.0f;
             if (local_bad == 0u) {
-                const int base = row * dim;
-                for (int d = tid; d < dim; d += blockDim.x) {
-                    const float value = samples[base + d];
-                    const float weight = weights[d];
-                    if (!(isfinite(value) && isfinite(weight))) {
+                for (int block = 0; block < block_count; block++) {
+                    const int block_dim = block_dims[block];
+                    const int value_base = block_value_offsets[block] + row * block_dim;
+                    const int feature_base = block_feature_offsets[block];
+                    const float scale = block_scales[fit * block_count + block];
+                    if (block_dim <= 0 || !(isfinite(scale) && scale > 0.0f)) {
                         local_bad |= ASSAY_FLAG_NONFINITE;
                     }
-                    partial += value * weight;
+                    for (int col = tid; col < block_dim; col += blockDim.x) {
+                        const float value = samples[value_base + col] / scale;
+                        const float weight = weights[feature_base + col];
+                        if (!(isfinite(value) && isfinite(weight))) {
+                            local_bad |= ASSAY_FLAG_NONFINITE;
+                        }
+                        partial += value * weight;
+                    }
                 }
             }
             sums[tid] = partial;
