@@ -1316,6 +1316,7 @@ namespace SynapseSetup
         private const uint CREATE_NO_WINDOW = 0x08000000;
         private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
         private const int JobObjectExtendedLimitInformation = 9;
+        private const int JobObjectBasicProcessIdList = 3;
         private const uint WAIT_OBJECT_0 = 0x00000000;
         private const uint WAIT_TIMEOUT = 0x00000102;
         private const uint WAIT_FAILED = 0xffffffff;
@@ -1403,6 +1404,14 @@ namespace SynapseSetup
             IntPtr lpJobObjectInfo,
             uint cbJobObjectInfoLength);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength,
+            out uint lpReturnLength);
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool CreateProcess(
             string lpApplicationName,
@@ -1464,6 +1473,8 @@ namespace SynapseSetup
             IntPtr job = IntPtr.Zero;
             IntPtr limitPointer = IntPtr.Zero;
             PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
+            uint[] activeJobProcessIds = new uint[0];
+            string activeJobProcessQueryError = "";
             try
             {
                 job = CreateJobObject(IntPtr.Zero, null);
@@ -1593,6 +1604,17 @@ namespace SynapseSetup
             }
             finally
             {
+                if (job != IntPtr.Zero)
+                {
+                    try
+                    {
+                        activeJobProcessIds = ActiveProcessIds(job);
+                    }
+                    catch (Exception error)
+                    {
+                        activeJobProcessQueryError = error.Message;
+                    }
+                }
                 diagnosticsJson = BuildDiagnosticsJson(
                     applicationName,
                     commandLine,
@@ -1612,6 +1634,8 @@ namespace SynapseSetup
                     terminateJobOk,
                     terminateJobError,
                     cleanupWait,
+                    activeJobProcessIds,
+                    activeJobProcessQueryError,
                     failure);
                 if (limitPointer != IntPtr.Zero)
                 {
@@ -1639,6 +1663,45 @@ namespace SynapseSetup
             if (wait == WAIT_TIMEOUT) return "WAIT_TIMEOUT";
             if (wait == WAIT_FAILED) return "WAIT_FAILED";
             return "unexpected_" + wait.ToString();
+        }
+
+        private static uint[] ActiveProcessIds(IntPtr job)
+        {
+            const int capacity = 4096;
+            int headerBytes = sizeof(uint) * 2;
+            int bufferBytes = headerBytes + (IntPtr.Size * capacity);
+            IntPtr buffer = Marshal.AllocHGlobal(bufferBytes);
+            try
+            {
+                uint returned;
+                if (!QueryInformationJobObject(
+                    job,
+                    JobObjectBasicProcessIdList,
+                    buffer,
+                    (uint)bufferBytes,
+                    out returned))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                uint count = unchecked((uint)Marshal.ReadInt32(buffer, sizeof(uint)));
+                if (count > capacity)
+                {
+                    throw new InvalidOperationException("job process list exceeded diagnostic capacity");
+                }
+                uint[] processIds = new uint[count];
+                for (int index = 0; index < count; index++)
+                {
+                    IntPtr offset = IntPtr.Add(buffer, headerBytes + (index * IntPtr.Size));
+                    processIds[index] = unchecked((uint)(IntPtr.Size == 8
+                        ? Marshal.ReadInt64(offset)
+                        : Marshal.ReadInt32(offset)));
+                }
+                return processIds;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
         }
 
         private static string JsonEscape(string value)
@@ -1691,6 +1754,8 @@ namespace SynapseSetup
             bool terminateJobOk,
             string terminateJobError,
             uint cleanupWait,
+            uint[] activeJobProcessIds,
+            string activeJobProcessQueryError,
             string failure)
         {
             int signedExitCode = unchecked((int)exitCode);
@@ -1718,6 +1783,15 @@ namespace SynapseSetup
             json.Append(",\"terminate_job_error\":\"").Append(JsonEscape(terminateJobError)).Append("\"");
             json.Append(",\"cleanup_wait_result\":").Append(cleanupWait);
             json.Append(",\"cleanup_wait_kind\":\"").Append(JsonEscape(WaitKind(cleanupWait))).Append("\"");
+            json.Append(",\"job_active_process_ids_after\":[");
+            for (int index = 0; index < activeJobProcessIds.Length; index++)
+            {
+                if (index != 0) json.Append(",");
+                json.Append(activeJobProcessIds[index]);
+            }
+            json.Append("]");
+            json.Append(",\"job_active_process_query_error\":\"")
+                .Append(JsonEscape(activeJobProcessQueryError)).Append("\"");
             json.Append(",\"failure\":\"").Append(JsonEscape(failure)).Append("\"");
             json.Append("}");
             return json.ToString();
@@ -1790,8 +1864,19 @@ function Invoke-SynapseProcessInKillOnCloseJob {
         $childProcessAfter = Get-CimInstance Win32_Process -Filter "ProcessId=$childPid" -ErrorAction SilentlyContinue |
             Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine
     }
+    $jobActiveProcessIds = if ($processJobDiagnostics -and $processJobDiagnostics.job_active_process_ids_after) {
+        @($processJobDiagnostics.job_active_process_ids_after | ForEach-Object { [uint32]$_ })
+    } else {
+        @()
+    }
+    $jobOwnedBuildToolsAfter = @($compilerProcessesAfter | Where-Object {
+        $jobActiveProcessIds -contains [uint32]$_.ProcessId
+    })
+    $unrelatedBuildToolsAfter = @($compilerProcessesAfter | Where-Object {
+        $jobActiveProcessIds -notcontains [uint32]$_.ProcessId
+    })
     $diagnosticObject = [ordered]@{
-        schema = 'synapse_setup_process_job_invocation/v1'
+        schema = 'synapse_setup_process_job_invocation/v2'
         command = $targetCommand
         application_path = $applicationPath
         working_directory = $WorkingDirectory
@@ -1804,12 +1889,15 @@ function Invoke-SynapseProcessInKillOnCloseJob {
         failure = $failure
         process_job = $processJobDiagnostics
         child_process_after = $childProcessAfter
-        build_tool_processes_before = $compilerProcessesBefore
-        build_tool_processes_after = $compilerProcessesAfter
+        global_build_tool_processes_before = $compilerProcessesBefore
+        global_build_tool_processes_after = $compilerProcessesAfter
+        job_owned_build_tool_processes_after = $jobOwnedBuildToolsAfter
+        unrelated_build_tool_processes_after = $unrelatedBuildToolsAfter
         cleanup_result = [ordered]@{
             process_table_after_read = $true
             child_process_alive_after = ($null -ne $childProcessAfter)
-            live_build_tool_process_count_after = @($compilerProcessesAfter).Count
+            job_owned_build_tool_process_count_after = @($jobOwnedBuildToolsAfter).Count
+            unrelated_build_tool_process_count_after = @($unrelatedBuildToolsAfter).Count
         }
     }
     if ($PSBoundParameters.ContainsKey('Diagnostics')) {
@@ -2061,7 +2149,7 @@ function Get-SynapseReleaseBuildFailureKind {
     if ($job -and $job.completion_kind -eq 'timeout') {
         return [pscustomobject]@{
             code = 'SYNAPSE_RELEASE_BUILD_TIMEOUT'
-            remediation = 'increase BuildTimeoutMinutes only after verifying rustc/cargo are still making progress, or inspect build_tool_processes_after and setup-build.log for a stuck compiler/linker'
+            remediation = 'increase BuildTimeoutMinutes only after verifying job_owned_build_tool_processes_after are still making progress, or inspect setup-build.log for a stuck compiler/linker; unrelated_build_tool_processes_after are context only and never cleanup targets'
         }
     }
     if ($job -and -not [string]::IsNullOrWhiteSpace([string]$job.failure) -and $job.completion_kind -ne 'child_exit') {
@@ -2091,12 +2179,12 @@ function Get-SynapseReleaseBuildFailureKind {
     if ($job -and [int]$job.exit_code_signed -eq -1) {
         return [pscustomobject]@{
             code = 'SYNAPSE_RELEASE_BUILD_CHILD_EXIT_NO_COMPILER_ERROR'
-            remediation = 'child process exited -1 without compiler diagnostics; inspect process_job child_pid, wait_kind, build_tool_processes_before/after, artifact_readback, and Windows host logs for external termination or toolchain process death'
+            remediation = 'child process exited -1 without compiler diagnostics; inspect process_job child_pid/wait_kind/job_active_process_ids_after, job_owned_build_tool_processes_after, artifact_readback, and Windows host logs; unrelated_build_tool_processes_after are context only'
         }
     }
     return [pscustomobject]@{
         code = 'SYNAPSE_RELEASE_BUILD_CHILD_EXIT'
-        remediation = 'child process exited nonzero; inspect setup-build.log, process_job, build_tool_processes_before/after, and artifact_readback for the root cause'
+        remediation = 'child process exited nonzero; inspect setup-build.log, process_job, job_owned_build_tool_processes_after, and artifact_readback; unrelated_build_tool_processes_after are context only'
     }
 }
 
@@ -8210,6 +8298,7 @@ if (-not $SkipBuild) {
     Info "Build parallelism: CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) (logical CPUs: $([Environment]::ProcessorCount))"
     $buildLog = Join-Path $LogDir 'setup-build.log'
     $buildDiagnosticsPath = Join-Path $LogDir 'setup-build-diagnostics.json'
+    $buildInvocationPath = Join-Path $LogDir 'setup-build-invocation.json'
     # Preserve the last failure diagnostics across later successful retries;
     # each new failure also writes an immutable per-attempt archive below.
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
@@ -8222,6 +8311,17 @@ if (-not $SkipBuild) {
         -TimeoutMinutes $BuildTimeoutMinutes `
         -LogPath $buildLog `
         -Diagnostics ([ref]$buildInvocationDiagnostics)
+    $buildInvocationDiagnostics |
+        ConvertTo-Json -Depth 32 |
+        Set-Content -LiteralPath $buildInvocationPath -Encoding UTF8
+    $buildInvocationReadback = Get-Content -LiteralPath $buildInvocationPath -Raw |
+        ConvertFrom-Json
+    if ($buildInvocationReadback.schema -ne 'synapse_setup_process_job_invocation/v2' -or
+        -not $buildInvocationReadback.process_job -or
+        -not $buildInvocationReadback.process_job.child_pid) {
+        Die "SYNAPSE_RELEASE_BUILD_INVOCATION_DIAGNOSTICS_INVALID path=$buildInvocationPath remediation=inspect filesystem integrity and setup process-job serialization"
+    }
+    Info "Build invocation diagnostics: $buildInvocationPath"
     if ($buildExit -ne 0) {
         $buildLogSignal = Get-SynapseBuildLogSignal -Path $buildLog
         $artifactReadback = Get-SynapseArtifactReadback -Path $built
@@ -8284,9 +8384,10 @@ if (-not $SkipBuild) {
         $cleanupWaitKind = if ($job -and $job.cleanup_wait_kind) { $job.cleanup_wait_kind } else { '<unknown>' }
         $compilerError = if ($buildLogSignal.has_compiler_error) { 'true' } else { 'false' }
         $childAliveAfter = if ($buildInvocationDiagnostics.cleanup_result) { [string]$buildInvocationDiagnostics.cleanup_result.child_process_alive_after } else { '<unknown>' }
-        $afterBuildToolCount = @($buildInvocationDiagnostics.build_tool_processes_after).Count
+        $ownedBuildToolCount = @($buildInvocationDiagnostics.job_owned_build_tool_processes_after).Count
+        $unrelatedBuildToolCount = @($buildInvocationDiagnostics.unrelated_build_tool_processes_after).Count
         $recentWerDumpCount = if ($werCrashReadback) { [int]$werCrashReadback.recent_dump_count } else { 0 }
-        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} live_build_tool_processes_after={10} artifact_exists={11} artifact_sha256={12} artifact_exclusive_open={13} diagnostics={14} diagnostics_archive={15} log={16} log_archive={17} wer_recent_dumps={18} remediation={19}`nTail:`n{20}" -f `
+        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
             $failureKind.code,
             $buildExit,
             $childPid,
@@ -8297,7 +8398,8 @@ if (-not $SkipBuild) {
             $terminateJobOk,
             $cleanupWaitKind,
             $compilerError,
-            $afterBuildToolCount,
+            $ownedBuildToolCount,
+            $unrelatedBuildToolCount,
             $artifactReadback.exists,
             ($(if ($artifactReadback.sha256) { $artifactReadback.sha256 } else { '<none>' })),
             $artifactReadback.exclusive_open,
