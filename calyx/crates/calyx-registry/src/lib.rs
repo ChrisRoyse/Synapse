@@ -79,11 +79,12 @@ pub use panels::{
     legal_default, materialize_panel_template, media_default, medical_default, text_default,
 };
 pub use persistence::{
-    LoadedRegistrySnapshotLens, RegistryBatchLimitChange, RegistryBatchLimitUpdate,
-    RegistrySnapshotMeasureStats, VaultPanelState, VaultPanelWrite, VaultRegistryBatchLimitWrite,
-    VaultRegistrySnapshot, apply_registry_snapshot_batch_limits, load_vault_panel_state,
-    measure_registry_snapshot_lens_batch, measure_registry_snapshot_lens_batch_with_stats,
-    persist_vault_panel_state, set_vault_registry_batch_limits,
+    CALYX_NO_ACTIVE_PANEL, LoadedRegistrySnapshotLens, RegistryBatchLimitChange,
+    RegistryBatchLimitUpdate, RegistrySnapshotMeasureStats, VaultPanelState, VaultPanelWrite,
+    VaultRegistryBatchLimitWrite, VaultRegistrySnapshot, apply_registry_snapshot_batch_limits,
+    load_vault_panel_state, measure_registry_snapshot_lens_batch,
+    measure_registry_snapshot_lens_batch_with_stats, persist_vault_panel_state,
+    set_vault_registry_batch_limits,
 };
 pub use persistence_contracts::{
     RegistryContractAudit, RegistryContractDiff, RegistryContractFieldDiff,

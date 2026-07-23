@@ -113,10 +113,53 @@ pub fn persist_vault_panel_state(
     })
 }
 
+/// Stable subsystem-local code for a manifest that publishes no active panel.
+///
+/// This is distinct from [`CalyxError::aster_corrupt_shard`]: the manifest is
+/// structurally sound but its `panel_ref` is the generated "no-active-panel"
+/// placeholder, which is an expected empty state (nothing has been published
+/// yet), not shard corruption. The remediation names the publication step and
+/// deliberately does not advise restore-from-backup.
+pub const CALYX_NO_ACTIVE_PANEL: &str = "CALYX_NO_ACTIVE_PANEL";
+
+/// `kind` field stamped into every generated manifest placeholder asset.
+const GENERATED_ASSET_KIND: &str = "calyx_manifest_generated_asset_v1";
+/// `status` field of the generated no-active-panel placeholder.
+const NO_ACTIVE_PANEL_STATUS: &str = "no-active-panel";
+
+/// Returns true when `bytes` is the generated no-active-panel placeholder that
+/// Aster writes into a fresh manifest before any real `Panel` is published.
+fn is_no_active_panel_placeholder(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct GeneratedAssetMarker {
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        status: String,
+    }
+    serde_json::from_slice::<GeneratedAssetMarker>(bytes).is_ok_and(|marker| {
+        marker.kind == GENERATED_ASSET_KIND && marker.status == NO_ACTIVE_PANEL_STATUS
+    })
+}
+
+/// Builds the typed no-active-panel error for a placeholder `panel_ref`.
+fn no_active_panel_error(logical_path: &str) -> CalyxError {
+    CalyxError {
+        code: CALYX_NO_ACTIVE_PANEL,
+        message: format!(
+            "durable manifest publishes no active panel: panel_ref {logical_path} is the generated no-active-panel placeholder, so there is nothing to load or rebuild"
+        ),
+        remediation: "publish an active durable Panel snapshot (persist_vault_panel_state) for the live constellation panel before search rebuild; this is an expected empty state, not shard corruption \u{2014} do not restore from restic/snapshot",
+    }
+}
+
 pub fn load_vault_panel_state(vault_dir: impl AsRef<Path>) -> Result<VaultPanelState> {
     let vault_dir = vault_dir.as_ref();
     let manifest = ManifestStore::open(vault_dir).load_current()?;
     let panel_bytes = assets::read_ref(vault_dir, &manifest.panel_ref)?;
+    if is_no_active_panel_placeholder(&panel_bytes) {
+        return Err(no_active_panel_error(&manifest.panel_ref.logical_path));
+    }
     let panel: Panel = serde_json::from_slice(&panel_bytes)
         .map_err(|error| CalyxError::aster_corrupt_shard(format!("decode panel: {error}")))?;
     let snapshot = manifest

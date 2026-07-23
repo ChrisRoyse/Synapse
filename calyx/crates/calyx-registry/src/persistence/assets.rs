@@ -54,6 +54,11 @@ pub(crate) fn load_manifest_panel_registry_snapshot(
 ) -> Result<(VaultManifest, Panel, VaultRegistrySnapshot)> {
     let manifest = ManifestStore::open(vault_dir).load_current()?;
     let panel_bytes = read_ref(vault_dir, &manifest.panel_ref)?;
+    if super::is_no_active_panel_placeholder(&panel_bytes) {
+        return Err(super::no_active_panel_error(
+            &manifest.panel_ref.logical_path,
+        ));
+    }
     let panel: Panel = serde_json::from_slice(&panel_bytes)
         .map_err(|error| CalyxError::aster_corrupt_shard(format!("decode panel: {error}")))?;
     let registry_ref = manifest.registry_ref.as_ref().ok_or_else(|| {
