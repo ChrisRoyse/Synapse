@@ -922,6 +922,327 @@ fn clamp_unit(value: f64, field: &str) -> StorageResult<f64> {
     Ok(value.clamp(0.0, 1.0))
 }
 
+// ---------------------------------------------------------------------------
+// Panel lifecycle: capability cards + admission gate (#1668)
+//
+// A newly added lens/panel is measured immediately (Parked) and may only be
+// promoted to full (Admitted) status once a capability card meets the documented
+// thresholds. The card is profiled from the #1672 assay reports (bits /
+// sufficiency / redundancy); this gate consumes plain numeric profile fields so
+// it stays decoupled from the evolving synapse-calyx report structs. Park/retire
+// are non-destructive: retired slots remain readable for history.
+// ---------------------------------------------------------------------------
+
+/// Synthetic CF label used in structured panel-lifecycle errors.
+const PANEL_LIFECYCLE_CF: &str = "calyx_panel_lifecycle";
+
+/// Signal floor (bits) a lens must clear to be admitted.
+///
+/// Mirrors the Calyx assay bit floor (`SYNAPSE_ASSAY_BIT_FLOOR`, handbook §13).
+pub const PANEL_ADMISSION_BIT_FLOOR: f32 = 0.05;
+/// Pairwise redundancy (normalized MI) ceiling above which a lens is a duplicate.
+pub const PANEL_ADMISSION_CORRELATION_CEILING: f32 = 0.6;
+/// Minimum paired samples before a capability profile is trusted.
+pub const PANEL_ADMISSION_MIN_SAMPLES: usize = 50;
+
+/// Lifecycle state of a panel generation or one of its lens slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelLifecycleState {
+    /// Added and measured on new records, but not yet admitted to full status.
+    Parked,
+    /// Admitted: measured on all records and searchable on its slot.
+    Admitted,
+    /// Retired: no longer measured on new records; slot stays readable for
+    /// history (non-destructive).
+    Retired,
+}
+
+impl PanelLifecycleState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parked => "parked",
+            Self::Admitted => "admitted",
+            Self::Retired => "retired",
+        }
+    }
+
+    /// Every lifecycle state keeps its historical slot values readable.
+    #[must_use]
+    pub const fn is_readable(self) -> bool {
+        true
+    }
+
+    /// Whether new records are measured on this slot in this state.
+    #[must_use]
+    pub const fn measures_new_records(self) -> bool {
+        matches!(self, Self::Parked | Self::Admitted)
+    }
+}
+
+/// The measured capability profile of one lens slot.
+///
+/// Field values come from the #1672 assay reports: `signal_bits` from the per
+/// lens grounded-bits pass, `max_redundancy_nmi` from the redundancy/effective
+/// rank pass, `n_samples` from the anchored records scanned. `spread`,
+/// `separation`, and `coverage` are `[0, 1]` descriptors; `cost_micros` is the
+/// measured encode cost.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LensCapabilityProfile {
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub slot: u16,
+    pub signal_bits: f32,
+    pub spread: f32,
+    pub separation: f32,
+    pub cost_micros: u64,
+    pub coverage: f32,
+    pub max_redundancy_nmi: f32,
+    pub n_samples: usize,
+}
+
+/// The gate's decision for one lens.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PanelAdmissionOutcome {
+    /// The profile clears every threshold; the lens may be admitted.
+    Admit,
+    /// The profile is valid but fails one or more thresholds; stay parked.
+    Park { reasons: Vec<String> },
+}
+
+impl PanelAdmissionOutcome {
+    #[must_use]
+    pub const fn is_admit(&self) -> bool {
+        matches!(self, Self::Admit)
+    }
+}
+
+/// A capability card: the measured profile plus the gate's decision and the
+/// exact threshold snapshot the decision was made against.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityCard {
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub slot: u16,
+    pub signal_bits: f32,
+    pub spread: f32,
+    pub separation: f32,
+    pub cost_micros: u64,
+    pub coverage: f32,
+    pub max_redundancy_nmi: f32,
+    pub n_samples: usize,
+    pub bit_floor: f32,
+    pub correlation_ceiling: f32,
+    pub min_samples: usize,
+    pub outcome: PanelAdmissionOutcome,
+}
+
+/// Profiles one lens into a [`CapabilityCard`] and decides admission fail-closed.
+///
+/// Malformed profiles (non-finite metrics, out-of-range `[0, 1]` descriptors,
+/// negative bits) are refused with a structured error rather than being silently
+/// admitted. A well-formed but under-signal profile yields a `Park` outcome, not
+/// an error.
+///
+/// # Errors
+///
+/// Returns a structured `CALYX_PANEL_CAPABILITY_INVALID` error when a profile
+/// field is non-finite or out of its valid range.
+pub fn evaluate_capability(profile: &LensCapabilityProfile) -> StorageResult<CapabilityCard> {
+    validate_unit_metric("signal_bits", profile.signal_bits, false)?;
+    if profile.signal_bits < 0.0 {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_CAPABILITY_INVALID",
+            &format!(
+                "panel={} slot={} signal_bits={} must be >= 0",
+                profile.panel_name, profile.slot, profile.signal_bits
+            ),
+            "recompute the assay bits pass; a negative bits estimate is a measurement fault",
+        ));
+    }
+    validate_unit_metric("spread", profile.spread, true)?;
+    validate_unit_metric("separation", profile.separation, true)?;
+    validate_unit_metric("coverage", profile.coverage, true)?;
+    validate_unit_metric("max_redundancy_nmi", profile.max_redundancy_nmi, true)?;
+
+    let mut reasons = Vec::new();
+    if profile.n_samples < PANEL_ADMISSION_MIN_SAMPLES {
+        reasons.push(format!(
+            "insufficient_samples: {} < {PANEL_ADMISSION_MIN_SAMPLES}",
+            profile.n_samples
+        ));
+    }
+    if profile.signal_bits < PANEL_ADMISSION_BIT_FLOOR {
+        reasons.push(format!(
+            "below_bit_floor: signal_bits {} < {PANEL_ADMISSION_BIT_FLOOR}",
+            profile.signal_bits
+        ));
+    }
+    if profile.max_redundancy_nmi > PANEL_ADMISSION_CORRELATION_CEILING {
+        reasons.push(format!(
+            "redundant: max_redundancy_nmi {} > {PANEL_ADMISSION_CORRELATION_CEILING}",
+            profile.max_redundancy_nmi
+        ));
+    }
+    if profile.coverage <= 0.0 {
+        reasons.push("no_coverage: slot is absent on every anchored record".to_owned());
+    }
+
+    let outcome = if reasons.is_empty() {
+        PanelAdmissionOutcome::Admit
+    } else {
+        PanelAdmissionOutcome::Park { reasons }
+    };
+    Ok(CapabilityCard {
+        panel_name: profile.panel_name.clone(),
+        panel_version: profile.panel_version,
+        slot: profile.slot,
+        signal_bits: profile.signal_bits,
+        spread: profile.spread,
+        separation: profile.separation,
+        cost_micros: profile.cost_micros,
+        coverage: profile.coverage,
+        max_redundancy_nmi: profile.max_redundancy_nmi,
+        n_samples: profile.n_samples,
+        bit_floor: PANEL_ADMISSION_BIT_FLOOR,
+        correlation_ceiling: PANEL_ADMISSION_CORRELATION_CEILING,
+        min_samples: PANEL_ADMISSION_MIN_SAMPLES,
+        outcome,
+    })
+}
+
+/// Admits a lens to full status, fail-closed against its capability card.
+///
+/// A lens can only be admitted from `Parked` and only when its card's outcome is
+/// `Admit`. A retired lens is terminal and can never be re-admitted.
+///
+/// # Errors
+///
+/// Returns a structured error when the transition is illegal or the card does
+/// not meet the documented thresholds.
+pub fn admit_lens(
+    current: PanelLifecycleState,
+    card: &CapabilityCard,
+) -> StorageResult<PanelLifecycleState> {
+    if current == PanelLifecycleState::Retired {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_ADMIT_RETIRED",
+            &format!(
+                "panel={} slot={} is retired and cannot be re-admitted",
+                card.panel_name, card.slot
+            ),
+            "allocate a new panel generation for the lens instead of re-admitting a retired slot",
+        ));
+    }
+    match &card.outcome {
+        PanelAdmissionOutcome::Admit => Ok(PanelLifecycleState::Admitted),
+        PanelAdmissionOutcome::Park { reasons } => Err(panel_lifecycle_error(
+            "CALYX_PANEL_ADMISSION_REFUSED",
+            &format!(
+                "panel={} slot={} failed the admission gate: {}",
+                card.panel_name,
+                card.slot,
+                reasons.join("; ")
+            ),
+            "keep the lens parked; raise grounded signal above the bit floor or reduce redundancy below the ceiling, then re-profile",
+        )),
+    }
+}
+
+/// Parks a lens (idempotent). Retired lenses are terminal.
+///
+/// # Errors
+///
+/// Returns a structured error when parking a retired lens.
+pub fn park_lens(current: PanelLifecycleState) -> StorageResult<PanelLifecycleState> {
+    if current == PanelLifecycleState::Retired {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_PARK_RETIRED",
+            "a retired lens is terminal and cannot be parked",
+            "allocate a new panel generation instead of reviving a retired slot",
+        ));
+    }
+    Ok(PanelLifecycleState::Parked)
+}
+
+/// Retires a lens (idempotent, non-destructive). The slot stays readable.
+#[must_use]
+pub const fn retire_lens(_current: PanelLifecycleState) -> PanelLifecycleState {
+    PanelLifecycleState::Retired
+}
+
+/// One built-in panel generation, for the `panel list` action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PanelCatalogEntry {
+    pub panel_name: &'static str,
+    pub panel_version: u32,
+}
+
+/// The built-in panel catalog: every `syn-*` panel and its first generation.
+#[must_use]
+pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
+    vec![
+        entry(SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION),
+        entry(SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION),
+        entry(SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION),
+        entry(
+            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        ),
+        entry(SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION),
+        entry(SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION),
+        entry(SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION),
+        entry(SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION),
+        entry(SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION),
+        entry(SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION),
+        entry(
+            SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+            SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
+        ),
+        entry(SYN_GRAPHPOS_APP_PANEL_NAME, SYN_GRAPHPOS_APP_PANEL_VERSION),
+        entry(
+            SYN_GRAPHPOS_PROCESS_PANEL_NAME,
+            SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
+        ),
+        entry(
+            SYN_PATH_HIERARCHY_PANEL_NAME,
+            SYN_PATH_HIERARCHY_PANEL_VERSION,
+        ),
+    ]
+}
+
+const fn entry(panel_name: &'static str, panel_version: u32) -> PanelCatalogEntry {
+    PanelCatalogEntry {
+        panel_name,
+        panel_version,
+    }
+}
+
+fn validate_unit_metric(field: &str, value: f32, unit_range: bool) -> StorageResult<()> {
+    if !value.is_finite() {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_CAPABILITY_INVALID",
+            &format!("capability metric {field}={value} is not finite"),
+            "recompute the assay pass; a non-finite metric is a measurement fault",
+        ));
+    }
+    if unit_range && !(0.0..=1.0).contains(&value) {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_CAPABILITY_INVALID",
+            &format!("capability metric {field}={value} must be within [0, 1]"),
+            "clamp or recompute the assay descriptor into its documented [0, 1] range",
+        ));
+    }
+    Ok(())
+}
+
+fn panel_lifecycle_error(code: &str, message: &str, remediation: &str) -> StorageError {
+    StorageError::WriteFailed {
+        cf_name: PANEL_LIFECYCLE_CF.to_owned(),
+        detail: format!("{code}: {message}; remediation={remediation}"),
+    }
+}
+
 /// Build the Calyx constellation for a timeline record.
 ///
 /// # Errors
