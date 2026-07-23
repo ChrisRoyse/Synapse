@@ -21,19 +21,23 @@ use super::{
     REPLAY_TOOL,
     artifact::inspect_replay_artifact,
     command_query::summarize_command_query,
-    errors::{delegate_error, missing_spec},
+    errors::{delegate_error, missing_spec, params_error},
     lifecycle::{lifecycle_path, read_lifecycle_tail},
     response::{audit_response, replay_response},
     types::{
-        AuditOperation, AuditParams, AuditResponse, ReplayArtifactInspectParams, ReplayOperation,
+        AuditLedgerEntryReadback, AuditOperation, AuditParams, AuditReproduceResponse,
+        AuditResponse, AuditVerifyChainResponse, ReplayArtifactInspectParams, ReplayOperation,
         ReplayParams, ReplayResponse,
     },
     validation::{validate_audit_params, validate_replay_params},
 };
+
+/// Physical Source of Truth for the ledger-backed audit operations.
+const LEDGER_SOT: &str = "CF_LEDGER append-only provenance hash chain";
 #[tool_router(router = audit_replay_facade_tool_router, vis = "pub(in crate::server)")]
 impl SynapseService {
     #[tool(
-        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging); lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent."
+        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging); lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain against the stored bytes (full or an incremental from_seq/to_seq window, with optional read_seq entry readback) and returns a fail-closed intact/broken/corrupt verdict; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
     )]
     pub async fn audit(
         &self,
@@ -169,6 +173,129 @@ impl SynapseService {
                         response.manifest_path, response.rows_exported, response.redacted_fields
                     ),
                     |out| out.export_bundle = Some(response),
+                )))
+            }
+            AuditOperation::VerifyChain => {
+                let spec = params
+                    .0
+                    .verify_chain
+                    .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), LEDGER_SOT))?;
+                let range = match (spec.from_seq, spec.to_seq) {
+                    (None, None) => None,
+                    (Some(from), Some(to)) => Some((from, to)),
+                    _ => {
+                        return Err(params_error(
+                            AUDIT_TOOL,
+                            operation.as_str(),
+                            "from_seq",
+                            LEDGER_SOT,
+                            "provide both from_seq and to_seq for an incremental window, or neither for a full-chain verify",
+                        ));
+                    }
+                };
+                let read_seq = spec.read_seq;
+                let db = self.m3_storage()?;
+                // Full-chain verification re-scans and re-hashes the whole
+                // physical Ledger CF; it must never occupy a Tokio runtime worker
+                // serving MCP. Offload to the blocking pool.
+                let (verify, entry) = tokio::task::spawn_blocking(move || {
+                    let verify = db.verify_calyx_ledger_chain(range)?;
+                    let entry = match read_seq {
+                        Some(seq) => Some(db.read_calyx_ledger_entry(seq)?),
+                        None => None,
+                    };
+                    Ok::<_, synapse_storage::StorageError>((verify, entry))
+                })
+                .await
+                .map_err(|join_error| {
+                    delegate_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        "calyx_ledger",
+                        LEDGER_SOT,
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!("verify_chain blocking task failed to join: {join_error}"),
+                        ),
+                        "inspect daemon logs; the ledger verify task terminated abnormally",
+                    )
+                })?
+                .map_err(|error| {
+                    delegate_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        "calyx_ledger",
+                        LEDGER_SOT,
+                        crate::m1::mcp_error(error.code(), error.to_string()),
+                        "inspect the physical CF_LEDGER hash chain and restore from a verified backup before trusting audit output",
+                    )
+                })?;
+                let response = verify_chain_response(&verify, entry.as_ref());
+                Ok(Json(audit_response(
+                    operation,
+                    format!(
+                        "CF_LEDGER verdict={} head_height={} verified=[{}..{}) entries={}",
+                        response.verdict,
+                        response.head_height,
+                        response.verified_from_seq,
+                        response.verified_to_seq,
+                        response.entry_count,
+                    ),
+                    |out| out.verify_chain = Some(response),
+                )))
+            }
+            AuditOperation::Reproduce => {
+                let spec = params
+                    .0
+                    .reproduce
+                    .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), LEDGER_SOT))?;
+                let cx_id = spec.cx_id.trim().to_owned();
+                if cx_id.is_empty() {
+                    return Err(params_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        "cx_id",
+                        LEDGER_SOT,
+                        "cx_id must not be empty",
+                    ));
+                }
+                let db = self.m3_storage()?;
+                let cx_for_task = cx_id.clone();
+                let report = tokio::task::spawn_blocking(move || {
+                    db.reproduce_calyx_record(&cx_for_task)
+                })
+                .await
+                .map_err(|join_error| {
+                    delegate_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        &cx_id,
+                        LEDGER_SOT,
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!("reproduce blocking task failed to join: {join_error}"),
+                        ),
+                        "inspect daemon logs; the reproduce task terminated abnormally",
+                    )
+                })?
+                .map_err(|error| {
+                    delegate_error(
+                        AUDIT_TOOL,
+                        operation.as_str(),
+                        &cx_id,
+                        LEDGER_SOT,
+                        crate::m1::mcp_error(error.code(), error.to_string()),
+                        "confirm the cx_id exists and inspect its provenance ledger entry before retrying reproduce",
+                    )
+                })?;
+                let response = reproduce_response(&report);
+                Ok(Json(audit_response(
+                    operation,
+                    format!(
+                        "CF_LEDGER reproduce cx_id={} reproduced={} recorded_seq={} drift={}",
+                        response.cx_id, response.reproduced, response.recorded_seq, response.drift,
+                    ),
+                    |out| out.reproduce = Some(response),
                 )))
             }
         }
@@ -460,5 +587,62 @@ impl SynapseService {
                 )))
             }
         }
+    }
+}
+
+fn ledger_entry_readback(
+    readback: &synapse_calyx::SynapseCalyxLedgerEntryReadback,
+) -> AuditLedgerEntryReadback {
+    AuditLedgerEntryReadback {
+        seq: readback.seq,
+        present: readback.present,
+        kind: readback.kind.clone(),
+        subject: readback.subject.clone(),
+        actor: readback.actor.clone(),
+        ts: readback.ts,
+        prev_hash: readback.prev_hash.clone(),
+        entry_hash: readback.entry_hash.clone(),
+        payload_len: readback.payload_len,
+        payload_sha256: readback.payload_sha256.clone(),
+        self_verifies: readback.self_verifies,
+    }
+}
+
+fn verify_chain_response(
+    verify: &synapse_calyx::SynapseCalyxLedgerVerifyReport,
+    entry: Option<&synapse_calyx::SynapseCalyxLedgerEntryReadback>,
+) -> AuditVerifyChainResponse {
+    AuditVerifyChainResponse {
+        source_of_truth: LEDGER_SOT.to_owned(),
+        intact: verify.intact,
+        verdict: verify.verdict.clone(),
+        head_height: verify.head_height,
+        verified_from_seq: verify.verified_from_seq,
+        verified_to_seq: verify.verified_to_seq,
+        entry_count: verify.entry_count,
+        tip_hash: verify.tip_hash.clone(),
+        quarantine_seq: verify.quarantine_seq,
+        broken_expected_hash: verify.broken_expected_hash.clone(),
+        broken_found_hash: verify.broken_found_hash.clone(),
+        corrupt_reason: verify.corrupt_reason.clone(),
+        entry_readback: entry.map(ledger_entry_readback),
+    }
+}
+
+fn reproduce_response(
+    report: &synapse_calyx::SynapseCalyxReproduceReport,
+) -> AuditReproduceResponse {
+    AuditReproduceResponse {
+        source_of_truth: LEDGER_SOT.to_owned(),
+        cx_id: report.cx_id.clone(),
+        reproduced: report.reproduced,
+        recorded_seq: report.recorded_seq,
+        recorded_hash: report.recorded_hash.clone(),
+        input_hash: report.input_hash.clone(),
+        entry_present: report.entry_present,
+        entry_hash: report.entry_hash.clone(),
+        entry_self_verifies: report.entry_self_verifies,
+        subject_matches: report.subject_matches,
+        drift: report.drift.clone(),
     }
 }

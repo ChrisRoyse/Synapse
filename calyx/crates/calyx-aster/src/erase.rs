@@ -107,6 +107,30 @@ where
     ) -> Result<EraseResult> {
         erase_inner(self, scope, vault_ctx.vault_id(), None, registry)
     }
+
+    /// Lawfully erases `scope`'s content — CF-row tombstones, an append-only
+    /// `EntryKind::Erase` Ledger entry, and physical purge of the tombstoned
+    /// rows — without shredding the whole-vault crypto key.
+    ///
+    /// This is the per-record / per-subject erasure entrypoint used by the
+    /// Synapse privacy surface: content becomes unrecoverable at the vault while
+    /// the hash chain gains the erasure entry and stays verifiable. Whole-vault
+    /// key crypto-shred is deliberately not performed here (it would destroy the
+    /// entire vault's value crypto); it belongs to a full [`EraseScope::Vault`]
+    /// flow that owns a mutable [`VaultContext`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the scope already carries an erasure
+    /// tombstone, or when target collection, commit, ledger append, or physical
+    /// purge fails. Fails closed before any partial visibility.
+    pub fn erase_scope_ledger_stamped(
+        &self,
+        scope: EraseScope,
+        registry: &EraseRegistry,
+    ) -> Result<EraseResult> {
+        erase_inner(self, scope, self.vault_id(), None, registry)
+    }
 }
 
 // A25 ("never delete to compress") does NOT forbid this operation.

@@ -25,6 +25,8 @@ pub enum AuditOperation {
     LifecycleExits,
     ProfileIntelligence,
     ExportBundle,
+    VerifyChain,
+    Reproduce,
 }
 
 impl AuditOperation {
@@ -35,6 +37,8 @@ impl AuditOperation {
             Self::LifecycleExits => "lifecycle_exits",
             Self::ProfileIntelligence => "profile_intelligence",
             Self::ExportBundle => "export_bundle",
+            Self::VerifyChain => "verify_chain",
+            Self::Reproduce => "reproduce",
         }
     }
 
@@ -45,6 +49,8 @@ impl AuditOperation {
             "lifecycle_exits" => Ok(Self::LifecycleExits),
             "profile_intelligence" => Ok(Self::ProfileIntelligence),
             "export_bundle" => Ok(Self::ExportBundle),
+            "verify_chain" => Ok(Self::VerifyChain),
+            "reproduce" => Ok(Self::Reproduce),
             other => Err(invalid_operation(
                 AUDIT_TOOL,
                 other,
@@ -54,6 +60,8 @@ impl AuditOperation {
                     "lifecycle_exits",
                     "profile_intelligence",
                     "export_bundle",
+                    "verify_chain",
+                    "reproduce",
                 ],
                 AUDIT_SOT,
             )),
@@ -120,6 +128,10 @@ pub struct AuditParams {
     pub profile_intelligence: Option<AuditIntelligenceQueryParams>,
     #[serde(default)]
     pub export_bundle: Option<AuditExportBundleParams>,
+    #[serde(default)]
+    pub verify_chain: Option<AuditVerifyChainParams>,
+    #[serde(default)]
+    pub reproduce: Option<AuditReproduceParams>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -147,7 +159,9 @@ fn audit_operation_schema(_: &mut SchemaGenerator) -> Schema {
             "lifecycle_events",
             "lifecycle_exits",
             "profile_intelligence",
-            "export_bundle"
+            "export_bundle",
+            "verify_chain",
+            "reproduce"
         ]
     })
 }
@@ -190,6 +204,30 @@ pub struct AuditCommandQueryParams {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditVerifyChainParams {
+    /// Inclusive start sequence for an incremental re-walk. Omit both bounds to
+    /// verify the full chain from genesis to the durable head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_seq: Option<u64>,
+    /// Exclusive end sequence for an incremental re-walk (defaults to the head).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_seq: Option<u64>,
+    /// Optionally read back one decoded ledger entry by sequence (provenance
+    /// readback for any record), verified alongside the chain walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditReproduceParams {
+    /// The content-addressed constellation id (32 lowercase hex chars) whose
+    /// recorded provenance binding is re-derived from the bytes.
+    pub cx_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -256,6 +294,78 @@ pub struct AuditResponse {
     pub profile_intelligence: Option<AuditIntelligenceQueryResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub export_bundle: Option<AuditExportBundleResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_chain: Option<AuditVerifyChainResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reproduce: Option<AuditReproduceResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLedgerEntryReadback {
+    pub seq: u64,
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_verifies: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditVerifyChainResponse {
+    pub source_of_truth: String,
+    /// True only when the verified window re-walked and re-hashed intact.
+    pub intact: bool,
+    /// Stable verdict label: `intact` | `broken` | `corrupt`.
+    pub verdict: String,
+    pub head_height: u64,
+    pub verified_from_seq: u64,
+    pub verified_to_seq: u64,
+    pub entry_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_expected_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_found_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrupt_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_readback: Option<AuditLedgerEntryReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditReproduceResponse {
+    pub source_of_truth: String,
+    pub cx_id: String,
+    pub reproduced: bool,
+    pub recorded_seq: u64,
+    pub recorded_hash: String,
+    pub input_hash: String,
+    pub entry_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_hash: Option<String>,
+    pub entry_self_verifies: bool,
+    pub subject_matches: bool,
+    pub drift: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

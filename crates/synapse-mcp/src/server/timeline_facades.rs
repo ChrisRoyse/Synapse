@@ -144,6 +144,7 @@ pub enum PrivacyOperation {
     Exclusions,
     Redact,
     Purge,
+    Erase,
 }
 
 impl PrivacyOperation {
@@ -154,8 +155,43 @@ impl PrivacyOperation {
             Self::Exclusions => "exclusions",
             Self::Redact => "redact",
             Self::Purge => "purge",
+            Self::Erase => "erase",
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyEraseParams {
+    /// The content-addressed constellation id (32 lowercase hex chars) of the
+    /// vault record to lawfully erase. Content is tombstoned, an append-only
+    /// ledger `Erase` entry is written, and the tombstoned rows are physically
+    /// purged; the provenance hash chain stays verifiable.
+    pub cx_id: String,
+}
+
+/// Physical readback of one lawful, ledger-stamped record erasure.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyEraseResponse {
+    pub source_of_truth: String,
+    pub scope: String,
+    pub records_deleted: usize,
+    pub shredded_at_ms: u64,
+    pub tombstone_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_hash: Option<String>,
+    /// Post-erase full hash-chain re-verification: the chain must stay intact
+    /// with the new erasure entry sealed in.
+    pub chain_intact_after_erase: bool,
+    pub chain_verdict: String,
+    pub chain_head_height: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_tip_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_quarantine_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -172,6 +208,8 @@ pub struct PrivacyParams {
     pub redact: Option<HygieneRedactParams>,
     #[serde(default)]
     pub purge: Option<TimelinePurgeParams>,
+    #[serde(default)]
+    pub erase: Option<PrivacyEraseParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -190,6 +228,8 @@ pub struct PrivacyResponse {
     pub redact: Option<HygieneRedactResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge: Option<TimelinePurgeResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erase: Option<PrivacyEraseResponse>,
 }
 
 #[tool_router(router = timeline_facade_tool_router, vis = "pub(super)")]
@@ -430,7 +470,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Profile-gated privacy facade for timeline recorder pause/resume/exclusions plus timeline redaction/purge in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutations require an explicit break_glass/full_capability profile and return physical CF_KV/CF_TIMELINE/hygiene readback metadata."
+        description = "Profile-gated privacy facade for timeline recorder pause/resume/exclusions, timeline redaction/purge, plus operation=erase for lawful ledger-stamped record erasure in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. erase tombstones a vault record by cx_id, writes an append-only CF_LEDGER Erase entry, physically purges the tombstoned rows (content becomes unrecoverable), and re-verifies that the provenance hash chain stays intact with the erasure sealed in. Mutations require an explicit break_glass/full_capability profile and return physical CF_KV/CF_TIMELINE/CF_LEDGER/hygiene readback metadata."
     )]
     pub async fn privacy(
         &self,
@@ -614,6 +654,79 @@ impl SynapseService {
                     |out| out.purge = Some(response),
                 )))
             }
+            PrivacyOperation::Erase => {
+                let spec = params
+                    .0
+                    .erase
+                    .ok_or_else(|| missing_privacy_spec("erase"))?;
+                let cx_id = spec.cx_id.trim().to_owned();
+                if cx_id.is_empty() {
+                    return Err(facade_params_error(
+                        PRIVACY_TOOL,
+                        "erase",
+                        "privacy operation=erase requires a non-empty cx_id",
+                        "pass erase={\"cx_id\":\"<32-hex constellation id>\"}",
+                    ));
+                }
+                let source_id = format!("cx:{cx_id}");
+                self.require_privacy_mutation_profile(operation, &source_id, &request_context)?;
+                let db = self.m3_storage()?;
+                let cx_for_task = cx_id.clone();
+                // Erase tombstones + physically purges the target rows and then
+                // re-verifies the whole hash chain — strictly blocking, CPU/IO
+                // bound work that must not park a Tokio runtime worker.
+                let report = tokio::task::spawn_blocking(move || {
+                    db.erase_calyx_record(&cx_for_task)
+                })
+                .await
+                .map_err(|join_error| {
+                    privacy_delegate_error(
+                        operation,
+                        source_id.clone(),
+                        crate::m1::mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            format!("erase blocking task failed to join: {join_error}"),
+                        ),
+                        "inspect daemon logs; the ledger-stamped erase task terminated abnormally",
+                    )
+                })?
+                .map_err(|error| {
+                    privacy_delegate_error(
+                        operation,
+                        source_id.clone(),
+                        crate::m1::mcp_error(error.code(), error.to_string()),
+                        "confirm the cx_id exists and is not already tombstoned, then inspect CF_LEDGER erasure entry and vault rows",
+                    )
+                })?;
+                let response = PrivacyEraseResponse {
+                    source_of_truth: "CF_LEDGER Erase entry + purged vault rows".to_owned(),
+                    scope: report.scope,
+                    records_deleted: report.records_deleted,
+                    shredded_at_ms: report.shredded_at_ms,
+                    tombstone_present: report.tombstone_present,
+                    tombstone_seq: report.tombstone_seq,
+                    tombstone_hash: report.tombstone_hash,
+                    chain_intact_after_erase: report.chain_verify.intact,
+                    chain_verdict: report.chain_verify.verdict,
+                    chain_head_height: report.chain_verify.head_height,
+                    chain_tip_hash: report.chain_verify.tip_hash,
+                    chain_quarantine_seq: report.chain_verify.quarantine_seq,
+                };
+                Ok(Json(privacy_response(
+                    operation,
+                    format!(
+                        "erase scope={} records_deleted={} tombstone_seq={} chain_intact_after_erase={} chain_verdict={}",
+                        response.scope,
+                        response.records_deleted,
+                        response
+                            .tombstone_seq
+                            .map_or_else(|| "<none>".to_owned(), |seq| seq.to_string()),
+                        response.chain_intact_after_erase,
+                        response.chain_verdict,
+                    ),
+                    |out| out.erase = Some(response),
+                )))
+            }
         }
     }
 }
@@ -689,6 +802,7 @@ fn validate_privacy_facade_params(params: &PrivacyParams) -> Result<(), ErrorDat
             ("exclusions", params.exclusions.is_some()),
             ("redact", params.redact.is_some()),
             ("purge", params.purge.is_some()),
+            ("erase", params.erase.is_some()),
         ],
     )
 }
@@ -903,6 +1017,7 @@ fn privacy_response(
         exclusions: None,
         redact: None,
         purge: None,
+        erase: None,
     };
     populate(&mut response);
     response

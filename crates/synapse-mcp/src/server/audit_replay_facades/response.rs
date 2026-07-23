@@ -16,6 +16,8 @@ pub(super) fn audit_response(
         lifecycle_exits: None,
         profile_intelligence: None,
         export_bundle: None,
+        verify_chain: None,
+        reproduce: None,
     };
     fill(&mut response);
     response

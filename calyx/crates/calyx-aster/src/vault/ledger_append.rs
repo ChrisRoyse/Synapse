@@ -5,9 +5,52 @@ use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock
 use calyx_ledger::{
     ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerHeadAnchor,
     LedgerRow, QueryId, RedactionPolicy, ReproduceInputResolver, ReproduceLensRegistry,
-    ReproduceResult, StagedLedgerRow, SubjectId, reproduce_payload_bytes,
-    reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
+    ReproduceResult, StagedLedgerRow, SubjectId, VerifyResult, decode as decode_ledger_entry,
+    reproduce_payload_bytes, reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
+    verify_chain,
 };
+use std::ops::Range;
+
+/// Result of verifying the live physical Ledger hash chain against the exact
+/// stored bytes in [`ColumnFamily::Ledger`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsterLedgerChainVerification {
+    /// The fail-closed verification verdict for the requested range.
+    pub result: VerifyResult,
+    /// The durable Ledger head height (entry count) at verification time.
+    pub head_height: u64,
+    /// The durable Ledger tip hash, when a head anchor exists.
+    pub tip_hash: Option<[u8; 32]>,
+    /// The exact half-open sequence range that was walked and re-hashed.
+    pub verified_range: Range<u64>,
+}
+
+/// Re-derivation verdict for one record's recorded provenance binding.
+///
+/// Reproduce reads the record, follows its recorded provenance pointer into the
+/// Ledger, and re-derives the sealed entry hash from the entry's own fields —
+/// proving the record still points at a genuine, self-consistent chain entry
+/// whose hash matches both the record's provenance ref and the chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsterProvenanceReproduction {
+    pub cx_id: CxId,
+    /// The Ledger sequence recorded in the record's provenance ref.
+    pub recorded_seq: u64,
+    /// The entry hash recorded in the record's provenance ref.
+    pub recorded_hash: [u8; 32],
+    /// The record's canonical input hash (evidence pointer).
+    pub input_hash: [u8; 32],
+    /// Whether the referenced Ledger entry physically exists.
+    pub entry_present: bool,
+    /// The re-decoded Ledger entry hash, when present.
+    pub entry_hash: Option<[u8; 32]>,
+    /// Whether the entry re-hashes to its stored hash (self-consistent bytes).
+    pub entry_self_verifies: bool,
+    /// Whether the entry's subject binds back to this record.
+    pub subject_matches: bool,
+    /// Overall verdict: the record re-derives to a genuine, matching entry.
+    pub reproduced: bool,
+}
 
 struct LedgerEntryInput {
     kind: EntryKind,
@@ -158,6 +201,96 @@ where
                 "anchor_with_ledger_entry",
             )?;
             Ok(ledger_ref)
+        })
+    }
+
+    /// Verifies the live physical Ledger hash chain against the exact stored
+    /// bytes, fail-closed.
+    ///
+    /// Pass `range = None` to verify the full chain (`0..head_height`); pass an
+    /// explicit sub-range for an incremental re-walk. The verifier re-hashes
+    /// every entry from its sealed fields and checks each `prev_hash` link, so a
+    /// single flipped byte anywhere in the requested window yields a `Broken` or
+    /// `Corrupt` verdict rather than a silent pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error only when the physical Ledger CF cannot be
+    /// scanned or the head anchor cannot be read; a detected tamper is a normal
+    /// `Ok(Broken | Corrupt)` verdict, never an `Err`.
+    pub fn verify_ledger_chain(
+        &self,
+        range: Option<Range<u64>>,
+    ) -> Result<AsterLedgerChainVerification> {
+        let store = AsterRawLedgerStore { vault: self };
+        let head = store.head_anchor()?;
+        let head_height = head.as_ref().map_or(0, |anchor| anchor.height);
+        let verified_range = range.unwrap_or(0..head_height);
+        let result = verify_chain(&store, verified_range.clone())?;
+        Ok(AsterLedgerChainVerification {
+            result,
+            head_height,
+            tip_hash: head.map(|anchor| anchor.tip_hash),
+            verified_range,
+        })
+    }
+
+    /// Reads and decodes one physical Ledger entry by sequence for provenance
+    /// readback. Returns `Ok(None)` when no row exists at `seq`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical row cannot be read or its
+    /// bytes cannot be decoded.
+    pub fn read_ledger_entry(&self, seq: u64) -> Result<Option<LedgerEntry>> {
+        let key = ledger_key(seq);
+        let Some(bytes) = self.read_cf_at(self.latest_seq(), ColumnFamily::Ledger, &key)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_ledger_entry(&bytes)?))
+    }
+
+    /// Re-derives a record's recorded provenance binding from the bytes.
+    ///
+    /// Reads the constellation, follows its recorded provenance pointer into the
+    /// physical Ledger, re-decodes that entry, and re-hashes it from its own
+    /// sealed fields. The record reproduces only when the referenced entry
+    /// exists, self-verifies, binds back to this record's subject, and its hash
+    /// matches the record's stored provenance ref.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the record is absent or its bytes cannot
+    /// be read; a provenance mismatch is a normal `reproduced == false` verdict.
+    pub fn reproduce_record_provenance(&self, id: CxId) -> Result<AsterProvenanceReproduction> {
+        let constellation = self.get(id, self.snapshot())?;
+        let recorded_seq = constellation.provenance.seq;
+        let recorded_hash = constellation.provenance.hash;
+        let input_hash = constellation.input_ref.hash;
+        let entry = self.read_ledger_entry(recorded_seq)?;
+        let (entry_present, entry_hash, entry_self_verifies, subject_matches) = match &entry {
+            Some(entry) => (
+                true,
+                Some(entry.entry_hash),
+                entry.verify(),
+                entry.subject == SubjectId::Cx(id),
+            ),
+            None => (false, None, false, false),
+        };
+        let reproduced = entry_present
+            && entry_self_verifies
+            && subject_matches
+            && entry_hash == Some(recorded_hash);
+        Ok(AsterProvenanceReproduction {
+            cx_id: id,
+            recorded_seq,
+            recorded_hash,
+            input_hash,
+            entry_present,
+            entry_hash,
+            entry_self_verifies,
+            subject_matches,
+            reproduced,
         })
     }
 

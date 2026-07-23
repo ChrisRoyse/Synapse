@@ -27,6 +27,8 @@ pub(super) fn validate_audit_params(params: &AuditParams) -> Result<AuditOperati
                 params.profile_intelligence.is_some(),
             ),
             ("export_bundle", params.export_bundle.is_some()),
+            ("verify_chain", params.verify_chain.is_some()),
+            ("reproduce", params.reproduce.is_some()),
         ],
         AUDIT_SOT,
     )?;

@@ -73,6 +73,7 @@ pub use keyspace::{
 };
 pub use layer_commit::CfLedgerEntry;
 pub use ledger_anchor_batch::MultiCxAnchorBatchOutcome;
+pub use ledger_append::{AsterLedgerChainVerification, AsterProvenanceReproduction};
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
