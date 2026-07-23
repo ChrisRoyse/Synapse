@@ -11,9 +11,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use calyx_assay::{
+    AssayCacheKey, AssayStore, AssaySubject, EstimatorKind, MiEstimate, SlotAttribution, TrustTag,
+    bits_report_with_anchor, entropy_bits, ksg_mi_continuous_discrete,
+    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution, stable_rank,
+};
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
-use calyx_core::{Constellation, CxId, SlotId, SlotVector};
+use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, SlotId, SlotVector};
 use calyx_forge::{Backend, KnnMetric};
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
@@ -382,6 +387,7 @@ impl SynapseCalyxVault {
 struct DenseRecord {
     cx_id: CxId,
     slots: BTreeMap<SlotId, Vec<f32>>,
+    anchors: Vec<Anchor>,
 }
 
 impl DenseRecord {
@@ -394,6 +400,7 @@ impl DenseRecord {
         Self {
             cx_id: constellation.cx_id,
             slots,
+            anchors: constellation.anchors.clone(),
         }
     }
 }
@@ -555,4 +562,668 @@ fn forge_math_error(action: &str, error: &calyx_forge::ForgeError) -> SynapseCal
         format!("{action}: Forge math backend failed: {error}"),
         "repair the process-local/host GPU Source of Truth or select math_backend=cpu, then retry",
     )
+}
+
+// ---------------------------------------------------------------------------
+// Assay bits / sufficiency / redundancy (#1672)
+//
+// Differentiate: measure in bits which lenses carry grounded signal about a
+// real outcome anchor (KSG mutual information), whether the panel collectively
+// explains the outcome (I(panel;anchor) >= H(anchor)), and how many lenses are
+// truly non-redundant (effective rank over a pairwise normalized-MI matrix).
+// Results persist to the native Assay CF and are read back.
+// ---------------------------------------------------------------------------
+
+/// Signal floor (bits) governing the sole-carrier attribution threshold and the
+/// admission contract. Calyx default (handbook section 13).
+pub const SYNAPSE_ASSAY_BIT_FLOOR: f32 = 0.05;
+/// Pairwise-redundancy normalized-MI ceiling. Calyx default (handbook section 13).
+pub const SYNAPSE_ASSAY_CORRELATION_CEILING: f32 = 0.6;
+/// Minimum paired samples before a bits/sufficiency result is trusted rather
+/// than tagged provisional (handbook section 11, `MIN_ASSAY_SAMPLES`).
+pub const SYNAPSE_ASSAY_MIN_SAMPLES: usize = 50;
+/// Default k for the KSG mutual-information estimator.
+pub const SYNAPSE_KSG_DEFAULT_K: usize = 4;
+/// Histogram bins for the pairwise normalized-MI redundancy sketch.
+pub const SYNAPSE_REDUNDANCY_NMI_BINS: usize = 8;
+
+const ASSAY_CORPUS_SHARD: &str = "synapse-intelligence";
+
+/// Bounded request describing one Assay bits/sufficiency/redundancy pass.
+#[derive(Clone, Debug)]
+pub struct SynapseCalyxAssayParams {
+    pub panel_version: u32,
+    /// Grounded outcome anchor to measure bits about. Synapse writes outcome
+    /// anchors as `AnchorKind::Label(<name>)`; a few canonical names map to the
+    /// native kinds.
+    pub anchor_kind: String,
+    pub max_records: usize,
+    pub ksg_k: usize,
+}
+
+impl SynapseCalyxAssayParams {
+    #[must_use]
+    pub const fn new(panel_version: u32, anchor_kind: String) -> Self {
+        Self {
+            panel_version,
+            anchor_kind,
+            max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
+            ksg_k: SYNAPSE_KSG_DEFAULT_K,
+        }
+    }
+}
+
+/// Per-lens grounded bits about the requested anchor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxSlotBits {
+    pub slot: u16,
+    pub marginal_bits: f32,
+    pub ci_low: f32,
+    pub ci_high: f32,
+    pub n_samples: usize,
+    pub sole_carrier: bool,
+    pub provisional: bool,
+}
+
+/// Result of one Assay bits pass with the physical Assay CF readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxBitsReport {
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    pub anchored_records: usize,
+    pub distinct_outcomes: usize,
+    pub total_bits: f32,
+    pub grounded: bool,
+    pub slots: Vec<SynapseCalyxSlotBits>,
+    pub assay_cf_rows_after: usize,
+}
+
+/// One localized sufficiency deficit routed to a logged propose-lens suggestion.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxSufficiencyDeficit {
+    pub slot: Option<u16>,
+    pub deficit_bits: f32,
+    pub suggested_action: String,
+    pub reason: String,
+}
+
+/// Result of one Assay panel-sufficiency pass with the physical Assay readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxSufficiencyReport {
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    pub anchored_records: usize,
+    pub joint_records: usize,
+    pub panel_bits: f32,
+    pub anchor_entropy_bits: f32,
+    pub sufficient: bool,
+    pub deficit_bits: f32,
+    pub grounded: bool,
+    pub deficits: Vec<SynapseCalyxSufficiencyDeficit>,
+    pub assay_cf_rows_after: usize,
+}
+
+/// One pairwise redundancy measurement between two lenses.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxRedundancyPair {
+    pub slot_a: u16,
+    pub slot_b: u16,
+    pub nmi: f32,
+    pub mi_bits: f32,
+    pub n_samples: usize,
+    pub redundant: bool,
+}
+
+/// Result of one Assay redundancy / effective-rank pass with Assay readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxRedundancyReport {
+    pub panel_version: u32,
+    pub n_lenses: usize,
+    pub records_scanned: usize,
+    pub effective_rank: f32,
+    pub pairs_evaluated: usize,
+    pub redundant_pairs: Vec<SynapseCalyxRedundancyPair>,
+    pub assay_cf_rows_after: usize,
+}
+
+struct AnchoredSlotSamples {
+    x: Vec<Vec<f32>>,
+    labels: Vec<usize>,
+}
+
+impl SynapseCalyxVault {
+    /// Measures grounded bits per lens about one outcome anchor over the panel
+    /// corpus (KSG mutual information), persists each lens estimate to the native
+    /// Assay CF, and reads the CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the Base CF cannot be
+    /// scanned, a constellation fails to decode, the KSG estimator rejects the
+    /// samples, or the Assay CF write/readback fails.
+    pub fn assay_bits(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> Result<SynapseCalyxBitsReport, SynapseCalyxError> {
+        let max_records = params
+            .max_records
+            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+        let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
+        let anchor_kind = parse_anchor_kind(&params.anchor_kind);
+        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind);
+
+        let mut store = AssayStore::default();
+        let vault_id = self.vault_id_value();
+        let seq = self.latest_seq();
+        let ksg_k = params.ksg_k.max(1);
+        let mut slots = Vec::new();
+        let mut slot_bits: Vec<(SlotId, f32)> = Vec::new();
+        for (slot, samples) in &gathered.by_slot {
+            if samples.x.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
+                slots.push(SynapseCalyxSlotBits {
+                    slot: slot.get(),
+                    marginal_bits: 0.0,
+                    ci_low: 0.0,
+                    ci_high: 0.0,
+                    n_samples: samples.x.len(),
+                    sole_carrier: false,
+                    provisional: true,
+                });
+                continue;
+            }
+            let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
+            let estimate = ksg_mi_continuous_discrete(&samples.x, &samples.labels, k)
+                .map_err(|error| loom_math_error("estimate KSG lens bits", &error))?;
+            slot_bits.push((*slot, estimate.bits));
+            store.put(
+                AssayCacheKey::scoped(
+                    params.panel_version,
+                    ASSAY_CORPUS_SHARD,
+                    vault_id,
+                    anchor_kind.clone(),
+                ),
+                AssaySubject::Lens { slot: *slot },
+                estimate.clone(),
+                "synapse-assay-bits",
+                seq,
+            );
+            slots.push(SynapseCalyxSlotBits {
+                slot: slot.get(),
+                marginal_bits: estimate.bits,
+                ci_low: estimate.ci_low,
+                ci_high: estimate.ci_high,
+                n_samples: estimate.n_samples,
+                sole_carrier: false,
+                provisional: false,
+            });
+        }
+
+        let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
+        mark_sole_carriers(&mut slots, &attributions);
+        let grounded = gathered.representative.as_ref().is_some_and(|anchor| {
+            matches!(
+                bits_report_with_anchor(attributions.clone(), anchor).trust,
+                TrustTag::Trusted
+            )
+        });
+        let total_bits = slot_bits.iter().map(|(_, bits)| *bits).sum();
+
+        let assay_cf_rows_after = self.persist_assay_store(&store)?;
+        Ok(SynapseCalyxBitsReport {
+            panel_version: params.panel_version,
+            anchor_kind: params.anchor_kind.clone(),
+            anchored_records: gathered.anchored_records,
+            distinct_outcomes: gathered.distinct_outcomes,
+            total_bits,
+            grounded,
+            slots,
+            assay_cf_rows_after,
+        })
+    }
+
+    /// Tests panel sufficiency `I(panel;anchor) >= H(anchor)` over the joint
+    /// slot representation, routes each deficit to a logged propose-lens
+    /// suggestion, persists the panel/outcome-entropy Assay rows, and reads the
+    /// Assay CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the corpus cannot be read,
+    /// the KSG estimator rejects the joint samples, or the Assay write/readback
+    /// fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn assay_sufficiency(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> Result<SynapseCalyxSufficiencyReport, SynapseCalyxError> {
+        let max_records = params
+            .max_records
+            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+        let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
+        let anchor_kind = parse_anchor_kind(&params.anchor_kind);
+        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind);
+
+        // Per-slot attributions feed the deficit split; the joint panel bits are
+        // the sufficiency numerator.
+        let ksg_k = params.ksg_k.max(1);
+        let mut slot_bits: Vec<(SlotId, f32)> = Vec::new();
+        for (slot, samples) in &gathered.by_slot {
+            if samples.x.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
+                slot_bits.push((*slot, 0.0));
+                continue;
+            }
+            let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
+            let estimate = ksg_mi_continuous_discrete(&samples.x, &samples.labels, k)
+                .map_err(|error| loom_math_error("estimate KSG lens bits", &error))?;
+            slot_bits.push((*slot, estimate.bits));
+        }
+        let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
+
+        let joint = build_joint_samples(&corpus, &anchor_kind);
+        let anchor_entropy_bits = entropy_bits(&joint.labels);
+        let joint_records = joint.labels.len();
+        let panel_bits = if joint_records >= SYNAPSE_ASSAY_MIN_SAMPLES {
+            let k = ksg_k.min(joint_records.saturating_sub(1)).max(1);
+            ksg_mi_continuous_discrete(&joint.x, &joint.labels, k)
+                .map_err(|error| loom_math_error("estimate KSG panel joint bits", &error))?
+                .bits
+        } else {
+            0.0
+        };
+
+        let mut store = AssayStore::default();
+        let vault_id = self.vault_id_value();
+        let seq = self.latest_seq();
+        let cache_key = AssayCacheKey::scoped(
+            params.panel_version,
+            ASSAY_CORPUS_SHARD,
+            vault_id,
+            anchor_kind,
+        );
+        let trust =
+            if joint_records >= SYNAPSE_ASSAY_MIN_SAMPLES && gathered.representative.is_some() {
+                TrustTag::Trusted
+            } else {
+                TrustTag::Provisional
+            };
+        store.put(
+            cache_key.clone(),
+            AssaySubject::Panel,
+            MiEstimate::point(
+                panel_bits,
+                joint_records,
+                EstimatorKind::PanelSufficiency,
+                trust,
+            ),
+            "synapse-assay-sufficiency",
+            seq,
+        );
+        store.put(
+            cache_key,
+            AssaySubject::OutcomeEntropy,
+            MiEstimate::point(
+                anchor_entropy_bits,
+                joint_records,
+                EstimatorKind::OutcomeEntropy,
+                trust,
+            ),
+            "synapse-assay-sufficiency",
+            seq,
+        );
+        let assay_cf_rows_after = self.persist_assay_store(&store)?;
+
+        if let Some(anchor) = gathered.representative.as_ref() {
+            let sufficiency = panel_sufficiency_with_anchor(
+                panel_bits,
+                anchor_entropy_bits,
+                &attributions,
+                anchor,
+            );
+            for deficit in &sufficiency.deficits {
+                // Route each deficit to a logged, human-actioned propose-lens
+                // suggestion (auto-commissioning is out of scope, #1672).
+                tracing::warn!(
+                    code = "SYNAPSE_ASSAY_PROPOSE_LENS",
+                    panel_version = params.panel_version,
+                    anchor_kind = %params.anchor_kind,
+                    slot = deficit.slot.map(SlotId::get),
+                    deficit_bits = deficit.deficit_bits,
+                    suggested_action = ?deficit.suggested_action,
+                    "panel sufficiency deficit — propose a lens to close the gap"
+                );
+            }
+            let deficits = sufficiency
+                .deficits
+                .iter()
+                .map(|deficit| SynapseCalyxSufficiencyDeficit {
+                    slot: deficit.slot.map(SlotId::get),
+                    deficit_bits: deficit.deficit_bits,
+                    suggested_action: format!("{:?}", deficit.suggested_action),
+                    reason: deficit.reason.clone(),
+                })
+                .collect::<Vec<_>>();
+            return Ok(SynapseCalyxSufficiencyReport {
+                panel_version: params.panel_version,
+                anchor_kind: params.anchor_kind.clone(),
+                anchored_records: gathered.anchored_records,
+                joint_records,
+                panel_bits,
+                anchor_entropy_bits,
+                sufficient: sufficiency.sufficient,
+                deficit_bits: sufficiency.deficit_bits,
+                grounded: matches!(trust, TrustTag::Trusted),
+                deficits,
+                assay_cf_rows_after,
+            });
+        }
+        Ok(SynapseCalyxSufficiencyReport {
+            panel_version: params.panel_version,
+            anchor_kind: params.anchor_kind.clone(),
+            anchored_records: gathered.anchored_records,
+            joint_records,
+            panel_bits,
+            anchor_entropy_bits,
+            sufficient: panel_bits >= anchor_entropy_bits,
+            deficit_bits: (anchor_entropy_bits - panel_bits).max(0.0),
+            grounded: false,
+            deficits: Vec::new(),
+            assay_cf_rows_after,
+        })
+    }
+
+    /// Measures pairwise lens redundancy (normalized MI over deterministic
+    /// random-projection sketches) and the panel effective rank (stable rank of
+    /// the redundancy matrix), persists redundant pairs to the Assay CF, and
+    /// reads the CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the corpus cannot be read,
+    /// the NMI/effective-rank math fails closed, or the Assay write/readback
+    /// fails.
+    pub fn assay_redundancy(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> Result<SynapseCalyxRedundancyReport, SynapseCalyxError> {
+        let max_records = params
+            .max_records
+            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+        let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
+
+        // Reduce every dense lens to a deterministic 1-D random-projection sketch
+        // per record (JL-style), keyed by record index, so heterogeneous-shape
+        // lenses can be compared by a discrete normalized-MI estimator.
+        let mut sketches: BTreeMap<SlotId, BTreeMap<usize, f32>> = BTreeMap::new();
+        for (index, record) in corpus.records.iter().enumerate() {
+            for (slot, vector) in &record.slots {
+                sketches
+                    .entry(*slot)
+                    .or_default()
+                    .insert(index, project_scalar(slot.get(), vector));
+            }
+        }
+        let slot_ids: Vec<SlotId> = sketches.keys().copied().collect();
+        let n_lenses = slot_ids.len();
+
+        let mut matrix = vec![vec![0.0_f32; n_lenses]; n_lenses];
+        for (index, row) in matrix.iter_mut().enumerate() {
+            row[index] = 1.0;
+        }
+        let mut store = AssayStore::default();
+        let vault_id = self.vault_id_value();
+        let seq = self.latest_seq();
+        let mut redundant_pairs = Vec::new();
+        let mut pairs_evaluated = 0usize;
+        for i in 0..n_lenses {
+            for j in (i + 1)..n_lenses {
+                let (paired_a, paired_b) =
+                    paired_sketches(&sketches[&slot_ids[i]], &sketches[&slot_ids[j]]);
+                if paired_a.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
+                    continue;
+                }
+                let report =
+                    partitioned_histogram_nmi(&paired_a, &paired_b, SYNAPSE_REDUNDANCY_NMI_BINS)
+                        .map_err(|error| {
+                            loom_math_error("estimate pairwise redundancy NMI", &error)
+                        })?;
+                pairs_evaluated += 1;
+                let nmi = report.nmi.clamp(0.0, 1.0);
+                matrix[i][j] = nmi;
+                matrix[j][i] = nmi;
+                let redundant = report.nmi >= SYNAPSE_ASSAY_CORRELATION_CEILING;
+                if redundant {
+                    store.put(
+                        AssayCacheKey::scoped(
+                            params.panel_version,
+                            ASSAY_CORPUS_SHARD,
+                            vault_id,
+                            AnchorKind::Reward,
+                        ),
+                        AssaySubject::Pair {
+                            a: slot_ids[i],
+                            b: slot_ids[j],
+                        },
+                        MiEstimate::point(
+                            report.mi_bits,
+                            paired_a.len(),
+                            EstimatorKind::HistogramNmi,
+                            TrustTag::Provisional,
+                        ),
+                        "synapse-assay-redundancy",
+                        seq,
+                    );
+                    redundant_pairs.push(SynapseCalyxRedundancyPair {
+                        slot_a: slot_ids[i].get(),
+                        slot_b: slot_ids[j].get(),
+                        nmi: report.nmi,
+                        mi_bits: report.mi_bits,
+                        n_samples: paired_a.len(),
+                        redundant,
+                    });
+                }
+            }
+        }
+        let effective_rank = stable_rank(&matrix)
+            .map_err(|error| loom_math_error("compute effective rank", &error))?
+            .n_eff;
+        let assay_cf_rows_after = self.persist_assay_store(&store)?;
+        Ok(SynapseCalyxRedundancyReport {
+            panel_version: params.panel_version,
+            n_lenses,
+            records_scanned: corpus.records_scanned,
+            effective_rank,
+            pairs_evaluated,
+            redundant_pairs,
+            assay_cf_rows_after,
+        })
+    }
+
+    /// Persists an in-memory Assay store to the native Assay CF and returns the
+    /// physical Assay CF row count read back afterwards.
+    fn persist_assay_store(&self, store: &AssayStore) -> Result<usize, SynapseCalyxError> {
+        if !store.is_empty() {
+            store
+                .persist_to_vault(&self.vault)
+                .map_err(|error| loom_math_error("persist Assay CF rows", &error))?;
+        }
+        Ok(self.scan_cf_latest(ColumnFamily::Assay)?.len())
+    }
+}
+
+struct GatheredAnchoredSamples {
+    by_slot: BTreeMap<SlotId, AnchoredSlotSamples>,
+    representative: Option<Anchor>,
+    anchored_records: usize,
+    distinct_outcomes: usize,
+}
+
+struct JointAnchoredSamples {
+    x: Vec<Vec<f32>>,
+    labels: Vec<usize>,
+}
+
+fn gather_anchored_slot_samples(
+    corpus: &DenseCorpus,
+    anchor_kind: &AnchorKind,
+) -> GatheredAnchoredSamples {
+    let mut by_slot: BTreeMap<SlotId, AnchoredSlotSamples> = BTreeMap::new();
+    let mut interner: BTreeMap<String, usize> = BTreeMap::new();
+    let mut representative = None;
+    let mut anchored_records = 0usize;
+    for record in &corpus.records {
+        let Some(anchor) = anchor_of_kind(&record.anchors, anchor_kind) else {
+            continue;
+        };
+        let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
+            continue;
+        };
+        if representative.is_none() {
+            representative = Some(anchor.clone());
+        }
+        anchored_records += 1;
+        for (slot, vector) in &record.slots {
+            let entry = by_slot.entry(*slot).or_insert_with(|| AnchoredSlotSamples {
+                x: Vec::new(),
+                labels: Vec::new(),
+            });
+            entry.x.push(vector.clone());
+            entry.labels.push(label);
+        }
+    }
+    GatheredAnchoredSamples {
+        by_slot,
+        representative,
+        anchored_records,
+        distinct_outcomes: interner.len(),
+    }
+}
+
+/// Builds the joint panel samples for sufficiency: the concatenation of the
+/// slots present in every anchored record (the coverage intersection), so the
+/// joint feature vector has one consistent dimension.
+fn build_joint_samples(corpus: &DenseCorpus, anchor_kind: &AnchorKind) -> JointAnchoredSamples {
+    let mut interner: BTreeMap<String, usize> = BTreeMap::new();
+    let mut anchored: Vec<(&BTreeMap<SlotId, Vec<f32>>, usize)> = Vec::new();
+    for record in &corpus.records {
+        let Some(anchor) = anchor_of_kind(&record.anchors, anchor_kind) else {
+            continue;
+        };
+        let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
+            continue;
+        };
+        anchored.push((&record.slots, label));
+    }
+    let mut required: Option<BTreeSet<SlotId>> = None;
+    for (slots, _) in &anchored {
+        let present: BTreeSet<SlotId> = slots.keys().copied().collect();
+        required = Some(match required.take() {
+            Some(current) => current.intersection(&present).copied().collect(),
+            None => present,
+        });
+    }
+    let required = required.unwrap_or_default();
+    let mut x = Vec::new();
+    let mut labels = Vec::new();
+    for (slots, label) in anchored {
+        let mut joint = Vec::new();
+        for slot in &required {
+            if let Some(vector) = slots.get(slot) {
+                joint.extend_from_slice(vector);
+            }
+        }
+        if !joint.is_empty() {
+            x.push(joint);
+            labels.push(label);
+        }
+    }
+    JointAnchoredSamples { x, labels }
+}
+
+fn mark_sole_carriers(slots: &mut [SynapseCalyxSlotBits], attributions: &[SlotAttribution]) {
+    for attribution in attributions {
+        if let Some(entry) = slots
+            .iter_mut()
+            .find(|slot| slot.slot == attribution.slot.get())
+        {
+            entry.sole_carrier = attribution.sole_carrier;
+        }
+    }
+}
+
+fn paired_sketches(a: &BTreeMap<usize, f32>, b: &BTreeMap<usize, f32>) -> (Vec<f32>, Vec<f32>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for (index, value_a) in a {
+        if let Some(value_b) = b.get(index) {
+            left.push(*value_a);
+            right.push(*value_b);
+        }
+    }
+    (left, right)
+}
+
+/// Deterministic JL-style random projection of a slot vector onto one pseudo-
+/// random unit direction seeded by the slot id, reducing any-shape dense lens
+/// to a single scalar per record for the discrete NMI redundancy estimator.
+#[allow(clippy::cast_precision_loss)]
+fn project_scalar(slot: u16, vector: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for (index, value) in vector.iter().enumerate() {
+        let seed = splitmix64(
+            (u64::from(slot) << 40) ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        // Map the hashed bits into a symmetric weight in [-1, 1].
+        let unit = ((seed >> 11) as f32 / (1u64 << 53) as f32).mul_add(2.0, -1.0);
+        acc = value.mul_add(unit, acc);
+    }
+    acc
+}
+
+const fn splitmix64(seed: u64) -> u64 {
+    let seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Interns an anchor value into a stable discrete class index. Vector anchors
+/// are not discrete labels and are skipped.
+fn discrete_anchor_label(
+    value: &AnchorValue,
+    interner: &mut BTreeMap<String, usize>,
+) -> Option<usize> {
+    let token = match value {
+        AnchorValue::Bool(flag) => format!("bool:{flag}"),
+        AnchorValue::Enum(name) => format!("enum:{name}"),
+        AnchorValue::Text(text) => format!("text:{text}"),
+        AnchorValue::OneHot(values) => format!("onehot:{}", values.join("|")),
+        AnchorValue::Number(number) => format!("num:{number}"),
+        AnchorValue::Vector(_) => return None,
+    };
+    let next = interner.len();
+    Some(*interner.entry(token).or_insert(next))
+}
+
+/// Returns the first grounded anchor of a given kind on a record.
+fn anchor_of_kind<'a>(anchors: &'a [Anchor], kind: &AnchorKind) -> Option<&'a Anchor> {
+    anchors
+        .iter()
+        .find(|anchor| &anchor.kind == kind && anchor.confidence > 0.0)
+}
+
+/// Maps an operator-supplied anchor-kind string to a native `AnchorKind`.
+/// Synapse writes outcome anchors as `Label(<name>)`, so an unrecognized name
+/// becomes a `Label`.
+fn parse_anchor_kind(raw: &str) -> AnchorKind {
+    match raw.trim() {
+        "test_pass" => AnchorKind::TestPass,
+        "tie_formed" => AnchorKind::TieFormed,
+        "thumbs" => AnchorKind::Thumbs,
+        "reward" => AnchorKind::Reward,
+        "speaker_match" => AnchorKind::SpeakerMatch,
+        "style_hold" => AnchorKind::StyleHold,
+        "recurrence" => AnchorKind::Recurrence,
+        other => AnchorKind::Label(other.to_owned()),
+    }
 }

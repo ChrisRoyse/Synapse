@@ -67,9 +67,13 @@ pub use backup::{
     verify_vault_restore,
 };
 pub use intelligence::{
+    SYNAPSE_ASSAY_BIT_FLOOR, SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES,
     SYNAPSE_INTELLIGENCE_MAX_RECORDS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
-    SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxBetweenRecordEdge,
-    SynapseCalyxNeffEstimate, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    SYNAPSE_KSG_DEFAULT_K, SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge,
+    SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport,
+    SynapseCalyxNeffEstimate, SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport,
+    SynapseCalyxSlotBits, SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport,
+    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
@@ -777,7 +781,7 @@ impl SynapseCalyxLedgerVerifyReport {
             tip_hash,
             verified_range,
         } = verification;
-        let mut report = Self {
+        let base = Self {
             intact: false,
             verdict: String::new(),
             head_height,
@@ -791,28 +795,30 @@ impl SynapseCalyxLedgerVerifyReport {
             corrupt_reason: None,
         };
         match result {
-            VerifyResult::Intact { count } => {
-                report.intact = true;
-                report.verdict = "intact".to_owned();
-                report.entry_count = count;
-            }
+            VerifyResult::Intact { count } => Self {
+                intact: true,
+                verdict: "intact".to_owned(),
+                entry_count: count,
+                ..base
+            },
             VerifyResult::Broken {
                 at_seq,
                 expected,
                 found,
-            } => {
-                report.verdict = "broken".to_owned();
-                report.quarantine_seq = Some(at_seq);
-                report.broken_expected_hash = Some(hex_bytes(&expected));
-                report.broken_found_hash = Some(hex_bytes(&found));
-            }
-            VerifyResult::Corrupt { at_seq, reason } => {
-                report.verdict = "corrupt".to_owned();
-                report.quarantine_seq = Some(at_seq);
-                report.corrupt_reason = Some(reason);
-            }
+            } => Self {
+                verdict: "broken".to_owned(),
+                quarantine_seq: Some(at_seq),
+                broken_expected_hash: Some(hex_bytes(&expected)),
+                broken_found_hash: Some(hex_bytes(&found)),
+                ..base
+            },
+            VerifyResult::Corrupt { at_seq, reason } => Self {
+                verdict: "corrupt".to_owned(),
+                quarantine_seq: Some(at_seq),
+                corrupt_reason: Some(reason),
+                ..base
+            },
         }
-        report
     }
 }
 
@@ -842,7 +848,7 @@ pub struct SynapseCalyxLedgerEntryReadback {
 }
 
 impl SynapseCalyxLedgerEntryReadback {
-    fn absent(seq: u64) -> Self {
+    const fn absent(seq: u64) -> Self {
         Self {
             seq,
             present: false,
@@ -877,6 +883,7 @@ impl SynapseCalyxLedgerEntryReadback {
 
 /// Re-derivation verdict for a record's recorded provenance binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SynapseCalyxReproduceReport {
     pub cx_id: String,
     pub reproduced: bool,
@@ -893,7 +900,7 @@ pub struct SynapseCalyxReproduceReport {
 }
 
 impl SynapseCalyxReproduceReport {
-    fn from_aster(reproduction: calyx_aster::vault::AsterProvenanceReproduction) -> Self {
+    fn from_aster(reproduction: &calyx_aster::vault::AsterProvenanceReproduction) -> Self {
         let drift = if reproduction.reproduced {
             "none".to_owned()
         } else if !reproduction.entry_present {
@@ -3207,10 +3214,10 @@ impl SynapseCalyxVault {
             .vault
             .read_ledger_entry(seq)
             .map_err(|error| SynapseCalyxError::from_calyx("read Calyx ledger entry", &error))?;
-        Ok(match entry {
-            Some(entry) => SynapseCalyxLedgerEntryReadback::from_entry(seq, &entry),
-            None => SynapseCalyxLedgerEntryReadback::absent(seq),
-        })
+        Ok(entry.map_or_else(
+            || SynapseCalyxLedgerEntryReadback::absent(seq),
+            |entry| SynapseCalyxLedgerEntryReadback::from_entry(seq, &entry),
+        ))
     }
 
     /// Re-derives a record's recorded provenance binding from the bytes and
@@ -3229,7 +3236,7 @@ impl SynapseCalyxVault {
             .vault
             .reproduce_record_provenance(cx_id)
             .map_err(|error| SynapseCalyxError::from_calyx("reproduce Calyx record", &error))?;
-        Ok(SynapseCalyxReproduceReport::from_aster(reproduction))
+        Ok(SynapseCalyxReproduceReport::from_aster(&reproduction))
     }
 
     /// Lawfully erases one record (constellation) by content-addressed id:

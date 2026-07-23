@@ -571,24 +571,55 @@ pub(super) async fn handle(
             // substrate math; that is blocking CPU/IO work that must not occupy a
             // runtime worker serving MCP requests. Offload to the blocking pool.
             let response = tokio::task::spawn_blocking(move || {
+                use crate::m3::storage::{StorageIntelligenceOperation, StorageIntelligenceResponse};
+                let base = StorageIntelligenceResponse {
+                    operation: sub_operation,
+                    weave: None,
+                    abundance: None,
+                    bits: None,
+                    sufficiency: None,
+                    redundancy: None,
+                };
                 match sub_operation {
-                    crate::m3::storage::StorageIntelligenceOperation::Weave => {
+                    StorageIntelligenceOperation::Weave => {
                         crate::m3::storage::run_intelligence_weave(&db, &spec).map(|weave| {
-                            crate::m3::storage::StorageIntelligenceResponse {
-                                operation: sub_operation,
+                            StorageIntelligenceResponse {
                                 weave: Some(weave),
-                                abundance: None,
+                                ..base
                             }
                         })
                     }
-                    crate::m3::storage::StorageIntelligenceOperation::Abundance => {
+                    StorageIntelligenceOperation::Abundance => {
                         crate::m3::storage::run_intelligence_abundance(&db, &spec).map(|abundance| {
-                            crate::m3::storage::StorageIntelligenceResponse {
-                                operation: sub_operation,
-                                weave: None,
+                            StorageIntelligenceResponse {
                                 abundance: Some(abundance),
+                                ..base
                             }
                         })
+                    }
+                    StorageIntelligenceOperation::Bits => {
+                        crate::m3::storage::run_intelligence_bits(&db, &spec).map(|bits| {
+                            StorageIntelligenceResponse {
+                                bits: Some(bits),
+                                ..base
+                            }
+                        })
+                    }
+                    StorageIntelligenceOperation::Sufficiency => {
+                        crate::m3::storage::run_intelligence_sufficiency(&db, &spec).map(
+                            |sufficiency| StorageIntelligenceResponse {
+                                sufficiency: Some(sufficiency),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::Redundancy => {
+                        crate::m3::storage::run_intelligence_redundancy(&db, &spec).map(
+                            |redundancy| StorageIntelligenceResponse {
+                                redundancy: Some(redundancy),
+                                ..base
+                            },
+                        )
                     }
                 }
             })
@@ -606,8 +637,8 @@ pub(super) async fn handle(
                     "inspect daemon logs; the intelligence weave/abundance task terminated abnormally",
                 )
             })??;
-            let summary = match (&response.weave, &response.abundance) {
-                (Some(weave), _) => format!(
+            let summary = if let Some(weave) = &response.weave {
+                format!(
                     "intelligence weave panel={} records_woven={} cross_terms={} agreement_edges={} between_record_edges={} xterm_rows={} graph_rows={}",
                     weave.panel_version,
                     weave.records_woven,
@@ -616,8 +647,9 @@ pub(super) async fn handle(
                     weave.between_record_edges_persisted,
                     weave.xterm_cf_rows_after,
                     weave.graph_cf_rows_after,
-                ),
-                (_, Some(abundance)) => format!(
+                )
+            } else if let Some(abundance) = &response.abundance {
+                format!(
                     "intelligence abundance panel={} n_lenses={} n_constellations={} c_n2={} materialized={} xterm_rows={} graph_rows={}",
                     abundance.panel_version,
                     abundance.n_lenses,
@@ -626,8 +658,42 @@ pub(super) async fn handle(
                     abundance.materialized,
                     abundance.xterm_cf_rows,
                     abundance.graph_cf_rows,
-                ),
-                (None, None) => "intelligence".to_owned(),
+                )
+            } else if let Some(bits) = &response.bits {
+                format!(
+                    "intelligence bits panel={} anchor={} anchored_records={} total_bits={:.4} grounded={} slots={} assay_rows={}",
+                    bits.panel_version,
+                    bits.anchor_kind,
+                    bits.anchored_records,
+                    bits.total_bits,
+                    bits.grounded,
+                    bits.slots.len(),
+                    bits.assay_cf_rows_after,
+                )
+            } else if let Some(sufficiency) = &response.sufficiency {
+                format!(
+                    "intelligence sufficiency panel={} anchor={} panel_bits={:.4} anchor_entropy_bits={:.4} sufficient={} deficit_bits={:.4} deficits={} assay_rows={}",
+                    sufficiency.panel_version,
+                    sufficiency.anchor_kind,
+                    sufficiency.panel_bits,
+                    sufficiency.anchor_entropy_bits,
+                    sufficiency.sufficient,
+                    sufficiency.deficit_bits,
+                    sufficiency.deficits.len(),
+                    sufficiency.assay_cf_rows_after,
+                )
+            } else if let Some(redundancy) = &response.redundancy {
+                format!(
+                    "intelligence redundancy panel={} n_lenses={} effective_rank={:.4} pairs_evaluated={} redundant_pairs={} assay_rows={}",
+                    redundancy.panel_version,
+                    redundancy.n_lenses,
+                    redundancy.effective_rank,
+                    redundancy.pairs_evaluated,
+                    redundancy.redundant_pairs.len(),
+                    redundancy.assay_cf_rows_after,
+                )
+            } else {
+                "intelligence".to_owned()
             };
             Ok(Json(storage_response(operation, summary, |out| {
                 out.intelligence = Some(response)

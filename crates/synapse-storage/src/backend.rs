@@ -20,14 +20,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
     SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
-    SynapseCalyxAnchorWriteReadback, SynapseCalyxBackupReport, SynapseCalyxCfRangePage,
-    SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
-    SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxGroundedObservationReadback,
-    SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
-    SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
-    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
-    SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard,
-    SynapseCalyxSearchRebuildReport, SynapseCalyxTemporalCandidate,
+    SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams, SynapseCalyxBackupReport,
+    SynapseCalyxBitsReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
+    SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxErasureReport,
+    SynapseCalyxError, SynapseCalyxGroundedObservationReadback, SynapseCalyxLedgerEntryReadback,
+    SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
+    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
+    SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
+    SynapseCalyxRedundancyReport, SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard,
+    SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
     SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
     SynapseCalyxVaultStatus, SynapseCalyxVerifyReport, SynapseCalyxWeaveParams,
     SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
@@ -627,6 +628,18 @@ pub trait StorageBackend: Send + Sync {
         panel_version: u32,
         max_records: usize,
     ) -> StorageResult<SynapseCalyxAbundanceReport>;
+    fn assay_bits_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseCalyxBitsReport>;
+    fn assay_sufficiency_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseCalyxSufficiencyReport>;
+    fn assay_redundancy_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseCalyxRedundancyReport>;
 }
 
 pub struct CalyxBackend {
@@ -1855,6 +1868,62 @@ impl StorageBackend for CalyxBackend {
                             &source,
                         )
                     })
+            },
+        )
+    }
+
+    fn assay_bits_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseCalyxBitsReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx lens bits",
+            true,
+            |vault| {
+                vault.assay_bits(params).map_err(|source| {
+                    calyx_write_failed("calyx_assay", "measure native Calyx lens bits", &source)
+                })
+            },
+        )
+    }
+
+    fn assay_sufficiency_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseCalyxSufficiencyReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx panel sufficiency",
+            true,
+            |vault| {
+                vault.assay_sufficiency(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx panel sufficiency",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn assay_redundancy_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseCalyxRedundancyReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx lens redundancy",
+            true,
+            |vault| {
+                vault.assay_redundancy(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_assay",
+                        "measure native Calyx lens redundancy",
+                        &source,
+                    )
+                })
             },
         )
     }

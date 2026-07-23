@@ -950,6 +950,49 @@ impl Db {
             .abundance_report_intelligence(panel_version, max_records)
     }
 
+    /// Measures grounded bits per lens about one outcome anchor over a panel,
+    /// persists each estimate to the native Assay CF, and reads it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the corpus cannot be read, the
+    /// KSG estimator rejects the samples, or the Assay write/readback fails.
+    pub fn assay_bits_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxAssayParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxBitsReport> {
+        self.backend.assay_bits_intelligence(params)
+    }
+
+    /// Tests panel sufficiency `I(panel;anchor) >= H(anchor)`, routes deficits to
+    /// logged propose-lens suggestions, persists the panel/outcome-entropy Assay
+    /// rows, and reads the Assay CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the corpus cannot be read, the
+    /// KSG estimator rejects the joint samples, or the Assay write/readback fails.
+    pub fn assay_sufficiency_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxAssayParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSufficiencyReport> {
+        self.backend.assay_sufficiency_intelligence(params)
+    }
+
+    /// Measures pairwise lens redundancy and the panel effective rank, persists
+    /// redundant pairs to the native Assay CF, and reads it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the corpus cannot be read, the
+    /// NMI/effective-rank math fails closed, or the Assay write/readback fails.
+    pub fn assay_redundancy_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxAssayParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxRedundancyReport> {
+        self.backend.assay_redundancy_intelligence(params)
+    }
+
     /// Flushes and explicitly closes the sole process-local Calyx vault.
     ///
     /// # Errors

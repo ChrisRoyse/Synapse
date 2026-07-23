@@ -531,6 +531,9 @@ const MAX_INTELLIGENCE_RECORDS: u32 = 20_000;
 pub enum StorageIntelligenceOperation {
     Weave,
     Abundance,
+    Bits,
+    Sufficiency,
+    Redundancy,
 }
 
 impl StorageIntelligenceOperation {
@@ -539,12 +542,22 @@ impl StorageIntelligenceOperation {
         match self {
             Self::Weave => "weave",
             Self::Abundance => "abundance",
+            Self::Bits => "bits",
+            Self::Sufficiency => "sufficiency",
+            Self::Redundancy => "redundancy",
         }
     }
 
     #[must_use]
     pub const fn mutates_state(self) -> bool {
-        matches!(self, Self::Weave)
+        // Abundance is a pure read; weave persists XTerm/Graph rows and the
+        // assay operations persist Assay rows.
+        !matches!(self, Self::Abundance)
+    }
+
+    #[must_use]
+    pub const fn requires_anchor(self) -> bool {
+        matches!(self, Self::Bits | Self::Sufficiency)
     }
 }
 
@@ -563,6 +576,14 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 64))]
     pub knn_k: Option<u32>,
+    /// Grounded outcome anchor kind to measure bits about (bits/sufficiency).
+    /// Synapse writes outcome anchors as a label string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_kind: Option<String>,
+    /// k for the KSG mutual-information estimator (bits/sufficiency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 32))]
+    pub ksg_k: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
@@ -626,12 +647,95 @@ pub struct StorageIntelligenceWeaveResponse {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceSlotBits {
+    pub slot: u32,
+    pub marginal_bits: f32,
+    pub ci_low: f32,
+    pub ci_high: f32,
+    pub n_samples: u64,
+    pub sole_carrier: bool,
+    pub provisional: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceBitsReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    pub anchored_records: u64,
+    pub distinct_outcomes: u64,
+    pub total_bits: f32,
+    pub grounded: bool,
+    pub slots: Vec<StorageIntelligenceSlotBits>,
+    pub assay_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceSufficiencyDeficit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    pub deficit_bits: f32,
+    pub suggested_action: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceSufficiencyReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    pub anchored_records: u64,
+    pub joint_records: u64,
+    pub panel_bits: f32,
+    pub anchor_entropy_bits: f32,
+    pub sufficient: bool,
+    pub deficit_bits: f32,
+    pub grounded: bool,
+    pub deficits: Vec<StorageIntelligenceSufficiencyDeficit>,
+    pub assay_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceRedundancyPair {
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub nmi: f32,
+    pub mi_bits: f32,
+    pub n_samples: u64,
+    pub redundant: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceRedundancyReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub n_lenses: u64,
+    pub records_scanned: u64,
+    pub effective_rank: f32,
+    pub pairs_evaluated: u64,
+    pub redundant_pairs: Vec<StorageIntelligenceRedundancyPair>,
+    pub assay_cf_rows_after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceResponse {
     pub operation: StorageIntelligenceOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weave: Option<StorageIntelligenceWeaveResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abundance: Option<StorageIntelligenceAbundanceReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<StorageIntelligenceBitsReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sufficiency: Option<StorageIntelligenceSufficiencyReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<StorageIntelligenceRedundancyReport>,
 }
 
 #[must_use]
@@ -931,6 +1035,134 @@ fn clamp_intelligence_records(requested: Option<u32>) -> usize {
     requested
         .unwrap_or(MAX_INTELLIGENCE_RECORDS)
         .clamp(1, MAX_INTELLIGENCE_RECORDS) as usize
+}
+
+fn assay_params(
+    params: &StorageIntelligenceParams,
+) -> Result<synapse_calyx::SynapseCalyxAssayParams, ErrorData> {
+    let anchor_kind = params
+        .anchor_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "storage operation=intelligence sub_operation={} requires a non-empty anchor_kind",
+                    params.operation.as_str()
+                ),
+            )
+        })?;
+    let mut assay =
+        synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, anchor_kind.to_owned());
+    assay.max_records = clamp_intelligence_records(params.max_records);
+    if let Some(ksg_k) = params.ksg_k {
+        assay.ksg_k = ksg_k as usize;
+    }
+    Ok(assay)
+}
+
+/// Measures grounded bits per lens about one outcome anchor and persists the
+/// Assay CF rows.
+pub fn run_intelligence_bits(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceBitsReport, ErrorData> {
+    let report = db
+        .assay_bits_intelligence(&assay_params(params)?)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceBitsReport {
+        source_of_truth: "Calyx Assay CF rows",
+        panel_version: report.panel_version,
+        anchor_kind: report.anchor_kind,
+        anchored_records: report.anchored_records as u64,
+        distinct_outcomes: report.distinct_outcomes as u64,
+        total_bits: report.total_bits,
+        grounded: report.grounded,
+        slots: report
+            .slots
+            .into_iter()
+            .map(|slot| StorageIntelligenceSlotBits {
+                slot: u32::from(slot.slot),
+                marginal_bits: slot.marginal_bits,
+                ci_low: slot.ci_low,
+                ci_high: slot.ci_high,
+                n_samples: slot.n_samples as u64,
+                sole_carrier: slot.sole_carrier,
+                provisional: slot.provisional,
+            })
+            .collect(),
+        assay_cf_rows_after: report.assay_cf_rows_after as u64,
+    })
+}
+
+/// Tests panel sufficiency and persists the panel/outcome-entropy Assay rows.
+pub fn run_intelligence_sufficiency(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceSufficiencyReport, ErrorData> {
+    let report = db
+        .assay_sufficiency_intelligence(&assay_params(params)?)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceSufficiencyReport {
+        source_of_truth: "Calyx Assay CF rows",
+        panel_version: report.panel_version,
+        anchor_kind: report.anchor_kind,
+        anchored_records: report.anchored_records as u64,
+        joint_records: report.joint_records as u64,
+        panel_bits: report.panel_bits,
+        anchor_entropy_bits: report.anchor_entropy_bits,
+        sufficient: report.sufficient,
+        deficit_bits: report.deficit_bits,
+        grounded: report.grounded,
+        deficits: report
+            .deficits
+            .into_iter()
+            .map(|deficit| StorageIntelligenceSufficiencyDeficit {
+                slot: deficit.slot.map(u32::from),
+                deficit_bits: deficit.deficit_bits,
+                suggested_action: deficit.suggested_action,
+                reason: deficit.reason,
+            })
+            .collect(),
+        assay_cf_rows_after: report.assay_cf_rows_after as u64,
+    })
+}
+
+/// Measures pairwise lens redundancy + effective rank and persists redundant
+/// Assay pairs.
+pub fn run_intelligence_redundancy(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceRedundancyReport, ErrorData> {
+    let mut assay =
+        synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, String::new());
+    assay.max_records = clamp_intelligence_records(params.max_records);
+    let report = db
+        .assay_redundancy_intelligence(&assay)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceRedundancyReport {
+        source_of_truth: "Calyx Assay CF rows",
+        panel_version: report.panel_version,
+        n_lenses: report.n_lenses as u64,
+        records_scanned: report.records_scanned as u64,
+        effective_rank: report.effective_rank,
+        pairs_evaluated: report.pairs_evaluated as u64,
+        redundant_pairs: report
+            .redundant_pairs
+            .into_iter()
+            .map(|pair| StorageIntelligenceRedundancyPair {
+                slot_a: u32::from(pair.slot_a),
+                slot_b: u32::from(pair.slot_b),
+                nmi: pair.nmi,
+                mi_bits: pair.mi_bits,
+                n_samples: pair.n_samples as u64,
+                redundant: pair.redundant,
+            })
+            .collect(),
+        assay_cf_rows_after: report.assay_cf_rows_after as u64,
+    })
 }
 
 fn storage_intelligence_agreement_edge(
