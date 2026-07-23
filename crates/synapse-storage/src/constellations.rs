@@ -3,10 +3,11 @@ use std::env;
 use std::time::Duration;
 
 use calyx_core::{
-    AbsentReason, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens,
+    AbsentReason, Asymmetry, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens,
     METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS, METADATA_SOURCE_SEQUENCE,
-    METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE, Modality, SlotId, SlotVector,
-    TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE, TEMPORAL_MISSING_CREATED_AT, VaultId,
+    METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE, Modality, Panel, QuantPolicy,
+    Slot, SlotId, SlotKey, SlotResource, SlotState, SlotVector, TEMPORAL_LANE_ACTIVE,
+    TEMPORAL_LANE_INACTIVE, TEMPORAL_MISSING_CREATED_AT, VaultId,
 };
 use calyx_lenses::AlgorithmicLens;
 use calyx_lenses::measure::{absent, input_hash};
@@ -1546,6 +1547,274 @@ pub fn build_episode_constellation(
         scalars,
         metadata,
     )
+}
+
+/// Builds the authoritative active-panel contract for one live panel version.
+///
+/// Reuses the exact frozen `AlgorithmicLens` constructors the ingest builders
+/// use so the published `Panel` carries the true slot identities (lens id,
+/// shape, modality) rather than a synthesized guess. The content slots are
+/// `Active`; retrieval-only temporal sidecars live in the native Registry CF
+/// and are not part of the panel's content slot set.
+///
+/// Returns `None` for panel versions whose durable content-slot contract is not
+/// enumerated here; callers must fail closed on `None` rather than publish a
+/// partial contract. This is the source of truth consumed by
+/// `SynapseCalyxVault::publish_active_panel`.
+#[must_use]
+pub fn syn_active_panel_contract(panel_version: u32, created_at_ms: u64) -> Option<Panel> {
+    let slots = match panel_version {
+        SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version),
+        SYN_EPISODE_PANEL_VERSION => episode_panel_slots(panel_version),
+        _ => return None,
+    };
+    Some(Panel {
+        version: panel_version,
+        slots,
+        created_at: created_at_ms,
+        kernel_ref: None,
+        guard_ref: None,
+    })
+}
+
+/// Builds one `Active`, content (non-retrieval-only) panel slot from the same
+/// frozen lens the ingest path measures with, so the slot's `lens_id`/`shape`/
+/// `modality` are authoritative rather than reconstructed.
+fn syn_content_slot(
+    slot_id: SlotId,
+    slot_key: &str,
+    lens: &AlgorithmicLens,
+    panel_version: u32,
+) -> Slot {
+    Slot {
+        slot_id,
+        slot_key: SlotKey::new(slot_id, slot_key),
+        lens_id: lens.id(),
+        shape: lens.shape(),
+        modality: lens.modality(),
+        asymmetry: Asymmetry::None,
+        quant: QuantPolicy::None,
+        resource: SlotResource::default(),
+        axis: None,
+        retrieval_only: false,
+        excluded_from_dedup: false,
+        bits_about: BTreeMap::new(),
+        state: SlotState::Active,
+        added_at_panel_version: panel_version,
+    }
+}
+
+fn timeline_panel_slots(panel_version: u32) -> Vec<Slot> {
+    vec![
+        syn_content_slot(
+            TL_SLOT_KIND_ONEHOT,
+            "syn.timeline.kind_onehot.v1",
+            &AlgorithmicLens::syn_one_hot("syn.timeline.kind_onehot.v1", Modality::Structured, 32),
+            panel_version,
+        ),
+        syn_content_slot(
+            TL_SLOT_APP_HASH,
+            "syn.timeline.app_hash.v1",
+            &AlgorithmicLens::syn_hash("syn.timeline.app_hash.v1", Modality::Structured, 1024),
+            panel_version,
+        ),
+        syn_content_slot(
+            TL_SLOT_TITLE_SPARSE,
+            "syn.timeline.title_sparse.v1",
+            &AlgorithmicLens::syn_sparse_text(
+                "syn.timeline.title_sparse.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            TL_SLOT_HOUR_CYCLIC,
+            "syn.timeline.hour_cyclic.v1",
+            &AlgorithmicLens::syn_cyclic_time(
+                "syn.timeline.hour_cyclic.v1",
+                Modality::Structured,
+                24,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            TL_SLOT_DOW_CYCLIC,
+            "syn.timeline.dow_cyclic.v1",
+            &AlgorithmicLens::syn_cyclic_time(
+                "syn.timeline.dow_cyclic.v1",
+                Modality::Structured,
+                7,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            TL_SLOT_ACTOR_ONEHOT,
+            "syn.timeline.actor_onehot.v1",
+            &AlgorithmicLens::syn_one_hot("syn.timeline.actor_onehot.v1", Modality::Structured, 8),
+            panel_version,
+        ),
+        syn_content_slot(
+            TL_SLOT_RECENCY_RANK,
+            "syn.timeline.event_time_rank.v1",
+            &AlgorithmicLens::syn_scalar_rank(
+                "syn.timeline.event_time_rank.v1",
+                Modality::Structured,
+                0,
+                RECENCY_RANK_MAX_UNIX_MS_MICROS,
+            ),
+            panel_version,
+        ),
+    ]
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "episode panel contract is a one-to-one slot-to-frozen-lens map mirroring build_episode_constellation; splitting would obscure the stable contract"
+)]
+fn episode_panel_slots(panel_version: u32) -> Vec<Slot> {
+    vec![
+        syn_content_slot(
+            EP_SLOT_APP_HASH,
+            "syn.episode.app_hash.v1",
+            &AlgorithmicLens::syn_hash("syn.episode.app_hash.v1", Modality::Structured, 1024),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_DOCUMENT_HASH,
+            "syn.episode.document_hash.v1",
+            &AlgorithmicLens::syn_hash("syn.episode.document_hash.v1", Modality::Structured, 2048),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_URL_HOST_HASH,
+            "syn.episode.url_host_hash.v1",
+            &AlgorithmicLens::syn_hash("syn.episode.url_host_hash.v1", Modality::Structured, 2048),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_TITLE_SPARSE,
+            "syn.episode.title_sparse.v1",
+            &AlgorithmicLens::syn_sparse_text(
+                "syn.episode.title_sparse.v1",
+                Modality::Structured,
+                4096,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_START_HOUR_CYCLIC,
+            "syn.episode.start_hour_cyclic.v1",
+            &AlgorithmicLens::syn_cyclic_time(
+                "syn.episode.start_hour_cyclic.v1",
+                Modality::Structured,
+                24,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_START_DOW_CYCLIC,
+            "syn.episode.start_dow_cyclic.v1",
+            &AlgorithmicLens::syn_cyclic_time(
+                "syn.episode.start_dow_cyclic.v1",
+                Modality::Structured,
+                7,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_DURATION_LOG1P,
+            "syn.episode.duration_log1p.v1",
+            &AlgorithmicLens::syn_scalar_log1p(
+                "syn.episode.duration_log1p.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_DURATION_RANK,
+            "syn.episode.duration_rank.v1",
+            &AlgorithmicLens::syn_scalar_rank(
+                "syn.episode.duration_rank.v1",
+                Modality::Structured,
+                0,
+                MAX_DAY_DURATION_MS_MICROS,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_KEYSTROKES_ZSCORE,
+            "syn.episode.keystrokes_zscore.v1",
+            &AlgorithmicLens::syn_scalar_zscore(
+                "syn.episode.keystrokes_zscore.v1",
+                Modality::Structured,
+                0,
+                10_000_000,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_CLICKS_ZSCORE,
+            "syn.episode.clicks_zscore.v1",
+            &AlgorithmicLens::syn_scalar_zscore(
+                "syn.episode.clicks_zscore.v1",
+                Modality::Structured,
+                0,
+                1_000_000,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_ROW_COUNT_ZSCORE,
+            "syn.episode.row_count_zscore.v1",
+            &AlgorithmicLens::syn_scalar_zscore(
+                "syn.episode.row_count_zscore.v1",
+                Modality::Structured,
+                0,
+                1_000_000,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_STARTED_BOUNDARY_ONEHOT,
+            "syn.episode.started_boundary_onehot.v1",
+            &AlgorithmicLens::syn_one_hot(
+                "syn.episode.started_boundary_onehot.v1",
+                Modality::Structured,
+                16,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_ENDED_BOUNDARY_ONEHOT,
+            "syn.episode.ended_boundary_onehot.v1",
+            &AlgorithmicLens::syn_one_hot(
+                "syn.episode.ended_boundary_onehot.v1",
+                Modality::Structured,
+                16,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_INTERRUPTION_RATIO,
+            "syn.episode.interruption_ratio_raw.v1",
+            &AlgorithmicLens::syn_scalar_raw(
+                "syn.episode.interruption_ratio_raw.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+        ),
+        syn_content_slot(
+            EP_SLOT_RECORD_VECTOR,
+            "syn.episode.record_vector.v1",
+            &AlgorithmicLens::syn_record_vector(
+                "syn.episode.record_vector.v1",
+                Modality::Structured,
+                64,
+            ),
+            panel_version,
+        ),
+    ]
 }
 
 /// Build the Calyx constellation for an agent event record.

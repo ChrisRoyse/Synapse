@@ -35,7 +35,7 @@ use calyx_aster::vault::{
 pub use calyx_core::TemporalPolicy;
 use calyx_core::{
     Anchor, AnchorKind, CalyxError, Clock, Constellation, CxId, METADATA_SOURCE_EVENT_TIME_RAW,
-    METADATA_SOURCE_EVENT_TIME_SECS, METADATA_TEMPORAL_LANE_STATE, Seq, SystemClock,
+    METADATA_SOURCE_EVENT_TIME_SECS, METADATA_TEMPORAL_LANE_STATE, Panel, Seq, SystemClock,
     TEMPORAL_LANE_ACTIVE, Ts, VaultId, VaultStore,
 };
 use calyx_forge::{
@@ -43,14 +43,15 @@ use calyx_forge::{
     HostGpuReservationStore,
 };
 use calyx_ledger::{ActorId, EntryKind, LedgerEntry, SubjectId, VerifyResult};
+use calyx_registry::{
+    CALYX_NO_ACTIVE_PANEL, Registry, VaultPanelWrite, allocate_vault_panel_generation,
+    list_vault_temporal_panels, load_vault_panel_state, persist_vault_panel_state,
+    read_vault_panel_generation_allocator, read_vault_temporal_panel,
+    register_vault_temporal_panel, reserve_vault_panel_generations,
+};
 pub use calyx_registry::{
     PanelGenerationAllocation, PanelGenerationAllocatorReadback, VaultTemporalPanelRegistration,
     VaultTemporalPanelRegistrationWrite,
-};
-use calyx_registry::{
-    allocate_vault_panel_generation, list_vault_temporal_panels, load_vault_panel_state,
-    read_vault_panel_generation_allocator, read_vault_temporal_panel,
-    register_vault_temporal_panel, reserve_vault_panel_generations,
 };
 pub use calyx_search::{PersistedSearchGeneration, PersistedSearchSlot};
 use calyx_sextant::{
@@ -203,6 +204,22 @@ pub struct SynapseCalyxSearchRebuildReport {
     pub generation: PersistedSearchGeneration,
     pub manifest_path: PathBuf,
     pub raw_sidecars: Vec<SynapseCalyxSearchRawSidecar>,
+}
+
+/// Outcome of publishing an active durable `Panel` snapshot to the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxPanelPublishReport {
+    /// Panel version whose contract was requested for publication.
+    pub panel_version: u32,
+    /// True when this call durably wrote a new active-panel manifest; false when
+    /// the exact panel version was already published (idempotent no-op).
+    pub published: bool,
+    /// Manifest `panel_ref` logical path after the operation.
+    pub panel_ref: String,
+    /// Manifest `registry_ref` logical path after the operation, if present.
+    pub registry_ref: Option<String>,
+    /// Panel version proven by an independent `load_vault_panel_state` readback.
+    pub readback_panel_version: u32,
 }
 
 fn search_rebuild_error(action: &str, error: calyx_search::SearchError) -> SynapseCalyxError {
@@ -2236,7 +2253,18 @@ impl SynapseCalyxVault {
         expected_panel_version: u32,
     ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
         let state = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
-            SynapseCalyxError::from_calyx("load durable panel state for search rebuild", &error)
+            if error.code == CALYX_NO_ACTIVE_PANEL {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_NO_ACTIVE_PANEL",
+                    format!(
+                        "no active durable panel is published for search rebuild: {}",
+                        error.message
+                    ),
+                    "publish the active panel for this constellation (publish_active_panel / boot panel publication) before requesting search_rebuild; this is an expected empty state, not shard corruption \u{2014} do not restore from backup",
+                )
+            } else {
+                SynapseCalyxError::from_calyx("load durable panel state for search rebuild", &error)
+            }
         })?;
         if state.panel.version != expected_panel_version {
             return Err(SynapseCalyxError::new(
@@ -2300,6 +2328,87 @@ impl SynapseCalyxVault {
             generation,
             manifest_path,
             raw_sidecars,
+        })
+    }
+
+    /// Publishes an active durable `Panel` snapshot into the Calyx manifest for
+    /// one exact constellation panel version, following the vault
+    /// commit-boundary discipline. The caller supplies the authoritative slot
+    /// contract; the raw Base rows remain the source of truth.
+    ///
+    /// This is the step `search_rebuild` depends on: without an active panel,
+    /// `load_vault_panel_state` returns `CALYX_NO_ACTIVE_PANEL` and no search
+    /// generation can be built. The operation is idempotent — when the exact
+    /// panel version is already the active manifest panel it is a no-op that
+    /// still proves the published state by an independent readback.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the manifest cannot be read, the durable write fails,
+    /// or the post-write readback does not resolve to the requested version.
+    pub fn publish_active_panel(
+        &self,
+        panel: &Panel,
+    ) -> Result<SynapseCalyxPanelPublishReport, SynapseCalyxError> {
+        let vault_dir = &self.config.vault_dir;
+        // The panel version is an immutable contract identity, so a manifest
+        // whose panel_ref already names `panel/panel-v<version>-*` has this
+        // panel published. Re-writing would churn manifest_seq for no change.
+        let published_prefix = format!("panel/panel-v{:08}-", panel.version);
+        let current = calyx_aster::manifest::ManifestStore::open(vault_dir)
+            .load_current()
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("read manifest for active-panel publication", &error)
+            })?;
+        if current
+            .panel_ref
+            .logical_path
+            .starts_with(&published_prefix)
+        {
+            let state = load_vault_panel_state(vault_dir).map_err(|error| {
+                SynapseCalyxError::from_calyx("read back already-published active panel", &error)
+            })?;
+            return Ok(SynapseCalyxPanelPublishReport {
+                panel_version: panel.version,
+                published: false,
+                panel_ref: current.panel_ref.logical_path,
+                registry_ref: current.registry_ref.map(|reference| reference.logical_path),
+                readback_panel_version: state.panel.version,
+            });
+        }
+        let write: VaultPanelWrite = persist_vault_panel_state(vault_dir, panel, &Registry::new())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("publish active durable panel snapshot", &error)
+            })?;
+        // Prove the published state through the same loader search rebuild uses.
+        let state = load_vault_panel_state(vault_dir).map_err(|error| {
+            SynapseCalyxError::from_calyx("read back published active panel", &error)
+        })?;
+        if state.panel.version != panel.version {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_PUBLISH_READBACK_MISMATCH",
+                format!(
+                    "published active panel {} but readback resolved panel {}",
+                    panel.version, state.panel.version
+                ),
+                "inspect the durable manifest panel_ref and registry_ref before retrying publication",
+            ));
+        }
+        tracing::info!(
+            code = "SYNAPSE_CALYX_ACTIVE_PANEL_PUBLISHED",
+            panel_version = panel.version,
+            manifest_seq = write.manifest_seq,
+            durable_seq = write.durable_seq,
+            panel_ref = %write.panel_ref.logical_path,
+            registry_ref = %write.registry_ref.logical_path,
+            "published active durable Calyx panel snapshot to the manifest"
+        );
+        Ok(SynapseCalyxPanelPublishReport {
+            panel_version: panel.version,
+            published: true,
+            panel_ref: write.panel_ref.logical_path,
+            registry_ref: Some(write.registry_ref.logical_path),
+            readback_panel_version: state.panel.version,
         })
     }
 

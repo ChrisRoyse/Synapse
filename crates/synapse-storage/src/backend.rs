@@ -54,7 +54,7 @@ use crate::constellations::{
     SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION,
     SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
     SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, syn_active_panel_contract,
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
@@ -1004,6 +1004,7 @@ impl CalyxBackend {
         ensure_calyx_ordered_key_migration(&vault, path)?;
         ensure_builtin_panel_generation_reservations(&vault)?;
         ensure_builtin_temporal_panel_registrations(&vault)?;
+        ensure_active_panel_published(&vault)?;
         // A bulk migration can checkpoint many commit sequences at once. It
         // must not publish a backend whose newly materialized physical files
         // already exceed the same source ceiling the page readers enforce.
@@ -1118,6 +1119,44 @@ fn ensure_builtin_temporal_panel_registrations(vault: &SynapseCalyxVault) -> Sto
             });
         }
     }
+    Ok(())
+}
+
+/// Publishes an active durable `Panel` snapshot into the Calyx manifest at boot
+/// so `storage/search_rebuild` is reachable-to-success (issue #1805). Before
+/// this, the manifest `panel_ref` stayed Aster's generated no-active-panel
+/// placeholder and no durable search generation could ever be built.
+///
+/// The manifest holds exactly one active panel; the primary constellation panel
+/// (timeline) is published here from its authoritative registered contract, and
+/// [`CalyxStorageBackend::rebuild_calyx_search_indexes`] republishes the exact
+/// requested panel before a rebuild. `publish_active_panel` is idempotent, so
+/// this is a no-op once the version is published and never churns `manifest_seq`.
+fn ensure_active_panel_published(vault: &SynapseCalyxVault) -> StorageResult<()> {
+    let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+    let Some(panel) = syn_active_panel_contract(SYN_TIMELINE_PANEL_VERSION, created_at_ms) else {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_manifest".to_owned(),
+            detail: format!(
+                "STORAGE_CALYX_ACTIVE_PANEL_CONTRACT_MISSING: no enumerated content-slot contract for primary panel generation {SYN_TIMELINE_PANEL_VERSION}; remediation=add the panel's slot contract to syn_active_panel_contract before publication"
+            ),
+        });
+    };
+    let report = vault.publish_active_panel(&panel).map_err(|source| {
+        calyx_write_failed(
+            "calyx_manifest",
+            &format!("publish active durable panel generation {SYN_TIMELINE_PANEL_VERSION}"),
+            &source,
+        )
+    })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_ACTIVE_PANEL_PUBLISHED",
+        panel_version = report.panel_version,
+        published = report.published,
+        panel_ref = %report.panel_ref,
+        readback_panel_version = report.readback_panel_version,
+        "ensured active durable Calyx panel snapshot is published to the manifest"
+    );
     Ok(())
 }
 
@@ -1655,6 +1694,27 @@ impl StorageBackend for CalyxBackend {
             "rebuild persisted Calyx search indexes",
             true,
             |vault| {
+                // The manifest holds one active panel; publish the exact
+                // requested panel's authoritative contract before rebuilding so
+                // the generation is rooted at that panel snapshot (issue #1805).
+                // publish_active_panel is idempotent. An unknown panel version
+                // leaves the active panel unchanged and the rebuild fails closed
+                // (NO_ACTIVE_PANEL / SEARCH_PANEL_MISMATCH) rather than silently
+                // rebuilding a different panel.
+                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                if let Some(panel) =
+                    syn_active_panel_contract(expected_panel_version, created_at_ms)
+                {
+                    vault.publish_active_panel(&panel).map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_manifest",
+                            &format!(
+                                "publish active durable panel generation {expected_panel_version} before search rebuild"
+                            ),
+                            &source,
+                        )
+                    })?;
+                }
                 vault
                     .rebuild_search_indexes(expected_panel_version)
                     .map_err(|source| {
