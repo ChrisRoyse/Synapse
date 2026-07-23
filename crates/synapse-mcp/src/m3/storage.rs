@@ -127,6 +127,77 @@ pub struct StorageSearchRebuildResponse {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageBackupParams {
+    /// Absolute path to a fresh, empty target directory. The restorable vault
+    /// copy is written to `<target_dir>/vault` and a hashed manifest to
+    /// `<target_dir>/backup_manifest.json`.
+    pub target_dir: String,
+    /// Include the rebuildable `ann/`, `kernel/`, and `guard/` artifacts. False
+    /// (default) backs up only sacred data; regenerable artifacts rebuild via
+    /// storage operation=search_rebuild after restore.
+    #[serde(default)]
+    pub include_regenerable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRestoreVerifyParams {
+    /// Absolute path to a vault directory to verify read-only (a backup's
+    /// `vault/` sub-directory, or a restored daemon data dir's vault).
+    pub vault_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageBackupFile {
+    pub relative_path: String,
+    pub len_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageVerifyReport {
+    pub vault_path: String,
+    pub success: bool,
+    pub chain_intact: bool,
+    pub constellation_count: u64,
+    pub anchor_count: u64,
+    pub ledger_entry_count: u64,
+    pub ledger_tip_hash: String,
+    pub wal_bytes_present: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_cx_id: Option<String>,
+    pub failure_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageBackupResponse {
+    pub vault_id: String,
+    pub source_vault_dir: String,
+    pub target_root: String,
+    pub backup_vault_dir: String,
+    pub manifest_path: String,
+    pub manifest_sha256: String,
+    pub durable_seq: u64,
+    pub latest_seq: u64,
+    pub include_regenerable: bool,
+    pub file_count: u64,
+    pub total_bytes: u64,
+    pub residency_enforced: bool,
+    pub files: Vec<StorageBackupFile>,
+    pub verify: StorageVerifyReport,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRestoreVerifyResponse {
+    pub verify: StorageVerifyReport,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StoragePressureSampleParams {
     pub free_bytes: u64,
 }
@@ -451,6 +522,118 @@ pub struct StorageTemporalRankedHit {
     pub e4_sequence: f32,
 }
 
+/// Upper bound on records the intelligence weave/abundance pass will scan in one
+/// bounded, pressure-aware operation.
+const MAX_INTELLIGENCE_RECORDS: u32 = 20_000;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceOperation {
+    Weave,
+    Abundance,
+}
+
+impl StorageIntelligenceOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Weave => "weave",
+            Self::Abundance => "abundance",
+        }
+    }
+
+    #[must_use]
+    pub const fn mutates_state(self) -> bool {
+        matches!(self, Self::Weave)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceParams {
+    /// Which native intelligence action to run over the panel corpus.
+    pub operation: StorageIntelligenceOperation,
+    /// Exact `Syn*` panel version (domain) to weave/report over.
+    pub panel_version: u32,
+    /// Bounded cap on records scanned; clamped to `[1, 20000]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 20000))]
+    pub max_records: Option<u32>,
+    /// k for the between-record nearest-neighbor graph (weave only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 64))]
+    pub knn_k: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceNeffEstimate {
+    pub value: f32,
+    pub provisional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_low: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_high: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceAbundanceReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub n_lenses: u64,
+    pub n_constellations: u64,
+    pub c_n2_upper_bound: u64,
+    pub materialized: u64,
+    pub measured_count: u64,
+    pub derived_count: u64,
+    pub meaning_compression_yield: f32,
+    pub n_eff: StorageIntelligenceNeffEstimate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpi_ceiling_bits: Option<f32>,
+    pub dpi_ceiling_provisional: bool,
+    pub xterm_cf_rows: u64,
+    pub graph_cf_rows: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceAgreementEdge {
+    pub panel_version: u32,
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub mean_agreement: f32,
+    pub agreement_weight: f32,
+    pub n: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceWeaveResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub records_scanned: u64,
+    pub records_woven: u64,
+    pub n_lenses: u64,
+    pub cross_terms_materialized: u64,
+    pub agreement_edges_persisted: u64,
+    pub between_record_edges_persisted: u64,
+    pub xterm_cf_rows_after: u64,
+    pub graph_cf_rows_after: u64,
+    pub agreement_edges: Vec<StorageIntelligenceAgreementEdge>,
+    pub abundance: StorageIntelligenceAbundanceReport,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceResponse {
+    pub operation: StorageIntelligenceOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weave: Option<StorageIntelligenceWeaveResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abundance: Option<StorageIntelligenceAbundanceReport>,
+}
+
 #[must_use]
 pub const fn storage_inspect() -> M3ToolStub {
     M3ToolStub::new("storage_inspect")
@@ -496,6 +679,18 @@ pub fn required_permissions_search_rebuild(
     _params: &StorageSearchRebuildParams,
 ) -> RequiredPermissions {
     required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_backup(_params: &StorageBackupParams) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_restore_verify(
+    _params: &StorageRestoreVerifyParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
 }
 
 #[must_use]
@@ -673,6 +868,110 @@ pub fn run_temporal_backfill(
     })
 }
 
+#[must_use]
+pub fn required_permissions_intelligence(
+    params: &StorageIntelligenceParams,
+) -> RequiredPermissions {
+    if params.operation.mutates_state() {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    } else {
+        required([Permission::ReadStorage])
+    }
+}
+
+/// Runs one native Loom weave pass over a panel (mutating: persists derived
+/// `XTerm`/`Graph` rows) and returns the physical CF readbacks.
+pub fn run_intelligence_weave(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceWeaveResponse, ErrorData> {
+    let max_records = clamp_intelligence_records(params.max_records);
+    let mut weave = synapse_calyx::SynapseCalyxWeaveParams::new(params.panel_version);
+    weave.max_records = max_records;
+    if let Some(knn_k) = params.knn_k {
+        weave.knn_k = knn_k as usize;
+    }
+    let report = db
+        .weave_panel_intelligence(weave)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceWeaveResponse {
+        source_of_truth: "Calyx XTerm + Graph CF rows",
+        panel_version: report.panel_version,
+        records_scanned: report.records_scanned as u64,
+        records_woven: report.records_woven as u64,
+        n_lenses: report.n_lenses as u64,
+        cross_terms_materialized: report.cross_terms_materialized as u64,
+        agreement_edges_persisted: report.agreement_edges_persisted as u64,
+        between_record_edges_persisted: report.between_record_edges_persisted as u64,
+        xterm_cf_rows_after: report.xterm_cf_rows_after as u64,
+        graph_cf_rows_after: report.graph_cf_rows_after as u64,
+        agreement_edges: report
+            .agreement_edges
+            .into_iter()
+            .map(storage_intelligence_agreement_edge)
+            .collect(),
+        abundance: storage_intelligence_abundance(report.abundance),
+    })
+}
+
+/// Reads the derived-data abundance report for a panel back from the physical
+/// `Base`/`XTerm`/`Graph` CFs.
+pub fn run_intelligence_abundance(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceAbundanceReport, ErrorData> {
+    let max_records = clamp_intelligence_records(params.max_records);
+    let report = db
+        .abundance_report_intelligence(params.panel_version, max_records)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(storage_intelligence_abundance(report))
+}
+
+fn clamp_intelligence_records(requested: Option<u32>) -> usize {
+    requested
+        .unwrap_or(MAX_INTELLIGENCE_RECORDS)
+        .clamp(1, MAX_INTELLIGENCE_RECORDS) as usize
+}
+
+fn storage_intelligence_agreement_edge(
+    edge: synapse_calyx::SynapseCalyxAgreementEdge,
+) -> StorageIntelligenceAgreementEdge {
+    StorageIntelligenceAgreementEdge {
+        panel_version: edge.panel_version,
+        slot_a: u32::from(edge.slot_a),
+        slot_b: u32::from(edge.slot_b),
+        mean_agreement: edge.mean_agreement,
+        agreement_weight: edge.agreement_weight,
+        n: edge.n as u64,
+    }
+}
+
+fn storage_intelligence_abundance(
+    report: synapse_calyx::SynapseCalyxAbundanceReport,
+) -> StorageIntelligenceAbundanceReport {
+    StorageIntelligenceAbundanceReport {
+        source_of_truth: "Calyx Base + XTerm + Graph CF rows",
+        panel_version: report.panel_version,
+        n_lenses: report.n_lenses as u64,
+        n_constellations: report.n_constellations as u64,
+        c_n2_upper_bound: report.c_n2_upper_bound as u64,
+        materialized: report.materialized as u64,
+        measured_count: report.measured_count as u64,
+        derived_count: report.derived_count as u64,
+        meaning_compression_yield: report.meaning_compression_yield,
+        n_eff: StorageIntelligenceNeffEstimate {
+            value: report.n_eff.value,
+            provisional: report.n_eff.provisional,
+            ci_low: report.n_eff.ci_low,
+            ci_high: report.n_eff.ci_high,
+        },
+        dpi_ceiling_bits: report.dpi_ceiling_bits,
+        dpi_ceiling_provisional: report.dpi_ceiling_provisional,
+        xterm_cf_rows: report.xterm_cf_rows as u64,
+        graph_cf_rows: report.graph_cf_rows as u64,
+    }
+}
+
 pub fn inspect_storage_summary(
     db: &synapse_storage::Db,
 ) -> Result<StorageSummaryResponse, ErrorData> {
@@ -798,6 +1097,92 @@ pub fn run_storage_gc_once(
         .map(|cf_report| (cf_report.before_value, cf_report.after_value))
         .unwrap_or((0, 0));
     Ok(gc_response(cf_name, before, after, report))
+}
+
+pub fn run_storage_backup(
+    db: &synapse_storage::Db,
+    params: &StorageBackupParams,
+) -> Result<StorageBackupResponse, ErrorData> {
+    let target = validate_fs_path(&params.target_dir, "target_dir")?;
+    let report = db
+        .backup_calyx_vault(&target, params.include_regenerable)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(storage_backup_response(report))
+}
+
+pub fn run_storage_restore_verify(
+    db: &synapse_storage::Db,
+    params: &StorageRestoreVerifyParams,
+) -> Result<StorageRestoreVerifyResponse, ErrorData> {
+    let vault_path = validate_fs_path(&params.vault_path, "vault_path")?;
+    let report = db
+        .verify_calyx_restore(&vault_path)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageRestoreVerifyResponse {
+        verify: storage_verify_report(&report),
+    })
+}
+
+fn validate_fs_path(raw: &str, field: &str) -> Result<std::path::PathBuf, ErrorData> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage {field} must not be empty"),
+        ));
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage {field} must be an absolute path; got {trimmed:?}"),
+        ));
+    }
+    Ok(path)
+}
+
+fn storage_backup_response(
+    report: synapse_calyx::SynapseCalyxBackupReport,
+) -> StorageBackupResponse {
+    StorageBackupResponse {
+        vault_id: report.vault_id,
+        source_vault_dir: report.source_vault_dir.display().to_string(),
+        target_root: report.target_root.display().to_string(),
+        backup_vault_dir: report.backup_vault_dir.display().to_string(),
+        manifest_path: report.manifest_path.display().to_string(),
+        manifest_sha256: report.manifest_sha256,
+        durable_seq: report.durable_seq,
+        latest_seq: report.latest_seq,
+        include_regenerable: report.include_regenerable,
+        file_count: report.file_count,
+        total_bytes: report.total_bytes,
+        residency_enforced: report.residency_enforced,
+        files: report
+            .files
+            .into_iter()
+            .map(|file| StorageBackupFile {
+                relative_path: file.relative_path,
+                len_bytes: file.len_bytes,
+                sha256: file.sha256,
+            })
+            .collect(),
+        verify: storage_verify_report(&report.verify),
+    }
+}
+
+fn storage_verify_report(report: &synapse_calyx::SynapseCalyxVerifyReport) -> StorageVerifyReport {
+    StorageVerifyReport {
+        vault_path: report.vault_path.display().to_string(),
+        success: report.success,
+        chain_intact: report.chain_intact,
+        constellation_count: report.constellation_count,
+        anchor_count: report.anchor_count,
+        ledger_entry_count: report.ledger_entry_count,
+        ledger_tip_hash: report.ledger_tip_hash.clone(),
+        wal_bytes_present: report.wal_bytes_present,
+        first_cx_id: report.first_cx_id.clone(),
+        failure_reasons: report.failure_reasons.clone(),
+    }
 }
 
 pub fn apply_storage_pressure_sample(

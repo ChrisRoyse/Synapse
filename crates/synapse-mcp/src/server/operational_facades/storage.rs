@@ -23,6 +23,14 @@ use super::{
 /// (`try_acquire`) rather than silently queueing behind the in-flight rebuild.
 static SEARCH_REBUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+/// At most one durable vault backup may execute at a time. A backup holds the
+/// native-compaction guard and copies the whole sacred vault tree; a second
+/// concurrent backup would contend on that guard and could interleave two copies
+/// onto the blocking pool. Admission is a single permit and a concurrent caller
+/// fails closed (`try_acquire`) rather than serializing behind the in-flight
+/// backup.
+static BACKUP_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 pub(super) async fn handle(
     service: &SynapseService,
     params: Parameters<StorageParams>,
@@ -396,6 +404,234 @@ pub(super) async fn handle(
                 ),
                 |out| out.search_rebuild = Some(response),
             )))
+        }
+        StorageOperation::Backup => {
+            let spec = params
+                .0
+                .backup
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "backup"))?;
+            let source_id = spec.target_dir.clone();
+            require_maintenance_profile(
+                service,
+                &request_context,
+                STORAGE_TOOL,
+                operation.as_str(),
+                &source_id,
+                STORAGE_SOT,
+            )?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_backup(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            // Fail closed if a backup is already in flight. A single admission
+            // permit both bounds blocking-pool pressure and rejects a concurrent
+            // backup of the same vault instead of contending on the guard.
+            let permit = Arc::clone(&BACKUP_PERMITS)
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    TryAcquireError::NoPermits => facade_conflict_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &source_id,
+                        STORAGE_SOT,
+                        error_codes::STORAGE_BACKUP_IN_PROGRESS,
+                        "a durable vault backup is already in progress for this vault".to_owned(),
+                        "wait for the in-flight storage operation=backup to publish its manifest, then retry",
+                    ),
+                    TryAcquireError::Closed => facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &source_id,
+                        STORAGE_SOT,
+                        crate::m1::mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            "backup admission semaphore was unexpectedly closed".to_owned(),
+                        ),
+                        "restart the daemon; the backup admission gate is no longer available",
+                    ),
+                })?;
+            // Backups are strictly blocking, CPU/IO-bound file copies that must
+            // not occupy a Tokio runtime worker serving MCP requests. Offload to
+            // the blocking pool and hold the permit for the task's lifetime.
+            let response = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::m3::storage::run_storage_backup(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("backup blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs for the SYNAPSE_CALYX_VAULT_BACKUP records; the backup task terminated abnormally",
+                )
+            })??;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "backup vault_id={} durable_seq={} files={} bytes={} verify_success={} tip={} manifest_sha256={}",
+                    response.vault_id,
+                    response.durable_seq,
+                    response.file_count,
+                    response.total_bytes,
+                    response.verify.success,
+                    response.verify.ledger_tip_hash,
+                    response.manifest_sha256,
+                ),
+                |out| out.backup = Some(response),
+            )))
+        }
+        StorageOperation::RestoreVerify => {
+            let spec = params
+                .0
+                .restore_verify
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "restore_verify"))?;
+            let source_id = spec.vault_path.clone();
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_restore_verify(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            // Byte-level verification scans every SST/WAL of the target vault; it
+            // is read-only but CPU/IO-bound, so run it off the runtime workers.
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::storage::run_storage_restore_verify(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("restore-verify blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the restore-verify task terminated abnormally",
+                )
+            })??;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "restore_verify vault_path={} success={} chain_intact={} constellations={} anchors={} ledger_entries={} tip={} wal_bytes={}",
+                    response.verify.vault_path,
+                    response.verify.success,
+                    response.verify.chain_intact,
+                    response.verify.constellation_count,
+                    response.verify.anchor_count,
+                    response.verify.ledger_entry_count,
+                    response.verify.ledger_tip_hash,
+                    response.verify.wal_bytes_present,
+                ),
+                |out| out.restore_verify = Some(response),
+            )))
+        }
+        StorageOperation::Intelligence => {
+            let spec = params
+                .0
+                .intelligence
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "intelligence"))?;
+            let sub_operation = spec.operation;
+            let source_id = format!("panel_{}", spec.panel_version);
+            // The weave sub-operation persists derived XTerm/Graph rows, so it is
+            // maintenance-gated exactly like the other mutating storage ops;
+            // abundance is a read-only physical CF readback.
+            if sub_operation.mutates_state() {
+                require_maintenance_profile(
+                    service,
+                    &request_context,
+                    STORAGE_TOOL,
+                    sub_operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                )?;
+            }
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_intelligence(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_loom",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=intelligence",
+                )
+            })?;
+            // Weaving and abundance both scan the whole Base panel and run the
+            // substrate math; that is blocking CPU/IO work that must not occupy a
+            // runtime worker serving MCP requests. Offload to the blocking pool.
+            let response = tokio::task::spawn_blocking(move || {
+                match sub_operation {
+                    crate::m3::storage::StorageIntelligenceOperation::Weave => {
+                        crate::m3::storage::run_intelligence_weave(&db, &spec).map(|weave| {
+                            crate::m3::storage::StorageIntelligenceResponse {
+                                operation: sub_operation,
+                                weave: Some(weave),
+                                abundance: None,
+                            }
+                        })
+                    }
+                    crate::m3::storage::StorageIntelligenceOperation::Abundance => {
+                        crate::m3::storage::run_intelligence_abundance(&db, &spec).map(|abundance| {
+                            crate::m3::storage::StorageIntelligenceResponse {
+                                operation: sub_operation,
+                                weave: None,
+                                abundance: Some(abundance),
+                            }
+                        })
+                    }
+                }
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("intelligence blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the intelligence weave/abundance task terminated abnormally",
+                )
+            })??;
+            let summary = match (&response.weave, &response.abundance) {
+                (Some(weave), _) => format!(
+                    "intelligence weave panel={} records_woven={} cross_terms={} agreement_edges={} between_record_edges={} xterm_rows={} graph_rows={}",
+                    weave.panel_version,
+                    weave.records_woven,
+                    weave.cross_terms_materialized,
+                    weave.agreement_edges_persisted,
+                    weave.between_record_edges_persisted,
+                    weave.xterm_cf_rows_after,
+                    weave.graph_cf_rows_after,
+                ),
+                (_, Some(abundance)) => format!(
+                    "intelligence abundance panel={} n_lenses={} n_constellations={} c_n2={} materialized={} xterm_rows={} graph_rows={}",
+                    abundance.panel_version,
+                    abundance.n_lenses,
+                    abundance.n_constellations,
+                    abundance.c_n2_upper_bound,
+                    abundance.materialized,
+                    abundance.xterm_cf_rows,
+                    abundance.graph_cf_rows,
+                ),
+                (None, None) => "intelligence".to_owned(),
+            };
+            Ok(Json(storage_response(operation, summary, |out| {
+                out.intelligence = Some(response)
+            })))
         }
         StorageOperation::GcOnce => {
             let spec = params

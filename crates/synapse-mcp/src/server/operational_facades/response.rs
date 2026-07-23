@@ -22,6 +22,9 @@ pub(super) fn storage_response(
         temporal_rerank: None,
         temporal_backfill: None,
         search_rebuild: None,
+        backup: None,
+        restore_verify: None,
+        intelligence: None,
     };
     fill(&mut response);
     response

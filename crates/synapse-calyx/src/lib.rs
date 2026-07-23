@@ -1,7 +1,10 @@
 //! Synapse-owned lifecycle wrapper for the embedded Calyx Aster vault.
 
 mod async_vault;
+pub mod backup;
 mod error_bridge;
+mod intelligence;
+pub mod lowering;
 mod math;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +19,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_key, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::dedup::EpochSecs;
+use calyx_aster::erase::{EraseRegistry, EraseScope, subject_metadata_value};
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::recurrence::{
     OccurrenceContext, RecurrenceAppendDisposition, RecurrenceSeriesReadback, RetentionPolicy,
@@ -35,7 +39,7 @@ use calyx_forge::{
     HostGpuReservation, HostGpuReservationRequest, HostGpuReservationSnapshot,
     HostGpuReservationStore,
 };
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, LedgerEntry, SubjectId, VerifyResult};
 pub use calyx_registry::{
     PanelGenerationAllocation, PanelGenerationAllocatorReadback, VaultTemporalPanelRegistration,
     VaultTemporalPanelRegistrationWrite,
@@ -57,6 +61,21 @@ use ulid::Ulid;
 pub use async_vault::{
     SynapseCalyxAsyncConfig, SynapseCalyxAsyncVault, SynapseCalyxAsyncVaultHandle,
     SynapseCalyxCfWrite, SynapseCalyxReaderLease,
+};
+pub use backup::{
+    SynapseCalyxBackupFile, SynapseCalyxBackupReport, SynapseCalyxVerifyReport,
+    verify_vault_restore,
+};
+pub use intelligence::{
+    SYNAPSE_INTELLIGENCE_MAX_RECORDS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
+    SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxBetweenRecordEdge,
+    SynapseCalyxNeffEstimate, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+};
+pub use lowering::{
+    LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
+    LoadedLoweredArtifact, LoweredArtifactEnvelope, LoweredArtifactHandle, LoweredArtifactKind,
+    LoweredArtifactState, LoweredFingerprint, LoweredGuardThresholds, LoweredPublishReport,
+    LoweredRefreshOutcome, LoweredSafeDefault, LoweringParams, hot_context,
 };
 pub use math::{
     SynapseCalyxMathBackendStatus, SynapseCalyxMathProbeReport, SynapseCalyxMathProbeTopKEntry,
@@ -180,6 +199,17 @@ fn read_optional_sha256(path: &Path) -> Result<Option<String>, SynapseCalyxError
             "repair access to the exact artifact path and retry without deleting the last known-good generation",
         )),
     }
+}
+
+fn parse_cx_id(raw: &str) -> Result<CxId, SynapseCalyxError> {
+    let trimmed = raw.trim();
+    CxId::from_str(trimmed).map_err(|error| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_CX_ID_INVALID",
+            format!("invalid content-addressed cx_id {trimmed:?}: {error}"),
+            "supply the exact lowercase 32-hex-character constellation id read back from a ledger/provenance readback",
+        )
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -709,6 +739,212 @@ pub struct SynapseCalyxNativeFanoutReadback {
 pub struct SynapseCalyxAnchorReadback {
     pub key: Vec<u8>,
     pub anchor: Anchor,
+}
+
+/// Fail-closed verdict of a live provenance-ledger hash-chain verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxLedgerVerifyReport {
+    /// True only when the requested range re-walked and re-hashed intact.
+    pub intact: bool,
+    /// Stable verdict label: `intact` | `broken` | `corrupt`.
+    pub verdict: String,
+    /// Durable ledger head height (total entry count) at verify time.
+    pub head_height: u64,
+    /// Inclusive-exclusive sequence window that was verified.
+    pub verified_from_seq: u64,
+    pub verified_to_seq: u64,
+    /// Number of entries confirmed intact (0 for a broken/corrupt verdict).
+    pub entry_count: u64,
+    /// Durable ledger tip hash, when a head anchor exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_hash: Option<String>,
+    /// The sequence that must be quarantined on a broken/corrupt verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_expected_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_found_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrupt_reason: Option<String>,
+}
+
+impl SynapseCalyxLedgerVerifyReport {
+    fn from_aster(verification: calyx_aster::vault::AsterLedgerChainVerification) -> Self {
+        let calyx_aster::vault::AsterLedgerChainVerification {
+            result,
+            head_height,
+            tip_hash,
+            verified_range,
+        } = verification;
+        let mut report = Self {
+            intact: false,
+            verdict: String::new(),
+            head_height,
+            verified_from_seq: verified_range.start,
+            verified_to_seq: verified_range.end,
+            entry_count: 0,
+            tip_hash: tip_hash.map(|hash| hex_bytes(&hash)),
+            quarantine_seq: None,
+            broken_expected_hash: None,
+            broken_found_hash: None,
+            corrupt_reason: None,
+        };
+        match result {
+            VerifyResult::Intact { count } => {
+                report.intact = true;
+                report.verdict = "intact".to_owned();
+                report.entry_count = count;
+            }
+            VerifyResult::Broken {
+                at_seq,
+                expected,
+                found,
+            } => {
+                report.verdict = "broken".to_owned();
+                report.quarantine_seq = Some(at_seq);
+                report.broken_expected_hash = Some(hex_bytes(&expected));
+                report.broken_found_hash = Some(hex_bytes(&found));
+            }
+            VerifyResult::Corrupt { at_seq, reason } => {
+                report.verdict = "corrupt".to_owned();
+                report.quarantine_seq = Some(at_seq);
+                report.corrupt_reason = Some(reason);
+            }
+        }
+        report
+    }
+}
+
+/// Decoded readback of one physical provenance-ledger entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxLedgerEntryReadback {
+    pub seq: u64,
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_verifies: Option<bool>,
+}
+
+impl SynapseCalyxLedgerEntryReadback {
+    fn absent(seq: u64) -> Self {
+        Self {
+            seq,
+            present: false,
+            kind: None,
+            subject: None,
+            actor: None,
+            ts: None,
+            prev_hash: None,
+            entry_hash: None,
+            payload_len: None,
+            payload_sha256: None,
+            self_verifies: None,
+        }
+    }
+
+    fn from_entry(seq: u64, entry: &LedgerEntry) -> Self {
+        Self {
+            seq,
+            present: true,
+            kind: Some(entry.kind.as_str().to_owned()),
+            subject: Some(subject_metadata_value(&entry.subject)),
+            actor: Some(format!("{:?}", entry.actor)),
+            ts: Some(entry.ts),
+            prev_hash: Some(hex_bytes(&entry.prev_hash)),
+            entry_hash: Some(hex_bytes(&entry.entry_hash)),
+            payload_len: Some(entry.payload.len() as u64),
+            payload_sha256: Some(sha256_hex(&entry.payload)),
+            self_verifies: Some(entry.verify()),
+        }
+    }
+}
+
+/// Re-derivation verdict for a record's recorded provenance binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxReproduceReport {
+    pub cx_id: String,
+    pub reproduced: bool,
+    pub recorded_seq: u64,
+    pub recorded_hash: String,
+    pub input_hash: String,
+    pub entry_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_hash: Option<String>,
+    pub entry_self_verifies: bool,
+    pub subject_matches: bool,
+    /// `none` when the record reproduces, else a fail-closed drift reason.
+    pub drift: String,
+}
+
+impl SynapseCalyxReproduceReport {
+    fn from_aster(reproduction: calyx_aster::vault::AsterProvenanceReproduction) -> Self {
+        let drift = if reproduction.reproduced {
+            "none".to_owned()
+        } else if !reproduction.entry_present {
+            format!(
+                "recorded provenance seq {} has no physical ledger entry",
+                reproduction.recorded_seq
+            )
+        } else if !reproduction.entry_self_verifies {
+            format!(
+                "ledger entry at seq {} does not re-hash to its stored hash",
+                reproduction.recorded_seq
+            )
+        } else if !reproduction.subject_matches {
+            format!(
+                "ledger entry at seq {} does not bind back to this record",
+                reproduction.recorded_seq
+            )
+        } else {
+            format!(
+                "ledger entry hash does not match the record's recorded provenance hash at seq {}",
+                reproduction.recorded_seq
+            )
+        };
+        Self {
+            cx_id: reproduction.cx_id.to_string(),
+            reproduced: reproduction.reproduced,
+            recorded_seq: reproduction.recorded_seq,
+            recorded_hash: hex_bytes(&reproduction.recorded_hash),
+            input_hash: hex_bytes(&reproduction.input_hash),
+            entry_present: reproduction.entry_present,
+            entry_hash: reproduction.entry_hash.map(|hash| hex_bytes(&hash)),
+            entry_self_verifies: reproduction.entry_self_verifies,
+            subject_matches: reproduction.subject_matches,
+            drift,
+        }
+    }
+}
+
+/// Readback of a lawful, ledger-stamped erasure plus a post-erase re-verify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxErasureReport {
+    pub scope: String,
+    pub records_deleted: usize,
+    pub shredded_at_ms: u64,
+    pub tombstone_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_hash: Option<String>,
+    /// Full hash-chain re-verification after the erasure entry was appended.
+    pub chain_verify: SynapseCalyxLedgerVerifyReport,
 }
 
 const SYNAPSE_DIR_NAME: &str = "synapse";
@@ -2793,6 +3029,83 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("compact Calyx KV CF", &error))
     }
 
+    /// Produces a durable, self-verifying online backup of the live vault.
+    ///
+    /// The sacred vault state is copied at a consistent `durable_seq` under the
+    /// native-compaction guard into `<target_root>/vault`, then immediately
+    /// re-derived with the read-only restore verifier; a manifest with per-file
+    /// SHA-256 digests is published only after verification passes. Vault
+    /// residency is enforced: a pinned dataset refuses an off-dataset target.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on WAL sync failure, a residency violation, a busy
+    /// maintenance guard, any copy error, or a backup that does not verify.
+    pub fn backup(
+        &self,
+        target_root: &Path,
+        include_regenerable: bool,
+    ) -> Result<SynapseCalyxBackupReport, SynapseCalyxError> {
+        // 1. Barrier the WAL group-committer so every accepted write is durable
+        //    before the consistent copy reads the tree.
+        self.flush()?;
+        let backup_vault_dir = target_root.join(backup::BACKUP_VAULT_SUBDIR);
+        // 2. Enforce vault residency against the backup vault directory.
+        let residency_enforced =
+            backup::authorize_residency(&self.config.vault_dir, &backup_vault_dir)?;
+        // 3. Consistent copy under the native-compaction guard.
+        let aster_report = self
+            .vault
+            .backup_consistent(&backup_vault_dir, include_regenerable)
+            .map_err(|error| SynapseCalyxError::from_calyx("back up Calyx vault", &error))?;
+        let latest_seq = self.vault.latest_seq();
+        // 4. Prove the copy restores byte-for-byte before publishing a manifest.
+        let verify = backup::verify_vault_restore(&backup_vault_dir)?;
+        backup::require_verified(&verify)?;
+        let files = aster_report
+            .files
+            .into_iter()
+            .map(|file| SynapseCalyxBackupFile {
+                relative_path: file.relative_path,
+                len_bytes: file.len_bytes,
+                sha256: file.sha256,
+            })
+            .collect();
+        let mut report = SynapseCalyxBackupReport {
+            vault_id: self.vault.vault_id().to_string(),
+            source_vault_dir: aster_report.source_vault_dir,
+            target_root: target_root.to_path_buf(),
+            backup_vault_dir,
+            manifest_path: PathBuf::new(),
+            manifest_sha256: String::new(),
+            durable_seq: aster_report.durable_seq,
+            latest_seq,
+            include_regenerable,
+            file_count: aster_report.file_count,
+            total_bytes: aster_report.total_bytes,
+            residency_enforced,
+            files,
+            verify,
+        };
+        // 5. Publish the manifest and record its own hash.
+        let (manifest_path, manifest_sha256) = backup::write_manifest(target_root, &report)?;
+        report.manifest_path = manifest_path;
+        report.manifest_sha256 = manifest_sha256;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_VAULT_BACKUP_COMPLETED",
+            vault_dir = %report.source_vault_dir.display(),
+            backup_vault_dir = %report.backup_vault_dir.display(),
+            durable_seq = report.durable_seq,
+            latest_seq = report.latest_seq,
+            file_count = report.file_count,
+            total_bytes = report.total_bytes,
+            verify_success = report.verify.success,
+            ledger_tip_hash = %report.verify.ledger_tip_hash,
+            "completed durable Calyx vault backup and restore verification"
+        );
+        Ok(report)
+    }
+
     /// Drains urgent file-count debt across native Aster column families and
     /// returns physical reclamation readback. Each rewrite is file/byte
     /// bounded; the pass covers every CF near the shared page-source ceiling.
@@ -2845,6 +3158,125 @@ impl SynapseCalyxVault {
         self.vault
             .purge_tombstoned_cfs(&[ColumnFamily::Kv])
             .map_err(|error| SynapseCalyxError::from_calyx("purge Calyx KV tombstones", &error))
+    }
+
+    /// Verifies the live provenance-ledger hash chain against the exact stored
+    /// bytes, fail-closed. Pass `None` to verify the full chain, or an explicit
+    /// `(from_seq, to_seq)` half-open window for an incremental re-walk.
+    ///
+    /// This is synchronous, CPU/IO-heavy over the whole physical Ledger CF, and
+    /// must be driven off the async MCP runtime by its caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error only when the physical Ledger cannot be read;
+    /// a detected tamper is a normal broken/corrupt verdict in the report.
+    pub fn verify_ledger_chain(
+        &self,
+        range: Option<(u64, u64)>,
+    ) -> Result<SynapseCalyxLedgerVerifyReport, SynapseCalyxError> {
+        let range = match range {
+            Some((from, to)) if from > to => {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_LEDGER_VERIFY_RANGE_INVALID",
+                    format!("ledger verify range start {from} is greater than end {to}"),
+                    "request a half-open [from_seq, to_seq) window with from_seq <= to_seq",
+                ));
+            }
+            Some((from, to)) => Some(from..to),
+            None => None,
+        };
+        let verification = self
+            .vault
+            .verify_ledger_chain(range)
+            .map_err(|error| SynapseCalyxError::from_calyx("verify Calyx ledger chain", &error))?;
+        Ok(SynapseCalyxLedgerVerifyReport::from_aster(verification))
+    }
+
+    /// Reads and decodes one physical provenance-ledger entry by sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical row cannot be read or its
+    /// bytes cannot be decoded.
+    pub fn read_ledger_entry(
+        &self,
+        seq: u64,
+    ) -> Result<SynapseCalyxLedgerEntryReadback, SynapseCalyxError> {
+        let entry = self
+            .vault
+            .read_ledger_entry(seq)
+            .map_err(|error| SynapseCalyxError::from_calyx("read Calyx ledger entry", &error))?;
+        Ok(match entry {
+            Some(entry) => SynapseCalyxLedgerEntryReadback::from_entry(seq, &entry),
+            None => SynapseCalyxLedgerEntryReadback::absent(seq),
+        })
+    }
+
+    /// Re-derives a record's recorded provenance binding from the bytes and
+    /// bounds drift to a genuine, self-consistent ledger entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the record is absent or unreadable; a
+    /// provenance mismatch is a normal `reproduced == false` verdict.
+    pub fn reproduce_record(
+        &self,
+        cx_id: &str,
+    ) -> Result<SynapseCalyxReproduceReport, SynapseCalyxError> {
+        let cx_id = parse_cx_id(cx_id)?;
+        let reproduction = self
+            .vault
+            .reproduce_record_provenance(cx_id)
+            .map_err(|error| SynapseCalyxError::from_calyx("reproduce Calyx record", &error))?;
+        Ok(SynapseCalyxReproduceReport::from_aster(reproduction))
+    }
+
+    /// Lawfully erases one record (constellation) by content-addressed id:
+    /// CF-row tombstone, an append-only `Erase` ledger entry, and physical
+    /// purge. Then re-verifies the full hash chain to prove it stays intact
+    /// with the new erasure entry sealed in.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the record is already tombstoned or the
+    /// tombstone/commit/purge/re-verify path fails; fails closed before any
+    /// partial visibility.
+    pub fn erase_record(
+        &self,
+        cx_id: &str,
+    ) -> Result<SynapseCalyxErasureReport, SynapseCalyxError> {
+        let cx_id = parse_cx_id(cx_id)?;
+        let registry = EraseRegistry::new();
+        let result = self
+            .vault
+            .erase_scope_ledger_stamped(EraseScope::Cx(cx_id), &registry)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("erase Calyx record via ledger tombstone", &error)
+            })?;
+        let (tombstone_present, tombstone_seq, tombstone_hash) = match &result.tombstone {
+            Some(tombstone) => {
+                let hash = self
+                    .vault
+                    .read_ledger_entry(tombstone.seq)
+                    .map_err(|error| {
+                        SynapseCalyxError::from_calyx("read Calyx erasure ledger entry", &error)
+                    })?
+                    .map(|entry| hex_bytes(&entry.entry_hash));
+                (true, Some(tombstone.seq), hash)
+            }
+            None => (false, None, None),
+        };
+        let chain_verify = self.verify_ledger_chain(None)?;
+        Ok(SynapseCalyxErasureReport {
+            scope: format!("cx:{cx_id}"),
+            records_deleted: result.records_deleted,
+            shredded_at_ms: result.shredded_at,
+            tombstone_present,
+            tombstone_seq,
+            tombstone_hash,
+            chain_verify,
+        })
     }
 
     /// Flushes pending Aster checkpoints and performs one bounded physical WAL

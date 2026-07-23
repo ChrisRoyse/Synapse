@@ -19,15 +19,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
-    SynapseCalyxAnchorWriteReadback, SynapseCalyxCfRangePage, SynapseCalyxCfRows,
-    SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxError,
-    SynapseCalyxGroundedObservationReadback, SynapseCalyxMultiConditionalWriteOutcome,
-    SynapseCalyxObservationPutReadback, SynapseCalyxReadOnlyVault,
-    SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
-    SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport, SynapseCalyxTemporalCandidate,
+    SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
+    SynapseCalyxAnchorWriteReadback, SynapseCalyxBackupReport, SynapseCalyxCfRangePage,
+    SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
+    SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxGroundedObservationReadback,
+    SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
+    SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
+    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard,
+    SynapseCalyxSearchRebuildReport, SynapseCalyxTemporalCandidate,
     SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
-    SynapseCalyxVaultStatus, VaultTemporalPanelRegistration,
+    SynapseCalyxVaultStatus, SynapseCalyxVerifyReport, SynapseCalyxWeaveParams,
+    SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -404,6 +407,26 @@ pub trait StorageBackend: Send + Sync {
         reason: &'static str,
     ) -> StorageResult<SynapseCalyxVaultCloseReadback>;
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>>;
+    fn backup_calyx_vault(
+        &self,
+        target_root: &Path,
+        include_regenerable: bool,
+    ) -> StorageResult<SynapseCalyxBackupReport>;
+    fn verify_calyx_restore(&self, vault_path: &Path) -> StorageResult<SynapseCalyxVerifyReport>;
+    /// Verifies the live provenance-ledger hash chain against the stored bytes.
+    /// `range` is an optional half-open `(from_seq, to_seq)` window; `None`
+    /// verifies the full chain.
+    fn verify_calyx_ledger_chain(
+        &self,
+        range: Option<(u64, u64)>,
+    ) -> StorageResult<SynapseCalyxLedgerVerifyReport>;
+    /// Reads and decodes one physical provenance-ledger entry by sequence.
+    fn read_calyx_ledger_entry(&self, seq: u64) -> StorageResult<SynapseCalyxLedgerEntryReadback>;
+    /// Re-derives a record's recorded provenance binding and bounds drift.
+    fn reproduce_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxReproduceReport>;
+    /// Lawfully erases one record by content-addressed id via a ledger-stamped
+    /// tombstone, then re-verifies the chain.
+    fn erase_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxErasureReport>;
     fn put_recurrence_subject_occurrence(
         &self,
         kind: RecurrenceSubjectKind,
@@ -595,6 +618,15 @@ pub trait StorageBackend: Send + Sync {
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>>;
     fn compact_cf(&self, cf_name: &str) -> StorageResult<()>;
     fn compact_cf_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> StorageResult<()>;
+    fn weave_panel_intelligence(
+        &self,
+        params: SynapseCalyxWeaveParams,
+    ) -> StorageResult<SynapseCalyxWeaveReport>;
+    fn abundance_report_intelligence(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> StorageResult<SynapseCalyxAbundanceReport>;
 }
 
 pub struct CalyxBackend {
@@ -1607,6 +1639,93 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
+    fn backup_calyx_vault(
+        &self,
+        target_root: &Path,
+        include_regenerable: bool,
+    ) -> StorageResult<SynapseCalyxBackupReport> {
+        self.with_vault("<calyx-vault>", "back up Calyx vault", true, |vault| {
+            vault
+                .backup(target_root, include_regenerable)
+                .map_err(|source| {
+                    calyx_write_failed("<calyx-vault>", "back up Calyx vault", &source)
+                })
+        })
+    }
+
+    fn verify_calyx_restore(&self, vault_path: &Path) -> StorageResult<SynapseCalyxVerifyReport> {
+        synapse_calyx::verify_vault_restore(vault_path).map_err(|source| {
+            calyx_write_failed("<calyx-vault>", "verify restored Calyx vault", &source)
+        })
+    }
+
+    fn verify_calyx_ledger_chain(
+        &self,
+        range: Option<(u64, u64)>,
+    ) -> StorageResult<SynapseCalyxLedgerVerifyReport> {
+        self.with_vault(
+            "calyx_ledger",
+            "verify Calyx provenance ledger chain",
+            false,
+            |vault| {
+                vault.verify_ledger_chain(range).map_err(|source| {
+                    calyx_read_failed(
+                        "calyx_ledger",
+                        "verify Calyx provenance ledger chain",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn read_calyx_ledger_entry(&self, seq: u64) -> StorageResult<SynapseCalyxLedgerEntryReadback> {
+        self.with_vault(
+            "calyx_ledger",
+            "read Calyx provenance ledger entry",
+            false,
+            |vault| {
+                vault.read_ledger_entry(seq).map_err(|source| {
+                    calyx_read_failed(
+                        "calyx_ledger",
+                        "read Calyx provenance ledger entry",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn reproduce_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxReproduceReport> {
+        self.with_vault(
+            "calyx_ledger",
+            "reproduce Calyx record provenance",
+            false,
+            |vault| {
+                vault.reproduce_record(cx_id).map_err(|source| {
+                    calyx_read_failed("calyx_ledger", "reproduce Calyx record provenance", &source)
+                })
+            },
+        )
+    }
+
+    fn erase_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxErasureReport> {
+        self.with_vault(
+            "calyx_ledger",
+            "erase Calyx record via ledger tombstone",
+            true,
+            |vault| {
+                vault.erase_record(cx_id).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_ledger",
+                        "erase Calyx record via ledger tombstone",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
     fn put_recurrence_subject_occurrence(
         &self,
         kind: RecurrenceSubjectKind,
@@ -1690,6 +1809,49 @@ impl StorageBackend for CalyxBackend {
                         calyx_write_failed(
                             "calyx_registry",
                             "apply registered Calyx temporal rerank",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn weave_panel_intelligence(
+        &self,
+        params: SynapseCalyxWeaveParams,
+    ) -> StorageResult<SynapseCalyxWeaveReport> {
+        self.with_vault(
+            "calyx_loom",
+            "weave native Calyx panel associations",
+            true,
+            |vault| {
+                vault.weave_panel(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_loom",
+                        "weave native Calyx panel associations",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn abundance_report_intelligence(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> StorageResult<SynapseCalyxAbundanceReport> {
+        self.with_vault(
+            "calyx_loom",
+            "read native Calyx abundance report",
+            false,
+            |vault| {
+                vault
+                    .abundance_report(panel_version, max_records)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_loom",
+                            "read native Calyx abundance report",
                             &source,
                         )
                     })

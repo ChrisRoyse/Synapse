@@ -11,11 +11,13 @@ default = ["calyx-cuda"]
 calyx-cuda = ["calyx-forge/cuda"]
 
 [dependencies]
+arc-swap.workspace = true
 base64.workspace = true
 calyx-aster = { path = "../../calyx/crates/calyx-aster" }
 calyx-core = { path = "../../calyx/crates/calyx-core" }
 calyx-forge = { path = "../../calyx/crates/calyx-forge" }
 calyx-ledger = { path = "../../calyx/crates/calyx-ledger" }
+calyx-loom = { path = "../../calyx/crates/calyx-loom" }
 calyx-registry = { path = "../../calyx/crates/calyx-registry" }
 calyx-search = { path = "../../calyx/crates/calyx-search" }
 calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }

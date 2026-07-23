@@ -18,11 +18,13 @@ use crate::m3::{
         LocalModelUpdateResponse,
     },
     storage::{
-        StorageAnchorsParams, StorageAnchorsResponse, StorageGcOnceParams, StorageGcOnceResponse,
-        StorageInspectParams, StorageInspectResponse, StorageSearchRebuildParams,
-        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
-        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
-        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
+        StorageAnchorsParams, StorageAnchorsResponse, StorageBackupParams, StorageBackupResponse,
+        StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
+        StorageIntelligenceParams, StorageIntelligenceResponse, StorageRestoreVerifyParams,
+        StorageRestoreVerifyResponse, StorageSearchRebuildParams, StorageSearchRebuildResponse,
+        StorageSummaryResponse, StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
+        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
+        StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -36,6 +38,9 @@ pub enum StorageOperation {
     TemporalRerank,
     TemporalBackfill,
     SearchRebuild,
+    Backup,
+    RestoreVerify,
+    Intelligence,
 }
 
 impl StorageOperation {
@@ -49,6 +54,9 @@ impl StorageOperation {
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
             Self::SearchRebuild => "search_rebuild",
+            Self::Backup => "backup",
+            Self::RestoreVerify => "restore_verify",
+            Self::Intelligence => "intelligence",
         }
     }
 }
@@ -73,6 +81,12 @@ pub struct StorageParams {
     pub temporal_backfill: Option<StorageTemporalBackfillParams>,
     #[serde(default)]
     pub search_rebuild: Option<StorageSearchRebuildParams>,
+    #[serde(default)]
+    pub backup: Option<StorageBackupParams>,
+    #[serde(default)]
+    pub restore_verify: Option<StorageRestoreVerifyParams>,
+    #[serde(default)]
+    pub intelligence: Option<StorageIntelligenceParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -97,6 +111,12 @@ pub struct StorageResponse {
     pub temporal_backfill: Option<StorageTemporalBackfillResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_rebuild: Option<StorageSearchRebuildResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<StorageBackupResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_verify: Option<StorageRestoreVerifyResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intelligence: Option<StorageIntelligenceResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

@@ -712,6 +712,99 @@ impl Db {
         self.backend.calyx_vault_inspect()
     }
 
+    /// Produces a durable, self-verifying online backup of the live Calyx vault
+    /// into `<target_root>/vault`, with a hashed manifest sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on a residency violation, a busy maintenance guard, any copy
+    /// error, or a backup that does not pass byte-level restore verification.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn backup_calyx_vault(
+        &self,
+        target_root: &std::path::Path,
+        include_regenerable: bool,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxBackupReport> {
+        self.backend
+            .backup_calyx_vault(target_root, include_regenerable)
+    }
+
+    /// Runs the read-only aster restore verifier over a vault directory (a backup
+    /// copy or a restored data dir) and returns its byte-level report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the path is not a readable Aster vault.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn verify_calyx_restore(
+        &self,
+        vault_path: &std::path::Path,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxVerifyReport> {
+        self.backend.verify_calyx_restore(vault_path)
+    }
+
+    /// Verifies the live provenance-ledger hash chain against the exact stored
+    /// bytes, fail-closed. `range` is an optional half-open `(from_seq, to_seq)`
+    /// window; `None` verifies the full chain. This is CPU/IO-heavy over the
+    /// whole physical Ledger CF and must be driven off the async MCP runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error only when the physical ledger cannot be read; a
+    /// detected tamper is a normal broken/corrupt verdict in the report.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn verify_calyx_ledger_chain(
+        &self,
+        range: Option<(u64, u64)>,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxLedgerVerifyReport> {
+        self.backend.verify_calyx_ledger_chain(range)
+    }
+
+    /// Reads and decodes one physical provenance-ledger entry by sequence for
+    /// provenance readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read or decoded.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn read_calyx_ledger_entry(
+        &self,
+        seq: u64,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxLedgerEntryReadback> {
+        self.backend.read_calyx_ledger_entry(seq)
+    }
+
+    /// Re-derives a record's recorded provenance binding from the bytes and
+    /// bounds drift to a genuine, self-consistent ledger entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the record is absent or unreadable; a
+    /// provenance mismatch is a normal `reproduced == false` verdict.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn reproduce_calyx_record(
+        &self,
+        cx_id: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxReproduceReport> {
+        self.backend.reproduce_calyx_record(cx_id)
+    }
+
+    /// Lawfully erases one record by content-addressed id via a ledger-stamped
+    /// tombstone, then re-verifies the full chain. Content becomes unrecoverable
+    /// at the vault while the chain stays verifiable with the erasure sealed in.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the record is already tombstoned or the
+    /// tombstone/commit/purge/re-verify path fails.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn erase_calyx_record(
+        &self,
+        cx_id: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxErasureReport> {
+        self.backend.erase_calyx_record(cx_id)
+    }
+
     /// Appends one physical event to the stable native Calyx recurrence
     /// subject identified by `kind + subject_id`.
     ///
@@ -822,6 +915,39 @@ impl Db {
     ) -> StorageResult<synapse_calyx::SynapseCalyxSearchRebuildReport> {
         self.backend
             .rebuild_calyx_search_indexes(expected_panel_version)
+    }
+
+    /// Weaves the native Loom base associations for one panel: within-record
+    /// cross-terms, the slot-pair agreement graph, and the between-record
+    /// nearest-neighbor graph, persisted to the native `XTerm`/`Graph` CFs and
+    /// read back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the Base CF cannot be scanned, a
+    /// constellation fails to decode, the substrate math rejects a vector, the
+    /// math backend is unavailable, or any CF write/readback fails.
+    pub fn weave_panel_intelligence(
+        &self,
+        params: synapse_calyx::SynapseCalyxWeaveParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxWeaveReport> {
+        self.backend.weave_panel_intelligence(params)
+    }
+
+    /// Reads the derived-data abundance report for one panel back from the
+    /// physical `Base`, `XTerm`, and `Graph` CFs without re-weaving.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when any CF cannot be scanned or a
+    /// Base row fails to decode.
+    pub fn abundance_report_intelligence(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAbundanceReport> {
+        self.backend
+            .abundance_report_intelligence(panel_version, max_records)
     }
 
     /// Flushes and explicitly closes the sole process-local Calyx vault.
