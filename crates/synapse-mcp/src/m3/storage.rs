@@ -562,7 +562,6 @@ impl StorageIntelligenceOperation {
         // (weave: XTerm/Graph; assay: Assay; temporal: Graph/TemporalXTerm).
         !matches!(self, Self::Abundance)
     }
-
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
