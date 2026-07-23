@@ -2040,15 +2040,36 @@ mod windows_toast {
                     ),
                 )
             })?;
-        if ticks_since_unix % HUNDRED_NS_PER_MS != 0 {
-            return Err(NotifyFailure::new(
-                error_codes::NOTIFY_DELIVERY_UNVERIFIED,
-                format!(
-                    "Action Center history expiration is not millisecond-aligned for tag={tag} group={group} at index {index}: universal_time={universal_time}"
-                ),
-            ));
+        // Delivery always SETS a whole-millisecond expiration
+        // (`universal_time = whole_ms * HUNDRED_NS_PER_MS`), but Windows
+        // returns Action Center *history* expirations at native FILETIME
+        // (100 ns) resolution and can carry a positive sub-millisecond
+        // residual that never predates the requested deadline. Requiring
+        // exact millisecond alignment turned that representational detail
+        // into a fail-closed false negative (NOTIFY_DELIVERY_UNVERIFIED that
+        // left an acknowledged escalation stuck in `removal_failed`; see
+        // #1762 real-host evidence universal_time=134295205123167746).
+        // Recover the durable whole-millisecond deadline by flooring: for any
+        // residual in `0..HUNDRED_NS_PER_MS` the floor equals the exact
+        // millisecond that was set, so every downstream exact expiration
+        // identity comparison (against `item.expires_at_unix_ms`) still holds.
+        // The tag/group/AUMID/payload identity guards are untouched.
+        let submillisecond_residual_ticks = ticks_since_unix % HUNDRED_NS_PER_MS;
+        let expiration_unix_ms = ticks_since_unix / HUNDRED_NS_PER_MS;
+        if submillisecond_residual_ticks != 0 {
+            tracing::debug!(
+                code = "NOTIFY_HISTORY_EXPIRATION_SUBMS_PRECISION",
+                tag,
+                group,
+                index,
+                universal_time,
+                ticks_since_unix,
+                submillisecond_residual_ticks,
+                recovered_expiration_unix_ms = expiration_unix_ms,
+                "readback=Action Center Windows returned a sub-millisecond FILETIME expiration; floored to the durable whole-millisecond escalation deadline without weakening tag/group identity"
+            );
         }
-        Ok(Some(ticks_since_unix / HUNDRED_NS_PER_MS))
+        Ok(Some(expiration_unix_ms))
     }
 
     fn verify_unique_payload(
