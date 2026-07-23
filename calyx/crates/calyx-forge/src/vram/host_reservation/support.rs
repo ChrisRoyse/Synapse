@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use super::{
-    DEFAULT_HOST_CAP_MIB, HOST_CAP_MIB_ENV, HostGpuReservationRequest, HostGpuReservationSnapshot,
-    PersistedState, REMEDIATION,
+    DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
+    HostGpuReservationRequest, HostGpuReservationSnapshot, PersistedState, REMEDIATION,
 };
 use crate::{ForgeError, Result};
 
@@ -138,7 +138,23 @@ pub(super) fn validate_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn host_cap_mib() -> Result<u64> {
+/// Principled default aggregate Calyx reservation cap when [`HOST_CAP_MIB_ENV`]
+/// is unset: the physical device capacity minus the safety floor
+/// (`required_free` + `headroom`). This lets the *realistic physical free*
+/// govern the reservation budget instead of a stale flat constant that
+/// under-provisions large cards (#1979: a hard-coded 12 GiB default starved a
+/// 32 GiB RTX 5090). The `required_free`/physical-free admission gate still
+/// prevents host OOM, and co-resident tenants keep their already-allocated
+/// memory untouched — Calyx only reserves within the free remainder. Set
+/// [`HOST_CAP_MIB_ENV`] to cap Calyx lower on a shared device when a co-tenant
+/// is expected to *grow* (card − co-tenant − margin).
+pub(super) fn default_host_cap_mib(device_total_mib: u64) -> u64 {
+    device_total_mib
+        .saturating_sub(DEFAULT_REQUIRED_FREE_MIB)
+        .saturating_sub(DEFAULT_HOST_HEADROOM_MIB)
+}
+
+pub(super) fn host_cap_mib(device_total_mib: u64) -> Result<u64> {
     match std::env::var(HOST_CAP_MIB_ENV) {
         Ok(raw) => {
             let value = raw.trim().parse::<u64>().map_err(|error| {
@@ -151,7 +167,7 @@ pub(super) fn host_cap_mib() -> Result<u64> {
             }
             Ok(value)
         }
-        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_HOST_CAP_MIB),
+        Err(std::env::VarError::NotPresent) => Ok(default_host_cap_mib(device_total_mib)),
         Err(error) => Err(config_error(format!(
             "{HOST_CAP_MIB_ENV} is not valid Unicode: {error}"
         ))),

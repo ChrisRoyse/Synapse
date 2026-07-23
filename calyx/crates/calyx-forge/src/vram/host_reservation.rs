@@ -29,13 +29,18 @@ use self::support::{
     reservation_identities, unix_ms, validate_request, validate_root,
 };
 
-/// Maximum aggregate Calyx reservation per device unless explicitly changed.
+/// Legacy flat aggregate-reservation cap (12 GiB). Superseded as the default by
+/// `support::default_host_cap_mib`, which derives the cap from the physical
+/// device so large cards are not under-provisioned (#1979). Retained for
+/// back-compat and as a reference constant.
 pub const DEFAULT_HOST_CAP_MIB: u64 = 12 * 1024;
 /// Device memory that must remain free for CUDA/runtime safety.
 pub const DEFAULT_REQUIRED_FREE_MIB: u64 = 4 * 1024;
 /// Additional fragmentation/driver headroom below the hard free floor.
 pub const DEFAULT_HOST_HEADROOM_MIB: u64 = 512;
-/// Overrides [`DEFAULT_HOST_CAP_MIB`] with a positive MiB count.
+/// Overrides the aggregate reservation cap with a positive MiB count. When
+/// unset the cap defaults to the physical device capacity minus the safety
+/// floor (see `support::default_host_cap_mib`).
 pub const HOST_CAP_MIB_ENV: &str = "CALYX_GPU_HOST_CAP_MIB";
 /// Overrides the host ledger directory.
 pub const HOST_RESERVATION_ROOT_ENV: &str = "CALYX_GPU_RESERVATION_ROOT";
@@ -200,7 +205,7 @@ impl HostGpuReservationStore {
         let global_lock = self.lock_global()?;
         let physical = read_physical_device(self.device_index)?;
         let now = unix_ms()?;
-        let host_cap_mib = host_cap_mib()?;
+        let host_cap_mib = host_cap_mib(physical.total_mib)?;
         let mut state = self.load_or_initialize(&physical, host_cap_mib, now)?;
         self.ensure_same_device(&state, &physical)?;
         let stale = self.prune_stale(&mut state)?;
@@ -350,7 +355,7 @@ impl HostGpuReservationStore {
         let global_lock = self.lock_global()?;
         let physical = read_physical_device(self.device_index)?;
         let now = unix_ms()?;
-        let host_cap_mib = host_cap_mib()?;
+        let host_cap_mib = host_cap_mib(physical.total_mib)?;
         let mut state = self.load_or_initialize(&physical, host_cap_mib, now)?;
         self.ensure_same_device(&state, &physical)?;
         let stale = self.prune_stale(&mut state)?;
