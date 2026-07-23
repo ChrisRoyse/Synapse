@@ -3,6 +3,7 @@
 mod anchor_codec;
 mod anchor_compact;
 mod anchor_merge;
+mod backup;
 mod batch_ingest;
 pub(crate) mod cf_codec;
 mod commit;
@@ -56,6 +57,10 @@ use std::{
 };
 
 pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
+pub use backup::{
+    AsterBackupFile, AsterBackupReport, CALYX_ASTER_BACKUP_IO, CALYX_ASTER_BACKUP_NOT_DURABLE,
+    CALYX_ASTER_BACKUP_TARGET_INVALID, EXCLUDED_RUNTIME_FILES, REGENERABLE_DIRS,
+};
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub(crate) use compaction_bridge::LIVE_COMPACTION_TRIGGER_FILES;
 pub use compaction_bridge::VaultCompactionScheduler;

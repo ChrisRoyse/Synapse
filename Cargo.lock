@@ -5112,11 +5112,14 @@ dependencies = [
 name = "synapse-calyx"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
+ "calyx-assay",
  "calyx-aster",
  "calyx-core",
  "calyx-forge",
  "calyx-ledger",
+ "calyx-loom",
  "calyx-registry",
  "calyx-search",
  "calyx-sextant",
