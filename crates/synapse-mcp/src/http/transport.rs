@@ -3680,7 +3680,7 @@ async fn cleanup_stale_session_resources_once(
             .teardown_session(&session_id, reason)
             .await
         {
-            Ok(report) => {
+            Ok(report) if report.failure_count == 0 => {
                 teardown_backoff.record_success(&session_id);
                 tracing::info!(
                     code = "MCP_HTTP_SESSION_STALE_LIFECYCLE_CLEANUP",
@@ -3689,6 +3689,26 @@ async fn cleanup_stale_session_resources_once(
                     active_session_count = active_sessions.len(),
                     report = ?report,
                     "readback=session_lifecycle edge=http_session_gone after_cleanup"
+                );
+            }
+            // Teardown reports embedded failures via Ok(report) rather than Err;
+            // without this arm those sessions re-fail every sweep at full rate
+            // (the 2026-07-23 MCP_SESSION_TEARDOWN_FAILED storm: 15 identical
+            // retries per session in 2.5 min) because record_success cleared
+            // the backoff each pass.
+            Ok(report) => {
+                let (consecutive_failures, retry_after) =
+                    teardown_backoff.record_failure(&session_id, now);
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    session_id = %session_id,
+                    reason,
+                    active_session_count = active_sessions.len(),
+                    failure_count = report.failure_count,
+                    consecutive_failures,
+                    retry_after_ms = retry_after.as_millis() as u64,
+                    report = ?report,
+                    "HTTP MCP stale-session lifecycle cleanup completed with embedded failures; retrying with backoff"
                 );
             }
             Err(error) => {
