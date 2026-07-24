@@ -167,6 +167,7 @@ let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
 let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
 let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
 let DURABLE_OWNER_STALE_SESSION_REPAIR = null;
+let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
@@ -1501,6 +1502,33 @@ async function restoreDurableOwnerLedger() {
       }
       if (
         !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+        DURABLE_OWNER_LEDGER.inFlightMutation
+      ) {
+        // A mutation persisted by a *prior* browser session cannot still be in
+        // flight: its worker died with that browser session, and Chrome tab
+        // ids are not stable across browser restarts, so no observation in
+        // this session can ever resolve it. Retaining it kept the mutation
+        // gate closed forever with no repair path (issue #1811 structural
+        // gap). It is provably terminal — resolve it audibly and let the
+        // stale-owner rebase decide re-enablement (a real operator panic,
+        // disableSequence > 0, still refuses to re-enable).
+        RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = {
+          ...DURABLE_OWNER_LEDGER.inFlightMutation,
+          ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId || null,
+          current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+          resolved_at_unix_ms: Date.now()
+        };
+        console.warn(
+          "synapse durable owner ledger: resolved terminally stranded in-flight " +
+            "mutation from a prior browser session",
+          RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION
+        );
+        DURABLE_OWNER_LEDGER.inFlightMutation = null;
+        staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER);
+        await persistDurableOwnerLedgerRepairSnapshot();
+      }
+      if (
+        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
         staleOwners === 0 &&
         !DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length &&
         rebaseDurableOwnerLedgerAfterStaleOwnerDrain()
@@ -1516,7 +1544,8 @@ async function restoreDurableOwnerLedger() {
           `stale_repair_absent_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.absent_tab_ids?.length || 0)} ` +
           `stale_repair_closed_matching_opened_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.closed_matching_opened_tabs?.length || 0)} ` +
           `stale_repair_live_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.live_tabs?.length || 0)} ` +
-          `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)}`;
+          `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)} ` +
+          `resolved_prior_session_in_flight_mutation=${RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION ? "resolved" : "none"}`;
       }
     }
     if (
@@ -12305,6 +12334,8 @@ function operatorPanicOwnerReadback() {
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
+    resolved_prior_session_in_flight_mutation:
+      RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION,
     unresolved_debugger_command_timeouts:
       DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
         id: entry.id,
@@ -12352,6 +12383,7 @@ function operatorPanicGateErrorSummary() {
     `stale_repair_closed_matching_opened_tab_count=${Number(readback.stale_browser_session_repair?.closed_matching_opened_tabs?.length || 0)} ` +
     `stale_repair_live_tab_count=${Number(readback.stale_browser_session_repair?.live_tabs?.length || 0)} ` +
     `stale_repair_failure_count=${Number(readback.stale_browser_session_repair?.failures?.length || 0)} ` +
+    `resolved_prior_session_in_flight_mutation=${readback.resolved_prior_session_in_flight_mutation ? "resolved" : "none"} ` +
     `non_zero_owner_counts=${nonZeroOwners || "none"}`
   );
 }
@@ -12819,6 +12851,8 @@ async function handleOperatorPanicCleanup(params) {
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
+    resolved_prior_session_in_flight_mutation:
+      RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION,
     unresolved_debugger_command_timeouts:
       DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
         id: entry.id,
