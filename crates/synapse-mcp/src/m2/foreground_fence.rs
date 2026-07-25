@@ -131,6 +131,13 @@ pub(crate) fn ensure(stage: &'static str) -> Result<(), ErrorData> {
                 ),
                 Some(json!({
                     "code": error_codes::ACTION_FOREGROUND_LOST,
+                    // This code is also raised by post-action readbacks, where
+                    // input *was* delivered and the caller must verify. The
+                    // fence refuses strictly before dispatch, so there is
+                    // provably nothing to verify; the marker keeps the facade
+                    // from reporting `delivered_unverified` for a call that
+                    // delivered nothing (#1830).
+                    "refused_before_delivery": true,
                     "stage": stage,
                     "expected": fence_window_json(&expected),
                     "actual": Value::Null,
@@ -164,6 +171,13 @@ pub(crate) fn ensure(stage: &'static str) -> Result<(), ErrorData> {
                 ),
                 Some(json!({
                     "code": error_codes::ACTION_FOREGROUND_LOST,
+                    // This code is also raised by post-action readbacks, where
+                    // input *was* delivered and the caller must verify. The
+                    // fence refuses strictly before dispatch, so there is
+                    // provably nothing to verify; the marker keeps the facade
+                    // from reporting `delivered_unverified` for a call that
+                    // delivered nothing (#1830).
+                    "refused_before_delivery": true,
                     "stage": stage,
                     "expected": fence_window_json(&expected),
                     "actual": {

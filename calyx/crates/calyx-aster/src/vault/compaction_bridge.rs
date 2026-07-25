@@ -16,6 +16,16 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long one tombstone-purge slice may hold the durable commit lock before
+/// yielding to queued vault writes. Matches `CHECKPOINT_DRAIN_HOLD_BUDGET`.
+const TOMBSTONE_PURGE_SLICE_HOLD_BUDGET: Duration = Duration::from_millis(250);
+
+/// Backstop against a fan-out reduction that never converges. Each slice makes
+/// strictly positive progress (enforced below), so this can only be reached by
+/// a genuinely pathological SST distribution.
+const TOMBSTONE_PURGE_MAX_SLICES: usize = 4096;
 
 /// Maximum number of SST indexes one live compaction batch may retain.
 ///
@@ -482,11 +492,128 @@ where
 
     /// Compacts the listed column families, prunes MVCC tombstone rows from the
     /// compacted SST, and reclaims superseded input SSTs for durable vaults.
+    /// Runs the sweep as paced slices instead of one lock hold.
+    ///
+    /// Every vault write — including the audit row an MCP `initialize` and each
+    /// `act` command writes before doing anything — is serialized behind the
+    /// durable commit lock. Taking it once around a whole multi-CF sweep
+    /// therefore parks the entire tool surface for as long as the sweep runs:
+    /// measured at 62 s here (and 469 s when #1806 was filed), which is what
+    /// made `act operation=lease_acquire` take ~111 s in #1829.
+    ///
+    /// The lock is now acquired per column family, and within a family per
+    /// budgeted slice of fan-out reduction, mirroring `drain_checkpoints_paced`
+    /// directly above and the per-CF bound already documented on
+    /// `retire_router_cf`. Waiting writers get the lock between slices, so the
+    /// worst-case write stall is one slice rather than one whole sweep.
     pub fn purge_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
         self.drain_checkpoints_paced("tombstone purge preflight")?;
+        let mut unique = Vec::new();
+        for cf in cfs {
+            if !unique.contains(cf) {
+                unique.push(*cf);
+            }
+        }
         self.with_native_compaction_guard(|| {
-            self.with_durable_commit_lock(|| self.purge_tombstoned_cfs_locked(cfs))
+            for cf in unique {
+                let mut slices = 0_usize;
+                loop {
+                    slices += 1;
+                    if slices > TOMBSTONE_PURGE_MAX_SLICES {
+                        return Err(CalyxError {
+                            code: "CALYX_ASTER_TOMBSTONE_PURGE_SLICE_BUDGET_EXHAUSTED",
+                            message: format!(
+                                "tombstone purge for {} did not converge within {TOMBSTONE_PURGE_MAX_SLICES} paced commit-lock slices",
+                                cf.name()
+                            ),
+                            remediation: "inspect SST size/order distribution for this CF; a non-converging fan-out reduction means compaction admission is not making progress",
+                        });
+                    }
+                    let more_work =
+                        self.with_durable_commit_lock(|| self.purge_tombstoned_cf_slice_locked(cf))?;
+                    if !more_work {
+                        break;
+                    }
+                }
+            }
+            Ok(())
         })
+    }
+
+    /// One budgeted slice of a single CF's tombstone purge.
+    ///
+    /// Returns `true` when the hold budget ran out with work remaining, so the
+    /// caller releases the durable commit lock and re-acquires it for the next
+    /// slice.
+    fn purge_tombstoned_cf_slice_locked(&self, cf: ColumnFamily) -> Result<bool> {
+        let Some(durable) = &self.durable else {
+            return Ok(false);
+        };
+        self.checkpoint_locked()?;
+        let durable_seq = self.verified_durable_coverage_seq(durable)?;
+        let catalog = catalog_from_vault_tiers_through_seq(
+            durable.root(),
+            durable.tiering_policy(),
+            durable_seq,
+        )?;
+        let slice_started = std::time::Instant::now();
+        loop {
+            let before = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
+            if before.pending_files <= DEFAULT_COMPACTION_TARGET_FILES {
+                break;
+            }
+            if slice_started.elapsed() >= TOMBSTONE_PURGE_SLICE_HOLD_BUDGET {
+                tracing::info!(
+                    code = "CALYX_ASTER_TOMBSTONE_PURGE_SLICE_YIELD",
+                    cf = cf.name(),
+                    pending_files = before.pending_files,
+                    target_files = DEFAULT_COMPACTION_TARGET_FILES,
+                    hold_ms = slice_started.elapsed().as_millis(),
+                    hold_budget_ms = TOMBSTONE_PURGE_SLICE_HOLD_BUDGET.as_millis(),
+                    "yielding the durable commit lock mid fan-out reduction so queued vault writes can proceed"
+                );
+                return Ok(true);
+            }
+            let result = self.compact_catalog_cf_batch_locked(
+                durable,
+                &catalog,
+                durable_seq,
+                cf,
+                LIVE_COMPACTION_MAX_INPUT_FILES,
+            )?;
+            let after = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
+            if after.pending_files >= before.pending_files {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_TOMBSTONE_PURGE_FANOUT_NO_PROGRESS",
+                    message: format!(
+                        "tombstone purge could not reduce {} to a bounded complete-compaction input: before_files={} after_files={} target_files={} result={result:?}",
+                        cf.name(),
+                        before.pending_files,
+                        after.pending_files,
+                        DEFAULT_COMPACTION_TARGET_FILES,
+                    ),
+                    remediation: "preserve the vault and inspect SST size/order distribution; do not prune tombstones from only a partial oldest prefix",
+                });
+            }
+        }
+        let Some(report) = prepare_tombstoned_cf_compaction(durable, &catalog, cf, durable_seq)?
+        else {
+            return Ok(false);
+        };
+        let doomed = plan_compaction_input_reclaim(&report)?;
+        let reclaimed = self.rows.retire_then_purge_cf_inputs(
+            &[cf],
+            "reclaim tombstoned compaction inputs",
+            &doomed,
+        )?;
+        if reclaimed != report.input_files {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "tombstone compaction reclaimed {reclaimed} of {} proven input files for {}",
+                report.input_files,
+                cf.name()
+            )));
+        }
+        Ok(false)
     }
 
     pub(crate) fn purge_tombstoned_cfs_locked(&self, cfs: &[ColumnFamily]) -> Result<()> {

@@ -10345,6 +10345,39 @@ fn child_base_environment() -> BTreeMap<String, (String, String)> {
     env
 }
 
+/// Every variable a normally-launched Windows process is guaranteed to have and
+/// that real tooling reads. `OS`, `PROCESSOR_ARCHITECTURE` and
+/// `NUMBER_OF_PROCESSORS` come from HKLM Session Manager; the identity and home
+/// variables come from the logon block or the derivations in
+/// `add_windows_standard_environment`. None of them may be quietly absent: a
+/// child missing them is the #768 failure mode (a launcher gated on
+/// `$env:OS -eq 'Windows_NT'` refusing to run). Checked twice — on the
+/// constructed map and again on the map actually delivered to `CreateProcess`.
+const REQUIRED_CHILD_ENVIRONMENT_KEYS: [&str; 22] = [
+    "PATH",
+    "PATHEXT",
+    "ComSpec",
+    "SystemDrive",
+    "SystemRoot",
+    "windir",
+    "OS",
+    "USERNAME",
+    "USERPROFILE",
+    "COMPUTERNAME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "ALLUSERSPROFILE",
+    "ProgramData",
+    "ProgramFiles",
+    "PUBLIC",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+];
+
 fn shell_child_environment(
     command_name: &str,
     args: &[String],
@@ -10358,7 +10391,73 @@ fn shell_child_environment(
     validate_configured_host_build_environment(&env, requested_env, command_name, args)?;
     apply_requested_shell_environment(&mut env, requested_env);
     apply_shell_session_environment(&mut env, effective_working_dir, context);
-    Ok(env.into_values().collect())
+    let delivered: BTreeMap<String, String> = env.into_values().collect();
+    validate_delivered_child_environment(&delivered, "act_run_shell")?;
+    Ok(delivered)
+}
+
+/// Re-checks the required variables on the exact map handed to `Command::env`.
+///
+/// `validate_child_base_environment` runs on the intermediate
+/// `UPPERCASE -> (original_key, value)` map, several transforms before the
+/// flattened map the spawn actually delivers. #768 stayed open through a state
+/// where that first validation *passed* while the spawned child provably had
+/// 28 of ~85 variables — construction and delivery disagreed, and nothing
+/// checked the side that matters. Validating the delivered map closes that
+/// gap: any future divergence fails the spawn by name instead of shipping a
+/// child that a normally-launched Windows process would never see.
+fn validate_delivered_child_environment(
+    delivered: &BTreeMap<String, String>,
+    surface: &'static str,
+) -> Result<(), ErrorData> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let missing: Vec<&str> = REQUIRED_CHILD_ENVIRONMENT_KEYS
+        .into_iter()
+        .filter(|key| {
+            !delivered
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case(key) && !value.trim().is_empty())
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    tracing::error!(
+        code = "M4_CHILD_ENV_DELIVERY_INCOMPLETE",
+        surface,
+        missing = ?missing,
+        delivered = delivered.len(),
+        daemon_pid = std::process::id(),
+        "constructed child environment passed validation but the delivered map is missing required Windows variables"
+    );
+    let message = format!(
+        "{surface} refused the spawn because the delivered child environment lost required Windows variables between construction and CreateProcess: missing=[{}] delivered_count={}. {CHILD_ENV_INCOMPLETE_REMEDIATION}",
+        missing.join(", "),
+        delivered.len()
+    );
+    let data = json!({
+        "code": error_codes::ACTION_TARGET_INVALID,
+        "reason": "child_environment_delivery_incomplete",
+        "surface": surface,
+        "missing": missing,
+        "delivered_count": delivered.len(),
+        "daemon_pid": std::process::id(),
+        "remediation": CHILD_ENV_INCOMPLETE_REMEDIATION,
+    });
+    if surface == "act_run_shell" {
+        return Err(shell_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            message,
+            data,
+        ));
+    }
+    Err(launch_tool_error(
+        error_codes::ACTION_TARGET_INVALID,
+        message,
+        data,
+    ))
 }
 
 fn apply_requested_shell_environment(
@@ -11395,30 +11494,7 @@ fn validate_child_base_environment(
     // them may be quietly absent: a child missing them is the #768 failure mode
     // (a launcher gated on `$env:OS -eq 'Windows_NT'` refusing to run), so the
     // spawn is refused here and names exactly what could not be resolved.
-    let required = [
-        "PATH",
-        "PATHEXT",
-        "ComSpec",
-        "SystemDrive",
-        "SystemRoot",
-        "windir",
-        "OS",
-        "USERNAME",
-        "USERPROFILE",
-        "COMPUTERNAME",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "TEMP",
-        "TMP",
-        "ALLUSERSPROFILE",
-        "ProgramData",
-        "ProgramFiles",
-        "PUBLIC",
-        "PROCESSOR_ARCHITECTURE",
-        "NUMBER_OF_PROCESSORS",
-    ];
+    let required = REQUIRED_CHILD_ENVIRONMENT_KEYS;
     let missing: Vec<&str> = required
         .into_iter()
         .filter(|key| env_value(env, key).is_none())
