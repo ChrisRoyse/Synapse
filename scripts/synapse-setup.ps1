@@ -8741,6 +8741,36 @@ if (-not $SkipBuild) {
     if ($SourceDir -match '^\\\\' -or $SourceDir -match '^[Zz]:\\home\\') {
         Die "-SourceDir '$SourceDir' looks like a UNC / WSL-mapped path. Build from a real local copy: building over \\wsl.localhost bakes transient drive paths into the binary."
     }
+    # #1819: crates/synapse-calyx depends on the vendored Calyx workspace through
+    # path dependencies, which cargo resolves while PARSING manifests - before any
+    # build script or feature gate can run. If the vendored tree is missing (it was
+    # found deleted from the working tree on 2026-07-24 with 902 tracked files
+    # absent) the build dies with a raw path-dependency error that names a
+    # sub-crate manifest and gives no remediation - landing on top of whatever
+    # outage prompted the rebuild. Fail here instead, with the exact restore
+    # command, before spending a full release build to find out.
+    $vendoredCalyxCrates = Join-Path $SourceDir 'calyx\crates'
+    $requiredCalyxCrates = @(
+        'calyx-assay', 'calyx-aster', 'calyx-core', 'calyx-forge', 'calyx-ledger',
+        'calyx-lodestar', 'calyx-loom', 'calyx-paths', 'calyx-registry',
+        'calyx-search', 'calyx-sextant'
+    )
+    $missingCalyxCrates = @(
+        $requiredCalyxCrates | Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $vendoredCalyxCrates (Join-Path $_ 'Cargo.toml')))
+        }
+    )
+    if ($missingCalyxCrates.Count -gt 0) {
+        Die ("SYNAPSE_VENDORED_CALYX_TREE_MISSING source_dir=$SourceDir " +
+             "vendored_path=$vendoredCalyxCrates missing_crate_count=$($missingCalyxCrates.Count) " +
+             "missing_crates=$($missingCalyxCrates -join ',') " +
+             "detail=crates\synapse-calyx depends on these through cargo path dependencies, which are " +
+             "resolved before any build script runs, so the build cannot report this itself. " +
+             "The tree is tracked in git and is NOT gitignored (.gitignore excludes only /calyx/target/). " +
+             "remediation=run 'git checkout -- calyx' in $SourceDir to restore the vendored Calyx " +
+             "workspace, confirm 'git status' reports no deletions under calyx/, then re-run setup")
+    }
+    Info "Vendored Calyx workspace verified: $($requiredCalyxCrates.Count) path-dependency crates present under $vendoredCalyxCrates"
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $cargoVersionLog = Join-Path $LogDir 'setup-cargo-version.log'
     $cargoVersionDiagnosticsPath = Join-Path $LogDir 'setup-cargo-version-diagnostics.json'
