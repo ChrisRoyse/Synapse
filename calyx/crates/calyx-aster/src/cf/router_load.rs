@@ -84,7 +84,7 @@ impl CfRouter {
             )?;
             cfs_loaded += 1;
             sst_files_loaded = sst_files_loaded.saturating_add(file_count);
-            tracing::info!(
+            tracing::debug!(
                 code = "CALYX_ASTER_ROUTER_LOAD_CF_DONE",
                 vault_dir = %self.vault_dir().display(),
                 cf = cf.name(),
@@ -163,7 +163,7 @@ impl CfRouter {
             self.load_cf_level(*cf, files, retain_lookup)?;
             cfs_loaded += 1;
             sst_files_loaded = sst_files_loaded.saturating_add(file_count);
-            tracing::info!(
+            tracing::debug!(
                 code = "CALYX_ASTER_ROUTER_LOAD_CF_DONE",
                 vault_dir = %self.vault_dir().display(),
                 cf = cf.name(),

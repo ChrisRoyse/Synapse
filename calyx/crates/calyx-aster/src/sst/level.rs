@@ -138,7 +138,7 @@ impl SstLevel {
             if file_count >= SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL
                 && files_opened % SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL == 0
             {
-                tracing::info!(
+                tracing::debug!(
                     code = "CALYX_ASTER_SST_LOOKUP_BUILD_PROGRESS",
                     file_count,
                     files_opened,
@@ -148,7 +148,7 @@ impl SstLevel {
             }
         }
         files.reverse();
-        tracing::info!(
+        tracing::debug!(
             code = "CALYX_ASTER_SST_LOOKUP_BUILD_DONE",
             file_count,
             retained_lookup_files,
