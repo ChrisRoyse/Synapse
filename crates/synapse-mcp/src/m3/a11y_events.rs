@@ -12,12 +12,23 @@ use synapse_a11y::{
 use synapse_core::{Event, EventFilter, EventSource, ForegroundContext};
 use synapse_reflex::EventBus;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 use super::activity_recorder::ActivityRecorder;
 
 pub struct A11yEventBridge {
     subscription: Option<WinEventSubscription>,
     task: Option<JoinHandle<()>>,
+    /// #1792: a stop signal for the bridge task that is INDEPENDENT of the
+    /// event channel. Closing the channel is a drain-ordered stop — tokio's
+    /// `Receiver::recv` returns `None` only once all senders are dropped *and
+    /// every buffered value has been received* — so with 10 system-wide WinEvent
+    /// hooks feeding an unbounded channel, the cooperative deadline was
+    /// structurally unmeetable: the task first had to consume a
+    /// desktop-controlled backlog, doing synchronous Win32 work per item.
+    /// Raising the deadline cannot fix that; a signal the queue does not gate
+    /// can.
+    stop: CancellationToken,
 }
 
 pub(crate) struct PreparedA11yEventBridge {
@@ -317,7 +328,13 @@ impl A11yEventBridge {
             receiver,
         } = prepared;
         let recorder_attached = activity_recorder.is_some();
-        let task = tokio::spawn(run_bridge(event_bus, receiver, activity_recorder));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_bridge(
+            event_bus,
+            receiver,
+            activity_recorder,
+            stop.clone(),
+        ));
         tracing::info!(
             code = "M3_A11Y_EVENT_BRIDGE_STARTED",
             thread_id = subscription.readback().thread_id,
@@ -329,6 +346,7 @@ impl A11yEventBridge {
         Self {
             subscription: Some(subscription),
             task: Some(task),
+            stop,
         }
     }
 
@@ -346,6 +364,10 @@ impl A11yEventBridge {
         // the WinEvent owner and recording its physical unregister readback.
         let mut failures = Vec::new();
         let shutdown_started_at = Utc::now().to_rfc3339();
+        // #1792: signal the bridge task BEFORE the OS source is torn down and
+        // before the cooperative join is awaited. Channel closure alone made the
+        // stop drain-ordered; this makes it immediate.
+        self.stop.cancel();
         let subscription_owner_present = self.subscription.is_some();
         let subscription_phase_start = Instant::now();
         let subscription = self.subscription.take().map(|subscription| {
@@ -527,9 +549,31 @@ async fn run_bridge(
     event_bus: EventBus,
     mut receiver: UnboundedReceiver<AccessibleEvent>,
     activity_recorder: Option<Arc<ActivityRecorder>>,
+    stop: CancellationToken,
 ) {
     let mut next_seq = 1_u64;
-    while let Some(accessible_event) = receiver.recv().await {
+    loop {
+        // #1792: race the stop signal against the next event. Cancellation is
+        // now observable regardless of how deep the WinEvent backlog is, which
+        // is what makes the cooperative deadline meetable at all. Abandoned
+        // events are reported rather than dropped silently, so a missed
+        // deadline is attributable to backlog depth from the log alone.
+        let accessible_event = tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                tracing::info!(
+                    code = "M3_A11Y_BRIDGE_STOP_SIGNALLED",
+                    published_events = next_seq.saturating_sub(1),
+                    abandoned_queued_events = receiver.len(),
+                    "M3 a11y bridge stopped on its cancellation signal; queued WinEvents were abandoned by design"
+                );
+                return;
+            }
+            event = receiver.recv() => match event {
+                Some(event) => event,
+                None => return,
+            },
+        };
         if let Some(recorder) = &activity_recorder {
             recorder.record_accessible_event(&accessible_event);
         }
