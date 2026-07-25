@@ -567,11 +567,11 @@ async fn run_bridge(
                     abandoned_queued_events = receiver.len(),
                     "M3 a11y bridge stopped on its cancellation signal; queued WinEvents were abandoned by design"
                 );
-                return;
+                break;
             }
             event = receiver.recv() => match event {
                 Some(event) => event,
-                None => return,
+                None => break,
             },
         };
         if let Some(recorder) = &activity_recorder {
