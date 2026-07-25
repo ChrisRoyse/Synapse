@@ -3699,32 +3699,72 @@ async fn cleanup_stale_session_resources_once(
             Ok(report) => {
                 let (consecutive_failures, retry_after) =
                     teardown_backoff.record_failure(&session_id, now);
-                tracing::error!(
-                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    session_id = %session_id,
-                    reason,
-                    active_session_count = active_sessions.len(),
-                    failure_count = report.failure_count,
-                    consecutive_failures,
-                    retry_after_ms = retry_after.as_millis() as u64,
-                    report = ?report,
-                    "HTTP MCP stale-session lifecycle cleanup completed with embedded failures; retrying with backoff"
-                );
+                // #1801: the first refusal is the actionable signal; every
+                // repeat is the KNOWN, intentional fail-closed retention
+                // re-observed on schedule (an operator-panic browser-mutation
+                // refusal is a correct outcome, not an incident). Logging each
+                // repeat at ERROR produced ~30.4k ERROR lines/day and drowned
+                // real failures. Keep exactly one ERROR per session per failure
+                // streak and report the continuing state at WARN; the streak
+                // resets to ERROR the moment a teardown succeeds and later
+                // starts failing again, so a genuinely new fault is never
+                // silenced.
+                if consecutive_failures <= 1 {
+                    tracing::error!(
+                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        session_id = %session_id,
+                        reason,
+                        active_session_count = active_sessions.len(),
+                        failure_count = report.failure_count,
+                        consecutive_failures,
+                        retry_after_ms = retry_after.as_millis() as u64,
+                        report = ?report,
+                        "HTTP MCP stale-session lifecycle cleanup completed with embedded failures; retrying with backoff"
+                    );
+                } else {
+                    tracing::warn!(
+                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        session_id = %session_id,
+                        reason,
+                        active_session_count = active_sessions.len(),
+                        failure_count = report.failure_count,
+                        consecutive_failures,
+                        retry_after_ms = retry_after.as_millis() as u64,
+                        report = ?report,
+                        "HTTP MCP stale-session lifecycle cleanup still reporting embedded failures; continuing backoff (first occurrence logged at ERROR)"
+                    );
+                }
             }
             Err(error) => {
                 let (consecutive_failures, retry_after) =
                     teardown_backoff.record_failure(&session_id, now);
-                tracing::error!(
-                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    session_id = %session_id,
-                    reason,
-                    active_session_count = active_sessions.len(),
-                    consecutive_failures,
-                    retry_after_ms = retry_after.as_millis() as u64,
-                    detail = %error.message,
-                    data = ?error.data,
-                    "HTTP MCP stale-session lifecycle cleanup failed; retrying with backoff"
-                );
+                // #1801: same rule as the embedded-failure arm above - one ERROR
+                // per failure streak, WARN while the known refusal persists.
+                if consecutive_failures <= 1 {
+                    tracing::error!(
+                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        session_id = %session_id,
+                        reason,
+                        active_session_count = active_sessions.len(),
+                        consecutive_failures,
+                        retry_after_ms = retry_after.as_millis() as u64,
+                        detail = %error.message,
+                        data = ?error.data,
+                        "HTTP MCP stale-session lifecycle cleanup failed; retrying with backoff"
+                    );
+                } else {
+                    tracing::warn!(
+                        code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        session_id = %session_id,
+                        reason,
+                        active_session_count = active_sessions.len(),
+                        consecutive_failures,
+                        retry_after_ms = retry_after.as_millis() as u64,
+                        detail = %error.message,
+                        data = ?error.data,
+                        "HTTP MCP stale-session lifecycle cleanup still failing; continuing backoff (first occurrence logged at ERROR)"
+                    );
+                }
             }
         }
     }
