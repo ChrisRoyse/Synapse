@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::support::{
     PhysicalDevice, config_error, effective_reserved_mib, io_error, open_existing_lock_file,
-    open_lock_file, snapshot,
+    open_lock_file, reservation_identities, snapshot,
 };
 use super::{
     DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
@@ -51,14 +51,11 @@ impl HostGpuReservationStore {
         now: u128,
     ) -> Result<PersistedState> {
         if self.state_path().exists() {
-            let state = self.load_existing()?;
-            if state.host_cap_mib != host_cap_mib && !state.reservations.is_empty() {
-                return Err(config_error(format!(
-                    "{HOST_CAP_MIB_ENV} changed from {} to {} while reservations are live",
-                    state.host_cap_mib, host_cap_mib
-                )));
-            }
-            return Ok(state);
+            // The persisted cap is deliberately *not* reconciled here: a
+            // reservation row is not evidence of a live owner until its lease
+            // lock has been probed. `reconcile_host_cap` runs that check after
+            // `prune_stale`.
+            return self.load_existing();
         }
         let epoch_capacity_mib = host_cap_mib.min(
             physical
@@ -243,12 +240,84 @@ impl HostGpuReservationStore {
         Ok(())
     }
 
+    /// Reconciles the persisted aggregate host cap against the cap observed for
+    /// this process, *after* [`Self::prune_stale`] has proven which
+    /// reservations are actually live.
+    ///
+    /// Changing the cap while real reservations are outstanding stays a hard
+    /// error: their owners were admitted against the old budget, so silently
+    /// re-basing it could let the live aggregate exceed a cap nobody was
+    /// admitted under. The correctness hinge is *when* that guard is evaluated.
+    /// A persisted row only proves a live owner once its lease lock has been
+    /// probed — the OS releases those locks when the holder dies, including
+    /// across a host reboot. Evaluating the guard against unprobed rows turned
+    /// every ungraceful shutdown that also changed the effective cap into a
+    /// permanent startup deadlock: the lease outlives the reboot, the cap no
+    /// longer matches, admission is refused, and the refusal happens before the
+    /// reaper that would have cleared the stale row ever runs.
+    pub(super) fn reconcile_host_cap(
+        &self,
+        state: &mut PersistedState,
+        physical: &PhysicalDevice,
+        host_cap_mib: u64,
+    ) -> Result<()> {
+        if !state.reservations.is_empty() {
+            if state.host_cap_mib != host_cap_mib {
+                return Err(config_error(format!(
+                    "{HOST_CAP_MIB_ENV} changed from {} to {} while {} reservation(s) remain live after stale-lease reaping: {}",
+                    state.host_cap_mib,
+                    host_cap_mib,
+                    state.reservations.len(),
+                    reservation_identities(state)
+                )));
+            }
+            return Ok(());
+        }
+        if state.host_cap_mib != host_cap_mib {
+            tracing::info!(
+                code = "CALYX_FORGE_HOST_CAP_REBASED",
+                device_index = self.device_index,
+                previous_host_cap_mib = state.host_cap_mib,
+                host_cap_mib,
+                device_total_mib = physical.total_mib,
+                physical_free_mib = physical.free_mib,
+                "rebased the aggregate host GPU cap because no reservation remains live"
+            );
+        }
+        state.host_cap_mib = host_cap_mib;
+        state.epoch_free_mib = physical.free_mib;
+        state.epoch_capacity_mib = host_cap_mib.min(
+            physical
+                .free_mib
+                .saturating_sub(DEFAULT_REQUIRED_FREE_MIB)
+                .saturating_sub(DEFAULT_HOST_HEADROOM_MIB),
+        );
+        Ok(())
+    }
+
     pub(super) fn prune_stale(&self, state: &mut PersistedState) -> Result<u64> {
         let mut live = Vec::with_capacity(state.reservations.len());
         let mut stale = 0_u64;
         for reservation in state.reservations.drain(..) {
             let lease_path = PathBuf::from(&reservation.lease_file);
-            let lease = open_existing_lock_file(&lease_path)?;
+            let Some(lease) = open_existing_lock_file(&lease_path)? else {
+                // No file means no lock: the row cannot correspond to a held
+                // lease. Reaping it is the only outcome that lets the ledger
+                // recover; refusing here would strand admission permanently.
+                tracing::warn!(
+                    code = "CALYX_FORGE_HOST_RESERVATION_LEASE_ABSENT",
+                    device_index = self.device_index,
+                    reservation_id = %reservation.reservation_id,
+                    owner = %reservation.owner,
+                    job_id = %reservation.job_id,
+                    pid = reservation.pid,
+                    requested_mib = reservation.requested_mib,
+                    lease_file = %lease_path.display(),
+                    "reaped a GPU reservation whose lease file is absent; no process can hold a lock on a file that does not exist"
+                );
+                stale = stale.saturating_add(1);
+                continue;
+            };
             match lease.try_lock() {
                 Ok(()) => {
                     lease.unlock().map_err(|error| {
@@ -269,6 +338,18 @@ impl HostGpuReservationStore {
                             "fix lease file permissions before retrying",
                         ));
                     }
+                    tracing::info!(
+                        code = "CALYX_FORGE_HOST_RESERVATION_REAPED",
+                        device_index = self.device_index,
+                        reservation_id = %reservation.reservation_id,
+                        owner = %reservation.owner,
+                        job_id = %reservation.job_id,
+                        pid = reservation.pid,
+                        requested_mib = reservation.requested_mib,
+                        acquired_unix_ms = reservation.acquired_unix_ms,
+                        lease_file = %lease_path.display(),
+                        "reaped a GPU reservation whose lease lock was no longer held by any live process"
+                    );
                     stale = stale.saturating_add(1);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => live.push(reservation),

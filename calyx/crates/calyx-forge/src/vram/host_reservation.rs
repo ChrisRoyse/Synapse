@@ -210,16 +210,7 @@ impl HostGpuReservationStore {
         self.ensure_same_device(&state, &physical)?;
         let stale = self.prune_stale(&mut state)?;
         state.stale_reaped_total = state.stale_reaped_total.saturating_add(stale);
-        if state.reservations.is_empty() {
-            state.host_cap_mib = host_cap_mib;
-            state.epoch_free_mib = physical.free_mib;
-            state.epoch_capacity_mib = host_cap_mib.min(
-                physical
-                    .free_mib
-                    .saturating_sub(DEFAULT_REQUIRED_FREE_MIB)
-                    .saturating_sub(DEFAULT_HOST_HEADROOM_MIB),
-            );
-        }
+        self.reconcile_host_cap(&mut state, &physical, host_cap_mib)?;
         state.last_physical_free_mib = physical.free_mib;
         state.last_updated_unix_ms = now;
 
@@ -360,16 +351,7 @@ impl HostGpuReservationStore {
         self.ensure_same_device(&state, &physical)?;
         let stale = self.prune_stale(&mut state)?;
         state.stale_reaped_total = state.stale_reaped_total.saturating_add(stale);
-        if state.reservations.is_empty() {
-            state.host_cap_mib = host_cap_mib;
-            state.epoch_free_mib = physical.free_mib;
-            state.epoch_capacity_mib = host_cap_mib.min(
-                physical
-                    .free_mib
-                    .saturating_sub(DEFAULT_REQUIRED_FREE_MIB)
-                    .saturating_sub(DEFAULT_HOST_HEADROOM_MIB),
-            );
-        }
+        self.reconcile_host_cap(&mut state, &physical, host_cap_mib)?;
         state.last_physical_free_mib = physical.free_mib;
         state.last_updated_unix_ms = now;
         let snapshot = self.persist_and_verify(&state)?;

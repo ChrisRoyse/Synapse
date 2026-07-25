@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -291,19 +292,25 @@ pub(super) fn create_lease_file(path: &Path) -> Result<File> {
         })
 }
 
-pub(super) fn open_existing_lock_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| {
-            io_error(
-                "open persisted GPU reservation lease",
-                path,
-                error,
-                "the ledger names a missing/unreadable lease; inspect process state and repair the source of truth rather than assuming the reservation is stale",
-            )
-        })
+/// Opens a persisted lease file for liveness probing.
+///
+/// Returns `Ok(None)` when the lease file does not exist. That case is
+/// unambiguous rather than merely unknown: the advisory lock that represents a
+/// held lease lives *in* this file, so if the file is absent no process can
+/// possibly be holding it, and the caller may reap the row. Every other error
+/// (permissions, I/O) leaves liveness genuinely unknown and stays fail-closed —
+/// treating an unreadable lease as dead could double-admit real device memory.
+pub(super) fn open_existing_lock_file(path: &Path) -> Result<Option<File>> {
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(
+            "open persisted GPU reservation lease",
+            path,
+            error,
+            "the ledger names an unreadable lease; inspect process state and repair the source of truth rather than assuming the reservation is stale",
+        )),
+    }
 }
 
 pub(super) fn unix_ms() -> Result<u128> {
