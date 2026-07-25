@@ -91,6 +91,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "operatorPanicReadback",
     "operatorPanicEnable",
     "cdpInput",
+    "keyDispatch",
     "viewportEmulation",
     "deviceEmulation",
     "geolocationEmulation",
@@ -6696,6 +6697,37 @@ pub async fn list_tabs(
     })
 }
 
+/// #1824: debugger-free synthetic key dispatch for a background bridge tab.
+///
+/// The real-mouse `cdpInput` lane and raw-CDP `Input.dispatchKeyEvent` both
+/// require a CDP endpoint the normal authenticated Chrome profile does not
+/// expose, which left `act verb=key` with no route at all on the transport that
+/// can happily open a modal. This lane runs the key sequence through
+/// `chrome.scripting` in the page. The events are untrusted by web-platform
+/// rule, so the response reports `input_trust` and `native_default_actions`
+/// explicitly instead of implying trusted OS input.
+pub async fn key_dispatch(
+    hwnd: i64,
+    target_id: &str,
+    keys: &[String],
+    wait_timeout_ms: u64,
+    suppress_page_text: bool,
+) -> Result<Value, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "keyDispatch")?;
+    bridge()
+        .send_command(
+            "keyDispatch",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "keys": keys,
+                "waitTimeoutMs": wait_timeout_ms,
+                "suppressPageText": suppress_page_text,
+            }),
+        )
+        .await
+}
+
 pub async fn close_tab(
     hwnd: i64,
     target_id: &str,
@@ -8264,6 +8296,9 @@ pub struct ChromeDebuggerDomActionRequest<'a> {
     pub wait_timeout_ms: u64,
     pub auto_wait: bool,
     pub auto_wait_timeout_ms: u32,
+    /// #1821 Playwright `force` parity: dispatch on the resolved node even when
+    /// an actionability predicate is unmet, recording the bypassed snapshot.
+    pub force: bool,
     pub suppress_page_text: bool,
 }
 
@@ -8297,6 +8332,7 @@ pub async fn dom_action(
                 "waitTimeoutMs": request.wait_timeout_ms,
                 "autoWait": request.auto_wait,
                 "autoWaitTimeoutMs": request.auto_wait_timeout_ms,
+                "force": request.force,
                 "suppressPageText": request.suppress_page_text,
             }),
         )

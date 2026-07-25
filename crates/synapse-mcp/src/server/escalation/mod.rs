@@ -58,12 +58,12 @@ use super::notify_tools::{
     PreparedToastPayload, SYNAPSE_AUMID, SYNAPSE_ESCALATION_TOAST_GROUP, SYNAPSE_TOAST_GROUP,
     TOAST_RENDERER_VERSION_CURRENT, TOAST_RENDERER_VERSION_V1, ToastCleanupReport,
     ToastHistoryReadback, ToastPreShowAuthorizer, ToastPreShowFailure, ToastRemovalOutcome,
-    ToastShowAuthority, inspect_internal_escalation_toast, inspect_internal_toast,
-    legacy_prepared_toast_payload_v1_valid, prepare_internal_escalation_toast,
-    prepared_toast_payload_matches_request, prepared_toast_payload_valid,
-    remove_internal_escalation_toast, remove_internal_toast, remove_orphaned_escalation_toasts,
-    run_internal_escalation_toast_blocking, toast_tag_for, toast_text_char_allowed,
-    upgrade_prepared_toast_payload_v1,
+    ToastShowAuthority, WINDOWS_ACTION_CENTER_MAX_HISTORY_MS, inspect_internal_escalation_toast,
+    inspect_internal_toast, legacy_prepared_toast_payload_v1_valid, platform_corrected_expiration,
+    prepare_internal_escalation_toast, prepared_toast_payload_matches_request,
+    prepared_toast_payload_valid, remove_internal_escalation_toast, remove_internal_toast,
+    remove_orphaned_escalation_toasts, run_internal_escalation_toast_blocking, toast_tag_for,
+    toast_text_char_allowed, upgrade_prepared_toast_payload_v1,
 };
 use super::session_registry::unix_time_ms_now;
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
@@ -10903,6 +10903,7 @@ async fn remove_tier0_if_terminal(
                     tag.clone(),
                     expected_payload_sha256,
                     item.expires_at_unix_ms,
+                    item.created_at_unix_ms,
                 )
                 .await
             }
@@ -10988,6 +10989,16 @@ async fn remove_tier0_if_terminal(
                 ),
                 _ => (1, recorded_at, false),
             };
+        // An intent that was stuck in `removal_failed` (e.g. the #1803
+        // ordinary-TTL toasts whose Action Center expiration was capped to
+        // `arrival + 3 days`, which the old exact-equality precondition refused
+        // to remove) converging to physically absent is a one-time contract
+        // repair worth attributing.
+        let recovered_from_removal_failed = matches!(
+            current.item.tier0_delivery,
+            Tier0ToastDelivery::RemovalFailed { .. }
+        );
+        let prior_removal_attempts = removal_attempt_count.saturating_sub(1);
         let mut updated = current.item;
         let delivery_proof_promoted = outcome.removed && outcome.before_count == Some(1);
         if delivery_proof_promoted {
@@ -11072,6 +11083,15 @@ async fn remove_tier0_if_terminal(
                 }
                 *item = readback.item;
                 *item_revision_sha256 = readback.revision_sha256;
+                if physically_absent && recovered_from_removal_failed {
+                    tracing::info!(
+                        code = "ESCALATION_TIER0_EXPIRATION_CONTRACT_REPAIRED",
+                        escalation_id = %item.escalation_id,
+                        prior_removal_attempts,
+                        expires_at_unix_ms = item.expires_at_unix_ms,
+                        "readback=CF_KV Action Center a Tier-0 intent previously stuck in removal_failed converged to Removed after the Windows retention-cap expiration contract was reconciled (#1762/#1803); the 60s removal retry loop is terminated"
+                    );
+                }
                 tracing::info!(
                     code = "ESCALATION_TIER0_TOAST_REMOVAL_DURABLE",
                     escalation_id = %item.escalation_id,
@@ -11564,10 +11584,30 @@ fn classify_tier0_pre_show_collision_locked(
         item.tier0_payload_sha256 = Some(prepared_payload.payload_sha256.clone());
         item.tier0_prepared_payload = Some(prepared_payload.clone());
         let expected_expiration_unix_ms = Some(item.expires_at_unix_ms);
+        // A prior reserved row carries the Windows-capped expiration
+        // (`arrival + 3 days`), not the durable deadline, for ordinary-TTL
+        // escalations (#1803). Recognize that capped value as the exact
+        // pre-existing row so a legitimate prior delivery is deferred to the
+        // durable dedupe path rather than misquarantined as a collision.
+        let stored_expiration_unix_ms = history_readback
+            .expiration_unix_ms
+            .first()
+            .copied()
+            .flatten();
+        let expiration_contract_matches = match stored_expiration_unix_ms {
+            Some(stored) => platform_corrected_expiration(
+                item.expires_at_unix_ms,
+                stored,
+                item.created_at_unix_ms,
+                classify_now_unix_ms,
+            )
+            .is_some(),
+            None => false,
+        };
         let physical_contract_matches = history_readback.history_count == 1
             && history_readback.payload_sha256s.first().map(String::as_str)
                 == Some(prepared_payload.payload_sha256.as_str())
-            && history_readback.expiration_unix_ms.first() == Some(&expected_expiration_unix_ms);
+            && expiration_contract_matches;
         if physical_contract_matches {
             tracing::info!(
                 code = "ESCALATION_TIER0_PRE_SHOW_EXACT_ROW_DEFERRED",
@@ -12393,13 +12433,27 @@ fn validate_tier0_send_response(
         )
     })?;
     let disposition_valid = response.shown != response.deduped;
+    // The physical Action Center expiration must be either the durable deadline
+    // or a provable Windows retention-cap truncation of it (#1803). Anything
+    // else fails the contract (fail-closed) exactly as before.
+    let now_unix_ms = checked_unix_time_ms("Tier-0 send-response validation boundary")?;
+    let expiration_contract_satisfied = match response.expiration_unix_ms {
+        Some(stored) => platform_corrected_expiration(
+            item.expires_at_unix_ms,
+            stored,
+            item.created_at_unix_ms,
+            now_unix_ms,
+        )
+        .is_some(),
+        None => false,
+    };
     if response.aumid != SYNAPSE_AUMID
         || response.group != SYNAPSE_ESCALATION_TOAST_GROUP
         || response.tag != expected_tag
         || !response.verified_in_history
         || response.history_count != 1
         || response.payload_sha256 != expected_payload
-        || response.expiration_unix_ms != Some(item.expires_at_unix_ms)
+        || !expiration_contract_satisfied
         || !disposition_valid
     {
         return Err(mcp_error(
@@ -12653,12 +12707,44 @@ fn classify_tier0_history_locked(
             && readback.history_count == 1
             && readback.payload_sha256s.first().map(String::as_str)
                 == Some(expected_payload_sha256.as_str());
-        let expected_expiration_unix_ms = match tier0_group_for_exact_tag(
+        let classified_at = checked_unix_time_ms("Tier-0 physical classification boundary")?
+            .max(now_unix_ms)
+            .max(current.item.updated_at_unix_ms);
+        let single_present_row = readback.present && readback.history_count == 1;
+        let stored_expiration_unix_ms = readback.expiration_unix_ms.first().copied().flatten();
+        // Corrected expected expiration, reconciled against the Windows Action
+        // Center retention cap (#1803): ordinary-TTL (7-day) toasts are stored
+        // at `arrival + 3 days`, never at the durable deadline. Anchor the
+        // verified expiration to the physically-stored value when the cap is
+        // provably applied (arrival bounded by `[item created, now]`), keeping
+        // exact-match semantics and the tag/group/payload identity guards.
+        let mut platform_cap_applied = false;
+        let (expected_expiration_unix_ms, expiration_matches) = match tier0_group_for_exact_tag(
             &current.item,
             &expected_tag,
         ) {
-            Some(SYNAPSE_ESCALATION_TOAST_GROUP) => Some(current.item.expires_at_unix_ms),
-            Some(SYNAPSE_TOAST_GROUP) => None,
+            Some(SYNAPSE_ESCALATION_TOAST_GROUP) => {
+                let requested = current.item.expires_at_unix_ms;
+                match (single_present_row, stored_expiration_unix_ms) {
+                    (true, Some(stored)) => match platform_corrected_expiration(
+                        requested,
+                        stored,
+                        current.item.created_at_unix_ms,
+                        classified_at,
+                    ) {
+                        Some(corrected) => {
+                            platform_cap_applied = corrected.platform_cap_applied;
+                            (Some(corrected.expected_unix_ms), true)
+                        }
+                        None => (Some(requested), false),
+                    },
+                    _ => (Some(requested), false),
+                }
+            }
+            Some(SYNAPSE_TOAST_GROUP) => (
+                None,
+                single_present_row && readback.expiration_unix_ms.first() == Some(&None),
+            ),
             _ => {
                 return Err(mcp_error(
                     error_codes::STORAGE_CORRUPTED,
@@ -12668,13 +12754,7 @@ fn classify_tier0_history_locked(
                 ));
             }
         };
-        let expiration_matches = readback.present
-            && readback.history_count == 1
-            && readback.expiration_unix_ms.first() == Some(&expected_expiration_unix_ms);
         let physical_identity_matches = payload_matches && expiration_matches;
-        let classified_at = checked_unix_time_ms("Tier-0 physical classification boundary")?
-            .max(now_unix_ms)
-            .max(current.item.updated_at_unix_ms);
         let legacy_compatibility_delivery_proven = current.item.tier0_delivery
             == Tier0ToastDelivery::LegacyUnclassified
             && current.item.tier0_fired;
@@ -12771,8 +12851,12 @@ fn classify_tier0_history_locked(
                 "history_readback": readback,
                 "payload_matches": payload_matches,
                 "expiration_matches": expiration_matches,
+                "requested_expiration_unix_ms": item.expires_at_unix_ms,
                 "expected_expiration_unix_ms": expected_expiration_unix_ms,
+                "stored_expiration_unix_ms": stored_expiration_unix_ms,
                 "actual_expiration_unix_ms": readback.expiration_unix_ms,
+                "platform_cap_applied": platform_cap_applied,
+                "windows_action_center_max_history_ms": WINDOWS_ACTION_CENTER_MAX_HISTORY_MS,
                 "send_verified_before_separate_read": send_verified,
                 "delivery_proof_before_classification": delivery_proven_before_classification,
                 "delivery_proof_after_classification": item.tier0_fired,
@@ -12817,6 +12901,11 @@ fn classify_tier0_history_locked(
                     committed_seq,
                     history_count = readback.history_count,
                     present = readback.present,
+                    requested_expiration_unix_ms = item.expires_at_unix_ms,
+                    expected_expiration_unix_ms = ?expected_expiration_unix_ms,
+                    stored_expiration_unix_ms = ?stored_expiration_unix_ms,
+                    expiration_matches,
+                    platform_cap_applied,
                     "readback=CF_KV Tier-0 physical Action Center classification is durable"
                 );
                 return Ok(Some(delivery_proven));

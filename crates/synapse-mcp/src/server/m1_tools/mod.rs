@@ -814,7 +814,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words (not an OCR_NO_TEXT error); pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
+        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. A clean OCR pass over a valid region that finds no glyphs is a valid empty observation, returned as success with no_text:true and empty full_text/words (not an OCR_NO_TEXT error); pass require_text:true to keep fail-closed absence. Backend/capture failures stay typed errors. BROWSER TAB CONSTRAINT (#1823): window capture observes only the tab a browser window is currently rendering, so per-tab OCR of a background tab is impossible by construction. When this session is bound to a CDP tab and the capture window is that tab's window, read_text proves the bound tab is the rendered one and returns its identity in captured_target; if a different tab is rendered it fails closed with OCR_TARGET_NOT_FOREGROUND naming both tabs instead of silently returning the other page's text. Use browser_dom/browser_capture for tab-exact readback of a background tab, or browser_tabs operation=activate first. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
     )]
     pub async fn read_text(
         &self,
@@ -847,7 +847,94 @@ impl SynapseService {
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
         let target_hwnd = perception_window_hwnd("read_text", &target, params.0.window_hwnd)?;
-        self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
+        // #1823: an explicit `window_hwnd` bypasses the CDP-target guard in
+        // `perception_window_hwnd`. Window capture renders only the tab that is
+        // active in the window, so a session bound to a background tab in that
+        // same window would silently receive OCR of a completely different page.
+        // Establish the physically-captured tab first and fail closed on a
+        // mismatch rather than returning confidently-wrong perception.
+        let captured_target = self
+            .resolve_ocr_captured_target("read_text", &target, target_hwnd)
+            .await?;
+        let mut result = self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())?;
+        result.0.captured_target = captured_target;
+        Ok(result)
+    }
+
+    /// Resolve — and enforce — the physical tab identity behind a browser-window
+    /// OCR capture (#1823).
+    ///
+    /// Returns `None` when the capture surface is not a browser window bound to a
+    /// CDP tab in this session (nothing to reconcile). Returns the physical
+    /// capture provenance when the bound tab *is* the tab rendered in the window.
+    /// Fails closed with `OCR_TARGET_NOT_FOREGROUND` when the session is bound to
+    /// a tab that is not the one the window is rendering — the case that
+    /// previously returned another page's text as a plain success.
+    async fn resolve_ocr_captured_target(
+        &self,
+        tool: &str,
+        target: &Option<SessionTarget>,
+        capture_hwnd: Option<i64>,
+    ) -> Result<Option<synapse_core::OcrCapturedTarget>, ErrorData> {
+        let (Some(capture_hwnd), Some(SessionTarget::Cdp { window_hwnd, cdp_target_id })) =
+            (capture_hwnd, target.as_ref())
+        else {
+            return Ok(None);
+        };
+        if capture_hwnd != *window_hwnd {
+            // The caller explicitly aimed at a different window than the one that
+            // owns its bound tab. That is an intentional cross-window read, not a
+            // silent tab mixup, so it is permitted — but never claimed to be the
+            // bound tab.
+            return Ok(None);
+        }
+        let listed = crate::chrome_debugger_bridge::list_tabs(capture_hwnd, None, None, None)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "{tool} could not read back which tab Chrome window {capture_hwnd:#x} is rendering, so it cannot prove the OCR pixels belong to the session's bound tab {cdp_target_id:?}; refusing to guess: {}",
+                        error.detail()
+                    ),
+                )
+            })?;
+        let Some(active) = listed.tabs.iter().find(|tab| tab.active) else {
+            return Err(mcp_error(
+                error_codes::OCR_TARGET_NOT_FOREGROUND,
+                format!(
+                    "{tool} refuses to OCR Chrome window {capture_hwnd:#x}: chrome.tabs.query reported no active tab (target_count={}, active_tab_count={}), so the pixels cannot be attributed to the session's bound tab {cdp_target_id:?}",
+                    listed.target_count, listed.active_tab_count
+                ),
+            ));
+        };
+        if active.target_id != *cdp_target_id {
+            let bound = listed
+                .tabs
+                .iter()
+                .find(|tab| tab.target_id == *cdp_target_id);
+            return Err(mcp_error(
+                error_codes::OCR_TARGET_NOT_FOREGROUND,
+                format!(
+                    "{tool} refuses to OCR Chrome window {capture_hwnd:#x}: window capture renders only the active tab, and the active tab is {active_id:?} (url={active_url:?} title={active_title:?}), not this session's bound tab {cdp_target_id:?} (url={bound_url:?} title={bound_title:?}). Returning the active tab's text under the bound tab's identity would be confidently-wrong perception. Remediation: read the bound tab with a tab-scoped surface (browser_dom content/locate/inspect, browser_capture), or make the bound tab active first with browser_tabs operation=activate and re-read, or pass a window_hwnd for a different window to read that window intentionally.",
+                    active_id = active.target_id,
+                    active_url = active.url,
+                    active_title = active.title,
+                    bound_url = bound.map(|tab| tab.url.as_str()).unwrap_or("<tab absent from this window>"),
+                    bound_title = bound.map(|tab| tab.title.as_str()).unwrap_or("<tab absent from this window>"),
+                ),
+            ));
+        }
+        Ok(Some(synapse_core::OcrCapturedTarget {
+            window_hwnd: capture_hwnd,
+            captured_cdp_target_id: active.target_id.clone(),
+            captured_url: active.url.clone(),
+            captured_title: active.title.clone(),
+            session_bound_cdp_target_id: Some(cdp_target_id.clone()),
+            matches_session_target: true,
+            readback_source: "chrome.tabs.query active-tab readback for the capture window"
+                .to_owned(),
+        }))
     }
 
     fn read_text_with_target_hwnd(

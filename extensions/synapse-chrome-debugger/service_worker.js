@@ -57,6 +57,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "operatorPanicReadback",
   "operatorPanicEnable",
   "cdpInput",
+  "keyDispatch",
   "viewportEmulation",
   "deviceEmulation",
   "geolocationEmulation",
@@ -167,6 +168,7 @@ let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
 let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
 let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
 let DURABLE_OWNER_STALE_SESSION_REPAIR = null;
+let RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = null;
 let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
@@ -797,6 +799,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "exposeBinding",
     "handleDialog",
     "cdpInput",
+    "keyDispatch",
     "viewportEmulation",
     "deviceEmulation",
     "geolocationEmulation",
@@ -1529,6 +1532,42 @@ async function restoreDurableOwnerLedger() {
       }
       if (
         !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+        DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length > 0
+      ) {
+        // Same terminal argument as the prior-session in-flight mutation
+        // above: a debugger command that timed out in a PRIOR browser session
+        // died with that session's worker and debuggee, and Chrome tab ids are
+        // not stable across browser sessions, so no observation in this session
+        // can ever resolve it or deliver its neutralizing release. Retaining
+        // the rows kept durableOwnerRowCount() permanently above zero, which
+        // blocked the stale-owner rebase and left every physical mutation
+        // refused with no repair path - the bridge became unusable after any
+        // service-worker restart that happened to follow a debugger timeout.
+        RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = {
+          rows: DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
+            id: entry.id || null,
+            tab_id: entry.tabId ?? null,
+            method: entry.method || null,
+            worker_boot_id: entry.workerBootId || null,
+            timed_out_at_unix_ms: entry.timedOutAtUnixMs ?? null,
+            neutralization_method: entry.neutralizationMethod || null
+          })),
+          ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId || null,
+          current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+          resolved_at_unix_ms: Date.now()
+        };
+        console.warn(
+          "synapse durable owner ledger: resolved terminally unresolvable debugger-command " +
+            "timeouts from a prior browser session",
+          RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS
+        );
+        DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts = [];
+        staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+          (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
+        await persistDurableOwnerLedgerRepairSnapshot();
+      }
+      if (
+        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
         staleOwners === 0 &&
         !DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length &&
         rebaseDurableOwnerLedgerAfterStaleOwnerDrain()
@@ -1743,8 +1782,16 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
     .filter((entry) => entry.tabId !== tabId);
   DURABLE_OWNER_LEDGER.debuggerTabs = DURABLE_OWNER_LEDGER.debuggerTabs
     .filter((candidate) => candidate !== tabId);
-  DURABLE_OWNER_LEDGER.executedInitScriptEffects =
-    DURABLE_OWNER_LEDGER.executedInitScriptEffects.filter((entry) => entry.tabId !== tabId);
+  // An unresolved debugger-command timeout is owned by a debugger session on a
+  // specific tab. Once that tab is gone the command can never resolve and the
+  // neutralizing release can never be delivered, so the row is terminal. It was
+  // the ONLY owner category this prune skipped, which meant a proven-closed tab
+  // still left a stale owner row behind - keeping durableOwnerRowCount() above
+  // zero, blocking the stale-owner rebase, and leaving the whole bridge
+  // fail-closed for every mutation with no repair path.
+  DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts =
+    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
+      .filter((entry) => entry.tabId !== tabId);
   DURABLE_OWNER_LEDGER.dialogTabs = DURABLE_OWNER_LEDGER.dialogTabs
     .filter((candidate) => candidate !== tabId);
   DURABLE_OWNER_LEDGER.fileChooserTabs = DURABLE_OWNER_LEDGER.fileChooserTabs
@@ -1882,6 +1929,16 @@ function isMutationCapableCommand(kind) {
     "operatorPanicReadback",
     "operatorPanicEnable",
     "maintenancePauseReconnect",
+    // `reloadSelf` mutates no page and no owner: it calls chrome.runtime.reload(),
+    // which is precisely the primitive that re-runs owner reconciliation from a
+    // clean worker boot. Treating it as a mutation made the admission gate
+    // UNRECOVERABLE - once closed, the only documented repair
+    // (browser_debugger.reload_bridge, which setup and every staleness error
+    // point at) was refused by the very gate it exists to clear, leaving the
+    // bridge bricked with no facade-reachable recovery (#1828). A genuine
+    // operator panic is not laundered by this: `disableSequence` is durable, so
+    // the fresh worker re-reads it and stays disabled.
+    "reloadSelf",
     "listTabs"
   ].includes(String(kind || ""));
 }
@@ -2438,6 +2495,8 @@ async function handleCommand(command) {
       result = await handleNavigateTab(params);
     } else if (kind === "activateTab") {
       result = await handleActivateTab(params);
+    } else if (kind === "keyDispatch") {
+      result = await handleKeyDispatch(params);
     } else if (kind === "domAction") {
       result = await handleDomAction(params);
     } else if (kind === "coordinateClick") {
@@ -5887,16 +5946,49 @@ async function handleNavigateTab(params) {
         sessionId: agentSessionId
       });
       downloadSeqBefore = downloadEventSeq;
+      const sameUrlNavigate = requestedUrl === before.url;
+      const beforeDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
+      if (sameUrlNavigate && beforeDocumentId === null) {
+        // Fail closed and immediately: without a main-frame documentId there is
+        // no observable that can distinguish "the same-URL navigation committed"
+        // from "nothing happened", and waiting the full budget to report a
+        // navigation that in fact succeeded is exactly the #1825 defect.
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `navigateTab cannot verify a same-URL navigation for tab ${selected.tabId}: ` +
+            `requested url equals the tab's current url and chrome.webNavigation.getFrame ` +
+            `returned no main-frame documentId, so no committed-document readback is available. ` +
+            `Remediation: use action=reload (which does not require a url delta), or grant the ` +
+            `webNavigation permission so the document commit can be proven.`
+        );
+      }
       assertPhysicalMutationAdmission(`chrome.tabs.update:navigate:tab=${selected.tabId}`);
       await chrome.tabs.update(selected.tabId, { url: requestedUrl });
-      if (requestedUrl !== before.url) {
-        readbackExpectation = {
-          description:
-            `tab url to become ${JSON.stringify(diagnosticUrl(requestedUrl))} ` +
+      readbackExpectation = {
+        needsDocumentId: true,
+        before_document_id: beforeDocumentId,
+        description: sameUrlNavigate
+          ? `a committed navigation in tab ${selected.tabId}: main-frame documentId to differ from ` +
+            `${JSON.stringify(beforeDocumentId)} (the requested url equals the current url, so a ` +
+            `new document is the only proof the navigation occurred)`
+          : `a committed navigation in tab ${selected.tabId}: main-frame documentId to differ from ` +
+            `${JSON.stringify(beforeDocumentId)}, or tab url to become ` +
+            `${JSON.stringify(diagnosticUrl(requestedUrl))} ` +
             `or differ from ${JSON.stringify(diagnosticUrl(before.url))}`,
-          matches: (state) => state.url === requestedUrl || state.url !== before.url
-        };
-      }
+        matches: (state) => {
+          const committed =
+            beforeDocumentId !== null &&
+            state.main_frame_document_id != null &&
+            state.main_frame_document_id !== beforeDocumentId;
+          if (committed) {
+            return true;
+          }
+          if (sameUrlNavigate) {
+            return false;
+          }
+          return state.url === requestedUrl || state.url !== before.url;
+        }
+      };
     } else if (action === "reload") {
       markAgentNavigation(selected.tabId, {
         action,
@@ -6053,6 +6145,9 @@ async function waitForNavigateOrDownload(
     }
     try {
       last = await tabPageState(tabId, fallbackTarget);
+      if (expectation?.needsDocumentId) {
+        last.main_frame_document_id = await mainFrameDocumentIdOrNull(tabId);
+      }
       lastError = null;
       const loaded = last.ready_state === "complete";
       if (loaded && (!expectation || expectation.matches(last))) {
@@ -6073,7 +6168,9 @@ async function waitForNavigateOrDownload(
     ? `waiting for ${expectation?.description || "complete tab state"} or a Chrome download; ` +
       `last url=${JSON.stringify(diagnosticUrl(last.url))} ` +
       `title=${JSON.stringify(diagnosticTitle(last.title))} ` +
-      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
+      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)} ` +
+      `before_document_id=${JSON.stringify(expectation?.before_document_id ?? null)} ` +
+      `last_document_id=${JSON.stringify(last.main_frame_document_id ?? null)}`
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
       : "no tab state readback";
@@ -6162,12 +6259,242 @@ async function handleActivateTab(params) {
   };
 }
 
+// #1824: keyboard parity for background CDP tabs on the debugger-free bridge.
+//
+// Mouse and DOM actions already reach a background tab through
+// chrome.scripting; keyboard actions did not, so `act verb=key` failed with
+// A11Y_CDP_UNREACHABLE and an agent could open a modal it had no way to
+// dismiss. "Press Escape to cancel" is the most common recovery primitive in
+// browser automation, and losing it means reaching states you cannot leave.
+//
+// The events dispatched here are synthetic (isTrusted === false): they run page
+// keydown/keypress/keyup handlers - which is exactly what a modal Escape
+// handler is - but by web-platform rule they never drive the browser's own
+// default behaviours (no form submit, no caret insertion, no browser
+// shortcuts). That limit is reported in every response as `input_trust` and
+// `native_default_actions`, never papered over.
+async function handleKeyDispatch(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
+  const suppressPageText = Boolean(params.suppressPageText);
+  const keys = Array.isArray(params.keys) ? params.keys.map((key) => String(key)) : [];
+  if (keys.length === 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "keyDispatch requires a non-empty keys array, for example [\"Escape\"] or [\"ctrl\",\"a\"]"
+    );
+  }
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforePageText = await tabPageTextState(selected.tabId, suppressPageText);
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId: selected.tabId },
+      func: dispatchKeySequenceInPage,
+      args: [{ keys }]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript keyDispatch(${selected.tabId}, ${JSON.stringify(keys)}) failed: ${errorMessage(error)}`
+    );
+  }
+  const frames = frameExecutionResults(injected);
+  const top = frames.find((frame) => frame.result) || null;
+  if (!top || typeof top.result !== "object" || top.result === null) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `keyDispatch returned no structured in-page result for tab ${selected.tabId}`
+    );
+  }
+  if (!top.result.ok) {
+    throw bridgeError(
+      String(top.result.error_code || ERROR_CHROME_DOM_ACTION_UNSUPPORTED),
+      `keyDispatch failed in tab ${selected.tabId}: ${String(top.result.error_detail || "no detail")}`
+    );
+  }
+  const after = await tabPageState(selected.tabId, selected.target);
+  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.chrome_window_id,
+    frame_id: top.frame_id,
+    frame_document_id: top.document_id,
+    keys,
+    input_trust: "synthetic_dom_dispatch",
+    native_default_actions: false,
+    trust_note:
+      "KeyboardEvents dispatched through chrome.scripting have isTrusted=false: page keydown/keypress/keyup handlers run (this is what dismisses a modal), but the browser default behaviours - form submission, caret text insertion, browser shortcuts - do not fire. Use a raw-CDP Input.dispatchKeyEvent target for trusted key input.",
+    readback_backend: "chrome.scripting.executeScript+chrome.tabs.get",
+    required_foreground: false,
+    wait_timeout_ms: waitTimeoutMs,
+    before_page: before,
+    after_page: after,
+    before_page_text: beforePageText,
+    after_page_text: afterPageText,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason,
+    ...top.result
+  };
+}
+
+function dispatchKeySequenceInPage(request) {
+  const ERROR_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
+  const raw = Array.isArray(request?.keys) ? request.keys.map((key) => String(key).trim()).filter(Boolean) : [];
+  if (raw.length === 0) {
+    return { ok: false, error_code: ERROR_ACTION_UNSUPPORTED, error_detail: "keys was empty" };
+  }
+  const MODIFIERS = { ctrl: "ctrlKey", control: "ctrlKey", shift: "shiftKey", alt: "altKey", meta: "metaKey", cmd: "metaKey", win: "metaKey" };
+  // Physical `code` + legacy keyCode for the keys page handlers actually test.
+  const NAMED = {
+    escape: { key: "Escape", code: "Escape", keyCode: 27 },
+    esc: { key: "Escape", code: "Escape", keyCode: 27 },
+    enter: { key: "Enter", code: "Enter", keyCode: 13 },
+    return: { key: "Enter", code: "Enter", keyCode: 13 },
+    tab: { key: "Tab", code: "Tab", keyCode: 9 },
+    backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    del: { key: "Delete", code: "Delete", keyCode: 46 },
+    space: { key: " ", code: "Space", keyCode: 32 },
+    arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    up: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    down: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    left: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    right: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    home: { key: "Home", code: "Home", keyCode: 36 },
+    end: { key: "End", code: "End", keyCode: 35 },
+    pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
+    pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 }
+  };
+
+  const modifierState = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
+  let terminal = null;
+  for (const token of raw) {
+    const lower = token.toLowerCase();
+    if (MODIFIERS[lower]) {
+      modifierState[MODIFIERS[lower]] = true;
+      continue;
+    }
+    if (terminal !== null) {
+      return {
+        ok: false,
+        error_code: ERROR_ACTION_UNSUPPORTED,
+        error_detail: `keyDispatch accepts one non-modifier key per call; got ${JSON.stringify(raw)}`
+      };
+    }
+    if (NAMED[lower]) {
+      terminal = { ...NAMED[lower] };
+    } else if (/^f([1-9]|1[0-2])$/.test(lower)) {
+      const index = Number(lower.slice(1));
+      terminal = { key: `F${index}`, code: `F${index}`, keyCode: 111 + index };
+    } else if (Array.from(token).length === 1) {
+      const upper = token.toUpperCase();
+      terminal = {
+        key: token,
+        code: /^[a-z]$/i.test(token) ? `Key${upper}` : /^[0-9]$/.test(token) ? `Digit${token}` : "",
+        keyCode: upper.charCodeAt(0),
+        printable: true
+      };
+    } else {
+      return {
+        ok: false,
+        error_code: ERROR_ACTION_UNSUPPORTED,
+        error_detail: `keyDispatch does not know key ${JSON.stringify(token)}; supported: single characters, F1-F12, and ${Object.keys(NAMED).join("/")}`
+      };
+    }
+  }
+  if (terminal === null) {
+    return {
+      ok: false,
+      error_code: ERROR_ACTION_UNSUPPORTED,
+      error_detail: `keyDispatch requires a non-modifier key; got only modifiers ${JSON.stringify(raw)}`
+    };
+  }
+
+  function describe(element) {
+    if (!element || !(element instanceof Element)) {
+      return null;
+    }
+    return {
+      tag_name: String(element.tagName || "").toLowerCase(),
+      id: String(element.id || ""),
+      role: String(element.getAttribute("role") || ""),
+      type_attr: String(element.getAttribute("type") || "")
+    };
+  }
+
+  let deepActive = document.activeElement;
+  while (deepActive && deepActive.shadowRoot && deepActive.shadowRoot.activeElement) {
+    deepActive = deepActive.shadowRoot.activeElement;
+  }
+  const dispatchTarget = deepActive instanceof Element ? deepActive : (document.body || document.documentElement);
+  if (!dispatchTarget) {
+    return { ok: false, error_code: ERROR_ACTION_UNSUPPORTED, error_detail: "page has no dispatchable node" };
+  }
+  const activeBefore = describe(deepActive);
+  const init = {
+    key: terminal.key,
+    code: terminal.code,
+    keyCode: terminal.keyCode,
+    which: terminal.keyCode,
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    ...modifierState
+  };
+  const dispatched = [];
+  const downDefaultAllowed = dispatchTarget.dispatchEvent(new KeyboardEvent("keydown", init));
+  dispatched.push("keydown");
+  let pressDefaultAllowed = null;
+  if (terminal.printable && !modifierState.ctrlKey && !modifierState.metaKey && !modifierState.altKey) {
+    pressDefaultAllowed = dispatchTarget.dispatchEvent(new KeyboardEvent("keypress", init));
+    dispatched.push("keypress");
+  }
+  const upDefaultAllowed = dispatchTarget.dispatchEvent(new KeyboardEvent("keyup", { ...init, cancelable: true }));
+  dispatched.push("keyup");
+
+  let deepActiveAfter = document.activeElement;
+  while (deepActiveAfter && deepActiveAfter.shadowRoot && deepActiveAfter.shadowRoot.activeElement) {
+    deepActiveAfter = deepActiveAfter.shadowRoot.activeElement;
+  }
+  return {
+    ok: true,
+    resolved_key: { key: terminal.key, code: terminal.code, key_code: terminal.keyCode, modifiers: modifierState },
+    dispatch_target: describe(dispatchTarget),
+    events_dispatched: dispatched,
+    // `false` means a page handler called preventDefault() - i.e. the page
+    // actively consumed the key, which is positive evidence it was received.
+    keydown_default_allowed: downDefaultAllowed,
+    keypress_default_allowed: pressDefaultAllowed,
+    keyup_default_allowed: upDefaultAllowed,
+    active_element_before: activeBefore,
+    active_element_after: describe(deepActiveAfter),
+    in_page_url: String(location.href || ""),
+    in_page_title: String(document.title || ""),
+    in_page_ready_state: String(document.readyState || "")
+  };
+}
+
 async function handleDomAction(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeDomAction(params.action);
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const autoWait = Boolean(params.autoWait);
   const autoWaitTimeoutMs = normalizeDomActionAutoWaitTimeout(params.autoWaitTimeoutMs, autoWait);
+  // #1821 Playwright `force` parity, honoured only on this debugger-free
+  // synthetic-dispatch lane (a real mouse event cannot bypass occlusion).
+  const force = Boolean(params.force);
   const suppressPageText = Boolean(params.suppressPageText);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
@@ -6202,6 +6529,7 @@ async function handleDomAction(params) {
     position: normalizeClickPosition(params, "domAction"),
     autoWait,
     autoWaitTimeoutMs,
+    force,
     maxPageTextChars: suppressPageText ? 0 : MAX_PAGE_TEXT_CHARS,
     suppressPageText
   };
@@ -12297,6 +12625,8 @@ function operatorPanicActiveOwners() {
     debugger_attached_tab_count: DURABLE_OWNER_LEDGER.debuggerTabs.length,
     unresolved_debugger_command_timeout_count:
       DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length,
+    resolved_prior_session_debugger_command_timeouts:
+      RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS,
     executed_init_script_effect_unresolved_count:
       DURABLE_OWNER_LEDGER.executedInitScriptEffects.length,
     dialog_policy_count: DURABLE_OWNER_LEDGER.dialogTabs.length,
@@ -12482,6 +12812,26 @@ async function mainFrameDocumentReadback(tabId) {
     url: String(frame?.url || tab?.url || ""),
     status: String(tab?.status || "")
   };
+}
+
+// #1825: the settle signal for a navigation is a COMMITTED DOCUMENT, not a URL
+// delta. A re-navigation to the tab's current URL (the standard way to reset a
+// page to a known state) produces a new document with an unchanged URL, so a
+// url-difference predicate is unsatisfiable and burns the entire wait budget
+// before reporting failure for a navigation that actually happened. Returns
+// null (never throws) when the documentId cannot be read, so the caller can
+// decide fail-closed instead of hanging.
+async function mainFrameDocumentIdOrNull(tabId) {
+  if (!chrome.webNavigation || typeof chrome.webNavigation.getFrame !== "function") {
+    return null;
+  }
+  try {
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 });
+    const documentId = String(frame?.documentId || "").trim();
+    return documentId || null;
+  } catch (_error) {
+    return null;
+  }
 }
 
 async function reloadTabForInitScriptEffectCleanup(tabId) {
@@ -14357,6 +14707,50 @@ async function tabActiveElementState(tabId) {
   }
 }
 
+// #1827: secret-safe page text, digested in-page. Returns the same structural
+// shape as the plain readback (never the text), plus a real SHA-256 of the page
+// text so `before`/`after` comparison proves whether the action changed the page.
+async function tabPageTextDigestState(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return {
+      ...suppressedPageTextState(),
+      available: false,
+      error_code: "CHROME_SCRIPTING_UNAVAILABLE",
+      error_detail: "Chrome scripting API is unavailable; extension is missing scripting permission"
+    };
+  }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: readPageTextDigestInPage,
+      args: [MAX_PAGE_TEXT_CHARS]
+    });
+    const frames = frameExecutionResults(results);
+    const top = frames.find((frame) => frame.frame_id === 0 && frame.result) || frames.find((frame) => frame.result) || null;
+    if (!top || typeof top.result !== "object" || top.result === null) {
+      return {
+        ...suppressedPageTextState(),
+        available: false,
+        error_code: "CHROME_SCRIPTING_EMPTY_RESULT",
+        error_detail: "chrome.scripting.executeScript returned no secret-safe page-text digest"
+      };
+    }
+    return {
+      available: true,
+      readback_source: "secret_safe_in_page_sha256_digest",
+      frame_count: frames.length,
+      ...top.result
+    };
+  } catch (error) {
+    return {
+      ...suppressedPageTextState(),
+      available: false,
+      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
+      error_detail: errorMessage(error)
+    };
+  }
+}
+
 function suppressedPageTextState(maxChars = MAX_PAGE_TEXT_CHARS) {
   return {
     available: true,
@@ -14372,7 +14766,7 @@ function suppressedPageTextState(maxChars = MAX_PAGE_TEXT_CHARS) {
 
 async function tabPageTextState(tabId, suppressPageText = false) {
   if (suppressPageText) {
-    return suppressedPageTextState();
+    return tabPageTextDigestState(tabId);
   }
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     return {
@@ -16026,6 +16420,59 @@ function readPageTextInPage(maxChars) {
   };
 }
 
+// #1827: secret-safe page-text readback. The suppressed variant used to return
+// a CONSTANT object, so its host-side sha256 was identical for every page and
+// every action — an information-free hash that a caller could easily read as
+// "the text did not change". Digest the real text in the page instead: the text
+// never crosses the page boundary, but the digest is a genuine change signal.
+async function readPageTextDigestInPage(maxChars) {
+  const limit = Number.isSafeInteger(maxChars) && maxChars >= 0 ? Math.min(maxChars, 65536) : 4096;
+  const source =
+    document.body && typeof document.body.innerText === "string"
+      ? document.body.innerText
+      : document.documentElement && typeof document.documentElement.innerText === "string"
+        ? document.documentElement.innerText
+        : document.body && typeof document.body.textContent === "string"
+          ? document.body.textContent
+          : document.documentElement && typeof document.documentElement.textContent === "string"
+            ? document.documentElement.textContent
+            : "";
+  const text = String(source || "");
+  const base = {
+    text: null,
+    text_len: Array.from(text).length,
+    text_truncated: false,
+    max_chars: limit,
+    redacted: true,
+    redaction_policy: "target_act_secret_safe_v1",
+    ready_state: String(document.readyState || "")
+  };
+  if (!globalThis.crypto || !globalThis.crypto.subtle || typeof globalThis.crypto.subtle.digest !== "function") {
+    // Fail loud rather than substituting a weaker digest: a caller comparing
+    // digests must never be handed a hash from a different algorithm.
+    return {
+      ...base,
+      text_sha256: null,
+      text_sha256_error:
+        "crypto.subtle.digest is unavailable in this page (SubtleCrypto requires a secure context); no page-text digest could be computed"
+    };
+  }
+  try {
+    const bytes = new TextEncoder().encode(text);
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    const hex = Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    return { ...base, text_sha256: `sha256:${hex}`, text_sha256_error: null };
+  } catch (error) {
+    return {
+      ...base,
+      text_sha256: null,
+      text_sha256_error: `crypto.subtle.digest failed: ${String(error && error.message ? error.message : error)}`
+    };
+  }
+}
+
 function readPageContentInPage(maxBytes) {
   const max = Number.isSafeInteger(maxBytes) && maxBytes >= 0 ? Math.min(maxBytes, 2 * 1024 * 1024) : 2 * 1024 * 1024;
   const html = String(document.documentElement?.outerHTML || "");
@@ -17314,6 +17761,24 @@ async function runBridgeElementCommandInPage(request) {
   }
 
   function twoAnimationFrames() {
+    // #1826 root cause: this inter-sample yield used to be
+    // `setTimeout(finish, 100)` raced against two animation frames. BOTH are
+    // suppressed in a background tab:
+    //   * a hidden tab does not paint, so requestAnimationFrame never fires;
+    //   * Chrome clamps timers in hidden tabs to >= 1s and, once a tab has been
+    //     hidden for ~5 minutes, applies INTENSIVE THROTTLING that aligns
+    //     timer wake-ups to a once-per-MINUTE budget.
+    // So the "100 ms" stability sample cost up to a minute per call on a
+    // long-idle background tab - which is how a plain static text subtree blew
+    // a 120 s client budget while identical calls on tabs opened moments
+    // earlier returned instantly.
+    //
+    // MessageChannel port messages are a task source that the timer-throttling
+    // budget does not govern (the same property React's scheduler relies on),
+    // so they still turn around promptly in a hidden tab. Prefer a real
+    // animation frame when the document is actually visible - that is the
+    // physically correct sample point - and fall back to the port yield
+    // otherwise. `setTimeout` is kept only as a last-resort ceiling.
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -17323,10 +17788,20 @@ async function runBridgeElementCommandInPage(request) {
         done = true;
         resolve();
       };
-      setTimeout(finish, 100);
-      if (typeof requestAnimationFrame === "function") {
+      const visible =
+        typeof document !== "undefined" && document.visibilityState === "visible";
+      if (visible && typeof requestAnimationFrame === "function") {
         requestAnimationFrame(() => requestAnimationFrame(finish));
+        setTimeout(finish, 100);
+        return;
       }
+      if (typeof MessageChannel === "function") {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = finish;
+        channel.port2.postMessage(0);
+        return;
+      }
+      setTimeout(finish, 100);
     });
   }
 
@@ -20139,6 +20614,11 @@ async function performDomActionInPage(request) {
   const resolveOnly = Boolean(request?.resolveOnly);
   const resolveActionability = Boolean(request?.resolveActionability);
   const autoWait = Boolean(request?.autoWait);
+  // #1821: Playwright `force` parity. `force` records the actionability
+  // snapshot but never gates on it, so an element under a transparent
+  // full-viewport overlay (elementFromPoint returns the overlay, a human clicks
+  // straight through) is still reachable through synthetic in-page dispatch.
+  const force = Boolean(request?.force);
   const autoWaitTimeoutMs = Number.isSafeInteger(request?.autoWaitTimeoutMs)
     ? Math.max(50, Math.min(request.autoWaitTimeoutMs, 30000))
     : 2000;
@@ -20156,7 +20636,7 @@ async function performDomActionInPage(request) {
 
   const beforeUrl = String(location.href || "");
   const beforePageText = suppressPageText
-    ? suppressedPageTextLocal(maxPageTextChars)
+    ? await suppressedPageTextDigestLocal(maxPageTextChars)
     : readPageText(maxPageTextChars);
   const resolved = resolveDomActionElement(action, locator);
   if (!resolved.ok) {
@@ -20166,7 +20646,9 @@ async function performDomActionInPage(request) {
   const beforeElement = elementSummary(element);
 
   const bypassActionability = ["dispatch_event", "focus", "blur", "select_text"].includes(action);
-  const deferActionability = autoWait && !bypassActionability;
+  // #1821: `force` defers every actionability judgement to the snapshot recorded
+  // just before dispatch, exactly like `autoWait` defers it to the poll loop.
+  const deferActionability = (autoWait || force) && !bypassActionability;
   if (!bypassActionability && !deferActionability && !isElementEnabled(element)) {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
       matched_count: resolved.matchedCount,
@@ -20184,17 +20666,27 @@ async function performDomActionInPage(request) {
   if (resolveOnly) {
     let autoWaitReadback = null;
     if (resolveActionability && !bypassActionability) {
-      autoWaitReadback = await waitForDomActionability(element, action, autoWaitTimeoutMs);
-      if (!autoWaitReadback.ok) {
+      // #1821: `autoWait` controls WAITING, not gating. Probing once when the
+      // caller asked not to wait keeps the safety check (a real mouse event
+      // dispatched at an occluded point would activate the overlay instead of
+      // the target) while returning the refusal immediately, with the typed
+      // not-actionable code rather than a wait-timeout the caller never asked
+      // for. `force` records the snapshot and never gates.
+      const gateTimeoutMs = autoWait ? autoWaitTimeoutMs : 0;
+      autoWaitReadback = await waitForDomActionability(element, action, gateTimeoutMs);
+      if (!autoWaitReadback.ok && !force) {
         return fail(
-          ERROR_BROWSER_WAIT_TIMEOUT,
-          `domAction ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for ${autoWaitReadback.requirement}; unmet predicates: ${autoWaitReadback.predicate_detail}`,
+          autoWait ? ERROR_BROWSER_WAIT_TIMEOUT : ERROR_ELEMENT_NOT_ACTIONABLE,
+          autoWait
+            ? `domAction ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for ${autoWaitReadback.requirement}; unmet predicates: ${autoWaitReadback.predicate_detail}`
+            : `domAction ${action} refused: ${autoWaitReadback.requirement} not met on a single probe (auto_wait=false, so no wait was performed); unmet predicates: ${autoWaitReadback.predicate_detail}. Retry with auto_wait=true to poll, or force=true to dispatch the event on the resolved node anyway (synthetic, untrusted input)`,
           {
             matched_count: resolved.matchedCount,
             resolved_by: resolved.resolvedBy,
             before_element: beforeElement,
-            auto_wait: true,
+            auto_wait: autoWait,
             auto_wait_readback: autoWaitReadback,
+            forced_actionability_bypass: false,
             source_of_truth: "Element.scrollIntoView({block:nearest,inline:nearest}) + getBoundingClientRect + elementFromPoint"
           }
         );
@@ -20224,6 +20716,7 @@ async function performDomActionInPage(request) {
       resolve_only: true,
       auto_wait: autoWait,
       auto_wait_readback: autoWaitReadback,
+      forced_actionability_bypass: Boolean(force && autoWaitReadback && !autoWaitReadback.ok),
       in_page_before_url: beforeUrl,
       in_page_after_url: String(location.href || ""),
       in_page_title: String(document.title || ""),
@@ -20236,9 +20729,9 @@ async function performDomActionInPage(request) {
   const eventsDispatched = [];
   let actionReadback = {};
   let autoWaitReadback = null;
-  if (autoWait && !bypassActionability) {
-    autoWaitReadback = await waitForDomActionability(element, action, autoWaitTimeoutMs);
-    if (!autoWaitReadback.ok) {
+  if ((autoWait || force) && !bypassActionability) {
+    autoWaitReadback = await waitForDomActionability(element, action, autoWait ? autoWaitTimeoutMs : 0);
+    if (!autoWaitReadback.ok && !force) {
       return fail(
         ERROR_BROWSER_WAIT_TIMEOUT,
         `domAction ${action} auto_wait timed out after ${autoWaitTimeoutMs} ms waiting for ${autoWaitReadback.requirement}; unmet predicates: ${autoWaitReadback.predicate_detail}`,
@@ -20248,12 +20741,29 @@ async function performDomActionInPage(request) {
           before_element: beforeElement,
           auto_wait: true,
           auto_wait_readback: autoWaitReadback,
+          forced_actionability_bypass: false,
           source_of_truth: "Element.scrollIntoView({block:nearest,inline:nearest}) + getBoundingClientRect + elementFromPoint"
         }
       );
     }
+    // #1821: with `force`, an unmet predicate is recorded and overridden, never
+    // fatal. `attached` stays fatal: there is no node to dispatch on.
+    if (force && !autoWaitReadback.attached && !autoWaitReadback.last_actionability?.attached) {
+      return fail(
+        ERROR_ELEMENT_NOT_ACTIONABLE,
+        `domAction ${action} force=true cannot dispatch on a detached node; the resolved element is no longer connected to the document`,
+        {
+          matched_count: resolved.matchedCount,
+          resolved_by: resolved.resolvedBy,
+          before_element: beforeElement,
+          auto_wait: autoWait,
+          auto_wait_readback: autoWaitReadback,
+          forced_actionability_bypass: false
+        }
+      );
+    }
   }
-  if (!bypassActionability && !isElementEnabled(element)) {
+  if (!force && !bypassActionability && !isElementEnabled(element)) {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
@@ -20262,7 +20772,7 @@ async function performDomActionInPage(request) {
       auto_wait_readback: autoWaitReadback
     });
   }
-  if (!bypassActionability && !isElementVisible(element) && action !== "submit") {
+  if (!force && !bypassActionability && !isElementVisible(element) && action !== "submit") {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is not visible/actionable", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
@@ -20308,7 +20818,7 @@ async function performDomActionInPage(request) {
 
   const afterElement = element.isConnected ? elementSummary(element) : null;
   const afterPageText = suppressPageText
-    ? suppressedPageTextLocal(maxPageTextChars)
+    ? await suppressedPageTextDigestLocal(maxPageTextChars)
     : readPageText(maxPageTextChars);
   return {
     ok: true,
@@ -20319,6 +20829,11 @@ async function performDomActionInPage(request) {
     after_element: afterElement,
     auto_wait: autoWait,
     auto_wait_readback: autoWaitReadback,
+    // #1821: an explicit, auditable record that an unmet actionability
+    // predicate was overridden, and that the delivered events were synthetic
+    // in-page dispatch rather than trusted OS/CDP input.
+    forced_actionability_bypass: Boolean(force && autoWaitReadback && !autoWaitReadback.ok),
+    input_trust: force ? "synthetic_dom_dispatch_forced" : "synthetic_dom_dispatch",
     events_dispatched: eventsDispatched,
     action_readback: actionReadback,
     in_page_before_url: beforeUrl,
@@ -20695,6 +21210,24 @@ async function performDomActionInPage(request) {
   }
 
   function twoAnimationFramesLocal() {
+    // #1826 root cause: this inter-sample yield used to be
+    // `setTimeout(finish, 100)` raced against two animation frames. BOTH are
+    // suppressed in a background tab:
+    //   * a hidden tab does not paint, so requestAnimationFrame never fires;
+    //   * Chrome clamps timers in hidden tabs to >= 1s and, once a tab has been
+    //     hidden for ~5 minutes, applies INTENSIVE THROTTLING that aligns
+    //     timer wake-ups to a once-per-MINUTE budget.
+    // So the "100 ms" stability sample cost up to a minute per call on a
+    // long-idle background tab - which is how a plain static text subtree blew
+    // a 120 s client budget while identical calls on tabs opened moments
+    // earlier returned instantly.
+    //
+    // MessageChannel port messages are a task source that the timer-throttling
+    // budget does not govern (the same property React's scheduler relies on),
+    // so they still turn around promptly in a hidden tab. Prefer a real
+    // animation frame when the document is actually visible - that is the
+    // physically correct sample point - and fall back to the port yield
+    // otherwise. `setTimeout` is kept only as a last-resort ceiling.
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -20704,20 +21237,55 @@ async function performDomActionInPage(request) {
         done = true;
         resolve();
       };
-      setTimeout(finish, 100);
-      if (typeof requestAnimationFrame === "function") {
+      const visible =
+        typeof document !== "undefined" && document.visibilityState === "visible";
+      if (visible && typeof requestAnimationFrame === "function") {
         requestAnimationFrame(() => requestAnimationFrame(finish));
+        setTimeout(finish, 100);
+        return;
       }
+      if (typeof MessageChannel === "function") {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = finish;
+        channel.port2.postMessage(0);
+        return;
+      }
+      setTimeout(finish, 100);
     });
   }
 
+  // #1826, same root cause as the stability-sample yield: a bare `setTimeout`
+  // poll interval is clamped to >= 1 s in a hidden tab and aligned to a
+  // once-per-minute budget once the tab has been hidden ~5 minutes, so a 50 ms
+  // poll could overshoot an entire auto-wait budget by a minute. Short waits in
+  // a hidden document are therefore driven by MessageChannel turns (a task
+  // source the throttling budget does not govern) until the real elapsed time
+  // is satisfied; a visible document keeps the ordinary timer.
   function delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    const target = Math.max(0, Number(ms) || 0);
+    const hidden = typeof document !== "undefined" && document.visibilityState !== "visible";
+    if (!hidden || target > 250 || typeof MessageChannel !== "function") {
+      return new Promise((resolve) => setTimeout(resolve, target));
+    }
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        if (Date.now() - started >= target) {
+          channel.port1.onmessage = null;
+          resolve();
+          return;
+        }
+        channel.port2.postMessage(0);
+      };
+      channel.port2.postMessage(0);
+    });
   }
 
   function resolveDomActionElement(actionName, loc) {
     let candidates = [];
     let resolvedBy = "semantic";
+    let pathDiagnostic = null;
     if (loc.selector) {
       resolvedBy = "selector";
       try {
@@ -20727,8 +21295,8 @@ async function performDomActionInPage(request) {
       }
     } else if (loc.elementPath) {
       resolvedBy = "element_path";
-      const byPath = elementByPathLocal(loc.elementPath);
-      candidates = byPath ? [byPath] : [];
+      pathDiagnostic = elementByPathDiagnosticLocal(loc.elementPath);
+      candidates = pathDiagnostic.element ? [pathDiagnostic.element] : [];
     } else if (loc.elementId) {
       resolvedBy = "element_id";
       const id = loc.elementId.startsWith("#") ? loc.elementId.slice(1) : loc.elementId;
@@ -20755,9 +21323,18 @@ async function performDomActionInPage(request) {
     });
 
     if (filtered.length === 0) {
-      return fail(ERROR_ELEMENT_NOT_FOUND, `no DOM element matched ${locatorDebug(loc)}`, {
+      const pathDetail = pathDiagnostic && !pathDiagnostic.element
+        ? `; element path traversal stopped at segment index ${pathDiagnostic.failed_at_segment_index} ` +
+          `(${JSON.stringify(pathDiagnostic.failed_segment)}) of ${JSON.stringify(pathDiagnostic.requested_path)}: ` +
+          `${pathDiagnostic.reason}; deepest resolved node was ${JSON.stringify(pathDiagnostic.resolved_node_description)} ` +
+          `at prefix ${JSON.stringify(pathDiagnostic.resolved_prefix)}`
+        : "";
+      return fail(ERROR_ELEMENT_NOT_FOUND, `no DOM element matched ${locatorDebug(loc)}${pathDetail}`, {
         matched_count: 0,
-        resolved_by: resolvedBy
+        resolved_by: resolvedBy,
+        element_path_diagnostic: pathDiagnostic
+          ? { ...pathDiagnostic, element: undefined }
+          : null
       });
     }
     if (filtered.length > 1) {
@@ -20776,36 +21353,98 @@ async function performDomActionInPage(request) {
   }
 
   function elementByPathLocal(path) {
+    return elementByPathDiagnosticLocal(path).element;
+  }
+
+  // #1822: a bare "element not found" for a path the read plane resolved sends
+  // the caller hunting for a staleness bug that may not exist. Report exactly
+  // which segment failed and what was actually there, so "the DOM moved under
+  // me" is distinguishable from "this path form is unsupported" without
+  // trial-and-error at up to 30 s per attempt.
+  function elementByPathDiagnosticLocal(path) {
+    const diagnostic = {
+      element: null,
+      requested_path: path == null ? null : String(path),
+      failed_at_segment_index: null,
+      failed_segment: null,
+      resolved_prefix: null,
+      resolved_node_description: null,
+      reason: null
+    };
     if (!path) {
-      return null;
+      diagnostic.reason = "empty_path";
+      return diagnostic;
     }
     // Shadow-aware: "s" token re-enters the current element's open shadowRoot.
     const parts = String(path).split(".");
     if (Number(parts[0]) !== 0) {
-      return null;
+      diagnostic.failed_at_segment_index = 0;
+      diagnostic.failed_segment = parts[0];
+      diagnostic.reason = "root_segment_must_be_0_documentElement";
+      return diagnostic;
     }
     let current = document.documentElement;
     let enterShadow = false;
-    for (const raw of parts.slice(1)) {
+    for (let index = 1; index < parts.length; index += 1) {
+      const raw = parts[index];
       if (raw === "s") {
         enterShadow = true;
         continue;
       }
-      const index = Number(raw);
-      if (!current || !Number.isSafeInteger(index) || index < 0) {
-        return null;
+      const childIndex = Number(raw);
+      if (!current || !Number.isSafeInteger(childIndex) || childIndex < 0) {
+        diagnostic.failed_at_segment_index = index;
+        diagnostic.failed_segment = raw;
+        diagnostic.resolved_prefix = parts.slice(0, index).join(".");
+        diagnostic.resolved_node_description = describeNodeForPathLocal(current);
+        diagnostic.reason = current ? "segment_is_not_a_child_index" : "traversal_reached_a_null_node";
+        return diagnostic;
       }
       let scope = current;
       if (enterShadow) {
         if (!current.shadowRoot) {
-          return null;
+          diagnostic.failed_at_segment_index = index;
+          diagnostic.failed_segment = raw;
+          diagnostic.resolved_prefix = parts.slice(0, index).join(".");
+          diagnostic.resolved_node_description = describeNodeForPathLocal(current);
+          diagnostic.reason = "shadow_hop_requested_but_node_has_no_open_shadow_root";
+          return diagnostic;
         }
         scope = current.shadowRoot;
         enterShadow = false;
       }
-      current = scope.children[index] || null;
+      const next = scope.children[childIndex] || null;
+      if (!next) {
+        diagnostic.failed_at_segment_index = index;
+        diagnostic.failed_segment = raw;
+        diagnostic.resolved_prefix = parts.slice(0, index).join(".");
+        diagnostic.resolved_node_description = describeNodeForPathLocal(current);
+        diagnostic.reason = `child_index_out_of_range (scope has ${scope.children.length} element children); the DOM most likely changed after this element id was resolved`;
+        return diagnostic;
+      }
+      current = next;
     }
-    return current instanceof Element ? current : null;
+    if (!(current instanceof Element)) {
+      diagnostic.reason = "path_resolved_to_a_non_element_node";
+      diagnostic.resolved_node_description = describeNodeForPathLocal(current);
+      return diagnostic;
+    }
+    diagnostic.element = current;
+    return diagnostic;
+  }
+
+  function describeNodeForPathLocal(node) {
+    if (!node) {
+      return null;
+    }
+    if (!(node instanceof Element)) {
+      return String(node.nodeName || "unknown-node");
+    }
+    const id = node.id ? `#${node.id}` : "";
+    const cls = node.classList && node.classList.length
+      ? `.${Array.from(node.classList).slice(0, 3).join(".")}`
+      : "";
+    return `${String(node.tagName || "").toLowerCase()}${id}${cls}`;
   }
 
   function deepQueryAllLocal(selector) {
@@ -21934,6 +22573,54 @@ async function performDomActionInPage(request) {
       redacted: true,
       redaction_policy: "target_act_secret_safe_v1"
     };
+  }
+
+  // #1827: secret-safe page text with a REAL digest. The constant-shaped
+  // suppressed payload hashed identically on every page, so before/after
+  // comparison carried no information. Digest the text in the page: the text
+  // never leaves, the digest proves whether the action changed the page.
+  async function suppressedPageTextDigestLocal(maxChars) {
+    // Digest the WHOLE page text, not the max_chars-truncated prefix: a change
+    // beyond the readback cap is still a change, and this value's only job is
+    // to answer "did the page change".
+    const full = String(
+      (document.body && typeof document.body.innerText === "string" && document.body.innerText) ||
+        (document.documentElement && typeof document.documentElement.innerText === "string" && document.documentElement.innerText) ||
+        (document.body && typeof document.body.textContent === "string" && document.body.textContent) ||
+        (document.documentElement && typeof document.documentElement.textContent === "string" && document.documentElement.textContent) ||
+        ""
+    );
+    const readback = { text: full, text_len: Array.from(full).length };
+    const base = {
+      text: null,
+      text_len: readback.text_len,
+      text_truncated: false,
+      max_chars: maxChars,
+      redacted: true,
+      redaction_policy: "target_act_secret_safe_v1"
+    };
+    if (!globalThis.crypto || !globalThis.crypto.subtle || typeof globalThis.crypto.subtle.digest !== "function") {
+      return {
+        ...base,
+        text_sha256: null,
+        text_sha256_error:
+          "crypto.subtle.digest is unavailable in this page (SubtleCrypto requires a secure context); no page-text digest could be computed"
+      };
+    }
+    try {
+      const bytes = new TextEncoder().encode(readback.text);
+      const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+      const hex = Array.from(new Uint8Array(digest))
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      return { ...base, text_sha256: `sha256:${hex}`, text_sha256_error: null };
+    } catch (error) {
+      return {
+        ...base,
+        text_sha256: null,
+        text_sha256_error: `crypto.subtle.digest failed: ${errorMessageLocal(error)}`
+      };
+    }
   }
 
   function locatorDebug(loc) {

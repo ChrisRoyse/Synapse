@@ -345,6 +345,90 @@ struct HistoryInspection {
     expiration_unix_ms: Vec<Option<u64>>,
 }
 
+/// Windows caps the Action Center *history* `ExpirationTime` at
+/// `arrival + 3 days` (259_200_000 ms) regardless of the deadline requested at
+/// `ToastNotifier.Show`. Real-host FSV evidence (#1803, 2026-07-23): a 7-day
+/// ordinary-TTL escalation Shown at T had its stored history expiration set to
+/// `arrival + 259_200_000` exactly — the observed value was
+/// `failed_at - 18ms + 259_200_000`, where `arrival` is Windows' internal
+/// arrival instant a few milliseconds after Show. MSDN documents the same
+/// 3-day maximum Action Center retention, and Microsoft has historically
+/// clamped `ExpirationTime` to it
+/// (`learn.microsoft.com/uwp/api/windows.ui.notifications.toastnotification.expirationtime`).
+/// Below the cap Windows persists the requested deadline verbatim (only a
+/// positive sub-millisecond FILETIME residue appears; see #1762 / 4f3d1f77).
+/// This is the platform contract the Tier-0 delivery/removal verifier
+/// reconciles against so ordinary-TTL (medium/low, 7-day) toasts stop reporting
+/// NOTIFY_DELIVERY_UNVERIFIED and looping `removal_failed` forever.
+///
+/// The cap is treated as version-dependent: it is used only to locate the
+/// implied physical arrival, which is then bounded by real causality
+/// (`item created <= arrival <= now`). If a future Windows build changed the
+/// cap, the implied arrival would fall outside that window and the row would be
+/// fail-closed rejected (never silently accepted), and the structured
+/// `platform_cap_applied` telemetry makes the change attributable.
+pub(crate) const WINDOWS_ACTION_CENTER_MAX_HISTORY_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+
+/// Platform-corrected expected Action Center expiration (readback-anchored).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CorrectedExpiration {
+    /// The expiration the physical Action Center row is required to equal. This
+    /// is the value Windows actually stored when the retention cap was applied
+    /// (readback-anchored), or the exact requested deadline otherwise.
+    pub expected_unix_ms: u64,
+    /// True when Windows truncated the requested deadline to the retention cap.
+    pub platform_cap_applied: bool,
+}
+
+/// Reconcile a requested escalation deadline against the whole-millisecond
+/// expiration Windows actually persisted in Action Center history.
+///
+/// Returns the platform-corrected expected expiration only when the stored
+/// value is provably one of:
+///   * the exact requested deadline (no cap applied), or
+///   * `arrival + WINDOWS_ACTION_CENTER_MAX_HISTORY_MS` for a physically real
+///     arrival in `[arrival_lower_bound_unix_ms, now_unix_ms]` — i.e. the
+///     retention cap was applied at an arrival that cannot precede the item's
+///     creation nor postdate the observation clock.
+///
+/// Any other value returns `None`: the row is a genuine mismatch and must be
+/// fail-closed quarantined, never deleted or attributed to this escalation.
+/// This is not a tolerance window — the accepted set is `{requested}` plus the
+/// single causal cap value; the `stored < requested` and bracketed-arrival
+/// guards keep it exact. `stored_unix_ms` must already be the whole-millisecond
+/// value floored by `read_expiration_unix_ms` (preserving the 4f3d1f77 sub-ms
+/// floor before this comparison).
+pub(crate) fn platform_corrected_expiration(
+    requested_unix_ms: u64,
+    stored_unix_ms: u64,
+    arrival_lower_bound_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Option<CorrectedExpiration> {
+    if stored_unix_ms == requested_unix_ms {
+        return Some(CorrectedExpiration {
+            expected_unix_ms: requested_unix_ms,
+            platform_cap_applied: false,
+        });
+    }
+    // Windows only ever truncates the requested deadline downward; a stored
+    // value larger than requested can never be a legitimate retention cap.
+    if stored_unix_ms > requested_unix_ms {
+        return None;
+    }
+    let implied_arrival_unix_ms =
+        stored_unix_ms.checked_sub(WINDOWS_ACTION_CENTER_MAX_HISTORY_MS)?;
+    if implied_arrival_unix_ms >= arrival_lower_bound_unix_ms
+        && implied_arrival_unix_ms <= now_unix_ms
+    {
+        Some(CorrectedExpiration {
+            expected_unix_ms: stored_unix_ms,
+            platform_cap_applied: true,
+        })
+    } else {
+        None
+    }
+}
+
 pub(crate) fn toast_text_char_allowed(character: char) -> bool {
     let scalar = character as u32;
     matches!(character, '\n' | '\r' | '\t')
@@ -628,13 +712,14 @@ fn is_escalation_toast_tag(tag: &str) -> bool {
 #[cfg(windows)]
 mod windows_toast {
     use super::{
-        HISTORY_VERIFY_POLL_MS, HISTORY_VERIFY_TIMEOUT_MS, HistoryInspection,
+        CorrectedExpiration, HISTORY_VERIFY_POLL_MS, HISTORY_VERIFY_TIMEOUT_MS, HistoryInspection,
         MAX_FROZEN_TOAST_XML_BYTES, NotifyFailure, NotifyHumanParams, PreparedToastPayload,
         SYNAPSE_AUMID, SYNAPSE_ESCALATION_TOAST_GROUP, SYNAPSE_NOTIFY_DISPLAY_NAME,
         TOAST_PAYLOAD_SCHEMA_VERSION, TOAST_RENDERER_VERSION_CURRENT, TOAST_RENDERER_VERSION_V1,
         ToastAction, ToastActivationCallback, ToastCleanupReport, ToastOutcome,
         ToastPreShowAuthorizer, ToastRemovalOutcome, error_codes, is_escalation_toast_tag,
-        toast_intent_digest, toast_payload_digest, toast_xml_with_actions,
+        platform_corrected_expiration, toast_intent_digest, toast_payload_digest,
+        toast_xml_with_actions,
     };
     use std::{
         collections::{BTreeSet, VecDeque},
@@ -824,6 +909,7 @@ mod windows_toast {
         group: String,
         expected_payload_sha256: Option<String>,
         expected_expiration_unix_ms: Option<u64>,
+        arrival_lower_bound_unix_ms: Option<u64>,
         allow_reserved_orphan: bool,
         reply: tokio::sync::oneshot::Sender<ToastRemovalOutcome>,
     }
@@ -944,6 +1030,7 @@ mod windows_toast {
                                     &job.group,
                                     job.expected_payload_sha256.as_deref(),
                                     job.expected_expiration_unix_ms,
+                                    job.arrival_lower_bound_unix_ms,
                                     job.allow_reserved_orphan,
                                 ),
                             };
@@ -1101,6 +1188,7 @@ mod windows_toast {
         group: String,
         expected_payload_sha256: String,
         expected_expiration_unix_ms: Option<u64>,
+        arrival_lower_bound_unix_ms: Option<u64>,
     ) -> ToastRemovalOutcome {
         let sender = match NOTIFY_WORKER.get_or_init(spawn_notify_worker).as_ref() {
             Ok(sender) => sender,
@@ -1121,6 +1209,7 @@ mod windows_toast {
                 group: group.clone(),
                 expected_payload_sha256: Some(expected_payload_sha256),
                 expected_expiration_unix_ms,
+                arrival_lower_bound_unix_ms,
                 allow_reserved_orphan: false,
                 reply: reply_tx,
             }),
@@ -1625,7 +1714,7 @@ mod windows_toast {
         };
         for tag in remove_tags {
             let outcome =
-                remove_toast_blocking(&tag, SYNAPSE_ESCALATION_TOAST_GROUP, None, None, true);
+                remove_toast_blocking(&tag, SYNAPSE_ESCALATION_TOAST_GROUP, None, None, None, true);
             if outcome.removed {
                 report.removed += 1;
             } else if outcome.already_absent {
@@ -1666,6 +1755,7 @@ mod windows_toast {
         group: &str,
         expected_payload_sha256: Option<&str>,
         expected_expiration_unix_ms: Option<u64>,
+        arrival_lower_bound_unix_ms: Option<u64>,
         allow_reserved_orphan: bool,
     ) -> ToastRemovalOutcome {
         if let Err(error) = ensure_aumid_registered() {
@@ -1718,18 +1808,64 @@ mod windows_toast {
                     ),
                 );
             }
-            Some(_) if before.expiration_unix_ms[0] != expected_expiration_unix_ms => {
-                return removal_precondition_failure(
-                    tag,
-                    group,
-                    before.count,
-                    format!(
-                        "refusing toast removal because the physical expiration is not the durable escalation expiration: tag={tag} group={group} expected_expiration_unix_ms={expected_expiration_unix_ms:?} actual_expiration_unix_ms={:?}",
-                        before.expiration_unix_ms[0]
-                    ),
-                );
+            Some(_) => {
+                // Reconcile the physical expiration against the Windows Action
+                // Center retention cap before permitting removal. Ordinary-TTL
+                // (7-day) escalations are stored at `arrival + 3 days`, never at
+                // the durable deadline (#1803); requiring exact equality left
+                // every acked ordinary escalation looping `removal_failed`
+                // forever. The tag/group/AUMID/payload identity guards above are
+                // unchanged; this only corrects the expiration contract.
+                match (expected_expiration_unix_ms, before.expiration_unix_ms[0]) {
+                    (None, _) => {}
+                    (Some(expected), Some(stored)) => {
+                        let corrected = match arrival_lower_bound_unix_ms {
+                            Some(arrival_lower_bound_unix_ms) => platform_corrected_expiration(
+                                expected,
+                                stored,
+                                arrival_lower_bound_unix_ms,
+                                current_unix_ms_for_cap_bound(),
+                            ),
+                            None => (stored == expected).then_some(CorrectedExpiration {
+                                expected_unix_ms: expected,
+                                platform_cap_applied: false,
+                            }),
+                        };
+                        match corrected {
+                            Some(corrected) if corrected.platform_cap_applied => tracing::info!(
+                                code = "NOTIFY_HISTORY_EXPIRATION_PLATFORM_CAP_RECONCILED",
+                                tag,
+                                group,
+                                requested_expiration = expected,
+                                stored_expiration = stored,
+                                platform_cap_applied = true,
+                                "readback=Action Center reconciled a Windows retention-cap expiration at the Tier-0 removal precondition; the physically-present capped toast will be removed without weakening tag/group/payload identity"
+                            ),
+                            Some(_) => {}
+                            None => {
+                                return removal_precondition_failure(
+                                    tag,
+                                    group,
+                                    before.count,
+                                    format!(
+                                        "refusing toast removal because the physical expiration is neither the durable escalation deadline nor a valid Action Center retention cap: tag={tag} group={group} expected_expiration_unix_ms={expected_expiration_unix_ms:?} actual_expiration_unix_ms={stored:?}"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    (Some(_), None) => {
+                        return removal_precondition_failure(
+                            tag,
+                            group,
+                            before.count,
+                            format!(
+                                "refusing toast removal because the physical row carries no expiration but the durable escalation requires one: tag={tag} group={group} expected_expiration_unix_ms={expected_expiration_unix_ms:?}"
+                            ),
+                        );
+                    }
+                }
             }
-            Some(_) => {}
             None if allow_reserved_orphan
                 && group == SYNAPSE_ESCALATION_TOAST_GROUP
                 && is_escalation_toast_tag(tag) => {}
@@ -2076,6 +2212,7 @@ mod windows_toast {
         inspection: &HistoryInspection,
         expected_payload_sha256: &str,
         expected_expiration_unix_ms: Option<u64>,
+        arrival_lower_bound_unix_ms: Option<u64>,
         tag: &str,
         group: &str,
         operation: &str,
@@ -2103,16 +2240,76 @@ mod windows_toast {
                 ),
             ));
         }
-        if inspection.expiration_unix_ms[0] != expected_expiration_unix_ms {
-            return Err(NotifyFailure::new(
-                error_codes::NOTIFY_DELIVERY_UNVERIFIED,
-                format!(
-                    "{operation} found an expiration mismatch for tag={tag} group={group}; expected_expiration_unix_ms={expected_expiration_unix_ms:?} actual_expiration_unix_ms={:?}",
-                    inspection.expiration_unix_ms[0]
-                ),
-            ));
+        match (
+            expected_expiration_unix_ms,
+            inspection.expiration_unix_ms[0],
+        ) {
+            // No expiration contract (internal, non-escalation toasts): the
+            // physical row must likewise carry no expiration.
+            (None, None) => {}
+            (Some(expected), Some(stored)) => {
+                // Reconcile against the Windows Action Center retention cap.
+                // Without an arrival window (dedupe path) only the exact
+                // requested deadline is accepted — the historical behavior.
+                let corrected = match arrival_lower_bound_unix_ms {
+                    Some(arrival_lower_bound_unix_ms) => {
+                        let now_unix_ms = current_unix_ms_for_cap_bound();
+                        platform_corrected_expiration(
+                            expected,
+                            stored,
+                            arrival_lower_bound_unix_ms,
+                            now_unix_ms,
+                        )
+                    }
+                    None => (stored == expected).then_some(CorrectedExpiration {
+                        expected_unix_ms: expected,
+                        platform_cap_applied: false,
+                    }),
+                };
+                match corrected {
+                    Some(corrected) if corrected.platform_cap_applied => tracing::info!(
+                        code = "NOTIFY_HISTORY_EXPIRATION_PLATFORM_CAP",
+                        operation,
+                        tag,
+                        group,
+                        requested_expiration = expected,
+                        stored_expiration = stored,
+                        platform_cap_applied = true,
+                        "readback=Action Center Windows truncated the requested Tier-0 expiration to its retention cap; anchoring the verified expiration to the physically-stored value without weakening tag/group/payload identity"
+                    ),
+                    Some(_) => {}
+                    None => {
+                        return Err(NotifyFailure::new(
+                            error_codes::NOTIFY_DELIVERY_UNVERIFIED,
+                            format!(
+                                "{operation} found an expiration mismatch for tag={tag} group={group}; expected_expiration_unix_ms={expected_expiration_unix_ms:?} actual_expiration_unix_ms={stored:?} (not the requested deadline nor a valid Action Center retention cap)"
+                            ),
+                        ));
+                    }
+                }
+            }
+            (expected, actual) => {
+                return Err(NotifyFailure::new(
+                    error_codes::NOTIFY_DELIVERY_UNVERIFIED,
+                    format!(
+                        "{operation} found an expiration mismatch for tag={tag} group={group}; expected_expiration_unix_ms={expected:?} actual_expiration_unix_ms={actual:?}"
+                    ),
+                ));
+            }
         }
         Ok(())
+    }
+
+    /// Best-effort wall clock for retention-cap arrival bounding. A clock that
+    /// precedes the Unix epoch yields `u64::MAX`, which keeps the
+    /// `implied_arrival <= now` guard permissive on the upper bound only (the
+    /// fail-closed lower bound `arrival >= item_created` is unaffected).
+    fn current_unix_ms_for_cap_bound() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(u64::MAX)
     }
 
     /// Runs on the dedicated `synapse-notify` COM worker thread only.
@@ -2167,6 +2364,10 @@ mod windows_toast {
                     &existing,
                     &prepared.payload_sha256,
                     not_after_unix_ms,
+                    // A pre-existing dedupe row was not shown by this call, so
+                    // there is no fresh arrival to bound; require the exact
+                    // requested deadline (escalation Tier-0 never dedupes).
+                    None,
                     tag,
                     group,
                     "toast deduplication",
@@ -2292,6 +2493,17 @@ mod windows_toast {
             return Ok(Some(outcome));
         }
 
+        // Sampled immediately before the side effect: the physical Action
+        // Center arrival cannot precede this instant, so it is the fail-closed
+        // lower bound for reconciling any Windows retention-cap truncation of
+        // the requested expiration in the post-Show readback below. A clock
+        // failure collapses it to 0 (the most conservative lower bound).
+        let show_arrival_lower_bound_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+
         notifier.Show(&toast).map_err(|error| {
             NotifyFailure::new(
                 error_codes::NOTIFY_SHOW_FAILED,
@@ -2315,6 +2527,7 @@ mod windows_toast {
                     &inspection,
                     &prepared.payload_sha256,
                     not_after_unix_ms,
+                    Some(show_arrival_lower_bound_unix_ms),
                     tag,
                     group,
                     "post-Show delivery verification",
@@ -2463,6 +2676,7 @@ async fn remove_toast_for_platform(
     group: String,
     _expected_payload_sha256: String,
     _expected_expiration_unix_ms: Option<u64>,
+    _arrival_lower_bound_unix_ms: Option<u64>,
 ) -> ToastRemovalOutcome {
     ToastRemovalOutcome::unsupported(tag, group)
 }
@@ -2531,12 +2745,14 @@ async fn remove_toast_for_platform(
     group: String,
     expected_payload_sha256: String,
     expected_expiration_unix_ms: Option<u64>,
+    arrival_lower_bound_unix_ms: Option<u64>,
 ) -> ToastRemovalOutcome {
     windows_toast::remove_toast(
         tag,
         group,
         expected_payload_sha256,
         expected_expiration_unix_ms,
+        arrival_lower_bound_unix_ms,
     )
     .await
 }
@@ -2563,19 +2779,31 @@ pub(crate) async fn remove_internal_toast(
     tag: String,
     expected_payload_sha256: String,
 ) -> ToastRemovalOutcome {
-    remove_internal_toast_in_group(tag, SYNAPSE_TOAST_GROUP, expected_payload_sha256, None).await
+    remove_internal_toast_in_group(
+        tag,
+        SYNAPSE_TOAST_GROUP,
+        expected_payload_sha256,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn remove_internal_escalation_toast(
     tag: String,
     expected_payload_sha256: String,
     expected_expiration_unix_ms: u64,
+    arrival_lower_bound_unix_ms: u64,
 ) -> ToastRemovalOutcome {
     remove_internal_toast_in_group(
         tag,
         SYNAPSE_ESCALATION_TOAST_GROUP,
         expected_payload_sha256,
         Some(expected_expiration_unix_ms),
+        // The escalation item's creation instant: the physical toast arrival
+        // cannot precede it, so it is the fail-closed lower bound for
+        // reconciling a Windows Action Center retention-cap expiration.
+        Some(arrival_lower_bound_unix_ms),
     )
     .await
 }
@@ -2585,12 +2813,14 @@ async fn remove_internal_toast_in_group(
     group: &str,
     expected_payload_sha256: String,
     expected_expiration_unix_ms: Option<u64>,
+    arrival_lower_bound_unix_ms: Option<u64>,
 ) -> ToastRemovalOutcome {
     let outcome = remove_toast_for_platform(
         tag.clone(),
         group.to_owned(),
         expected_payload_sha256.clone(),
         expected_expiration_unix_ms,
+        arrival_lower_bound_unix_ms,
     )
     .await;
     tracing::info!(
@@ -2599,6 +2829,7 @@ async fn remove_internal_toast_in_group(
         group,
         expected_payload_sha256 = %expected_payload_sha256,
         expected_expiration_unix_ms,
+        arrival_lower_bound_unix_ms,
         status = %outcome.status,
         removed = outcome.removed,
         already_absent = outcome.already_absent,

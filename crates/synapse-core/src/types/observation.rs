@@ -486,6 +486,41 @@ pub struct OcrResult {
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspected_injection: Vec<SuspectedInjectionAnnotation>,
+    /// #1823: what was *physically* captured, when the capture surface is a
+    /// browser window whose rendered content depends on which tab is active.
+    /// Present only for browser-window OCR so a caller can detect programmatically
+    /// that the pixels came from a specific tab rather than assume they belong to
+    /// whatever target the session bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_target: Option<OcrCapturedTarget>,
+}
+
+/// Physical provenance of a browser-window OCR capture (#1823).
+///
+/// Window capture (WGC) renders only the tab that is currently active in the
+/// window, so per-tab OCR of a background tab is impossible by construction.
+/// This records the tab that actually produced the pixels, plus the session's
+/// bound tab when there is one, so cross-tab contamination is always visible in
+/// the response instead of being silently plausible.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OcrCapturedTarget {
+    /// Browser window HWND the pixels were captured from.
+    pub window_hwnd: i64,
+    /// CDP/bridge target id of the tab rendered in that window at capture time.
+    pub captured_cdp_target_id: String,
+    /// URL of the tab rendered in that window at capture time.
+    pub captured_url: String,
+    /// Title of the tab rendered in that window at capture time.
+    pub captured_title: String,
+    /// The MCP session's bound CDP tab, when the session had one bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_bound_cdp_target_id: Option<String>,
+    /// True when the captured tab is the session's bound tab. Always true for a
+    /// successful read: a mismatch fails closed with `OCR_TARGET_NOT_FOREGROUND`.
+    pub matches_session_target: bool,
+    /// How the captured tab identity was established.
+    pub readback_source: String,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]

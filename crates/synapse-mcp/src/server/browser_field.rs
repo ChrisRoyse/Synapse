@@ -924,6 +924,9 @@ impl SynapseService {
                 wait_timeout_ms,
                 auto_wait: false,
                 auto_wait_timeout_ms: 0,
+                // browser_fill_form never bypasses actionability: a form field
+                // that is not actionable is a real failure the caller must see.
+                force: false,
                 suppress_page_text: false,
             },
         )

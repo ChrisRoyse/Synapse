@@ -41,6 +41,12 @@ pub const DETECTION_MODEL_INFER_FAILED: &str = "DETECTION_MODEL_INFER_FAILED";
 pub const DETECTION_NO_FRAME: &str = "DETECTION_NO_FRAME";
 pub const OCR_NO_TEXT: &str = "OCR_NO_TEXT";
 pub const OCR_BACKEND_UNAVAILABLE: &str = "OCR_BACKEND_UNAVAILABLE";
+/// #1823: the MCP session is bound to a specific browser tab, but window
+/// capture (WGC) can only observe whichever tab is currently rendered in that
+/// window. Returning OCR of the rendered tab under a different tab's binding is
+/// confidently-wrong perception, so the read fails closed with this code naming
+/// both the bound tab and the tab actually rendered.
+pub const OCR_TARGET_NOT_FOREGROUND: &str = "OCR_TARGET_NOT_FOREGROUND";
 // Per-agent active target (epic #720): each MCP session can bind its own window/CDP
 // target so observe/find/read_text perceive it without stealing the global foreground.
 pub const TARGET_WINDOW_NOT_FOUND: &str = "TARGET_WINDOW_NOT_FOUND";

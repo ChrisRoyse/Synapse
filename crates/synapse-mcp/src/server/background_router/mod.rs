@@ -254,9 +254,31 @@ pub struct TargetActParams {
     #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
     /// Browser DOM action / delegated CDP field action: opt in to polling
-    /// actionability before dispatch. Default false preserves existing behavior.
+    /// actionability before dispatch. `false` (the default) means *do not wait
+    /// and do not poll*: actionability is probed exactly once and an unmet
+    /// predicate fails immediately with `CHROME_DOM_ELEMENT_NOT_ACTIONABLE`
+    /// naming the predicate, instead of burning the auto-wait budget (#1821).
     #[serde(default)]
     pub auto_wait: bool,
+    /// Playwright `locator.click({ force: true })` parity (#1821): dispatch even
+    /// when an actionability predicate is unmet — the case that matters is
+    /// `receives_events` returning a false negative because a transparent
+    /// full-viewport overlay (consent banner, chat widget, A/B mount point,
+    /// half-finished framework migration) sits over an element a human clicks
+    /// straight through.
+    ///
+    /// A real OS/CDP mouse event cannot bypass occlusion — by construction it
+    /// lands on whatever is painted on top — so `force` never silently degrades
+    /// a trusted click into one that hits the overlay. Instead it routes the
+    /// action to the synthetic in-page DOM dispatch lane, which delivers the
+    /// event sequence directly to the resolved node, and the readback reports
+    /// `forced_actionability_bypass: true` plus the full actionability snapshot
+    /// that was overridden so the trust downgrade is explicit and auditable.
+    ///
+    /// Rejected for coordinate clicks: with no resolved element there is nothing
+    /// to dispatch on and the request is a caller error, not a forceable action.
+    #[serde(default)]
+    pub force: bool,
     /// Browser action output mode for secret-producing pages. When true,
     /// Synapse suppresses page-text collection in the Chrome bridge and returns
     /// only structural state plus hashes/lengths for any redacted scalar fields.
@@ -2573,6 +2595,14 @@ impl SynapseService {
             }
             "set_selection" => target_act_set_selection(self, &params, &request_context).await?,
             action @ ("click" | "dblclick") => {
+                if params.force && target_act_coordinate(&params)?.is_some() {
+                    return Err(mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!(
+                            "target_act verb={action} force=true requires an element locator (element_id/selector/role/name): force bypasses element actionability by dispatching the event on the resolved node, and a coordinate click has no resolved node to dispatch on. Remediation: resolve the element with browser_dom operation=locate and pass its element_id, or drop force for a coordinate click."
+                        ),
+                    ));
+                }
                 if target_act_coordinate(&params)?.is_some() {
                     if target_act_has_any_locator(&params) {
                         return Err(mcp_error(
@@ -5633,6 +5663,7 @@ async fn target_act_browser_dom_action(
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
+        "force": params.force,
         "secret_safe": params.secret_safe,
         "required_foreground": false,
     });
@@ -5695,6 +5726,7 @@ async fn target_act_browser_dom_action(
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
+        "force": params.force,
         "secret_safe": params.secret_safe,
         "required_foreground": false,
     });
@@ -5737,6 +5769,7 @@ async fn target_act_browser_dom_action(
             wait_timeout_ms,
             auto_wait: params.auto_wait,
             auto_wait_timeout_ms: params.auto_wait_timeout_ms,
+            force: params.force,
             suppress_page_text: params.secret_safe,
         },
     )
@@ -6559,6 +6592,17 @@ async fn target_act_dom_locator_pointer(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     let session_id = target_act_session_id(request_context, bridge_action)?;
+    // #1821: `force` means "dispatch even though a predicate is unmet". A real
+    // trusted mouse event physically cannot do that — it lands on whatever is
+    // painted at the action point — so the only honest implementation is the
+    // synthetic in-page DOM dispatch lane, which delivers the event sequence to
+    // the resolved node itself. Route there before the raw-CDP / bridge
+    // real-mouse lanes are considered, rather than letting a "forced" click
+    // silently activate an overlay.
+    if params.force {
+        return target_act_browser_dom_action(service, fallback_action, params, request_context)
+            .await;
+    }
     let Some(target) = service.session_target(Some(&session_id))? else {
         return target_act_browser_dom_action(service, fallback_action, params, request_context)
             .await;
@@ -8340,7 +8384,10 @@ fn target_act_secret_safe_sanitize_value(
             let mut out = Map::new();
             for (key, child) in fields {
                 let child_path = format!("{path}.{}", target_act_secret_safe_path_segment(key));
-                if target_act_secret_safe_redact_key(key) {
+                if target_act_secret_safe_redact_key(key)
+                    && !target_act_secret_safe_already_redacted(child)
+                    && !child.is_null()
+                {
                     redactions.push(child_path);
                     out.insert(key.clone(), target_act_secret_safe_redacted_scalar(child)?);
                 } else {
@@ -8350,6 +8397,7 @@ fn target_act_secret_safe_sanitize_value(
                     );
                 }
             }
+            target_act_secret_safe_annotate_changed(&mut out);
             Ok(Value::Object(out))
         }
         Value::Array(items) => items
@@ -8368,8 +8416,61 @@ fn target_act_secret_safe_sanitize_value(
     }
 }
 
+/// #1827: the Chrome bridge already emits secret-safe structures for suppressed
+/// page text — `{redacted: true, text: null, text_len, text_sha256, ...}`.
+/// Blob-hashing those a second time destroys the very fields that let a caller
+/// verify an action's effect (and the outer hash is then a hash of a hash).
+/// Recurse into them instead; the payload already contains no content.
+fn target_act_secret_safe_already_redacted(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("redacted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// #1827: structural readback fields are never content and must always survive
+/// `secret_safe`. Without this, `in_page_ready_state` ("complete"),
+/// `matched_count`, `resolved_by`, geometry, and the actionability predicates
+/// were hashed purely because their key contained `in_page` or ended in
+/// `_text`/`_value`, leaving the caller no way to verify the action's effect.
+fn target_act_secret_safe_structural_key(lower: &str) -> bool {
+    matches!(
+        lower,
+        "ready_state"
+            | "in_page_ready_state"
+            | "matched_count"
+            | "resolved_by"
+            | "visible"
+            | "enabled"
+            | "attached"
+            | "stable"
+            | "editable"
+            | "receives_events"
+            | "action_ready"
+            | "editable_action_ready"
+            | "requirement"
+            | "predicate"
+            | "predicate_detail"
+            | "input_trust"
+            | "forced_actionability_bypass"
+            | "auto_wait"
+            | "text_truncated"
+            | "max_chars"
+            | "available"
+            | "redacted"
+            | "redaction_policy"
+            | "readback_source"
+            | "original_type"
+            | "changed"
+    )
+}
+
 fn target_act_secret_safe_redact_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
+    if target_act_secret_safe_structural_key(&lower) {
+        return false;
+    }
     if lower.ends_with("_len")
         || lower.ends_with("_length")
         || lower.ends_with("_sha256")
@@ -8463,6 +8564,54 @@ fn target_act_secret_safe_redacted_scalar(value: &Value) -> Result<Value, ErrorD
         "sha256": target_act_secret_safe_sha256(&encoded),
         "redaction_policy": TARGET_ACT_SECRET_SAFE_REDACTION_POLICY,
     }))
+}
+
+/// #1827: give every redacted `after_*` field a redaction-safe change signal.
+///
+/// The digests are already computed; comparing the `before_*` sibling to the
+/// `after_*` sibling answers "did this action have an effect" without revealing
+/// a single character of content — the exact question that previously forced a
+/// second round-trip on every audited action.
+fn target_act_secret_safe_annotate_changed(object: &mut Map<String, Value>) {
+    const PREFIX_PAIRS: [(&str, &str); 2] = [("before_", "after_"), ("in_page_before_", "in_page_after_")];
+    let mut updates: Vec<(String, bool)> = Vec::new();
+    for (key, after) in object.iter() {
+        let Some((before_prefix, suffix)) = PREFIX_PAIRS.iter().find_map(|(before, after_prefix)| {
+            key.strip_prefix(after_prefix)
+                .map(|suffix| (*before, suffix.to_owned()))
+        }) else {
+            continue;
+        };
+        let before_key = format!("{before_prefix}{suffix}");
+        let Some(before) = object.get(&before_key) else {
+            continue;
+        };
+        // Only meaningful when the comparison is actually decidable: two
+        // self-describing digests, or two blob-redacted scalars. A missing or
+        // errored digest must not be reported as "unchanged".
+        let comparable = target_act_secret_safe_comparable_digest(before);
+        let after_digest = target_act_secret_safe_comparable_digest(after);
+        if let (Some(before_digest), Some(after_digest)) = (comparable, after_digest) {
+            updates.push((key.clone(), before_digest != after_digest));
+        }
+    }
+    for (key, changed) in updates {
+        if let Some(Value::Object(entry)) = object.get_mut(&key) {
+            entry.insert("changed".to_owned(), Value::Bool(changed));
+        }
+    }
+}
+
+/// The digest that identifies a redacted field's content, when one exists.
+/// `text_sha256` is the in-page digest of real page text (#1827); `sha256` is
+/// the host-side blob digest of a redacted scalar. Anything else (including a
+/// digest the page could not compute) is not comparable.
+fn target_act_secret_safe_comparable_digest(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    object
+        .get("text_sha256")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("sha256").and_then(Value::as_str))
 }
 
 fn target_act_secret_safe_sha256(bytes: &[u8]) -> String {
@@ -8679,12 +8828,133 @@ async fn target_act_key_press(
     }
     let verb = params.verb.as_str();
     let keys = target_act_key_chord_keys(params, verb)?;
+    // #1824: a background tab reached through the debugger-free Chrome bridge
+    // has no CDP endpoint, so act_press had no route at all and failed with
+    // A11Y_CDP_UNREACHABLE - while `click` on the identical target dispatched
+    // fine. An agent could therefore open a modal it had no way to leave.
+    // Route keyboard input through the same bridge, reporting the input-trust
+    // downgrade explicitly rather than implying trusted OS input.
+    #[cfg(windows)]
+    if let Some(result) =
+        target_act_bridge_key_dispatch(service, params, request_context, &keys, verb).await?
+    {
+        return Ok(result);
+    }
     let press_params = target_act_press_params(keys, params.wait_timeout_ms, verb)?;
     ensure_target_act_operator_panic_boundary("key_before_input_delivery")?;
     let response = service
         .act_press(Parameters(press_params), request_context.clone())
         .await;
     target_act_delegate_response("act_press", response)
+}
+
+/// Deliver `verb=key`/`verb=press` key input to a bridge-only background browser
+/// tab (#1824).
+///
+/// Returns `Ok(None)` when this is not a bridge-only CDP target - a raw-CDP
+/// endpoint or a native window target keeps the existing trusted `act_press`
+/// path, which is strictly better input. Only the case that previously had no
+/// route at all is served here.
+#[cfg(windows)]
+async fn target_act_bridge_key_dispatch(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+    keys: &[String],
+    verb: &str,
+) -> Result<Option<(&'static str, bool, &'static str, Value)>, ErrorData> {
+    let session_id = target_act_session_id(request_context, verb)?;
+    let Some(SessionTarget::Cdp {
+        window_hwnd,
+        cdp_target_id,
+    }) = service.session_target(Some(&session_id))?
+    else {
+        return Ok(None);
+    };
+    if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
+        // A raw-CDP endpoint exists: Input.dispatchKeyEvent delivers TRUSTED key
+        // input, which is strictly better. Never downgrade it.
+        return Ok(None);
+    }
+    let target = SessionTarget::Cdp {
+        window_hwnd,
+        cdp_target_id: cdp_target_id.clone(),
+    };
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": verb,
+        "lane": "chrome_debugger_bridge.keyDispatch",
+        "window_hwnd": window_hwnd,
+        "cdp_target_id": &cdp_target_id,
+        "keys": keys,
+        "real_trusted_input": false,
+        "input_trust": "synthetic_dom_dispatch",
+        "required_foreground": false,
+        "secret_safe": params.secret_safe,
+    });
+    if let Err(error) =
+        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+    {
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok(Some((
+            "chrome_debugger_bridge.keyDispatch",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        )));
+    }
+    service.audit_action_started_with_details_for_session(
+        "target_act",
+        &request_details,
+        &session_id,
+    )?;
+    ensure_target_act_operator_panic_boundary("bridge_key_dispatch_before_delivery")?;
+    let result = crate::chrome_debugger_bridge::key_dispatch(
+        window_hwnd,
+        &cdp_target_id,
+        keys,
+        target_act_dom_wait_timeout(params.wait_timeout_ms)?,
+        params.secret_safe,
+    )
+    .await
+    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+    target_act_audit_result_for_session(
+        service,
+        "chrome_debugger_bridge.keyDispatch",
+        &result,
+        &session_id,
+        params.secret_safe,
+    )?;
+    Ok(Some(match result {
+        Ok(value) => {
+            let value = target_act_maybe_secret_safe_result(
+                "chrome_debugger_bridge.keyDispatch",
+                value,
+                params.secret_safe,
+            )?;
+            (
+                "chrome_debugger_bridge.keyDispatch",
+                true,
+                TARGET_ACT_STATUS_OK,
+                value,
+            )
+        }
+        Err(error) => (
+            "chrome_debugger_bridge.keyDispatch",
+            false,
+            target_act_error_status(&error),
+            target_act_maybe_secret_safe_error_result(
+                "chrome_debugger_bridge.keyDispatch",
+                error,
+                params.secret_safe,
+            ),
+        ),
+    }))
 }
 
 async fn target_act_insert_or_append_text(

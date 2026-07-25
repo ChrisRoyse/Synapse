@@ -390,6 +390,7 @@ fn ocr_result_from_text_regions(
         no_text,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
+        captured_target: None,
     }
 }
 
@@ -406,6 +407,7 @@ fn empty_ocr_result(request: &ResolvedReadTextRequest) -> OcrResult {
         no_text: true,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
+        captured_target: None,
     }
 }
 
