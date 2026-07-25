@@ -1095,20 +1095,50 @@ impl SessionLifecycleState {
                 return report;
             }
         };
-        report.browser_continuity = self.browser_continuity_for_daemon_shutdown(session_id);
+        // #1800: the continuity readback and the lease-row delete are both
+        // synchronous CF_SESSIONS operations. Keep their ordering around the
+        // input cleanup exactly as-is, but run each on the blocking pool so the
+        // enclosing per-session deadline stays enforceable while storage is
+        // contended. See `admit_shutdown_storage_step`.
+        report.browser_continuity = {
+            let lifecycle = self.clone();
+            let owned_session_id = session_id.to_owned();
+            match admit_shutdown_storage_step(session_id, "browser_continuity_readback", move || {
+                lifecycle.browser_continuity_for_daemon_shutdown(&owned_session_id)
+            })
+            .await
+            {
+                Ok(continuity) => continuity,
+                Err(detail) => SessionShutdownBrowserContinuityReport {
+                    source_of_truth: "UNPROVEN: in-memory session target/CDP owner registries + CF_SESSIONS persisted target/CDP owner rows were not read".to_owned(),
+                    recovery_action: "browser continuity for this session is unknown; after restart inspect session_list/session_status(include_closed) before adopting any Chrome tab".to_owned(),
+                    failed: true,
+                    error_message: Some(detail),
+                    ..SessionShutdownBrowserContinuityReport::default()
+                },
+            }
+        };
         report.process_jobs =
             self.disarm_owned_process_jobs_for_daemon_shutdown(session_id, reason);
         report.input = self.cleanup_inputs_and_lease(session_id).await;
-        match super::session_continuity::delete_persisted_session_lease_row(
-            &self.m3_state,
-            session_id,
-        ) {
-            Ok(readback) => {
+        let lease_row_delete = {
+            let m3_state = Arc::clone(&self.m3_state);
+            let owned_session_id = session_id.to_owned();
+            admit_shutdown_storage_step(session_id, "session_lease_row_delete", move || {
+                super::session_continuity::delete_persisted_session_lease_row(
+                    &m3_state,
+                    &owned_session_id,
+                )
+            })
+            .await
+        };
+        match lease_row_delete {
+            Ok(Ok(readback)) => {
                 report.lease_row_existed_before = readback.row_existed_before;
                 report.lease_row_deleted = readback.row_deleted;
                 report.lease_row_exists_after = readback.row_exists_after;
             }
-            Err(error) => {
+            Ok(Err(error)) | Err(error) => {
                 report.failed = true;
                 report.error_message = Some(error);
             }
@@ -1481,7 +1511,27 @@ impl SessionLifecycleState {
         candidates
     }
 
-    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
+    /// #1800: the spawned-agent liveness scan runs one synchronous OS handle
+    /// probe (`m4::process_exists`) per registered spawned session and sits on
+    /// the daemon-shutdown critical path with no deadline above it at all.
+    /// Admit it to the blocking pool so the shutdown driver keeps a real yield
+    /// point while it runs. Fails closed: an unproven scan is an error, never
+    /// an empty set treated as "nothing live".
+    pub(crate) async fn live_spawned_session_ids_for_shutdown(
+        &self,
+    ) -> Result<BTreeSet<String>, String> {
+        let lifecycle = self.clone();
+        match admit_shutdown_storage_step("*", "live_spawned_session_liveness_scan", move || {
+            lifecycle.live_spawned_session_ids_for_shutdown_blocking()
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(detail) => Err(detail),
+        }
+    }
+
+    fn live_spawned_session_ids_for_shutdown_blocking(&self) -> Result<BTreeSet<String>, String> {
         let registry_reads = match self.session_registry.lock() {
             Ok(registry) => registry.reads(unix_time_ms_now()),
             Err(_poisoned) => {
@@ -2680,6 +2730,72 @@ fn persisted_cdp_target_owner_readbacks_for_session(
     .collect::<Vec<_>>();
     owners.sort_by(|left, right| left.owner_key.cmp(&right.owner_key));
     Ok(owners)
+}
+
+/// #1800: run one synchronous daemon-shutdown step on the dedicated blocking
+/// pool instead of inline on an async runtime worker.
+///
+/// Every Calyx/RocksDB and OS-probe call reached from the daemon-shutdown
+/// session cleanup is synchronous. Polled inline, such a step never returns
+/// `Poll::Pending`, so the task owning it never yields — and a
+/// `tokio::time::timeout` wrapped around that task is unenforceable, because
+/// the timer future is only polled by the very task the step has frozen.
+///
+/// Physical evidence: on 2026-07-25 the shutdown driver thread (`threadName:
+/// main`) emitted `AUTHORITY_TRANSACTIONS_DRAINED` at `10:21:38.580732Z` and
+/// then produced no log line at all until `MCP_SESSION_LEASE_CONTINUITY_DELETED`
+/// at `10:21:54.058883Z` — 15.4 s frozen inside a nominal 5 s per-session
+/// deadline, resuming 63 ms after a background
+/// `CALYX_ASTER_MANIFEST_GENERATIONS_RECLAIMED` pass released the storage lock
+/// on a `tokio-rt-worker`. On 2026-07-23 the same stall, multiplied by 54
+/// abandoned HTTP sessions, carried the shutdown past the installer's 60 s
+/// budget and into the 90 s `MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED` kill.
+///
+/// Admitting the step to the blocking pool (the same doctrine the storage
+/// maintenance path already logs as `STORAGE_MAINTENANCE_ADMITTED`) turns the
+/// surrounding `.await` into a real yield point, so every deadline stacked
+/// above it becomes physically enforceable and one wedged storage lock can no
+/// longer freeze the shutdown driver.
+///
+/// Fails closed: a panicking or cancelled blocking step is reported as an
+/// unproven step, never as success.
+async fn admit_shutdown_storage_step<T, F>(
+    session_id: &str,
+    step: &'static str,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let started = Instant::now();
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => {
+            tracing::debug!(
+                code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_ADMITTED",
+                session_id,
+                step,
+                elapsed_ms = duration_millis_u64(started.elapsed()),
+                "admitted a daemon-shutdown session step onto the dedicated blocking pool off the async runtime workers"
+            );
+            Ok(value)
+        }
+        Err(error) => {
+            let detail = format!(
+                "daemon-shutdown session step '{step}' for session {session_id} did not complete on the blocking pool after {} ms: {error}; the step's effect on storage is UNPROVEN. remediation=search synapse.log for code=MCP_SESSION_SHUTDOWN_STORAGE_STEP_FAILED with this session_id/step, fix the panic it names, then re-run the shutdown; lifetime locks are retained until it is proven",
+                duration_millis_u64(started.elapsed())
+            );
+            tracing::error!(
+                code = error_codes::TOOL_INTERNAL_ERROR,
+                detail_code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_FAILED",
+                session_id,
+                step,
+                detail,
+                "daemon-shutdown session step could not be proven complete on the blocking pool"
+            );
+            Err(detail)
+        }
+    }
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {

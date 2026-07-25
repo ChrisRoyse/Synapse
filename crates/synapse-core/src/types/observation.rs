@@ -502,7 +502,7 @@ pub struct OcrResult {
 /// This records the tab that actually produced the pixels, plus the session's
 /// bound tab when there is one, so cross-tab contamination is always visible in
 /// the response instead of being silently plausible.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OcrCapturedTarget {
     /// Browser window HWND the pixels were captured from.

@@ -67,6 +67,11 @@ static NEXT_WIN_EVENT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 /// potentially blocking cache-mutex operation after the callback returns.
 static SNAPSHOT_CACHE_INVALIDATION_PENDING: AtomicBool = AtomicBool::new(false);
 static WIN_EVENT_CALLBACKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// #1792: producer-side delivery ledger for the active subscription slot.
+/// Reset when a slot is reserved so each owner's shutdown report describes its
+/// own delivery volume. See `WinEventSubscriptionShutdownReport::events_delivered_at_disconnect`.
+static WIN_EVENT_EVENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static WIN_EVENT_EVENT_SENDS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static WIN_EVENT_CALLBACK_DELIVERY_CONTENTION: AtomicUsize = AtomicUsize::new(0);
 static WIN_EVENT_CALLBACK_DELIVERY_POISON: AtomicUsize = AtomicUsize::new(0);
 
@@ -293,6 +298,12 @@ impl WinEventSubscription {
         if let Some(failure) = disconnect_failure {
             failures.push(failure);
         }
+        // Read the producer-side delivery ledger at the exact disconnect
+        // boundary (#1792). No further send can be admitted past this point,
+        // so these totals are terminal for this owner.
+        let events_delivered_at_disconnect = WIN_EVENT_EVENTS_DELIVERED.load(Ordering::Acquire);
+        let event_sends_rejected_at_disconnect =
+            WIN_EVENT_EVENT_SENDS_REJECTED.load(Ordering::Acquire);
 
         let thread_owner_present = self.join.is_some();
         let mut exit_report_receiver = self.exit_report.take();
@@ -387,6 +398,8 @@ impl WinEventSubscription {
             stop_requested: true,
             stop_wake_sent,
             sender_disconnected,
+            events_delivered_at_disconnect,
+            event_sends_rejected_at_disconnect,
             subscription_slot_released,
             thread_owner_present,
             thread_terminal: join_readback.thread_terminal,
@@ -704,6 +717,10 @@ fn reserve_win_event_subscription_slot(
     }
     state.subscription_owner_id = Some(owner_id);
     state.sender = Some(sender);
+    // Per-owner delivery ledger (#1792): the slot is exclusive, so resetting
+    // here scopes both counters to exactly this subscription owner.
+    WIN_EVENT_EVENTS_DELIVERED.store(0, Ordering::Release);
+    WIN_EVENT_EVENT_SENDS_REJECTED.store(0, Ordering::Release);
     Ok(())
 }
 
@@ -1262,7 +1279,16 @@ unsafe extern "system" fn win_event_proc(
         name: None,
         value: None,
     };
-    let _ = sender.send(event);
+    // #1792: count what this producer actually pushed into the delivery
+    // channel. A consumer whose only stop signal is channel closure has to
+    // drain everything counted here that it had not yet taken before it can
+    // observe the disconnect, so this total is the evidence that separates a
+    // drain backlog from a scheduling problem.
+    if sender.send(event).is_ok() {
+        WIN_EVENT_EVENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WIN_EVENT_EVENT_SENDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 const fn event_kind(event: u32) -> Option<AccessibleEventKind> {

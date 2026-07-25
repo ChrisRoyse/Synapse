@@ -14,7 +14,6 @@ use synapse_core::{
     ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredAuditContext,
     StoredReflexAudit, error_codes,
 };
-use synapse_storage::Db;
 use uuid::Uuid;
 
 use super::{
@@ -23,7 +22,7 @@ use super::{
 };
 use crate::{
     EventBus, REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_TRACK_LOST_KIND, ReflexActionGateHandle,
-    SubscriberHandle,
+    ReflexAuditSink, SubscriberHandle,
     error::ReflexResult,
     kinds::{
         aim_track::{AimTrackController, AimTrackTargetSourceHandle},
@@ -33,7 +32,6 @@ use crate::{
         on_event::OnEventState,
         path_follow::PathFollowController,
     },
-    write_audit,
 };
 
 const REFLEX_FIRES_METRIC: &str = "reflex_fires_total";
@@ -69,7 +67,11 @@ pub(super) struct RuntimeState {
     pub(super) controls: Arc<Mutex<Vec<ReflexControl>>>,
     pub(super) statuses: Arc<Mutex<Vec<ReflexStatus>>>,
     pub(super) config: SchedulerConfig,
-    pub(super) audit_db: Option<Arc<Db>>,
+    /// Off-thread audit hand-off. The scheduler thread must never call
+    /// [`crate::write_audit`] directly: that performs a synchronous Calyx
+    /// constellation measurement, and doing it inline adds vault-latency jitter
+    /// on exactly the non-nominal edges that are already degraded (#1802).
+    pub(super) audit_sink: Option<Arc<ReflexAuditSink>>,
     pub(super) audit_context: Option<StoredAuditContext>,
     pub(super) action_gate: Option<ReflexActionGateHandle>,
     pub(super) tick_index: u64,
@@ -503,7 +505,7 @@ fn write_lifetime_expired_audit_inner(
     reason: &str,
     completion: Option<(&'static str, Value)>,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
     let mut details = json!({
@@ -529,15 +531,7 @@ fn write_lifetime_expired_audit_inner(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_lifetime",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "reflex lifetime audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn write_track_lost_audit(
@@ -546,7 +540,7 @@ fn write_track_lost_audit(
     lost_for: Duration,
     target_context: &serde_json::Value,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -569,15 +563,7 @@ fn write_track_lost_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_track_lost",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "reflex track-lost audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn now_ts_ns() -> u64 {

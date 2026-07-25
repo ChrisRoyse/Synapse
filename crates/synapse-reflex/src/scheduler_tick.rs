@@ -25,7 +25,6 @@ use crate::{
         hold_lifetime::{HoldReleaseReason, emit_lifetime_expired},
         on_event::{OnEventTickGuard, publish_debounced, publish_fired},
     },
-    write_audit,
 };
 
 const REFLEX_TICK_JITTER_METRIC: &str = "reflex_tick_jitter_us";
@@ -136,7 +135,7 @@ fn dispatch_triggered_reflexes(
                 if !guard.can_fire() {
                     guard.report_limit_once(
                         &runtime.event_bus,
-                        runtime.audit_db.as_deref(),
+                        runtime.audit_sink.as_deref(),
                         &trigger.reflex_id,
                         runtime.tick_index,
                         event,
@@ -151,7 +150,7 @@ fn dispatch_triggered_reflexes(
                         guard.record_fire();
                         publish_fired(
                             &runtime.event_bus,
-                            runtime.audit_db.as_deref(),
+                            runtime.audit_sink.as_deref(),
                             &trigger.reflex_id,
                             runtime.tick_index,
                             event,
@@ -267,7 +266,7 @@ fn publish_debounce_suppression(
     };
     publish_debounced(
         &runtime.event_bus,
-        runtime.audit_db.as_deref(),
+        runtime.audit_sink.as_deref(),
         &reflex.reflex_id,
         runtime.tick_index,
         &first_event,
@@ -337,7 +336,7 @@ fn record_starvation(
             .increment(1);
             publish_starved(
                 &runtime.event_bus,
-                runtime.audit_db.as_deref(),
+                runtime.audit_sink.as_deref(),
                 loser,
                 runtime.tick_index,
                 runtime.starvation_states[loser.loser_slot].contended_for(),
@@ -360,7 +359,7 @@ fn record_starvation(
 
 fn publish_starved(
     event_bus: &crate::EventBus,
-    audit_db: Option<&synapse_storage::Db>,
+    audit_sink: Option<&crate::ReflexAuditSink>,
     loser: &ConflictLoser,
     tick_index: u64,
     starved_for: Duration,
@@ -383,7 +382,7 @@ fn publish_starved(
         correlations: Vec::new(),
     };
     let _report = event_bus.publish(event);
-    let Some(db) = audit_db else {
+    let Some(sink) = audit_sink else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -406,15 +405,7 @@ fn publish_starved(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_conflict",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "reflex starvation audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn dispatch_actions(
@@ -585,7 +576,7 @@ fn write_tick_late_audit(
     classification: &str,
     degraded: bool,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -616,14 +607,7 @@ fn write_tick_late_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_scheduler",
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "reflex tick-late audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn warn_dispatch_blocked(reflex_id: &ReflexId, error: &ReflexError) {

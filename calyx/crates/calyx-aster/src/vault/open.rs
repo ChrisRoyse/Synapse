@@ -198,6 +198,7 @@ where
             ledger_hook,
             read_only: options.read_only,
             commit_lock: Mutex::new(()),
+            commit_lock_waiters: std::sync::atomic::AtomicUsize::new(0),
             recurrence_write_lock: Mutex::new(()),
             ledger_state_reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             post_commit_error_seq: std::sync::atomic::AtomicU64::new(0),

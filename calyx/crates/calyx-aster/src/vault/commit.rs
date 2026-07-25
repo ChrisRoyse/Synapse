@@ -1,20 +1,106 @@
 use super::{AsterVault, encode};
 use calyx_core::{CalyxError, Clock, Result, Seq};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The WAL append is durable, but the live MVCC/router apply failed and the
 /// caller must reconcile the reported sequence before retrying.
 pub const CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED: &str =
     "CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED";
 
+/// Wait or hold above which one durable-commit-lock acquisition is reported as
+/// a stall (issue #1806).
+///
+/// The durable commit lock serializes every vault write, so a hold beyond this
+/// budget is directly visible to callers as a stalled MCP request. Before this
+/// telemetry existed a 469 s hold could only be inferred from third-party
+/// symptoms; the warning below names the exact call site responsible.
+const DURABLE_COMMIT_LOCK_SLOW_BUDGET_MS: u128 = 1_000;
+
+/// Waiter accounting for the durable commit lock. Decrements on every exit
+/// path, including the error paths that abandon the acquisition.
+struct CommitLockWaiterTicket<'a> {
+    waiters: &'a AtomicUsize,
+    released: bool,
+}
+
+impl<'a> CommitLockWaiterTicket<'a> {
+    fn enqueue(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::AcqRel);
+        Self {
+            waiters,
+            released: false,
+        }
+    }
+
+    fn admitted(&mut self) {
+        if !self.released {
+            self.waiters.fetch_sub(1, Ordering::AcqRel);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for CommitLockWaiterTicket<'_> {
+    fn drop(&mut self) {
+        self.admitted();
+    }
+}
+
 impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Threads currently queued for the durable commit lock.
+    pub(crate) fn durable_commit_lock_waiters(&self) -> usize {
+        self.commit_lock_waiters.load(Ordering::Acquire)
+    }
+
+    /// Runs `f` under the process + cross-process durable commit boundary,
+    /// recording how long the caller queued and how long it held the lock.
+    ///
+    /// `#[track_caller]` is what makes the stall telemetry actionable: the
+    /// warning below names the exact call site holding the only lock that
+    /// serializes vault writes, so a future regression is attributable without
+    /// re-deriving it from unrelated request timeouts (issue #1806).
+    #[track_caller]
     pub(crate) fn with_durable_commit_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let caller = std::panic::Location::caller();
+        let wait_started = std::time::Instant::now();
+        let mut ticket = CommitLockWaiterTicket::enqueue(&self.commit_lock_waiters);
         let _process_guard = self
             .commit_lock
             .lock()
             .map_err(|_| CalyxError::backpressure("vault commit lock poisoned"))?;
+        let _commit_guard = match &self.durable {
+            Some(durable) => Some(crate::file_lock::FileLockGuard::acquire(
+                &durable.commit_lock_path(),
+            )?),
+            None => None,
+        };
+        ticket.admitted();
+        let wait_ms = wait_started.elapsed().as_millis();
+        let hold_started = std::time::Instant::now();
+        let outcome = self.durable_commit_lock_body(f);
+        let hold_ms = hold_started.elapsed().as_millis();
+        if hold_ms > DURABLE_COMMIT_LOCK_SLOW_BUDGET_MS
+            || wait_ms > DURABLE_COMMIT_LOCK_SLOW_BUDGET_MS
+        {
+            tracing::warn!(
+                code = "CALYX_ASTER_DURABLE_COMMIT_LOCK_SLOW",
+                call_site = %caller,
+                wait_ms,
+                hold_ms,
+                slow_budget_ms = DURABLE_COMMIT_LOCK_SLOW_BUDGET_MS,
+                queued_waiters = self.commit_lock_waiters.load(Ordering::Acquire),
+                ok = outcome.is_ok(),
+                "durable commit lock wait or hold exceeded the stall budget; every vault write \
+                 (including the MCP initialize activity write) is serialized behind this lock"
+            );
+        }
+        outcome
+    }
+
+    fn durable_commit_lock_body<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let Some(durable) = &self.durable else {
             if self
                 .ledger_state_reconciliation_required
@@ -26,7 +112,6 @@ where
             }
             return f();
         };
-        let _commit_guard = crate::file_lock::FileLockGuard::acquire(&durable.commit_lock_path())?;
         if self
             .ledger_state_reconciliation_required
             .load(std::sync::atomic::Ordering::Acquire)

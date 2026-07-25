@@ -54,7 +54,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Mutex,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 
 pub use anchor_compact::{AnchorCompactionConflict, AnchorCompactionReport};
@@ -112,6 +113,13 @@ pub struct AsterVault<C = SystemClock> {
     ledger_hook: Option<AsterLedgerHook>,
     read_only: bool,
     commit_lock: Mutex<()>,
+    /// Threads currently queued for the durable commit lock (issue #1806).
+    ///
+    /// Maintenance drains use this to decide whether to hand the lock off to a
+    /// waiting writer between bounded units instead of immediately re-taking
+    /// it, and the slow-hold telemetry reports it so a stall can be attributed
+    /// to contention rather than to a single slow operation.
+    commit_lock_waiters: AtomicUsize,
     recurrence_write_lock: Mutex<()>,
     ledger_state_reconciliation_required: AtomicBool,
     /// Exact sequence of the most recent commit that returned an error after
@@ -128,6 +136,22 @@ pub struct VaultRecoveryReport {
     pub last_recovered_seq: Seq,
     pub torn_tail: Option<TornTail>,
 }
+
+/// Bounded commit-lock acquisitions one paced checkpoint drain may use before
+/// it fails closed (issue #1806).
+///
+/// At the 256-batch / 250 ms per-hold bound this covers a backlog of up to
+/// ~1M staged group commits. Exceeding it means commits are arriving faster
+/// than durable checkpoints can be materialized, which is a real capacity
+/// fault: it is reported, never papered over by reverting to one unbounded
+/// hold.
+const PACED_CHECKPOINT_MAX_HOLDS: usize = 4_096;
+
+/// Pause used to hand the durable commit lock to a queued writer between
+/// bounded maintenance units. `std::sync::Mutex` is not fair, so without an
+/// explicit pause a draining thread re-acquires immediately and the pacing
+/// delivers no write progress.
+const COMMIT_LOCK_HANDOFF_PAUSE: Duration = Duration::from_millis(2);
 
 /// Stable error code for an invalid revision-guarded CF mutation.
 pub const CALYX_ASTER_CONDITIONAL_WRITE_INVALID: &str = "CALYX_ASTER_CONDITIONAL_WRITE_INVALID";
@@ -402,6 +426,7 @@ where
             ledger_hook: None,
             read_only: false,
             commit_lock: Mutex::new(()),
+            commit_lock_waiters: AtomicUsize::new(0),
             recurrence_write_lock: Mutex::new(()),
             ledger_state_reconciliation_required: AtomicBool::new(false),
             post_commit_error_seq: AtomicU64::new(0),
@@ -999,7 +1024,112 @@ where
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.drain_checkpoints_paced("flush")?;
         self.with_durable_commit_lock(|| self.flush_locked())
+    }
+
+    /// Materializes every staged durable checkpoint using **bounded**
+    /// durable-commit-lock acquisitions, releasing the lock between them
+    /// (issue #1806).
+    ///
+    /// Root cause this exists for: one durable group commit stages one
+    /// checkpoint batch, and each batch becomes one create+fsync+rename SST
+    /// per touched CF. A derived-write fanout backfill stages tens of
+    /// thousands of those between 30 s checkpoint ticks, and the previous
+    /// single-acquisition drain therefore held the *only* lock serializing
+    /// vault writes for the entire backlog — observed at 86 s in this vault's
+    /// own boot telemetry (`CALYX_ASTER_NATIVE_FANOUT_MAINTENANCE_START
+    /// commit_lock_hold_us=86096312`) and at 469 s live during the #1782 FSV.
+    /// Writers, including the activity-recorder write that MCP `initialize`
+    /// performs, queued behind it for the whole drain.
+    ///
+    /// Pacing does not reduce the total work; it bounds the *hold*, so queued
+    /// writers interleave. It fails closed rather than silently giving up:
+    /// a drain that cannot converge, or that stops making progress, returns a
+    /// typed error naming the backlog instead of leaving the manifest behind
+    /// the committed tail.
+    ///
+    /// Callers that need the drained state to still hold must follow this with
+    /// their own commit-lock acquisition (the residual drain there covers only
+    /// what was committed during the pacing loop).
+    pub(crate) fn drain_checkpoints_paced(&self, operation: &'static str) -> Result<()> {
+        if self.durable.is_none() || self.read_only {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut holds = 0_usize;
+        let mut batches_written = 0_usize;
+        let mut rows_written = 0_usize;
+        let mut max_hold_ms = 0_u128;
+        loop {
+            let hold_started = Instant::now();
+            let chunk = self.with_durable_commit_lock(|| {
+                self.ensure_writeable("checkpoint")?;
+                let Some(durable) = &self.durable else {
+                    return Ok(durable::CheckpointDrainChunk::default());
+                };
+                durable.sync_wal()?;
+                durable.flush_pending_checkpoints_bounded(
+                    durable::CHECKPOINT_DRAIN_MAX_BATCHES,
+                    durable::CHECKPOINT_DRAIN_HOLD_BUDGET,
+                )
+            })?;
+            holds = holds.saturating_add(1);
+            batches_written = batches_written.saturating_add(chunk.batches_written);
+            rows_written = rows_written.saturating_add(chunk.rows_written);
+            max_hold_ms = max_hold_ms.max(hold_started.elapsed().as_millis());
+            if chunk.remaining_batches == 0 {
+                break;
+            }
+            if chunk.batches_written == 0 {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_CHECKPOINT_DRAIN_NO_PROGRESS",
+                    message: format!(
+                        "paced checkpoint drain for {operation} wrote no batch while {} remain staged after {holds} bounded commit-lock acquisitions",
+                        chunk.remaining_batches
+                    ),
+                    remediation: "inspect the preceding durable-batch SST write errors and free disk/handles; do not advance the manifest past staged batches",
+                });
+            }
+            if holds >= PACED_CHECKPOINT_MAX_HOLDS {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_CHECKPOINT_DRAIN_UNCONVERGED",
+                    message: format!(
+                        "paced checkpoint drain for {operation} used its full budget of {PACED_CHECKPOINT_MAX_HOLDS} bounded commit-lock acquisitions ({batches_written} batches, {rows_written} rows, {} ms) and {} batches are still staged; incoming commits are outrunning durable checkpoint materialization",
+                        started.elapsed().as_millis(),
+                        chunk.remaining_batches
+                    ),
+                    remediation: "throttle the write source (derived-write fanout/backfill pager) or provision faster durable storage; retry maintenance once the staged backlog drains, and do not hold the durable commit lock across the whole backlog to force convergence",
+                });
+            }
+            self.yield_durable_commit_lock_to_writers();
+        }
+        if batches_written > 0 || holds > 1 {
+            tracing::info!(
+                code = "CALYX_ASTER_CHECKPOINT_DRAIN_PACED",
+                operation,
+                holds,
+                batches_written,
+                rows_written,
+                max_hold_ms,
+                elapsed_ms = started.elapsed().as_millis(),
+                max_batches_per_hold = durable::CHECKPOINT_DRAIN_MAX_BATCHES,
+                hold_budget_ms = durable::CHECKPOINT_DRAIN_HOLD_BUDGET.as_millis(),
+                "materialized staged durable checkpoints in bounded durable-commit-lock holds"
+            );
+        }
+        Ok(())
+    }
+
+    /// Hands the durable commit lock to queued writers between bounded
+    /// maintenance units. Without this, an unfair mutex lets the draining
+    /// thread immediately re-acquire and the pacing buys writers nothing.
+    fn yield_durable_commit_lock_to_writers(&self) {
+        if self.durable_commit_lock_waiters() > 0 {
+            std::thread::sleep(COMMIT_LOCK_HANDOFF_PAUSE);
+        } else {
+            std::thread::yield_now();
+        }
     }
 
     /// Synchronizes the WAL batcher and materializes pending durable
@@ -1011,6 +1141,7 @@ where
     /// separate prevents a caller requesting durability from creating one
     /// tiny router SST per logical flush.
     pub fn checkpoint(&self) -> Result<()> {
+        self.drain_checkpoints_paced("periodic checkpoint")?;
         self.with_durable_commit_lock(|| self.checkpoint_locked())
     }
 
@@ -1060,6 +1191,7 @@ where
                 "WAL recycle limits must both be non-zero",
             ));
         }
+        self.drain_checkpoints_paced("WAL recycle preflight")?;
         self.with_durable_commit_lock(|| {
             self.checkpoint_locked()?;
             let Some(durable) = &self.durable else {

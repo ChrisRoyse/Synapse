@@ -93,6 +93,7 @@ where
         let Some(durable) = &self.durable else {
             return Ok(None);
         };
+        self.drain_checkpoints_paced("compaction catalog snapshot")?;
         let durable_seq = self.with_durable_commit_lock(|| {
             self.checkpoint_locked()?;
             self.verified_durable_coverage_seq(durable)
@@ -122,6 +123,11 @@ where
             return Ok(None);
         };
         let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+        // Drain the staged checkpoint backlog in bounded commit-lock holds
+        // BEFORE taking the lock for the coverage snapshot (issue #1806); the
+        // acquisition below then only has to absorb what was committed during
+        // that paced drain.
+        self.drain_checkpoints_paced("single-CF compaction preflight")?;
         let commit_lock_started = std::time::Instant::now();
         let durable_seq = self.with_durable_commit_lock(|| {
             self.checkpoint_locked()?;
@@ -176,6 +182,16 @@ where
             return Ok(Vec::new());
         };
         let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+        // Issue #1806: this pass already performed its physical rewrites off
+        // the durable commit lock, but its *preflight* checkpoint drained the
+        // entire staged backlog inside one acquisition — the actual 469 s /
+        // 86 s holds attributed to `CALYX_ASTER_NATIVE_FANOUT`. Pace that
+        // drain first so the snapshot acquisition below is short.
+        self.drain_checkpoints_paced(if readiness_only {
+            "write-stall readiness preflight"
+        } else {
+            "native fan-out maintenance preflight"
+        })?;
         let commit_lock_started = std::time::Instant::now();
         let durable_seq = self.with_durable_commit_lock(|| {
             self.checkpoint_locked()?;
@@ -465,6 +481,7 @@ where
     /// Compacts the listed column families, prunes MVCC tombstone rows from the
     /// compacted SST, and reclaims superseded input SSTs for durable vaults.
     pub fn purge_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
+        self.drain_checkpoints_paced("tombstone purge preflight")?;
         self.with_native_compaction_guard(|| {
             self.with_durable_commit_lock(|| self.purge_tombstoned_cfs_locked(cfs))
         })

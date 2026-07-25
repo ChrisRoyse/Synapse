@@ -120,6 +120,8 @@ impl WinEventSubscription {
                 stop_requested: true,
                 stop_wake_sent: true,
                 sender_disconnected: true,
+                events_delivered_at_disconnect: 0,
+                event_sends_rejected_at_disconnect: 0,
                 subscription_slot_released: true,
                 thread_owner_present: false,
                 thread_terminal: true,
@@ -151,6 +153,23 @@ pub struct WinEventSubscriptionShutdownReport {
     /// True only after the callback delivery-state lock was acquired within
     /// its shutdown bound and the process-global sender read back empty.
     pub sender_disconnected: bool,
+    /// #1792: total `AccessibleEvent`s this owner accepted into the delivery
+    /// channel, read at the instant the sender was disconnected.
+    ///
+    /// `sender_disconnected` proves the producer side is closed; it does NOT
+    /// prove the consumer can observe the closure. A Tokio `UnboundedReceiver`
+    /// returns `None` only after every sender is dropped **and every buffered
+    /// value has been received**, so a consumer whose only stop signal is
+    /// channel closure must first drain whatever this counter accumulated but
+    /// the consumer had not yet taken. Publishing the producer-side total makes
+    /// that drain depth computable against the consumer's own published
+    /// sequence, which is what separates "channel closure never reached the
+    /// consumer" from subscription-thread delay, scheduler starvation, and join
+    /// ordering.
+    pub events_delivered_at_disconnect: u64,
+    /// Sends this owner attempted after its receiver was already gone. Nonzero
+    /// means the consumer stopped before the producer did.
+    pub event_sends_rejected_at_disconnect: u64,
     pub subscription_slot_released: bool,
     pub thread_owner_present: bool,
     pub thread_terminal: bool,

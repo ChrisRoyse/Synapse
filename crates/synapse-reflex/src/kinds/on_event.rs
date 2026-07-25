@@ -6,10 +6,9 @@ use synapse_core::{
     Action, Event, EventRef, EventSource, ReflexId, ReflexState, SCHEMA_VERSION,
     StoredAuditContext, StoredReflexAudit, StoredReflexStep, error_codes,
 };
-use synapse_storage::Db;
 use uuid::Uuid;
 
-use crate::{EventBus, write_audit};
+use crate::{EventBus, ReflexAuditSink};
 
 pub const MAX_ON_EVENT_FIRINGS_PER_TICK: usize = 4;
 pub const REFLEX_DEBOUNCED_KIND: &str = "reflex_debounced";
@@ -53,7 +52,7 @@ impl OnEventTickGuard {
     pub(crate) fn report_limit_once(
         &mut self,
         event_bus: &EventBus,
-        audit_db: Option<&Db>,
+        audit_sink: Option<&ReflexAuditSink>,
         reflex_id: &ReflexId,
         tick_index: u64,
         trigger_event: &Event,
@@ -66,13 +65,13 @@ impl OnEventTickGuard {
         metrics::counter!(REFLEX_RECURSION_CLAMPS_METRIC).increment(1);
         publish_limit_event(event_bus, reflex_id, tick_index, trigger_event);
         let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context);
-        write_audit_if_configured(audit_db, &audit);
+        enqueue_audit_if_configured(audit_sink, audit);
     }
 }
 
 pub(crate) fn publish_fired(
     event_bus: &EventBus,
-    audit_db: Option<&Db>,
+    audit_sink: Option<&ReflexAuditSink>,
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
@@ -94,7 +93,7 @@ pub(crate) fn publish_fired(
     };
     let _report = event_bus.publish(event);
     let audit = fired_audit(reflex_id, tick_index, trigger_event, actions, audit_context);
-    write_audit_if_configured(audit_db, &audit);
+    enqueue_audit_if_configured(audit_sink, audit);
     tracing::info!(
         code = "REFLEX_FIRED",
         reflex_id = %reflex_id,
@@ -109,7 +108,7 @@ pub(crate) fn publish_fired(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_debounced(
     event_bus: &EventBus,
-    audit_db: Option<&Db>,
+    audit_sink: Option<&ReflexAuditSink>,
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
@@ -147,7 +146,7 @@ pub(crate) fn publish_debounced(
         reason,
         audit_context,
     );
-    write_audit_if_configured(audit_db, &audit);
+    enqueue_audit_if_configured(audit_sink, audit);
     tracing::info!(
         code = error_codes::REFLEX_DEBOUNCED,
         reflex_id = %reflex_id,
@@ -284,19 +283,13 @@ fn completed_steps(actions: &[Action]) -> Vec<StoredReflexStep> {
         .collect()
 }
 
-fn write_audit_if_configured(audit_db: Option<&Db>, audit: &StoredReflexAudit) {
-    let Some(db) = audit_db else {
+/// Hands an on-event audit row to the off-thread writer. Never performs I/O on
+/// the scheduler tick thread (#1802).
+fn enqueue_audit_if_configured(audit_sink: Option<&ReflexAuditSink>, audit: StoredReflexAudit) {
+    let Some(sink) = audit_sink else {
         return;
     };
-    if let Err(error) = write_audit(db, audit) {
-        tracing::warn!(
-            component = "reflex_on_event",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "reflex audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn trigger_correlation(trigger_event: &Event) -> Vec<EventRef> {

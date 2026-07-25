@@ -446,6 +446,13 @@ pub fn close_daemon_lifetime_locks(
     shell_job_store: ShellJobStoreLockGuard,
     single_instance: SingleInstanceGuard,
 ) -> Result<DaemonLifetimeLocksCloseReadback, DaemonLifetimeLocksCloseError> {
+    // This is the only graceful release point for the durable shell-job store,
+    // shared by the stdio and HTTP daemons. Recording the clean shutdown here is
+    // what lets the NEXT daemon incarnation tell an orderly stop apart from a
+    // crash/kill/power-loss when it reconciles orphaned `running` records
+    // (#1808). It runs before the lock is released so a successor can never
+    // observe the store unlocked without the marker already committed.
+    crate::m4::mark_shell_job_supervisor_clean_shutdown();
     let shell_job_store = shell_job_store.close();
     let single_instance = single_instance.close();
     let (shell_job_store, shell_error) = match shell_job_store {

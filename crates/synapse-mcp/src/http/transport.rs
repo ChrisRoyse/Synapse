@@ -100,6 +100,18 @@ const ABANDONED_SESSION_REAP_AFTER_DEFAULT: Duration = Duration::from_mins(30);
 const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Whole-phase deadline for the daemon-shutdown per-session input cleanup
+/// (#1800). The per-session budget above bounds one session; this bounds the
+/// phase, so the number of live HTTP sessions can never multiply into an
+/// unbounded shutdown. Sized from measured behaviour: the 2026-07-25 shutdown
+/// spent 19.98 s here (`AUTHORITY_TRANSACTIONS_DRAINED` 10:21:38.580732Z ->
+/// `MCP_HTTP_SHUTDOWN_INPUT_CLEANUP` 10:21:58.561266Z) while blocked behind a
+/// background Calyx manifest reclaim, so 30 s leaves real headroom over the
+/// worst observed healthy phase while keeping the whole shutdown inside both
+/// the installer's 60 s budget and the 90 s watchdog. Deliberately NOT sized to
+/// rescue a wedged owner: an owner that misses this stays unproven and named,
+/// and the daemon lifetime locks are retained.
+const DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 // Escalation delivery can spend up to one bounded HTTP timeout on contract
 // preflight and one on POST, then must durably checkpoint the outcome. Its
@@ -347,6 +359,16 @@ struct DaemonShutdownInputCleanupReport {
     cleaned_sessions: usize,
     session_cleanup_timeout_ms: u64,
     session_cleanup_timeouts: Vec<String>,
+    /// #1800 phase evidence: the whole per-session cleanup phase is bounded, not
+    /// just each session, so N abandoned sessions cannot multiply into an
+    /// unbounded phase that rides the daemon into the shutdown watchdog.
+    session_cleanup_phase_timeout_ms: u64,
+    session_cleanup_phase_elapsed_ms: u64,
+    session_cleanup_phase_deadline_expired: bool,
+    /// Sessions whose cleanup never published a report before the phase
+    /// deadline. Each also appears in `session_reports` as a failed, explicitly
+    /// unproven row so the lifetime-lock gate stays fail-closed.
+    session_cleanup_phase_unreported_session_ids: Vec<String>,
     orphan_lease_owner_cleanup:
         Option<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
     final_lease_held: bool,
@@ -370,6 +392,11 @@ impl DaemonShutdownInputCleanupReport {
     fn all_input_owners_quiescent(&self) -> bool {
         self.authority_finalizer_owners_quiescent()
             && self.failure_count == 0
+            // A phase that hit its deadline never proved the sessions it was
+            // still running, even if every report it had already published was
+            // clean. Fail closed on the phase verdict itself (#1800).
+            && !self.session_cleanup_phase_deadline_expired
+            && self.session_cleanup_phase_unreported_session_ids.is_empty()
             && self.live_spawn_snapshot_read_before
             && self.live_spawn_snapshot_error.is_none()
             && self.input_owner_snapshot_read_before
@@ -3865,11 +3892,13 @@ async fn cleanup_active_session_inputs_for_shutdown(
             Err(error) => (Some(error.readback.clone()), Some(error.to_string())),
         };
     let active_sessions = active_http_session_ids(session_manager).await;
-    let (live_spawn_sessions, live_spawn_snapshot_error) =
-        match session_lifecycle.live_spawned_session_ids_for_shutdown() {
-            Ok(session_ids) => (session_ids, None),
-            Err(error) => (BTreeSet::new(), Some(error)),
-        };
+    let (live_spawn_sessions, live_spawn_snapshot_error) = match session_lifecycle
+        .live_spawned_session_ids_for_shutdown()
+        .await
+    {
+        Ok(session_ids) => (session_ids, None),
+        Err(error) => (BTreeSet::new(), Some(error)),
+    };
     let live_spawn_snapshot_read_before = live_spawn_snapshot_error.is_none();
     let close_candidate_sessions = close_candidate_session_ids
         .iter()
@@ -3900,25 +3929,18 @@ async fn cleanup_active_session_inputs_for_shutdown(
     // unbounded reacquisition of the same session gate or an unbounded emitter
     // acknowledgement. Start every independent cleanup so one retained owner
     // cannot suppress the remaining attempts, and give each exact operation its
-    // own terminal deadline.
-    let cleanup_results = join_all(shutdown_sessions.iter().map(|session_id| {
-        await_daemon_session_input_cleanup(
-            session_id,
-            reason,
-            session_lifecycle.release_session_inputs_for_daemon_shutdown(session_id, reason),
-        )
-    }))
-    .await;
-    let mut session_cleanup_timeouts = Vec::new();
-    let session_reports = cleanup_results
-        .into_iter()
-        .map(|(report, timed_out)| {
-            if timed_out {
-                session_cleanup_timeouts.push(report.session_id.clone());
-            }
-            report
-        })
-        .collect::<Vec<_>>();
+    // own terminal deadline — under a phase deadline that stays enforceable
+    // even if one cleanup stops yielding (#1800).
+    let phase =
+        run_shutdown_session_input_cleanup_phase(session_lifecycle, &shutdown_sessions, reason)
+            .await;
+    let ShutdownSessionCleanupPhase {
+        session_reports,
+        mut session_cleanup_timeouts,
+        phase_elapsed_ms,
+        phase_deadline_expired,
+        phase_unreported_session_ids,
+    } = phase;
     let mut orphan_lease_owner_cleanup = None;
     let mut final_lease = synapse_action::lease::status();
     if let Some(owner_session_id) = final_lease.owner_session_id.clone()
@@ -3988,6 +4010,13 @@ async fn cleanup_active_session_inputs_for_shutdown(
         session_cleanup_timeout_ms: u64::try_from(DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT.as_millis())
             .unwrap_or(u64::MAX),
         session_cleanup_timeouts,
+        session_cleanup_phase_timeout_ms: u64::try_from(
+            DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis(),
+        )
+        .unwrap_or(u64::MAX),
+        session_cleanup_phase_elapsed_ms: phase_elapsed_ms,
+        session_cleanup_phase_deadline_expired: phase_deadline_expired,
+        session_cleanup_phase_unreported_session_ids: phase_unreported_session_ids,
         orphan_lease_owner_cleanup,
         final_lease_held: final_lease.held,
         final_lease_owner_session_id: final_lease.owner_session_id,
@@ -3998,6 +4027,163 @@ async fn cleanup_active_session_inputs_for_shutdown(
         input_owner_snapshot_errors,
         failure_count,
         session_reports,
+    }
+}
+
+/// Outcome of the bounded daemon-shutdown per-session input-cleanup phase
+/// (#1800).
+struct ShutdownSessionCleanupPhase {
+    session_reports: Vec<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
+    session_cleanup_timeouts: Vec<String>,
+    phase_elapsed_ms: u64,
+    phase_deadline_expired: bool,
+    phase_unreported_session_ids: Vec<String>,
+}
+
+/// Run every session's daemon-shutdown input cleanup under a phase deadline
+/// that is *physically* enforceable (#1800).
+///
+/// The per-session `time::timeout` in `await_daemon_session_input_cleanup` is
+/// only enforceable while the guarded future keeps yielding: a future that
+/// never returns `Poll::Pending` is never preempted, because `timeout` polls
+/// the timer from the very task that future has frozen. On 2026-07-23 that is
+/// how a shutdown with 54 live HTTP sessions stayed alive with its listener
+/// closed until `MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED` at 90 s, after the
+/// installer had already abandoned the deploy at 60 s.
+///
+/// `session_lifecycle` now admits its synchronous storage steps to the blocking
+/// pool, so the per-session deadline is real again. This phase adds the
+/// structural guarantee that does not depend on that: the cleanups run on a
+/// spawned task and report incrementally over a channel, while this task only
+/// ever awaits `recv()`/`sleep()`. A cleanup that stops yielding can therefore
+/// no longer freeze the shutdown driver — the phase deadline still fires, the
+/// exact unfinished sessions are named, and shutdown proceeds to a terminal
+/// exit decision instead of burning the watchdog window.
+///
+/// Fail-closed: every session that did not publish a report becomes an
+/// explicitly failed, unproven row, so `failure_count` is non-zero and the
+/// daemon lifetime locks are retained.
+async fn run_shutdown_session_input_cleanup_phase(
+    session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
+    shutdown_sessions: &BTreeSet<String>,
+    reason: &'static str,
+) -> ShutdownSessionCleanupPhase {
+    let phase_started = Instant::now();
+    if shutdown_sessions.is_empty() {
+        return ShutdownSessionCleanupPhase {
+            session_reports: Vec::new(),
+            session_cleanup_timeouts: Vec::new(),
+            phase_elapsed_ms: 0,
+            phase_deadline_expired: false,
+            phase_unreported_session_ids: Vec::new(),
+        };
+    }
+    let (report_sender, mut report_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let worker_lifecycle = session_lifecycle.clone();
+    let worker_sessions = shutdown_sessions.iter().cloned().collect::<Vec<_>>();
+    let cleanup_task = tokio::spawn(async move {
+        join_all(worker_sessions.iter().map(|session_id| {
+            let report_sender = report_sender.clone();
+            let worker_lifecycle = &worker_lifecycle;
+            async move {
+                let (report, timed_out) = await_daemon_session_input_cleanup(
+                    session_id,
+                    reason,
+                    worker_lifecycle.release_session_inputs_for_daemon_shutdown(session_id, reason),
+                )
+                .await;
+                // The receiver outlives this send unless the phase deadline
+                // already expired; a dropped receiver simply means the report
+                // was superseded by the unproven row this phase recorded.
+                drop(report_sender.send((report, timed_out)));
+            }
+        }))
+        .await;
+    });
+
+    let mut session_reports = Vec::with_capacity(shutdown_sessions.len());
+    let mut session_cleanup_timeouts = Vec::new();
+    let mut pending = shutdown_sessions.clone();
+    let phase_deadline = time::sleep(DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT);
+    tokio::pin!(phase_deadline);
+    let mut phase_deadline_expired = false;
+    loop {
+        tokio::select! {
+            biased;
+            received = report_receiver.recv() => {
+                let Some((report, timed_out)) = received else {
+                    break;
+                };
+                pending.remove(&report.session_id);
+                if timed_out {
+                    session_cleanup_timeouts.push(report.session_id.clone());
+                }
+                session_reports.push(report);
+            }
+            () = &mut phase_deadline => {
+                phase_deadline_expired = true;
+                break;
+            }
+        }
+    }
+    if phase_deadline_expired {
+        // Timing out a JoinHandle does not cancel its task; the abort request is
+        // what stops the cleanup owner from mutating session state behind the
+        // terminal readbacks that follow this phase.
+        cleanup_task.abort();
+    }
+    let phase_elapsed_ms = u64::try_from(phase_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let phase_unreported_session_ids = pending.into_iter().collect::<Vec<_>>();
+    for session_id in &phase_unreported_session_ids {
+        let detail = if phase_deadline_expired {
+            format!(
+                "daemon-shutdown session input cleanup did not publish a report within the {} ms phase deadline (phase_elapsed_ms={phase_elapsed_ms}); this session's input/lease/browser-continuity ownership is UNPROVEN and the daemon lifetime locks are retained. remediation=search synapse.log for code=MCP_SESSION_SHUTDOWN_STORAGE_STEP_ADMITTED with this session_id to see which step stalled, and for the storage pass holding its lock (code=STORAGE_MAINTENANCE_ADMITTED / CALYX_ASTER_MANIFEST_GENERATIONS_RECLAIMED) in the same window",
+                DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis()
+            )
+        } else {
+            format!(
+                "daemon-shutdown session input cleanup owner ended after {phase_elapsed_ms} ms without publishing a report for this session; ownership is UNPROVEN. remediation=search synapse.log for a panic in the cleanup task in this window; the daemon lifetime locks are retained"
+            )
+        };
+        tracing::error!(
+            code = synapse_core::error_codes::ACTION_POSTCONDITION_FAILED,
+            detail_code = "MCP_SESSION_SHUTDOWN_INPUT_CLEANUP_UNPROVEN",
+            session_id = session_id.as_str(),
+            reason,
+            phase_elapsed_ms,
+            phase_timeout_ms = DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis() as u64,
+            phase_deadline_expired,
+            detail,
+            "daemon-shutdown session input cleanup did not reach a proven terminal readback"
+        );
+        session_reports.push(
+            crate::server::session_lifecycle::SessionShutdownInputCleanupReport {
+                session_id: session_id.clone(),
+                reason: reason.to_owned(),
+                failed: true,
+                error_message: Some(detail),
+                ..Default::default()
+            },
+        );
+    }
+    tracing::info!(
+        code = "MCP_HTTP_SHUTDOWN_SESSION_CLEANUP_PHASE",
+        reason,
+        sessions = shutdown_sessions.len(),
+        reported = session_reports.len() - phase_unreported_session_ids.len(),
+        unreported = phase_unreported_session_ids.len(),
+        per_session_timeouts = session_cleanup_timeouts.len(),
+        phase_elapsed_ms,
+        phase_timeout_ms = DAEMON_SESSION_INPUT_CLEANUP_PHASE_TIMEOUT.as_millis() as u64,
+        phase_deadline_expired,
+        "readback=session_input_cleanup_phase edge=daemon_shutdown after_bounded_phase"
+    );
+    ShutdownSessionCleanupPhase {
+        session_reports,
+        session_cleanup_timeouts,
+        phase_elapsed_ms,
+        phase_deadline_expired,
+        phase_unreported_session_ids,
     }
 }
 

@@ -1,6 +1,7 @@
 mod action_combo_bridge;
 pub mod audit;
 mod audit_migration;
+pub mod audit_offload;
 mod audit_state;
 pub mod bus;
 pub mod conflict;
@@ -15,6 +16,10 @@ mod storage;
 
 pub use action_combo_bridge::install_action_combo_scheduler;
 pub use audit::write_audit;
+pub use audit_offload::{
+    REFLEX_AUDIT_QUEUE_CAPACITY, REFLEX_AUDIT_QUEUE_OVERFLOW, ReflexAuditQueueSnapshot,
+    ReflexAuditSink,
+};
 pub use bus::{
     DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EVENTS_DROPPED_METRIC, EventBus,
     EventBusError, EventBusResult, PublishReport, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle,

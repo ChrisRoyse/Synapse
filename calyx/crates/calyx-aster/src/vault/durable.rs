@@ -1,5 +1,9 @@
 mod checkpointing;
 mod manifest_ops;
+
+pub(in crate::vault) use checkpointing::{
+    CHECKPOINT_DRAIN_HOLD_BUDGET, CHECKPOINT_DRAIN_MAX_BATCHES, CheckpointDrainChunk,
+};
 pub(in crate::vault) mod recovery_readback;
 pub(in crate::vault) mod router_coverage;
 

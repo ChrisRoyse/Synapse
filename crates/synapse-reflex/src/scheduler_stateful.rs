@@ -28,7 +28,6 @@ use crate::{
         },
     },
     scheduler::ScheduledReflexDriver,
-    write_audit,
 };
 
 pub(super) fn step_stateful_controllers(
@@ -432,7 +431,7 @@ fn dispatch_context(runtime: &RuntimeState) -> ReflexActionDispatchContext {
     ReflexActionDispatchContext::new(
         runtime.action_handle.clone(),
         runtime.action_gate.clone(),
-        runtime.audit_db.clone(),
+        runtime.audit_sink.clone(),
         runtime.audit_context.clone(),
         runtime.tick_index,
     )
@@ -642,7 +641,7 @@ fn write_path_follow_tick_audit(
     if records.is_empty() {
         return;
     }
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
     let steps = records
@@ -678,15 +677,7 @@ fn write_path_follow_tick_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_path_follow",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "path_follow dispatch audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn warn_stateful_dispatch_blocked(index: usize, error: &ReflexError) {
@@ -719,7 +710,7 @@ fn write_aim_track_correction_audit(
     smoothed_delta: (f64, f64),
     snapshot: &AimTrackTargetSnapshot,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -750,15 +741,7 @@ fn write_aim_track_correction_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
-        tracing::warn!(
-            component = "reflex_aim_track",
-            reflex_id = %audit.reflex_id,
-            audit_id = %audit.audit_id,
-            detail = %error,
-            "aim_track correction audit write failed"
-        );
-    }
+    sink.enqueue(audit);
 }
 
 fn aim_track_params_value(params: &AimTrackParams) -> Value {

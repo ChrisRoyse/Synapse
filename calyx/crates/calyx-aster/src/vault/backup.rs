@@ -97,6 +97,7 @@ where
             });
         };
         prepare_target_dir(target_vault_dir)?;
+        self.drain_checkpoints_paced("backup preflight")?;
         self.with_native_compaction_guard(|| {
             let durable_seq = self.with_durable_commit_lock(|| {
                 self.checkpoint_locked()?;

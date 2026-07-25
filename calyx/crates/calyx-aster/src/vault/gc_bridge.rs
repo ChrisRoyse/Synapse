@@ -57,6 +57,12 @@ where
     }
 
     fn reclaim_snapshot_ssts(&self, safe_point: u64, max_input_files: usize) -> Result<GcResult> {
+        // Issue #1806: `reclaim_snapshot_ssts_locked` starts with a full
+        // `flush_locked`, so the staged checkpoint backlog used to be drained
+        // inside this single acquisition (the "storage GC holds the lock ~64 s"
+        // symptom). Pace that drain first; the acquisition below then only
+        // absorbs commits that landed during the pacing loop.
+        self.drain_checkpoints_paced("snapshot GC preflight")?;
         self.with_durable_commit_lock(|| {
             self.reclaim_snapshot_ssts_locked(safe_point, max_input_files)
         })

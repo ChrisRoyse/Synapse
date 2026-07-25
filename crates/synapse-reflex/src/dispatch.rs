@@ -7,10 +7,9 @@ use synapse_core::{
     Action, ReflexId, ReflexState, SCHEMA_VERSION, StoredAuditContext, StoredReflexAudit,
     StoredReflexStep, error_codes,
 };
-use synapse_storage::Db;
 use uuid::Uuid;
 
-use crate::{ReflexError, ReflexResult, write_audit};
+use crate::{ReflexAuditSink, ReflexError, ReflexResult};
 
 pub const REFLEX_ACTION_PERMISSION_DENIED_KIND: &str = "reflex_action_permission_denied";
 pub const REFLEX_ACTION_DENIED_STEP_STATUS: &str = "action_denied";
@@ -57,7 +56,10 @@ impl ReflexActionPermissionDenied {
 pub struct ReflexActionDispatchContext {
     action_handle: ActionHandle,
     action_gate: Option<ReflexActionGateHandle>,
-    audit_db: Option<Arc<Db>>,
+    /// Off-thread audit hand-off; see [`crate::audit_offload`]. Action-denied
+    /// rows used to be written *and flushed* inline, which put a synchronous
+    /// vault write plus a flush on the scheduler tick thread (#1802).
+    audit_sink: Option<Arc<ReflexAuditSink>>,
     audit_context: Option<StoredAuditContext>,
     tick_index: u64,
 }
@@ -67,14 +69,14 @@ impl ReflexActionDispatchContext {
     pub fn new(
         action_handle: ActionHandle,
         action_gate: Option<ReflexActionGateHandle>,
-        audit_db: Option<Arc<Db>>,
+        audit_sink: Option<Arc<ReflexAuditSink>>,
         audit_context: Option<StoredAuditContext>,
         tick_index: u64,
     ) -> Self {
         Self {
             action_handle,
             action_gate,
-            audit_db,
+            audit_sink,
             audit_context,
             tick_index,
         }
@@ -109,7 +111,7 @@ impl ReflexActionDispatchContext {
         action: &Action,
         denial: &ReflexActionPermissionDenied,
     ) {
-        let Some(db) = self.audit_db.as_deref() else {
+        let Some(sink) = self.audit_sink.as_deref() else {
             return;
         };
         let audit = StoredReflexAudit {
@@ -142,15 +144,9 @@ impl ReflexActionDispatchContext {
             redactions: Vec::new(),
         };
 
-        if let Err(error) = write_audit(db, &audit).and_then(|()| db.flush()) {
-            tracing::warn!(
-                component = "reflex_dispatch",
-                reflex_id = %audit.reflex_id,
-                audit_id = %audit.audit_id,
-                detail = %error,
-                "reflex action-denied audit write failed"
-            );
-        }
+        // Durability-critical: the writer thread flushes the vault once this
+        // row lands, off the scheduler tick.
+        sink.enqueue_flushing(audit);
     }
 }
 

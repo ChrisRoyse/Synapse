@@ -90,34 +90,6 @@ const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const SHELL_ENV_DAEMON_STALE: &str = "SYNAPSE_SHELL_ENV_DAEMON_STALE";
 const SHELL_ENV_DURABLE_MISSING: &str = "SYNAPSE_SHELL_ENV_DURABLE_MISSING";
 const SHELL_ENV_DURABLE_INVALID: &str = "SYNAPSE_SHELL_ENV_DURABLE_INVALID";
-const PROCESS_BASE_ENV_KEYS: [&str; 26] = [
-    "PATH",
-    "PATHEXT",
-    "COMSPEC",
-    "SystemDrive",
-    "SystemRoot",
-    "WINDIR",
-    "TEMP",
-    "TMP",
-    "USERDOMAIN",
-    "USERNAME",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "ProgramData",
-    "ProgramFiles",
-    "ProgramFiles(x86)",
-    "ProgramW6432",
-    "CommonProgramFiles",
-    "CommonProgramFiles(x86)",
-    "CommonProgramW6432",
-    "CUDA_PATH",
-    "CUDA_PATH_V13_3",
-    "FORGE_CUDA_CCBIN",
-    "NVCC_CCBIN",
-    "NVCC_APPEND_FLAGS",
-    "NVCC_PREPEND_FLAGS",
-];
 const WINDOWS_DURABLE_ENV_OVERRIDE_KEYS: [&str; 6] = [
     "CUDA_PATH",
     "CUDA_PATH_V13_3",
@@ -132,6 +104,14 @@ const WINDOWS_MACHINE_ENVIRONMENT_SUBKEY: &str =
 #[cfg(windows)]
 const WINDOWS_USER_ENVIRONMENT_SUBKEY: &str = "Environment";
 #[cfg(windows)]
+const CHILD_ENV_INCOMPLETE_REMEDIATION: &str = concat!(
+    "The variable could not be found in the daemon's own environment, in ",
+    r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment, in HKCU\Environment, ",
+    "nor derived deterministically. Set it durably (setx / the relevant registry key) and restart ",
+    "the Synapse daemon so it inherits the repaired block, or pass it explicitly in the call's `env` map. ",
+    "Synapse refuses the spawn rather than handing the child an environment a normal Windows process would never have."
+);
+#[cfg(windows)]
 const WINDOWS_DEFAULT_PATHEXT: &str =
     ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW";
 #[cfg(windows)]
@@ -141,6 +121,16 @@ const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
 const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
 const SHELL_REMOTE_TRANSPORT_LOCAL: &str = "local";
 const SHELL_REMOTE_TRANSPORT_SSH: &str = "ssh";
+/// A `wsl.exe` invocation. The payload runs inside the WSL2 utility VM, which is
+/// a *separate kernel* with its own PID namespace: the Linux child is not a
+/// Windows process, is not in the Windows process table, and is not contained by
+/// the job's Windows kill-on-close job object. Microsoft additionally documents
+/// that `wslhost.exe` takes over the Linux process lifetime when `wsl.exe`
+/// terminates first, and that a wrapper kill only delivers `SIGHUP` to the Linux
+/// child when its streams are redirected. So `wsl.exe` liveness is neither
+/// necessary nor sufficient evidence about the payload and must never be
+/// classified as `local`.
+const SHELL_REMOTE_TRANSPORT_WSL: &str = "wsl";
 const SHELL_REMOTE_CLEANUP_NOT_APPLICABLE: &str = "not_applicable";
 const SHELL_REMOTE_CLEANUP_NOT_TRACKED: &str = "remote_process_not_tracked";
 const SHELL_REMOTE_CLEANUP_TRACKING_PENDING: &str = "remote_process_tracking_pending";
@@ -154,6 +144,15 @@ const SHELL_JOB_STATUS_REMOTE_TRANSPORT_LOST: &str = "transport_lost_process_may
 const SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE: &str =
     "remote_process_exited_local_transport_stale";
 const SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED: &str = "spawn_cleanup_unverified";
+/// Terminal status published by startup reconciliation for a durable job whose
+/// owning supervisor incarnation is gone. It is deliberately NOT a success: no
+/// exit code was ever observed, so the record says "interrupted" and carries the
+/// attribution evidence instead of synthesizing an outcome.
+const SHELL_JOB_STATUS_INTERRUPTED: &str = "interrupted";
+/// The WSL payload's `(distro, linux boot_id, linux pid, /proc/<pid>/stat
+/// starttime)` identity was never captured, so the durable record cannot tell a
+/// live Linux child from a dead `wsl.exe` wrapper.
+const SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED: &str = "wsl_linux_child_identity_untracked";
 const SHELL_REMOTE_CLEANUP_TRANSPORT_LOST: &str = "transport_lost_process_may_still_run";
 const SHELL_REMOTE_CLEANUP_ALREADY_GONE: &str = "remote_process_already_gone";
 const SHELL_REMOTE_PROCESS_MARKER: &str = "SYNAPSE_REMOTE_PROCESS_V1";
@@ -841,6 +840,76 @@ pub struct ActRunShellJobStatus {
     /// while the daemon retains the exact owner for bounded retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_failure: Option<ActRunShellSpawnFailureReadback>,
+    /// The synapse-mcp process that owns this job's monitor task and its
+    /// Windows kill-on-close job object. Recorded so a *later* daemon
+    /// incarnation can prove the previous owner is gone and publish an honest
+    /// terminal record instead of leaving `running` forever (#1808).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<ActRunShellSupervisorIdentity>,
+    /// Startup/crash reconciliation evidence. Present only on records that a
+    /// supervisor restart transitioned to a terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_reconciliation: Option<ActRunShellSupervisorReconciliation>,
+}
+
+/// Identity of the synapse-mcp supervisor process that owns a durable job.
+///
+/// Every durable child is assigned to a Windows job object created with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (see [`assign_owned_process_job`]). The
+/// kernel closes every handle of a dying process however it died — clean exit,
+/// unhandled exception, or `TerminateProcess` — so the owning supervisor's death
+/// destroys that job object and terminates the owned Windows process tree. That
+/// makes "the recorded supervisor incarnation is absent from the process table"
+/// a *proof* about the fate of the owned children, not a guess.
+///
+/// The kernel records no durable evidence of that reap (a job object dies with
+/// its owner, taking `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION` with it), so the
+/// attribution has to be written by us, ahead of time, into the job record.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActRunShellSupervisorIdentity {
+    /// Random per-daemon-process incarnation id, regenerated on every start
+    /// (the systemd `InvocationID` model). Two records with different
+    /// incarnation ids were started by different daemon processes even when the
+    /// OS recycled the pid.
+    pub incarnation_id: String,
+    pub pid: u32,
+    /// Windows: `GetProcessTimes` creation FILETIME in 100 ns ticks. Other
+    /// platforms: the kernel start-time value exposed by sysinfo.
+    pub start_time: u64,
+    pub start_time_source: String,
+    /// How this supervisor contains the job's owned children.
+    pub child_containment: String,
+    pub started_at: String,
+}
+
+/// Why a durable `running` record was terminated by a later supervisor.
+///
+/// `cause` is deliberately separate from `exit_code`, and `exit_code_trustworthy`
+/// is explicit: a job reaped by job-object close never produced an observed exit
+/// status, so the record must say the code is unknown rather than synthesize one.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActRunShellSupervisorReconciliation {
+    /// `supervisor_restart_children_reaped_by_job_object_close` |
+    /// `supervisor_restart_child_absent_containment_unknown` |
+    /// `supervisor_restart_child_never_had_creation_identity`
+    pub cause: String,
+    /// `absent_no_clean_shutdown_marker` (crash, kill, or power loss) |
+    /// `absent_clean_shutdown_marker` (graceful stop) |
+    /// `absent_no_supervisor_recorded` (record predates supervisor identity).
+    pub prior_supervisor_state: String,
+    pub prior_supervisor_incarnation_id: Option<String>,
+    pub prior_supervisor_pid: Option<u32>,
+    pub prior_supervisor_identity_state: String,
+    pub reconciling_supervisor_incarnation_id: String,
+    pub reconciling_supervisor_pid: u32,
+    pub child_containment: String,
+    pub child_identity_state: String,
+    pub children_terminated_by: String,
+    pub exit_code_trustworthy: bool,
+    pub observation_source: String,
+    pub observed_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -6535,6 +6604,638 @@ fn reap_stale_shell_jobs_with_ttl(ttl: Duration) -> Result<ShellJobReapReadback,
     Ok(readback)
 }
 
+const SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT: &str = "windows_job_object_kill_on_job_close";
+const SHELL_SUPERVISOR_CONTAINMENT_NONE: &str = "no_kill_on_close_containment";
+const SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX: &str = "unavailable:";
+const SHELL_SUPERVISOR_MARKER_FILE: &str = "supervisor.json";
+
+static SHELL_JOB_SUPERVISOR_IDENTITY: OnceLock<ActRunShellSupervisorIdentity> = OnceLock::new();
+
+/// This daemon process's durable-shell-job supervisor identity, computed once.
+///
+/// If the process cannot read its own kernel creation identity the record is
+/// still written, but with an `unavailable:` source so that
+/// [`shell_supervisor_identity_is_provable`] refuses to use it as absence proof
+/// later. Degrading silently to a bare pid would let a *recycled* pid look like
+/// a live supervisor (or a live supervisor look dead), so it fails closed.
+fn shell_job_supervisor_identity() -> &'static ActRunShellSupervisorIdentity {
+    SHELL_JOB_SUPERVISOR_IDENTITY.get_or_init(|| {
+        let pid = std::process::id();
+        let (start_time, start_time_source) = match capture_local_process_identity(pid) {
+            Ok(identity) => (identity.start_time, identity.start_time_source),
+            Err(detail) => {
+                tracing::error!(
+                    code = "M4_SHELL_JOB_SUPERVISOR_IDENTITY_UNAVAILABLE",
+                    pid,
+                    detail = %detail,
+                    "durable shell-job supervisor could not read its own kernel process creation identity; \
+                     after a restart, orphan reconciliation will REFUSE to publish terminal records for this \
+                     incarnation's jobs because it cannot prove this supervisor is gone. Fix the process query \
+                     failure named in `detail` (usually a denied OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) \
+                     or a failing GetProcessTimes) and restart the daemon."
+                );
+                (
+                    0,
+                    format!("{SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX}{detail}"),
+                )
+            }
+        };
+        ActRunShellSupervisorIdentity {
+            incarnation_id: uuid::Uuid::new_v4().simple().to_string(),
+            pid,
+            start_time,
+            start_time_source,
+            child_containment: if cfg!(windows) {
+                SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT
+            } else {
+                SHELL_SUPERVISOR_CONTAINMENT_NONE
+            }
+            .to_owned(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        }
+    })
+}
+
+/// Whether a recorded supervisor identity is strong enough to prove absence.
+/// A zero/unavailable creation time cannot be compared against a live process.
+fn shell_supervisor_identity_is_provable(identity: &ActRunShellSupervisorIdentity) -> bool {
+    identity.start_time != 0
+        && !identity
+            .start_time_source
+            .starts_with(SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX)
+}
+
+fn shell_supervisor_process_identity(
+    identity: &ActRunShellSupervisorIdentity,
+) -> ActRunShellLocalProcessIdentity {
+    ActRunShellLocalProcessIdentity {
+        pid: identity.pid,
+        start_time: identity.start_time,
+        start_time_source: identity.start_time_source.clone(),
+    }
+}
+
+fn local_process_identity_state_label(state: &LocalProcessIdentityState) -> String {
+    match state {
+        LocalProcessIdentityState::Match => "match".to_owned(),
+        LocalProcessIdentityState::Exited => "exited".to_owned(),
+        LocalProcessIdentityState::Absent => "absent".to_owned(),
+        LocalProcessIdentityState::Mismatch(actual) => format!(
+            "mismatch:actual_start_time={}:source={}",
+            actual.start_time, actual.start_time_source
+        ),
+        LocalProcessIdentityState::Unreadable(detail) => format!("unreadable:{detail}"),
+    }
+}
+
+/// On-disk record of the daemon incarnation that currently owns the durable
+/// shell-job store.
+///
+/// This is the crash-vs-clean-shutdown discriminator (PostgreSQL `pg_control`
+/// `DB_SHUTDOWNED`, Kafka `.kafka_cleanshutdown`, systemd `InvocationID`): the
+/// running daemon writes it with `clean_shutdown_at: null` at startup and
+/// rewrites it with a timestamp when it releases the shell-job store lifetime
+/// lock. A successor that finds `clean_shutdown_at: null` knows the previous
+/// incarnation never got to shut down.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobSupervisorMarker {
+    schema_version: u32,
+    incarnation_id: String,
+    pid: u32,
+    start_time: u64,
+    start_time_source: String,
+    child_containment: String,
+    started_at: String,
+    clean_shutdown_at: Option<String>,
+}
+
+fn shell_job_supervisor_marker_path() -> Result<PathBuf, ErrorData> {
+    Ok(shell_job_root_dir()?.join(SHELL_SUPERVISOR_MARKER_FILE))
+}
+
+fn shell_job_supervisor_marker_for(
+    identity: &ActRunShellSupervisorIdentity,
+    clean_shutdown_at: Option<String>,
+) -> ShellJobSupervisorMarker {
+    ShellJobSupervisorMarker {
+        schema_version: 1,
+        incarnation_id: identity.incarnation_id.clone(),
+        pid: identity.pid,
+        start_time: identity.start_time,
+        start_time_source: identity.start_time_source.clone(),
+        child_containment: identity.child_containment.clone(),
+        started_at: identity.started_at.clone(),
+        clean_shutdown_at,
+    }
+}
+
+/// Read the predecessor's marker, if any. A marker that exists but cannot be
+/// decoded is reported as an error rather than treated as absent: silently
+/// downgrading it would attribute a graceful shutdown as a crash.
+fn read_shell_job_supervisor_marker(
+    path: &Path,
+) -> Result<Option<ShellJobSupervisorMarker>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read durable shell-job supervisor marker {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_slice::<ShellJobSupervisorMarker>(&bytes)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "durable shell-job supervisor marker {} did not decode: {error}",
+                path.display()
+            )
+        })
+}
+
+/// Record that this daemon released the durable shell-job store gracefully.
+///
+/// Called from the single graceful lifetime-lock close path shared by the stdio
+/// and HTTP daemons. Its absence at the next startup is what distinguishes a
+/// crash/kill/power-loss from an orderly stop.
+pub fn mark_shell_job_supervisor_clean_shutdown() {
+    let identity = shell_job_supervisor_identity();
+    let path = match shell_job_supervisor_marker_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_SUPERVISOR_CLEAN_SHUTDOWN_PATH_FAILED",
+                incarnation_id = %identity.incarnation_id,
+                detail = %error.message,
+                "could not resolve the durable shell-job supervisor marker path at shutdown; the next \
+                 daemon start will attribute this exit as `absent_no_clean_shutdown_marker`"
+            );
+            return;
+        }
+    };
+    let marker = shell_job_supervisor_marker_for(identity, Some(chrono::Utc::now().to_rfc3339()));
+    if let Err(error) = write_pretty_json_file(&path, &marker, "supervisor_marker") {
+        tracing::error!(
+            code = "M4_SHELL_JOB_SUPERVISOR_CLEAN_SHUTDOWN_WRITE_FAILED",
+            incarnation_id = %identity.incarnation_id,
+            path = %path_string(&path),
+            detail = %error.message,
+            "could not persist the durable shell-job clean-shutdown marker; the next daemon start will \
+             attribute this exit as `absent_no_clean_shutdown_marker` (crash) even though it was graceful"
+        );
+    } else {
+        tracing::info!(
+            code = "M4_SHELL_JOB_SUPERVISOR_CLEAN_SHUTDOWN_RECORDED",
+            incarnation_id = %identity.incarnation_id,
+            path = %path_string(&path),
+            "readback=shell_job_supervisor_marker after=clean_shutdown_recorded"
+        );
+    }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ShellJobSupervisorRestartReadback {
+    pub incarnation_id: String,
+    pub supervisor_pid: u32,
+    pub supervisor_identity_provable: bool,
+    pub prior_supervisor_state: String,
+    pub prior_incarnation_id: Option<String>,
+    pub job_root: Option<String>,
+    pub scanned_job_dirs: usize,
+    pub live_status_jobs: usize,
+    pub interrupted_jobs: usize,
+    pub retained_live_child_jobs: usize,
+    pub retained_unprovable_jobs: usize,
+    pub retained_foreign_supervisor_jobs: usize,
+    pub write_failures: usize,
+    pub interrupted_job_ids_sample: Vec<String>,
+    pub retained_job_ids_sample: Vec<String>,
+}
+
+/// Reconcile durable `running`/`cancel_requested` records left behind by a
+/// previous daemon incarnation (#1808).
+///
+/// Before this pass existed, the only reconciliation of a dead-pid `running`
+/// record happened on an explicit `act_run_shell_status` read or on cleanup of
+/// the *owning* session. A crash destroys the session, so nothing ever read
+/// those records again and they stayed `"status": "running"` forever while their
+/// process trees had already been reaped by the job object closing with the
+/// dying daemon. An agent polling the store would believe an expensive job was
+/// still protected.
+///
+/// The pass is strictly evidence-driven and fails closed in every uncertain
+/// case: it only publishes a terminal record when it can prove BOTH that the
+/// owning supervisor incarnation is gone AND that the child's exact creation
+/// identity is gone.
+fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
+-> Result<ShellJobSupervisorRestartReadback, ErrorData> {
+    let identity = shell_job_supervisor_identity();
+    let marker_path = shell_job_supervisor_marker_path()?;
+    let prior_marker = match read_shell_job_supervisor_marker(&marker_path) {
+        Ok(marker) => marker,
+        Err(detail) => {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "daemon startup could not read the durable shell-job supervisor marker: {detail}. \
+                     Refusing to guess whether the previous daemon shut down cleanly. Inspect {} and \
+                     delete it only if you accept that the previous exit will be attributed as a crash.",
+                    marker_path.display()
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "path": marker_path,
+                    "reason": "shell_job_supervisor_marker_unreadable",
+                    "detail": detail,
+                }),
+            ));
+        }
+    };
+    let prior_supervisor_state = match prior_marker.as_ref() {
+        Some(marker) if marker.clean_shutdown_at.is_some() => "absent_clean_shutdown_marker",
+        Some(_) => "absent_no_clean_shutdown_marker",
+        None => "absent_no_supervisor_recorded",
+    };
+    let root = shell_durable_job_root_dir()?;
+    let mut readback = ShellJobSupervisorRestartReadback {
+        incarnation_id: identity.incarnation_id.clone(),
+        supervisor_pid: identity.pid,
+        supervisor_identity_provable: shell_supervisor_identity_is_provable(identity),
+        prior_supervisor_state: prior_supervisor_state.to_owned(),
+        prior_incarnation_id: prior_marker
+            .as_ref()
+            .map(|marker| marker.incarnation_id.clone()),
+        job_root: Some(path_string(&root)),
+        scanned_job_dirs: 0,
+        live_status_jobs: 0,
+        interrupted_jobs: 0,
+        retained_live_child_jobs: 0,
+        retained_unprovable_jobs: 0,
+        retained_foreign_supervisor_jobs: 0,
+        write_failures: 0,
+        interrupted_job_ids_sample: Vec::new(),
+        retained_job_ids_sample: Vec::new(),
+    };
+    if root.exists() {
+        let entries = fs::read_dir(&root).map_err(|error| {
+            shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "daemon startup supervisor-restart reconciliation could not read the durable shell-job root {}: {error}",
+                    root.display()
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "path": root,
+                    "reason": "supervisor_restart_job_root_read_failed",
+                }),
+            )
+        })?;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let job_dir = entry.path();
+            if !job_dir.is_dir() {
+                continue;
+            }
+            let Some(job_id) = job_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            if validate_shell_job_id(&job_id).is_err() {
+                continue;
+            }
+            readback.scanned_job_dirs = readback.scanned_job_dirs.saturating_add(1);
+            let paths = shell_job_paths_from_root(&root, &job_id);
+            // A record this pass cannot read is handled by the corrupt-job
+            // recovery gate that runs immediately after; never guess here.
+            let Ok(job) = read_shell_job_status(&paths.status_path, &job_id) else {
+                continue;
+            };
+            if !shell_job_live_status(&job.status) {
+                continue;
+            }
+            readback.live_status_jobs = readback.live_status_jobs.saturating_add(1);
+            reconcile_one_orphaned_shell_job(
+                job,
+                &paths,
+                identity,
+                prior_supervisor_state,
+                &mut readback,
+            );
+        }
+    }
+    // Claim the store for this incarnation only after the predecessor's marker
+    // has been consumed, so a crash *during* this pass leaves the predecessor's
+    // evidence intact for the next attempt.
+    let marker = shell_job_supervisor_marker_for(identity, None);
+    write_pretty_json_file(&marker_path, &marker, "supervisor_marker")?;
+    tracing::info!(
+        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_RECONCILED",
+        incarnation_id = %readback.incarnation_id,
+        supervisor_pid = readback.supervisor_pid,
+        supervisor_identity_provable = readback.supervisor_identity_provable,
+        prior_supervisor_state = %readback.prior_supervisor_state,
+        prior_incarnation_id = ?readback.prior_incarnation_id,
+        scanned_job_dirs = readback.scanned_job_dirs,
+        live_status_jobs = readback.live_status_jobs,
+        interrupted_jobs = readback.interrupted_jobs,
+        retained_live_child_jobs = readback.retained_live_child_jobs,
+        retained_unprovable_jobs = readback.retained_unprovable_jobs,
+        retained_foreign_supervisor_jobs = readback.retained_foreign_supervisor_jobs,
+        write_failures = readback.write_failures,
+        interrupted_job_ids_sample = ?readback.interrupted_job_ids_sample,
+        retained_job_ids_sample = ?readback.retained_job_ids_sample,
+        "readback=shell_job_supervisor_restart after=durable_job_root_scan"
+    );
+    Ok(readback)
+}
+
+/// Classify and, when provable, terminalize one orphaned durable record.
+fn reconcile_one_orphaned_shell_job(
+    mut job: ActRunShellJobStatus,
+    paths: &ShellJobPaths,
+    identity: &ActRunShellSupervisorIdentity,
+    prior_supervisor_state: &str,
+    readback: &mut ShellJobSupervisorRestartReadback,
+) {
+    let job_id = job.job_id.clone();
+    // 1. Is the supervisor that owned this record actually gone?
+    let (prior_state_label, prior_incarnation, prior_pid) = match job.supervisor.as_ref() {
+        Some(owner) if owner.incarnation_id == identity.incarnation_id => {
+            // This incarnation owns it; a live monitor task is authoritative.
+            return;
+        }
+        Some(owner) if !shell_supervisor_identity_is_provable(owner) => {
+            readback.retained_unprovable_jobs = readback.retained_unprovable_jobs.saturating_add(1);
+            push_shell_job_recovery_sample(&mut readback.retained_job_ids_sample, job_id.clone());
+            tracing::error!(
+                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_OWNER_UNPROVABLE",
+                job_id = %job_id,
+                owner_incarnation_id = %owner.incarnation_id,
+                owner_pid = owner.pid,
+                owner_start_time_source = %owner.start_time_source,
+                "durable shell job retained as live: the owning supervisor incarnation has no provable \
+                 kernel creation identity, so its absence cannot be proven and the record must not be \
+                 declared interrupted"
+            );
+            return;
+        }
+        Some(owner) => {
+            let state = local_process_identity_state(&shell_supervisor_process_identity(owner));
+            match state {
+                LocalProcessIdentityState::Match => {
+                    readback.retained_foreign_supervisor_jobs =
+                        readback.retained_foreign_supervisor_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_OWNER_STILL_LIVE",
+                        job_id = %job_id,
+                        owner_incarnation_id = %owner.incarnation_id,
+                        owner_pid = owner.pid,
+                        this_incarnation_id = %identity.incarnation_id,
+                        this_pid = identity.pid,
+                        "durable shell job retained as live: another synapse-mcp process with the recorded \
+                         supervisor creation identity is still running, so this daemon must not reconcile \
+                         its jobs. Two daemons are sharing one shell-job store — stop the extra instance."
+                    );
+                    return;
+                }
+                LocalProcessIdentityState::Unreadable(detail) => {
+                    readback.retained_unprovable_jobs =
+                        readback.retained_unprovable_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_OWNER_UNREADABLE",
+                        job_id = %job_id,
+                        owner_incarnation_id = %owner.incarnation_id,
+                        owner_pid = owner.pid,
+                        detail = %detail,
+                        "durable shell job retained as live: the owning supervisor process could not be \
+                         queried, which is uncertainty and never absence proof"
+                    );
+                    return;
+                }
+                other => (
+                    local_process_identity_state_label(&other),
+                    Some(owner.incarnation_id.clone()),
+                    Some(owner.pid),
+                ),
+            }
+        }
+        None => ("no_supervisor_recorded".to_owned(), None, None),
+    };
+
+    // 2. Is the child gone? Absence of the *exact creation identity* is the only
+    //    proof accepted here; a bare pid can have been recycled.
+    let child_state_label = match job.local_process_identity.as_ref() {
+        Some(child_identity) => {
+            let state = local_process_identity_state(child_identity);
+            match state {
+                LocalProcessIdentityState::Match => {
+                    readback.retained_live_child_jobs =
+                        readback.retained_live_child_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_SURVIVED",
+                        job_id = %job_id,
+                        pid = child_identity.pid,
+                        child_containment = %identity.child_containment,
+                        "durable shell job retained as live: its exact child creation identity is STILL \
+                         RUNNING after the owning supervisor exited. On Windows that should be impossible \
+                         under JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — the child either broke away from the \
+                         job object or was created outside it. No monitor owns it now; cancel it with \
+                         act_run_shell_cancel or terminate the pid manually."
+                    );
+                    return;
+                }
+                LocalProcessIdentityState::Unreadable(detail) => {
+                    readback.retained_unprovable_jobs =
+                        readback.retained_unprovable_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_UNREADABLE",
+                        job_id = %job_id,
+                        pid = child_identity.pid,
+                        detail = %detail,
+                        "durable shell job retained as live: its child process identity could not be read, \
+                         which is uncertainty and never absence proof"
+                    );
+                    return;
+                }
+                other => local_process_identity_state_label(&other),
+            }
+        }
+        None => {
+            // Legacy record with no creation identity. A pid alone can be
+            // recycled, so a *present* pid is not proof of life and an absent
+            // one is not proof of death — but the owning supervisor is proven
+            // gone, and with it the monitor that could ever finish this record.
+            match job.pid {
+                Some(pid) if shell_job_live_process_ids(&[pid]).contains(&pid) => {
+                    readback.retained_unprovable_jobs =
+                        readback.retained_unprovable_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_LEGACY_PID_PRESENT",
+                        job_id = %job_id,
+                        pid,
+                        "durable shell job retained as live: the record predates immutable process creation \
+                         identity and its numeric pid is still present in the process table, which may be a \
+                         recycled pid. Verify manually and cancel the job if the pid is not the original child."
+                    );
+                    return;
+                }
+                Some(pid) => format!("legacy_no_creation_identity:pid_absent:{pid}"),
+                None => "legacy_no_creation_identity:no_pid".to_owned(),
+            }
+        }
+    };
+
+    // 3. Both proven gone: publish the honest terminal record.
+    let children_terminated_by =
+        if identity.child_containment == SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT {
+            "windows_job_object_kill_on_job_close_when_owning_supervisor_process_exited".to_owned()
+        } else {
+            "unknown_no_kill_on_close_containment_on_this_platform".to_owned()
+        };
+    let cause = if job.local_process_identity.is_none() {
+        "supervisor_restart_child_never_had_creation_identity"
+    } else if identity.child_containment == SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT {
+        "supervisor_restart_children_reaped_by_job_object_close"
+    } else {
+        "supervisor_restart_child_absent_containment_unknown"
+    };
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let reconciliation = ActRunShellSupervisorReconciliation {
+        cause: cause.to_owned(),
+        prior_supervisor_state: prior_supervisor_state.to_owned(),
+        prior_supervisor_incarnation_id: prior_incarnation.clone(),
+        prior_supervisor_pid: prior_pid,
+        prior_supervisor_identity_state: prior_state_label.clone(),
+        reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
+        reconciling_supervisor_pid: identity.pid,
+        child_containment: identity.child_containment.clone(),
+        child_identity_state: child_state_label.clone(),
+        children_terminated_by: children_terminated_by.clone(),
+        // No exit status was ever observed for this child. Kubelet's rule: when
+        // the cause cannot be proven, say so — never synthesize `exit 0`.
+        exit_code_trustworthy: false,
+        observation_source: "daemon_startup_supervisor_restart_reconciliation".to_owned(),
+        observed_at: observed_at.clone(),
+    };
+    let prior_shutdown_sentence = match prior_supervisor_state {
+        "absent_clean_shutdown_marker" => {
+            "the previous daemon recorded a clean shutdown of the durable shell-job store"
+        }
+        "absent_no_clean_shutdown_marker" => {
+            "the previous daemon never recorded a clean shutdown of the durable shell-job store, so it \
+             crashed, was killed, or lost power"
+        }
+        _ => {
+            "no previous supervisor marker existed, so this store predates supervisor identity tracking \
+             and the previous exit mode is unknown"
+        }
+    };
+    job.status = SHELL_JOB_STATUS_INTERRUPTED.to_owned();
+    job.completed_at.get_or_insert_with(|| observed_at.clone());
+    job.duration_ms
+        .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
+    job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+    job.error_message = Some(format!(
+        "durable shell job was interrupted by a synapse-mcp supervisor restart and never produced an exit status. \
+         Owning supervisor incarnation {owner_incarnation} (pid {owner_pid}) is {prior_state}; {prior_shutdown_sentence}. \
+         This daemon is incarnation {this_incarnation} (pid {this_pid}). Child containment was {containment}; \
+         owned children were terminated by {children_terminated_by}. Child process identity readback: {child_state}. \
+         exit_code is unknown and MUST NOT be read as success.",
+        owner_incarnation = prior_incarnation.as_deref().unwrap_or("<unrecorded>"),
+        owner_pid = prior_pid.map_or_else(|| "<unrecorded>".to_owned(), |pid| pid.to_string()),
+        prior_state = prior_state_label,
+        this_incarnation = identity.incarnation_id,
+        this_pid = identity.pid,
+        containment = identity.child_containment,
+        child_state = child_state_label,
+    ));
+    job.supervisor_reconciliation = Some(reconciliation);
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!(
+            "supervisor_restart_reconciliation:cause={cause}:prior_state={prior_supervisor_state}"
+        ),
+    );
+    // The transport wrapper died with the daemon, so nothing ever proved the
+    // remote payload stopped. Say so loudly instead of leaving a silent gap.
+    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL {
+        mark_shell_job_wsl_child_unverified(
+            &mut job,
+            "daemon_startup_supervisor_restart_reconciliation",
+        );
+    } else if job.remote_process_scope.remote_cleanup_required
+        && !job.remote_process_scope.remote_cleanup_verified
+    {
+        mark_shell_job_remote_cleanup_unverified(
+            &mut job,
+            "daemon_startup_supervisor_restart_reconciliation",
+            "supervisor_restart_terminated_local_transport_before_remote_cleanup",
+        );
+    }
+    match write_shell_job_reconciliation_status(paths, job) {
+        Ok(persisted) => {
+            readback.interrupted_jobs = readback.interrupted_jobs.saturating_add(1);
+            push_shell_job_recovery_sample(
+                &mut readback.interrupted_job_ids_sample,
+                job_id.clone(),
+            );
+            tracing::error!(
+                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_INTERRUPTED",
+                job_id = %job_id,
+                status = %persisted.status,
+                cause,
+                prior_supervisor_state,
+                prior_supervisor_incarnation_id = ?prior_incarnation,
+                child_identity_state = %child_state_label,
+                children_terminated_by = %children_terminated_by,
+                "published an honest terminal record for a durable shell job orphaned by a supervisor restart"
+            );
+        }
+        Err(error) => {
+            readback.write_failures = readback.write_failures.saturating_add(1);
+            push_shell_job_recovery_sample(&mut readback.retained_job_ids_sample, job_id.clone());
+            tracing::error!(
+                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_WRITE_FAILED",
+                job_id = %job_id,
+                detail = %error.message,
+                data = ?error.data,
+                "could not persist the terminal record for a durable shell job orphaned by a supervisor \
+                 restart; the record still claims to be running. Fix the storage failure named in `detail` \
+                 and restart the daemon, or read the job with act_run_shell_status to force reconciliation."
+            );
+        }
+    }
+}
+
 /// Required corrupt-job recovery gate plus best-effort stale-job retention for
 /// daemon startup. A corrupt directory whose evidence disposition or remote
 /// state cannot be proved prevents the daemon from accepting requests. Once
@@ -6596,6 +7297,41 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
         bytes_quarantined = corrupt_readback.bytes_quarantined,
         "daemon startup completed corrupt durable shell-job recovery"
     );
+    // Orphan reconciliation runs after the corrupt-record gate (so every record
+    // it reads is structurally valid) and before the TTL reaper (so a record it
+    // terminalizes can be reaped in the same pass once aged).
+    let restart_readback = match reconcile_orphaned_shell_jobs_after_supervisor_restart() {
+        Ok(readback) => readback,
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_SUPERVISOR_RESTART_RECONCILE_FAILED",
+                detail = %error.message,
+                data = ?error.data,
+                "daemon startup could not reconcile durable shell jobs orphaned by a previous supervisor; \
+                 refusing startup rather than serving records that still claim to be running"
+            );
+            return Err(error);
+        }
+    };
+    if restart_readback.write_failures > 0 {
+        tracing::error!(
+            code = "M4_SHELL_JOB_SUPERVISOR_RESTART_RECONCILE_INCOMPLETE",
+            write_failures = restart_readback.write_failures,
+            live_status_jobs = restart_readback.live_status_jobs,
+            interrupted_jobs = restart_readback.interrupted_jobs,
+            "refusing daemon startup because one or more orphaned durable shell-job records could not be \
+             transitioned out of `running` after a supervisor restart"
+        );
+        return Err(shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "daemon startup refused: durable shell jobs orphaned by a supervisor restart still claim to be running",
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "reason": "startup_supervisor_restart_reconciliation_incomplete",
+                "readback": restart_readback,
+            }),
+        ));
+    }
     match reap_stale_shell_jobs() {
         Ok(readback) => tracing::info!(
             code = "M4_SHELL_JOB_REAP_STARTUP",
@@ -9536,15 +10272,55 @@ pub(crate) fn launch_child_environment(
     Ok(env.into_values().collect())
 }
 
+/// Builds the base environment every Synapse-spawned child receives.
+///
+/// # Why this is full inheritance and not an allow-list (#768)
+///
+/// `CreateProcess` with `lpEnvironment = NULL` gives a child a verbatim copy of
+/// the parent block, so *faithful inheritance* is what "a normal Windows
+/// process" means. `act_run_shell`/`act_launch` deliberately call `env_clear()`
+/// so the block is deterministic and auditable, which means this function has to
+/// reproduce that baseline explicitly.
+///
+/// It used to copy a hand-maintained 26-key allow-list out of the daemon
+/// environment. Every standard variable outside that list was silently dropped
+/// even when the daemon itself had it — `OS`, `PROCESSOR_ARCHITECTURE`,
+/// `NUMBER_OF_PROCESSORS`, `COMPUTERNAME`, `HOMEDRIVE`, `HOMEPATH`, `PUBLIC`,
+/// `ALLUSERSPROFILE`, `SESSIONNAME`, `LOGONSERVER`, `PSModulePath`, `DriverData`
+/// and every user tool/credential variable. That is the #768 class defect and
+/// the cause of its 2026-07-23 recurrence: a launcher guarded by
+/// `if ($env:OS -ne "Windows_NT")` refused inside a Synapse shell job because
+/// `OS` was never on the list, while `env: {"OS":"Windows_NT"}` per call worked.
+///
+/// The layering mirrors what winlogon + `CreateEnvironmentBlock` do at logon:
+///
+/// 1. every variable of the daemon process (faithful inheritance),
+/// 2. every value under `HKLM\...\Session Manager\Environment` then
+///    `HKCU\Environment` — this repairs a daemon whose own block is stale or
+///    impoverished (e.g. a Scheduled-Task launch, or persisted variables added
+///    after the daemon started), which inheritance alone cannot fix,
+/// 3. deterministic Windows standard/profile derivations.
+///
+/// Callers then run [`validate_child_base_environment`], which fails the spawn
+/// closed and names any required variable that still could not be resolved.
 fn child_base_environment() -> BTreeMap<String, (String, String)> {
     let mut env: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) = std::env::var_os(key) {
-            env.insert(
-                key.to_ascii_uppercase(),
-                (key.to_owned(), value.to_string_lossy().into_owned()),
+    for (raw_key, raw_value) in std::env::vars_os() {
+        let (Some(key), Some(value)) = (raw_key.to_str(), raw_value.to_str()) else {
+            tracing::error!(
+                code = "M4_CHILD_ENV_INHERIT_NON_UTF8",
+                key = %raw_key.to_string_lossy(),
+                "daemon environment variable is not valid UTF-8 and cannot be forwarded to child processes; re-set it with a UTF-8 value via setx or HKCU\\Environment"
             );
+            continue;
+        };
+        // Windows keeps hidden per-drive cwd entries (`=C:=C:\dir`) and an
+        // `=ExitCode` slot in the block. They are not inheritable variables and
+        // an `=` in a name would corrupt the child's environment block.
+        if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
+            continue;
         }
+        env.insert(key.to_ascii_uppercase(), (key.to_owned(), value.to_owned()));
     }
     add_windows_registry_environment(&mut env);
     add_windows_standard_environment(&mut env);
@@ -10068,28 +10844,126 @@ fn persisted_environment_source_of_truth() -> String {
     "process environment".to_owned()
 }
 
+/// Merges the durable Windows environment into the child block, machine first
+/// then user, exactly the way `CreateEnvironmentBlock` composes a logon
+/// environment.
+///
+/// Every value under both keys is enumerated. A fixed key list here would
+/// reintroduce the #768 defect from the registry side: a variable that the user
+/// persisted with `setx` after the daemon started would never reach a child,
+/// and the "durable registry is the Source of Truth" repair path would only
+/// work for variables somebody remembered to add to a constant.
 #[cfg(windows)]
 fn add_windows_registry_environment(env: &mut BTreeMap<String, (String, String)>) {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
-    for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) = read_windows_registry_environment_value(
+    for (root, subkey, source) in [
+        (
             HKEY_LOCAL_MACHINE,
             WINDOWS_MACHINE_ENVIRONMENT_SUBKEY,
-            key,
-        ) {
-            apply_windows_registry_environment_value(env, key, value, "machine");
+            "machine",
+        ),
+        (HKEY_CURRENT_USER, WINDOWS_USER_ENVIRONMENT_SUBKEY, "user"),
+    ] {
+        for key in windows_registry_environment_value_names(root, subkey) {
+            if let Some(value) = read_windows_registry_environment_value(root, subkey, &key) {
+                apply_windows_registry_environment_value(env, &key, value, source);
+            }
         }
     }
-    for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) = read_windows_registry_environment_value(
-            HKEY_CURRENT_USER,
-            WINDOWS_USER_ENVIRONMENT_SUBKEY,
-            key,
-        ) {
-            apply_windows_registry_environment_value(env, key, value, "user");
-        }
+}
+
+/// Enumerates the value names under one durable environment registry key.
+///
+/// Returns an empty list (with a structured warning) when the key cannot be
+/// opened or enumerated; the caller still fails closed afterwards through
+/// [`validate_child_base_environment`] if that loss made a required variable
+/// unresolvable.
+#[cfg(windows)]
+fn windows_registry_environment_value_names(
+    root: windows::Win32::System::Registry::HKEY,
+    subkey: &str,
+) -> Vec<String> {
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
+            System::Registry::{HKEY, KEY_READ, RegCloseKey, RegEnumValueW, RegOpenKeyExW},
+        },
+        core::{PCWSTR, PWSTR},
+    };
+
+    // Registry value names are capped at 16383 characters.
+    const MAX_VALUE_NAME_CHARS: usize = 16_384;
+
+    let subkey_wide = wide_null(subkey);
+    let mut key = HKEY::default();
+    let status = unsafe {
+        RegOpenKeyExW(
+            root,
+            PCWSTR(subkey_wide.as_ptr()),
+            None,
+            KEY_READ,
+            &raw mut key,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_REGISTRY_OPEN_FAILED",
+            subkey,
+            status = status.0,
+            "could not open the durable Windows environment registry key; child environments fall back to daemon inheritance plus deterministic derivation"
+        );
+        return Vec::new();
     }
+
+    let mut names = Vec::new();
+    let mut index = 0_u32;
+    loop {
+        let mut buffer = vec![0_u16; MAX_VALUE_NAME_CHARS];
+        let mut len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+        let status = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                Some(PWSTR(buffer.as_mut_ptr())),
+                &raw mut len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if status == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if status != ERROR_SUCCESS {
+            tracing::warn!(
+                code = "M4_CHILD_ENV_REGISTRY_ENUM_FAILED",
+                subkey,
+                index,
+                status = status.0,
+                "durable Windows environment registry enumeration stopped early; later values were not merged into the child environment"
+            );
+            break;
+        }
+        let name_len = (len as usize).min(buffer.len());
+        let name = String::from_utf16_lossy(&buffer[..name_len]);
+        if !name.is_empty() {
+            names.push(name);
+        }
+        index = index.saturating_add(1);
+    }
+
+    let close_status = unsafe { RegCloseKey(key) };
+    if close_status != ERROR_SUCCESS {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_REGISTRY_CLOSE_FAILED",
+            subkey,
+            status = close_status.0,
+            "RegCloseKey failed after enumerating the durable Windows environment key"
+        );
+    }
+    names
 }
 
 #[cfg(not(windows))]
@@ -10256,6 +11130,22 @@ fn add_windows_standard_environment(env: &mut BTreeMap<String, (String, String)>
             .to_string_lossy()
             .into_owned(),
     );
+    // Variables below are supplied by winlogon/`CreateEnvironmentBlock` at
+    // logon rather than by the registry, so they only reach a child through
+    // inheritance. Derive them from documented Windows invariants when the
+    // daemon's own block lacks them (a service/Scheduled-Task launch can),
+    // instead of shipping a child that a normal process would never see.
+    if let Some(program_data) = env_value(env, "ProgramData").map(ToOwned::to_owned) {
+        // ALLUSERSPROFILE and ProgramData name the same directory on Vista+.
+        insert_env_if_absent(env, "ALLUSERSPROFILE", program_data);
+    }
+    let public_dir = Path::new(&system_drive).join("Users").join("Public");
+    if public_dir.is_dir() {
+        insert_env_if_absent(env, "PUBLIC", public_dir.to_string_lossy().into_owned());
+    }
+    if let Some(computer_name) = windows_computer_name() {
+        insert_env_if_absent(env, "COMPUTERNAME", computer_name);
+    }
     insert_env_if_absent(
         env,
         "ProgramFiles",
@@ -10312,6 +11202,37 @@ fn windows_directory() -> Option<String> {
     }
     buffer.truncate(written as usize);
     Some(String::from_utf16_lossy(&buffer))
+}
+
+/// Reads the NetBIOS computer name, the value winlogon publishes as
+/// `COMPUTERNAME`.
+#[cfg(windows)]
+fn windows_computer_name() -> Option<String> {
+    use windows::{
+        Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW},
+        core::PWSTR,
+    };
+
+    // MAX_COMPUTERNAME_LENGTH is 15; size generously and let the API report the
+    // exact length it wrote.
+    let mut buffer = vec![0_u16; 256];
+    let mut len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+    if let Err(error) = unsafe {
+        GetComputerNameExW(
+            ComputerNameNetBIOS,
+            Some(PWSTR(buffer.as_mut_ptr())),
+            &raw mut len,
+        )
+    } {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_COMPUTERNAME_UNAVAILABLE",
+            detail = %error,
+            "GetComputerNameExW failed; COMPUTERNAME cannot be derived for child processes"
+        );
+        return None;
+    }
+    let len = (len as usize).min(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..len]))
 }
 
 #[cfg(windows)]
@@ -10450,19 +11371,36 @@ fn validate_child_base_environment(
     env: &BTreeMap<String, (String, String)>,
     surface: &'static str,
 ) -> Result<(), ErrorData> {
+    // Every variable a normally-launched Windows process is guaranteed to have
+    // and that real tooling reads. `OS`, `PROCESSOR_ARCHITECTURE` and
+    // `NUMBER_OF_PROCESSORS` come from HKLM Session Manager; the identity and
+    // home variables come from the logon block or the derivations above. None of
+    // them may be quietly absent: a child missing them is the #768 failure mode
+    // (a launcher gated on `$env:OS -eq 'Windows_NT'` refusing to run), so the
+    // spawn is refused here and names exactly what could not be resolved.
     let required = [
         "PATH",
         "PATHEXT",
         "ComSpec",
+        "SystemDrive",
         "SystemRoot",
         "windir",
+        "OS",
+        "USERNAME",
         "USERPROFILE",
+        "COMPUTERNAME",
+        "HOMEDRIVE",
+        "HOMEPATH",
         "APPDATA",
         "LOCALAPPDATA",
         "TEMP",
         "TMP",
+        "ALLUSERSPROFILE",
         "ProgramData",
         "ProgramFiles",
+        "PUBLIC",
+        "PROCESSOR_ARCHITECTURE",
+        "NUMBER_OF_PROCESSORS",
     ];
     let missing: Vec<&str> = required
         .into_iter()
@@ -10490,10 +11428,12 @@ fn validate_child_base_environment(
         surface,
         missing = ?missing,
         invalid = ?invalid,
+        daemon_pid = std::process::id(),
+        remediation = %CHILD_ENV_INCOMPLETE_REMEDIATION,
         "child process environment is missing required Windows variables"
     );
     let message = format!(
-        "{surface} cannot spawn a reliable Windows child process because Synapse could not construct required environment variables: missing=[{}] invalid=[{}]",
+        "{surface} cannot spawn a reliable Windows child process because Synapse could not construct required environment variables: missing=[{}] invalid=[{}]. {CHILD_ENV_INCOMPLETE_REMEDIATION}",
         missing.join(", "),
         invalid.join(", ")
     );
@@ -10504,6 +11444,14 @@ fn validate_child_base_environment(
         "missing": missing,
         "invalid": invalid,
         "required": required,
+        "daemon_pid": std::process::id(),
+        "sources": [
+            "daemon process environment (inherited verbatim)",
+            format!(r"HKLM\{WINDOWS_MACHINE_ENVIRONMENT_SUBKEY}"),
+            format!(r"HKCU\{WINDOWS_USER_ENVIRONMENT_SUBKEY}"),
+            "deterministic Windows derivation (SystemRoot/USERPROFILE/GetComputerNameExW)",
+        ],
+        "remediation": CHILD_ENV_INCOMPLETE_REMEDIATION,
     });
     if surface == "act_run_shell" {
         return Err(shell_tool_error(
@@ -10559,6 +11507,18 @@ fn add_windows_profile_environment(env: &mut BTreeMap<String, (String, String)>)
             .to_string_lossy()
             .into_owned(),
     );
+    // winlogon splits USERPROFILE into HOMEDRIVE + HOMEPATH; scripts and build
+    // tools (notably MSYS/Git-bash shims) read them directly.
+    if userprofile.as_bytes().get(1) == Some(&b':') {
+        insert_env_if_absent(env, "HOMEDRIVE", userprofile[..2].to_owned());
+        insert_env_if_absent(env, "HOMEPATH", userprofile[2..].to_owned());
+    } else {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_HOME_UNAVAILABLE",
+            userprofile = %userprofile,
+            "USERPROFILE is not a drive-qualified path; HOMEDRIVE and HOMEPATH cannot be derived"
+        );
+    }
     let system_drive = env
         .get("SYSTEMDRIVE")
         .map(|(_key, value)| value.as_str())
@@ -12659,6 +13619,11 @@ fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
     if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_LOCAL {
         return;
     }
+    if is_wsl_executable(&job.command) {
+        job.remote_process_scope =
+            wsl_remote_process_scope(&job.args, "direct_command_wsl:normalized_legacy_record");
+        return;
+    }
     if let Some(client) = ssh_family_client_for_executable(&job.command) {
         let evidence = if client == "ssh" {
             "direct_command_ssh".to_owned()
@@ -12672,7 +13637,11 @@ fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
 fn shell_job_remote_process_scope_from_start_params(
     params: &ActRunShellStartParams,
 ) -> ActRunShellRemoteProcessScope {
-    if let Some(invocation) = shell_job_remote_scope_invocation(&params.command, &params.args) {
+    if is_wsl_executable(&params.command) {
+        wsl_remote_process_scope(&params.args, "direct_command_wsl")
+    } else if let Some(invocation) =
+        shell_job_remote_scope_invocation(&params.command, &params.args)
+    {
         ssh_remote_process_scope(
             &invocation.command,
             &invocation.args,
@@ -12726,6 +13695,85 @@ fn ssh_remote_process_scope(
         remote_cleanup_error_code: None,
         remote_cleanup_message: None,
         detection_evidence,
+    }
+}
+
+fn is_wsl_executable(command: &str) -> bool {
+    matches!(
+        executable_leaf(command).to_ascii_lowercase().as_str(),
+        "wsl" | "wsl.exe"
+    )
+}
+
+/// Parse `-d`/`--distribution` out of a `wsl.exe` argv.
+///
+/// Option scanning stops at the first token that begins the payload — `--`,
+/// `-e`/`--exec`, or the first non-option word — so a `-d` that belongs to the
+/// Linux command is never mistaken for the distribution selector.
+fn wsl_distribution_from_args(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    while let Some(raw) = args.get(index) {
+        let arg = trim_arg_quotes(raw);
+        if matches!(arg, "--" | "-e" | "--exec") {
+            return None;
+        }
+        if let Some(value) = arg.strip_prefix("--distribution=") {
+            let value = trim_arg_quotes(value);
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+        if matches!(arg, "-d" | "--distribution") {
+            let value = trim_arg_quotes(args.get(index + 1)?);
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+        if matches!(arg, "-u" | "--user" | "--cd" | "--shell-type") {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Classify a `wsl.exe` job as its own remote transport.
+///
+/// Recording it as `local` (the previous behavior) asserted two false things:
+/// that the payload was inside the job's Windows kill-on-close job object, and
+/// that the wrapper's absence proved the payload had ended. Neither holds for
+/// WSL2 — the payload runs in the utility VM's own kernel and PID namespace.
+/// Cleanup is therefore required and starts out explicitly unverified.
+fn wsl_remote_process_scope(
+    args: &[String],
+    evidence: impl Into<String>,
+) -> ActRunShellRemoteProcessScope {
+    let distribution = wsl_distribution_from_args(args);
+    let mut detection_evidence = vec![evidence.into()];
+    detection_evidence.push(match distribution.as_deref() {
+        Some(distribution) => format!("wsl_distribution:{distribution}"),
+        None => "wsl_distribution:default_not_specified_on_argv".to_owned(),
+    });
+    detection_evidence.push(
+        "wsl_payload_outside_windows_job_object:separate_wsl2_kernel_and_pid_namespace".to_owned(),
+    );
+    detection_evidence.push(
+        "wsl_wrapper_liveness_is_not_payload_liveness:wslhost_exe_assumes_lifetime_and_redirected_kill_sends_only_sighup"
+            .to_owned(),
+    );
+    ActRunShellRemoteProcessScope {
+        transport: SHELL_REMOTE_TRANSPORT_WSL.to_owned(),
+        local_process_scope: "windows_wsl_exe_wrapper_process_tree_only".to_owned(),
+        remote_cleanup_required: true,
+        remote_cleanup_verified: false,
+        remote_cleanup_status: SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED.to_owned(),
+        remote_identity: Some(match distribution.as_deref() {
+            Some(distribution) => format!("wsl:{distribution}"),
+            None => "wsl:<default-distribution>".to_owned(),
+        }),
+        detection_evidence,
+        ..ActRunShellRemoteProcessScope::default()
     }
 }
 
@@ -13866,7 +14914,12 @@ raise SystemExit(exit_code if 0 <= exit_code <= 255 else 1)
 }
 
 fn ensure_shell_job_remote_scope_from_process_tree(job: &mut ActRunShellJobStatus) {
-    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH {
+    // A WSL job's scope is already the strictly stronger claim (payload outside
+    // the Windows job object, cleanup required and unverified). Never downgrade
+    // it to the SSH scope just because the wrapper tree happens to contain ssh.
+    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH
+        || job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL
+    {
         return;
     }
     let Some(pid) = job.pid else {
@@ -13925,6 +14978,12 @@ fn mark_shell_job_remote_cleanup_unverified(
     if !job.remote_process_scope.remote_cleanup_required {
         return;
     }
+    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL {
+        // WSL has its own failure mode and its own remediation; the SSH wording
+        // below would misdescribe it.
+        mark_shell_job_wsl_child_unverified(job, trigger);
+        return;
+    }
     let remote_identity = job
         .remote_process_scope
         .remote_identity
@@ -13939,6 +14998,57 @@ fn mark_shell_job_remote_cleanup_unverified(
     job.remote_process_scope.remote_cleanup_error_code =
         Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
     job.remote_process_scope.remote_cleanup_message = Some(message.clone());
+    if job.error_code.is_none() {
+        job.error_code = Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
+        job.error_message = Some(message);
+    }
+}
+
+/// Publish the honest verdict for a terminal WSL job.
+///
+/// The Windows `wsl.exe` wrapper is the only thing this daemon can observe: the
+/// payload runs in the WSL2 utility VM, in a different kernel and PID namespace,
+/// and is therefore outside the job's Windows kill-on-close job object. Microsoft
+/// documents that `wslhost.exe` assumes the Linux process's lifetime when
+/// `wsl.exe` exits first, and that a wrapper kill with redirected streams only
+/// delivers `SIGHUP`. So wrapper death is NOT evidence the payload stopped, and
+/// the record must say the remote state is unknown rather than imply cleanliness.
+fn mark_shell_job_wsl_child_unverified(job: &mut ActRunShellJobStatus, trigger: &'static str) {
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_WSL
+        || job.remote_process_scope.remote_cleanup_verified
+    {
+        return;
+    }
+    let remote_identity = job
+        .remote_process_scope
+        .remote_identity
+        .clone()
+        .unwrap_or_else(|| "wsl:<default-distribution>".to_owned());
+    let distribution = remote_identity
+        .strip_prefix("wsl:")
+        .unwrap_or("<default-distribution>")
+        .to_owned();
+    let message = format!(
+        "{trigger}: the Windows wsl.exe wrapper for '{remote_identity}' reached terminal status '{}', but the \
+         Linux payload was never bound to a WSL-side identity (distribution + /proc/sys/kernel/random/boot_id + \
+         linux pid + /proc/<pid>/stat field 22 starttime), so Synapse cannot prove whether it is still running. \
+         The Linux child lives in the WSL2 utility VM and is NOT contained by this job's Windows job object; \
+         wslhost.exe takes over its lifetime when wsl.exe exits, and a wrapper kill with redirected streams only \
+         delivers SIGHUP. Verify and clean up manually: `wsl.exe --list --running` (do NOT probe a stopped \
+         distribution — that restarts it and destroys the evidence), then \
+         `wsl.exe -d {distribution} -- ps -eo pid,lstart,args`.",
+        job.status
+    );
+    job.remote_process_scope.remote_cleanup_verified = false;
+    job.remote_process_scope.remote_cleanup_status =
+        SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED.to_owned();
+    job.remote_process_scope.remote_cleanup_error_code =
+        Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
+    job.remote_process_scope.remote_cleanup_message = Some(message.clone());
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!("wsl_child_liveness_unknown_at_terminal:{trigger}"),
+    );
     if job.error_code.is_none() {
         job.error_code = Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED.to_owned());
         job.error_message = Some(message);
@@ -14313,6 +15423,9 @@ fn verify_shell_job_remote_cleanup_after_terminal(
     trigger: &'static str,
     original_args: Option<&[String]>,
 ) {
+    if shell_job_terminal_status(&job.status) {
+        mark_shell_job_wsl_child_unverified(job, trigger);
+    }
     if !shell_job_terminal_status(&job.status)
         || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
         || !job.remote_process_scope.remote_cleanup_required
@@ -16194,6 +17307,8 @@ fn shell_job_status_record(
         remote_process_scope: shell_job_remote_process_scope_from_start_params(params),
         diagnostics: None,
         spawn_failure: None,
+        supervisor: Some(shell_job_supervisor_identity().clone()),
+        supervisor_reconciliation: None,
     };
     shell_job_status_with_safe_command_metadata(&status)
 }

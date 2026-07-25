@@ -130,11 +130,27 @@
   exercised without waiting for a random bridge outage.
 
 .PARAMETER InstallHealthTimeoutSeconds
-  Seconds to wait for the installed daemon to answer /health after the scheduled
-  task starts it. Defaults to 600 because the live Calyx-backed database can
-  spend several minutes in startup preflights before the HTTP listener is bound.
-  Setup still fails closed after the deadline and prints process/socket/startup
-  log readbacks before rollback.
+  Minimum seconds to wait for the installed daemon to answer /health after the
+  scheduled task starts it. Defaults to 600 because the live Calyx-backed
+  database can spend several minutes in startup preflights before the HTTP
+  listener is bound. This is a floor, not a ceiling: past this deadline setup
+  keeps waiting only while the daemon proves forward progress (new startup log
+  phase, CPU time burned, disk I/O transferred, or vault files mutated), and
+  fails closed the moment progress stops. Setup always prints
+  process/socket/startup log readbacks before rollback.
+
+.PARAMETER InstallHealthMaxSeconds
+  Absolute ceiling for the installed-daemon and rollback-daemon startup gates.
+  Reachable only while forward progress keeps being observed. A one-time Calyx
+  WAL-backlog paydown at open has been measured at ~40 minutes on this host, so
+  the default is 5400s (90 minutes). Hitting this ceiling is reported as its own
+  verdict (progress observed, budget exhausted) and never as a dead daemon.
+
+.PARAMETER InstallHealthProgressStallSeconds
+  How long the daemon may make zero forward progress (no new startup log phase,
+  no CPU time, no disk I/O, no vault file mutation) before setup declares it
+  hung and fails closed. Only armed after -InstallHealthTimeoutSeconds has
+  elapsed, so it can never shorten today's minimum wait.
 
 .PARAMETER ResumeChromeBridgePending
   Resume only a previously checkpointed chrome_bridge_activation phase. The
@@ -172,6 +188,10 @@ param(
     [AllowNull()][string]$AllowedPermissions = $(if ([string]::IsNullOrWhiteSpace($env:SYNAPSE_MCP_ALLOWED_PERMISSIONS)) { 'READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE' } else { $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS }),
     [ValidateRange(60, 3600)]
     [int]$InstallHealthTimeoutSeconds = 600,
+    [ValidateRange(600, 86400)]
+    [int]$InstallHealthMaxSeconds = 5400,
+    [ValidateRange(60, 3600)]
+    [int]$InstallHealthProgressStallSeconds = 300,
     [switch]$ManualInstallHealthRollbackProbe,
     [ValidateSet('normal','require_active_ack','force_unacknowledged')]
     [string]$ManualInstallHealthRollbackPauseMode = 'normal',
@@ -3347,6 +3367,665 @@ function Test-SynapseInstallHealthProgressSignalCanExtend {
         }
     }
     return $false
+}
+
+# ---------------------------------------------------------------------------
+# Startup progress watchdog (#1816)
+#
+# A daemon open that replays a Calyx WAL backlog is legitimately SILENT for many
+# minutes: the measured 2026-07-23 candidate emitted CALYX_ASTER_RECOVERY_START
+# at 01:08:32Z and its next startup log line (CALYX_ASTER_RECOVERY_MANIFEST_
+# LOADED) only at 01:25:58Z - a 17m26s gap with no log evidence at all. A gate
+# that can only see log lines therefore cannot tell "working hard" from "hung",
+# and a fixed wall-clock budget kills healthy candidates.
+#
+# So progress is sampled from four independent physical sources and ANY of them
+# advancing counts as forward progress:
+#   1. startup log phase advanced (and is not a terminal failure phase)
+#   2. candidate process CPU time advanced by a meaningful amount
+#   3. candidate process disk I/O transfer counters advanced by >= 1 MiB
+#   4. vault physical state changed (CURRENT pointer / manifest / cf / wal files)
+# A hung daemon burns no CPU, moves no bytes, writes no logs and mutates no
+# files, so it stalls out and is failed closed. Absence of progress is failure;
+# absence of evidence about progress is also failure, with its own verdict.
+# ---------------------------------------------------------------------------
+
+function Get-SynapseDaemonStartupPhaseCode {
+    param([AllowNull()][string]$ProgressKey)
+
+    if ([string]::IsNullOrWhiteSpace($ProgressKey)) {
+        return '<none>'
+    }
+    $codeMatches = [regex]::Matches($ProgressKey, '"code"\s*:\s*"(?<code>[A-Za-z0-9_]+)"')
+    if ($codeMatches.Count -gt 0) {
+        return $codeMatches[$codeMatches.Count - 1].Groups['code'].Value
+    }
+    return '<uncoded-line>'
+}
+
+function Get-SynapseDaemonStartupTerminalFailureLine {
+    param(
+        [AllowNull()]$Signal,
+        [AllowNull()][string]$DbPath,
+        [AllowNull()][string]$Bind
+    )
+
+    if (-not $Signal -or -not $Signal.matches -or @($Signal.matches).Count -eq 0) {
+        return $null
+    }
+    $terminalCodes = @(
+        'STORAGE_OR_CALYX_OPEN_START_FAILED',
+        'STORAGE_LOCK_CONTENDED',
+        'STORAGE_OPEN_FAILED',
+        'SYNAPSE_CALYX_ASTER_OPEN_FAILED',
+        'CALYX_ASTER_ROUTER_OPEN_FAILED',
+        'MCP_HTTP_BIND_FAILED'
+    )
+    # Terminal lines are only honoured when they can be attributed to THIS
+    # daemon (db path or bind appears in the line). synapse.log is shared by
+    # candidate-preflight daemons, and a misattributed terminal line would kill
+    # a healthy candidate - exactly the failure mode being fixed.
+    $attribution = @()
+    if (-not [string]::IsNullOrWhiteSpace($DbPath)) {
+        $attribution += $DbPath
+        $attribution += ([string]$DbPath).Replace('\', '\\')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Bind)) {
+        $attribution += $Bind
+    }
+    if ($attribution.Count -eq 0) {
+        return $null
+    }
+    foreach ($entry in @($Signal.matches)) {
+        $text = [string]$entry.line
+        foreach ($code in $terminalCodes) {
+            if ($text.IndexOf($code, [System.StringComparison]::Ordinal) -lt 0) { continue }
+            foreach ($needle in $attribution) {
+                if ($text.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    return $text
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-SynapseDaemonProcessWorkCounterSample {
+    param([AllowNull()][object[]]$Processes)
+
+    $ids = @(@($Processes) | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_.ProcessId } | Sort-Object)
+    $sample = [ordered]@{
+        Readable = $false
+        Error = $null
+        ProcessIds = $ids
+        CpuTicks = [double]0
+        IoBytes = [double]0
+        Detail = '<none>'
+    }
+    if ($ids.Count -eq 0) {
+        $sample.Detail = 'no_candidate_process'
+        return [pscustomobject]$sample
+    }
+    try {
+        $rows = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'synapse-mcp%.exe'" -ErrorAction Stop |
+            Where-Object { $ids -contains [int]$_.ProcessId } |
+            Select-Object ProcessId, KernelModeTime, UserModeTime, ReadTransferCount, WriteTransferCount, OtherTransferCount)
+        if ($rows.Count -eq 0) {
+            $sample.Detail = 'candidate_process_exited_between_snapshots'
+            return [pscustomobject]$sample
+        }
+        $details = @()
+        foreach ($row in $rows) {
+            $cpuTicks = ([double]$row.KernelModeTime) + ([double]$row.UserModeTime)
+            $ioBytes = ([double]$row.ReadTransferCount) + ([double]$row.WriteTransferCount) + ([double]$row.OtherTransferCount)
+            $sample.CpuTicks = $sample.CpuTicks + $cpuTicks
+            $sample.IoBytes = $sample.IoBytes + $ioBytes
+            $details += ("pid={0} cpu_ms={1} io_bytes={2}" -f [int]$row.ProcessId, [int64]($cpuTicks / 10000), [int64]$ioBytes)
+        }
+        $sample.Readable = $true
+        $sample.Detail = ($details -join ' ')
+    } catch {
+        $sample.Error = (($_.Exception.Message) -replace '\s+', ' ').Trim()
+        $sample.Detail = "counter_read_failed: $($sample.Error)"
+    }
+    return [pscustomobject]$sample
+}
+
+function Get-SynapseVaultRecoveryFingerprint {
+    param([AllowNull()][string]$Path)
+
+    $fingerprint = [ordered]@{
+        Readable = $false
+        Path = $Path
+        Key = $null
+        Detail = '<none>'
+        Error = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        $fingerprint.Detail = 'vault_path_missing'
+        return [pscustomobject]$fingerprint
+    }
+    try {
+        $currentPointer = ''
+        $currentPath = Join-Path $Path 'CURRENT'
+        if (Test-Path -LiteralPath $currentPath -PathType Leaf) {
+            $currentPointer = ((Get-Content -LiteralPath $currentPath -Raw -ErrorAction Stop) -replace '\s+', '')
+        }
+        $newestTicks = [int64]0
+        $manifestFiles = @(Get-ChildItem -LiteralPath $Path -Filter 'manifest-*.json' -File -ErrorAction SilentlyContinue)
+        $manifestBytes = [double]0
+        if ($manifestFiles.Count -gt 0) {
+            $manifestBytes = [double](($manifestFiles | Measure-Object Length -Sum).Sum)
+            $newestManifest = [int64](@($manifestFiles | ForEach-Object { [int64]$_.LastWriteTimeUtc.Ticks } | Sort-Object -Descending)[0])
+            if ($newestManifest -gt $newestTicks) { $newestTicks = $newestManifest }
+        }
+        $cfCount = 0
+        $cfBytes = [double]0
+        $cfRoot = Join-Path $Path 'cf'
+        if (Test-Path -LiteralPath $cfRoot -PathType Container) {
+            $cfFiles = @(Get-ChildItem -LiteralPath $cfRoot -Recurse -File -ErrorAction SilentlyContinue)
+            if ($cfFiles.Count -gt 0) {
+                $cfCount = $cfFiles.Count
+                $cfBytes = [double](($cfFiles | Measure-Object Length -Sum).Sum)
+                $newestCf = [int64](@($cfFiles | ForEach-Object { [int64]$_.LastWriteTimeUtc.Ticks } | Sort-Object -Descending)[0])
+                if ($newestCf -gt $newestTicks) { $newestTicks = $newestCf }
+            }
+        }
+        $walCount = 0
+        $walBytes = [double]0
+        $walRoot = Join-Path $Path 'wal'
+        if (Test-Path -LiteralPath $walRoot -PathType Container) {
+            $walFiles = @(Get-ChildItem -LiteralPath $walRoot -Filter '*.wal' -File -ErrorAction SilentlyContinue)
+            if ($walFiles.Count -gt 0) {
+                $walCount = $walFiles.Count
+                $walBytes = [double](($walFiles | Measure-Object Length -Sum).Sum)
+                $newestWal = [int64](@($walFiles | ForEach-Object { [int64]$_.LastWriteTimeUtc.Ticks } | Sort-Object -Descending)[0])
+                if ($newestWal -gt $newestTicks) { $newestTicks = $newestWal }
+            }
+        }
+        $fingerprint.Key = ("current={0} manifests={1}/{2} cf={3}/{4} wal={5}/{6} newest_write_ticks={7}" -f `
+            $(if ([string]::IsNullOrWhiteSpace($currentPointer)) { '<none>' } else { $currentPointer }),
+            $manifestFiles.Count,
+            [int64]$manifestBytes,
+            $cfCount,
+            [int64]$cfBytes,
+            $walCount,
+            [int64]$walBytes,
+            $newestTicks)
+        $fingerprint.Readable = $true
+        $fingerprint.Detail = $fingerprint.Key
+    } catch {
+        $fingerprint.Error = (($_.Exception.Message) -replace '\s+', ' ').Trim()
+        $fingerprint.Detail = "vault_fingerprint_failed: $($fingerprint.Error)"
+    }
+    return [pscustomobject]$fingerprint
+}
+
+function Get-SynapseDaemonStartupProgressSample {
+    param(
+        [AllowNull()]$StartupLogSignal,
+        [AllowNull()][object[]]$CandidateProcesses,
+        [AllowNull()][string]$VaultPath
+    )
+
+    $counters = Get-SynapseDaemonProcessWorkCounterSample -Processes $CandidateProcesses
+    $vault = Get-SynapseVaultRecoveryFingerprint -Path $VaultPath
+    $logKey = Get-SynapseDaemonStartupProgressKey -Signal $StartupLogSignal
+    return [pscustomobject]@{
+        SampledAt = (Get-Date)
+        LogKey = $logKey
+        LogPhase = (Get-SynapseDaemonStartupPhaseCode -ProgressKey $logKey)
+        ProcessIds = @($counters.ProcessIds)
+        ProcessCount = @($counters.ProcessIds).Count
+        CountersReadable = $counters.Readable
+        CpuTicks = $counters.CpuTicks
+        IoBytes = $counters.IoBytes
+        CounterDetail = $counters.Detail
+        VaultReadable = $vault.Readable
+        VaultKey = $vault.Key
+        VaultDetail = $vault.Detail
+        Observable = ($counters.Readable -or $vault.Readable -or (-not [string]::IsNullOrWhiteSpace($logKey)))
+    }
+}
+
+function Compare-SynapseDaemonStartupProgressSample {
+    param(
+        [AllowNull()]$Previous,
+        [Parameter(Mandatory=$true)]$Current,
+        [double]$MinCpuTicksDelta = 2500000,
+        [double]$MinIoBytesDelta = 1048576
+    )
+
+    if ($null -eq $Previous) {
+        return [pscustomobject]@{
+            Advanced = $false
+            PidsChanged = $false
+            Reasons = @('baseline_sample')
+            Detail = 'baseline_sample'
+        }
+    }
+    $previousIds = (@($Previous.ProcessIds) -join ',')
+    $currentIds = (@($Current.ProcessIds) -join ',')
+    $pidsChanged = ($previousIds -ne $currentIds)
+    $reasons = @()
+    if ((-not [string]::IsNullOrWhiteSpace($Current.LogKey)) -and
+        ($Current.LogKey -ne $Previous.LogKey) -and
+        (Test-SynapseInstallHealthProgressSignalCanExtend -ProgressKey $Current.LogKey)) {
+        $reasons += ("startup_log_phase_advanced={0}" -f $Current.LogPhase)
+    }
+    if ($Current.CountersReadable -and $Previous.CountersReadable -and -not $pidsChanged) {
+        $cpuDelta = [double]$Current.CpuTicks - [double]$Previous.CpuTicks
+        $ioDelta = [double]$Current.IoBytes - [double]$Previous.IoBytes
+        if ($cpuDelta -ge $MinCpuTicksDelta) {
+            $reasons += ("cpu_time_advanced_ms={0}" -f [int64]($cpuDelta / 10000))
+        }
+        if ($ioDelta -ge $MinIoBytesDelta) {
+            $reasons += ("io_bytes_advanced={0}" -f [int64]$ioDelta)
+        }
+    }
+    if ($Current.VaultReadable -and $Previous.VaultReadable -and ($Current.VaultKey -ne $Previous.VaultKey)) {
+        $reasons += 'vault_physical_state_advanced'
+    }
+    return [pscustomobject]@{
+        Advanced = ($reasons.Count -gt 0)
+        PidsChanged = $pidsChanged
+        Reasons = @($reasons)
+        Detail = $(if ($reasons.Count -gt 0) { $reasons -join ',' } else { 'no_forward_progress' })
+    }
+}
+
+function New-SynapseDaemonStartupWatchdog {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('install','rollback')][string]$Phase,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [AllowNull()][string]$VaultPath,
+        [Parameter(Mandatory=$true)][int]$BaseTimeoutSeconds,
+        [Parameter(Mandatory=$true)][int]$MaxSeconds,
+        [Parameter(Mandatory=$true)][int]$StallSeconds,
+        [int]$SampleIntervalSeconds = 30
+    )
+
+    $startedAt = Get-Date
+    $effectiveMax = [Math]::Max($MaxSeconds, $BaseTimeoutSeconds)
+    $effectiveVault = $VaultPath
+    if ([string]::IsNullOrWhiteSpace($effectiveVault)) { $effectiveVault = $DbPath }
+    return [pscustomobject]@{
+        Phase = $Phase
+        LogDir = $LogDir
+        Bind = $Bind
+        DbPath = $DbPath
+        VaultPath = $effectiveVault
+        BaseTimeoutSeconds = $BaseTimeoutSeconds
+        MaxSeconds = $effectiveMax
+        StallSeconds = $StallSeconds
+        SampleIntervalSeconds = $SampleIntervalSeconds
+        StartedAt = $startedAt
+        SinceUtc = $startedAt.ToUniversalTime().AddSeconds(-5)
+        NextSampleAt = $startedAt
+        SampleCount = 0
+        PreviousSample = $null
+        LastSample = $null
+        LastProgressAt = $startedAt
+        LastProgressReason = 'watchdog_armed'
+        ProgressEventCount = 0
+        EverSawProcess = $false
+        ConsecutiveNoProcessSamples = 0
+        RestartCount = 0
+        TerminalFailureLine = $null
+        Verdict = 'continue'
+    }
+}
+
+function Format-SynapseDaemonStartupWatchdogState {
+    param([Parameter(Mandatory=$true)]$Watchdog)
+
+    $now = Get-Date
+    $sample = $Watchdog.LastSample
+    return ("watchdog_phase={0} verdict={1} elapsed_s={2} base_timeout_s={3} absolute_cap_s={4} stall_window_s={5} samples={6} progress_events={7} last_progress_at={8} last_progress_age_s={9} last_progress_reason={10} process_count={11} pids={12} ever_saw_process={13} restart_count={14} counters_readable={15} counter_detail={16} vault_readable={17} vault_key={18} startup_log_phase={19} terminal_failure_line={20}" -f `
+        $Watchdog.Phase,
+        $Watchdog.Verdict,
+        [int](($now - $Watchdog.StartedAt).TotalSeconds),
+        $Watchdog.BaseTimeoutSeconds,
+        $Watchdog.MaxSeconds,
+        $Watchdog.StallSeconds,
+        $Watchdog.SampleCount,
+        $Watchdog.ProgressEventCount,
+        $Watchdog.LastProgressAt.ToString('o'),
+        [int](($now - $Watchdog.LastProgressAt).TotalSeconds),
+        $Watchdog.LastProgressReason,
+        $(if ($sample) { $sample.ProcessCount } else { '<unsampled>' }),
+        $(if ($sample -and @($sample.ProcessIds).Count -gt 0) { (@($sample.ProcessIds) -join ',') } else { '<none>' }),
+        $Watchdog.EverSawProcess,
+        $Watchdog.RestartCount,
+        $(if ($sample) { $sample.CountersReadable } else { '<unsampled>' }),
+        $(if ($sample) { $sample.CounterDetail } else { '<unsampled>' }),
+        $(if ($sample) { $sample.VaultReadable } else { '<unsampled>' }),
+        $(if ($sample -and $sample.VaultKey) { $sample.VaultKey } else { '<none>' }),
+        $(if ($sample) { $sample.LogPhase } else { '<unsampled>' }),
+        $(if ([string]::IsNullOrWhiteSpace($Watchdog.TerminalFailureLine)) { '<none>' } else { $Watchdog.TerminalFailureLine }))
+}
+
+function Get-SynapseDaemonStartupWatchdogRemediation {
+    param(
+        [Parameter(Mandatory=$true)][string]$Verdict,
+        [Parameter(Mandatory=$true)][string]$Phase
+    )
+
+    switch ($Verdict) {
+        'terminal_failure' {
+            return "the $Phase daemon logged a terminal startup failure attributed to this bind/db; the quoted terminal_failure_line names the exact cause (storage/Calyx open, vault lock holder, or HTTP bind). Fix that cause - waiting longer cannot help."
+        }
+        'daemon_not_running' {
+            return "no $Phase daemon process for this bind/db was alive across two consecutive 30s samples after it had been seen running; the daemon exited instead of finishing startup. Inspect daemon-stderr-gen*.log for the exit and the launcher log for relaunch attempts."
+        }
+        'daemon_restart_loop' {
+            return "the $Phase daemon process id changed repeatedly during the startup gate, i.e. it is crash-looping under the supervisor rather than opening. Inspect daemon-stderr-gen*.log for the crash and daemon-supervisor-events.jsonl for the relaunch cadence."
+        }
+        'stalled' {
+            return "the $Phase daemon process is alive but made NO forward progress for the whole stall window: no new startup log phase, no CPU time burned, no disk bytes transferred and no vault file mutation. That is a hang, not a slow open. Capture a stack dump of the listed pid(s) and inspect the vault lock holder; do NOT raise the budget."
+        }
+        'absolute_cap' {
+            return "the $Phase daemon was STILL MAKING FORWARD PROGRESS when the absolute ceiling expired, so this is a budget verdict and not a dead daemon. Let the daemon finish its open, then rerun setup; if this vault legitimately needs longer, rerun with a larger -InstallHealthMaxSeconds justified by the recorded last_progress_reason."
+        }
+        'progress_unobservable' {
+            return "setup could not READ any progress evidence for the $Phase daemon (Win32_Process counters unreadable, vault directory unreadable and no startup log line). Setup fails closed rather than granting an unjustified extension. Fix the observability first: confirm the vault path is readable and that this session can query Win32_Process for synapse-mcp.exe."
+        }
+        'daemon_identity_mismatch' {
+            return "the $Phase daemon answered /health but is not the binary/arguments/supervisor child setup just installed; the quoted terminal_identity_failure names each mismatching field. A foreign daemon owns the bind - stop it and rerun setup."
+        }
+        'manual_probe_rejected_ready_daemon' {
+            return "-ManualInstallHealthRollbackProbe deliberately rejected a critical-ready daemon to exercise the rollback path; this is the requested probe outcome, not a daemon defect."
+        }
+        'manual_probe_bridge_ack_absolute_cap' {
+            return "-ManualInstallHealthRollbackProbe with pause mode require_active_ack never saw an active Chrome bridge host before the absolute ceiling; attach a real bridge host before rerunning the probe."
+        }
+        default {
+            return "unclassified $Phase startup watchdog verdict '$Verdict'; treat as a setup defect and report it with the full watchdog block."
+        }
+    }
+}
+
+function Update-SynapseDaemonStartupWatchdog {
+    param([Parameter(Mandatory=$true)]$Watchdog)
+
+    $now = Get-Date
+    if ($now -ge $Watchdog.NextSampleAt) {
+        $signal = Get-SynapseDaemonStartupLogSignal -LogDir $Watchdog.LogDir -SinceUtc $Watchdog.SinceUtc
+        $processSnapshot = @(Get-SynapseMcpProcessSnapshot)
+        $targets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot $processSnapshot -Bind $Watchdog.Bind -DbPath $Watchdog.DbPath)
+        $sample = Get-SynapseDaemonStartupProgressSample `
+            -StartupLogSignal $signal `
+            -CandidateProcesses $targets `
+            -VaultPath $Watchdog.VaultPath
+        $Watchdog.SampleCount = $Watchdog.SampleCount + 1
+        $comparison = Compare-SynapseDaemonStartupProgressSample -Previous $Watchdog.PreviousSample -Current $sample
+        if ($sample.ProcessCount -gt 0) {
+            $Watchdog.EverSawProcess = $true
+            $Watchdog.ConsecutiveNoProcessSamples = 0
+        } else {
+            $Watchdog.ConsecutiveNoProcessSamples = $Watchdog.ConsecutiveNoProcessSamples + 1
+        }
+        if ($comparison.PidsChanged -and $Watchdog.PreviousSample -and $Watchdog.PreviousSample.ProcessCount -gt 0 -and $sample.ProcessCount -gt 0) {
+            $Watchdog.RestartCount = $Watchdog.RestartCount + 1
+            Info ("WARN: SYNAPSE_STARTUP_WATCHDOG_PROCESS_IDENTITY_CHANGED phase={0} restart_count={1} previous_pids={2} current_pids={3} remediation=a daemon restart during the startup gate means the daemon exited; two restarts fail the gate closed" -f `
+                $Watchdog.Phase,
+                $Watchdog.RestartCount,
+                (@($Watchdog.PreviousSample.ProcessIds) -join ','),
+                (@($sample.ProcessIds) -join ','))
+        }
+        if ($comparison.Advanced) {
+            $Watchdog.LastProgressAt = $sample.SampledAt
+            $Watchdog.LastProgressReason = $comparison.Detail
+            $Watchdog.ProgressEventCount = $Watchdog.ProgressEventCount + 1
+        }
+        $terminalLine = Get-SynapseDaemonStartupTerminalFailureLine -Signal $signal -DbPath $Watchdog.DbPath -Bind $Watchdog.Bind
+        if ($terminalLine) {
+            $Watchdog.TerminalFailureLine = $terminalLine
+        }
+        $Watchdog.PreviousSample = $sample
+        $Watchdog.LastSample = $sample
+        $Watchdog.NextSampleAt = $now.AddSeconds($Watchdog.SampleIntervalSeconds)
+        Info ("SYNAPSE_STARTUP_WATCHDOG_SAMPLE phase={0} sample={1} elapsed_s={2} progress={3} reasons={4} base_remaining_s={5} absolute_remaining_s={6} stall_remaining_s={7} process_count={8} pids={9} log_phase={10} counters={11} vault={12}" -f `
+            $Watchdog.Phase,
+            $Watchdog.SampleCount,
+            [int](($now - $Watchdog.StartedAt).TotalSeconds),
+            $comparison.Advanced,
+            $comparison.Detail,
+            [int]([Math]::Max(0, $Watchdog.BaseTimeoutSeconds - ($now - $Watchdog.StartedAt).TotalSeconds)),
+            [int]([Math]::Max(0, $Watchdog.MaxSeconds - ($now - $Watchdog.StartedAt).TotalSeconds)),
+            [int]([Math]::Max(0, $Watchdog.StallSeconds - ($now - $Watchdog.LastProgressAt).TotalSeconds)),
+            $sample.ProcessCount,
+            $(if (@($sample.ProcessIds).Count -gt 0) { (@($sample.ProcessIds) -join ',') } else { '<none>' }),
+            $sample.LogPhase,
+            $sample.CounterDetail,
+            $(if ($sample.VaultKey) { $sample.VaultKey } else { '<unreadable>' }))
+    }
+
+    $elapsedSeconds = ($now - $Watchdog.StartedAt).TotalSeconds
+    $stallAgeSeconds = ($now - $Watchdog.LastProgressAt).TotalSeconds
+    $verdict = 'continue'
+    if (-not [string]::IsNullOrWhiteSpace($Watchdog.TerminalFailureLine)) {
+        $verdict = 'terminal_failure'
+    } elseif ($Watchdog.EverSawProcess -and $Watchdog.ConsecutiveNoProcessSamples -ge 2) {
+        $verdict = 'daemon_not_running'
+    } elseif ($Watchdog.RestartCount -ge 2) {
+        $verdict = 'daemon_restart_loop'
+    } elseif ($elapsedSeconds -lt $Watchdog.BaseTimeoutSeconds) {
+        $verdict = 'continue'
+    } elseif ($null -ne $Watchdog.LastSample -and -not $Watchdog.LastSample.Observable) {
+        $verdict = 'progress_unobservable'
+    } elseif ($elapsedSeconds -ge $Watchdog.MaxSeconds) {
+        $verdict = 'absolute_cap'
+    } elseif ($stallAgeSeconds -ge $Watchdog.StallSeconds) {
+        $verdict = 'stalled'
+    }
+    $Watchdog.Verdict = $verdict
+    return [pscustomobject]@{
+        Continue = ($verdict -eq 'continue')
+        Verdict = $verdict
+        ElapsedSeconds = [int]$elapsedSeconds
+        StallAgeSeconds = [int]$stallAgeSeconds
+        MadeProgress = ($Watchdog.ProgressEventCount -gt 0)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Rollback verdict facts (#1816)
+#
+# "The rollback daemon did not answer /health inside my window" is NOT the same
+# fact as "the rollback failed". On 2026-07-23 setup printed
+# SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_FAILED while the previous binary was
+# byte-for-byte restored and running under the supervisor - it was simply still
+# replaying the vault, and answered /health 9 minutes after setup gave up. The
+# operator therefore debugged the wrong binary for a full FSV cycle. The verdict
+# below is derived from PHYSICAL facts (restored bytes hash, live process
+# running those bytes, supervisor restart authority, forward progress) and only
+# says ROLLBACK_FAILED when one of those physical facts is actually missing.
+# ---------------------------------------------------------------------------
+
+function Get-SynapseRollbackPhysicalFacts {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$ExpectedSha256,
+        [AllowNull()][string]$BackupPath,
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$SupervisorPath,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [AllowNull()]$Watchdog,
+        [switch]$DaemonHealthy
+    )
+
+    $installedSha256 = '<missing>'
+    if (Test-Path -LiteralPath $ExePath -PathType Leaf) {
+        try {
+            $installedSha256 = Get-SynapseFileSha256 -Path $ExePath
+        } catch {
+            $installedSha256 = "<hash_failed: $((($_.Exception.Message) -replace '\s+', ' ').Trim())>"
+        }
+    }
+    $binaryRestored = ($installedSha256 -ieq $ExpectedSha256)
+
+    $taskState = '<unregistered>'
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($task) { $taskState = [string]$task.State }
+    } catch {
+        $taskState = "<task_query_failed: $((($_.Exception.Message) -replace '\s+', ' ').Trim())>"
+    }
+
+    $supervisorProcesses = @()
+    try {
+        $supervisorProcesses = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
+    } catch {
+        $supervisorProcesses = @()
+    }
+    $supervisorStatePath = Join-Path $LogDir 'daemon-supervisor-current.json'
+    $supervisorStateText = '<unreadable>'
+    $supervisorChildPid = 0
+    try {
+        $supervisorStateJson = (Get-Content -Raw -LiteralPath $supervisorStatePath -ErrorAction Stop) | ConvertFrom-Json
+        $supervisorStateText = [string]$supervisorStateJson.state
+        if ($null -ne $supervisorStateJson.child_pid) { $supervisorChildPid = [int]$supervisorStateJson.child_pid }
+    } catch {
+        $supervisorStateText = '<unreadable>'
+    }
+    $supervisorPresent = (@($supervisorProcesses).Count -gt 0) -or ($taskState -eq 'Running')
+
+    $daemonProcesses = @(Select-SynapseMcpDeployTargetProcesses `
+        -Snapshot @(Get-SynapseMcpProcessSnapshot) `
+        -Bind $Bind `
+        -DbPath $DbPath)
+    $daemonDetails = @()
+    $daemonRunningRestoredBytes = $false
+    foreach ($daemonProcess in $daemonProcesses) {
+        $processExePath = [string]$daemonProcess.ExecutablePath
+        $processSha256 = '<unreadable>'
+        if (-not [string]::IsNullOrWhiteSpace($processExePath) -and (Test-Path -LiteralPath $processExePath -PathType Leaf)) {
+            try {
+                $processSha256 = Get-SynapseFileSha256 -Path $processExePath
+            } catch {
+                $processSha256 = '<hash_failed>'
+            }
+        }
+        if ($processSha256 -ieq $ExpectedSha256) { $daemonRunningRestoredBytes = $true }
+        $daemonDetails += ("pid={0} path={1} sha256={2} matches_rollback_bytes={3}" -f `
+            $daemonProcess.ProcessId,
+            $(if ([string]::IsNullOrWhiteSpace($processExePath)) { '<unknown>' } else { $processExePath }),
+            $processSha256,
+            ($processSha256 -ieq $ExpectedSha256))
+    }
+    $daemonRunning = (@($daemonProcesses).Count -gt 0)
+
+    $watchdogVerdict = '<not-run>'
+    $watchdogMadeProgress = $false
+    $watchdogPhase = '<unknown>'
+    $lastProgressAgeSeconds = -1
+    $lastProgressReason = '<none>'
+    if ($Watchdog) {
+        $watchdogVerdict = [string]$Watchdog.Verdict
+        $watchdogMadeProgress = ($Watchdog.ProgressEventCount -gt 0)
+        $lastProgressReason = [string]$Watchdog.LastProgressReason
+        $lastProgressAgeSeconds = [int](((Get-Date) - $Watchdog.LastProgressAt).TotalSeconds)
+        if ($Watchdog.LastSample) { $watchdogPhase = [string]$Watchdog.LastSample.LogPhase }
+    }
+
+    if ($DaemonHealthy) {
+        $verdict = 'rolled_back_daemon_healthy'
+    } elseif (-not $binaryRestored) {
+        $verdict = 'rollback_failed_binary_not_restored'
+    } elseif (-not $daemonRunning) {
+        $verdict = 'rollback_failed_daemon_not_running'
+    } elseif (-not $daemonRunningRestoredBytes) {
+        $verdict = 'rollback_failed_daemon_running_foreign_bytes'
+    } elseif ($watchdogVerdict -in @('stalled', 'terminal_failure', 'daemon_restart_loop', 'progress_unobservable')) {
+        $verdict = 'rollback_failed_daemon_not_progressing'
+    } else {
+        $verdict = 'rolled_back_daemon_recovering'
+    }
+
+    return [pscustomobject]@{
+        Verdict = $verdict
+        RollbackSucceeded = ($verdict -eq 'rolled_back_daemon_healthy' -or $verdict -eq 'rolled_back_daemon_recovering')
+        ExePath = $ExePath
+        BackupPath = $(if ([string]::IsNullOrWhiteSpace($BackupPath)) { '<none>' } else { $BackupPath })
+        ExpectedSha256 = $ExpectedSha256
+        InstalledSha256 = $installedSha256
+        BinaryRestored = $binaryRestored
+        TaskName = $TaskName
+        TaskState = $taskState
+        SupervisorPath = $SupervisorPath
+        SupervisorProcessCount = @($supervisorProcesses).Count
+        SupervisorState = $supervisorStateText
+        SupervisorChildPid = $supervisorChildPid
+        SupervisorPresent = $supervisorPresent
+        DaemonRunning = $daemonRunning
+        DaemonRunningRestoredBytes = $daemonRunningRestoredBytes
+        DaemonDetail = $(if ($daemonDetails.Count -gt 0) { $daemonDetails -join ' | ' } else { '<none>' })
+        WatchdogVerdict = $watchdogVerdict
+        WatchdogMadeProgress = $watchdogMadeProgress
+        StartupLogPhase = $watchdogPhase
+        LastProgressReason = $lastProgressReason
+        LastProgressAgeSeconds = $lastProgressAgeSeconds
+    }
+}
+
+function Format-SynapseRollbackPhysicalFacts {
+    param([Parameter(Mandatory=$true)]$Facts)
+
+    return ("rollback_verdict={0} rollback_succeeded={1} binary_restored={2} install_path={3} expected_sha256={4} installed_sha256={5} backup={6} task={7} task_state={8} supervisor_present={9} supervisor_process_count={10} supervisor_state={11} supervisor_child_pid={12} daemon_running={13} daemon_running_restored_bytes={14} daemon_processes=[{15}] startup_watchdog_verdict={16} startup_log_phase={17} made_forward_progress={18} last_progress_reason={19} last_progress_age_s={20}" -f `
+        $Facts.Verdict,
+        $Facts.RollbackSucceeded,
+        $Facts.BinaryRestored,
+        $Facts.ExePath,
+        $Facts.ExpectedSha256,
+        $Facts.InstalledSha256,
+        $Facts.BackupPath,
+        $Facts.TaskName,
+        $Facts.TaskState,
+        $Facts.SupervisorPresent,
+        $Facts.SupervisorProcessCount,
+        $Facts.SupervisorState,
+        $Facts.SupervisorChildPid,
+        $Facts.DaemonRunning,
+        $Facts.DaemonRunningRestoredBytes,
+        $Facts.DaemonDetail,
+        $Facts.WatchdogVerdict,
+        $Facts.StartupLogPhase,
+        $Facts.WatchdogMadeProgress,
+        $Facts.LastProgressReason,
+        $Facts.LastProgressAgeSeconds)
+}
+
+function Get-SynapseRollbackVerdictRemediation {
+    param([Parameter(Mandatory=$true)]$Facts)
+
+    switch ($Facts.Verdict) {
+        'rollback_failed_binary_not_restored' {
+            return "ROLLBACK FAILED: $($Facts.ExePath) does NOT contain the previous bytes (expected $($Facts.ExpectedSha256), found $($Facts.InstalledSha256)). Restore it by hand from $($Facts.BackupPath), verify the sha256, then start task $($Facts.TaskName) before doing anything else."
+        }
+        'rollback_failed_daemon_not_running' {
+            return "ROLLBACK FAILED: the previous bytes were restored to $($Facts.ExePath) but NO daemon process for this bind/db is running them, so nothing will serve /mcp. Start task $($Facts.TaskName) and inspect daemon-stderr-gen*.log plus daemon-launcher.log for why the relaunch died."
+        }
+        'rollback_failed_daemon_running_foreign_bytes' {
+            return "ROLLBACK FAILED: a daemon for this bind/db is running, but none of its processes execute the restored bytes ($($Facts.ExpectedSha256)). Identify the listed process paths, stop the foreign daemon, and restart the supervisor task so the restored binary owns the bind."
+        }
+        'rollback_failed_daemon_not_progressing' {
+            return "ROLLBACK FAILED: the restored binary is installed and running, but its startup made no forward progress (watchdog verdict $($Facts.WatchdogVerdict), last progress $($Facts.LastProgressAgeSeconds)s ago at phase $($Facts.StartupLogPhase)). The previous daemon is hung, not slow - capture a stack dump of the listed pid(s) and inspect the vault lock holder before restarting."
+        }
+        'rolled_back_daemon_recovering' {
+            return "ROLLBACK SUCCEEDED - the candidate binary is NOT installed. $($Facts.ExePath) holds the previous bytes ($($Facts.ExpectedSha256), hash-verified), a daemon process is running those exact bytes, supervisor restart authority is present=$($Facts.SupervisorPresent), and the daemon is STILL OPENING its Calyx vault (phase $($Facts.StartupLogPhase), forward progress $($Facts.LastProgressAgeSeconds)s ago: $($Facts.LastProgressReason)). Do NOT debug the candidate binary - it was never left installed. Wait for /health to answer, then diagnose the CANDIDATE from its own startup logs before retrying the deploy."
+        }
+        'rolled_back_daemon_healthy' {
+            return "ROLLBACK SUCCEEDED and the previous daemon is serving /health again; diagnose the candidate from its own startup logs before retrying the deploy."
+        }
+        default {
+            return "unclassified rollback verdict '$($Facts.Verdict)'; treat as a setup defect and report it with the full rollback fact block."
+        }
+    }
 }
 
 function Get-SynapseProtectedProcessNames {
@@ -9410,26 +10089,29 @@ if ($ManualInstallHealthRollbackProbe) {
 } else {
     Info "Installed daemon health timeout seconds=$installHealthTimeoutSeconds"
 }
-$installHealthStartedAt = Get-Date
-$installHealthStartedAtUtc = $installHealthStartedAt.ToUniversalTime().AddSeconds(-5)
-$installHealthDeadline = $installHealthStartedAt.AddSeconds($installHealthTimeoutSeconds)
-$installHealthHardCapSeconds = [Math]::Min(
-    1800,
-    [Math]::Max(
-        ($installHealthTimeoutSeconds * 3),
-        ($installHealthTimeoutSeconds + 900)))
-$installHealthHardDeadline = $installHealthStartedAt.AddSeconds($installHealthHardCapSeconds)
-$installHealthProgressWindowSeconds = [Math]::Min(
-    1200,
-    [Math]::Max(900, $installHealthTimeoutSeconds))
-$installHealthProgressExtensions = 0
-$lastInstallHealthProgressKey = $null
-$lastInstallHealthProgressAt = $null
+$installHealthWatchdog = New-SynapseDaemonStartupWatchdog `
+    -Phase 'install' `
+    -LogDir $LogDir `
+    -Bind $Bind `
+    -DbPath $DbPath `
+    -VaultPath $DbPath `
+    -BaseTimeoutSeconds $installHealthTimeoutSeconds `
+    -MaxSeconds $InstallHealthMaxSeconds `
+    -StallSeconds $InstallHealthProgressStallSeconds
+$installHealthStartedAt = $installHealthWatchdog.StartedAt
+$installHealthStartedAtUtc = $installHealthWatchdog.SinceUtc
+$installHealthGateVerdict = 'continue'
 $installHealthAttempt = 0
-while ((Get-Date) -lt $installHealthDeadline) {
+Info ("SYNAPSE_STARTUP_WATCHDOG_ARMED phase=install base_timeout_s={0} absolute_cap_s={1} stall_window_s={2} sample_interval_s={3} vault={4} remediation=setup waits at least base_timeout_s, then keeps waiting only while the daemon proves forward progress (startup log phase, CPU time, disk I/O, or vault file mutation) and fails closed the moment progress stops" -f `
+    $installHealthWatchdog.BaseTimeoutSeconds,
+    $installHealthWatchdog.MaxSeconds,
+    $installHealthWatchdog.StallSeconds,
+    $installHealthWatchdog.SampleIntervalSeconds,
+    $installHealthWatchdog.VaultPath)
+while ($true) {
     $installHealthAttempt++
     Start-Sleep -Seconds 2
-    $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($installHealthDeadline - (Get-Date)).TotalSeconds))
+    $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($installHealthStartedAt.AddSeconds($installHealthWatchdog.MaxSeconds) - (Get-Date)).TotalSeconds))
     $healthTimeoutSec = [Math]::Min(30, [Math]::Max(5, $remainingSeconds))
     try {
         $h = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec $healthTimeoutSec
@@ -9447,6 +10129,7 @@ while ((Get-Date) -lt $installHealthDeadline) {
                 -AllowedPermissions $AllowedPermissions
             if (-not $daemonIdentityReadback.Ok) {
                 $terminalDaemonIdentityFailure = $daemonIdentityReadback.Detail
+                $installHealthGateVerdict = 'daemon_identity_mismatch'
                 $lastHealthError = "SYNAPSE_INSTALL_DAEMON_IDENTITY_MISMATCH $terminalDaemonIdentityFailure"
                 Info "ERROR: $lastHealthError"
                 break
@@ -9466,10 +10149,17 @@ while ((Get-Date) -lt $installHealthDeadline) {
                         $lastHealthError = "manual install-health rollback probe waiting for active Chrome bridge before ACK edge; pid=$($h.pid) chrome_bridge_status=$candidateChromeBridgeStatus"
                         Info "WARN: $lastHealthError subsystem_statuses=$lastHealthSubsystemStatuses chrome_bridge_detail=$candidateChromeBridgeDetail"
                         Start-Sleep -Seconds 2
+                        if ((Get-Date) -ge $installHealthStartedAt.AddSeconds($installHealthWatchdog.MaxSeconds)) {
+                            $installHealthGateVerdict = 'manual_probe_bridge_ack_absolute_cap'
+                            $lastHealthError = "SYNAPSE_INSTALL_HEALTH_MANUAL_PROBE_BRIDGE_ACK_TIMEOUT the daemon is critical-subsystem ready but no active Chrome bridge host appeared within absolute_cap_s=$($installHealthWatchdog.MaxSeconds); remediation=attach a real Chrome bridge host before rerunning -ManualInstallHealthRollbackProbe with pause mode require_active_ack"
+                            Info "ERROR: $lastHealthError"
+                            break
+                        }
                         continue
                     }
                     Info "Manual install-health rollback probe observed active Chrome bridge host before ACK edge pid=$($h.pid)"
                 }
+                $installHealthGateVerdict = 'manual_probe_rejected_ready_daemon'
                 $lastHealthError = "manual install-health rollback probe rejected critical-ready daemon pid=$($h.pid)"
                 Info "WARN: $lastHealthError subsystem_statuses=$lastHealthSubsystemStatuses"
                 break
@@ -9487,51 +10177,28 @@ while ((Get-Date) -lt $installHealthDeadline) {
         $lastHealthError = $_.Exception.Message
         Info "WARN: daemon /health not ready yet attempt=$installHealthAttempt timeout_s=$healthTimeoutSec remaining_s=$remainingSeconds error=$lastHealthError"
     }
-    if (-not $ok -and ($installHealthAttempt -eq 1 -or ($installHealthAttempt % 15) -eq 0)) {
+    if ($ok) { break }
+    $installHealthTick = Update-SynapseDaemonStartupWatchdog -Watchdog $installHealthWatchdog
+    if ($installHealthAttempt -eq 1 -or ($installHealthAttempt % 15) -eq 0) {
         $progressListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
         $progressProcesses = @(Get-SynapseMcpProcessSnapshot)
         $progressStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $installHealthStartedAtUtc
-        $progressTargets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot $progressProcesses -Bind $Bind -DbPath $DbPath)
-        $progressKey = Get-SynapseDaemonStartupProgressKey -Signal $progressStartupLog
-        $phaseCanExtend = Test-SynapseInstallHealthProgressSignalCanExtend -ProgressKey $progressKey
-        $candidateAlive = ($progressTargets.Count -gt 0)
-        $now = Get-Date
-        $progressChanged = ($progressKey -ne $lastInstallHealthProgressKey)
-        if ($candidateAlive -and $phaseCanExtend -and $progressChanged) {
-            $lastInstallHealthProgressKey = $progressKey
-            $lastInstallHealthProgressAt = $now
-            $proposedDeadline = $now.AddSeconds($installHealthProgressWindowSeconds)
-            if ($proposedDeadline -gt $installHealthHardDeadline) {
-                $proposedDeadline = $installHealthHardDeadline
-            }
-            if ($proposedDeadline -gt $installHealthDeadline) {
-                $installHealthDeadline = $proposedDeadline
-                $installHealthProgressExtensions++
-                $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($installHealthDeadline - $now).TotalSeconds))
-                $hardRemainingSeconds = [Math]::Max(0, [int][Math]::Ceiling(($installHealthHardDeadline - $now).TotalSeconds))
-                Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS_DEADLINE_EXTENDED attempt={0} extension_count={1} remaining_s={2} hard_remaining_s={3} progress_changed={4} candidate_pids={5} phase_key={6}" -f `
-                    $installHealthAttempt,
-                    $installHealthProgressExtensions,
-                    $remainingSeconds,
-                    $hardRemainingSeconds,
-                    $progressChanged,
-                    ((@($progressTargets | ForEach-Object { $_.ProcessId })) -join ','),
-                    $progressKey)
-            }
-        } elseif ($candidateAlive -and $phaseCanExtend -and -not $progressChanged) {
-            Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS_UNCHANGED_NO_DEADLINE_EXTENSION attempt={0} remaining_s={1} candidate_pids={2} phase_key={3}" -f `
-                $installHealthAttempt,
-                $remainingSeconds,
-                ((@($progressTargets | ForEach-Object { $_.ProcessId })) -join ','),
-                $progressKey)
-        }
-        Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS attempt={0} remaining_s={1} last_health_error={2}`nlisteners:`n{3}`nprocesses:`n{4}`nstartup_log:`n{5}" -f `
+        Info ("SYNAPSE_INSTALL_HEALTH_PROGRESS attempt={0} elapsed_s={1} watchdog={2} last_health_error={3}`nlisteners:`n{4}`nprocesses:`n{5}`nstartup_log:`n{6}" -f `
             $installHealthAttempt,
-            $remainingSeconds,
+            $installHealthTick.ElapsedSeconds,
+            (Format-SynapseDaemonStartupWatchdogState -Watchdog $installHealthWatchdog),
             ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
             (Format-SynapseTcpBindListenerSnapshot -Snapshot $progressListeners),
             (Format-SynapseMcpProcessSnapshot -Snapshot $progressProcesses),
             (Format-SynapseDaemonStartupLogSignal -Signal $progressStartupLog))
+    }
+    if (-not $installHealthTick.Continue) {
+        $installHealthGateVerdict = $installHealthTick.Verdict
+        Info ("SYNAPSE_INSTALL_HEALTH_WATCHDOG_FAILED_CLOSED verdict={0} {1} remediation={2}" -f `
+            $installHealthGateVerdict,
+            (Format-SynapseDaemonStartupWatchdogState -Watchdog $installHealthWatchdog),
+            (Get-SynapseDaemonStartupWatchdogRemediation -Verdict $installHealthGateVerdict -Phase 'install'))
+        break
     }
 }
 if (-not $ok) {
@@ -9539,21 +10206,19 @@ if (-not $ok) {
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
     $failureStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $installHealthStartedAtUtc
     $failurePhysicalState = Format-SynapseDaemonStartupPhysicalState -DbPath $DbPath
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} timeout_s={4} hard_cap_s={5} progress_window_s={6} progress_extensions={7} last_progress_at={8} last_health_error={9} last_subsystem_statuses={10} manual_probe={11} manual_probe_pause_mode={12} terminal_identity_failure={13}`nlisteners:`n{14}`nprocesses:`n{15}`nstartup_log:`n{16}`nphysical_storage_state:`n{17}`nremediation=inspect {18} and synapse.log.* under {19} for launch / STORAGE_* / bind errors" -f `
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} health_gate_verdict={4} health_gate_remediation={5} last_health_error={6} last_subsystem_statuses={7} manual_probe={8} manual_probe_pause_mode={9} terminal_identity_failure={10}`nstartup_watchdog:`n{11}`nlisteners:`n{12}`nprocesses:`n{13}`nstartup_log:`n{14}`nphysical_storage_state:`n{15}`nremediation=read health_gate_verdict first - it names WHY the gate ended (stalled / daemon_not_running / daemon_restart_loop / terminal_failure / absolute_cap / progress_unobservable) - then inspect {16} and synapse.log.* under {17} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
         ($(if ($backupPath) { $backupPath } else { '<none>' })),
-        $installHealthTimeoutSeconds,
-        $installHealthHardCapSeconds,
-        $installHealthProgressWindowSeconds,
-        $installHealthProgressExtensions,
-        ($(if ($lastInstallHealthProgressAt) { $lastInstallHealthProgressAt.ToString('o') } else { '<none>' })),
+        $installHealthGateVerdict,
+        (Get-SynapseDaemonStartupWatchdogRemediation -Verdict $installHealthGateVerdict -Phase 'install'),
         ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
         $lastHealthSubsystemStatuses,
         $ManualInstallHealthRollbackProbe,
         $ManualInstallHealthRollbackPauseMode,
         ($(if ([string]::IsNullOrWhiteSpace($terminalDaemonIdentityFailure)) { '<none>' } else { $terminalDaemonIdentityFailure })),
+        (Format-SynapseDaemonStartupWatchdogState -Watchdog $installHealthWatchdog),
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
         (Format-SynapseDaemonStartupLogSignal -Signal $failureStartupLog),
@@ -9618,12 +10283,27 @@ if (-not $ok) {
         $rollbackHealth = $null
         $rollbackLastHealthError = $null
         $rollbackLastSubsystemStatuses = '<none>'
-        $rollbackHealthDeadline = (Get-Date).AddSeconds($installHealthTimeoutSeconds)
+        $rollbackSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+        $rollbackWatchdog = New-SynapseDaemonStartupWatchdog `
+            -Phase 'rollback' `
+            -LogDir $LogDir `
+            -Bind $Bind `
+            -DbPath $DbPath `
+            -VaultPath $DbPath `
+            -BaseTimeoutSeconds $installHealthTimeoutSeconds `
+            -MaxSeconds $InstallHealthMaxSeconds `
+            -StallSeconds $InstallHealthProgressStallSeconds
+        $rollbackGateVerdict = 'continue'
         $rollbackHealthAttempt = 0
-        while ((Get-Date) -lt $rollbackHealthDeadline) {
+        Info ("SYNAPSE_STARTUP_WATCHDOG_ARMED phase=rollback base_timeout_s={0} absolute_cap_s={1} stall_window_s={2} sample_interval_s={3} remediation=the rollback daemon opens the SAME vault the candidate could not finish opening, so it gets the same progress-aware budget; a rollback that is still making forward progress is never reported as a failed rollback" -f `
+            $rollbackWatchdog.BaseTimeoutSeconds,
+            $rollbackWatchdog.MaxSeconds,
+            $rollbackWatchdog.StallSeconds,
+            $rollbackWatchdog.SampleIntervalSeconds)
+        while ($true) {
             $rollbackHealthAttempt++
             Start-Sleep -Seconds 2
-            $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($rollbackHealthDeadline - (Get-Date)).TotalSeconds))
+            $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($rollbackWatchdog.StartedAt.AddSeconds($rollbackWatchdog.MaxSeconds) - (Get-Date)).TotalSeconds))
             $rollbackHealthTimeoutSec = [Math]::Min(30, [Math]::Max(5, $remainingSeconds))
             try {
                 $rh = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec $rollbackHealthTimeoutSec
@@ -9641,6 +10321,15 @@ if (-not $ok) {
                 $rollbackLastHealthError = $_.Exception.Message
                 Info "WARN: rollback daemon /health not ready yet attempt=$rollbackHealthAttempt timeout_s=$rollbackHealthTimeoutSec remaining_s=$remainingSeconds error=$rollbackLastHealthError"
             }
+            $rollbackTick = Update-SynapseDaemonStartupWatchdog -Watchdog $rollbackWatchdog
+            if (-not $rollbackTick.Continue) {
+                $rollbackGateVerdict = $rollbackTick.Verdict
+                Info ("SYNAPSE_ROLLBACK_HEALTH_WATCHDOG_FAILED_CLOSED verdict={0} {1} remediation={2}" -f `
+                    $rollbackGateVerdict,
+                    (Format-SynapseDaemonStartupWatchdogState -Watchdog $rollbackWatchdog),
+                    (Get-SynapseDaemonStartupWatchdogRemediation -Verdict $rollbackGateVerdict -Phase 'rollback'))
+                break
+            }
         }
         if ($rollbackOk) {
             $rollbackHealth = Assert-SynapseChromeBridgeLiveAfterSetup `
@@ -9650,26 +10339,63 @@ if (-not $ok) {
                 -ChromeBridgeInstallerPath $chromeBridgeInstaller `
                 -ChromeNativeHostExePath $ChromeNativeHostExePath
             $rollbackBridge = $rollbackHealth.subsystems.chrome_bridge
-            Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} rollback_subsystem_statuses={3} rollback_chrome_bridge_status={4} rollback_chrome_bridge_detail={5} original_failure=[{6}] remediation=old daemon and Chrome bridge Source of Truth were re-read after rollback; inspect candidate startup logs before retrying" -f `
+            $rollbackHealthyFacts = Get-SynapseRollbackPhysicalFacts `
+                -ExePath $ExePath `
+                -ExpectedSha256 $oldInstalledHash `
+                -BackupPath $backupPath `
+                -TaskName $TaskName `
+                -SupervisorPath $rollbackSupervisorPath `
+                -LogDir $LogDir `
+                -Bind $Bind `
+                -DbPath $DbPath `
+                -Watchdog $rollbackWatchdog `
+                -DaemonHealthy
+            Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} rollback_subsystem_statuses={3} rollback_chrome_bridge_status={4} rollback_chrome_bridge_detail={5}`nrollback_facts:`n{6}`noriginal_failure=[{7}]`nremediation={8} Old daemon and Chrome bridge Source of Truth were re-read after rollback; inspect candidate startup logs before retrying." -f `
                 $installSourceHash,
                 $rollbackHash,
                 $rollbackHealth.pid,
                 $rollbackLastSubsystemStatuses,
                 ($(if ($null -eq $rollbackBridge) { '<missing>' } else { $rollbackBridge.status })),
                 ($(if ($null -eq $rollbackBridge) { '<missing>' } else { $rollbackBridge.detail })),
-                $failureDetail)
+                (Format-SynapseRollbackPhysicalFacts -Facts $rollbackHealthyFacts),
+                $failureDetail,
+                (Get-SynapseRollbackVerdictRemediation -Facts $rollbackHealthyFacts))
         }
 
         $rollbackListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
         $rollbackProcesses = @(Get-SynapseMcpProcessSnapshot)
-        Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_FAILED candidate_sha256={0} rollback_sha256={1} rollback_last_health_error={2} rollback_last_subsystem_statuses={3} original_failure=[{4}]`nrollback_listeners:`n{5}`nrollback_processes:`n{6}`nremediation=rollback binary was restored but daemon did not become critical-subsystem ready; inspect {7} and synapse.log.* under {8}" -f `
+        $rollbackStartupLog = Get-SynapseDaemonStartupLogSignal -LogDir $LogDir -SinceUtc $rollbackWatchdog.SinceUtc
+        $rollbackFacts = Get-SynapseRollbackPhysicalFacts `
+            -ExePath $ExePath `
+            -ExpectedSha256 $oldInstalledHash `
+            -BackupPath $backupPath `
+            -TaskName $TaskName `
+            -SupervisorPath $rollbackSupervisorPath `
+            -LogDir $LogDir `
+            -Bind $Bind `
+            -DbPath $DbPath `
+            -Watchdog $rollbackWatchdog
+        $rollbackFactsText = Format-SynapseRollbackPhysicalFacts -Facts $rollbackFacts
+        $rollbackRemediation = Get-SynapseRollbackVerdictRemediation -Facts $rollbackFacts
+        $rollbackDieCode = $(if ($rollbackFacts.RollbackSucceeded) {
+            'SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK_DAEMON_RECOVERING'
+        } else {
+            'SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_FAILED'
+        })
+        Die ("{0} candidate_sha256={1} rollback_sha256={2} rollback_gate_verdict={3} rollback_last_health_error={4} rollback_last_subsystem_statuses={5}`nrollback_facts:`n{6}`nrollback_startup_watchdog:`n{7}`nrollback_listeners:`n{8}`nrollback_processes:`n{9}`nrollback_startup_log:`n{10}`noriginal_failure=[{11}]`nremediation={12} Inspect {13} and synapse.log.* under {14}." -f `
+            $rollbackDieCode,
             $installSourceHash,
             $rollbackHash,
+            $rollbackGateVerdict,
             ($(if ([string]::IsNullOrWhiteSpace($rollbackLastHealthError)) { '<none>' } else { $rollbackLastHealthError })),
             $rollbackLastSubsystemStatuses,
-            $failureDetail,
+            $rollbackFactsText,
+            (Format-SynapseDaemonStartupWatchdogState -Watchdog $rollbackWatchdog),
             (Format-SynapseTcpBindListenerSnapshot -Snapshot $rollbackListeners),
             (Format-SynapseMcpProcessSnapshot -Snapshot $rollbackProcesses),
+            (Format-SynapseDaemonStartupLogSignal -Signal $rollbackStartupLog),
+            $failureDetail,
+            $rollbackRemediation,
             $launcherLog,
             $LogDir)
     }

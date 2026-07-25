@@ -499,6 +499,21 @@ impl ReflexScheduler {
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
+        // The scheduler thread is a hard-real-time 1 ms loop; it must never
+        // perform a vault write. Build the off-thread audit sink before the
+        // scheduler exists and refuse to start if its writer thread cannot be
+        // spawned, rather than degrading to on-tick writes (#1802).
+        let audit_sink = audit_db
+            .map(|db| {
+                crate::ReflexAuditSink::start(db, audit_context.clone())
+                    .map(Arc::new)
+                    .map_err(|error| ReflexError::ParamsInvalid {
+                        detail: format!(
+                            "reflex audit writer thread spawn failed: {error}; the scheduler refuses to start because reflex audit rows would otherwise be written synchronously on the high-resolution tick thread"
+                        ),
+                    })
+            })
+            .transpose()?;
         let subscription = event_bus
             .subscribe(EventFilter::All, Vec::new(), false)
             .map_err(|error| ReflexError::CapReached {
@@ -563,7 +578,7 @@ impl ReflexScheduler {
             controls: Arc::clone(&controls),
             statuses: Arc::clone(&statuses),
             config,
-            audit_db,
+            audit_sink,
             audit_context,
             action_gate,
             tick_index: 0,
