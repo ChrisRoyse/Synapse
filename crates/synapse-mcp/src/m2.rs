@@ -3,6 +3,7 @@ mod click;
 mod clipboard;
 mod config;
 mod focus_window;
+pub(crate) mod foreground_fence;
 mod pad;
 pub(crate) mod postcondition;
 pub(crate) mod press;
@@ -150,6 +151,9 @@ impl Drop for ForegroundInputLeaseGuard {
         }
         match lease::release(&self.session_id) {
             Ok(status) => {
+                // The foreground claim ends with the lease, so the delivery
+                // fence armed under it must not outlive it (#1830).
+                foreground_fence::disarm("foreground_input_lease_auto_released");
                 tracing::info!(
                     code = "INPUT_LEASE_AUTO_RELEASED",
                     tool = self.tool,

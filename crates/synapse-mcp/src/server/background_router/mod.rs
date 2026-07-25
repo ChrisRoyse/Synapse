@@ -8573,13 +8573,16 @@ fn target_act_secret_safe_redacted_scalar(value: &Value) -> Result<Value, ErrorD
 /// a single character of content — the exact question that previously forced a
 /// second round-trip on every audited action.
 fn target_act_secret_safe_annotate_changed(object: &mut Map<String, Value>) {
-    const PREFIX_PAIRS: [(&str, &str); 2] = [("before_", "after_"), ("in_page_before_", "in_page_after_")];
+    const PREFIX_PAIRS: [(&str, &str); 2] =
+        [("before_", "after_"), ("in_page_before_", "in_page_after_")];
     let mut updates: Vec<(String, bool)> = Vec::new();
     for (key, after) in object.iter() {
-        let Some((before_prefix, suffix)) = PREFIX_PAIRS.iter().find_map(|(before, after_prefix)| {
-            key.strip_prefix(after_prefix)
-                .map(|suffix| (*before, suffix.to_owned()))
-        }) else {
+        let Some((before_prefix, suffix)) =
+            PREFIX_PAIRS.iter().find_map(|(before, after_prefix)| {
+                key.strip_prefix(after_prefix)
+                    .map(|suffix| (*before, suffix.to_owned()))
+            })
+        else {
             continue;
         };
         let before_key = format!("{before_prefix}{suffix}");

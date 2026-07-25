@@ -10322,9 +10322,26 @@ fn child_base_environment() -> BTreeMap<String, (String, String)> {
         }
         env.insert(key.to_ascii_uppercase(), (key.to_owned(), value.to_owned()));
     }
+    let inherited = env.len();
     add_windows_registry_environment(&mut env);
+    let after_registry = env.len();
     add_windows_standard_environment(&mut env);
+    let after_standard = env.len();
     add_windows_profile_environment(&mut env);
+    // #768 stayed open because every existing signal was consistent with a
+    // *complete* map (validation passed, the registry merge logged) while the
+    // spawned child provably had 28 variables. Per-layer counts plus the exact
+    // key list make the construction side directly readable, so the next
+    // measurement can say whether the map or the delivery is short.
+    tracing::info!(
+        code = "M4_CHILD_ENV_LAYERS",
+        inherited,
+        after_registry,
+        after_standard,
+        total = env.len(),
+        keys = %env.keys().cloned().collect::<Vec<_>>().join(","),
+        "constructed child process environment layer by layer"
+    );
     env
 }
 
@@ -20889,6 +20906,16 @@ fn spawn_shell_child(
         params.working_dir.as_deref(),
         context,
     )?;
+    // Delivery-side readback for #768: paired with M4_CHILD_ENV_LAYERS this
+    // says whether a variable was lost during construction or between the
+    // constructed map and CreateProcess.
+    tracing::info!(
+        code = "M4_CHILD_ENV_DELIVERED",
+        surface = "act_run_shell",
+        delivered = env.len(),
+        keys = %env.keys().cloned().collect::<Vec<_>>().join(","),
+        "applying constructed environment to the child command"
+    );
     for (key, value) in env {
         command.env(key, value);
     }

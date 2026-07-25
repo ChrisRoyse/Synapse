@@ -856,7 +856,8 @@ impl SynapseService {
         let captured_target = self
             .resolve_ocr_captured_target("read_text", &target, target_hwnd)
             .await?;
-        let mut result = self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())?;
+        let mut result =
+            self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())?;
         result.0.captured_target = captured_target;
         Ok(result)
     }
@@ -876,8 +877,13 @@ impl SynapseService {
         target: &Option<SessionTarget>,
         capture_hwnd: Option<i64>,
     ) -> Result<Option<synapse_core::OcrCapturedTarget>, ErrorData> {
-        let (Some(capture_hwnd), Some(SessionTarget::Cdp { window_hwnd, cdp_target_id })) =
-            (capture_hwnd, target.as_ref())
+        let (
+            Some(capture_hwnd),
+            Some(SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            }),
+        ) = (capture_hwnd, target.as_ref())
         else {
             return Ok(None);
         };
@@ -920,8 +926,12 @@ impl SynapseService {
                     active_id = active.target_id,
                     active_url = active.url,
                     active_title = active.title,
-                    bound_url = bound.map(|tab| tab.url.as_str()).unwrap_or("<tab absent from this window>"),
-                    bound_title = bound.map(|tab| tab.title.as_str()).unwrap_or("<tab absent from this window>"),
+                    bound_url = bound
+                        .map(|tab| tab.url.as_str())
+                        .unwrap_or("<tab absent from this window>"),
+                    bound_title = bound
+                        .map(|tab| tab.title.as_str())
+                        .unwrap_or("<tab absent from this window>"),
                 ),
             ));
         }

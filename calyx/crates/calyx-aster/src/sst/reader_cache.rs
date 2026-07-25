@@ -90,6 +90,17 @@ pub fn shared_reader(path: &Path) -> Result<Arc<SstReader>> {
     Ok(reader)
 }
 
+/// Drops the cache-owned mapping for an already-canonical key.
+///
+/// [`invalidate_reader`] canonicalizes, which opens the file. Reclaim paths
+/// that must drop mappings while holding the exclusive router lock resolve
+/// their canonical keys *before* taking that lock and call this instead, so
+/// no filesystem syscall runs inside the lock (issue #1806).
+pub fn invalidate_reader_canonical(canonical: &Path) {
+    let mut cache = lock();
+    cache.remove(canonical);
+}
+
 /// Drops the cache-owned mapping before a caller reclaims an SST file.
 pub fn invalidate_reader(path: &Path) {
     let mut cache = lock();

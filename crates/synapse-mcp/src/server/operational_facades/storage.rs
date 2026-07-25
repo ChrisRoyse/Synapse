@@ -979,7 +979,7 @@ pub(super) async fn handle(
                 "intelligence".to_owned()
             };
             Ok(Json(storage_response(operation, summary, |out| {
-                out.intelligence = Some(response)
+                out.intelligence = Some(response);
             })))
         }
         StorageOperation::GcOnce => {

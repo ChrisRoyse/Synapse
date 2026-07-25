@@ -9,7 +9,7 @@ mod page;
 mod point_read;
 mod reader_cache;
 
-pub use reader_cache::{invalidate_reader, shared_reader};
+pub use reader_cache::{invalidate_reader, invalidate_reader_canonical, shared_reader};
 
 /// Hard ceiling on immutable SST sources participating in one range page.
 ///

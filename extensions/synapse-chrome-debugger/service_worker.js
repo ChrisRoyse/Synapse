@@ -222,6 +222,27 @@ let serviceWorkerIntegrityState = {
   checkedAtUnixMs: 0,
   reason: "not_checked"
 };
+// Identity of the bytes THIS worker is executing (#1828).
+//
+// `refreshServiceWorkerIntegrity()` fetches `service_worker.js` when it is
+// called, so it reports what is on disk *now* - not what Chrome loaded when it
+// started this worker. Redeploying the file therefore flipped
+// `extension_stale` to false while the old code was still the code running,
+// which is exactly backwards: a changed file is evidence of staleness, not
+// proof of freshness.
+//
+// Chrome reads the file once at worker startup, so hashing it during startup
+// is an exact fingerprint of the executing script. It is captured once and
+// never refreshed for the life of the worker; divergence from the live on-disk
+// hash is then a real, reportable staleness signal.
+let runningServiceWorkerIdentity = {
+  status: "not_checked",
+  sha256: null,
+  byteLength: null,
+  error: null,
+  capturedAtUnixMs: 0
+};
+let runningServiceWorkerCapture = null;
 
 function maintenanceReconnectPauseStorage() {
   return chrome.storage?.session || null;
@@ -531,6 +552,9 @@ async function registerDaemon() {
   }
   hostId = registered.host_id;
   bridgeToken = registered.bridge_token;
+  // Both identities before the hello: the startup fingerprint of the running
+  // code, and the current on-disk bytes (#1828).
+  await captureRunningServiceWorkerIdentity();
   await refreshServiceWorkerIntegrity("registerDaemon");
   await postDaemonMessage({
     type: "hello",
@@ -2532,6 +2556,49 @@ async function handleCommand(command) {
   }
 }
 
+/// Fingerprints the executing worker exactly once, at worker startup.
+function captureRunningServiceWorkerIdentity() {
+  if (runningServiceWorkerCapture) {
+    return runningServiceWorkerCapture;
+  }
+  const source = chrome.runtime.getURL("service_worker.js");
+  runningServiceWorkerCapture = (async () => {
+    const capturedAtUnixMs = Date.now();
+    try {
+      if (!crypto?.subtle?.digest) {
+        throw new Error("crypto.subtle.digest unavailable");
+      }
+      const response = await fetch(source, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`fetch service_worker.js failed status=${response.status}`);
+      }
+      const bytes = await response.arrayBuffer();
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      runningServiceWorkerIdentity = {
+        status: "ok",
+        sha256: arrayBufferToHex(digest),
+        byteLength: bytes.byteLength,
+        error: null,
+        capturedAtUnixMs
+      };
+    } catch (error) {
+      runningServiceWorkerIdentity = {
+        status: "error",
+        sha256: null,
+        byteLength: null,
+        error: errorMessage(error),
+        capturedAtUnixMs
+      };
+    }
+    return runningServiceWorkerIdentity;
+  })();
+  return runningServiceWorkerCapture;
+}
+
+// Startup capture: run it as the module evaluates so the fingerprint is taken
+// before any redeploy can land, not lazily at first daemon registration.
+void captureRunningServiceWorkerIdentity();
+
 async function refreshServiceWorkerIntegrity(reason) {
   const source = chrome.runtime.getURL("service_worker.js");
   const checkedAtUnixMs = Date.now();
@@ -2598,6 +2665,19 @@ function bridgeIdentity() {
     serviceWorkerSha256Error: serviceWorkerIntegrityState.error,
     serviceWorkerSha256CheckedAtUnixMs: serviceWorkerIntegrityState.checkedAtUnixMs,
     serviceWorkerSha256Reason: serviceWorkerIntegrityState.reason,
+    // The executing bytes, captured at worker startup, plus whether disk has
+    // moved away from them since. `serviceWorkerSha256` above is the on-disk
+    // value and must never be read as proof of what is running (#1828).
+    runningServiceWorkerSha256: runningServiceWorkerIdentity.sha256,
+    runningServiceWorkerSha256Status: runningServiceWorkerIdentity.status,
+    runningServiceWorkerSha256Error: runningServiceWorkerIdentity.error,
+    runningServiceWorkerByteLength: runningServiceWorkerIdentity.byteLength,
+    runningServiceWorkerCapturedAtUnixMs: runningServiceWorkerIdentity.capturedAtUnixMs,
+    serviceWorkerBytesDivergedFromRunning: Boolean(
+      runningServiceWorkerIdentity.sha256 &&
+        serviceWorkerIntegrityState.serviceWorkerSha256 &&
+        runningServiceWorkerIdentity.sha256 !== serviceWorkerIntegrityState.serviceWorkerSha256
+    ),
     debuggerApiAvailable: runtimeDebuggerApiAvailable(),
     capabilities: [...COMMAND_CAPABILITIES],
     commandCapabilities: [...COMMAND_CAPABILITIES],

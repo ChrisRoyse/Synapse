@@ -126,10 +126,11 @@ where
                     manifest_durable_seq,
                 )?;
                 let net = report.input_bytes.saturating_sub(report.output_bytes) as usize;
-                let reclaimed = self.rows.refresh_router_cfs_after_reclaim(
+                let doomed = super::compaction_bridge::plan_compaction_input_reclaim(&report)?;
+                let reclaimed = self.rows.retire_then_purge_cf_inputs(
                     &[cf],
                     "reclaim snapshot GC inputs",
-                    || super::compaction_bridge::reclaim_compaction_inputs(&report),
+                    &doomed,
                 )?;
                 if reclaimed != report.input_files {
                     return Err(CalyxError::aster_corrupt_shard(format!(

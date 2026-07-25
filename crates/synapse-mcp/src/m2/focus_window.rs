@@ -115,6 +115,17 @@ pub(crate) async fn act_focus_window_with_boundary(
     let changed = before.hwnd != verification.after.hwnd;
     let matched_hwnd = matched.hwnd;
 
+    // Arm the delivery fence from the *verified* foreground, not the requested
+    // target: every later foreground-tier dispatch now refuses unless this
+    // exact window still holds the foreground (#1830).
+    super::foreground_fence::arm(super::foreground_fence::ArmedForeground {
+        hwnd: verification.after.hwnd,
+        pid: verification.after.pid,
+        process_name: verification.after.process_name.clone(),
+        window_title: verification.after.window_title.clone(),
+        armed_by: TOOL,
+    });
+
     tracing::info!(
         code = "M2_ACT_FOCUS_WINDOW_READBACK",
         hwnd = matched.hwnd,

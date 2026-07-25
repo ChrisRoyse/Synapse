@@ -408,6 +408,9 @@ pub(crate) async fn act_type_with_handle_and_boundary(
     let action = action_from_type_params(&params)?;
 
     boundary.ensure("immediately_before_foreground_type_dispatch")?;
+    // A typed string is the worst thing to misdeliver: refuse unless the armed
+    // window still holds the foreground at this instant (#1830).
+    super::foreground_fence::ensure("immediately_before_foreground_type_dispatch")?;
     if let Some(recording) = recording {
         execute_recording(&recording, &action)?;
     } else {

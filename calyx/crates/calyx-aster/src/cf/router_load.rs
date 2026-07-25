@@ -9,7 +9,7 @@ use crate::storage_names::{
     SstName, classify_sst, ensure_unambiguous_sst_order, parse_cf_dir_name, sst_order_key,
 };
 use calyx_core::{CalyxError, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -115,6 +115,23 @@ impl CfRouter {
         cfs: &[ColumnFamily],
         eager_lookup_on_open: bool,
     ) -> Result<()> {
+        self.load_existing_cfs_excluding(cfs, eager_lookup_on_open, &BTreeSet::new())
+    }
+
+    /// Reloads the selected CF levels while treating `excluded` (canonical
+    /// paths) as already gone.
+    ///
+    /// This is what lets a reclaim retire input SSTs from the served level
+    /// *before* paying their deletion cost: the level installed here is
+    /// byte-identical to the one a post-deletion rescan would produce, so the
+    /// physical `remove_file` calls can run after the exclusive router lock is
+    /// released instead of inside it (issue #1806).
+    pub(crate) fn load_existing_cfs_excluding(
+        &mut self,
+        cfs: &[ColumnFamily],
+        eager_lookup_on_open: bool,
+        excluded: &BTreeSet<PathBuf>,
+    ) -> Result<()> {
         let started_at = Instant::now();
         tracing::info!(
             code = "CALYX_ASTER_ROUTER_LOAD_START",
@@ -132,7 +149,23 @@ impl CfRouter {
                 let cf_dir = cf_root.join(cf.name());
                 if cf_dir.exists() {
                     cf_dirs_scanned += 1;
-                    let files = list_sst_files(&cf_dir)?;
+                    let mut files = list_sst_files(&cf_dir)?;
+                    if !excluded.is_empty() {
+                        // One canonicalize per directory, then pure path
+                        // comparison: `list_sst_files` only returns entries
+                        // directly under `cf_dir`, so joining the file name
+                        // onto the canonical directory is exact.
+                        let canonical_dir = fs::canonicalize(&cf_dir).map_err(|error| {
+                            CalyxError::disk_pressure(format!(
+                                "canonicalize CF dir {} for retired-input exclusion: {error}",
+                                cf_dir.display()
+                            ))
+                        })?;
+                        files.retain(|path| {
+                            path.file_name()
+                                .is_none_or(|name| !excluded.contains(&canonical_dir.join(name)))
+                        });
+                    }
                     sst_files_discovered = sst_files_discovered.saturating_add(files.len());
                     if sst_files_discovered >= ROUTER_LOAD_PROGRESS_FILE_INTERVAL
                         && sst_files_discovered % ROUTER_LOAD_PROGRESS_FILE_INTERVAL < files.len()

@@ -157,6 +157,109 @@ impl VersionedCfStore {
         Self::new_with_router_and_policy(start_seq, router, true, false)
     }
 
+    /// Retires already-proven compaction input SSTs from the served CF levels
+    /// and only then deletes them physically.
+    ///
+    /// Physical SST deletion costs 10–300 ms per file on a Windows host with
+    /// real-time scanning, and a bounded compaction reclaims up to 512 of them.
+    /// [`Self::refresh_router_cfs_after_reclaim`] paid that entire cost inside
+    /// the single global router write lock, which every read *and* every
+    /// `commit_batch` must pass through — one reclaim blocked the whole vault
+    /// for as long as 108 s (issue #1806, #1829).
+    ///
+    /// The split here follows the standard LSM contract (RocksDB's
+    /// `PurgeObsoleteFiles` is explicitly documented as *"not necessary to hold
+    /// the mutex"*): make the new view visible under a short exclusive hold,
+    /// then purge the now-unreferenced files with no lock held.
+    ///
+    /// Safety of the ordering rests on two facts:
+    /// 1. Readers hold the router **read** lock across their SST reads, so
+    ///    taking the write lock drains every in-flight mapping.
+    /// 2. After the swap the retired paths are absent from every level, so no
+    ///    reader can newly open them.
+    ///
+    /// Together those mean no mapping can exist for a retired file once the
+    /// lock is released, which is exactly the precondition `remove_file` needs
+    /// on Windows. `doomed` must already be canonicalized and validated by the
+    /// caller — that work is filesystem I/O and stays outside the lock too.
+    pub(crate) fn retire_then_purge_cf_inputs(
+        &self,
+        cfs: &[ColumnFamily],
+        operation: &'static str,
+        doomed: &BTreeSet<std::path::PathBuf>,
+    ) -> Result<usize> {
+        let mut unique = cfs.to_vec();
+        unique.sort();
+        unique.dedup();
+        let cf_names = unique
+            .iter()
+            .map(|cf| cf.name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let eager_lookup = self.router_eager_lookup_on_refresh.load(Ordering::Acquire);
+
+        // ---- Phase A: exclusive, metadata only ----------------------------
+        // The guard lives only inside this block: Phase B below MUST run with
+        // the router lock released, which is the entire point of the split.
+        let lock_wait_started = Instant::now();
+        let (lock_wait_ms, held_ms) = {
+            let mut guard = self.router.write().expect("mvcc router poisoned");
+            let lock_wait_ms = lock_wait_started.elapsed().as_millis();
+            let held_started = Instant::now();
+            let Some(router) = guard.as_mut() else {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "{operation}: physical SST reclaim requires a live CF router; cfs={cf_names}"
+                )));
+            };
+            router.load_existing_cfs_excluding(&unique, eager_lookup, doomed)?;
+            for path in doomed {
+                crate::sst::invalidate_reader_canonical(path);
+            }
+            (lock_wait_ms, held_started.elapsed().as_millis())
+        };
+        tracing::info!(
+            code = "CALYX_ASTER_CF_INPUT_RETIRE_DONE",
+            operation,
+            cfs = %cf_names,
+            retired_files = doomed.len(),
+            eager_lookup_on_refresh = eager_lookup,
+            lock_wait_ms,
+            exclusive_hold_ms = held_ms,
+            exclusive_hold_warn_ms = EXCLUSIVE_ROUTER_RECLAIM_WARN_MS,
+            "retired compaction inputs from the served CF level under a metadata-only exclusive hold"
+        );
+        if held_ms > u128::from(EXCLUSIVE_ROUTER_RECLAIM_WARN_MS) {
+            tracing::warn!(
+                code = "CALYX_ASTER_CF_INPUT_RETIRE_SLOW",
+                operation,
+                cfs = %cf_names,
+                retired_files = doomed.len(),
+                exclusive_hold_ms = held_ms,
+                exclusive_hold_warn_ms = EXCLUSIVE_ROUTER_RECLAIM_WARN_MS,
+                "exclusive Calyx router write lock exceeded the maintenance budget during the metadata-only level swap"
+            );
+        }
+
+        // ---- Phase B: physical deletion, no lock held ---------------------
+        let purge_started = Instant::now();
+        let mut reclaimed = 0_usize;
+        let mut retries = 0_u32;
+        for path in doomed {
+            retries = retries.saturating_add(purge_retired_sst(path, operation)?);
+            reclaimed += 1;
+        }
+        tracing::info!(
+            code = "CALYX_ASTER_CF_INPUT_PURGE_DONE",
+            operation,
+            cfs = %cf_names,
+            reclaimed_files = reclaimed,
+            sharing_retries = retries,
+            elapsed_ms = purge_started.elapsed().as_millis(),
+            "purged retired compaction inputs with no router lock held"
+        );
+        Ok(reclaimed)
+    }
+
     pub(crate) fn refresh_router_cfs_after_reclaim<T>(
         &self,
         cfs: &[ColumnFamily],
@@ -667,4 +770,50 @@ impl Default for VersionedCfStore {
     fn default() -> Self {
         Self::new(0)
     }
+}
+
+/// Attempts on a retired SST before a purge is declared failed.
+const RETIRED_SST_PURGE_ATTEMPTS: u32 = 5;
+
+/// Deletes one retired SST, returning how many retries it needed.
+///
+/// The level swap in [`VersionedCfStore::retire_then_purge_cf_inputs`] already
+/// drained every mapping, so the first attempt is expected to succeed. The
+/// bounded retry only covers a straggler mapping that a non-router code path
+/// still owns on Windows, where an open mapping makes `remove_file` fail. A
+/// file that survives every attempt is reported as an error with the exact
+/// path and OS error rather than being skipped: leaving a retired input on
+/// disk lets a later cold open re-adopt it alongside its own compaction
+/// output, so this must fail closed.
+fn purge_retired_sst(path: &std::path::Path, operation: &'static str) -> Result<u32> {
+    let mut last_error = None;
+    for attempt in 0..RETIRED_SST_PURGE_ATTEMPTS {
+        if attempt > 0 {
+            crate::sst::invalidate_reader_canonical(path);
+            std::thread::sleep(std::time::Duration::from_millis(20 << (attempt - 1)));
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(attempt),
+            // Already gone: the retirement is what makes this idempotent, so a
+            // concurrent purge of the same path is success, not an error.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(attempt),
+            Err(error) => {
+                tracing::warn!(
+                    code = "CALYX_ASTER_CF_INPUT_PURGE_RETRY",
+                    operation,
+                    path = %path.display(),
+                    attempt = attempt + 1,
+                    max_attempts = RETIRED_SST_PURGE_ATTEMPTS,
+                    error = %error,
+                    "retired SST is still mapped or locked; retrying purge"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(CalyxError::disk_pressure(format!(
+        "{operation}: retired compaction input {} survived {RETIRED_SST_PURGE_ATTEMPTS} purge attempts: {}",
+        path.display(),
+        last_error.map_or_else(|| "unknown error".to_owned(), |error| error.to_string())
+    )))
 }

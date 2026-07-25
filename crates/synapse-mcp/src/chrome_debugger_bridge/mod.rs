@@ -4695,6 +4695,14 @@ struct HostRecord {
     extension_service_worker_sha256_source: Option<String>,
     extension_service_worker_byte_length: Option<u64>,
     extension_service_worker_sha256_error: Option<String>,
+    /// Fingerprint of the bytes the worker is actually EXECUTING, captured at
+    /// its startup. `extension_service_worker_sha256` above is the worker's
+    /// read of the file on disk *now*, which a redeploy changes without
+    /// changing the running code — comparing that against the daemon's own
+    /// on-disk read compared a value with itself and reported freshness for a
+    /// worker running old code (#1828).
+    extension_running_service_worker_sha256: Option<String>,
+    extension_running_service_worker_sha256_status: Option<String>,
     extension_capabilities: BTreeSet<String>,
     extension_user_agent: Option<String>,
     extension_debugger_api_available: Option<bool>,
@@ -4924,21 +4932,35 @@ fn bridge_command_stale_reason_with_profile_state(
             format_capabilities(&host.extension_capabilities)
         ));
     }
+    // Compare the daemon's on-disk read against the bytes the worker is
+    // EXECUTING, not against the worker's own re-read of the same file. The
+    // latter is the same value from a second source, so it always matched and
+    // reported "not stale" for a worker still running pre-redeploy code
+    // (#1828). A bridge too old to report its running identity falls back to
+    // the on-disk value — degraded, but never worse than the old behavior.
+    let running_sha256 = host
+        .extension_running_service_worker_sha256
+        .as_deref()
+        .or(host.extension_service_worker_sha256.as_deref());
+    let running_status = host
+        .extension_running_service_worker_sha256_status
+        .as_deref()
+        .or(host.extension_service_worker_sha256_status.as_deref());
     let mut identity_reasons = Vec::new();
     if let Some(reason) = bridge_build_id_stale_reason(
         host.extension_build_id.as_deref(),
         EXPECTED_EXTENSION_BUILD_ID,
-        host.extension_service_worker_sha256.as_deref(),
+        running_sha256,
         profile_install_state
             .active_profile_service_worker_sha256
             .as_deref(),
-        host.extension_service_worker_sha256_status.as_deref(),
+        running_status,
     ) {
         identity_reasons.push(reason);
     }
     if let Some(reason) = service_worker_integrity_stale_reason(
-        host.extension_service_worker_sha256.as_deref(),
-        host.extension_service_worker_sha256_status.as_deref(),
+        running_sha256,
+        running_status,
         host.extension_service_worker_sha256_error.as_deref(),
         profile_install_state
             .active_profile_service_worker_sha256
@@ -5250,6 +5272,8 @@ impl ChromeDebuggerBridge {
             extension_service_worker_sha256_source: None,
             extension_service_worker_byte_length: None,
             extension_service_worker_sha256_error: None,
+            extension_running_service_worker_sha256: None,
+            extension_running_service_worker_sha256_status: None,
             extension_capabilities: BTreeSet::new(),
             extension_user_agent: None,
             extension_debugger_api_available: None,
@@ -5369,6 +5393,16 @@ impl ChromeDebuggerBridge {
                 host.extension_service_worker_sha256_error = request
                     .message
                     .get("serviceWorkerSha256Error")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                host.extension_running_service_worker_sha256 = request
+                    .message
+                    .get("runningServiceWorkerSha256")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                host.extension_running_service_worker_sha256_status = request
+                    .message
+                    .get("runningServiceWorkerSha256Status")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 host.extension_user_agent = request

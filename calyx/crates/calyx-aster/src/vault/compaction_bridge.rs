@@ -12,6 +12,7 @@ use crate::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
 use crate::sst::{invalidate_reader, shared_reader};
 use crate::storage_names::{SstName, classify_sst, sst_order_key};
 use calyx_core::{CalyxError, Clock, Result};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -419,10 +420,11 @@ where
                 });
             }
             ensure_reclaim_outputs_manifest_bounded(&report.output_paths, durable_seq)?;
-            report.reclaimed_input_files = self.rows.refresh_router_cfs_after_reclaim(
+            let doomed = plan_compaction_input_reclaim(report)?;
+            report.reclaimed_input_files = self.rows.retire_then_purge_cf_inputs(
                 &[cf],
                 "reclaim generic native-CF compaction inputs",
-                || reclaim_compaction_inputs(report),
+                &doomed,
             )?;
             if report.reclaimed_input_files != report.input_files {
                 return Err(CalyxError::aster_corrupt_shard(format!(
@@ -537,10 +539,11 @@ where
             else {
                 continue;
             };
-            let reclaimed = self.rows.refresh_router_cfs_after_reclaim(
+            let doomed = plan_compaction_input_reclaim(&report)?;
+            let reclaimed = self.rows.retire_then_purge_cf_inputs(
                 &[cf],
                 "reclaim tombstoned compaction inputs",
-                || reclaim_compaction_inputs(&report),
+                &doomed,
             )?;
             if reclaimed != report.input_files {
                 return Err(CalyxError::aster_corrupt_shard(format!(
@@ -811,11 +814,17 @@ pub(super) fn ensure_reclaim_outputs_manifest_bounded(
     Ok(())
 }
 
-pub(super) fn reclaim_compaction_inputs(
+/// Resolves and proves the compaction inputs that may be physically reclaimed.
+///
+/// Every check here is filesystem I/O (`canonicalize` opens the file), so it
+/// runs *before* the exclusive router lock is taken; the returned canonical
+/// set is what [`VersionedCfStore::retire_then_purge_cf_inputs`] retires from
+/// the served level and then deletes without the lock held (issue #1806).
+pub(super) fn plan_compaction_input_reclaim(
     report: &crate::compaction::CompactionReport,
-) -> Result<usize> {
+) -> Result<BTreeSet<PathBuf>> {
     let outputs = canonical_output_paths(report, "stat compacted SST")?;
-    let mut reclaimed = 0;
+    let mut doomed = BTreeSet::new();
     for input in &report.input_paths {
         let input = fs::canonicalize(input).map_err(|error| {
             CalyxError::disk_pressure(format!(
@@ -835,16 +844,9 @@ pub(super) fn reclaim_compaction_inputs(
                 input.display()
             )));
         }
-        invalidate_reader(&input);
-        fs::remove_file(&input).map_err(|error| {
-            CalyxError::disk_pressure(format!(
-                "reclaim compaction input {}: {error}",
-                input.display()
-            ))
-        })?;
-        reclaimed += 1;
+        doomed.insert(input);
     }
-    Ok(reclaimed)
+    Ok(doomed)
 }
 
 fn canonical_output_paths(

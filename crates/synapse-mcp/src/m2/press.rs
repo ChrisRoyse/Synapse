@@ -51,6 +51,9 @@ pub(crate) async fn act_press_with_handle_and_boundary(
     let action = press_action(keys.clone(), params.hold_ms, backend);
 
     boundary.ensure("immediately_before_press_dispatch")?;
+    // SendInput has no destination argument. Refuse rather than deliver these
+    // keystrokes to whatever window happens to hold the foreground (#1830).
+    super::foreground_fence::ensure("immediately_before_press_dispatch")?;
     if let Some(recording) = recording {
         record::execute_recording(&recording, &action)?;
     } else {
