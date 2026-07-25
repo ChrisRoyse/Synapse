@@ -41,6 +41,25 @@ pub(in crate::vault) const CHECKPOINT_DRAIN_MAX_BATCHES: usize = 256;
 /// the sub-second commit-lock holds #1806 requires.
 pub(in crate::vault) const CHECKPOINT_DRAIN_HOLD_BUDGET: Duration = Duration::from_millis(250);
 
+/// Row ceiling for one coalesced checkpoint flush.
+///
+/// Coalescing removes the per-batch fsync cost, so the remaining bound to
+/// respect is the size of the single SST produced (and the transient memory
+/// used to build it). These caps keep one drain's output to a normal SST rather
+/// than an unbounded merge of the whole backlog.
+const COALESCED_FLUSH_MAX_ROWS: usize = 200_000;
+
+/// Byte ceiling (key + value, pre-encoding) for one coalesced checkpoint flush.
+const COALESCED_FLUSH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Name discriminator for a coalesced durable-batch SST.
+///
+/// Per-batch writes name files `{seq:020}-{first_index:04}.sst`, where the
+/// index disambiguates several CFs written for the same seq. A coalesced flush
+/// publishes at most one file per CF under the prefix's highest seq, in each
+/// CF's own directory, so a fixed discriminator cannot collide.
+const COALESCED_FLUSH_INDEX: usize = 0;
+
 /// Outcome of one bounded checkpoint drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(in crate::vault) struct CheckpointDrainChunk {
@@ -111,32 +130,61 @@ impl DurableVault {
         Ok(())
     }
 
-    pub(super) fn write_rows(&self, seq: u64, rows: &[WriteRow]) -> Result<()> {
-        let mut by_cf = Vec::<(ColumnFamily, Vec<(usize, &WriteRow)>)>::new();
-        for (index, row) in rows.iter().enumerate() {
-            if let Some((_, group)) = by_cf.iter_mut().find(|(cf, _)| *cf == row.cf) {
-                group.push((index, row));
-            } else {
-                by_cf.push((row.cf, vec![(index, row)]));
+    /// Materializes a whole staged prefix as **one SST per touched CF**.
+    ///
+    /// [`Self::write_rows`] writes one SST per `(seq, CF)`, and every durable
+    /// group commit stages exactly one batch, so draining 256 staged batches
+    /// across 3 CFs used to publish ~768 files of ~113 bytes each. Every one of
+    /// those goes through `write_atomic_create_new`: temp create, `sync_all()`,
+    /// rename, parent-directory fsync — **two fsyncs plus two metadata ops per
+    /// file**, all while the durable commit lock is held and every vault write
+    /// (including the MCP `initialize` activity row) queues behind it.
+    ///
+    /// That is fsync amplification, not a throughput limit: the payload is
+    /// bytes and the cost is barriers. It is why checkpoint materialization
+    /// never caught up on this host — observed `manifest_seq=48,427` against
+    /// `durable_seq=1,554,692` (#1832).
+    ///
+    /// Coalescing is the standard answer. RocksDB group-commits concurrent
+    /// writes into one WAL write with one fsync, and its
+    /// "group multiple batch of flush into one manifest write" change fixed the
+    /// identical per-batch-fsync bottleneck in `LogAndApply`; BoLT's group
+    /// compaction merges several victim SSTables in one pass for the same
+    /// reason. Here the same prefix becomes one SST per CF: the fsync count per
+    /// drain drops from `O(batches x CFs)` to `O(CFs)`.
+    ///
+    /// Ordering is preserved exactly. The prefix is contiguous and ascending in
+    /// seq, and everything newer is still staged, so publishing under the
+    /// prefix's highest seq keeps newest-wins order intact. Within the prefix,
+    /// later seqs must shadow earlier ones for the same key, which the
+    /// per-CF `BTreeMap` does by construction: batches are applied in ascending
+    /// seq order and a later insert replaces an earlier one.
+    fn write_coalesced_rows(&self, batches: &[(u64, Vec<WriteRow>)]) -> Result<()> {
+        let Some((last_seq, _)) = batches.last() else {
+            return Ok(());
+        };
+        // CF -> key -> value, latest write wins.
+        let mut by_cf: BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
+        for (_, rows) in batches {
+            for row in rows {
+                by_cf
+                    .entry(row.cf)
+                    .or_default()
+                    .insert(row.key.clone(), row.value.clone());
             }
         }
-        by_cf.sort_by_key(|(cf, _)| cf.name());
         for (cf, rows) in by_cf {
-            let rows = latest_rows_by_key(rows);
-            let first_index = rows.first().map_or(0, |(index, _)| *index);
+            if rows.is_empty() {
+                continue;
+            }
             let dir = self.cf_dir(cf);
             fs::create_dir_all(&dir).map_err(|error| storage_error("create CF dir", error))?;
-            let path = dir.join(format!("{seq:020}-{first_index:04}.sst"));
+            let path = dir.join(format!("{last_seq:020}-{COALESCED_FLUSH_INDEX:04}.sst"));
             match &self.value_crypto {
                 Some(context) => {
                     let entries = rows
                         .iter()
-                        .map(|(_, row)| {
-                            Ok((
-                                row.key.clone(),
-                                seal_value(context, row.cf, &row.key, &row.value)?,
-                            ))
-                        })
+                        .map(|(key, value)| Ok((key.clone(), seal_value(context, cf, key, value)?)))
                         .collect::<Result<Vec<_>>>()?;
                     write_sst(
                         &path,
@@ -146,10 +194,11 @@ impl DurableVault {
                     )?;
                 }
                 None => {
-                    let entries = rows
-                        .iter()
-                        .map(|(_, row)| (row.key.as_slice(), row.value.as_slice()));
-                    write_sst(&path, entries)?;
+                    write_sst(
+                        &path,
+                        rows.iter()
+                            .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                    )?;
                 }
             }
         }
@@ -209,22 +258,44 @@ impl DurableVault {
             return Ok(CheckpointDrainChunk::default());
         }
         let started = Instant::now();
-        let mut written = 0_usize;
+        // Select how many staged batches to materialize together. This loop is
+        // pure in-memory accounting — the physical write happens once, below —
+        // so the elapsed budget here only bounds selection, not I/O.
+        let mut selected = 0_usize;
         let mut rows_written = 0_usize;
         let mut last_written_seq = 0_u64;
-        let mut write_error = None;
+        let mut coalesced_bytes = 0_usize;
         for (index, (seq, rows)) in chunk.iter().enumerate() {
-            if index > 0 && started.elapsed() >= hold_budget {
+            if index > 0
+                && (started.elapsed() >= hold_budget
+                    || rows_written >= COALESCED_FLUSH_MAX_ROWS
+                    || coalesced_bytes >= COALESCED_FLUSH_MAX_BYTES)
+            {
                 break;
             }
-            if let Err(error) = self.write_rows(*seq, rows) {
-                write_error = Some(error);
-                break;
-            }
-            self.advance_checkpointed_derived_content(*seq, rows);
-            written = index.saturating_add(1);
+            coalesced_bytes = coalesced_bytes.saturating_add(
+                rows.iter()
+                    .map(|row| row.key.len().saturating_add(row.value.len()))
+                    .sum::<usize>(),
+            );
+            selected = index.saturating_add(1);
             rows_written = rows_written.saturating_add(rows.len());
             last_written_seq = *seq;
+        }
+        let mut written = 0_usize;
+        let mut write_error = None;
+        match self.write_coalesced_rows(&chunk[..selected]) {
+            Ok(()) => {
+                for (seq, rows) in &chunk[..selected] {
+                    self.advance_checkpointed_derived_content(*seq, rows);
+                }
+                written = selected;
+            }
+            Err(error) => {
+                rows_written = 0;
+                last_written_seq = 0;
+                write_error = Some(error);
+            }
         }
         if let Some(error) = write_error {
             // Preserve the pre-#1806 failure semantics exactly: the staging
@@ -292,12 +363,4 @@ impl DurableVault {
         *pending = restored;
         Ok(())
     }
-}
-
-fn latest_rows_by_key<'a>(rows: Vec<(usize, &'a WriteRow)>) -> Vec<(usize, &'a WriteRow)> {
-    let mut latest = BTreeMap::<Vec<u8>, (usize, &'a WriteRow)>::new();
-    for (index, row) in rows {
-        latest.insert(row.key.clone(), (index, row));
-    }
-    latest.into_values().collect()
 }

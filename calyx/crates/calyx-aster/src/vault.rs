@@ -1063,12 +1063,31 @@ where
         let mut max_hold_ms = 0_u128;
         loop {
             let hold_started = Instant::now();
+            // Sync the WAL BEFORE taking the commit lock.
+            //
+            // `sync_wal` is `flush_sync`, which posts a Flush to the
+            // group-commit batcher thread over an mpsc channel and blocks for
+            // its ack — so it waits behind every WAL append already queued on
+            // that thread. Doing that inside the exclusive hold parked every
+            // vault write behind another thread's queue depth: measured 37.6 s
+            // of hold for a drain that materialized 4 batches / 72 rows, i.e. a
+            // fixed cost with no relation to the work done (#1832).
+            //
+            // Durability is unchanged. The #1132 invariant is that the manifest
+            // may only advance past a batch once that batch's rows exist as
+            // fsynced durable-batch SSTs, and that is enforced below by the
+            // coalesced flush itself, not by this sync. A batch staged between
+            // this sync and the flush is therefore still recoverable from its
+            // SST; this sync covers the WAL tail *above* the new replay floor,
+            // which is exactly the part no SST covers.
+            if let Some(durable) = &self.durable {
+                durable.sync_wal()?;
+            }
             let chunk = self.with_durable_commit_lock(|| {
                 self.ensure_writeable("checkpoint")?;
                 let Some(durable) = &self.durable else {
                     return Ok(durable::CheckpointDrainChunk::default());
                 };
-                durable.sync_wal()?;
                 durable.flush_pending_checkpoints_bounded(
                     durable::CHECKPOINT_DRAIN_MAX_BATCHES,
                     durable::CHECKPOINT_DRAIN_HOLD_BUDGET,
@@ -1142,6 +1161,11 @@ where
     /// tiny router SST per logical flush.
     pub fn checkpoint(&self) -> Result<()> {
         self.drain_checkpoints_paced("periodic checkpoint")?;
+        // Same reasoning as the paced drain: get the batcher barrier out of the
+        // exclusive hold, so the lock only covers the staged-batch flush.
+        if let Some(durable) = &self.durable {
+            durable.sync_wal()?;
+        }
         self.with_durable_commit_lock(|| self.checkpoint_locked())
     }
 
@@ -1152,11 +1176,12 @@ where
     /// therefore the correct implementation for callers that ask only to sync
     /// pending writes; checkpoint SST publication remains owned by maintenance,
     /// WAL recycling, and deterministic close.
+    /// Takes no commit lock: this is a barrier on the group-commit batcher
+    /// thread, not a vault mutation. Holding the lock across it parked every
+    /// writer behind that thread's queue depth for as long as the queue took to
+    /// drain, which is unbounded under load and bought nothing — the batcher
+    /// serializes its own work, and this method mutates no vault state (#1832).
     pub fn sync_wal(&self) -> Result<()> {
-        self.with_durable_commit_lock(|| self.sync_wal_locked())
-    }
-
-    pub(crate) fn sync_wal_locked(&self) -> Result<()> {
         self.ensure_writeable("sync WAL")?;
         if let Some(durable) = &self.durable {
             durable.sync_wal()?;
