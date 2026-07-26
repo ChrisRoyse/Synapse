@@ -68,7 +68,7 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
     let indexes = match PersistedSearchIndexes::open(vault_dir, panel.version) {
         Ok(indexes) => indexes,
         Err(error) if is_stale_derived(&error) => {
-            let read = SearchReadSnapshot::pin(vault);
+            let read = SearchReadSnapshot::pin(vault, panel.version)?;
             if vault_base_count_at(vault, read.snapshot(), panel.version)? == 0 {
                 return Ok(SearchOutcome::empty());
             }

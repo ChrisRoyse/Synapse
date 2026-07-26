@@ -1325,6 +1325,17 @@ where
         self.rows.pin_snapshot(freshness, &self.clock, max_age_ms)
     }
 
+    /// Pins a reader with the exact search-input watermark for one panel.
+    pub fn pin_reader_for_panel(
+        &self,
+        panel_version: u32,
+        freshness: Freshness,
+        max_age_ms: u64,
+    ) -> Result<Snapshot> {
+        self.rows
+            .pin_snapshot_for_panel(panel_version, freshness, &self.clock, max_age_ms)
+    }
+
     /// Releases an explicit reader lease; returns whether it was still live.
     pub fn release_reader(&self, lease_id: u64) -> bool {
         self.rows.release_lease(lease_id)

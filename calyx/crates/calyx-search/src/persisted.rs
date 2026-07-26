@@ -163,6 +163,10 @@ impl PersistedSearchIndexes {
         })
     }
 
+    pub(crate) fn panel_version(&self) -> u32 {
+        self.manifest.panel_version
+    }
+
     pub fn search(
         &self,
         slot: SlotId,

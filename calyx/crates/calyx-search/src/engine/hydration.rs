@@ -28,7 +28,14 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks<C: Clock>(
 ) -> CliResult<(BTreeMap<CxId, Constellation>, FreshnessTag)> {
     if hits.is_empty() {
         budget.check("empty_hit_set", 0)?;
-        let read = pin_search_readback(vault, trace, "empty_hit_set", None, 0);
+        let read = pin_search_readback(
+            vault,
+            indexes.panel_version(),
+            trace,
+            "empty_hit_set",
+            None,
+            0,
+        )?;
         let freshness_tag = verify_index_freshness(indexes, &read, freshness, trace)?;
         return Ok((BTreeMap::new(), freshness_tag));
     }
@@ -40,11 +47,12 @@ pub(super) fn hydrate_hit_docs_with_bounded_readbacks<C: Clock>(
         budget.check("before_hit_doc_hydration", hit_index)?;
         let read = pin_search_readback(
             vault,
+            indexes.panel_version(),
             trace,
             "hit_doc_hydration",
             Some(hit.cx_id),
             hit_index + 1,
-        );
+        )?;
         if let Some(seq) = expected_seq {
             if read.seq() != seq {
                 return Err(calyx_core::CalyxError::stale_derived(format!(
@@ -141,11 +149,12 @@ fn hit_slots_key(hit: &Hit) -> String {
 
 fn pin_search_readback<'a, C: Clock>(
     vault: &'a AsterVault<C>,
+    panel_version: u32,
     trace: &mut SearchTracer<'_>,
     phase: &'static str,
     cx_id: Option<CxId>,
     hit_ordinal: usize,
-) -> SearchReadSnapshot<'a, C> {
+) -> CliResult<SearchReadSnapshot<'a, C>> {
     trace.emit_detail(
         "snapshot.pin.start",
         None,
@@ -156,7 +165,7 @@ fn pin_search_readback<'a, C: Clock>(
         },
         Some(snapshot_detail(phase, cx_id, None)),
     );
-    let read = SearchReadSnapshot::pin(vault);
+    let read = SearchReadSnapshot::pin(vault, panel_version)?;
     trace.emit_detail(
         "snapshot.pin.done",
         None,
@@ -172,7 +181,7 @@ fn pin_search_readback<'a, C: Clock>(
             )),
         )),
     );
-    read
+    Ok(read)
 }
 
 fn verify_index_freshness<C: Clock>(

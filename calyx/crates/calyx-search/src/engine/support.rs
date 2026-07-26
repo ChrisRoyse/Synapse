@@ -40,11 +40,15 @@ pub(super) struct SearchReadSnapshot<'a, C: Clock> {
 }
 
 impl<'a, C: Clock> SearchReadSnapshot<'a, C> {
-    pub(super) fn pin(vault: &'a AsterVault<C>) -> Self {
-        Self {
+    pub(super) fn pin(vault: &'a AsterVault<C>, panel_version: u32) -> CliResult<Self> {
+        Ok(Self {
             vault,
-            snapshot: vault.pin_reader(Freshness::FreshDerived, SEARCH_READER_LEASE_MS),
-        }
+            snapshot: vault.pin_reader_for_panel(
+                panel_version,
+                Freshness::FreshDerived,
+                SEARCH_READER_LEASE_MS,
+            )?,
+        })
     }
 
     pub(super) fn snapshot(&self) -> Snapshot {
@@ -55,8 +59,7 @@ impl<'a, C: Clock> SearchReadSnapshot<'a, C> {
         self.snapshot.seq()
     }
 
-    /// Derived-content watermark observed at pin time, clamped to the pinned
-    /// seq by the MVCC store (issue #1100).
+    /// Exact-panel content watermark observed atomically with the pinned seq.
     pub(super) fn derived_content_seq(&self) -> u64 {
         self.snapshot.derived_content_seq()
     }

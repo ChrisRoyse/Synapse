@@ -96,6 +96,14 @@ pub struct VersionedCfStore {
     /// write lock *before* the seq becomes visible, so any reader that
     /// observes a content commit's seq also observes its watermark.
     derived_content_seq: AtomicU64,
+    /// Max committed search-input sequence for each exact panel generation.
+    ///
+    /// Persisted search artifacts are panel-scoped, so freshness must not be
+    /// invalidated by Base/Slot writes belonging to another panel. This map is
+    /// rebuilt from the same ordered MVCC batches during recovery and advances
+    /// under the row-table write lock before the corresponding sequence is
+    /// published (#1841).
+    panel_content_seqs: RwLock<BTreeMap<u32, Seq>>,
     next_lease_id: AtomicU64,
     rows: RwLock<RowTable>,
     router: RwLock<Option<CfRouter>>,
@@ -113,6 +121,7 @@ impl VersionedCfStore {
         Self {
             seqs: SeqAllocator::new(start_seq),
             derived_content_seq: AtomicU64::new(0),
+            panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(None),
@@ -140,6 +149,7 @@ impl VersionedCfStore {
         Self {
             seqs: SeqAllocator::new(start_seq),
             derived_content_seq: AtomicU64::new(0),
+            panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(Some(router)),
@@ -447,6 +457,49 @@ impl VersionedCfStore {
             .with_derived_content_seq(self.derived_content_seq_at(seq))
     }
 
+    /// Pins the latest committed view with the search-input watermark for one
+    /// exact panel generation.
+    ///
+    /// The row-table read lock makes `(seq, panel_content_seq)` one atomic
+    /// observation with respect to commits. Latest-only recovery deliberately
+    /// fails closed: without restored MVCC batches there is no exact historical
+    /// panel attribution for coalesced Base/Slot SST rows.
+    pub fn pin_snapshot_for_panel(
+        &self,
+        panel_version: u32,
+        freshness: Freshness,
+        clock: &dyn Clock,
+        max_age_ms: u64,
+    ) -> Result<Snapshot> {
+        if self.router_latest_readback.load(Ordering::Acquire) {
+            return Err(CalyxError::stale_derived(format!(
+                "exact panel {panel_version} search freshness is unavailable in latest-only recovery mode; reopen with full MVCC row restoration before searching"
+            )));
+        }
+        let _table = self.rows.read().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC row-table lock was poisoned while pinning panel search freshness",
+            )
+        })?;
+        let seq = self.current_seq();
+        let panel_content_seq = self
+            .panel_content_seqs
+            .read()
+            .map_err(|_| {
+                CalyxError::aster_corrupt_shard(
+                    "MVCC panel-content watermark lock was poisoned while pinning search freshness",
+                )
+            })?
+            .get(&panel_version)
+            .copied()
+            .unwrap_or_default()
+            .min(seq);
+        let lease_id = self.next_lease_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let lease = ReaderLease::new(lease_id, seq, clock.now(), max_age_ms);
+        self.leases.register(lease);
+        Ok(Snapshot::new(seq, freshness, lease).with_derived_content_seq(panel_content_seq))
+    }
+
     /// Pins a reader lease at an explicit historical `seq` (time-travel). The
     /// lease participates in oldest-pinned-seq accounting so version GC cannot
     /// reclaim versions at or below `seq` until it is released.
@@ -562,6 +615,7 @@ impl VersionedCfStore {
         let mut router = self.router.write().map_err(|_| {
             CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
         })?;
+        let affected_panels = search_panels_affected_by_batch(&table, self.current_seq(), &rows)?;
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
         // this commit's seq must already observe its watermark (issue #1100).
@@ -575,6 +629,7 @@ impl VersionedCfStore {
             self.derived_content_seq
                 .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
         }
+        self.advance_panel_content_seqs(&affected_panels, self.current_seq() + 1)?;
         let seq = self.seqs.allocate();
         for (cf, key, value) in &rows {
             table
@@ -641,12 +696,15 @@ impl VersionedCfStore {
                 "MVCC row-table lock was poisoned during atomic recovery restore",
             )
         })?;
+        let affected_panels =
+            search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows)?;
         if rows
             .iter()
             .any(|(cf, _, _)| cf.feeds_persistent_search_index())
         {
             self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
         }
+        self.advance_panel_content_seqs(&affected_panels, seq)?;
         for (cf, key, value) in rows {
             table
                 .entry(cf)
@@ -695,12 +753,15 @@ impl VersionedCfStore {
             .into_iter()
             .filter(|(seq, _rows)| *seq > published_seq)
         {
+            let affected_panels =
+                search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows)?;
             if rows
                 .iter()
                 .any(|(cf, _, _)| cf.feeds_persistent_search_index())
             {
                 self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
             }
+            self.advance_panel_content_seqs(&affected_panels, seq)?;
             for (cf, key, value) in rows {
                 table
                     .entry(cf)
@@ -711,6 +772,22 @@ impl VersionedCfStore {
             }
         }
         self.seqs.advance_to_at_least(final_seq);
+        Ok(())
+    }
+
+    fn advance_panel_content_seqs(&self, panels: &BTreeSet<u32>, seq: Seq) -> Result<()> {
+        if panels.is_empty() {
+            return Ok(());
+        }
+        let mut watermarks = self.panel_content_seqs.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC panel-content watermark lock was poisoned during commit",
+            )
+        })?;
+        for panel_version in panels {
+            let watermark = watermarks.entry(*panel_version).or_default();
+            *watermark = (*watermark).max(seq);
+        }
         Ok(())
     }
 
@@ -764,6 +841,95 @@ impl VersionedCfStore {
             .expect("mvcc read barriers poisoned")
             .clone()
     }
+}
+
+fn search_panels_affected_by_batch(
+    table: &RowTable,
+    visible_seq: Seq,
+    rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+) -> Result<BTreeSet<u32>> {
+    let mut panels = BTreeSet::new();
+    let mut staged_base_panels = BTreeMap::<Vec<u8>, Option<u32>>::new();
+
+    for (cf, key, value) in rows {
+        if *cf != ColumnFamily::Base {
+            continue;
+        }
+        if staged_base_panels.contains_key(key) {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "atomic batch contains duplicate Base writes for one CxId key (key_len={}); exact panel freshness attribution is ambiguous",
+                key.len()
+            )));
+        }
+        let panel_version = if is_tombstone_value(value) {
+            visible_base_panel(table, key, visible_seq)?
+        } else {
+            Some(panel_from_base_value(key, value)?)
+        };
+        if let Some(panel_version) = panel_version {
+            panels.insert(panel_version);
+        }
+        staged_base_panels.insert(key.clone(), panel_version);
+    }
+
+    for (cf, key, value) in rows {
+        if !matches!(
+            cf,
+            ColumnFamily::Slot {
+                kind: crate::cf::SlotFamilyKind::Quantized,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let panel_version = match staged_base_panels.get(key) {
+            Some(panel_version) => *panel_version,
+            None => visible_base_panel(table, key, visible_seq)?,
+        };
+        match panel_version {
+            Some(panel_version) => {
+                panels.insert(panel_version);
+            }
+            None if is_tombstone_value(value) => {
+                // Deleting an already-unreferenced physical slot row cannot
+                // change any panel-scoped search input.
+            }
+            None => {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "live quantized slot write has no visible or same-batch Base row (cf={}, key_len={}); refusing unscoped search-index mutation",
+                    cf.name(),
+                    key.len()
+                )));
+            }
+        }
+    }
+
+    Ok(panels)
+}
+
+fn visible_base_panel(table: &RowTable, key: &[u8], seq: Seq) -> Result<Option<u32>> {
+    let Some(version) = table
+        .get(&ColumnFamily::Base)
+        .and_then(|base| base.get(key))
+        .and_then(|versions| versions.iter().rev().find(|version| version.seq <= seq))
+    else {
+        return Ok(None);
+    };
+    if is_tombstone_value(&version.value) {
+        return Ok(None);
+    }
+    panel_from_base_value(key, &version.value).map(Some)
+}
+
+fn panel_from_base_value(key: &[u8], value: &[u8]) -> Result<u32> {
+    let header = crate::vault::encode::decode_header(value)?;
+    if header.cx_id.as_bytes() != key {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "Base row key/header CxId mismatch while attributing panel freshness (key_len={})",
+            key.len()
+        )));
+    }
+    Ok(header.panel_version)
 }
 
 impl Default for VersionedCfStore {
