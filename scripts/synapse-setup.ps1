@@ -226,6 +226,7 @@ $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
 $script:SynapseChromeBridgePendingPath = $ChromeBridgePendingPath
 $script:SynapseSetupPartialState = $null
 $script:SynapseSetupPartialReadback = $null
+$script:SynapseCurrentDaemonStagingDirectory = $null
 $script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
 $script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
 $script:SynapseBundledProfilesRollbackDirName = '.synapse-profile-reconcile-backups'
@@ -871,6 +872,15 @@ function Wait-SynapsePostExitParent {
 
 trap {
     $errorText = $_ | Out-String
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:SynapseCurrentDaemonStagingDirectory)) {
+        try {
+            Remove-SynapseCurrentDaemonStagingArtifact
+        } catch {
+            $cleanupError = "SYNAPSE_DAEMON_STAGING_TRAP_CLEANUP_FAILED error=$($_.Exception.Message) remediation=inspect the exact setup-staging path named by the nested error; do not delete any path whose ownership validation failed"
+            Info "FATAL: $cleanupError"
+            $errorText = "$errorText`n$cleanupError"
+        }
+    }
     if ($script:SynapseSetupPartialState -eq 'bridge_pending') {
         try {
             Write-SynapseSetupRepairManifestState `
@@ -5967,6 +5977,161 @@ function New-SynapseSetupRunDirectory {
     return $path
 }
 
+function Get-SynapseDaemonStagingDescriptor {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot
+    )
+
+    $rootFull = Get-SynapseFullPathForScopeCheck -Path $ExpectedRoot
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        throw "SYNAPSE_DAEMON_STAGING_ROOT_MISSING root=$rootFull remediation=do not delete anything; rerun setup so the exact setup-owned root can be inspected"
+    }
+    $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_DAEMON_STAGING_ROOT_REPARSE_POINT root=$rootFull attributes=$($rootItem.Attributes) remediation=do not follow or delete this link; restore setup-staging as a physical directory"
+    }
+
+    $pathFull = Get-SynapseFullPathForScopeCheck -Path $Path
+    $actualParent = Get-SynapseFullPathForScopeCheck -Path (Split-Path -Parent $pathFull)
+    if (-not $actualParent.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SYNAPSE_DAEMON_STAGING_SCOPE_INVALID path=$pathFull expected_parent=$rootFull actual_parent=$actualParent remediation=do not delete this path; inspect setup run-directory construction"
+    }
+    $leaf = Split-Path -Leaf $pathFull
+    if ($leaf -notmatch '^daemon-binary-\d{8}T\d{9}Z-\d+$') {
+        throw "SYNAPSE_DAEMON_STAGING_NAME_INVALID path=$pathFull leaf=$leaf remediation=do not delete this directory; only exact setup-owned daemon-binary timestamp/PID names are eligible"
+    }
+    if (-not (Test-Path -LiteralPath $pathFull -PathType Container)) {
+        throw "SYNAPSE_DAEMON_STAGING_DIRECTORY_MISSING path=$pathFull remediation=refresh the setup-staging Source of Truth before retrying cleanup"
+    }
+    $directory = Get-Item -LiteralPath $pathFull -Force -ErrorAction Stop
+    if ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_DAEMON_STAGING_DIRECTORY_REPARSE_POINT path=$pathFull attributes=$($directory.Attributes) remediation=do not follow or delete this link; inspect the setup-staging directory"
+    }
+
+    $items = @(Get-ChildItem -LiteralPath $pathFull -Force -ErrorAction Stop)
+    if ($items.Count -gt 4) {
+        throw "SYNAPSE_DAEMON_STAGING_ENTRY_BOUND_EXCEEDED path=$pathFull count=$($items.Count) max=4 remediation=do not delete this directory; inspect the unexpected setup-staging contents"
+    }
+    $invalid = @($items | Where-Object {
+        $_.PSIsContainer -or
+        ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+        $_.Name -notmatch '^(synapse-mcp-[0-9A-Fa-f]{64}\.exe|onnxruntime\.dll|onnxruntime_providers_shared\.dll|onnxruntime_providers_cuda\.dll)$'
+    })
+    if ($invalid.Count -gt 0) {
+        $invalidState = ($invalid | ForEach-Object { "name=$($_.Name),container=$($_.PSIsContainer),attributes=$($_.Attributes)" }) -join ';'
+        throw "SYNAPSE_DAEMON_STAGING_CONTENT_INVALID path=$pathFull invalid=[$invalidState] remediation=do not delete this directory; inspect why an unowned entry exists under setup-staging"
+    }
+    $executables = @($items | Where-Object { $_.Name -match '^synapse-mcp-[0-9A-Fa-f]{64}\.exe$' })
+    if ($items.Count -gt 0 -and $executables.Count -ne 1) {
+        throw "SYNAPSE_DAEMON_STAGING_EXECUTABLE_CARDINALITY_INVALID path=$pathFull item_count=$($items.Count) executable_count=$($executables.Count) remediation=do not delete this directory; setup-owned non-empty staging must contain exactly one hash-named daemon executable"
+    }
+    $bytes = ($items | Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $bytes) { $bytes = 0 }
+    return [pscustomobject]@{
+        Path = $pathFull
+        ItemCount = $items.Count
+        Bytes = [int64]$bytes
+    }
+}
+
+function Assert-SynapseDaemonStagingHasNoLiveExecutable {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $pathFull = Get-SynapseFullPathForScopeCheck -Path $Path
+    $pathPrefix = $pathFull + [System.IO.Path]::DirectorySeparatorChar
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    foreach ($process in $processes) {
+        if ([string]::IsNullOrWhiteSpace([string]$process.ExecutablePath)) {
+            if ([string]$process.Name -like 'synapse-mcp*') {
+                throw "SYNAPSE_DAEMON_STAGING_PROCESS_PATH_UNREADABLE pid=$($process.ProcessId) name=$($process.Name) staging_path=$pathFull remediation=do not delete staging while a Synapse executable path cannot be read; inspect this exact PID"
+            }
+            continue
+        }
+        $executableFull = [System.IO.Path]::GetFullPath([string]$process.ExecutablePath)
+        if ($executableFull.StartsWith($pathPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "SYNAPSE_DAEMON_STAGING_EXECUTABLE_LIVE pid=$($process.ProcessId) executable=$executableFull staging_path=$pathFull remediation=stop only this exact setup-owned candidate process, verify it exited, then rerun setup cleanup"
+        }
+    }
+}
+
+function Remove-SynapseDaemonStagingDirectory {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [string]$Reason = 'setup_cleanup'
+    )
+
+    # Independently re-read the complete descriptor and process SoT at the
+    # destructive boundary; callers may have supplied a stale enumeration.
+    $descriptor = Get-SynapseDaemonStagingDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    Assert-SynapseDaemonStagingHasNoLiveExecutable -Path $descriptor.Path
+    foreach ($file in @(Get-ChildItem -LiteralPath $descriptor.Path -File -Force -ErrorAction Stop)) {
+        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $file.FullName) {
+            throw "SYNAPSE_DAEMON_STAGING_FILE_CLEANUP_UNVERIFIED path=$($file.FullName) reason=$Reason remediation=inspect filesystem permissions and handles; the exact setup-owned file still exists after Remove-Item"
+        }
+    }
+    Remove-Item -LiteralPath $descriptor.Path -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $descriptor.Path) {
+        throw "SYNAPSE_DAEMON_STAGING_CLEANUP_UNVERIFIED path=$($descriptor.Path) reason=$Reason remediation=inspect filesystem permissions and handles; the exact directory still exists after Remove-Item"
+    }
+    Info "Daemon staging artifact removed reason=$Reason path=$($descriptor.Path) item_count=$($descriptor.ItemCount) bytes=$($descriptor.Bytes) readback_exists=false"
+    return $descriptor
+}
+
+function Remove-SynapseStaleDaemonStagingArtifacts {
+    param([Parameter(Mandatory=$true)][string]$LogDir)
+
+    $stagingRoot = Get-SynapseFullPathForScopeCheck -Path (Join-Path $LogDir 'setup-staging')
+    if (-not (Test-Path -LiteralPath $stagingRoot)) {
+        Info "Daemon staging stale sweep root=$stagingRoot before_count=0 before_bytes=0 after_count=0 after_bytes=0"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $stagingRoot -PathType Container)) {
+        throw "SYNAPSE_DAEMON_STAGING_ROOT_NOT_DIRECTORY root=$stagingRoot remediation=do not delete this path; restore setup-staging as a physical directory"
+    }
+    $rootItem = Get-Item -LiteralPath $stagingRoot -Force -ErrorAction Stop
+    if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_DAEMON_STAGING_ROOT_REPARSE_POINT root=$stagingRoot attributes=$($rootItem.Attributes) remediation=do not follow or delete this link; restore setup-staging as a physical directory"
+    }
+    $children = @(Get-ChildItem -LiteralPath $stagingRoot -Force -ErrorAction Stop)
+    if ($children.Count -gt 4096) {
+        throw "SYNAPSE_DAEMON_STAGING_DIRECTORY_BOUND_EXCEEDED root=$stagingRoot count=$($children.Count) max=4096 remediation=inspect the unexpectedly large setup-owned root before cleanup"
+    }
+    $nonDirectories = @($children | Where-Object { -not $_.PSIsContainer })
+    if ($nonDirectories.Count -gt 0) {
+        $names = ($nonDirectories | Select-Object -ExpandProperty Name) -join ','
+        throw "SYNAPSE_DAEMON_STAGING_ROOT_CONTENT_INVALID root=$stagingRoot files=[$names] remediation=do not delete anything; only setup-owned run directories may exist directly under this root"
+    }
+
+    $validated = @()
+    foreach ($child in @($children | Sort-Object Name)) {
+        $validated += Get-SynapseDaemonStagingDescriptor -Path $child.FullName -ExpectedRoot $stagingRoot
+    }
+    $beforeBytes = ($validated | Measure-Object -Property Bytes -Sum).Sum
+    if ($null -eq $beforeBytes) { $beforeBytes = 0 }
+    foreach ($descriptor in $validated) {
+        [void](Remove-SynapseDaemonStagingDirectory -Path $descriptor.Path -ExpectedRoot $stagingRoot -Reason 'startup_stale_sweep')
+    }
+    $after = @(Get-ChildItem -LiteralPath $stagingRoot -Force -ErrorAction Stop)
+    $afterBytes = ($after | Where-Object { -not $_.PSIsContainer } | Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $afterBytes) { $afterBytes = 0 }
+    if ($after.Count -ne 0 -or [int64]$afterBytes -ne 0) {
+        throw "SYNAPSE_DAEMON_STAGING_SWEEP_READBACK_FAILED root=$stagingRoot before_count=$($validated.Count) before_bytes=$beforeBytes after_count=$($after.Count) after_bytes=$afterBytes remediation=inspect the exact remaining setup-staging entries before rerunning setup"
+    }
+    Info "Daemon staging stale sweep root=$stagingRoot before_count=$($validated.Count) before_bytes=$beforeBytes after_count=0 after_bytes=0"
+}
+
+function Remove-SynapseCurrentDaemonStagingArtifact {
+    if ([string]::IsNullOrWhiteSpace([string]$script:SynapseCurrentDaemonStagingDirectory)) {
+        return
+    }
+    $stagingRoot = Get-SynapseFullPathForScopeCheck -Path (Join-Path $LogDir 'setup-staging')
+    [void](Remove-SynapseDaemonStagingDirectory -Path $script:SynapseCurrentDaemonStagingDirectory -ExpectedRoot $stagingRoot -Reason 'current_setup_run')
+    $script:SynapseCurrentDaemonStagingDirectory = $null
+}
+
 function Get-SynapseOrtRuntimeCompanions {
     param([Parameter(Mandatory=$true)][string]$ExecutablePath)
 
@@ -6223,8 +6388,12 @@ function New-SynapseStagedDaemonBinary {
         [Parameter(Mandatory=$true)][string]$RuntimeDir
     )
 
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:SynapseCurrentDaemonStagingDirectory)) {
+        Die "SYNAPSE_DAEMON_STAGING_ALREADY_ACTIVE path=$script:SynapseCurrentDaemonStagingDirectory remediation=clean the exact prior setup-owned staging directory before creating another candidate copy"
+    }
     $stagingRoot = Join-Path $LogDir 'setup-staging'
     $stagingDir = New-SynapseSetupRunDirectory -Root $stagingRoot -Purpose 'daemon-binary'
+    $script:SynapseCurrentDaemonStagingDirectory = Get-SynapseFullPathForScopeCheck -Path $stagingDir
     $builtHash = Get-SynapseFileSha256 -Path $BuiltPath
     $stagedPath = Join-Path $stagingDir "synapse-mcp-$builtHash.exe"
     Copy-Item -LiteralPath $BuiltPath -Destination $stagedPath -Force
@@ -6245,6 +6414,7 @@ function New-SynapseStagedDaemonBinary {
     Info "Staged daemon binary path=$stagedPath sha256=$stagedHash"
     return [pscustomobject]@{
         Path = $stagedPath
+        Directory = $script:SynapseCurrentDaemonStagingDirectory
         Sha256 = $stagedHash
         SourcePath = $BuiltPath
         RuntimeFiles = @($runtimeFiles)
@@ -9390,6 +9560,7 @@ function Stop-SynapseChromeNativeHostProcesses {
 $maintenanceReason = if ($Remove) { 'remove' } elseif ($ResumeChromeBridgePending) { 'resume_chrome_bridge' } else { 'setup' }
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
+Remove-SynapseStaleDaemonStagingArtifacts -LogDir $LogDir
 
 if ($ResumeChromeBridgePending) {
     Invoke-SynapseChromeBridgePendingResume -CheckpointPath $ChromeBridgePendingPath
@@ -9960,6 +10131,7 @@ foreach ($companion in $candidateRuntimeFiles) {
 $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
+Remove-SynapseCurrentDaemonStagingArtifact
 
 $installDir = Split-Path -Parent $ExePath
 $retiredSetupOwnedExecutables = @(
