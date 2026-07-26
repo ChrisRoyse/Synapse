@@ -5156,6 +5156,7 @@ dependencies = [
  "calyx-search",
  "calyx-sextant",
  "fs2",
+ "num-traits",
  "serde",
  "serde_json",
  "sha2 0.11.0",

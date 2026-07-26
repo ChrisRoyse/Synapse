@@ -31,6 +31,21 @@ pub const DEFAULT_GROUP_COMMIT_WINDOW: Duration = Duration::from_millis(2);
 /// before they reach the fail-closed WAL encoder.
 pub const MAX_RECORD_BYTES: usize = record::MAX_RECORD_BYTES as usize;
 
+/// Opens WAL scan handles with the platform's sequential-read hint. Recovery,
+/// streaming, and inventory all consume record framing monotonically.
+fn sequential_read_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+
+        options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+    }
+    options
+}
+
 /// WAL writer configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalOptions {
@@ -375,14 +390,16 @@ fn segment_inventory_locked(dir: &Path, active_index: u64) -> Result<Vec<WalSegm
 }
 
 fn read_segment_seq_bounds(path: &Path) -> Result<(Option<u64>, Option<u64>, usize)> {
-    let mut file =
-        File::open(path).map_err(|error| storage_error("open WAL segment for inventory", error))?;
+    let file = sequential_read_options()
+        .open(path)
+        .map_err(|error| storage_error("open WAL segment for inventory", error))?;
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
     let mut offset = 0;
     let mut first = None;
     let mut last = None;
     let mut count = 0;
     loop {
-        match record::decode_at(&mut file, offset)
+        match record::decode_next(&mut reader, offset)
             .map_err(|error| storage_error("decode WAL inventory", error))?
         {
             DecodeStatus::Complete(decoded) => {

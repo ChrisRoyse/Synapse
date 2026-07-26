@@ -284,11 +284,41 @@ impl ManifestStore {
         fs::create_dir_all(&self.vault_dir).map_err(|error| {
             storage_error("create vault manifest directory", &self.vault_dir, error)
         })?;
+        let lock_dir = self.vault_dir.join("locks");
+        fs::create_dir_all(&lock_dir).map_err(|error| {
+            storage_error("create vault manifest lock directory", &lock_dir, error)
+        })?;
+        // Every manifest writer, including callers that use ManifestStore
+        // directly, shares this publication boundary. Vault checkpoint and
+        // retention code deliberately take their higher-level checkpoint lock
+        // first, so the order is always checkpoint -> manifest and manifest
+        // fsync never requires the unrelated global durable commit lock.
+        let _publish_guard =
+            crate::file_lock::FileLockGuard::acquire(&lock_dir.join("manifest.publish.lock"))?;
         let pointer = manifest_filename(manifest.manifest_seq);
         let manifest_path = self.vault_dir.join(&pointer);
         let mirror_path = self.vault_dir.join(MANIFEST_FILE);
         let current_path = self.vault_dir.join(CURRENT_FILE);
         let bytes = encode_manifest(manifest)?;
+
+        if current_path.exists() {
+            let current = self.load_current()?;
+            let expected_seq = current.manifest_seq.checked_add(1).ok_or_else(|| {
+                CalyxError::ledger_chain_broken(
+                    "manifest publication sequence exhausted at u64::MAX",
+                )
+            })?;
+            if manifest.manifest_seq != expected_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "manifest publication is stale or non-contiguous: current generation {} requires next generation {expected_seq}, proposed generation {}; retry from the current manifest instead of overwriting immutable history",
+                    current.manifest_seq, manifest.manifest_seq
+                )));
+            }
+        } else if manifest.manifest_seq == 0 {
+            return Err(CalyxError::aster_corrupt_shard(
+                "initial manifest publication requires a non-zero generation",
+            ));
+        }
 
         write_atomic(&manifest_path, &bytes)?;
         write_atomic(&mirror_path, &bytes)?;

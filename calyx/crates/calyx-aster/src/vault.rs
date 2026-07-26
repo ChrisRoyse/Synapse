@@ -1025,12 +1025,14 @@ where
 
     pub fn flush(&self) -> Result<()> {
         self.drain_checkpoints_paced("flush")?;
-        self.with_durable_commit_lock(|| self.flush_locked())
+        self.with_durable_commit_lock(|| {
+            self.ensure_writeable("flush")?;
+            self.rows.flush_all_cfs().map(|_| ())
+        })
     }
 
-    /// Materializes every staged durable checkpoint using **bounded**
-    /// durable-commit-lock acquisitions, releasing the lock between them
-    /// (issue #1806).
+    /// Materializes every staged durable checkpoint without holding the global
+    /// durable commit lock across filesystem I/O (issues #1806 and #1832).
     ///
     /// Root cause this exists for: one durable group commit stages one
     /// checkpoint batch, and each batch becomes one create+fsync+rename SST
@@ -1043,26 +1045,37 @@ where
     /// Writers, including the activity-recorder write that MCP `initialize`
     /// performs, queued behind it for the whole drain.
     ///
-    /// Pacing does not reduce the total work; it bounds the *hold*, so queued
-    /// writers interleave. It fails closed rather than silently giving up:
-    /// a drain that cannot converge, or that stops making progress, returns a
-    /// typed error naming the backlog instead of leaving the manifest behind
-    /// the committed tail.
-    ///
-    /// Callers that need the drained state to still hold must follow this with
-    /// their own commit-lock acquisition (the residual drain there covers only
-    /// what was committed during the pacing loop).
+    /// Each iteration reserves a contiguous staged prefix under a short commit
+    /// boundary, then releases it for immutable SST create+fsync+rename and
+    /// manifest publication. A dedicated process/cross-process checkpoint lock
+    /// serializes manifest publishers and is always acquired before the short
+    /// global-lock reserve, preventing both filename collisions and lock-order
+    /// deadlocks. Concurrent commits serialize only on the staging mutex while
+    /// the prepared prefix is validated; they never wait for manifest fsync.
+    /// Any failure re-stages the exact prefix before returning.
     pub(crate) fn drain_checkpoints_paced(&self, operation: &'static str) -> Result<()> {
         if self.durable.is_none() || self.read_only {
             return Ok(());
         }
+        let durable = self.durable.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "write-capable checkpoint drain lost its durable vault handle",
+            )
+        })?;
+        let checkpoint_lock_path = durable.checkpoint_lock_path();
+        let checkpoint_lock_started = Instant::now();
+        let _checkpoint_guard = crate::file_lock::FileLockGuard::acquire(&checkpoint_lock_path)?;
+        let checkpoint_lock_wait_ms = checkpoint_lock_started.elapsed().as_millis();
         let started = Instant::now();
-        let mut holds = 0_usize;
+        let mut chunks = 0_usize;
         let mut batches_written = 0_usize;
         let mut rows_written = 0_usize;
-        let mut max_hold_ms = 0_u128;
+        let mut sst_files_written = 0_usize;
+        let mut sst_bytes_written = 0_u64;
+        let mut max_reserve_elapsed_ms = 0_u128;
+        let mut max_materialize_ms = 0_u128;
+        let mut max_publish_elapsed_ms = 0_u128;
         loop {
-            let hold_started = Instant::now();
             // Sync the WAL BEFORE taking the commit lock.
             //
             // `sync_wal` is `flush_sync`, which posts a Flush to the
@@ -1080,61 +1093,129 @@ where
             // this sync and the flush is therefore still recoverable from its
             // SST; this sync covers the WAL tail *above* the new replay floor,
             // which is exactly the part no SST covers.
-            if let Some(durable) = &self.durable {
-                durable.sync_wal()?;
-            }
-            let chunk = self.with_durable_commit_lock(|| {
+            durable.sync_wal()?;
+            let reserve_started = Instant::now();
+            let prepared = self.with_durable_commit_lock(|| {
                 self.ensure_writeable("checkpoint")?;
-                let Some(durable) = &self.durable else {
-                    return Ok(durable::CheckpointDrainChunk::default());
-                };
-                durable.flush_pending_checkpoints_bounded(
-                    durable::CHECKPOINT_DRAIN_MAX_BATCHES,
-                    durable::CHECKPOINT_DRAIN_HOLD_BUDGET,
-                )
+                durable.prepare_pending_checkpoint(durable::CHECKPOINT_DRAIN_MAX_BATCHES)
             })?;
-            holds = holds.saturating_add(1);
+            max_reserve_elapsed_ms =
+                max_reserve_elapsed_ms.max(reserve_started.elapsed().as_millis());
+            let Some(prepared) = prepared else {
+                break;
+            };
+            let materialize_started = Instant::now();
+            let materialized = match durable.materialize_prepared_checkpoint(&prepared) {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    tracing::error!(
+                        code = "CALYX_ASTER_CHECKPOINT_MATERIALIZE_FAILED",
+                        operation,
+                        base_durable_seq = prepared.base_durable_seq,
+                        first_seq = prepared.first_seq,
+                        last_seq = prepared.last_seq,
+                        batches = prepared.batch_count(),
+                        rows = prepared.rows,
+                        bytes = prepared.bytes,
+                        elapsed_ms = materialize_started.elapsed().as_millis(),
+                        error_code = error.code,
+                        error = %error.message,
+                        "checkpoint SST materialization failed outside the global commit lock; restoring the reserved prefix"
+                    );
+                    if let Err(restage) = durable.restage_prepared_checkpoint(prepared) {
+                        return Err(CalyxError::aster_corrupt_shard(format!(
+                            "checkpoint materialization failed with error[{}]: {}; restoring its reserved prefix also failed with error[{}]: {}",
+                            error.code, error.message, restage.code, restage.message
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            let materialize_ms = materialize_started.elapsed().as_millis();
+            max_materialize_ms = max_materialize_ms.max(materialize_ms);
+            let publish_started = Instant::now();
+            let chunk = match (|| {
+                self.ensure_writeable("checkpoint publication")?;
+                durable.publish_prepared_checkpoint(&prepared)
+            })() {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    tracing::error!(
+                        code = "CALYX_ASTER_CHECKPOINT_PUBLISH_FAILED",
+                        operation,
+                        base_durable_seq = prepared.base_durable_seq,
+                        first_seq = prepared.first_seq,
+                        last_seq = prepared.last_seq,
+                        batches = prepared.batch_count(),
+                        rows = prepared.rows,
+                        materialize_ms,
+                        error_code = error.code,
+                        error = %error.message,
+                        "checkpoint manifest publication failed; restoring the materialized prefix for an idempotent retry"
+                    );
+                    if let Err(restage) = durable.restage_prepared_checkpoint(prepared) {
+                        return Err(CalyxError::aster_corrupt_shard(format!(
+                            "checkpoint publication failed with error[{}]: {}; restoring its reserved prefix also failed with error[{}]: {}",
+                            error.code, error.message, restage.code, restage.message
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            max_publish_elapsed_ms =
+                max_publish_elapsed_ms.max(publish_started.elapsed().as_millis());
+            chunks = chunks.saturating_add(1);
             batches_written = batches_written.saturating_add(chunk.batches_written);
             rows_written = rows_written.saturating_add(chunk.rows_written);
-            max_hold_ms = max_hold_ms.max(hold_started.elapsed().as_millis());
+            sst_files_written = sst_files_written.saturating_add(materialized.sst_files);
+            sst_bytes_written = sst_bytes_written.saturating_add(materialized.sst_bytes);
+            tracing::info!(
+                code = "CALYX_ASTER_CHECKPOINT_MATERIALIZED_OFF_COMMIT_LOCK",
+                operation,
+                base_durable_seq = prepared.base_durable_seq,
+                first_seq = prepared.first_seq,
+                last_seq = prepared.last_seq,
+                batches = prepared.batch_count(),
+                rows = prepared.rows,
+                source_bytes = prepared.bytes,
+                sst_files = materialized.sst_files,
+                sst_bytes = materialized.sst_bytes,
+                materialize_ms,
+                remaining_batches = chunk.remaining_batches,
+                "materialized immutable checkpoint SSTs with the global durable commit lock released"
+            );
             if chunk.remaining_batches == 0 {
                 break;
             }
-            if chunk.batches_written == 0 {
-                return Err(CalyxError {
-                    code: "CALYX_ASTER_CHECKPOINT_DRAIN_NO_PROGRESS",
-                    message: format!(
-                        "paced checkpoint drain for {operation} wrote no batch while {} remain staged after {holds} bounded commit-lock acquisitions",
-                        chunk.remaining_batches
-                    ),
-                    remediation: "inspect the preceding durable-batch SST write errors and free disk/handles; do not advance the manifest past staged batches",
-                });
-            }
-            if holds >= PACED_CHECKPOINT_MAX_HOLDS {
+            if chunks >= PACED_CHECKPOINT_MAX_HOLDS {
                 return Err(CalyxError {
                     code: "CALYX_ASTER_CHECKPOINT_DRAIN_UNCONVERGED",
                     message: format!(
-                        "paced checkpoint drain for {operation} used its full budget of {PACED_CHECKPOINT_MAX_HOLDS} bounded commit-lock acquisitions ({batches_written} batches, {rows_written} rows, {} ms) and {} batches are still staged; incoming commits are outrunning durable checkpoint materialization",
+                        "paced checkpoint drain for {operation} used its full budget of {PACED_CHECKPOINT_MAX_HOLDS} off-lock materialization chunks ({batches_written} batches, {rows_written} rows, {} ms) and {} batches are still staged; incoming commits are outrunning durable checkpoint materialization",
                         started.elapsed().as_millis(),
                         chunk.remaining_batches
                     ),
-                    remediation: "throttle the write source (derived-write fanout/backfill pager) or provision faster durable storage; retry maintenance once the staged backlog drains, and do not hold the durable commit lock across the whole backlog to force convergence",
+                    remediation: "throttle the write source or provision faster durable storage; retry maintenance once the staged backlog drains",
                 });
             }
             self.yield_durable_commit_lock_to_writers();
         }
-        if batches_written > 0 || holds > 1 {
+        if batches_written > 0 || chunks > 1 || checkpoint_lock_wait_ms > 0 {
             tracing::info!(
                 code = "CALYX_ASTER_CHECKPOINT_DRAIN_PACED",
                 operation,
-                holds,
+                chunks,
                 batches_written,
                 rows_written,
-                max_hold_ms,
+                sst_files_written,
+                sst_bytes_written,
+                checkpoint_lock_wait_ms,
+                max_reserve_elapsed_ms,
+                max_materialize_ms,
+                max_publish_elapsed_ms,
                 elapsed_ms = started.elapsed().as_millis(),
-                max_batches_per_hold = durable::CHECKPOINT_DRAIN_MAX_BATCHES,
-                hold_budget_ms = durable::CHECKPOINT_DRAIN_HOLD_BUDGET.as_millis(),
-                "materialized staged durable checkpoints in bounded durable-commit-lock holds"
+                max_batches_per_chunk = durable::CHECKPOINT_DRAIN_MAX_BATCHES,
+                "materialized staged durable checkpoints with physical SST I/O outside the global commit lock"
             );
         }
         Ok(())
@@ -1160,13 +1241,7 @@ where
     /// separate prevents a caller requesting durability from creating one
     /// tiny router SST per logical flush.
     pub fn checkpoint(&self) -> Result<()> {
-        self.drain_checkpoints_paced("periodic checkpoint")?;
-        // Same reasoning as the paced drain: get the batcher barrier out of the
-        // exclusive hold, so the lock only covers the staged-batch flush.
-        if let Some(durable) = &self.durable {
-            durable.sync_wal()?;
-        }
-        self.with_durable_commit_lock(|| self.checkpoint_locked())
+        self.drain_checkpoints_paced("periodic checkpoint")
     }
 
     /// Waits until every submitted group-commit WAL append has reached its
@@ -1192,6 +1267,13 @@ where
     pub(crate) fn checkpoint_locked(&self) -> Result<()> {
         self.ensure_writeable("checkpoint")?;
         if let Some(durable) = &self.durable {
+            let Some(_checkpoint_guard) =
+                crate::file_lock::FileLockGuard::try_acquire(&durable.checkpoint_lock_path())?
+            else {
+                return Err(CalyxError::backpressure(
+                    "exclusive checkpoint could not acquire the checkpoint publisher lock without waiting while the global commit lock is held; retry after the active off-lock publisher completes",
+                ));
+            };
             durable.flush()?;
         }
         Ok(())
@@ -1218,7 +1300,6 @@ where
         }
         self.drain_checkpoints_paced("WAL recycle preflight")?;
         self.with_durable_commit_lock(|| {
-            self.checkpoint_locked()?;
             let Some(durable) = &self.durable else {
                 return Ok(WalRecycleReport::default());
             };

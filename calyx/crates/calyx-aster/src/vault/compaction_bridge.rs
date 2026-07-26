@@ -16,16 +16,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-/// How long one tombstone-purge slice may hold the durable commit lock before
-/// yielding to queued vault writes. Matches `CHECKPOINT_DRAIN_HOLD_BUDGET`.
-const TOMBSTONE_PURGE_SLICE_HOLD_BUDGET: Duration = Duration::from_millis(250);
-
-/// Backstop against a fan-out reduction that never converges. Each slice makes
+/// Backstop against a fan-out reduction that never converges. Each pass makes
 /// strictly positive progress (enforced below), so this can only be reached by
 /// a genuinely pathological SST distribution.
-const TOMBSTONE_PURGE_MAX_SLICES: usize = 4096;
+const TOMBSTONE_PURGE_MAX_COMPACTION_PASSES: usize = 4096;
 
 /// Maximum number of SST indexes one live compaction batch may retain.
 ///
@@ -105,10 +100,8 @@ where
             return Ok(None);
         };
         self.drain_checkpoints_paced("compaction catalog snapshot")?;
-        let durable_seq = self.with_durable_commit_lock(|| {
-            self.checkpoint_locked()?;
-            self.verified_durable_coverage_seq(durable)
-        })?;
+        let durable_seq =
+            self.with_durable_commit_lock(|| self.published_compaction_snapshot_seq(durable))?;
         Ok(Some(Arc::new(catalog_from_vault_tiers_through_seq(
             durable.root(),
             durable.tiering_policy(),
@@ -140,10 +133,8 @@ where
         // that paced drain.
         self.drain_checkpoints_paced("single-CF compaction preflight")?;
         let commit_lock_started = std::time::Instant::now();
-        let durable_seq = self.with_durable_commit_lock(|| {
-            self.checkpoint_locked()?;
-            self.verified_durable_coverage_seq(durable)
-        })?;
+        let durable_seq =
+            self.with_durable_commit_lock(|| self.published_compaction_snapshot_seq(durable))?;
         let commit_lock_hold_us = commit_lock_started.elapsed().as_micros();
         let catalog_started = std::time::Instant::now();
         let catalog = catalog_from_vault_tiers_through_seq(
@@ -159,7 +150,7 @@ where
             cf = cf.name(),
             "captured native compaction input view without retaining the durable commit lock"
         );
-        self.compact_catalog_cf_batch_locked(durable, &catalog, durable_seq, cf, max_input_files)
+        self.compact_catalog_cf_batch(durable, &catalog, durable_seq, cf, max_input_files)
             .map(Some)
     }
 
@@ -204,10 +195,8 @@ where
             "native fan-out maintenance preflight"
         })?;
         let commit_lock_started = std::time::Instant::now();
-        let durable_seq = self.with_durable_commit_lock(|| {
-            self.checkpoint_locked()?;
-            self.verified_durable_coverage_seq(durable)
-        })?;
+        let durable_seq =
+            self.with_durable_commit_lock(|| self.published_compaction_snapshot_seq(durable))?;
         let commit_lock_hold_us = commit_lock_started.elapsed().as_micros();
         let catalog_started = std::time::Instant::now();
         let catalog = catalog_from_vault_tiers_through_seq(
@@ -276,7 +265,7 @@ where
                 if readiness_required && before.pending_files <= DEFAULT_COMPACTION_TARGET_FILES {
                     break;
                 }
-                let result = self.compact_catalog_cf_batch_locked(
+                let result = self.compact_catalog_cf_batch(
                     durable,
                     &catalog,
                     durable_seq,
@@ -351,7 +340,7 @@ where
         Ok(results)
     }
 
-    fn compact_catalog_cf_batch_locked(
+    fn compact_catalog_cf_batch(
         &self,
         durable: &DurableVault,
         catalog: &CompactionCatalog,
@@ -471,10 +460,43 @@ where
         Ok(result)
     }
 
-    /// Manifest durable coverage after a locked flush; fails closed when the
-    /// manifest does not cover the latest committed seq, because naming a
-    /// compaction output beyond `durable_seq` makes full-restore readback
-    /// skip it while its inputs get reclaimed (issue #1132).
+    /// Captures the immutable, manifest-covered prefix for off-lock compaction.
+    ///
+    /// A paced checkpoint releases its publisher boundary before this short
+    /// commit-lock read. Commits in that interval legitimately advance
+    /// `latest_seq` beyond the published watermark. They stay in the WAL and
+    /// are excluded by `catalog_from_vault_tiers_through_seq`; requiring tip
+    /// equality here would turn every such concurrent commit into a false
+    /// coverage failure. Outputs are independently required to remain at or
+    /// below this watermark before any input is reclaimed (issue #1132).
+    fn published_compaction_snapshot_seq(&self, durable: &DurableVault) -> Result<u64> {
+        let durable_seq = durable.manifest_durable_seq()?;
+        let latest = self.latest_seq();
+        if durable_seq > latest {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_COMPACTION_SNAPSHOT_AHEAD",
+                message: format!(
+                    "manifest durable_seq {durable_seq} exceeds latest committed seq {latest}; the in-memory vault cannot prove the published compaction prefix"
+                ),
+                remediation: "preserve the vault and inspect CURRENT, its manifest, and WAL replay telemetry; do not compact or reclaim any SST inputs",
+            });
+        }
+        if durable_seq < latest {
+            tracing::info!(
+                code = "CALYX_ASTER_COMPACTION_SNAPSHOT_WITH_CONCURRENT_TAIL",
+                durable_seq,
+                latest_seq = latest,
+                concurrent_tail_seqs = latest.saturating_sub(durable_seq),
+                "captured a manifest-covered compaction prefix while newer commits remain WAL-authoritative"
+            );
+        }
+        Ok(durable_seq)
+    }
+
+    /// Manifest durable coverage after a locked full flush; fails closed when
+    /// the manifest does not cover the latest committed seq. Callers that copy
+    /// or recycle the whole durable state require tip equality; bounded
+    /// compaction uses [`Self::published_compaction_snapshot_seq`] instead.
     pub(super) fn verified_durable_coverage_seq(&self, durable: &DurableVault) -> Result<u64> {
         let durable_seq = durable.manifest_durable_seq()?;
         let latest = self.latest_seq();
@@ -492,7 +514,9 @@ where
 
     /// Compacts the listed column families, prunes MVCC tombstone rows from the
     /// compacted SST, and reclaims superseded input SSTs for durable vaults.
-    /// Runs the sweep as paced slices instead of one lock hold.
+    /// Captures a short manifest-covered snapshot per CF, then performs every
+    /// physical merge, fsync, router retirement, and file purge off the global
+    /// durable commit lock under the native-compaction guard.
     ///
     /// Every vault write — including the audit row an MCP `initialize` and each
     /// `act` command writes before doing anything — is serialized behind the
@@ -501,11 +525,11 @@ where
     /// measured at 62 s here (and 469 s when #1806 was filed), which is what
     /// made `act operation=lease_acquire` take ~111 s in #1829.
     ///
-    /// The lock is now acquired per column family, and within a family per
-    /// budgeted slice of fan-out reduction, mirroring `drain_checkpoints_paced`
-    /// directly above and the per-CF bound already documented on
-    /// `retire_router_cf`. Waiting writers get the lock between slices, so the
-    /// worst-case write stall is one slice rather than one whole sweep.
+    /// A wall-clock check between compaction calls cannot bound a call already
+    /// inside the lock: the configured host measured one 747 MiB full-CF merge
+    /// at 14.1 s and a 14.8 s commit-lock hold. The immutable manifest prefix is
+    /// the compaction boundary; newer commits remain WAL-authoritative and win
+    /// by sequence while this older prefix is rewritten (issues #1806/#1832).
     pub fn purge_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
         self.drain_checkpoints_paced("tombstone purge preflight")?;
         let mut unique = Vec::new();
@@ -516,65 +540,54 @@ where
         }
         self.with_native_compaction_guard(|| {
             for cf in unique {
-                let mut slices = 0_usize;
-                loop {
-                    slices += 1;
-                    if slices > TOMBSTONE_PURGE_MAX_SLICES {
-                        return Err(CalyxError {
-                            code: "CALYX_ASTER_TOMBSTONE_PURGE_SLICE_BUDGET_EXHAUSTED",
-                            message: format!(
-                                "tombstone purge for {} did not converge within {TOMBSTONE_PURGE_MAX_SLICES} paced commit-lock slices",
-                                cf.name()
-                            ),
-                            remediation: "inspect SST size/order distribution for this CF; a non-converging fan-out reduction means compaction admission is not making progress",
-                        });
-                    }
-                    let more_work =
-                        self.with_durable_commit_lock(|| self.purge_tombstoned_cf_slice_locked(cf))?;
-                    if !more_work {
-                        break;
-                    }
-                }
+                self.purge_tombstoned_cf_snapshot(cf)?;
             }
             Ok(())
         })
     }
 
-    /// One budgeted slice of a single CF's tombstone purge.
-    ///
-    /// Returns `true` when the hold budget ran out with work remaining, so the
-    /// caller releases the durable commit lock and re-acquires it for the next
-    /// slice.
-    fn purge_tombstoned_cf_slice_locked(&self, cf: ColumnFamily) -> Result<bool> {
+    /// Captures one manifest-covered CF view under a short commit-lock read and
+    /// runs all physical tombstone-purge work after releasing that lock.
+    fn purge_tombstoned_cf_snapshot(&self, cf: ColumnFamily) -> Result<()> {
         let Some(durable) = &self.durable else {
-            return Ok(false);
+            return Ok(());
         };
-        self.checkpoint_locked()?;
-        let durable_seq = self.verified_durable_coverage_seq(durable)?;
+        let commit_lock_started = std::time::Instant::now();
+        let durable_seq =
+            self.with_durable_commit_lock(|| self.published_compaction_snapshot_seq(durable))?;
+        let commit_lock_hold_us = commit_lock_started.elapsed().as_micros();
+        let catalog_started = std::time::Instant::now();
         let catalog = catalog_from_vault_tiers_through_seq(
             durable.root(),
             durable.tiering_policy(),
             durable_seq,
         )?;
-        let slice_started = std::time::Instant::now();
+        tracing::info!(
+            code = "CALYX_ASTER_TOMBSTONE_PURGE_SNAPSHOT_READY",
+            cf = cf.name(),
+            durable_seq,
+            commit_lock_hold_us,
+            catalog_scan_ms = catalog_started.elapsed().as_millis(),
+            "captured tombstone-purge input view without retaining the durable commit lock"
+        );
+        let mut passes = 0_usize;
         loop {
             let before = catalog.debt_for_cf(cf, DEFAULT_COMPACTION_TARGET_BYTES);
             if before.pending_files <= DEFAULT_COMPACTION_TARGET_FILES {
                 break;
             }
-            if slice_started.elapsed() >= TOMBSTONE_PURGE_SLICE_HOLD_BUDGET {
-                tracing::info!(
-                    code = "CALYX_ASTER_TOMBSTONE_PURGE_SLICE_YIELD",
-                    cf = cf.name(),
-                    pending_files = before.pending_files,
-                    target_files = DEFAULT_COMPACTION_TARGET_FILES,
-                    hold_ms = slice_started.elapsed().as_millis(),
-                    hold_budget_ms = TOMBSTONE_PURGE_SLICE_HOLD_BUDGET.as_millis(),
-                    "yielding the durable commit lock mid fan-out reduction so queued vault writes can proceed"
-                );
-                return Ok(true);
+            passes += 1;
+            if passes > TOMBSTONE_PURGE_MAX_COMPACTION_PASSES {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_TOMBSTONE_PURGE_PASS_BUDGET_EXHAUSTED",
+                    message: format!(
+                        "tombstone purge for {} did not converge within {TOMBSTONE_PURGE_MAX_COMPACTION_PASSES} off-lock compaction passes",
+                        cf.name()
+                    ),
+                    remediation: "inspect SST size/order distribution for this CF; a non-converging fan-out reduction means compaction admission is not making progress",
+                });
             }
-            let result = self.compact_catalog_cf_batch_locked(
+            let result = self.compact_catalog_cf_batch(
                 durable,
                 &catalog,
                 durable_seq,
@@ -598,7 +611,7 @@ where
         }
         let Some(report) = prepare_tombstoned_cf_compaction(durable, &catalog, cf, durable_seq)?
         else {
-            return Ok(false);
+            return Ok(());
         };
         let doomed = plan_compaction_input_reclaim(&report)?;
         let reclaimed = self.rows.retire_then_purge_cf_inputs(
@@ -613,7 +626,7 @@ where
                 cf.name()
             )));
         }
-        Ok(false)
+        Ok(())
     }
 
     pub(crate) fn purge_tombstoned_cfs_locked(&self, cfs: &[ColumnFamily]) -> Result<()> {
@@ -639,7 +652,7 @@ where
                 if before.pending_files <= DEFAULT_COMPACTION_TARGET_FILES {
                     break;
                 }
-                let result = self.compact_catalog_cf_batch_locked(
+                let result = self.compact_catalog_cf_batch(
                     durable,
                     &catalog,
                     durable_seq,

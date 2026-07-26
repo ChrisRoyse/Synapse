@@ -19,24 +19,53 @@ where
 
     pub fn set_retention_horizon(&self, horizon: RetentionHorizon) -> Result<()> {
         horizon.validate()?;
-        self.with_durable_commit_lock(|| {
-            let old = self.retention_horizon();
-            if old == horizon {
-                return Ok(());
-            }
-            if let Some(durable) = &self.durable {
-                durable.write_retention_horizon_manifest(&horizon)?;
-            }
-            if let Err(error) = self.commit_retention_horizon_ledger(&old, &horizon) {
-                if let Some(durable) = &self.durable
-                    && let Err(rollback) = durable.write_retention_horizon_manifest(&old)
-                {
-                    eprintln!("calyx retention horizon manifest rollback failed: {rollback}");
+        if self.durable.is_none() {
+            return self.with_durable_commit_lock(|| {
+                let old = self.retention_horizon();
+                if old == horizon {
+                    return Ok(());
                 }
-                return Err(error);
+                self.commit_retention_horizon_ledger(&old, &horizon)?;
+                self.replace_retention_horizon(horizon)
+            });
+        }
+        // Manifest writes share the checkpoint publisher lock and run outside
+        // the global writer lock. A manifest is three atomic-file publications
+        // plus readback and generation reclaim; on a cold filesystem that took
+        // 6.9 s and parked every unrelated commit when performed inside the
+        // global boundary (#1832).
+        let durable = self.durable.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "durable retention update lost its durable vault handle",
+            )
+        })?;
+        let _checkpoint_guard =
+            crate::file_lock::FileLockGuard::acquire(&durable.checkpoint_lock_path())?;
+        let old = self.retention_horizon();
+        if old == horizon {
+            return Ok(());
+        }
+        durable.write_retention_horizon_manifest(&horizon)?;
+        let commit =
+            self.with_durable_commit_lock(|| self.commit_retention_horizon_ledger(&old, &horizon));
+        if let Err(error) = commit {
+            if let Err(rollback) = durable.write_retention_horizon_manifest(&old) {
+                tracing::error!(
+                    code = "CALYX_ASTER_RETENTION_MANIFEST_ROLLBACK_FAILED",
+                    primary_code = error.code,
+                    primary_error = %error.message,
+                    rollback_code = rollback.code,
+                    rollback_error = %rollback.message,
+                    "retention horizon ledger publication failed and the off-lock manifest rollback also failed"
+                );
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "retention horizon update failed with error[{}]: {}; restoring its manifest also failed with error[{}]: {}",
+                    error.code, error.message, rollback.code, rollback.message
+                )));
             }
-            self.replace_retention_horizon(horizon.clone())
-        })
+            return Err(error);
+        }
+        self.replace_retention_horizon(horizon)
     }
 
     pub(crate) fn replace_retention_horizon(&self, horizon: RetentionHorizon) -> Result<()> {

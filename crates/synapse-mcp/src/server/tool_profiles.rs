@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::{ErrorData, RoleServer, model::ErrorCode, model::Tool, service::RequestContext};
@@ -14,7 +14,9 @@ use synapse_action::lease;
 use synapse_core::error_codes;
 use synapse_storage::cf;
 
-use super::{Json, Parameters, SynapseService, empty_input_schema, mcp_error, tool, tool_router};
+use super::{
+    Json, Parameters, SynapseService, ToolRouter, empty_input_schema, mcp_error, tool, tool_router,
+};
 
 const TOOL_PROFILE_PREFIX: &str = "mcp/tool-profile/v1/";
 const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<session_id>";
@@ -41,6 +43,46 @@ const CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH: &str = "%APPDATA%\\synapse\\codex-to
 const CODEX_CLIENT_SURFACE_REMEDIATION: &str = "restart Codex through the patched launcher when a live stale codex.exe PID is named by the latest handoff; rerun scripts\\synapse-setup.ps1 if the host tool-surface snapshot is missing, missing public tools, or hash-mismatched with the live daemon surface";
 const CODEX_CLIENT_SURFACE_SCHEMA_STALE_DOCTOR_COMMAND: &str = "pwsh -NoProfile -File .\\scripts\\synapse-codex-doctor.ps1 -ProjectDir C:\\code\\Synapse -ObservedSynapseSchemaStale -ActiveIssue <issue>";
 const CODEX_CLIENT_SURFACE_SCHEMA_STALE_READBACK_COMMAND: &str = "Get-Content .\\STATE\\RECOVERY_NOTES.md; Get-ChildItem \"$env:LOCALAPPDATA\\synapse\\codex-restart-handoffs\" -Filter 'codex-restart-handoff-*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1";
+
+/// The implementation router is immutable after service construction. Keep
+/// its sanitized schemas, canonical names, and fingerprint together so every
+/// unscoped `tools/list` and `/health` read observes the same precomputed
+/// source of truth without rebuilding schemas or reading Codex host state.
+#[derive(Debug)]
+pub(super) struct ImmutableToolSurface {
+    tools: Vec<Tool>,
+    names: Vec<String>,
+    fingerprint: super::health::ToolSurfaceFingerprint,
+}
+
+impl ImmutableToolSurface {
+    pub(super) fn from_tool_router(
+        tool_router: &ToolRouter<SynapseService>,
+    ) -> anyhow::Result<Self> {
+        let started_at = Instant::now();
+        let mut tools = super::schema_sanitize::sanitize_tools(tool_router.list_all());
+        sort_tools_for_profile(&mut tools, ToolProfileKind::BreakGlass);
+        let fingerprint = super::health::tool_surface_fingerprint_for_tools(tools.clone());
+        if let Some(error) = fingerprint.error.as_deref() {
+            anyhow::bail!(
+                "MCP_IMMUTABLE_TOOL_SURFACE_BUILD_FAILED: sanitized registry fingerprint failed during service construction: {error}"
+            );
+        }
+        let names = fingerprint.names.clone();
+        tracing::info!(
+            code = "MCP_IMMUTABLE_TOOL_SURFACE_CACHED",
+            tool_count = names.len(),
+            tool_surface_sha256 = %fingerprint.sha256,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "sanitized immutable MCP registry surface cached at service construction"
+        );
+        Ok(Self {
+            tools,
+            names,
+            fingerprint,
+        })
+    }
+}
 
 pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[
     "health",
@@ -3483,12 +3525,16 @@ impl SynapseService {
         &self,
         session_id: Option<&str>,
     ) -> Result<Vec<Tool>, ErrorData> {
-        let snapshot = self.tool_profile_snapshot(session_id)?;
+        let Some(session_id) = session_id else {
+            return Ok(self.immutable_tool_surface.tools.clone());
+        };
+        let profile = self
+            .ensure_tool_profile_assignment(session_id)?
+            .record
+            .profile;
         let mut tools = self.full_sanitized_tools();
-        if session_id.is_some() {
-            tools.retain(|tool| snapshot.profile.is_visible(tool.name.as_ref()));
-        }
-        sort_tools_for_profile(&mut tools, snapshot.profile);
+        tools.retain(|tool| profile.is_visible(tool.name.as_ref()));
+        sort_tools_for_profile(&mut tools, profile);
         Ok(tools)
     }
 
@@ -3901,17 +3947,17 @@ impl SynapseService {
     }
 
     pub(crate) fn full_sanitized_tools(&self) -> Vec<Tool> {
-        super::schema_sanitize::sanitize_tools(self.tool_router.list_all())
+        self.immutable_tool_surface.tools.clone()
     }
 
     fn full_tool_names(&self) -> Vec<String> {
-        let mut names = self
-            .full_sanitized_tools()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
+        self.immutable_tool_surface.names.clone()
+    }
+
+    pub(crate) fn immutable_tool_surface_fingerprint(
+        &self,
+    ) -> super::health::ToolSurfaceFingerprint {
+        self.immutable_tool_surface.fingerprint.clone()
     }
 }
 

@@ -95,6 +95,9 @@ fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -
     if readback.maintenance_supported && !readback.gc_task_running {
         reasons.push("storage GC task is not running".to_owned());
     }
+    if readback.maintenance_supported && !readback.checkpoint_task_running {
+        reasons.push("storage checkpoint task is not running".to_owned());
+    }
     if !readback.pressure_task_running {
         reasons.push("storage pressure task is not running".to_owned());
     }
@@ -105,6 +108,11 @@ fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -
         && let Some(error) = &readback.gc_task.last_error
     {
         reasons.push(format!("storage GC last_error={error}"));
+    }
+    if readback.maintenance_supported
+        && let Some(error) = &readback.checkpoint_task.last_error
+    {
+        reasons.push(format!("storage checkpoint last_error={error}"));
     }
     if let Some(error) = &readback.pressure_probe.last_error {
         reasons.push(format!("storage pressure last_error={error}"));
@@ -123,6 +131,13 @@ fn storage_gc_tick_active(readback: &crate::m3::StorageMaintenanceReadback) -> b
     )
 }
 
+fn storage_checkpoint_tick_active(readback: &crate::m3::StorageMaintenanceReadback) -> bool {
+    storage_tick_active(
+        readback.checkpoint_task.last_started_unix_ms,
+        readback.checkpoint_task.last_completed_unix_ms,
+    )
+}
+
 fn storage_pressure_probe_active(readback: &crate::m3::StorageMaintenanceReadback) -> bool {
     storage_tick_active(
         readback.pressure_probe.last_started_unix_ms,
@@ -131,7 +146,9 @@ fn storage_pressure_probe_active(readback: &crate::m3::StorageMaintenanceReadbac
 }
 
 fn storage_maintenance_active(readback: &crate::m3::StorageMaintenanceReadback) -> bool {
-    storage_gc_tick_active(readback) || storage_pressure_probe_active(readback)
+    storage_gc_tick_active(readback)
+        || storage_checkpoint_tick_active(readback)
+        || storage_pressure_probe_active(readback)
 }
 
 fn calyx_health_cf_sizes_skipped_reason() -> String {
@@ -146,6 +163,8 @@ fn apply_storage_maintenance_fields(
     health.storage_maintenance_unsupported_reason = readback.unsupported_reason.clone();
     health.storage_gc_task_running = Some(readback.gc_task_running);
     health.storage_gc_tick_active = Some(storage_gc_tick_active(readback));
+    health.storage_checkpoint_task_running = Some(readback.checkpoint_task_running);
+    health.storage_checkpoint_tick_active = Some(storage_checkpoint_tick_active(readback));
     health.storage_pressure_task_running = Some(readback.pressure_task_running);
     health.storage_pressure_probe_active = Some(storage_pressure_probe_active(readback));
     health.storage_pressure_probe_observed = Some(readback.pressure_probe.observed);
@@ -158,8 +177,43 @@ fn apply_storage_maintenance_fields(
     health.storage_gc_last_completed_unix_ms = readback.gc_task.last_completed_unix_ms;
     health.storage_gc_last_duration_ms = readback.gc_task.last_duration_ms;
     health.storage_gc_last_error = readback.gc_task.last_error.clone();
+    health.storage_gc_last_error_classification =
+        readback.gc_task.last_error_classification.clone();
+    health.storage_gc_last_attempt_count = Some(readback.gc_task.last_attempt_count);
+    health.storage_gc_next_retry_unix_ms = readback.gc_task.next_retry_unix_ms;
+    health.storage_gc_retry_exhausted = Some(readback.gc_task.retry_exhausted);
+    health.storage_gc_last_successful_unix_ms = readback.gc_task.last_successful_unix_ms;
+    health.storage_gc_last_successful_cf_readback_count =
+        readback.gc_task.last_successful_cf_readback_count;
+    health.storage_gc_last_successful_total_examined_rows =
+        readback.gc_task.last_successful_total_examined_rows;
+    health.storage_gc_last_successful_total_evicted_rows =
+        readback.gc_task.last_successful_total_evicted_rows;
+    health.storage_gc_last_successful_after_value_sum =
+        readback.gc_task.last_successful_after_value_sum;
     health.storage_gc_last_unsupported_policy_skips =
         readback.gc_task.last_unsupported_policy_skips.clone();
+    health.storage_checkpoint_last_started_unix_ms = readback.checkpoint_task.last_started_unix_ms;
+    health.storage_checkpoint_last_completed_unix_ms =
+        readback.checkpoint_task.last_completed_unix_ms;
+    health.storage_checkpoint_last_duration_ms = readback.checkpoint_task.last_duration_ms;
+    health.storage_checkpoint_last_error = readback.checkpoint_task.last_error.clone();
+    health.storage_checkpoint_last_error_classification =
+        readback.checkpoint_task.last_error_classification.clone();
+    health.storage_checkpoint_last_attempt_count =
+        Some(readback.checkpoint_task.last_attempt_count);
+    health.storage_checkpoint_next_retry_unix_ms = readback.checkpoint_task.next_retry_unix_ms;
+    health.storage_checkpoint_retry_exhausted = Some(readback.checkpoint_task.retry_exhausted);
+    health.storage_checkpoint_last_successful_unix_ms =
+        readback.checkpoint_task.last_successful_unix_ms;
+    health.storage_checkpoint_last_successful_cf_readback_count =
+        readback.checkpoint_task.last_successful_cf_readback_count;
+    health.storage_checkpoint_last_successful_total_examined_rows =
+        readback.checkpoint_task.last_successful_total_examined_rows;
+    health.storage_checkpoint_last_successful_total_evicted_rows =
+        readback.checkpoint_task.last_successful_total_evicted_rows;
+    health.storage_checkpoint_last_successful_after_value_sum =
+        readback.checkpoint_task.last_successful_after_value_sum;
     health.storage_pressure_last_started_unix_ms = readback.pressure_probe.last_started_unix_ms;
     health.storage_pressure_last_completed_unix_ms = readback.pressure_probe.last_completed_unix_ms;
     health.storage_pressure_last_duration_ms = readback.pressure_probe.last_duration_ms;
@@ -560,6 +614,9 @@ impl SynapseService {
     }
 
     fn tool_surface_fingerprint(&self, session_id: Option<&str>) -> ToolSurfaceFingerprint {
+        if session_id.is_none() {
+            return self.immutable_tool_surface_fingerprint();
+        }
         let tools = match self.health_tool_surface(session_id) {
             Ok(tools) => tools,
             Err(error) => {
@@ -990,7 +1047,7 @@ impl SynapseService {
                             )
                         },
                     );
-                    let search_tools = crate::m4::shell_search_tool_readback();
+                    let search_tools = self.m4_config.shell_search_tool_readback();
                     SubsystemHealth {
                         status: if emitter_available { "ok" } else { "error" }.to_owned(),
                         detail: Some(format!(
@@ -1137,6 +1194,7 @@ impl SynapseService {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct ToolSurfaceFingerprint {
     pub(crate) names: Vec<String>,
     pub(crate) sha256: String,

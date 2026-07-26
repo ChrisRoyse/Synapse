@@ -951,8 +951,10 @@ impl Db {
     /// Retires orphaned physical `cf/slot_*` column families that no live panel
     /// references (issue #1776), deriving orphan-ness from live Base membership.
     /// Fail-closed with readback, idempotent, and per-CF durable-lock bounded.
-    /// The blocking pass should be admitted off the runtime workers by the
-    /// caller (see `CalyxBackend::retire_orphan_slot_cfs_off_runtime`).
+    /// The blocking pass must be admitted off runtime workers by its transport
+    /// owner. The MCP storage facade enforces a single-flight permit and
+    /// `spawn_blocking`; keeping another backend-local async wrapper created an
+    /// unused, competing admission owner (#1835).
     ///
     /// # Errors
     ///
@@ -1056,7 +1058,7 @@ impl Db {
 
     /// Runs the Lomb-Scargle periodogram (with permutation false-alarm
     /// probability) and a slotted-autocorrelation cross-check over a panel's
-    /// occurrence series and persists the result to the native TemporalXTerm CF.
+    /// occurrence series and persists the result to the native `TemporalXTerm` CF.
     ///
     /// # Errors
     ///
@@ -1071,7 +1073,7 @@ impl Db {
 
     /// Detects recurrence-rate change (CUSUM) and distribution drift (MMD) over a
     /// panel's occurrence series and persists the result to the native
-    /// TemporalXTerm CF.
+    /// `TemporalXTerm` CF.
     ///
     /// # Errors
     ///
@@ -1085,7 +1087,7 @@ impl Db {
     }
 
     /// Fits the Gamma-renewal inter-event overdue hazard over a panel's
-    /// occurrence series and persists the result to the native TemporalXTerm CF.
+    /// occurrence series and persists the result to the native `TemporalXTerm` CF.
     ///
     /// # Errors
     ///

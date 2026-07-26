@@ -1,8 +1,11 @@
-use super::record::DecodeStatus;
+use super::record::{DecodeStatus, PayloadStatus};
 use super::{ReplayOutcome, ReplayRecord, TornTail, record, segment, storage_error};
 use calyx_core::{CalyxErrorCode, Result};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
+
+const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Replays a WAL directory, truncating a torn physical tail if present.
 pub fn replay_dir(dir: impl AsRef<Path>) -> Result<ReplayOutcome> {
@@ -12,8 +15,8 @@ pub fn replay_dir(dir: impl AsRef<Path>) -> Result<ReplayOutcome> {
 /// Replays WAL records after a durable checkpoint sequence.
 ///
 /// Records at or below `replay_floor_seq` are already represented by durable
-/// SST/manifest state, so recovery validates their headers and seeks over their
-/// payloads without re-reading and re-decoding old vector-heavy batches.
+/// SST/manifest state. Recovery scans and authenticates their framing and
+/// payloads sequentially without retaining old vector-heavy batches.
 pub fn replay_dir_after(dir: impl AsRef<Path>, replay_floor_seq: u64) -> Result<ReplayOutcome> {
     let dir = dir.as_ref();
     let _lock = crate::file_lock::FileLockGuard::acquire(&dir.join(".append.lock"))?;
@@ -30,22 +33,22 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
 
     for (position, (_, path)) in segments.iter().enumerate() {
         let has_later_segments = position + 1 < segments.len();
-        let mut file = OpenOptions::new()
-            .read(true)
+        let file = super::sequential_read_options()
             .write(true)
             .open(path)
             .map_err(|error| storage_error("open WAL segment for replay", error))?;
+        let mut reader = BufReader::with_capacity(REPLAY_BUFFER_BYTES, file);
         let mut offset = 0;
 
         loop {
-            let header = match record::read_header_at(&mut file, offset)
+            let header = match record::read_header(&mut reader, offset)
                 .map_err(|error| storage_error("decode WAL header", error))?
             {
                 record::HeaderStatus::Complete(header) => header,
                 record::HeaderStatus::Eof => break,
                 record::HeaderStatus::Torn { offset, message } => {
                     return resolve_torn_tail(
-                        &file,
+                        reader.get_ref(),
                         path,
                         offset,
                         message,
@@ -55,10 +58,24 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                 }
             };
             if header.seq <= replay_floor_seq {
-                offset = header.end_offset;
+                match record::validate_payload(&mut reader, &header)
+                    .map_err(|error| storage_error("validate durable WAL payload", error))?
+                {
+                    PayloadStatus::Complete => offset = header.end_offset,
+                    PayloadStatus::Torn { offset, message } => {
+                        return resolve_torn_tail(
+                            reader.get_ref(),
+                            path,
+                            offset,
+                            message,
+                            records,
+                            has_later_segments,
+                        );
+                    }
+                }
                 continue;
             }
-            match record::decode_at(&mut file, offset)
+            match record::decode_payload(&mut reader, header)
                 .map_err(|error| storage_error("decode WAL record", error))?
             {
                 DecodeStatus::Complete(decoded) => {
@@ -74,7 +91,7 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                 DecodeStatus::Eof => break,
                 DecodeStatus::Torn { offset, message } => {
                     return resolve_torn_tail(
-                        &file,
+                        reader.get_ref(),
                         path,
                         offset,
                         message,

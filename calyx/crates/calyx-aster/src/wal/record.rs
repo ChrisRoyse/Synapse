@@ -22,6 +22,12 @@ pub(super) enum HeaderStatus {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(super) enum PayloadStatus {
+    Complete,
+    Torn { offset: u64, message: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct RecordHeader {
     pub seq: u64,
     pub len: u32,
@@ -57,20 +63,26 @@ pub(super) fn encode(seq: u64, payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn decode_at(file: &mut File, offset: u64) -> io::Result<DecodeStatus> {
-    let header = match read_header_at(file, offset)? {
+pub(super) fn decode_next(reader: &mut impl Read, offset: u64) -> io::Result<DecodeStatus> {
+    let header = match read_header(reader, offset)? {
         HeaderStatus::Complete(header) => header,
         HeaderStatus::Eof => return Ok(DecodeStatus::Eof),
         HeaderStatus::Torn { offset, message } => {
             return Ok(DecodeStatus::Torn { offset, message });
         }
     };
-    file.seek(SeekFrom::Start(offset + HEADER_LEN as u64))?;
+    decode_payload(reader, header)
+}
+
+pub(super) fn decode_payload(
+    reader: &mut impl Read,
+    header: RecordHeader,
+) -> io::Result<DecodeStatus> {
     let mut payload = vec![0u8; header.len as usize];
-    if let Err(error) = file.read_exact(&mut payload) {
+    if let Err(error) = reader.read_exact(&mut payload) {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             return Ok(DecodeStatus::Torn {
-                offset,
+                offset: header.start_offset,
                 message: format!(
                     "partial WAL payload for seq {}: wanted {} bytes",
                     header.seq, header.len
@@ -83,7 +95,7 @@ pub(super) fn decode_at(file: &mut File, offset: u64) -> io::Result<DecodeStatus
     let actual_crc = payload_crc(header.seq, header.len, &payload);
     if actual_crc != header.expected_crc {
         return Ok(DecodeStatus::Torn {
-            offset,
+            offset: header.start_offset,
             message: format!(
                 "crc mismatch for seq {}: expected {:08x}, got {actual_crc:08x}",
                 header.seq, header.expected_crc
@@ -94,15 +106,74 @@ pub(super) fn decode_at(file: &mut File, offset: u64) -> io::Result<DecodeStatus
     Ok(DecodeStatus::Complete(DecodedRecord {
         seq: header.seq,
         payload,
-        start_offset: offset,
+        start_offset: header.start_offset,
         end_offset: header.end_offset,
     }))
 }
 
+/// Reads and authenticates a payload without retaining it. Recovery uses this
+/// for records already represented by durable SST state so the WAL is scanned
+/// sequentially with bounded memory while corruption still fails closed.
+pub(super) fn validate_payload(
+    reader: &mut impl Read,
+    header: &RecordHeader,
+) -> io::Result<PayloadStatus> {
+    const SCRATCH_BYTES: usize = 64 * 1024;
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&header.seq.to_le_bytes());
+    hasher.update(&header.len.to_le_bytes());
+    let mut remaining = header.len as usize;
+    let mut scratch = [0_u8; SCRATCH_BYTES];
+    while remaining > 0 {
+        let wanted = remaining.min(scratch.len());
+        let read = match reader.read(&mut scratch[..wanted]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            return Ok(PayloadStatus::Torn {
+                offset: header.start_offset,
+                message: format!(
+                    "partial WAL payload for seq {}: wanted {} bytes",
+                    header.seq, header.len
+                ),
+            });
+        }
+        hasher.update(&scratch[..read]);
+        remaining -= read;
+    }
+
+    let actual_crc = hasher.finalize();
+    if actual_crc != header.expected_crc {
+        return Ok(PayloadStatus::Torn {
+            offset: header.start_offset,
+            message: format!(
+                "crc mismatch for seq {}: expected {:08x}, got {actual_crc:08x}",
+                header.seq, header.expected_crc
+            ),
+        });
+    }
+    Ok(PayloadStatus::Complete)
+}
+
 pub(super) fn read_header_at(file: &mut File, offset: u64) -> io::Result<HeaderStatus> {
     file.seek(SeekFrom::Start(offset))?;
+    read_header(file, offset)
+}
+
+pub(super) fn read_header(reader: &mut impl Read, offset: u64) -> io::Result<HeaderStatus> {
     let mut header = [0u8; HEADER_LEN];
-    let read = file.read(&mut header)?;
+    let mut read = 0;
+    while read < HEADER_LEN {
+        match reader.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
     if read == 0 {
         return Ok(HeaderStatus::Eof);
     }

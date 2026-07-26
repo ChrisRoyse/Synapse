@@ -6,6 +6,12 @@ use std::{
 use crate::{StorageError, StorageResult};
 
 const GC_INTERVAL: Duration = Duration::from_mins(5);
+const GC_RETRY_MAX_ATTEMPTS: u32 = 5;
+const GC_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const GC_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const GC_RETRYABLE_CALYX_BACKPRESSURE: &str = "retryable_calyx_backpressure";
+const GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE: &str = "retry_exhausted_calyx_backpressure";
+const GC_TERMINAL_ERROR: &str = "terminal_non_retryable";
 
 /// One storage GC pass across all configured column families.
 #[derive(Debug, Default)]
@@ -55,6 +61,15 @@ pub struct GcTaskReadback {
     pub last_completed_unix_ms: Option<u64>,
     pub last_duration_ms: Option<u64>,
     pub last_error: Option<String>,
+    pub last_error_classification: Option<String>,
+    pub last_attempt_count: u32,
+    pub next_retry_unix_ms: Option<u64>,
+    pub retry_exhausted: bool,
+    pub last_successful_unix_ms: Option<u64>,
+    pub last_successful_cf_readback_count: Option<u64>,
+    pub last_successful_total_examined_rows: Option<u64>,
+    pub last_successful_total_evicted_rows: Option<u64>,
+    pub last_successful_after_value_sum: Option<u64>,
     pub last_unsupported_policy_skips: Vec<String>,
 }
 
@@ -116,7 +131,33 @@ pub trait GcRunner: Send + Sync + 'static {
     fn run_once(&self) -> StorageResult<GcReport>;
 }
 
-pub fn spawn_runner(runner: Arc<dyn GcRunner>, interval: Duration) -> StorageResult<GcTask> {
+#[derive(Clone, Copy, Debug)]
+pub enum MaintenanceTaskKind {
+    GarbageCollection,
+    Checkpoint,
+}
+
+impl MaintenanceTaskKind {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::GarbageCollection => "storage_gc",
+            Self::Checkpoint => "storage_checkpoint",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::GarbageCollection => "garbage_collection",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+}
+
+pub fn spawn_runner(
+    runner: Arc<dyn GcRunner>,
+    interval: Duration,
+    task_kind: MaintenanceTaskKind,
+) -> StorageResult<GcTask> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| StorageError::WriteFailed {
             cf_name: "storage_gc".to_owned(),
@@ -133,19 +174,64 @@ pub fn spawn_runner(runner: Arc<dyn GcRunner>, interval: Duration) -> StorageRes
             tokio::select! {
                 _ = interval.tick() => {
                     let started = mark_gc_tick_started(&task_state);
-                    // The GC pass is synchronous and can run for minutes over
-                    // hundreds of megabytes (native-CF compaction, tombstone
-                    // purge). Admit it onto the dedicated blocking pool so it
-                    // never parks a runtime worker serving MCP requests (#1798).
-                    let tick_runner = Arc::clone(&runner);
-                    let result = crate::maintenance::run_admitted_maintenance(
-                        "storage_gc",
-                        move || tick_runner.run_once(),
-                    )
-                    .await;
-                    mark_gc_tick_completed(&task_state, started, &result);
+                    let mut attempt = 0_u32;
+                    let result = loop {
+                        attempt = attempt.saturating_add(1);
+                        mark_gc_attempt_started(&task_state, attempt);
+                        // The GC pass is synchronous and can run for minutes over
+                        // hundreds of megabytes (native-CF compaction, tombstone
+                        // purge). Admit each attempt onto the dedicated blocking
+                        // pool so neither the pass nor retry backoff parks a
+                        // runtime worker serving MCP requests (#1798/#1836).
+                        let tick_runner = Arc::clone(&runner);
+                        let attempt_result = crate::maintenance::run_admitted_maintenance(
+                            task_kind.operation(),
+                            move || tick_runner.run_once(),
+                        )
+                        .await;
+                        let Some(classification) = retryable_gc_error(&attempt_result) else {
+                            break attempt_result;
+                        };
+                        if attempt >= GC_RETRY_MAX_ATTEMPTS {
+                            break attempt_result;
+                        }
+                        let delay = gc_retry_delay(started.unix_ms, attempt);
+                        let next_retry_unix_ms = unix_time_ms_now().saturating_add(
+                            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        );
+                        mark_gc_retry_scheduled(
+                            &task_state,
+                            attempt,
+                            next_retry_unix_ms,
+                            classification,
+                            &attempt_result,
+                        );
+                        tracing::warn!(
+                            code = "STORAGE_MAINTENANCE_RETRY_SCHEDULED",
+                            task = task_kind.label(),
+                            attempt,
+                            max_attempts = GC_RETRY_MAX_ATTEMPTS,
+                            retry_after_ms = delay.as_millis(),
+                            next_retry_unix_ms,
+                            classification,
+                            error = ?attempt_result.as_ref().err(),
+                            "storage maintenance released admission after retryable contention and scheduled a bounded retry"
+                        );
+                        // Tokio sleep performs no work while pending. It is
+                        // outside both the admitted blocking operation and every
+                        // storage/commit/checkpoint lock.
+                        tokio::time::sleep(delay).await;
+                    };
+                    mark_gc_tick_completed(&task_state, started, attempt, &result);
                     if let Err(error) = result {
-                        tracing::warn!(error = %error, "storage GC tick failed");
+                        tracing::warn!(
+                            code = "STORAGE_MAINTENANCE_TICK_FAILED",
+                            task = task_kind.label(),
+                            attempts = attempt,
+                            classification = final_error_classification(&error, attempt),
+                            error = %error,
+                            "storage maintenance tick failed"
+                        );
                     }
                 }
                 _ = &mut shutdown_rx => break,
@@ -173,19 +259,75 @@ fn mark_gc_tick_started(state: &GcTaskState) -> TickStarted {
     if let Ok(mut readback) = state.readback.lock() {
         readback.running = true;
         readback.last_started_unix_ms = Some(started.unix_ms);
+        readback.last_attempt_count = 0;
+        readback.next_retry_unix_ms = None;
+        readback.retry_exhausted = false;
     }
     started
+}
+
+fn mark_gc_attempt_started(state: &GcTaskState, attempt: u32) {
+    if let Ok(mut readback) = state.readback.lock() {
+        readback.last_attempt_count = attempt;
+        readback.next_retry_unix_ms = None;
+    }
+}
+
+fn mark_gc_retry_scheduled(
+    state: &GcTaskState,
+    attempt: u32,
+    next_retry_unix_ms: u64,
+    classification: &'static str,
+    result: &StorageResult<GcReport>,
+) {
+    if let Ok(mut readback) = state.readback.lock() {
+        readback.last_attempt_count = attempt;
+        readback.next_retry_unix_ms = Some(next_retry_unix_ms);
+        readback.retry_exhausted = false;
+        readback.last_error = result.as_ref().err().map(ToString::to_string);
+        readback.last_error_classification = Some(classification.to_owned());
+    }
 }
 
 fn mark_gc_tick_completed(
     state: &GcTaskState,
     started: TickStarted,
+    attempts: u32,
     result: &StorageResult<GcReport>,
 ) {
     if let Ok(mut readback) = state.readback.lock() {
         readback.last_completed_unix_ms = Some(unix_time_ms_now());
         readback.last_duration_ms = Some(duration_millis_u64(started.instant.elapsed()));
+        readback.last_attempt_count = attempts;
+        readback.next_retry_unix_ms = None;
         readback.last_error = result.as_ref().err().map(ToString::to_string);
+        readback.last_error_classification = result
+            .as_ref()
+            .err()
+            .map(|error| final_error_classification(error, attempts).to_owned());
+        readback.retry_exhausted = result.as_ref().err().is_some_and(|error| {
+            retryable_storage_error(error) && attempts >= GC_RETRY_MAX_ATTEMPTS
+        });
+        if let Ok(report) = result {
+            readback.last_successful_unix_ms = readback.last_completed_unix_ms;
+            readback.last_successful_cf_readback_count =
+                Some(u64::try_from(report.cf_reports.len()).unwrap_or(u64::MAX));
+            readback.last_successful_total_examined_rows = Some(
+                report
+                    .cf_reports
+                    .iter()
+                    .map(|cf| cf.examined_rows)
+                    .fold(0_u64, u64::saturating_add),
+            );
+            readback.last_successful_total_evicted_rows = Some(report.total_evicted_rows());
+            readback.last_successful_after_value_sum = Some(
+                report
+                    .cf_reports
+                    .iter()
+                    .map(|cf| cf.after_value)
+                    .fold(0_u64, u64::saturating_add),
+            );
+        }
         readback.last_unsupported_policy_skips = result
             .as_ref()
             .ok()
@@ -199,6 +341,42 @@ fn mark_gc_tick_completed(
             })
             .unwrap_or_default();
     }
+}
+
+fn retryable_gc_error(result: &StorageResult<GcReport>) -> Option<&'static str> {
+    result
+        .as_ref()
+        .err()
+        .filter(|error| retryable_storage_error(error))
+        .map(|_| GC_RETRYABLE_CALYX_BACKPRESSURE)
+}
+
+fn retryable_storage_error(error: &StorageError) -> bool {
+    error.code() == synapse_calyx::SYNAPSE_CALYX_BACKPRESSURE
+}
+
+fn final_error_classification(error: &StorageError, attempts: u32) -> &'static str {
+    if retryable_storage_error(error) && attempts >= GC_RETRY_MAX_ATTEMPTS {
+        GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE
+    } else if retryable_storage_error(error) {
+        GC_RETRYABLE_CALYX_BACKPRESSURE
+    } else {
+        GC_TERMINAL_ERROR
+    }
+}
+
+fn gc_retry_delay(tick_unix_ms: u64, attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let exponential_ms = u64::try_from(GC_RETRY_BASE_DELAY.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(multiplier);
+    let cap_ms = u64::try_from(GC_RETRY_MAX_DELAY.as_millis()).unwrap_or(u64::MAX);
+    let bounded_ms = exponential_ms.min(cap_ms);
+    let jitter_window_ms = (bounded_ms / 4).max(1);
+    let jitter_ms =
+        tick_unix_ms.wrapping_add(u64::from(attempt).wrapping_mul(0x9E37_79B9)) % jitter_window_ms;
+    Duration::from_millis(bounded_ms.saturating_add(jitter_ms).min(cap_ms))
 }
 
 fn unix_time_ms_now() -> u64 {

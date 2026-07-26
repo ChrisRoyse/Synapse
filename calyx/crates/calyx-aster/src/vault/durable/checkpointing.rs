@@ -18,10 +18,9 @@ use crate::sst::write_sst;
 use calyx_core::{CalyxError, Result};
 use std::collections::BTreeMap;
 use std::fs;
-use std::time::{Duration, Instant};
 
 /// Maximum staged batches one bounded checkpoint drain may materialize before
-/// it returns so the caller can release the durable commit lock (issue #1806).
+/// it returns (issue #1806).
 ///
 /// Every durable group commit stages exactly one checkpoint batch, and each
 /// batch is written as one `write_atomic_create_new` SST *per touched CF*
@@ -31,15 +30,6 @@ use std::time::{Duration, Instant};
 /// commit-lock acquisition blocked every writer — including the MCP
 /// `initialize` activity-recorder write — for multi-minute stretches.
 pub(in crate::vault) const CHECKPOINT_DRAIN_MAX_BATCHES: usize = 256;
-
-/// Wall-clock budget for one bounded checkpoint drain.
-///
-/// The batch ceiling alone cannot bound the hold time because per-SST fsync
-/// cost varies by orders of magnitude across hosts and filesystems. The drain
-/// therefore also stops at this elapsed budget (always after at least one
-/// batch, so the manifest can never stall), which is what actually delivers
-/// the sub-second commit-lock holds #1806 requires.
-pub(in crate::vault) const CHECKPOINT_DRAIN_HOLD_BUDGET: Duration = Duration::from_millis(250);
 
 /// Row ceiling for one coalesced checkpoint flush.
 ///
@@ -73,6 +63,34 @@ pub(in crate::vault) struct CheckpointDrainChunk {
     pub remaining_batches: usize,
 }
 
+/// A contiguous staged prefix reserved under the global durable commit lock.
+///
+/// The bytes are then materialized while that global lock is released. The
+/// prefix remains owned by this value until manifest publication succeeds or
+/// the caller explicitly re-stages it after an error.
+#[derive(Debug)]
+pub(in crate::vault) struct PreparedCheckpoint {
+    pub base_durable_seq: u64,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub rows: usize,
+    pub bytes: usize,
+    batches: Vec<(u64, Vec<WriteRow>)>,
+}
+
+impl PreparedCheckpoint {
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
+    }
+}
+
+/// Physical output produced before a prepared checkpoint is manifested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::vault) struct CheckpointMaterialization {
+    pub sst_files: usize,
+    pub sst_bytes: u64,
+}
+
 impl DurableVault {
     /// Checkpoints a WAL-committed batch without allowing the manifest replay
     /// floor to jump past older staged batches. This is the post-WAL recovery
@@ -84,6 +102,13 @@ impl DurableVault {
         rows: &[WriteRow],
     ) -> Result<()> {
         self.stage_recovered_wal_batches(vec![(seq, rows.to_vec())])?;
+        let Some(_checkpoint_guard) =
+            crate::file_lock::FileLockGuard::try_acquire(&self.checkpoint_lock_path())?
+        else {
+            return Err(CalyxError::backpressure(format!(
+                "checkpoint reconciliation for committed seq {seq} could not acquire the checkpoint publisher lock without waiting while the global commit lock is held; the WAL batch remains staged and must be reconciled by the active checkpoint publisher"
+            )));
+        };
         self.flush_pending_checkpoints()
     }
 
@@ -137,13 +162,14 @@ impl DurableVault {
     /// across 3 CFs used to publish ~768 files of ~113 bytes each. Every one of
     /// those goes through `write_atomic_create_new`: temp create, `sync_all()`,
     /// rename, parent-directory fsync — **two fsyncs plus two metadata ops per
-    /// file**, all while the durable commit lock is held and every vault write
-    /// (including the MCP `initialize` activity row) queues behind it.
+    /// file**. Issue #1832 moved this physical work outside the durable commit
+    /// lock; the immutable files are published first and only then made
+    /// authoritative by one short manifest publication section.
     ///
     /// That is fsync amplification, not a throughput limit: the payload is
-    /// bytes and the cost is barriers. It is why checkpoint materialization
-    /// never caught up on this host — observed `manifest_seq=48,427` against
-    /// `durable_seq=1,554,692` (#1832).
+    /// bytes and the cost is barriers. `manifest_seq` is a metadata generation
+    /// counter and must never be compared with `durable_seq` as backlog;
+    /// checkpoint lag is `durable_seq - derived_content_seq` (#1832).
     ///
     /// Coalescing is the standard answer. RocksDB group-commits concurrent
     /// writes into one WAL write with one fsync, and its
@@ -159,9 +185,12 @@ impl DurableVault {
     /// later seqs must shadow earlier ones for the same key, which the
     /// per-CF `BTreeMap` does by construction: batches are applied in ascending
     /// seq order and a later insert replaces an earlier one.
-    fn write_coalesced_rows(&self, batches: &[(u64, Vec<WriteRow>)]) -> Result<()> {
+    fn write_coalesced_rows(
+        &self,
+        batches: &[(u64, Vec<WriteRow>)],
+    ) -> Result<CheckpointMaterialization> {
         let Some((last_seq, _)) = batches.last() else {
-            return Ok(());
+            return Ok(CheckpointMaterialization::default());
         };
         // CF -> key -> value, latest write wins.
         let mut by_cf: BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
@@ -173,6 +202,7 @@ impl DurableVault {
                     .insert(row.key.clone(), row.value.clone());
             }
         }
+        let mut materialized = CheckpointMaterialization::default();
         for (cf, rows) in by_cf {
             if rows.is_empty() {
                 continue;
@@ -186,37 +216,222 @@ impl DurableVault {
                         .iter()
                         .map(|(key, value)| Ok((key.clone(), seal_value(context, cf, key, value)?)))
                         .collect::<Result<Vec<_>>>()?;
-                    write_sst(
+                    let summary = write_sst(
                         &path,
                         entries
                             .iter()
                             .map(|(key, value)| (key.as_slice(), value.as_slice())),
                     )?;
+                    materialized.sst_files = materialized.sst_files.saturating_add(1);
+                    materialized.sst_bytes = materialized.sst_bytes.saturating_add(summary.bytes);
                 }
                 None => {
-                    write_sst(
+                    let summary = write_sst(
                         &path,
                         rows.iter()
                             .map(|(key, value)| (key.as_slice(), value.as_slice())),
                     )?;
+                    materialized.sst_files = materialized.sst_files.saturating_add(1);
+                    materialized.sst_bytes = materialized.sst_bytes.saturating_add(summary.bytes);
                 }
             }
         }
-        Ok(())
+        Ok(materialized)
+    }
+
+    /// Reserves the oldest complete WAL-tail prefix for off-lock materialization.
+    ///
+    /// This method must run under `AsterVault::with_durable_commit_lock`. It
+    /// first discards entries already covered by the authoritative manifest,
+    /// then proves that the local staging vector covers every sequence from
+    /// `manifest.durable_seq + 1` through the WAL tip. A missing or duplicate
+    /// sequence fails closed: publishing a later floor would strand that WAL
+    /// batch after recycling.
+    pub(in crate::vault) fn prepare_pending_checkpoint(
+        &self,
+        max_batches: usize,
+    ) -> Result<Option<PreparedCheckpoint>> {
+        if max_batches == 0 {
+            return Err(CalyxError::disk_pressure(
+                "checkpoint preparation requires max_batches >= 1; a zero batch budget can never advance the manifest",
+            ));
+        }
+        let base_durable_seq = self.manifest_durable_seq()?;
+        let wal_tip = self.durable_tip_seq()?;
+        if wal_tip < base_durable_seq {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "checkpoint manifest floor {base_durable_seq} exceeds WAL tip {wal_tip}"
+            )));
+        }
+        let mut pending = self
+            .pending_checkpoint
+            .lock()
+            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
+        if let Some(window) = pending.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "staged checkpoint batches are not strictly seq-ordered ({} then {}); refusing to reserve a prefix",
+                window[0].0, window[1].0
+            )));
+        }
+        let already_manifested = pending.partition_point(|(seq, _)| *seq <= base_durable_seq);
+        pending.drain(..already_manifested);
+        if pending.is_empty() {
+            if wal_tip != base_durable_seq {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "checkpoint staging is empty but WAL tip {wal_tip} exceeds manifest floor {base_durable_seq}; publishing any later floor would strand committed WAL rows"
+                )));
+            }
+            return Ok(None);
+        }
+        let expected_first = base_durable_seq.checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "checkpoint manifest floor reached u64::MAX while staged batches remain",
+            )
+        })?;
+        if pending[0].0 != expected_first {
+            return Err(CalyxError::backpressure(format!(
+                "checkpoint prefix is not available from the manifest floor: expected first seq {expected_first}, staged first seq {}; another publisher may have reserved the prefix, so this caller refuses to publish across the gap",
+                pending[0].0
+            )));
+        }
+        if let Some(window) = pending
+            .windows(2)
+            .find(|pair| pair[0].0.checked_add(1) != Some(pair[1].0))
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "staged checkpoint sequence gap {} -> {}; a manifest advance would strand the missing WAL batch",
+                window[0].0, window[1].0
+            )));
+        }
+        let staged_tip = pending.last().map_or(base_durable_seq, |(seq, _)| *seq);
+        if staged_tip != wal_tip {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "checkpoint staging tip {staged_tip} does not cover WAL tip {wal_tip}; refusing to publish incomplete coverage"
+            )));
+        }
+
+        let mut selected = 0_usize;
+        let mut selected_rows = 0_usize;
+        let mut selected_bytes = 0_usize;
+        for (_, rows) in pending.iter().take(max_batches) {
+            let batch_rows = rows.len();
+            let batch_bytes = rows.iter().fold(0_usize, |bytes, row| {
+                bytes.saturating_add(row.key.len().saturating_add(row.value.len()))
+            });
+            if selected > 0
+                && (selected_rows.saturating_add(batch_rows) > COALESCED_FLUSH_MAX_ROWS
+                    || selected_bytes.saturating_add(batch_bytes) > COALESCED_FLUSH_MAX_BYTES)
+            {
+                break;
+            }
+            selected = selected.saturating_add(1);
+            selected_rows = selected_rows.saturating_add(batch_rows);
+            selected_bytes = selected_bytes.saturating_add(batch_bytes);
+        }
+        let batches = pending.drain(..selected).collect::<Vec<_>>();
+        let first_seq = batches.first().map_or(0, |(seq, _)| *seq);
+        let last_seq = batches.last().map_or(0, |(seq, _)| *seq);
+        Ok(Some(PreparedCheckpoint {
+            base_durable_seq,
+            first_seq,
+            last_seq,
+            rows: selected_rows,
+            bytes: selected_bytes,
+            batches,
+        }))
+    }
+
+    /// Writes immutable checkpoint SSTs without publishing a new replay floor.
+    pub(in crate::vault) fn materialize_prepared_checkpoint(
+        &self,
+        prepared: &PreparedCheckpoint,
+    ) -> Result<CheckpointMaterialization> {
+        self.write_coalesced_rows(&prepared.batches)
+    }
+
+    /// Publishes an already-materialized prefix under the dedicated checkpoint
+    /// publisher lock. The staging mutex below is the only boundary shared
+    /// with concurrent commits; manifest filesystem I/O must never inherit the
+    /// unrelated global writer lock (#1832).
+    pub(in crate::vault) fn publish_prepared_checkpoint(
+        &self,
+        prepared: &PreparedCheckpoint,
+    ) -> Result<CheckpointDrainChunk> {
+        let current_floor = self.manifest_durable_seq()?;
+        if current_floor < prepared.base_durable_seq {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "checkpoint manifest floor regressed from reserved base {} to {current_floor}",
+                prepared.base_durable_seq
+            )));
+        }
+
+        let mut pending = self
+            .pending_checkpoint
+            .lock()
+            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
+        // Validate before mutating. An early error after `drain(..)` would drop
+        // the unvisited newer tail from in-memory staging even though its WAL
+        // bytes remain authoritative.
+        for batch in pending.iter() {
+            if batch.0 <= current_floor || batch.0 > prepared.last_seq {
+                continue;
+            }
+            let expected = prepared
+                .batches
+                .binary_search_by_key(&batch.0, |(seq, _)| *seq)
+                .ok()
+                .and_then(|index| prepared.batches.get(index))
+                .ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "checkpoint publication encountered unexpected staged seq {} within reserved range {}..={}",
+                        batch.0, prepared.first_seq, prepared.last_seq
+                    ))
+                })?;
+            if expected.1 != batch.1 {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "checkpoint seq {} was re-staged with different rows while its SSTs were materialized: reserved_rows={} staged_rows={}",
+                    batch.0,
+                    expected.1.len(),
+                    batch.1.len()
+                )));
+            }
+        }
+        let newly_covered_floor = current_floor.max(prepared.last_seq);
+        pending.retain(|(seq, _)| *seq > newly_covered_floor);
+        let remaining_batches = pending.len();
+        drop(pending);
+
+        for (seq, rows) in &prepared.batches {
+            self.advance_checkpointed_derived_content(*seq, rows);
+        }
+        if current_floor < prepared.last_seq {
+            self.write_manifest(prepared.last_seq)?;
+        }
+        Ok(CheckpointDrainChunk {
+            batches_written: prepared.batch_count(),
+            rows_written: prepared.rows,
+            last_written_seq: prepared.last_seq,
+            remaining_batches,
+        })
+    }
+
+    /// Returns a reserved prefix to staging after any materialize/publish error.
+    pub(in crate::vault) fn restage_prepared_checkpoint(
+        &self,
+        prepared: PreparedCheckpoint,
+    ) -> Result<()> {
+        self.stage_recovered_wal_batches(prepared.batches)
     }
 
     /// Materializes every staged checkpoint batch.
     ///
-    /// This is the unbounded-completion contract required by the post-WAL
-    /// reconciliation path and by deterministic close. It is implemented as a
-    /// sequence of bounded drains so a single pass never builds one giant
-    /// in-memory clone of the whole backlog; callers that must also bound the
-    /// *durable commit lock hold* use `AsterVault::drain_checkpoints_paced`,
-    /// which releases the lock between drains.
+    /// This is the unbounded-completion contract used only by callers that
+    /// already hold the global commit lock and have exclusively acquired the
+    /// checkpoint publisher lock. Routine maintenance uses the split
+    /// reserve/materialize/publish path above so physical I/O is off-lock.
     pub(super) fn flush_pending_checkpoints(&self) -> Result<()> {
         loop {
-            let chunk = self
-                .flush_pending_checkpoints_bounded(CHECKPOINT_DRAIN_MAX_BATCHES, Duration::MAX)?;
+            let chunk = self.flush_pending_checkpoints_bounded(CHECKPOINT_DRAIN_MAX_BATCHES)?;
             if chunk.remaining_batches == 0 {
                 return Ok(());
             }
@@ -229,8 +444,7 @@ impl DurableVault {
         }
     }
 
-    /// Materializes at most `max_batches` staged checkpoint batches, stopping
-    /// early once `hold_budget` elapses (never before the first batch).
+    /// Materializes at most `max_batches` staged checkpoint batches.
     ///
     /// The staged prefix is *moved* out of the staging vector rather than
     /// cloned, so a multi-gigabyte derived-write backlog is no longer deep
@@ -246,121 +460,20 @@ impl DurableVault {
     pub(in crate::vault) fn flush_pending_checkpoints_bounded(
         &self,
         max_batches: usize,
-        hold_budget: Duration,
     ) -> Result<CheckpointDrainChunk> {
-        if max_batches == 0 {
-            return Err(CalyxError::disk_pressure(
-                "bounded checkpoint drain requires max_batches >= 1; a zero batch budget can never advance the manifest and would strand every staged batch",
-            ));
-        }
-        let chunk = self.take_staged_checkpoint_prefix(max_batches)?;
-        if chunk.is_empty() {
+        let Some(prepared) = self.prepare_pending_checkpoint(max_batches)? else {
             return Ok(CheckpointDrainChunk::default());
-        }
-        let started = Instant::now();
-        // Select how many staged batches to materialize together. This loop is
-        // pure in-memory accounting — the physical write happens once, below —
-        // so the elapsed budget here only bounds selection, not I/O.
-        let mut selected = 0_usize;
-        let mut rows_written = 0_usize;
-        let mut last_written_seq = 0_u64;
-        let mut coalesced_bytes = 0_usize;
-        for (index, (seq, rows)) in chunk.iter().enumerate() {
-            if index > 0
-                && (started.elapsed() >= hold_budget
-                    || rows_written >= COALESCED_FLUSH_MAX_ROWS
-                    || coalesced_bytes >= COALESCED_FLUSH_MAX_BYTES)
-            {
-                break;
-            }
-            coalesced_bytes = coalesced_bytes.saturating_add(
-                rows.iter()
-                    .map(|row| row.key.len().saturating_add(row.value.len()))
-                    .sum::<usize>(),
-            );
-            selected = index.saturating_add(1);
-            rows_written = rows_written.saturating_add(rows.len());
-            last_written_seq = *seq;
-        }
-        let mut written = 0_usize;
-        let mut write_error = None;
-        match self.write_coalesced_rows(&chunk[..selected]) {
-            Ok(()) => {
-                for (seq, rows) in &chunk[..selected] {
-                    self.advance_checkpointed_derived_content(*seq, rows);
-                }
-                written = selected;
-            }
-            Err(error) => {
-                rows_written = 0;
-                last_written_seq = 0;
-                write_error = Some(error);
-            }
-        }
-        if let Some(error) = write_error {
-            // Preserve the pre-#1806 failure semantics exactly: the staging
-            // vector is restored in full and the manifest is not advanced, so
-            // a retry sees the identical staged set it would have seen when
-            // the whole drain was one clone-and-write pass.
-            self.restage_checkpoint_prefix(chunk)?;
+        };
+        if let Err(error) = self.materialize_prepared_checkpoint(&prepared) {
+            self.restage_prepared_checkpoint(prepared)?;
             return Err(error);
         }
-        let mut chunk = chunk;
-        let deferred = chunk.split_off(written);
-        self.restage_checkpoint_prefix(deferred)?;
-        if written > 0 {
-            self.write_manifest(last_written_seq)?;
+        match self.publish_prepared_checkpoint(&prepared) {
+            Ok(chunk) => Ok(chunk),
+            Err(error) => {
+                self.restage_prepared_checkpoint(prepared)?;
+                Err(error)
+            }
         }
-        let remaining = self
-            .pending_checkpoint
-            .lock()
-            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?
-            .len();
-        Ok(CheckpointDrainChunk {
-            batches_written: written,
-            rows_written,
-            last_written_seq,
-            remaining_batches: remaining,
-        })
-    }
-
-    /// Removes the oldest contiguous staged prefix, failing closed if the
-    /// staging vector is not seq-ordered (which would let the manifest advance
-    /// past an older staged batch and strand it — issue #1132).
-    fn take_staged_checkpoint_prefix(
-        &self,
-        max_batches: usize,
-    ) -> Result<Vec<(u64, Vec<WriteRow>)>> {
-        let mut pending = self
-            .pending_checkpoint
-            .lock()
-            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
-        if pending.is_empty() {
-            return Ok(Vec::new());
-        }
-        if let Some(window) = pending.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "staged checkpoint batches are not strictly seq-ordered ({} then {}); a bounded drain would advance the manifest past an older staged batch and strand its rows behind the WAL replay floor",
-                window[0].0, window[1].0
-            )));
-        }
-        let take = max_batches.min(pending.len());
-        Ok(pending.drain(..take).collect())
-    }
-
-    /// Returns unwritten batches to the front of the staging vector, keeping
-    /// it seq-ordered.
-    fn restage_checkpoint_prefix(&self, batches: Vec<(u64, Vec<WriteRow>)>) -> Result<()> {
-        if batches.is_empty() {
-            return Ok(());
-        }
-        let mut pending = self
-            .pending_checkpoint
-            .lock()
-            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
-        let mut restored = batches;
-        restored.append(&mut pending);
-        *pending = restored;
-        Ok(())
     }
 }

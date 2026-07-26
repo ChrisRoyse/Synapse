@@ -37,6 +37,7 @@ use calyx_loom::{
     StaticPairGainGate, plan_cross_terms,
 };
 use calyx_paths::AssocGraph;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1273,6 +1274,12 @@ pub const SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS: f64 = 3_600.0;
 pub const SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG: usize = 8;
 /// Cap on reported periodogram peaks.
 pub const SYNAPSE_TEMPORAL_MAX_PEAKS: usize = 4;
+/// Hard cap on the aligned transfer-entropy timeline. This admits more than 29
+/// years of hourly bins while preventing a sparse or hostile timestamp span
+/// from turning one request into an unbounded allocation.
+pub const SYNAPSE_TEMPORAL_MAX_BINS: usize = 262_144;
+
+const MAX_EXACT_I64_IN_F64: u64 = 1_u64 << f64::MANTISSA_DIGITS;
 
 const GRAPH_CAUSALITY_PREFIX: &[u8; 5] = b"GTE01";
 const TEMPORAL_PERIODICITY_PREFIX: &[u8; 5] = b"TPER1";
@@ -1308,7 +1315,7 @@ pub struct SynapseCalyxTemporalParams {
 
 impl SynapseCalyxTemporalParams {
     #[must_use]
-    pub fn new(panel_version: u32) -> Self {
+    pub const fn new(panel_version: u32) -> Self {
         Self {
             panel_version,
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
@@ -1370,7 +1377,7 @@ pub struct SynapseCalyxPeriodogramPeak {
 }
 
 /// Lomb-Scargle periodicity result plus slotted-autocorrelation cross-check,
-/// with the physical TemporalXTerm CF readback.
+/// with the physical `TemporalXTerm` CF readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxPeriodicityReport {
     pub panel_version: u32,
@@ -1387,7 +1394,7 @@ pub struct SynapseCalyxPeriodicityReport {
     pub temporal_xterm_cf_rows_after: usize,
 }
 
-/// CUSUM + MMD drift result with the physical TemporalXTerm CF readback.
+/// CUSUM + MMD drift result with the physical `TemporalXTerm` CF readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxDriftReport {
     pub panel_version: u32,
@@ -1406,7 +1413,7 @@ pub struct SynapseCalyxDriftReport {
     pub temporal_xterm_cf_rows_after: usize,
 }
 
-/// Gamma-renewal overdue-hazard result with the physical TemporalXTerm CF
+/// Gamma-renewal overdue-hazard result with the physical `TemporalXTerm` CF
 /// readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxHazardReport {
@@ -1481,7 +1488,7 @@ impl SynapseCalyxVault {
         }
 
         let bin = validated_bin_seconds(params.bin_seconds)?;
-        let (stream_a, stream_b) = paired_binned_streams(&a_times, &b_times, bin);
+        let (stream_a, stream_b) = paired_binned_streams(&a_times, &b_times, bin)?;
         let n_bins = stream_a.len();
         let mut lags: Vec<usize> = DEFAULT_TE_LAGS
             .iter()
@@ -1542,7 +1549,7 @@ impl SynapseCalyxVault {
 
     /// Runs the Lomb-Scargle GLS periodogram (with permutation false-alarm
     /// probability) and a slotted-autocorrelation cross-check over the panel's
-    /// occurrence-count series, persists the result to the native TemporalXTerm
+    /// occurrence-count series, persists the result to the native `TemporalXTerm`
     /// CF, and reads it back.
     ///
     /// # Errors
@@ -1593,7 +1600,7 @@ impl SynapseCalyxVault {
             "acf_dominant_period_seconds": acf_dominant,
         });
         let key = temporal_report_key(
-            TEMPORAL_PERIODICITY_PREFIX,
+            *TEMPORAL_PERIODICITY_PREFIX,
             params.panel_version,
             params.filter_value.as_deref(),
         );
@@ -1618,7 +1625,7 @@ impl SynapseCalyxVault {
 
     /// Detects recurrence-rate change (Page two-sided CUSUM over the gap series)
     /// and distribution drift (MMD two-sample over the activity-count series),
-    /// persists the result to the native TemporalXTerm CF, and reads it back.
+    /// persists the result to the native `TemporalXTerm` CF, and reads it back.
     ///
     /// # Errors
     ///
@@ -1652,7 +1659,7 @@ impl SynapseCalyxVault {
             "mmd_p_value": mmd.as_ref().map(|report| report.report.p_value),
         });
         let key = temporal_report_key(
-            TEMPORAL_DRIFT_PREFIX,
+            *TEMPORAL_DRIFT_PREFIX,
             params.panel_version,
             params.filter_value.as_deref(),
         );
@@ -1678,7 +1685,7 @@ impl SynapseCalyxVault {
     }
 
     /// Fits the Gamma-renewal inter-event hazard and evaluates the overdue
-    /// survival at `now`, persists the result to the native TemporalXTerm CF, and
+    /// survival at `now`, persists the result to the native `TemporalXTerm` CF, and
     /// reads it back.
     ///
     /// # Errors
@@ -1716,7 +1723,7 @@ impl SynapseCalyxVault {
             "alpha": report.alpha,
         });
         let key = temporal_report_key(
-            TEMPORAL_HAZARD_PREFIX,
+            *TEMPORAL_HAZARD_PREFIX,
             params.panel_version,
             params.filter_value.as_deref(),
         );
@@ -1765,12 +1772,23 @@ impl SynapseCalyxVault {
             let Some(secs) = constellation.source_event_time_secs() else {
                 continue;
             };
+            if secs.unsigned_abs() > MAX_EXACT_I64_IN_F64 {
+                return Err(temporal_error(
+                    "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE",
+                    "a source event timestamp exceeds the exactly representable f64 integer range",
+                    "repair the source timestamp to a valid Unix-second value within +/- 2^53",
+                ));
+            }
+            let secs = secs.to_f64().ok_or_else(|| {
+                temporal_error(
+                    "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
+                    "a validated source event timestamp could not be converted to f64",
+                    "inspect the persisted Base row and repair its source event timestamp",
+                )
+            })?;
             let group =
                 group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
-            records.push(EventRecord {
-                secs: secs as f64,
-                group,
-            });
+            records.push(EventRecord { secs, group });
             if records.len() >= max_records {
                 break;
             }
@@ -1866,7 +1884,7 @@ fn paired_binned_streams(
     a_times: &[f64],
     b_times: &[f64],
     bin: f64,
-) -> (BinnedStream, BinnedStream) {
+) -> Result<(BinnedStream, BinnedStream), SynapseCalyxError> {
     let min_t = a_times
         .iter()
         .chain(b_times)
@@ -1878,17 +1896,49 @@ fn paired_binned_streams(
         .copied()
         .fold(f64::NEG_INFINITY, f64::max);
     if !min_t.is_finite() || !max_t.is_finite() || max_t < min_t {
-        return (Vec::new(), Vec::new());
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_TIME_RANGE_INVALID",
+            "the transfer-entropy time range is non-finite or reversed",
+            "inspect the persisted source event timestamps and repair invalid values",
+        ));
     }
-    let n_bins = (((max_t - min_t) / bin).floor() as usize) + 1;
+    let max_index = checked_temporal_bin_index((max_t - min_t) / bin)?;
+    let n_bins = max_index.checked_add(1).ok_or_else(|| {
+        temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_BIN_RANGE_OVERFLOW",
+            "the transfer-entropy bin count overflowed usize",
+            "increase bin_seconds or narrow the source event time window",
+        )
+    })?;
+    if n_bins > SYNAPSE_TEMPORAL_MAX_BINS {
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_BIN_RANGE_TOO_LARGE",
+            "the transfer-entropy timeline exceeds the bounded bin limit",
+            "increase bin_seconds or narrow the source event time window",
+        ));
+    }
     let mut a_counts = vec![0.0_f32; n_bins];
     let mut b_counts = vec![0.0_f32; n_bins];
     for &time in a_times {
-        let index = (((time - min_t) / bin).floor() as usize).min(n_bins - 1);
+        let index = checked_temporal_bin_index((time - min_t) / bin)?;
+        if index >= n_bins {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_BIN_INDEX_INVALID",
+                "an event mapped outside the validated transfer-entropy timeline",
+                "inspect the persisted source event timestamps and bin_seconds",
+            ));
+        }
         a_counts[index] += 1.0;
     }
     for &time in b_times {
-        let index = (((time - min_t) / bin).floor() as usize).min(n_bins - 1);
+        let index = checked_temporal_bin_index((time - min_t) / bin)?;
+        if index >= n_bins {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_BIN_INDEX_INVALID",
+                "an event mapped outside the validated transfer-entropy timeline",
+                "inspect the persisted source event timestamps and bin_seconds",
+            ));
+        }
         b_counts[index] += 1.0;
     }
     let stream_a = a_counts
@@ -1901,7 +1951,24 @@ fn paired_binned_streams(
         .enumerate()
         .map(|(index, count)| (index as u64, count))
         .collect();
-    (stream_a, stream_b)
+    Ok((stream_a, stream_b))
+}
+
+fn checked_temporal_bin_index(value: f64) -> Result<usize, SynapseCalyxError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_BIN_INDEX_INVALID",
+            "a transfer-entropy bin index is negative or non-finite",
+            "inspect the persisted source event timestamps and bin_seconds",
+        ));
+    }
+    value.floor().to_usize().ok_or_else(|| {
+        temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_BIN_INDEX_OVERFLOW",
+            "a transfer-entropy bin index does not fit usize",
+            "increase bin_seconds or narrow the source event time window",
+        )
+    })
 }
 
 /// Picks the transfer-entropy lag with the largest absolute directed asymmetry
@@ -1996,10 +2063,10 @@ fn causality_edge_key(panel_version: u32, group_a: &str, group_b: &str) -> Vec<u
     key
 }
 
-fn temporal_report_key(prefix: &[u8; 5], panel_version: u32, filter: Option<&str>) -> Vec<u8> {
+fn temporal_report_key(prefix: [u8; 5], panel_version: u32, filter: Option<&str>) -> Vec<u8> {
     let filter = filter.unwrap_or("");
     let mut key = Vec::with_capacity(prefix.len() + 4 + filter.len());
-    key.extend_from_slice(prefix);
+    key.extend_from_slice(&prefix);
     key.extend_from_slice(&panel_version.to_be_bytes());
     key.extend_from_slice(filter.as_bytes());
     key
@@ -2044,7 +2111,7 @@ pub const SYNAPSE_KERNEL_DEFAULT_EDGE_COS: f32 = 0.25;
 pub const SYNAPSE_KERNEL_DEFAULT_MIN_RECALL: f32 = 0.95;
 /// Default maximum hops walked from an anchored kernel node to the query.
 pub const SYNAPSE_KERNEL_DEFAULT_MAX_HOPS: usize = 4;
-/// Cap on member cx_ids echoed in a kernel report (the full set persists to CF).
+/// Cap on member `cx_ids` echoed in a kernel report (the full set persists to CF).
 pub const SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS: usize = 256;
 
 const KERNEL_ROW_PREFIX: &[u8; 5] = b"KERN1";
@@ -2085,7 +2152,7 @@ pub struct SynapseCalyxKernelReport {
     pub panel_version: u32,
     pub content_slot: u16,
     pub kernel_id: String,
-    /// Corpus fingerprint (sha256 over the sorted embedded cx_ids) proving which
+    /// Corpus fingerprint (sha256 over the sorted embedded `cx_ids`) proving which
     /// corpus this kernel was selected against.
     pub corpus_fingerprint: String,
     pub members: usize,
@@ -2535,7 +2602,7 @@ impl SynapseCalyxVault {
     }
 }
 
-/// Content fingerprint of the embedded corpus: sha256 over the sorted cx_id
+/// Content fingerprint of the embedded corpus: sha256 over the sorted `cx_id`
 /// bytes, hex-encoded — proves which concepts the kernel was selected against.
 fn corpus_fingerprint(rows: &[RecallQuery]) -> String {
     let bytes = corpus_hash_bytes(rows);

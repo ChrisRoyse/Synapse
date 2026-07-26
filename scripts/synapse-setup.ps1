@@ -3413,13 +3413,21 @@ function Get-SynapseDaemonStartupTerminalFailureLine {
     if (-not $Signal -or -not $Signal.matches -or @($Signal.matches).Count -eq 0) {
         return $null
     }
+    # Only final daemon-startup transaction failures are terminal. Nested
+    # storage/Calyx operations deliberately emit their own ERROR before the
+    # startup transaction decides whether that condition is recoverable. In
+    # particular, STORAGE_CALYX_ROUTER_ONLY_ROWS_ADOPTION_START handles an
+    # initial SYNAPSE_CALYX_ASTER_OPEN_FAILED and then proves a full-MVCC
+    # reopen. Treating that nested line as terminal killed the same healthy PID
+    # before it reached MCP_HTTP_BIND_NORMAL (#1816).
+    #
+    # Bind/runtime failures that occur without either final storage code are
+    # still fail-closed: the owned daemon exits and the watchdog reports
+    # daemon_not_running (or daemon_restart_loop) from the process/supervisor
+    # Source of Truth. Do not infer transaction termination from log severity.
     $terminalCodes = @(
         'STORAGE_OR_CALYX_OPEN_START_FAILED',
-        'STORAGE_LOCK_CONTENDED',
-        'STORAGE_OPEN_FAILED',
-        'SYNAPSE_CALYX_ASTER_OPEN_FAILED',
-        'CALYX_ASTER_ROUTER_OPEN_FAILED',
-        'MCP_HTTP_BIND_FAILED'
+        'STORAGE_LOCK_CONTENDED'
     )
     # Terminal lines are only honoured when they can be attributed to THIS
     # daemon (db path or bind appears in the line). synapse.log is shared by
@@ -6475,6 +6483,22 @@ function Test-SynapseCandidateDaemon {
             Stop-SynapseExactCandidateProcess -ProcessId ([int]$candidate.Id) -Bind $candidateBind -Token $tokenRead.Token -Reason 'candidate_health'
         } elseif ($candidateBind) {
             Wait-SynapseBindReleased -Reason 'candidate_health' -Bind $candidateBind -TimeoutSeconds 5
+        }
+        if (Test-Path -LiteralPath $candidateRoot) {
+            $candidateParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $candidateRoot)).TrimEnd('\')
+            $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $LogDir 'setup-candidates')).TrimEnd('\')
+            if (-not $candidateParent.Equals($expectedParent, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Die "SYNAPSE_CANDIDATE_ARTIFACT_SCOPE_INVALID path=$candidateRoot expected_parent=$expectedParent actual_parent=$candidateParent remediation=do not delete the path; inspect setup run-directory construction"
+            }
+            try {
+                Remove-Item -LiteralPath $candidateRoot -Recurse -Force -ErrorAction Stop
+            } catch {
+                Die "SYNAPSE_CANDIDATE_ARTIFACT_CLEANUP_FAILED path=$candidateRoot error=$($_.Exception.Message) remediation=close only handles owned by the stopped candidate PID, remove this exact isolated directory, and rerun setup"
+            }
+            if (Test-Path -LiteralPath $candidateRoot) {
+                Die "SYNAPSE_CANDIDATE_ARTIFACT_CLEANUP_UNVERIFIED path=$candidateRoot remediation=inspect filesystem permissions and remove this exact isolated candidate directory before rerunning setup"
+            }
+            Info "Candidate daemon isolated artifacts removed path=$candidateRoot"
         }
     }
 }

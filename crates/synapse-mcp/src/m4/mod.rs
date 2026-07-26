@@ -192,6 +192,7 @@ pub struct M4ServiceConfig {
     allow_shell_any: bool,
     allow_launch_any: bool,
     run_shell_inline_await_limit_ms: u64,
+    shell_search_tools: Arc<str>,
 }
 
 impl Default for M4ServiceConfig {
@@ -202,6 +203,7 @@ impl Default for M4ServiceConfig {
             allow_shell_any: false,
             allow_launch_any: false,
             run_shell_inline_await_limit_ms: DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
+            shell_search_tools: Arc::from(shell_search_tool_readback()),
         }
     }
 }
@@ -296,6 +298,7 @@ impl M4ServiceConfig {
             allow_shell_any,
             allow_launch_any,
             run_shell_inline_await_limit_ms,
+            shell_search_tools: Arc::from(shell_search_tool_readback()),
         })
     }
 
@@ -348,6 +351,11 @@ impl M4ServiceConfig {
     #[must_use]
     pub const fn run_shell_durable_max_timeout_ms(&self) -> Option<u64> {
         None
+    }
+
+    #[must_use]
+    pub fn shell_search_tool_readback(&self) -> &str {
+        &self.shell_search_tools
     }
 
     fn shell_match<'a>(&'a self, command_line: &str) -> Option<&'a str> {
@@ -10605,36 +10613,103 @@ fn cuda_path_nvcc_path(cuda_path: &str) -> PathBuf {
         .join("nvcc.exe")
 }
 
-/// Resolves a bare executable name (`rg`, `findstr`, …) against a semicolon
-/// PATH plus PATHEXT, returning the first matching file. Mirrors how Windows
-/// resolves a bare command name so the readback matches what a shell job's own
-/// executable resolution would find.
+/// Resolves several command names in one ordered directory inventory.
+///
+/// The old resolver performed one `is_file` for the bare name plus every
+/// `PATHEXT` variant at every PATH entry, then repeated that full walk for each
+/// program. `/health` called it synchronously, so four programs over 64 PATH
+/// entries produced thousands of metadata calls and took 16.361 s on the
+/// configured Windows host (#1816). Inventorying each directory once preserves
+/// PATH-first / PATHEXT-second precedence while reducing filesystem round trips
+/// to one directory enumeration plus metadata for matching names.
 #[cfg(windows)]
-fn resolve_program_on_path(program: &str, path: &str, pathext: &str) -> Option<String> {
-    let exts: Vec<&str> = pathext
+fn resolve_programs_on_path(
+    programs: &[&str],
+    path: &str,
+    pathext: &str,
+) -> BTreeMap<String, String> {
+    let extensions = pathext
         .split(';')
         .map(str::trim)
         .filter(|ext| !ext.is_empty())
-        .collect();
-    for dir in path.split(';').map(str::trim).filter(|dir| !dir.is_empty()) {
-        let base = Path::new(dir.trim_matches('"'));
-        // Honor an already-qualified name (e.g. "rg.exe") before appending exts.
-        let direct = base.join(program);
-        if direct.is_file() {
-            return Some(direct.to_string_lossy().into_owned());
+        .collect::<Vec<_>>();
+    let candidates = programs
+        .iter()
+        .map(|program| {
+            let mut names = vec![program.to_ascii_lowercase()];
+            names.extend(
+                extensions
+                    .iter()
+                    .map(|ext| format!("{program}{ext}").to_ascii_lowercase()),
+            );
+            ((*program).to_owned(), names)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let wanted = candidates
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let path_entries = path
+        .split(';')
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let mut resolved = BTreeMap::new();
+    let mut scanned_directories = 0_usize;
+    let mut unreadable_directories = 0_usize;
+
+    for dir in &path_entries {
+        if resolved.len() == candidates.len() {
+            break;
         }
-        for ext in &exts {
-            let candidate = base.join(format!("{program}{ext}"));
+        scanned_directories += 1;
+        let base = Path::new(dir.trim_matches('"'));
+        let entries = match fs::read_dir(base) {
+            Ok(entries) => entries,
+            Err(_) => {
+                unreadable_directories += 1;
+                continue;
+            }
+        };
+        let mut directory_matches = BTreeMap::<String, PathBuf>::new();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_ascii_lowercase) else {
+                continue;
+            };
+            if !wanted.contains(&name) {
+                continue;
+            }
+            let candidate = entry.path();
             if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
+                directory_matches.entry(name).or_insert(candidate);
+            }
+        }
+        for (program, names) in &candidates {
+            if resolved.contains_key(program) {
+                continue;
+            }
+            if let Some(found) = names.iter().find_map(|name| directory_matches.get(name)) {
+                resolved.insert(program.clone(), found.to_string_lossy().into_owned());
             }
         }
     }
-    None
+    tracing::info!(
+        code = "M4_SHELL_SEARCH_TOOL_SNAPSHOT_CACHED",
+        path_entries = path_entries.len(),
+        scanned_directories,
+        unreadable_directories,
+        resolved_programs = resolved.len(),
+        requested_programs = programs.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "cached one deterministic child-PATH search-tool snapshot for health"
+    );
+    resolved
 }
 
-/// Reports which bounded-search tools resolve inside the exact child-process
-/// environment Synapse shell jobs receive — not the daemon's own PATH.
+/// Reports which bounded-search tools resolved in the exact child-process
+/// environment captured at service construction — not the daemon's own PATH.
 ///
 /// Agents are told to prefer `rg` for fast bounded manual FSV scans, but `rg` may be
 /// absent from the machine entirely (it is not a Windows built-in, and it lived
@@ -10652,11 +10727,15 @@ pub fn shell_search_tool_readback() -> String {
         let env = child_base_environment();
         let path = env_value(&env, "PATH").unwrap_or_default();
         let pathext = env_value(&env, "PATHEXT").unwrap_or(WINDOWS_DEFAULT_PATHEXT);
-        let rg = resolve_program_on_path("rg", path, pathext);
-        let findstr = resolve_program_on_path("findstr", path, pathext);
-        let git = resolve_program_on_path("git", path, pathext);
-        let powershell = resolve_program_on_path("powershell", path, pathext)
-            .or_else(|| resolve_program_on_path("pwsh", path, pathext));
+        let resolved = resolve_programs_on_path(
+            &["rg", "findstr", "git", "powershell", "pwsh"],
+            path,
+            pathext,
+        );
+        let rg = resolved.get("rg");
+        let findstr = resolved.get("findstr");
+        let git = resolved.get("git");
+        let powershell = resolved.get("powershell").or_else(|| resolved.get("pwsh"));
         let primary = if rg.is_some() {
             "rg"
         } else if findstr.is_some() {
@@ -10665,11 +10744,11 @@ pub fn shell_search_tool_readback() -> String {
             "powershell_select_string"
         };
         format!(
-            "shell_search_tools rg={} findstr={} git={} powershell={} primary={primary} documented_fallback=powershell_select_string",
-            rg.as_deref().unwrap_or("absent"),
-            findstr.as_deref().unwrap_or("absent"),
-            git.as_deref().unwrap_or("absent"),
-            powershell.as_deref().unwrap_or("absent"),
+            "shell_search_tools source=daemon_startup_child_environment rg={} findstr={} git={} powershell={} primary={primary} documented_fallback=powershell_select_string",
+            rg.map_or("absent", String::as_str),
+            findstr.map_or("absent", String::as_str),
+            git.map_or("absent", String::as_str),
+            powershell.map_or("absent", String::as_str),
         )
     }
     #[cfg(not(windows))]

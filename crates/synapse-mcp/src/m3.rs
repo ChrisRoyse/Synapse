@@ -337,8 +337,10 @@ pub struct StorageMaintenanceReadback {
     pub maintenance_supported: bool,
     pub unsupported_reason: Option<String>,
     pub gc_task_running: bool,
+    pub checkpoint_task_running: bool,
     pub pressure_task_running: bool,
     pub gc_task: GcTaskReadback,
+    pub checkpoint_task: GcTaskReadback,
     pub pressure_probe: PressureProbeReadback,
 }
 
@@ -838,6 +840,11 @@ impl M3State {
             .as_ref()
             .map(GcTask::readback)
             .unwrap_or_default();
+        let checkpoint_task = self
+            .storage_checkpoint_task
+            .as_ref()
+            .map(GcTask::readback)
+            .unwrap_or_default();
         let pressure_task_running = self
             .storage_pressure_task
             .as_ref()
@@ -856,8 +863,10 @@ impl M3State {
             maintenance_supported: self.storage_maintenance_unsupported.is_none(),
             unsupported_reason: self.storage_maintenance_unsupported.clone(),
             gc_task_running: gc_task.running,
+            checkpoint_task_running: checkpoint_task.running,
             pressure_task_running,
             gc_task,
+            checkpoint_task,
             pressure_probe,
         }
     }

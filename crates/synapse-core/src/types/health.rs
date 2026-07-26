@@ -53,6 +53,10 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_tick_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_task_running: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_tick_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_task_running: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_probe_active: Option<bool>,
@@ -70,8 +74,52 @@ pub struct SubsystemHealth {
     pub storage_gc_last_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_error_classification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_attempt_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_next_retry_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_retry_exhausted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_cf_readback_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_total_examined_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_total_evicted_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_after_value_sum: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_gc_last_unsupported_policy_skips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_completed_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_error_classification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_attempt_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_next_retry_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_retry_exhausted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_successful_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_successful_cf_readback_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_successful_total_examined_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_successful_total_evicted_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_checkpoint_last_successful_after_value_sum: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_pressure_last_started_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

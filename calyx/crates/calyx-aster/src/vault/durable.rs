@@ -1,9 +1,7 @@
 mod checkpointing;
 mod manifest_ops;
 
-pub(in crate::vault) use checkpointing::{
-    CHECKPOINT_DRAIN_HOLD_BUDGET, CHECKPOINT_DRAIN_MAX_BATCHES, CheckpointDrainChunk,
-};
+pub(in crate::vault) use checkpointing::CHECKPOINT_DRAIN_MAX_BATCHES;
 pub(in crate::vault) mod recovery_readback;
 pub(in crate::vault) mod router_coverage;
 
@@ -462,6 +460,10 @@ impl DurableVault {
 
     pub(super) fn commit_lock_path(&self) -> PathBuf {
         self.root.join("locks").join("durable.commit.lock")
+    }
+
+    pub(super) fn checkpoint_lock_path(&self) -> PathBuf {
+        self.root.join("locks").join("durable.checkpoint.lock")
     }
 
     pub(super) fn native_compaction_lock_path(&self) -> PathBuf {

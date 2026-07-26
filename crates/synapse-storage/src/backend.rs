@@ -1064,25 +1064,6 @@ impl CalyxBackend {
         self.vault.with_vault(cf_name, operation, write, f)
     }
 
-    /// Runs orphan physical slot-CF retirement off the async runtime workers on
-    /// the dedicated blocking maintenance pool. The pass can scan Base and hold
-    /// the exclusive router lock per CF drop, so it must never park a runtime
-    /// worker serving MCP requests (issues #1798, #1806).
-    ///
-    /// # Errors
-    ///
-    /// Returns the pass error, or a structured storage error if maintenance
-    /// admission failed.
-    pub async fn retire_orphan_slot_cfs_off_runtime(
-        &self,
-    ) -> StorageResult<AsterOrphanSlotGcReport> {
-        let vault = Arc::clone(&self.vault);
-        crate::maintenance::run_admitted_maintenance("orphan_slot_cf_gc", move || {
-            retire_orphan_slot_cfs_on_vault(&vault)
-        })
-        .await
-    }
-
     fn commit_rows(&self, cf_name: &str, rows: Vec<SynapseCalyxCfWrite>) -> StorageResult<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1761,6 +1742,7 @@ impl StorageBackend for CalyxBackend {
         gc::spawn_runner(
             Arc::new(CalyxGcRunner::new(Arc::clone(&self.vault))),
             config.interval(),
+            gc::MaintenanceTaskKind::GarbageCollection,
         )
     }
 
@@ -1768,6 +1750,7 @@ impl StorageBackend for CalyxBackend {
         gc::spawn_runner(
             Arc::new(CalyxCheckpointRunner::new(Arc::clone(&self.vault))),
             CALYX_CHECKPOINT_INTERVAL,
+            gc::MaintenanceTaskKind::Checkpoint,
         )
     }
 

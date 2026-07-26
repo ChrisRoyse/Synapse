@@ -693,6 +693,7 @@ impl std::fmt::Debug for AuthorityFinalizerSupervisor {
 pub struct SynapseService {
     started_at: Instant,
     tool_router: ToolRouter<Self>,
+    immutable_tool_surface: Arc<tool_profiles::ImmutableToolSurface>,
     m1_state: SharedM1State,
     m2_state: SharedM2State,
     m3_state: SharedM3State,
@@ -779,9 +780,14 @@ impl SynapseService {
     pub fn try_new() -> anyhow::Result<Self> {
         let m3_state = shared_m3_state_from_env()?;
         install_chrome_browser_navigation_sink(&m3_state);
+        let tool_router = Self::tool_router();
+        let immutable_tool_surface = Arc::new(
+            tool_profiles::ImmutableToolSurface::from_tool_router(&tool_router)?,
+        );
         Ok(Self {
             started_at: Instant::now(),
-            tool_router: Self::tool_router(),
+            tool_router,
+            immutable_tool_surface,
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_env()?,
             m3_state,
@@ -817,9 +823,14 @@ impl SynapseService {
             sse_state,
         )?;
         install_chrome_browser_navigation_sink(&m3_state);
+        let tool_router = Self::tool_router();
+        let immutable_tool_surface = Arc::new(
+            tool_profiles::ImmutableToolSurface::from_tool_router(&tool_router)?,
+        );
         Ok(Self {
             started_at: Instant::now(),
-            tool_router: Self::tool_router(),
+            tool_router,
+            immutable_tool_surface,
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_config_with_shutdown_reason(
                 m2_config,
@@ -860,9 +871,14 @@ impl SynapseService {
             sse_state,
         )?;
         install_chrome_browser_navigation_sink(&m3_state);
+        let tool_router = Self::tool_router();
+        let immutable_tool_surface = Arc::new(
+            tool_profiles::ImmutableToolSurface::from_tool_router(&tool_router)?,
+        );
         Ok(Self {
             started_at: Instant::now(),
-            tool_router: Self::tool_router(),
+            tool_router,
+            immutable_tool_surface,
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_config_with_shutdown_reason(
                 m2_config,

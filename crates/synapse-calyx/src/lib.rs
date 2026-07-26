@@ -4,6 +4,8 @@ mod async_vault;
 pub mod backup;
 mod drift;
 mod error_bridge;
+
+pub use error_bridge::SYNAPSE_CALYX_BACKPRESSURE;
 mod find;
 mod grounding;
 mod intelligence;
