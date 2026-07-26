@@ -500,6 +500,87 @@ impl VersionedCfStore {
         Ok(Snapshot::new(seq, freshness, lease).with_derived_content_seq(panel_content_seq))
     }
 
+    /// Atomic copy of the panel-scoped search-input watermarks. Manifest
+    /// publication clamps these values to its durable sequence before writing
+    /// them, so observing a newer concurrent commit can only conservatively
+    /// overstate a panel watermark, never accept a stale index (#1841).
+    pub(crate) fn panel_content_seqs_snapshot(&self) -> Result<BTreeMap<u32, Seq>> {
+        let _table = self.rows.read().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC row-table lock was poisoned while snapshotting panel watermarks",
+            )
+        })?;
+        self.panel_content_seqs
+            .read()
+            .map_err(|_| {
+                CalyxError::aster_corrupt_shard(
+                    "MVCC panel-content watermark lock was poisoned while snapshotting manifest state",
+                )
+            })
+            .map(|watermarks| watermarks.clone())
+    }
+
+    /// Installs a manifest-vouched panel watermark floor before WAL replay.
+    pub(crate) fn advance_panel_content_seqs_to_at_least(
+        &self,
+        floors: &BTreeMap<u32, Seq>,
+    ) -> Result<()> {
+        let mut watermarks = self.panel_content_seqs.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC panel-content watermark lock was poisoned while adopting manifest state",
+            )
+        })?;
+        for (panel_version, seq) in floors {
+            let watermark = watermarks.entry(*panel_version).or_default();
+            *watermark = (*watermark).max(*seq);
+        }
+        Ok(())
+    }
+
+    /// One-time migration from a vault-global model. Every panel physically
+    /// observed in restored Base history, plus the configured active panel, is
+    /// conservatively advanced to the proven global floor. This may force one
+    /// rebuild but cannot let stale panel content pass after migration.
+    pub(crate) fn migrate_panel_content_seqs_to_at_least(
+        &self,
+        floor: Seq,
+        active_panel_version: Option<u32>,
+    ) -> Result<()> {
+        let table = self.rows.read().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC row-table lock was poisoned while migrating panel watermarks",
+            )
+        })?;
+        let mut panels = self
+            .panel_content_seqs
+            .read()
+            .map_err(|_| {
+                CalyxError::aster_corrupt_shard(
+                    "MVCC panel-content watermark lock was poisoned while reading migration state",
+                )
+            })?
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some(panel_version) = active_panel_version {
+            panels.insert(panel_version);
+        }
+        if let Some(base_rows) = table.get(&ColumnFamily::Base) {
+            for (key, versions) in base_rows {
+                for version in versions
+                    .iter()
+                    .filter(|version| version.seq <= self.current_seq())
+                {
+                    if !is_tombstone_value(&version.value) {
+                        panels.insert(panel_from_base_value(key, &version.value)?);
+                    }
+                }
+            }
+        }
+        drop(table);
+        self.advance_affected_panel_content_seqs(&panels, floor)
+    }
+
     /// Pins a reader lease at an explicit historical `seq` (time-travel). The
     /// lease participates in oldest-pinned-seq accounting so version GC cannot
     /// reclaim versions at or below `seq` until it is released.
@@ -615,7 +696,12 @@ impl VersionedCfStore {
         let mut router = self.router.write().map_err(|_| {
             CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
         })?;
-        let affected_panels = search_panels_affected_by_batch(&table, self.current_seq(), &rows)?;
+        let affected_panels = search_panels_affected_by_batch(
+            &table,
+            self.current_seq(),
+            &rows,
+            PanelAttribution::Strict,
+        )?;
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
         // this commit's seq must already observe its watermark (issue #1100).
@@ -629,7 +715,7 @@ impl VersionedCfStore {
             self.derived_content_seq
                 .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
         }
-        self.advance_panel_content_seqs(&affected_panels, self.current_seq() + 1)?;
+        self.advance_affected_panel_content_seqs(&affected_panels, self.current_seq() + 1)?;
         let seq = self.seqs.allocate();
         for (cf, key, value) in &rows {
             table
@@ -687,6 +773,43 @@ impl VersionedCfStore {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
+        self.restore_batch_with_attribution(seq, rows, PanelAttribution::Strict)
+    }
+
+    /// Restores checkpoint SST rows. A model-3 manifest is the watermark SoT,
+    /// because coalesced SST rows carry the file's maximum sequence rather than
+    /// each original commit sequence. Older models re-derive conservatively
+    /// while tolerating only an unreferenced historical quantized slot.
+    pub(crate) fn restore_manifested_batch<I, K, V>(
+        &self,
+        seq: Seq,
+        rows: I,
+        migrate_panel_model: bool,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (ColumnFamily, K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let attribution = if migrate_panel_model {
+            PanelAttribution::HistoricalMigration
+        } else {
+            PanelAttribution::ManifestBaseline
+        };
+        self.restore_batch_with_attribution(seq, rows, attribution)
+    }
+
+    fn restore_batch_with_attribution<I, K, V>(
+        &self,
+        seq: Seq,
+        rows: I,
+        attribution: PanelAttribution,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (ColumnFamily, K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
         let rows: Vec<_> = rows
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
@@ -697,14 +820,14 @@ impl VersionedCfStore {
             )
         })?;
         let affected_panels =
-            search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows)?;
+            search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows, attribution)?;
         if rows
             .iter()
             .any(|(cf, _, _)| cf.feeds_persistent_search_index())
         {
             self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
         }
-        self.advance_panel_content_seqs(&affected_panels, seq)?;
+        self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
         for (cf, key, value) in rows {
             table
                 .entry(cf)
@@ -723,6 +846,39 @@ impl VersionedCfStore {
     /// latest reader from observing restored version chains whose sequence is
     /// still in the future relative to [`Self::current_seq`].
     pub(crate) fn restore_batches_and_advance<I, R>(&self, batches: I, final_seq: Seq) -> Result<()>
+    where
+        I: IntoIterator<Item = (Seq, R)>,
+        R: IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    {
+        self.restore_batches_and_advance_with_manifest_floor(batches, final_seq, None, false)
+    }
+
+    pub(crate) fn restore_recovered_batches_and_advance<I, R>(
+        &self,
+        batches: I,
+        final_seq: Seq,
+        manifested_through_seq: Seq,
+        migrate_panel_model: bool,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (Seq, R)>,
+        R: IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    {
+        self.restore_batches_and_advance_with_manifest_floor(
+            batches,
+            final_seq,
+            Some(manifested_through_seq),
+            migrate_panel_model,
+        )
+    }
+
+    fn restore_batches_and_advance_with_manifest_floor<I, R>(
+        &self,
+        batches: I,
+        final_seq: Seq,
+        manifested_through_seq: Option<Seq>,
+        migrate_panel_model: bool,
+    ) -> Result<()>
     where
         I: IntoIterator<Item = (Seq, R)>,
         R: IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
@@ -753,15 +909,24 @@ impl VersionedCfStore {
             .into_iter()
             .filter(|(seq, _rows)| *seq > published_seq)
         {
+            let attribution = if manifested_through_seq.is_some_and(|floor| seq <= floor) {
+                if migrate_panel_model {
+                    PanelAttribution::HistoricalMigration
+                } else {
+                    PanelAttribution::ManifestBaseline
+                }
+            } else {
+                PanelAttribution::Strict
+            };
             let affected_panels =
-                search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows)?;
+                search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows, attribution)?;
             if rows
                 .iter()
                 .any(|(cf, _, _)| cf.feeds_persistent_search_index())
             {
                 self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
             }
-            self.advance_panel_content_seqs(&affected_panels, seq)?;
+            self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
             for (cf, key, value) in rows {
                 table
                     .entry(cf)
@@ -775,7 +940,7 @@ impl VersionedCfStore {
         Ok(())
     }
 
-    fn advance_panel_content_seqs(&self, panels: &BTreeSet<u32>, seq: Seq) -> Result<()> {
+    fn advance_affected_panel_content_seqs(&self, panels: &BTreeSet<u32>, seq: Seq) -> Result<()> {
         if panels.is_empty() {
             return Ok(());
         }
@@ -843,11 +1008,27 @@ impl VersionedCfStore {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelAttribution {
+    /// Live or WAL-tail mutation: every quantized slot must resolve to Base.
+    Strict,
+    /// Legacy checkpoint rows: derive a conservative migration baseline, but
+    /// tolerate an already-orphaned slot awaiting physical GC.
+    HistoricalMigration,
+    /// Model-3 checkpoint rows: the manifest map is authoritative, and SST
+    /// coalescing has erased per-row commit sequences, so do not re-attribute.
+    ManifestBaseline,
+}
+
 fn search_panels_affected_by_batch(
     table: &RowTable,
     visible_seq: Seq,
     rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+    attribution: PanelAttribution,
 ) -> Result<BTreeSet<u32>> {
+    if attribution == PanelAttribution::ManifestBaseline {
+        return Ok(BTreeSet::new());
+    }
     let mut panels = BTreeSet::new();
     let mut staged_base_panels = BTreeMap::<Vec<u8>, Option<u32>>::new();
 
@@ -893,6 +1074,15 @@ fn search_panels_affected_by_batch(
             None if is_tombstone_value(value) => {
                 // Deleting an already-unreferenced physical slot row cannot
                 // change any panel-scoped search input.
+            }
+            None if attribution == PanelAttribution::HistoricalMigration => {
+                tracing::debug!(
+                    code = "CALYX_MVCC_ORPHAN_SLOT_RECOVERY_IGNORED",
+                    cf = cf.name(),
+                    key_len = key.len(),
+                    visible_seq,
+                    "ignored checkpointed quantized-slot residue with no visible Base row while migrating panel freshness; the row is not a search input and remains eligible for orphan-slot GC"
+                );
             }
             None => {
                 return Err(CalyxError::aster_corrupt_shard(format!(

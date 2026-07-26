@@ -118,6 +118,7 @@ where
         // for checkpointed seqs; replayed batches below re-derive the rest
         // from their CFs.
         rows.advance_derived_content_seq_to_at_least(recovery.derived_content_floor_seq);
+        rows.advance_panel_content_seqs_to_at_least(&recovery.panel_content_floor_seqs)?;
         // WAL-tail batches have no durable-batch SSTs yet; write-capable
         // handles must re-stage them so no later manifest advance can strand
         // them behind the WAL replay floor (issue #1132).
@@ -132,11 +133,26 @@ where
                 .collect()
         };
         for batch in recovery.batches {
+            let manifested = batch.seq <= recovery.wal_replay_floor_seq;
             let rows_at_seq = batch
                 .rows
                 .into_iter()
                 .map(|row| (row.cf, row.key, row.value));
-            rows.restore_batch(batch.seq, rows_at_seq)?;
+            if manifested {
+                rows.restore_manifested_batch(
+                    batch.seq,
+                    rows_at_seq,
+                    recovery.migrate_derived_content_model,
+                )?;
+            } else {
+                rows.restore_batch(batch.seq, rows_at_seq)?;
+            }
+        }
+        if recovery.migrate_derived_content_model {
+            rows.migrate_panel_content_seqs_to_at_least(
+                recovery.derived_content_floor_seq,
+                options.panel.as_ref().map(|panel| panel.version),
+            )?;
         }
         rows.set_start_seq(recovery.last_recovered_seq)?;
         if !recovery.router_latest_readback {
@@ -168,6 +184,7 @@ where
                 &durable_options,
                 recovery.wal_replay_floor_seq,
                 recovery.derived_content_floor_seq,
+                rows.panel_content_seqs_snapshot()?,
             )?;
             durable.stage_recovered_wal_batches(wal_tail_batches)?;
             Some(durable)

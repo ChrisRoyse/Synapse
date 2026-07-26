@@ -1136,6 +1136,9 @@ where
             let publish_started = Instant::now();
             let chunk = match (|| {
                 self.ensure_writeable("checkpoint publication")?;
+                durable.advance_panel_content_watermarks_to_at_least(
+                    &self.rows.panel_content_seqs_snapshot()?,
+                )?;
                 durable.publish_prepared_checkpoint(&prepared)
             })() {
                 Ok(chunk) => chunk,
@@ -1274,6 +1277,9 @@ where
                     "exclusive checkpoint could not acquire the checkpoint publisher lock without waiting while the global commit lock is held; retry after the active off-lock publisher completes",
                 ));
             };
+            durable.advance_panel_content_watermarks_to_at_least(
+                &self.rows.panel_content_seqs_snapshot()?,
+            )?;
             durable.flush()?;
         }
         Ok(())

@@ -145,6 +145,7 @@ where
                 last_recovered_seq: self.latest_seq(),
                 wal_replay_floor_seq: 0,
                 derived_content_floor_seq: 0,
+                panel_content_floor_seqs: std::collections::BTreeMap::new(),
                 migrate_derived_content_model: false,
                 torn_tail: None,
                 temporal_policy: None,

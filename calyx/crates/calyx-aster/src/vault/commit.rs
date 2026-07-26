@@ -181,6 +181,10 @@ where
         self.rows
             .advance_derived_content_seq_to_at_least(recovered.derived_content_floor_seq);
         durable.advance_derived_content_watermark_to_at_least(recovered.derived_content_floor_seq);
+        self.rows
+            .advance_panel_content_seqs_to_at_least(&recovered.panel_content_floor_seqs)?;
+        durable
+            .advance_panel_content_watermarks_to_at_least(&recovered.panel_content_floor_seqs)?;
         // WAL-tail batches from a foreign writer have no durable-batch SSTs
         // yet; stage them here so this handle's next checkpoint flush cannot
         // advance the manifest past them if that writer dies (issue #1132).
@@ -192,7 +196,7 @@ where
                 .map(|batch| (batch.seq, batch.rows.clone()))
                 .collect(),
         )?;
-        self.rows.restore_batches_and_advance(
+        self.rows.restore_recovered_batches_and_advance(
             recovered
                 .batches
                 .iter()
@@ -207,6 +211,17 @@ where
                     )
                 }),
             recovered.last_recovered_seq,
+            recovered.wal_replay_floor_seq,
+            recovered.migrate_derived_content_model,
+        )?;
+        if recovered.migrate_derived_content_model {
+            self.rows.migrate_panel_content_seqs_to_at_least(
+                recovered.derived_content_floor_seq,
+                None,
+            )?;
+        }
+        durable.advance_panel_content_watermarks_to_at_least(
+            &self.rows.panel_content_seqs_snapshot()?,
         )?;
         Ok(())
     }
@@ -345,7 +360,11 @@ where
                     checkpoint_anchor.as_ref().map_or(Ok(()), |anchor| {
                         crate::ledger_head::write_checkpoint_anchor(durable.root(), anchor)
                     });
-                let checkpoint = durable.checkpoint_committed_batch_with_pending(durable_seq, rows);
+                let panel_watermarks = self.rows.panel_content_seqs_snapshot();
+                let checkpoint = panel_watermarks.and_then(|panel_watermarks| {
+                    durable.advance_panel_content_watermarks_to_at_least(&panel_watermarks)?;
+                    durable.checkpoint_committed_batch_with_pending(durable_seq, rows)
+                });
                 if rows
                     .iter()
                     .any(|row| row.cf == crate::cf::ColumnFamily::Ledger)

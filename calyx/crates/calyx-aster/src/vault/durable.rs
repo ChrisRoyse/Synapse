@@ -20,6 +20,7 @@ use crate::timetravel::RetentionHorizon;
 use crate::wal::{GroupCommitBatcher, ReplayRecord, WalOptions, WalRecycleReport, replay_dir};
 use calyx_core::{CalyxError, Panel, Result, SystemClock, TemporalPolicy};
 use calyx_ledger::CheckpointConfig;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -135,6 +136,10 @@ pub(super) struct DurableVault {
     /// (issues #1100 and #1808); persisted into every manifest write as
     /// `derived_content_seq`, clamped to that manifest's `durable_seq`.
     checkpointed_derived_content_seq: AtomicU64,
+    /// Panel-scoped counterpart persisted by watermark model 3 (#1841).
+    /// Values may include live WAL-tail sequences; manifest serialization
+    /// clamps them to the manifest's durable floor, which is conservative.
+    checkpointed_panel_content_seqs: Mutex<BTreeMap<u32, u64>>,
 }
 
 pub(super) struct RecoveredBatch {
@@ -149,6 +154,8 @@ pub(super) struct RecoveredBatches {
     /// Durably recorded derived-content watermark floor for seqs at or below
     /// `wal_replay_floor_seq`; WAL replay re-derives the rest per batch.
     pub derived_content_floor_seq: u64,
+    /// Exact panel-scoped floors vouched for by a model-3 manifest.
+    pub panel_content_floor_seqs: BTreeMap<u32, u64>,
     /// The pointed manifest predates the exact persistent-search-input model;
     /// open must re-derive and prove its floor from validated relevant levels.
     pub migrate_derived_content_model: bool,
@@ -207,6 +214,7 @@ impl DurableVault {
         options: &VaultOptions,
         wal_replay_floor_seq: u64,
         derived_content_floor_seq: u64,
+        panel_content_floor_seqs: BTreeMap<u32, u64>,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         Self::validate_options(options)?;
@@ -241,6 +249,7 @@ impl DurableVault {
             value_crypto: options.value_crypto.clone(),
             pending_checkpoint: Mutex::new(Vec::new()),
             checkpointed_derived_content_seq: AtomicU64::new(0),
+            checkpointed_panel_content_seqs: Mutex::new(panel_content_floor_seqs),
         };
         durable
             .checkpointed_derived_content_seq
@@ -278,6 +287,8 @@ impl DurableVault {
                 manifest_seq = recovery.manifest.manifest_seq,
                 durable_seq = recovery.manifest.durable_seq,
                 derived_content_seq = recovery.manifest.effective_derived_content_seq(),
+                derived_content_model = ?recovery.manifest.derived_content_model,
+                panel_content_watermark_count = recovery.manifest.panel_content_seqs.len(),
                 wal_record_count = recovery.wal_records.len(),
                 restore_mvcc_rows = options.restore_mvcc_rows,
                 eager_router_lookup_on_open = options.eager_router_lookup_on_open,
@@ -320,6 +331,7 @@ impl DurableVault {
                 wal_replay_floor_seq = recovery.manifest.durable_seq,
                 router_latest_readback,
                 migrate_derived_content_model,
+                panel_content_watermark_count = recovery.manifest.panel_content_seqs.len(),
                 torn_tail = ?recovery.torn_tail,
                 "completed Calyx Aster recovery planning"
             );
@@ -331,6 +343,11 @@ impl DurableVault {
                     0
                 } else {
                     recovery.manifest.effective_derived_content_seq()
+                },
+                panel_content_floor_seqs: if migrate_derived_content_model {
+                    BTreeMap::new()
+                } else {
+                    recovery.manifest.panel_content_seqs
                 },
                 migrate_derived_content_model,
                 torn_tail: recovery.torn_tail,
@@ -371,6 +388,7 @@ impl DurableVault {
             last_recovered_seq,
             wal_replay_floor_seq: 0,
             derived_content_floor_seq: 0,
+            panel_content_floor_seqs: BTreeMap::new(),
             migrate_derived_content_model: false,
             torn_tail: replay.torn_tail,
             temporal_policy: options.temporal_policy,
@@ -429,6 +447,41 @@ impl DurableVault {
     pub(in crate::vault) fn advance_derived_content_watermark_to_at_least(&self, seq: u64) {
         self.checkpointed_derived_content_seq
             .fetch_max(seq, Ordering::AcqRel);
+    }
+
+    /// Adopts the live MVCC panel map before manifest publication. Entrywise
+    /// max keeps the map monotone across local and foreign writers; the writer
+    /// clamps each entry to the manifest durable floor.
+    pub(in crate::vault) fn advance_panel_content_watermarks_to_at_least(
+        &self,
+        floors: &BTreeMap<u32, u64>,
+    ) -> Result<()> {
+        let mut watermarks = self
+            .checkpointed_panel_content_seqs
+            .lock()
+            .map_err(|_| CalyxError::disk_pressure("panel-content manifest lock poisoned"))?;
+        for (panel_version, seq) in floors {
+            let watermark = watermarks.entry(*panel_version).or_default();
+            *watermark = (*watermark).max(*seq);
+        }
+        Ok(())
+    }
+
+    pub(super) fn panel_content_seqs_for_manifest(
+        &self,
+        durable_seq: u64,
+    ) -> Result<BTreeMap<u32, u64>> {
+        let watermarks = self
+            .checkpointed_panel_content_seqs
+            .lock()
+            .map_err(|_| CalyxError::disk_pressure("panel-content manifest lock poisoned"))?;
+        Ok(watermarks
+            .iter()
+            .filter_map(|(panel_version, seq)| {
+                let clamped = (*seq).min(durable_seq);
+                (clamped != 0).then_some((*panel_version, clamped))
+            })
+            .collect())
     }
 
     pub(super) fn sync_wal(&self) -> Result<()> {

@@ -98,6 +98,17 @@ impl DurableVault {
                 derived_content_seq.max(current.effective_derived_content_seq().min(durable_seq));
         }
         manifest.derived_content_seq = Some(derived_content_seq);
+        let mut panel_content_seqs = self.panel_content_seqs_for_manifest(durable_seq)?;
+        if let Some(current) = current
+            .as_ref()
+            .filter(|manifest| manifest.uses_persistent_search_content_model())
+        {
+            for (panel_version, seq) in &current.panel_content_seqs {
+                let watermark = panel_content_seqs.entry(*panel_version).or_default();
+                *watermark = (*watermark).max((*seq).min(durable_seq));
+            }
+        }
+        manifest.panel_content_seqs = panel_content_seqs;
         manifest.retention_horizon = horizon.clone();
         manifest.registry_ref = current.and_then(|manifest| manifest.registry_ref);
         manifest.validate()?;

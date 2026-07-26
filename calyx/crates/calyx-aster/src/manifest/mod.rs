@@ -10,7 +10,7 @@ use crate::wal::{ReplayRecord, TornTail, replay_dir_after};
 use calyx_core::{CalyxError, Result, TemporalPolicy};
 use calyx_ledger::QuarantineSet;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -24,10 +24,12 @@ const MANIFEST_SUFFIX: &str = ".json";
 const MANIFEST_GENERATIONS_RETAINED: usize = 32;
 const SUPPORTED_MANIFEST_MAJOR: u16 = 1;
 const SUPPORTED_MANIFEST_MINOR: u16 = 0;
-/// Watermark model 2 tracks only the CFs consumed by the persistent search
-/// builder. Pre-versioned manifests used the broader issue-#1100 doctrine and
-/// must be physically re-derived during vault recovery (issue #1808).
-pub(crate) const PERSISTENT_SEARCH_CONTENT_MODEL: u16 = 2;
+/// Watermark model 3 tracks the exact panel generation whose persistent-search
+/// inputs changed. Model 2 tracked the right CFs but collapsed every panel into
+/// one vault-global watermark; older models must be migrated conservatively
+/// during vault recovery (issues #1808 and #1841).
+pub(crate) const PERSISTENT_SEARCH_CONTENT_MODEL: u16 = 3;
+const GLOBAL_PERSISTENT_SEARCH_CONTENT_MODEL: u16 = 2;
 
 pub use quarantine::QuarantineRecord;
 
@@ -127,6 +129,12 @@ pub struct VaultManifest {
     /// physical migration during recovery; unknown explicit models fail.
     #[serde(default)]
     pub derived_content_model: Option<u16>,
+    /// Max checkpointed persistent-search-input seq for each exact panel
+    /// generation. Entries are monotone and retained even after the panel's
+    /// final Base row is deleted, so restart cannot forget a deletion that
+    /// invalidated an older persisted index (issue #1841).
+    #[serde(default)]
+    pub panel_content_seqs: BTreeMap<u32, u64>,
     pub panel_ref: ImmutableRef,
     #[serde(default)]
     pub registry_ref: Option<ImmutableRef>,
@@ -189,6 +197,7 @@ impl VaultManifest {
             durable_seq,
             derived_content_seq: None,
             derived_content_model: Some(PERSISTENT_SEARCH_CONTENT_MODEL),
+            panel_content_seqs: BTreeMap::new(),
             panel_ref,
             registry_ref: None,
             codebook_refs,
@@ -230,10 +239,23 @@ impl VaultManifest {
             )));
         }
         if let Some(model) = self.derived_content_model
-            && model != PERSISTENT_SEARCH_CONTENT_MODEL
+            && !matches!(
+                model,
+                GLOBAL_PERSISTENT_SEARCH_CONTENT_MODEL | PERSISTENT_SEARCH_CONTENT_MODEL
+            )
         {
             return Err(format_version_unsupported(format!(
-                "unsupported derived-content watermark model {model}; supported model is {PERSISTENT_SEARCH_CONTENT_MODEL}"
+                "unsupported derived-content watermark model {model}; supported models are {GLOBAL_PERSISTENT_SEARCH_CONTENT_MODEL} (migrated on open) and {PERSISTENT_SEARCH_CONTENT_MODEL}"
+            )));
+        }
+        if let Some((panel_version, panel_content_seq)) = self
+            .panel_content_seqs
+            .iter()
+            .find(|(_, panel_content_seq)| **panel_content_seq > self.durable_seq)
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "manifest panel {panel_version} content seq {panel_content_seq} exceeds durable_seq {}; a panel watermark can only vouch for checkpointed seqs",
+                self.durable_seq
             )));
         }
         self.panel_ref.validate()?;
