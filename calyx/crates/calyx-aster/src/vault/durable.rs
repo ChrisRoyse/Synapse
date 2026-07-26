@@ -156,6 +156,10 @@ pub(super) struct RecoveredBatches {
     pub derived_content_floor_seq: u64,
     /// Exact panel-scoped floors vouched for by a model-3 manifest.
     pub panel_content_floor_seqs: BTreeMap<u32, u64>,
+    /// Active panel version decoded from the manifest's hash-verified panel
+    /// asset. Required when migrating a latest-readback handle with no restored
+    /// Base rows from the global watermark model.
+    pub active_panel_version: Option<u32>,
     /// The pointed manifest predates the exact persistent-search-input model;
     /// open must re-derive and prove its floor from validated relevant levels.
     pub migrate_derived_content_model: bool,
@@ -322,6 +326,8 @@ impl DurableVault {
             let recovered_row_count = batches.iter().map(|batch| batch.rows.len()).sum::<usize>();
             let migrate_derived_content_model =
                 !recovery.manifest.uses_persistent_search_content_model();
+            let active_panel_version =
+                read_manifest_panel_version(root, &recovery.manifest.panel_ref)?;
             tracing::info!(
                 code = "CALYX_ASTER_RECOVERY_DONE",
                 vault_dir = %root.display(),
@@ -332,6 +338,7 @@ impl DurableVault {
                 router_latest_readback,
                 migrate_derived_content_model,
                 panel_content_watermark_count = recovery.manifest.panel_content_seqs.len(),
+                active_panel_version,
                 torn_tail = ?recovery.torn_tail,
                 "completed Calyx Aster recovery planning"
             );
@@ -349,6 +356,7 @@ impl DurableVault {
                 } else {
                     recovery.manifest.panel_content_seqs
                 },
+                active_panel_version,
                 migrate_derived_content_model,
                 torn_tail: recovery.torn_tail,
                 temporal_policy: recovery.manifest.temporal_policy,
@@ -389,6 +397,7 @@ impl DurableVault {
             wal_replay_floor_seq: 0,
             derived_content_floor_seq: 0,
             panel_content_floor_seqs: BTreeMap::new(),
+            active_panel_version: options.panel.as_ref().map(|panel| panel.version),
             migrate_derived_content_model: false,
             torn_tail: replay.torn_tail,
             temporal_policy: options.temporal_policy,
@@ -606,6 +615,46 @@ fn validate_dedup_policy(policy: &DedupPolicy, panel: Option<&Panel>) -> Result<
         policy.validate(panel)
     } else {
         policy.validate_manifest()
+    }
+}
+
+fn read_manifest_panel_version(
+    root: &Path,
+    panel_ref: &crate::manifest::ImmutableRef,
+) -> Result<Option<u32>> {
+    let path = root.join(&panel_ref.logical_path);
+    let bytes = fs::read(&path).map_err(|error| {
+        storage_error(
+            &format!("read hash-verified manifest panel asset {}", path.display()),
+            error,
+        )
+    })?;
+    match serde_json::from_slice::<Panel>(&bytes) {
+        Ok(panel) if panel.version != 0 => Ok(Some(panel.version)),
+        Ok(_) => Err(CalyxError::aster_corrupt_shard(format!(
+            "manifest panel asset {} has version zero",
+            path.display()
+        ))),
+        Err(panel_error) => {
+            let generated = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("calyx_manifest_generated_asset_v1")
+                        && value.get("asset_kind").and_then(serde_json::Value::as_str)
+                            == Some("panel")
+                        && value.get("status").and_then(serde_json::Value::as_str)
+                            == Some("no-active-panel")
+                });
+            if generated {
+                Ok(None)
+            } else {
+                Err(CalyxError::aster_corrupt_shard(format!(
+                    "manifest panel asset {} is neither a valid Panel nor the canonical no-active-panel marker: {panel_error}",
+                    path.display()
+                )))
+            }
+        }
     }
 }
 

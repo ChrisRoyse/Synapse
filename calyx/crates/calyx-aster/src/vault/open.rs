@@ -55,12 +55,22 @@ where
                 selected.dedup();
             }
         }
+        // The one-time physical watermark migration proves router-flushed keys
+        // against commit-domain durable SSTs. That proof consumes validated
+        // key/offset indexes, so a latest-readback open must eagerly build the
+        // relevant Base/Slot indexes even when its steady-state policy is lazy.
+        // CfRouter keeps the eager policy selective (Base + Slot, plus KV's
+        // always-on paging contract), rather than indexing unrelated CFs.
+        let eager_lookup_on_open =
+            options.eager_router_lookup_on_open || recovery.migrate_derived_content_model;
         let router_started_at = std::time::Instant::now();
         tracing::info!(
             code = "CALYX_ASTER_ROUTER_OPEN_START",
             vault_dir = %vault_dir.as_ref().display(),
             selected_cfs = ?selected_cfs,
-            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            eager_router_lookup_on_open = eager_lookup_on_open,
+            requested_eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            migration_requires_eager_lookup = recovery.migrate_derived_content_model,
             router_latest_readback = recovery.router_latest_readback,
             "opening Calyx CF router"
         );
@@ -71,14 +81,14 @@ where
                 cfs.iter().copied(),
                 options.tiering_policy.clone(),
                 options.value_crypto.clone(),
-                options.eager_router_lookup_on_open,
+                eager_lookup_on_open,
             ),
             None => CfRouter::open_with_tiering_crypto_and_lookup_policy(
                 vault_dir.as_ref(),
                 options.memtable_byte_cap,
                 options.tiering_policy.clone(),
                 options.value_crypto.clone(),
-                options.eager_router_lookup_on_open,
+                eager_lookup_on_open,
             ),
         };
         let router = match router {
@@ -88,7 +98,7 @@ where
                     code = "CALYX_ASTER_ROUTER_OPEN_FAILED",
                     vault_dir = %vault_dir.as_ref().display(),
                     selected_cfs = ?selected_cfs,
-                    eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+                    eager_router_lookup_on_open = eager_lookup_on_open,
                     elapsed_ms = router_started_at.elapsed().as_millis(),
                     error = %error,
                     "Calyx CF router open failed"
@@ -100,7 +110,7 @@ where
             code = "CALYX_ASTER_ROUTER_OPEN_DONE",
             vault_dir = %vault_dir.as_ref().display(),
             selected_cfs = ?selected_cfs,
-            eager_router_lookup_on_open = options.eager_router_lookup_on_open,
+            eager_router_lookup_on_open = eager_lookup_on_open,
             elapsed_ms = router_started_at.elapsed().as_millis(),
             "opened Calyx CF router"
         );
@@ -112,7 +122,7 @@ where
             recovery.last_recovered_seq,
             router,
             recovery.router_latest_readback,
-            options.eager_router_lookup_on_open,
+            eager_lookup_on_open,
         );
         // Derived-content watermark (issue #1100): the manifest floor vouches
         // for checkpointed seqs; replayed batches below re-derive the rest
@@ -151,7 +161,11 @@ where
         if recovery.migrate_derived_content_model {
             rows.migrate_panel_content_seqs_to_at_least(
                 recovery.derived_content_floor_seq,
-                options.panel.as_ref().map(|panel| panel.version),
+                options
+                    .panel
+                    .as_ref()
+                    .map(|panel| panel.version)
+                    .or(recovery.active_panel_version),
             )?;
         }
         rows.set_start_seq(recovery.last_recovered_seq)?;

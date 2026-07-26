@@ -461,9 +461,9 @@ impl VersionedCfStore {
     /// exact panel generation.
     ///
     /// The row-table read lock makes `(seq, panel_content_seq)` one atomic
-    /// observation with respect to commits. Latest-only recovery deliberately
-    /// fails closed: without restored MVCC batches there is no exact historical
-    /// panel attribution for coalesced Base/Slot SST rows.
+    /// observation with respect to commits. Latest-only recovery is supported:
+    /// model-3 manifests provide its exact checkpointed panel baseline and WAL
+    /// replay derives every later change.
     pub fn pin_snapshot_for_panel(
         &self,
         panel_version: u32,
@@ -471,11 +471,6 @@ impl VersionedCfStore {
         clock: &dyn Clock,
         max_age_ms: u64,
     ) -> Result<Snapshot> {
-        if self.router_latest_readback.load(Ordering::Acquire) {
-            return Err(CalyxError::stale_derived(format!(
-                "exact panel {panel_version} search freshness is unavailable in latest-only recovery mode; reopen with full MVCC row restoration before searching"
-            )));
-        }
         let _table = self.rows.read().map_err(|_| {
             CalyxError::aster_corrupt_shard(
                 "MVCC row-table lock was poisoned while pinning panel search freshness",
@@ -696,8 +691,14 @@ impl VersionedCfStore {
         let mut router = self.router.write().map_err(|_| {
             CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
         })?;
+        let latest_router = if self.router_latest_readback.load(Ordering::Acquire) {
+            router.as_ref()
+        } else {
+            None
+        };
         let affected_panels = search_panels_affected_by_batch(
             &table,
+            latest_router,
             self.current_seq(),
             &rows,
             PanelAttribution::Strict,
@@ -819,8 +820,25 @@ impl VersionedCfStore {
                 "MVCC row-table lock was poisoned during atomic recovery restore",
             )
         })?;
-        let affected_panels =
-            search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows, attribution)?;
+        let router = self.router.read().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC router lock was poisoned during atomic recovery restore",
+            )
+        })?;
+        let latest_router = if attribution == PanelAttribution::Strict
+            && self.router_latest_readback.load(Ordering::Acquire)
+        {
+            router.as_ref()
+        } else {
+            None
+        };
+        let affected_panels = search_panels_affected_by_batch(
+            &table,
+            latest_router,
+            seq.saturating_sub(1),
+            &rows,
+            attribution,
+        )?;
         if rows
             .iter()
             .any(|(cf, _, _)| cf.feeds_persistent_search_index())
@@ -899,6 +917,11 @@ impl VersionedCfStore {
                 "MVCC row-table lock was poisoned during atomic recovery restore",
             )
         })?;
+        let router = self.router.read().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC router lock was poisoned during recovered-batch publication",
+            )
+        })?;
         let published_seq = self.current_seq();
         if final_seq < published_seq {
             return Err(CalyxError::aster_corrupt_shard(format!(
@@ -918,8 +941,19 @@ impl VersionedCfStore {
             } else {
                 PanelAttribution::Strict
             };
-            let affected_panels =
-                search_panels_affected_by_batch(&table, seq.saturating_sub(1), &rows, attribution)?;
+            let affected_panels = search_panels_affected_by_batch(
+                &table,
+                if attribution == PanelAttribution::Strict
+                    && self.router_latest_readback.load(Ordering::Acquire)
+                {
+                    router.as_ref()
+                } else {
+                    None
+                },
+                seq.saturating_sub(1),
+                &rows,
+                attribution,
+            )?;
             if rows
                 .iter()
                 .any(|(cf, _, _)| cf.feeds_persistent_search_index())
@@ -1022,6 +1056,7 @@ enum PanelAttribution {
 
 fn search_panels_affected_by_batch(
     table: &RowTable,
+    latest_router: Option<&CfRouter>,
     visible_seq: Seq,
     rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
     attribution: PanelAttribution,
@@ -1042,15 +1077,18 @@ fn search_panels_affected_by_batch(
                 key.len()
             )));
         }
-        let panel_version = if is_tombstone_value(value) {
-            visible_base_panel(table, key, visible_seq)?
+        let tombstone = is_tombstone_value(value);
+        let panel_version = if tombstone {
+            visible_base_panel(table, latest_router, key, visible_seq)?
         } else {
             Some(panel_from_base_value(key, value)?)
         };
         if let Some(panel_version) = panel_version {
             panels.insert(panel_version);
         }
-        staged_base_panels.insert(key.clone(), panel_version);
+        // A tombstone still invalidates the row's previous panel, but it does
+        // not provide same-batch Base membership for a live Slot write.
+        staged_base_panels.insert(key.clone(), if tombstone { None } else { panel_version });
     }
 
     for (cf, key, value) in rows {
@@ -1065,7 +1103,7 @@ fn search_panels_affected_by_batch(
         }
         let panel_version = match staged_base_panels.get(key) {
             Some(panel_version) => *panel_version,
-            None => visible_base_panel(table, key, visible_seq)?,
+            None => visible_base_panel(table, latest_router, key, visible_seq)?,
         };
         match panel_version {
             Some(panel_version) => {
@@ -1097,18 +1135,33 @@ fn search_panels_affected_by_batch(
     Ok(panels)
 }
 
-fn visible_base_panel(table: &RowTable, key: &[u8], seq: Seq) -> Result<Option<u32>> {
-    let Some(version) = table
+fn visible_base_panel(
+    table: &RowTable,
+    latest_router: Option<&CfRouter>,
+    key: &[u8],
+    seq: Seq,
+) -> Result<Option<u32>> {
+    let version = table
         .get(&ColumnFamily::Base)
         .and_then(|base| base.get(key))
-        .and_then(|versions| versions.iter().rev().find(|version| version.seq <= seq))
+        .and_then(|versions| versions.iter().rev().find(|version| version.seq <= seq));
+    if let Some(version) = version {
+        if is_tombstone_value(&version.value) {
+            return Ok(None);
+        }
+        return panel_from_base_value(key, &version.value).map(Some);
+    }
+    let Some(value) = latest_router
+        .map(|router| router.get(ColumnFamily::Base, key))
+        .transpose()?
+        .flatten()
     else {
         return Ok(None);
     };
-    if is_tombstone_value(&version.value) {
+    if is_tombstone_value(&value) {
         return Ok(None);
     }
-    panel_from_base_value(key, &version.value).map(Some)
+    panel_from_base_value(key, &value).map(Some)
 }
 
 fn panel_from_base_value(key: &[u8], value: &[u8]) -> Result<u32> {

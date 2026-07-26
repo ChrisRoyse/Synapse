@@ -217,7 +217,7 @@ where
         if recovered.migrate_derived_content_model {
             self.rows.migrate_panel_content_seqs_to_at_least(
                 recovered.derived_content_floor_seq,
-                None,
+                recovered.active_panel_version,
             )?;
         }
         durable.advance_panel_content_watermarks_to_at_least(
