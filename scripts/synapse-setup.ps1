@@ -9868,7 +9868,14 @@ if ($script:SynapsePostExitStartOnly) {
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon when binary bytes or launch arguments changed
 # ---------------------------------------------------------------------------
-$liveDaemonHandoffRequired = ((-not $installedBinaryAlreadyVerified) -or ($liveDaemonArgumentDrift -and $liveDaemonArgumentDrift.HasDrift))
+$liveDaemonHandoffRequired = (
+    (-not $installedBinaryAlreadyVerified) -or
+    ($liveDaemonArgumentDrift -and $liveDaemonArgumentDrift.HasDrift) -or
+    [bool]$ForceRestart
+)
+if ($ForceRestart -and $installedBinaryAlreadyVerified -and (-not ($liveDaemonArgumentDrift -and $liveDaemonArgumentDrift.HasDrift))) {
+    Info "Explicit -ForceRestart requires a verified live daemon drain even though the installed binary and launch arguments are unchanged."
+}
 if (-not $liveDaemonHandoffRequired) {
     Step "Verified installed daemon binary without live drain -> $ExePath"
 } else {

@@ -1,5 +1,6 @@
 mod checkpointing;
 mod manifest_ops;
+mod stale_sst_temp;
 
 pub(in crate::vault) use checkpointing::CHECKPOINT_DRAIN_MAX_BATCHES;
 pub(in crate::vault) mod recovery_readback;
@@ -266,6 +267,9 @@ impl DurableVault {
             selected_cfs = ?options.selected_cfs,
             "starting Calyx Aster recovery"
         );
+        if !options.read_only {
+            stale_sst_temp::reclaim_stale_sst_temps(root, options.tiering_policy.as_ref())?;
+        }
         if root.join("CURRENT").exists() {
             let recovery = recover_vault(root)?;
             tracing::info!(
