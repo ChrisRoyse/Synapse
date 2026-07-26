@@ -13,8 +13,30 @@ use super::pinned::{self, PinKey};
 use super::{SearchIndexEntry, rel, sha256_hex, stale, write_json_atomic_hashed};
 use crate::error::CliResult;
 
-const SPARSE_FORMAT: &str = "calyx-search-sparse-index-v2";
-const PIN_KIND: &str = "sparse_inverted";
+const SPARSE_FORMAT_V2: &str = "calyx-search-sparse-index-v2";
+const SPARSE_FORMAT_V3: &str = "calyx-search-sparse-index-v3";
+const LEGACY_BM25_KIND: &str = "sparse_inverted";
+const PIN_KIND: &str = "sparse";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SparseScoring {
+    Bm25,
+    DotProduct,
+}
+
+impl SparseScoring {
+    pub(super) const fn index_kind(self) -> &'static str {
+        match self {
+            Self::Bm25 => "sparse_bm25",
+            Self::DotProduct => "sparse_dot",
+        }
+    }
+}
+
+const fn legacy_sparse_scoring() -> SparseScoring {
+    SparseScoring::Bm25
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct SparseSlotRows {
@@ -25,6 +47,8 @@ pub(super) struct SparseSlotRows {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SparseIndex {
     format: String,
+    #[serde(default = "legacy_sparse_scoring")]
+    scoring: SparseScoring,
     slot: u16,
     dim: u32,
     base_seq: u64,
@@ -59,13 +83,14 @@ pub(super) fn write(
     slot: SlotId,
     rows: SparseSlotRows,
     base_seq: u64,
+    scoring: SparseScoring,
 ) -> CliResult<SearchIndexEntry> {
     let path = root.join(format!(
         "slot_{:05}_seq_{base_seq:020}_n_{:010}.sparse.json",
         slot.get(),
         rows.rows.len()
     ));
-    let index = build_index(slot, rows.dim, rows.rows, base_seq)?;
+    let index = build_index(slot, rows.dim, rows.rows, base_seq, scoring)?;
     let sha256 = write_json_atomic_hashed(&path, &index)?;
     Ok(SearchIndexEntry::sparse(
         slot,
@@ -74,6 +99,7 @@ pub(super) fn write(
         base_seq,
         rel(vault_dir, &path)?,
         sha256,
+        scoring.index_kind(),
     ))
 }
 
@@ -104,8 +130,8 @@ pub(super) fn search(
             err.message
         ))
     })?;
-    validate_sparse_weights(entries, "query")?;
     let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
+    validate_sparse_weights(entries, index.scoring, "query")?;
     if index.dim != *query_dim {
         return Err(stale(format!(
             "persistent sparse slot {slot} index dim {} != query dim {query_dim}; reingest/backfill the vault",
@@ -170,11 +196,12 @@ fn build_index(
     dim: u32,
     source_rows: Vec<(CxId, Vec<SparseEntry>)>,
     base_seq: u64,
+    scoring: SparseScoring,
 ) -> CliResult<SparseIndex> {
     let rows = source_rows
         .into_iter()
         .map(|(cx_id, entries)| {
-            let doc_len = validate_sparse_weights(&entries, &format!("row {cx_id}"))?;
+            let doc_len = validate_sparse_weights(&entries, scoring, &format!("row {cx_id}"))?;
             Ok(SparseRow {
                 cx_id,
                 doc_len,
@@ -185,7 +212,8 @@ fn build_index(
     let postings = postings_from_rows(&rows);
     let (doc_lengths, avg_doc_len) = sparse_stats(&rows)?;
     Ok(SparseIndex {
-        format: SPARSE_FORMAT.to_string(),
+        format: SPARSE_FORMAT_V3.to_string(),
+        scoring,
         slot: slot.get(),
         dim,
         base_seq,
@@ -202,7 +230,7 @@ fn read(
     manifest_base_seq: u64,
     slot: SlotId,
 ) -> CliResult<SparseIndex> {
-    entry.require_kind("sparse_inverted", slot)?;
+    require_sparse_kind(entry, slot)?;
     let path = vault_dir.join(entry.require_index_rel(slot)?);
     if !path.is_file() {
         return Err(stale(format!(
@@ -244,12 +272,23 @@ fn validate(
     manifest_base_seq: u64,
     slot: SlotId,
 ) -> CliResult {
-    if index.format != SPARSE_FORMAT {
+    if index.format != SPARSE_FORMAT_V2 && index.format != SPARSE_FORMAT_V3 {
         return Err(stale(format!(
-            "persistent sparse sidecar has format {}; expected {SPARSE_FORMAT}",
+            "persistent sparse sidecar has format {}; expected {SPARSE_FORMAT_V2} or {SPARSE_FORMAT_V3}",
             index.format
         )));
     }
+    let expected_kind = if index.format == SPARSE_FORMAT_V2 {
+        if index.scoring != SparseScoring::Bm25 {
+            return Err(stale(
+                "persistent sparse v2 sidecar declares non-BM25 scoring; rebuild the vault search indexes",
+            ));
+        }
+        LEGACY_BM25_KIND
+    } else {
+        index.scoring.index_kind()
+    };
+    entry.require_kind(expected_kind, slot)?;
     if index.slot != slot.get() || entry.slot != slot.get() {
         return Err(stale(format!(
             "persistent sparse sidecar slot {} / entry slot {} != query slot {}",
@@ -287,7 +326,7 @@ fn validate(
             )));
         }
         let expected_doc_len =
-            validate_sparse_weights(&row.entries, &format!("row {}", row.cx_id))?;
+            validate_sparse_weights(&row.entries, index.scoring, &format!("row {}", row.cx_id))?;
         if row.doc_len.to_bits() != expected_doc_len.to_bits() {
             return Err(stale(format!(
                 "persistent sparse row {} doc_len {} != weight sum {expected_doc_len}; rebuild the vault search indexes",
@@ -364,6 +403,9 @@ fn score(
     query: &[SparseEntry],
     candidates: Option<&BTreeSet<CxId>>,
 ) -> CliResult<Vec<(CxId, f32)>> {
+    if index.scoring == SparseScoring::DotProduct {
+        return score_dot_product(index, query, candidates);
+    }
     let total_docs = index.rows.len();
     let scorer = Bm25::default();
     let mut scores = BTreeMap::<CxId, f32>::new();
@@ -393,16 +435,60 @@ fn score(
     Ok(scores.into_iter().collect())
 }
 
-fn validate_sparse_weights(entries: &[SparseEntry], context: &str) -> CliResult<f32> {
+fn score_dot_product(
+    index: &SparseIndex,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    let mut scores = BTreeMap::<CxId, f32>::new();
+    for query_entry in query {
+        let Some(postings) = index.postings.get(&query_entry.idx) else {
+            continue;
+        };
+        for posting in postings {
+            if candidates.is_some_and(|allowed| !allowed.contains(&posting.cx_id)) {
+                continue;
+            }
+            let contribution = posting.tf * query_entry.val;
+            let score = scores.entry(posting.cx_id).or_default();
+            *score += contribution;
+            if !score.is_finite() {
+                return Err(stale(format!(
+                    "persistent sparse dot-product score overflowed for {}; rebuild the vault search indexes",
+                    posting.cx_id
+                )));
+            }
+        }
+    }
+    Ok(scores.into_iter().collect())
+}
+
+fn validate_sparse_weights(
+    entries: &[SparseEntry],
+    scoring: SparseScoring,
+    context: &str,
+) -> CliResult<f32> {
     let mut total = 0.0_f32;
     for entry in entries {
-        if !entry.val.is_finite() || entry.val <= 0.0 {
-            return Err(stale(format!(
-                "persistent sparse {context} weight at index {} must be finite and greater than zero",
-                entry.idx
-            )));
+        match scoring {
+            SparseScoring::Bm25 if !entry.val.is_finite() || entry.val <= 0.0 => {
+                return Err(stale(format!(
+                    "persistent sparse BM25 {context} weight at index {} must be finite and greater than zero",
+                    entry.idx
+                )));
+            }
+            SparseScoring::DotProduct if !entry.val.is_finite() || entry.val == 0.0 => {
+                return Err(stale(format!(
+                    "persistent sparse dot-product {context} weight at index {} must be finite and non-zero",
+                    entry.idx
+                )));
+            }
+            _ => {}
         }
-        total += entry.val;
+        total += match scoring {
+            SparseScoring::Bm25 => entry.val,
+            SparseScoring::DotProduct => entry.val.abs(),
+        };
         if !total.is_finite() {
             return Err(stale(format!(
                 "persistent sparse {context} weight sum overflowed"
@@ -410,6 +496,15 @@ fn validate_sparse_weights(entries: &[SparseEntry], context: &str) -> CliResult<
         }
     }
     Ok(total)
+}
+
+pub(super) fn require_sparse_kind(entry: &SearchIndexEntry, slot: SlotId) -> CliResult {
+    match entry.kind.as_str() {
+        LEGACY_BM25_KIND | "sparse_bm25" | "sparse_dot" => Ok(()),
+        other => Err(stale(format!(
+            "persistent slot {slot} index kind {other} is not a supported sparse index; rebuild the vault search indexes"
+        ))),
+    }
 }
 
 fn top_k(mut scored: Vec<(CxId, f32)>, k: usize) -> Vec<(CxId, f32)> {

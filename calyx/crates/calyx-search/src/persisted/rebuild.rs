@@ -1,7 +1,8 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
-use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, SlotId, SlotState};
+use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, SlotId, SlotShape, SlotState};
+use calyx_registry::{LensRuntime, VaultPanelState};
 use rayon::prelude::*;
 
 use super::*;
@@ -108,29 +109,32 @@ pub fn rebuild_for_vault_with_fallible_progress<C: Clock, F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
-    super::rebuild_stream::rebuild_for_vault_with_progress(vault_dir, vault, progress)
+    let state = calyx_registry::load_vault_panel_state(vault_dir)?;
+    rebuild_for_vault_with_panel_state_fallible_progress(vault_dir, vault, &state, progress)
 }
 
 pub fn rebuild_for_vault_with_panel_state_fallible_progress<C: Clock, F>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
-    state: &calyx_registry::VaultPanelState,
+    state: &VaultPanelState,
     progress: F,
 ) -> CliResult
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
     let active_slots = active_panel_slots(state);
+    let sparse_scoring = active_sparse_scoring(state)?;
     super::rebuild_stream::rebuild_for_vault_with_active_slots_progress(
         vault_dir,
         vault,
         state.panel.version,
         &active_slots,
+        &sparse_scoring,
         progress,
     )
 }
 
-fn active_panel_slots(state: &calyx_registry::VaultPanelState) -> BTreeSet<SlotId> {
+fn active_panel_slots(state: &VaultPanelState) -> BTreeSet<SlotId> {
     state
         .panel
         .slots
@@ -138,6 +142,53 @@ fn active_panel_slots(state: &calyx_registry::VaultPanelState) -> BTreeSet<SlotI
         .filter(|slot| slot.state == SlotState::Active)
         .map(|slot| slot.slot_id)
         .collect()
+}
+
+fn active_sparse_scoring(
+    state: &VaultPanelState,
+) -> CliResult<BTreeMap<SlotId, sparse::SparseScoring>> {
+    let mut scoring = BTreeMap::new();
+    for slot in state
+        .panel
+        .slots
+        .iter()
+        .filter(|slot| slot.state == SlotState::Active)
+    {
+        if !matches!(slot.shape, SlotShape::Sparse(_)) {
+            continue;
+        }
+        let spec = state.registry.lens_spec(slot.lens_id).ok_or_else(|| {
+            stale(format!(
+                "active sparse panel slot {} references lens {}, but the persisted registry has no LensSpec; repair the panel registry before rebuilding search indexes",
+                slot.slot_id, slot.lens_id
+            ))
+        })?;
+        if spec.output != slot.shape {
+            return Err(stale(format!(
+                "active sparse panel slot {} shape {:?} != lens {} contract {:?}; repair the panel registry before rebuilding search indexes",
+                slot.slot_id, slot.shape, slot.lens_id, spec.output
+            )));
+        }
+        scoring.insert(slot.slot_id, sparse_scoring_for_runtime(&spec.runtime));
+    }
+    Ok(scoring)
+}
+
+fn sparse_scoring_for_runtime(runtime: &LensRuntime) -> sparse::SparseScoring {
+    match runtime {
+        LensRuntime::Algorithmic { kind } if is_lexical_term_frequency_kind(kind) => {
+            sparse::SparseScoring::Bm25
+        }
+        _ => sparse::SparseScoring::DotProduct,
+    }
+}
+
+fn is_lexical_term_frequency_kind(kind: &str) -> bool {
+    let normalized = kind.replace('-', "_");
+    matches!(
+        normalized.split(':').next(),
+        Some("sparse" | "sparse_keywords")
+    )
 }
 
 pub(super) fn previous_manifest(

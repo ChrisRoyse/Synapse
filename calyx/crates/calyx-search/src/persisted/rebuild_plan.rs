@@ -6,6 +6,7 @@ use calyx_sextant::index::DiskAnnBuildBackend;
 
 use crate::error::{CliError, CliResult};
 use crate::persisted::SearchIndexManifest;
+use crate::persisted::sparse::SparseScoring;
 
 pub(super) const DISKANN_BUILD_BACKEND_ENV: &str = "CALYX_SEARCH_DISKANN_BUILD_BACKEND";
 const REQUIRE_CUVS_ENV: &str = "CALYX_SEARCH_REQUIRE_CUVS_CAGRA";
@@ -34,6 +35,7 @@ pub(super) struct SlotBuildPlan {
     pub(super) slot: SlotId,
     pub(super) expected_ids: Vec<CxId>,
     pub(super) estimated_bytes: usize,
+    pub(super) sparse_scoring: Option<SparseScoring>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +198,7 @@ pub(super) fn slot_build_plans(
     ids_by_slot: &BTreeMap<SlotId, Vec<CxId>>,
     previous_manifest: Option<&SearchIndexManifest>,
     active_slots: Option<&BTreeSet<SlotId>>,
+    sparse_scoring_by_slot: &BTreeMap<SlotId, SparseScoring>,
 ) -> Vec<SlotBuildPlan> {
     ids_by_slot
         .iter()
@@ -210,6 +213,7 @@ pub(super) fn slot_build_plans(
                 slot: *slot,
                 expected_ids,
                 estimated_bytes,
+                sparse_scoring: sparse_scoring_by_slot.get(slot).copied(),
             }
         })
         .collect()
@@ -271,7 +275,9 @@ fn estimate_slot_bytes(
                     .saturating_add(expected_len.saturating_mul(MULTI_ROW_OVERHEAD_BYTES))
             })
             .unwrap_or_else(|| expected_len.saturating_mul(DEFAULT_SLOT_ROW_MEMORY_ESTIMATE_BYTES)),
-        "sparse_inverted" => expected_len.saturating_mul(SPARSE_ROW_MEMORY_ESTIMATE_BYTES),
+        "sparse_inverted" | "sparse_bm25" | "sparse_dot" => {
+            expected_len.saturating_mul(SPARSE_ROW_MEMORY_ESTIMATE_BYTES)
+        }
         _ => expected_len.saturating_mul(DEFAULT_SLOT_ROW_MEMORY_ESTIMATE_BYTES),
     };
     estimate.max(MIN_SLOT_MEMORY_ESTIMATE_BYTES)

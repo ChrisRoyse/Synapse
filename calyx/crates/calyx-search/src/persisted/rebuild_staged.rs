@@ -41,7 +41,7 @@ impl BuiltSlot {
     pub(super) fn ok_phase(&self) -> &'static str {
         match self.entry.kind() {
             Some("diskann" | "flat_dense") => "dense_slot_ok",
-            Some("sparse_inverted") => "sparse_slot_ok",
+            Some("sparse_inverted" | "sparse_bm25" | "sparse_dot") => "sparse_slot_ok",
             Some("multi_maxsim" | "multi_maxsim_segments") => "multi_slot_ok",
             _ => "slot_build_ok",
         }
@@ -141,10 +141,9 @@ pub(super) fn write_staged_filter_artifact(
     )
 }
 
-/// `Ok(None)` = nothing staged (or the staged record failed validation and the
-/// slot must be rebuilt — the expected residue of a killed run, surfaced via
-/// the caller's progress phases, never trusted). `Ok(Some)` = every byte the
-/// staged entry references revalidated at this exact base seq.
+/// `Ok(None)` means the staged record is physically absent. A present record
+/// must parse and revalidate completely; corrupt resume state is evidence that
+/// must remain visible, never a signal to silently regenerate different bytes.
 pub(super) fn reuse_staged_slot_entry(
     vault_dir: &Path,
     root: &Path,
@@ -162,16 +161,41 @@ pub(super) fn reuse_staged_slot_entry(
             )));
         }
     };
-    let Ok(staged) = serde_json::from_slice::<StagedSlotArtifact>(&bytes) else {
-        return Ok(None);
-    };
-    if staged.schema != STAGED_ARTIFACT_SCHEMA
-        || staged.base_seq != base_seq
-        || staged.slot != plan.slot.get()
-    {
-        return Ok(None);
+    let staged = serde_json::from_slice::<StagedSlotArtifact>(&bytes).map_err(|error| {
+        stale(format!(
+            "staged slot artifact {} is not valid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    if staged.schema != STAGED_ARTIFACT_SCHEMA {
+        return Err(stale(format!(
+            "staged slot artifact {} schema {} != {STAGED_ARTIFACT_SCHEMA}",
+            path.display(),
+            staged.schema
+        )));
+    }
+    if staged.base_seq != base_seq {
+        return Err(stale(format!(
+            "staged slot artifact {} base_seq {} != pinned {base_seq}",
+            path.display(),
+            staged.base_seq
+        )));
+    }
+    if staged.slot != plan.slot.get() {
+        return Err(stale(format!(
+            "staged slot artifact {} slot {} != planned {}",
+            path.display(),
+            staged.slot,
+            plan.slot
+        )));
     }
     let Some(entry) = staged.entry else {
+        if staged.graph_sha256.is_some() || staged.id_map_sha256.is_some() {
+            return Err(stale(format!(
+                "staged absent-only slot artifact {} unexpectedly contains index hashes",
+                path.display()
+            )));
+        }
         return Ok(Some(BuiltSlot {
             entry: OptionalSearchIndexEntry::None {
                 slot: plan.slot.get(),
@@ -179,9 +203,22 @@ pub(super) fn reuse_staged_slot_entry(
             row_count: 0,
         }));
     };
-    if entry.slot != plan.slot.get() || entry.built_at_seq != base_seq {
-        return Ok(None);
+    if entry.slot != plan.slot.get() {
+        return Err(stale(format!(
+            "staged slot artifact {} entry slot {} != planned {}",
+            path.display(),
+            entry.slot,
+            plan.slot
+        )));
     }
+    if entry.built_at_seq != base_seq {
+        return Err(stale(format!(
+            "staged slot artifact {} entry seq {} != pinned {base_seq}",
+            path.display(),
+            entry.built_at_seq
+        )));
+    }
+    validate_staged_scoring_contract(&path, plan, &entry)?;
     let validated = match entry.kind.as_str() {
         "diskann" => validate_staged_diskann(
             vault_dir,
@@ -192,15 +229,25 @@ pub(super) fn reuse_staged_slot_entry(
             staged.id_map_sha256.as_deref(),
         ),
         "flat_dense" => dense::validate_entry(vault_dir, &entry, plan.panel_version, plan.slot),
-        "sparse_inverted" => sparse::validate_entry(vault_dir, &entry, base_seq, plan.slot),
+        "sparse_inverted" | "sparse_bm25" | "sparse_dot" => {
+            sparse::validate_entry(vault_dir, &entry, base_seq, plan.slot)
+        }
         "multi_maxsim" | "multi_maxsim_segments" => {
             multi::validate_entry(vault_dir, &entry, base_seq, plan.slot)
         }
-        _ => return Ok(None),
+        other => Err(stale(format!(
+            "staged slot artifact {} uses unsupported index kind {other}",
+            path.display()
+        ))),
     };
-    if validated.is_err() {
-        return Ok(None);
-    }
+    validated.map_err(|error| {
+        stale(format!(
+            "staged slot artifact {} failed referenced-artifact validation [{}] {}",
+            path.display(),
+            error.code(),
+            error.message()
+        ))
+    })?;
     let row_count = entry.len;
     Ok(Some(BuiltSlot {
         entry: OptionalSearchIndexEntry::Some(entry),
@@ -253,16 +300,65 @@ pub(super) fn reuse_staged_filter_entry(
             )));
         }
     };
-    let Ok(staged) = serde_json::from_slice::<StagedFilterArtifact>(&bytes) else {
-        return Ok(None);
-    };
-    if staged.schema != STAGED_ARTIFACT_SCHEMA || staged.base_seq != base_seq {
-        return Ok(None);
+    let staged = serde_json::from_slice::<StagedFilterArtifact>(&bytes).map_err(|error| {
+        stale(format!(
+            "staged filter artifact {} is not valid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    if staged.schema != STAGED_ARTIFACT_SCHEMA {
+        return Err(stale(format!(
+            "staged filter artifact {} schema {} != {STAGED_ARTIFACT_SCHEMA}",
+            path.display(),
+            staged.schema
+        )));
     }
-    if filter::validate_entry(vault_dir, &staged.entry, base_seq).is_err() {
-        return Ok(None);
+    if staged.base_seq != base_seq {
+        return Err(stale(format!(
+            "staged filter artifact {} base_seq {} != pinned {base_seq}",
+            path.display(),
+            staged.base_seq
+        )));
     }
+    filter::validate_entry(vault_dir, &staged.entry, base_seq).map_err(|error| {
+        stale(format!(
+            "staged filter artifact {} failed referenced-artifact validation [{}] {}",
+            path.display(),
+            error.code(),
+            error.message()
+        ))
+    })?;
     Ok(Some(staged.entry))
+}
+
+fn validate_staged_scoring_contract(
+    path: &Path,
+    plan: &SlotBuildPlan,
+    entry: &SearchIndexEntry,
+) -> CliResult {
+    let actual_sparse = match entry.kind.as_str() {
+        "sparse_inverted" => Some(sparse::SparseScoring::Bm25),
+        "sparse_bm25" => Some(sparse::SparseScoring::Bm25),
+        "sparse_dot" => Some(sparse::SparseScoring::DotProduct),
+        _ => None,
+    };
+    match (plan.sparse_scoring, actual_sparse) {
+        (Some(expected), Some(actual)) if expected == actual => Ok(()),
+        (Some(expected), Some(actual)) => Err(stale(format!(
+            "staged slot artifact {} sparse scoring {actual:?} != active panel/lens contract {expected:?}",
+            path.display()
+        ))),
+        (Some(expected), None) => Err(stale(format!(
+            "staged slot artifact {} kind {} is not sparse but the active panel/lens contract requires {expected:?}",
+            path.display(),
+            entry.kind
+        ))),
+        (None, Some(actual)) => Err(stale(format!(
+            "staged slot artifact {} declares sparse scoring {actual:?} but the active panel/lens contract is not sparse",
+            path.display()
+        ))),
+        (None, None) => Ok(()),
+    }
 }
 
 fn sha256_of_rel(vault_dir: &Path, rel: &str) -> CliResult<String> {

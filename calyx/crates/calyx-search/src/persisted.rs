@@ -376,10 +376,11 @@ impl SearchIndexEntry {
         base_seq: u64,
         index_rel: String,
         sha256: String,
+        kind: &str,
     ) -> Self {
         Self {
             slot: slot.get(),
-            kind: "sparse_inverted".to_string(),
+            kind: kind.to_string(),
             dim: Some(dim),
             token_dim: None,
             len,

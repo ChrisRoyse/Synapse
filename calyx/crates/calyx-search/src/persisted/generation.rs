@@ -53,7 +53,9 @@ impl PersistedSearchSlot {
     fn from_entry(panel_version: u32, entry: &SearchIndexEntry) -> CliResult<Self> {
         let shape = match entry.kind.as_str() {
             "diskann" | "flat_dense" => SlotShape::Dense(required_dim(entry)?),
-            "sparse_inverted" => SlotShape::Sparse(required_dim(entry)?),
+            "sparse_inverted" | "sparse_bm25" | "sparse_dot" => {
+                SlotShape::Sparse(required_dim(entry)?)
+            }
             "multi_maxsim" | "multi_maxsim_segments" => SlotShape::Multi {
                 token_dim: entry
                     .token_dim

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -38,22 +38,12 @@ where
     (**progress)(event)
 }
 
-pub(super) fn rebuild_for_vault_with_progress<C: Clock, F>(
-    vault_dir: &Path,
-    vault: &AsterVault<C>,
-    progress: F,
-) -> CliResult
-where
-    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
-{
-    rebuild_for_vault_with_slot_filter(vault_dir, vault, None, None, progress)
-}
-
 pub(super) fn rebuild_for_vault_with_active_slots_progress<C: Clock, F>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
     panel_version: u32,
     active_slots: &BTreeSet<SlotId>,
+    sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
     progress: F,
 ) -> CliResult
 where
@@ -64,6 +54,7 @@ where
         vault,
         Some(panel_version),
         Some(active_slots),
+        sparse_scoring,
         progress,
     )
 }
@@ -73,6 +64,7 @@ fn rebuild_for_vault_with_slot_filter<C: Clock, F>(
     vault: &AsterVault<C>,
     requested_panel_version: Option<u32>,
     active_slots: Option<&BTreeSet<SlotId>>,
+    sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
     mut progress: F,
 ) -> CliResult
 where
@@ -136,6 +128,7 @@ where
             page_rows,
             panel_version,
             active_slots,
+            sparse_scoring,
             build_policy,
         },
         &mut progress,
@@ -155,6 +148,7 @@ struct RebuildOptions<'a> {
     page_rows: usize,
     panel_version: u32,
     active_slots: Option<&'a BTreeSet<SlotId>>,
+    sparse_scoring: &'a BTreeMap<SlotId, sparse::SparseScoring>,
     build_policy: DiskAnnBuildPolicy,
 }
 
@@ -173,6 +167,7 @@ where
         page_rows,
         panel_version,
         active_slots,
+        sparse_scoring,
         build_policy,
     } = options;
     let root = panel_index_root(vault_dir, panel_version);
@@ -187,6 +182,7 @@ where
         &base_docs.ids_by_slot,
         previous_manifest.as_ref(),
         active_slots,
+        sparse_scoring,
     );
     if plans.is_empty()
         && previous_manifest
@@ -343,7 +339,9 @@ pub(super) fn validate_staged_manifest_artifacts(
             "diskann" | "flat_dense" => {
                 dense::validate_entry(vault_dir, entry, manifest.panel_version, slot)?
             }
-            "sparse_inverted" => sparse::validate_entry(vault_dir, entry, manifest.base_seq, slot)?,
+            "sparse_inverted" | "sparse_bm25" | "sparse_dot" => {
+                sparse::validate_entry(vault_dir, entry, manifest.base_seq, slot)?
+            }
             "multi_maxsim" | "multi_maxsim_segments" => {
                 multi::validate_entry(vault_dir, entry, manifest.base_seq, slot)?
             }
@@ -427,9 +425,17 @@ where
                 None => Ok(()),
             },
         )?),
-        ScannedSlotRows::Sparse(rows) => OptionalSearchIndexEntry::Some(sparse::write(
-            vault_dir, root, plan.slot, rows, base_seq,
-        )?),
+        ScannedSlotRows::Sparse(rows) => {
+            let scoring = plan.sparse_scoring.ok_or_else(|| {
+                stale(format!(
+                    "slot {} contains sparse rows but the active panel/lens contract declares no sparse scoring mode",
+                    plan.slot
+                ))
+            })?;
+            OptionalSearchIndexEntry::Some(sparse::write(
+                vault_dir, root, plan.slot, rows, base_seq, scoring,
+            )?)
+        }
         ScannedSlotRows::MultiEntry(entry) => OptionalSearchIndexEntry::Some(entry),
         ScannedSlotRows::AbsentOnly => OptionalSearchIndexEntry::None {
             slot: plan.slot.get(),
