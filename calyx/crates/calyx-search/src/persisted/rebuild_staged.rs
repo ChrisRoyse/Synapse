@@ -88,6 +88,140 @@ fn staged_filter_path(root: &Path, base_seq: u64) -> PathBuf {
     root.join(format!("filter_seq_{:020}.staged.json", base_seq))
 }
 
+/// Validates every staged recovery record physically present in `root` before
+/// a rebuild is allowed to write or prune anything. Records from older pins
+/// are still evidence of an interrupted recovery and must be internally
+/// complete; only a successful manifest publication may retire them.
+pub(super) fn validate_present_staged_artifacts(
+    vault_dir: &Path,
+    root: &Path,
+    plans: &[SlotBuildPlan],
+) -> CliResult<usize> {
+    let mut entries = fs::read_dir(root)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".staged.json")
+                .then_some(Ok(entry)),
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in &entries {
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            return Err(stale(format!(
+                "staged recovery artifact {} is not a regular file",
+                path.display()
+            )));
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        match parse_staged_name(&path, &name)? {
+            StagedArtifactName::Slot { slot, base_seq } => {
+                let plan = plans
+                    .iter()
+                    .find(|plan| plan.slot == slot)
+                    .ok_or_else(|| {
+                        stale(format!(
+                            "staged slot artifact {} names slot {slot}, which is absent from the active panel rebuild plan",
+                            path.display()
+                        ))
+                    })?;
+                if reuse_staged_slot_entry(vault_dir, root, plan, base_seq)?.is_none() {
+                    return Err(stale(format!(
+                        "staged slot artifact {} disappeared during recovery preflight",
+                        path.display()
+                    )));
+                }
+            }
+            StagedArtifactName::Filter { base_seq } => {
+                if reuse_staged_filter_entry(vault_dir, root, base_seq)?.is_none() {
+                    return Err(stale(format!(
+                        "staged filter artifact {} disappeared during recovery preflight",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(entries.len())
+}
+
+enum StagedArtifactName {
+    Slot { slot: SlotId, base_seq: u64 },
+    Filter { base_seq: u64 },
+}
+
+fn parse_staged_name(path: &Path, name: &str) -> CliResult<StagedArtifactName> {
+    let stem = name.strip_suffix(".staged.json").ok_or_else(|| {
+        stale(format!(
+            "staged recovery artifact {} lacks the .staged.json suffix",
+            path.display()
+        ))
+    })?;
+    if let Some(rest) = stem.strip_prefix("slot_") {
+        let (slot, base_seq) = rest.split_once("_seq_").ok_or_else(|| {
+            staged_name_error(path, "expected slot_<5 digits>_seq_<20 digits>.staged.json")
+        })?;
+        require_decimal_width(path, "slot", slot, 5)?;
+        require_decimal_width(path, "base sequence", base_seq, 20)?;
+        let slot = slot.parse::<u16>().map_err(|error| {
+            staged_name_error(path, &format!("slot number does not fit u16: {error}"))
+        })?;
+        let base_seq = base_seq.parse::<u64>().map_err(|error| {
+            staged_name_error(path, &format!("base sequence does not fit u64: {error}"))
+        })?;
+        let canonical = format!("slot_{slot:05}_seq_{base_seq:020}.staged.json");
+        if name != canonical {
+            return Err(staged_name_error(
+                path,
+                &format!("non-canonical staged slot name; expected {canonical}"),
+            ));
+        }
+        return Ok(StagedArtifactName::Slot {
+            slot: SlotId::new(slot),
+            base_seq,
+        });
+    }
+    if let Some(base_seq) = stem.strip_prefix("filter_seq_") {
+        require_decimal_width(path, "base sequence", base_seq, 20)?;
+        let base_seq = base_seq.parse::<u64>().map_err(|error| {
+            staged_name_error(path, &format!("base sequence does not fit u64: {error}"))
+        })?;
+        let canonical = format!("filter_seq_{base_seq:020}.staged.json");
+        if name != canonical {
+            return Err(staged_name_error(
+                path,
+                &format!("non-canonical staged filter name; expected {canonical}"),
+            ));
+        }
+        return Ok(StagedArtifactName::Filter { base_seq });
+    }
+    Err(staged_name_error(
+        path,
+        "expected slot_<5 digits>_seq_<20 digits>.staged.json or filter_seq_<20 digits>.staged.json",
+    ))
+}
+
+fn require_decimal_width(path: &Path, field: &str, value: &str, width: usize) -> CliResult {
+    if value.len() != width || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(staged_name_error(
+            path,
+            &format!("{field} must contain exactly {width} ASCII decimal digits"),
+        ));
+    }
+    Ok(())
+}
+
+fn staged_name_error(path: &Path, detail: &str) -> CliError {
+    stale(format!(
+        "staged recovery artifact {} has an invalid file name: {detail}",
+        path.display()
+    ))
+}
+
 pub(super) fn write_staged_slot_artifact(
     vault_dir: &Path,
     root: &Path,

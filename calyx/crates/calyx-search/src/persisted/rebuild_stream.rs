@@ -87,22 +87,6 @@ where
         &mut progress,
     )?;
     let panel_version = base_docs.panel_version();
-    // Stake the write-ahead rebuild intent before creating any derived index
-    // artifact. Base discovery above is read-only and establishes the exact
-    // panel namespace the marker must protect.
-    match marker::read_rebuild_required_marker(vault_dir, panel_version)? {
-        Some(_) => progress(RebuildProgress::phase("rebuild_marker_preserved"))?,
-        None => {
-            let mut intent = marker::RebuildRequiredMarker::new(
-                panel_version,
-                "search_index_rebuild",
-                "panel-scoped search-index rebuild in progress; derived indexes are unproven until the manifest is republished",
-            )?;
-            intent.required_base_seq = Some(base_seq);
-            marker::write_rebuild_required_marker(vault_dir, &intent)?;
-            progress(RebuildProgress::phase("rebuild_marker_written"))?;
-        }
-    }
     let retained_slot_payloads = base_docs.retained_slot_payloads();
     if retained_slot_payloads != 0 {
         return Err(stale(format!(
@@ -194,6 +178,31 @@ where
             "base CF scan produced no searchable slots but the previous search manifest was non-empty; refusing to replace it with an empty manifest",
         ));
     }
+    // Validate every staged recovery record before staking a new rebuild
+    // marker or writing any derived artifact. A record from an older pin is
+    // still crash evidence: silently skipping it here and deleting it during
+    // post-publish pruning would turn corruption into apparent recovery.
+    let staged_records = validate_present_staged_artifacts(vault_dir, &root, &plans)?;
+    progress(RebuildProgress {
+        rows: Some(staged_records),
+        base_seq: Some(base_seq),
+        ..RebuildProgress::phase("staged_preflight_ok")
+    })?;
+    // Stake the write-ahead rebuild intent after the read-only preflight and
+    // before creating any derived index artifact.
+    match marker::read_rebuild_required_marker(vault_dir, panel_version)? {
+        Some(_) => progress(RebuildProgress::phase("rebuild_marker_preserved"))?,
+        None => {
+            let mut intent = marker::RebuildRequiredMarker::new(
+                panel_version,
+                "search_index_rebuild",
+                "panel-scoped search-index rebuild in progress; derived indexes are unproven until the manifest is republished",
+            )?;
+            intent.required_base_seq = Some(base_seq);
+            marker::write_rebuild_required_marker(vault_dir, &intent)?;
+            progress(RebuildProgress::phase("rebuild_marker_written"))?;
+        }
+    }
     let parallelism = bounded_parallel_slot_count(&plans)?;
     progress(RebuildProgress {
         rows: Some(plans.len()),
@@ -249,6 +258,13 @@ where
 
     let filter = match reuse_staged_filter_entry(vault_dir, &root, base_seq)? {
         Some(entry) => {
+            if entry.len != base_docs.len() {
+                return Err(stale(format!(
+                    "staged filter artifact at base seq {base_seq} contains {} rows, but the pinned Base snapshot contains {}; refusing to reuse incomplete recovery state",
+                    entry.len,
+                    base_docs.len()
+                )));
+            }
             progress(RebuildProgress {
                 rows: Some(entry.len),
                 base_seq: Some(base_seq),
@@ -371,6 +387,15 @@ where
 {
     let base_seq = snapshot.seq();
     if let Some(built) = reuse_staged_slot_entry(vault_dir, root, plan, base_seq)? {
+        if built.row_count != plan.expected_ids.len() {
+            return Err(stale(format!(
+                "staged slot artifact for panel {} slot {} at base seq {base_seq} contains {} rows, but the pinned Base membership contains {}; refusing to reuse incomplete recovery state",
+                plan.panel_version,
+                plan.slot,
+                built.row_count,
+                plan.expected_ids.len()
+            )));
+        }
         if let Some(progress) = progress {
             emit_shared_progress(
                 progress,
@@ -461,7 +486,7 @@ where
 mod rebuild_staged;
 use rebuild_staged::{
     BuiltSlot, OptionalSearchIndexEntry, reuse_staged_filter_entry, reuse_staged_slot_entry,
-    write_staged_filter_artifact, write_staged_slot_artifact,
+    validate_present_staged_artifacts, write_staged_filter_artifact, write_staged_slot_artifact,
 };
 
 struct PinnedReadGuard<'a, C: Clock> {
