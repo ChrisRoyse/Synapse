@@ -461,6 +461,15 @@ impl AlgorithmicLens {
         &self.contract
     }
 
+    /// Returns the exact frozen encoder discriminator used by this lens.
+    ///
+    /// Durable panel publishers use this to serialize a reconstructable
+    /// `LensRuntime::Algorithmic` contract beside the panel instead of
+    /// publishing an empty registry snapshot.
+    pub const fn encoder(&self) -> AlgorithmicEncoder {
+        self.encoder
+    }
+
     /// Returns the most recent serializable batch provider/transfer evidence.
     pub fn last_batch_stats(&self) -> Option<AlgorithmicBatchStats> {
         self.batch.last_stats()

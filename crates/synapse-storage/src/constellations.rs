@@ -11,6 +11,10 @@ use calyx_core::{
 };
 use calyx_lenses::AlgorithmicLens;
 use calyx_lenses::measure::{absent, input_hash};
+use calyx_registry::{
+    AlgorithmicEncoder as RegistryAlgorithmicEncoder, AlgorithmicLens as RegistryAlgorithmicLens,
+    LensRuntime, LensSpec, Registry, default_recall_delta,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -1561,20 +1565,45 @@ pub fn build_episode_constellation(
 /// enumerated here; callers must fail closed on `None` rather than publish a
 /// partial contract. This is the source of truth consumed by
 /// `SynapseCalyxVault::publish_active_panel`.
-#[must_use]
-pub fn syn_active_panel_contract(panel_version: u32, created_at_ms: u64) -> Option<Panel> {
+/// Complete immutable panel definition and the frozen lens registry needed to
+/// reconstruct every active slot after a process restart.
+pub struct SynActivePanelContract {
+    /// Durable active-panel definition.
+    pub panel: Panel,
+    /// Frozen runtime contracts for every lens referenced by `panel`.
+    pub registry: Registry,
+}
+
+/// Returns the complete built-in contract for a known panel generation.
+///
+/// Unknown generations return `Ok(None)` and are never synthesized from a
+/// nearby version.
+///
+/// # Errors
+///
+/// Returns an error when a built-in slot has a non-reconstructable runtime or
+/// when its frozen lens contract and structured registry specification differ.
+#[must_use = "panel contract errors and unknown generations must be handled"]
+pub fn syn_active_panel_contract(
+    panel_version: u32,
+    created_at_ms: u64,
+) -> StorageResult<Option<SynActivePanelContract>> {
+    let mut registry = Registry::new();
     let slots = match panel_version {
-        SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version),
-        SYN_EPISODE_PANEL_VERSION => episode_panel_slots(panel_version),
-        _ => return None,
+        SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version, &mut registry)?,
+        SYN_EPISODE_PANEL_VERSION => episode_panel_slots(panel_version, &mut registry)?,
+        _ => return Ok(None),
     };
-    Some(Panel {
-        version: panel_version,
-        slots,
-        created_at: created_at_ms,
-        kernel_ref: None,
-        guard_ref: None,
-    })
+    Ok(Some(SynActivePanelContract {
+        panel: Panel {
+            version: panel_version,
+            slots,
+            created_at: created_at_ms,
+            kernel_ref: None,
+            guard_ref: None,
+        },
+        registry,
+    }))
 }
 
 /// Builds one `Active`, content (non-retrieval-only) panel slot from the same
@@ -1583,15 +1612,47 @@ pub fn syn_active_panel_contract(panel_version: u32, created_at_ms: u64) -> Opti
 fn syn_content_slot(
     slot_id: SlotId,
     slot_key: &str,
-    lens: &AlgorithmicLens,
+    lens: RegistryAlgorithmicLens,
     panel_version: u32,
-) -> Slot {
-    Slot {
+    registry: &mut Registry,
+) -> StorageResult<Slot> {
+    let contract = lens.contract().clone();
+    let output = contract.shape();
+    let modality = contract.modality();
+    let spec = LensSpec {
+        name: slot_key.to_owned(),
+        runtime: LensRuntime::Algorithmic {
+            kind: persisted_syn_runtime_kind(lens.encoder())?,
+        },
+        output: contract.shape(),
+        modality: contract.modality(),
+        weights_sha256: contract.weights_sha256(),
+        corpus_hash: contract.corpus_hash(),
+        norm_policy: contract.norm_policy(),
+        max_batch: None,
+        axis: Some(slot_key.to_owned()),
+        asymmetry: Asymmetry::None,
+        quant_default: QuantPolicy::None,
+        truncate_dim: None,
+        recall_delta: default_recall_delta(),
+        retrieval_only: false,
+        excluded_from_dedup: false,
+    };
+    let lens_id = registry
+        .register_frozen_with_spec(lens, contract, spec)
+        .map_err(|error| {
+            panel_lifecycle_error(
+                "CALYX_PANEL_REGISTRY_INVALID",
+                &format!("register active slot {slot_id} key {slot_key}: {error}"),
+                "fix the static panel lens/runtime contract before publishing the active panel",
+            )
+        })?;
+    Ok(Slot {
         slot_id,
         slot_key: SlotKey::new(slot_id, slot_key),
-        lens_id: lens.id(),
-        shape: lens.shape(),
-        modality: lens.modality(),
+        lens_id,
+        shape: output,
+        modality,
         asymmetry: Asymmetry::None,
         quant: QuantPolicy::None,
         resource: SlotResource::default(),
@@ -1601,220 +1662,330 @@ fn syn_content_slot(
         bits_about: BTreeMap::new(),
         state: SlotState::Active,
         added_at_panel_version: panel_version,
-    }
+    })
 }
 
-fn timeline_panel_slots(panel_version: u32) -> Vec<Slot> {
-    vec![
+fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageResult<String> {
+    let kind = match encoder {
+        RegistryAlgorithmicEncoder::SynCyclicTime { period } => {
+            format!("syn_cyclic_time:{period}")
+        }
+        RegistryAlgorithmicEncoder::SynScalarRaw => "syn_scalar_raw".to_owned(),
+        RegistryAlgorithmicEncoder::SynScalarLog1p => "syn_scalar_log1p".to_owned(),
+        RegistryAlgorithmicEncoder::SynScalarZScore {
+            mean_micros,
+            std_micros,
+        } => format!("syn_scalar_zscore:{mean_micros}:{std_micros}"),
+        RegistryAlgorithmicEncoder::SynScalarRank {
+            min_micros,
+            max_micros,
+        } => format!("syn_scalar_rank:{min_micros}:{max_micros}"),
+        RegistryAlgorithmicEncoder::SynOneHot { buckets } => {
+            format!("syn_one_hot:{buckets}")
+        }
+        RegistryAlgorithmicEncoder::SynHash { dim } => format!("syn_hash:{dim}"),
+        RegistryAlgorithmicEncoder::SynSparseText { dim } => {
+            format!("syn_sparse_text:{dim}")
+        }
+        RegistryAlgorithmicEncoder::SynTokenSlots { token_dim } => {
+            format!("syn_token_slots:{token_dim}")
+        }
+        RegistryAlgorithmicEncoder::SynMultiHot { dim } => format!("syn_multi_hot:{dim}"),
+        RegistryAlgorithmicEncoder::SynRecordVector { dim } => {
+            format!("syn_record_vector:{dim}")
+        }
+        RegistryAlgorithmicEncoder::SynBin {
+            buckets,
+            min_micros,
+            max_micros,
+        } => format!("syn_bin:{buckets}:{min_micros}:{max_micros}"),
+        RegistryAlgorithmicEncoder::SynOrdinal { levels } => format!("syn_ordinal:{levels}"),
+        RegistryAlgorithmicEncoder::SynFrequency { count, total } => {
+            format!("syn_frequency:{count}:{total}")
+        }
+        RegistryAlgorithmicEncoder::SynTargetMean {
+            mean_micros,
+            fold_count,
+            outcome_hash,
+        } => format!("syn_target_mean:{mean_micros}:{fold_count}:{outcome_hash}"),
+        RegistryAlgorithmicEncoder::SynDelta { scale_micros } => {
+            format!("syn_delta:{scale_micros}")
+        }
+        RegistryAlgorithmicEncoder::SynRate { scale_micros } => {
+            format!("syn_rate:{scale_micros}")
+        }
+        RegistryAlgorithmicEncoder::SynCross { dim } => format!("syn_cross:{dim}"),
+        RegistryAlgorithmicEncoder::SynAggregation { dim } => {
+            format!("syn_aggregation:{dim}")
+        }
+        other => {
+            return Err(panel_lifecycle_error(
+                "CALYX_PANEL_REGISTRY_INVALID",
+                &format!("static Synapse panel contains non-Syn encoder {other:?}"),
+                "declare a reconstructable Syn* runtime for every static Synapse panel lens",
+            ));
+        }
+    };
+    Ok(kind)
+}
+
+fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
+    Ok(vec![
         syn_content_slot(
             TL_SLOT_KIND_ONEHOT,
             "syn.timeline.kind_onehot.v1",
-            &AlgorithmicLens::syn_one_hot("syn.timeline.kind_onehot.v1", Modality::Structured, 32),
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.timeline.kind_onehot.v1",
+                Modality::Structured,
+                32,
+            ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             TL_SLOT_APP_HASH,
             "syn.timeline.app_hash.v1",
-            &AlgorithmicLens::syn_hash("syn.timeline.app_hash.v1", Modality::Structured, 1024),
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.timeline.app_hash.v1",
+                Modality::Structured,
+                1024,
+            ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             TL_SLOT_TITLE_SPARSE,
             "syn.timeline.title_sparse.v1",
-            &AlgorithmicLens::syn_sparse_text(
+            RegistryAlgorithmicLens::syn_sparse_text(
                 "syn.timeline.title_sparse.v1",
                 Modality::Structured,
                 2048,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             TL_SLOT_HOUR_CYCLIC,
             "syn.timeline.hour_cyclic.v1",
-            &AlgorithmicLens::syn_cyclic_time(
+            RegistryAlgorithmicLens::syn_cyclic_time(
                 "syn.timeline.hour_cyclic.v1",
                 Modality::Structured,
                 24,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             TL_SLOT_DOW_CYCLIC,
             "syn.timeline.dow_cyclic.v1",
-            &AlgorithmicLens::syn_cyclic_time(
+            RegistryAlgorithmicLens::syn_cyclic_time(
                 "syn.timeline.dow_cyclic.v1",
                 Modality::Structured,
                 7,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             TL_SLOT_ACTOR_ONEHOT,
             "syn.timeline.actor_onehot.v1",
-            &AlgorithmicLens::syn_one_hot("syn.timeline.actor_onehot.v1", Modality::Structured, 8),
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.timeline.actor_onehot.v1",
+                Modality::Structured,
+                8,
+            ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             TL_SLOT_RECENCY_RANK,
             "syn.timeline.event_time_rank.v1",
-            &AlgorithmicLens::syn_scalar_rank(
+            RegistryAlgorithmicLens::syn_scalar_rank(
                 "syn.timeline.event_time_rank.v1",
                 Modality::Structured,
                 0,
                 RECENCY_RANK_MAX_UNIX_MS_MICROS,
             ),
             panel_version,
-        ),
-    ]
+            registry,
+        )?,
+    ])
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "episode panel contract is a one-to-one slot-to-frozen-lens map mirroring build_episode_constellation; splitting would obscure the stable contract"
 )]
-fn episode_panel_slots(panel_version: u32) -> Vec<Slot> {
-    vec![
+fn episode_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
+    Ok(vec![
         syn_content_slot(
             EP_SLOT_APP_HASH,
             "syn.episode.app_hash.v1",
-            &AlgorithmicLens::syn_hash("syn.episode.app_hash.v1", Modality::Structured, 1024),
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.episode.app_hash.v1",
+                Modality::Structured,
+                1024,
+            ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_DOCUMENT_HASH,
             "syn.episode.document_hash.v1",
-            &AlgorithmicLens::syn_hash("syn.episode.document_hash.v1", Modality::Structured, 2048),
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.episode.document_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_URL_HOST_HASH,
             "syn.episode.url_host_hash.v1",
-            &AlgorithmicLens::syn_hash("syn.episode.url_host_hash.v1", Modality::Structured, 2048),
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.episode.url_host_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_TITLE_SPARSE,
             "syn.episode.title_sparse.v1",
-            &AlgorithmicLens::syn_sparse_text(
+            RegistryAlgorithmicLens::syn_sparse_text(
                 "syn.episode.title_sparse.v1",
                 Modality::Structured,
                 4096,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_START_HOUR_CYCLIC,
             "syn.episode.start_hour_cyclic.v1",
-            &AlgorithmicLens::syn_cyclic_time(
+            RegistryAlgorithmicLens::syn_cyclic_time(
                 "syn.episode.start_hour_cyclic.v1",
                 Modality::Structured,
                 24,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_START_DOW_CYCLIC,
             "syn.episode.start_dow_cyclic.v1",
-            &AlgorithmicLens::syn_cyclic_time(
+            RegistryAlgorithmicLens::syn_cyclic_time(
                 "syn.episode.start_dow_cyclic.v1",
                 Modality::Structured,
                 7,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_DURATION_LOG1P,
             "syn.episode.duration_log1p.v1",
-            &AlgorithmicLens::syn_scalar_log1p(
+            RegistryAlgorithmicLens::syn_scalar_log1p(
                 "syn.episode.duration_log1p.v1",
                 Modality::Structured,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_DURATION_RANK,
             "syn.episode.duration_rank.v1",
-            &AlgorithmicLens::syn_scalar_rank(
+            RegistryAlgorithmicLens::syn_scalar_rank(
                 "syn.episode.duration_rank.v1",
                 Modality::Structured,
                 0,
                 MAX_DAY_DURATION_MS_MICROS,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_KEYSTROKES_ZSCORE,
             "syn.episode.keystrokes_zscore.v1",
-            &AlgorithmicLens::syn_scalar_zscore(
+            RegistryAlgorithmicLens::syn_scalar_zscore(
                 "syn.episode.keystrokes_zscore.v1",
                 Modality::Structured,
                 0,
                 10_000_000,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_CLICKS_ZSCORE,
             "syn.episode.clicks_zscore.v1",
-            &AlgorithmicLens::syn_scalar_zscore(
+            RegistryAlgorithmicLens::syn_scalar_zscore(
                 "syn.episode.clicks_zscore.v1",
                 Modality::Structured,
                 0,
                 1_000_000,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_ROW_COUNT_ZSCORE,
             "syn.episode.row_count_zscore.v1",
-            &AlgorithmicLens::syn_scalar_zscore(
+            RegistryAlgorithmicLens::syn_scalar_zscore(
                 "syn.episode.row_count_zscore.v1",
                 Modality::Structured,
                 0,
                 1_000_000,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_STARTED_BOUNDARY_ONEHOT,
             "syn.episode.started_boundary_onehot.v1",
-            &AlgorithmicLens::syn_one_hot(
+            RegistryAlgorithmicLens::syn_one_hot(
                 "syn.episode.started_boundary_onehot.v1",
                 Modality::Structured,
                 16,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_ENDED_BOUNDARY_ONEHOT,
             "syn.episode.ended_boundary_onehot.v1",
-            &AlgorithmicLens::syn_one_hot(
+            RegistryAlgorithmicLens::syn_one_hot(
                 "syn.episode.ended_boundary_onehot.v1",
                 Modality::Structured,
                 16,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_INTERRUPTION_RATIO,
             "syn.episode.interruption_ratio_raw.v1",
-            &AlgorithmicLens::syn_scalar_raw(
+            RegistryAlgorithmicLens::syn_scalar_raw(
                 "syn.episode.interruption_ratio_raw.v1",
                 Modality::Structured,
             ),
             panel_version,
-        ),
+            registry,
+        )?,
         syn_content_slot(
             EP_SLOT_RECORD_VECTOR,
             "syn.episode.record_vector.v1",
-            &AlgorithmicLens::syn_record_vector(
+            RegistryAlgorithmicLens::syn_record_vector(
                 "syn.episode.record_vector.v1",
                 Modality::Structured,
                 64,
             ),
             panel_version,
-        ),
-    ]
+            registry,
+        )?,
+    ])
 }
 
 /// Build the Calyx constellation for an agent event record.

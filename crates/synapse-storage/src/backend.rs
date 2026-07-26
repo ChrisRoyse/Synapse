@@ -1172,7 +1172,8 @@ fn ensure_builtin_temporal_panel_registrations(vault: &SynapseCalyxVault) -> Sto
 /// this is a no-op once the version is published and never churns `manifest_seq`.
 fn ensure_active_panel_published(vault: &SynapseCalyxVault) -> StorageResult<()> {
     let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-    let Some(panel) = syn_active_panel_contract(SYN_TIMELINE_PANEL_VERSION, created_at_ms) else {
+    let Some(contract) = syn_active_panel_contract(SYN_TIMELINE_PANEL_VERSION, created_at_ms)?
+    else {
         return Err(StorageError::WriteFailed {
             cf_name: "calyx_manifest".to_owned(),
             detail: format!(
@@ -1180,13 +1181,15 @@ fn ensure_active_panel_published(vault: &SynapseCalyxVault) -> StorageResult<()>
             ),
         });
     };
-    let report = vault.publish_active_panel(&panel).map_err(|source| {
-        calyx_write_failed(
-            "calyx_manifest",
-            &format!("publish active durable panel generation {SYN_TIMELINE_PANEL_VERSION}"),
-            &source,
-        )
-    })?;
+    let report = vault
+        .publish_active_panel(&contract.panel, &contract.registry)
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_manifest",
+                &format!("publish active durable panel generation {SYN_TIMELINE_PANEL_VERSION}"),
+                &source,
+            )
+        })?;
     tracing::info!(
         code = "STORAGE_CALYX_ACTIVE_PANEL_PUBLISHED",
         panel_version = report.panel_version,
@@ -1826,18 +1829,20 @@ impl StorageBackend for CalyxBackend {
                 // (NO_ACTIVE_PANEL / SEARCH_PANEL_MISMATCH) rather than silently
                 // rebuilding a different panel.
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-                if let Some(panel) =
-                    syn_active_panel_contract(expected_panel_version, created_at_ms)
+                if let Some(contract) =
+                    syn_active_panel_contract(expected_panel_version, created_at_ms)?
                 {
-                    vault.publish_active_panel(&panel).map_err(|source| {
-                        calyx_write_failed(
-                            "calyx_manifest",
-                            &format!(
-                                "publish active durable panel generation {expected_panel_version} before search rebuild"
-                            ),
-                            &source,
-                        )
-                    })?;
+                    vault
+                        .publish_active_panel(&contract.panel, &contract.registry)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_manifest",
+                                &format!(
+                                    "publish active durable panel generation {expected_panel_version} before search rebuild"
+                                ),
+                                &source,
+                            )
+                        })?;
                 }
                 vault
                     .rebuild_search_indexes(expected_panel_version)

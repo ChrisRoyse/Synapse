@@ -141,7 +141,9 @@ pub use runtime::tei_http::{DEFAULT_TEI_ENDPOINT, TeiHttpLens};
 pub use runtime_limit::{
     measure_registry_batch_with_runtime_limit, measure_registry_group_with_runtime_limit,
 };
-pub use spec::{Bgem3Engine, FastembedBgem3Output, LensHealth, LensRuntime, LensSpec};
+pub use spec::{
+    Bgem3Engine, FastembedBgem3Output, LensHealth, LensRuntime, LensSpec, default_recall_delta,
+};
 pub use structured_record::{
     CALYX_STRUCTURED_FIELD_MISSING, CALYX_STRUCTURED_FIELD_TYPE_MISMATCH,
     CALYX_STRUCTURED_RECORD_INVALID, CALYX_STRUCTURED_SCHEMA_INVALID, StructuredBatchMeasurement,

@@ -230,6 +230,61 @@ pub struct SynapseCalyxPanelPublishReport {
     pub readback_panel_version: u32,
 }
 
+fn same_panel_definition(left: &Panel, right: &Panel) -> bool {
+    let Panel {
+        version: left_version,
+        slots: left_slots,
+        created_at: _,
+        kernel_ref: left_kernel_ref,
+        guard_ref: left_guard_ref,
+    } = left;
+    let Panel {
+        version: right_version,
+        slots: right_slots,
+        created_at: _,
+        kernel_ref: right_kernel_ref,
+        guard_ref: right_guard_ref,
+    } = right;
+    left_version == right_version
+        && left_slots == right_slots
+        && left_kernel_ref == right_kernel_ref
+        && left_guard_ref == right_guard_ref
+}
+
+fn verify_published_panel_readback(
+    state: &calyx_registry::VaultPanelState,
+    panel: &Panel,
+    registry: &Registry,
+) -> Result<(), SynapseCalyxError> {
+    if state.panel.version != panel.version || !same_panel_definition(&state.panel, panel) {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_PANEL_PUBLISH_READBACK_MISMATCH",
+            format!(
+                "published active panel {} but readback resolved panel {} with a different immutable definition",
+                panel.version, state.panel.version
+            ),
+            "inspect the durable manifest panel_ref and immutable panel asset before retrying publication",
+        ));
+    }
+    let desired_registry = registry.lens_snapshots();
+    if !state
+        .registry_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.lenses == desired_registry)
+    {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_PANEL_REGISTRY_READBACK_MISMATCH",
+            format!(
+                "published panel {} registry but the durable snapshot does not contain the exact {} requested lenses",
+                panel.version,
+                desired_registry.len()
+            ),
+            "inspect the manifest registry_ref and immutable registry asset before retrying publication",
+        ));
+    }
+    Ok(())
+}
+
 fn search_rebuild_error(action: &str, error: calyx_search::SearchError) -> SynapseCalyxError {
     match error {
         calyx_search::SearchError::Calyx(error) => SynapseCalyxError::from_calyx(action, &error),
@@ -2357,6 +2412,7 @@ impl SynapseCalyxVault {
     pub fn publish_active_panel(
         &self,
         panel: &Panel,
+        registry: &Registry,
     ) -> Result<SynapseCalyxPanelPublishReport, SynapseCalyxError> {
         let vault_dir = &self.config.vault_dir;
         // The panel version is an immutable contract identity, so a manifest
@@ -2368,7 +2424,8 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("read manifest for active-panel publication", &error)
             })?;
-        if current
+        let desired_registry = registry.lens_snapshots();
+        let panel_to_publish = if current
             .panel_ref
             .logical_path
             .starts_with(&published_prefix)
@@ -2376,32 +2433,44 @@ impl SynapseCalyxVault {
             let state = load_vault_panel_state(vault_dir).map_err(|error| {
                 SynapseCalyxError::from_calyx("read back already-published active panel", &error)
             })?;
-            return Ok(SynapseCalyxPanelPublishReport {
-                panel_version: panel.version,
-                published: false,
-                panel_ref: current.panel_ref.logical_path,
-                registry_ref: current.registry_ref.map(|reference| reference.logical_path),
-                readback_panel_version: state.panel.version,
-            });
-        }
-        let write: VaultPanelWrite = persist_vault_panel_state(vault_dir, panel, &Registry::new())
-            .map_err(|error| {
+            if !same_panel_definition(&state.panel, panel) {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_PANEL_VERSION_COLLISION",
+                    format!(
+                        "active panel version {} is already published with a different slot/kernel/guard definition",
+                        panel.version
+                    ),
+                    "allocate a new panel version for the changed contract; never overwrite an immutable panel generation",
+                ));
+            }
+            let registry_matches = state
+                .registry_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.lenses == desired_registry);
+            if registry_matches {
+                return Ok(SynapseCalyxPanelPublishReport {
+                    panel_version: panel.version,
+                    published: false,
+                    panel_ref: current.panel_ref.logical_path,
+                    registry_ref: current.registry_ref.map(|reference| reference.logical_path),
+                    readback_panel_version: state.panel.version,
+                });
+            }
+            // Preserve the original server-stamped creation time when repairing
+            // the registry beside an already-published immutable panel.
+            state.panel
+        } else {
+            panel.clone()
+        };
+        let write: VaultPanelWrite =
+            persist_vault_panel_state(vault_dir, &panel_to_publish, registry).map_err(|error| {
                 SynapseCalyxError::from_calyx("publish active durable panel snapshot", &error)
             })?;
         // Prove the published state through the same loader search rebuild uses.
         let state = load_vault_panel_state(vault_dir).map_err(|error| {
             SynapseCalyxError::from_calyx("read back published active panel", &error)
         })?;
-        if state.panel.version != panel.version {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_PANEL_PUBLISH_READBACK_MISMATCH",
-                format!(
-                    "published active panel {} but readback resolved panel {}",
-                    panel.version, state.panel.version
-                ),
-                "inspect the durable manifest panel_ref and registry_ref before retrying publication",
-            ));
-        }
+        verify_published_panel_readback(&state, panel, registry)?;
         tracing::info!(
             code = "SYNAPSE_CALYX_ACTIVE_PANEL_PUBLISHED",
             panel_version = panel.version,

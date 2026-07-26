@@ -13,6 +13,7 @@ default = []
 calyx-aster = { path = "../../calyx/crates/calyx-aster" }
 calyx-core = { path = "../../calyx/crates/calyx-core" }
 calyx-lenses = { path = "../../calyx/crates/calyx-lenses" }
+calyx-registry = { path = "../../calyx/crates/calyx-registry" }
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -5341,6 +5341,7 @@ dependencies = [
  "calyx-aster",
  "calyx-core",
  "calyx-lenses",
+ "calyx-registry",
  "fs2",
  "serde",
  "serde_json",
