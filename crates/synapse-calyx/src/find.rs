@@ -316,6 +316,10 @@ impl SynapseCalyxVault {
         };
 
         let k = params.k.clamp(1, SYNAPSE_FIND_MAX_K);
+        // Query-by-example removes the query record itself after substrate
+        // fusion. Ask for one additional bounded candidate so that removal
+        // cannot underfill the caller's requested result count (#1844).
+        let substrate_k = if self_cx.is_some() { k + 1 } else { k };
         // Ward guarded search is a documented seam (#1677); keep it off so the
         // result is the honest fused recall, never a silently guarded subset.
         let outcome: SearchOutcome = search_outcome_with_query_vectors_freshness(
@@ -323,7 +327,7 @@ impl SynapseCalyxVault {
             vault_dir,
             &state.panel,
             &query_vectors,
-            k,
+            substrate_k,
             params.fusion.to_choice(),
             GuardChoice::Off,
             params.filter.as_deref(),
@@ -335,6 +339,7 @@ impl SynapseCalyxVault {
         .map_err(|error| find_index_error("run fused persisted search", &error))?;
 
         let mut hits = build_find_hits(&outcome, &consulted_slots, self_cx);
+        hits.truncate(k);
 
         // Bounded temporal post-boost (#1667): reuse the fully-validated
         // registered-policy rerank over the fused candidates, then merge the
