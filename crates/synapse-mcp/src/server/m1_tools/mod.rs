@@ -2981,7 +2981,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Ask the installed normal Chrome bridge extension to reload itself in the background via chrome.runtime.reload(), then wait for a new authenticated bridge host registration. This never opens chrome://extensions, never activates Chrome, and fails closed with CHROME_BRIDGE_EXTENSION_STALE when the loaded worker does not advertise reloadSelf."
+        description = "Reload or install the normal-profile Chrome bridge through the exact Reload or Load unpacked control in the already-open authenticated Chrome window, then separately verify the physical profile row and a new clean authenticated bridge host registration. This requires bounded foreground control, never calls chrome.runtime.reload(), never launches a second Chrome profile, and fails with CHROME_BRIDGE_HOST_RELOAD_FAILED plus process/UI/readback evidence when any postcondition is missing."
     )]
     pub async fn cdp_bridge_reload(
         &self,
@@ -3001,12 +3001,12 @@ impl SynapseService {
         let request_details = json!({
             "session_id": &session_id,
             "wait_timeout_ms": wait_timeout_ms,
-            "required_foreground": false,
-            "trigger": "chrome.runtime.reload",
+            "required_foreground": true,
+            "trigger": "chrome_extensions_exact_reload_or_load_unpacked_control",
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         super::operator_panic_boundary::ensure_mcp_mutation(
-            "cdp_bridge_reload_before_runtime_reload",
+            "cdp_bridge_reload_before_host_ui_control",
         )?;
         let mut result = crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms)
             .await
@@ -3014,7 +3014,7 @@ impl SynapseService {
             .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
         if result.is_ok()
             && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-                "cdp_bridge_reload_after_runtime_reload",
+                "cdp_bridge_reload_after_host_ui_control",
             )
         {
             result = Err(panic_error);
@@ -19647,9 +19647,9 @@ fn chrome_bridge_reload_response(
 ) -> CdpBridgeReloadResponse {
     CdpBridgeReloadResponse {
         session_id: session_id.to_owned(),
-        required_foreground: false,
+        required_foreground: true,
         wait_timeout_ms,
-        before: chrome_bridge_host_readback(reload.before),
+        before: reload.before.map(chrome_bridge_host_readback),
         command_ack: chrome_bridge_reload_ack_readback(reload.command_ack),
         after: chrome_bridge_host_readback(reload.after),
         reconnected: reload.reconnected,
@@ -19696,22 +19696,29 @@ fn chrome_bridge_reload_ack_readback(
 ) -> CdpBridgeReloadAckReadback {
     CdpBridgeReloadAckReadback {
         ok: ack.ok,
+        control_surface: ack.control_surface,
+        required_foreground: ack.required_foreground,
+        installer_path: ack.installer_path,
+        installer_sha256: ack.installer_sha256,
+        installer_exit_code: ack.installer_exit_code,
+        installer_stdout_sha256: ack.installer_stdout_sha256,
+        installer_stderr_sha256: ack.installer_stderr_sha256,
+        installer_duration_ms: ack.installer_duration_ms,
         extension_id: ack.extension_id,
-        version: ack.version,
-        protocol_version: ack.protocol_version,
-        build_id: ack.build_id,
-        build_sha256: ack.build_sha256,
-        declared_build_sha256: ack.declared_build_sha256,
-        service_worker_sha256: ack.service_worker_sha256,
-        service_worker_sha256_status: ack.service_worker_sha256_status,
-        service_worker_sha256_source: ack.service_worker_sha256_source,
-        service_worker_byte_length: ack.service_worker_byte_length,
-        service_worker_sha256_error: ack.service_worker_sha256_error,
-        debugger_api_available: ack.debugger_api_available,
-        capabilities: ack.capabilities,
-        host_id: ack.host_id,
-        reload_requested_at_unix_ms: ack.reload_requested_at_unix_ms,
-        reload_delay_ms: ack.reload_delay_ms,
+        extension_dir: ack.extension_dir,
+        extension_service_worker_sha256: ack.extension_service_worker_sha256,
+        active_profile: ack.active_profile,
+        reason: ack.reason,
+        chrome_window_pid: ack.chrome_window_pid,
+        chrome_window_hwnd: ack.chrome_window_hwnd,
+        profile_before_installed: ack.profile_before_installed,
+        profile_before_ready: ack.profile_before_ready,
+        profile_after_installed: ack.profile_after_installed,
+        profile_after_ready: ack.profile_after_ready,
+        ui_before_reload_button_present: ack.ui_before_reload_button_present,
+        ui_before_enable_toggle_on: ack.ui_before_enable_toggle_on,
+        ui_after_reload_button_present: ack.ui_after_reload_button_present,
+        ui_after_enable_toggle_on: ack.ui_after_enable_toggle_on,
     }
 }
 

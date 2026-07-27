@@ -55,19 +55,16 @@ uses that identity as the Source of Truth for extension/runtime skew. A loaded
 worker that does not advertise a command needed by the daemon fails closed with
 `CHROME_BRIDGE_EXTENSION_STALE` before the command is queued to Chrome.
 
-Future bridge updates reload through the background MCP tool
-`cdp_bridge_reload`. That tool asks the loaded extension to run
-`chrome.runtime.reload()`, then waits for a new authenticated bridge host
-registration in daemon health. It does not open `chrome://extensions`, does not
-activate Chrome, and does not use coordinates. If the currently loaded worker
-predates the `reloadSelf` capability, Synapse cannot make that old worker run
-new code; the correct behavior is a visible stale-worker error, not foreground
-automation.
-If daemon health reports `synapse_chrome_bridge_profile_installation
-installed=false`, Chrome has no loaded extension host to receive `reloadSelf`;
-run the installer from the interactive Windows desktop with the target Chrome
-profile already open. The installer auto-loads this directory as an unpacked
-extension in that active profile before retrying bridge health.
+Future bridge updates reload through the public `browser_debugger`
+`reload_bridge` operation. Chrome 137 removed `--load-extension` from branded
+Chrome, and an unpacked service worker that calls `chrome.runtime.reload()` can
+unload itself without a programmatic path back. The extension therefore exposes
+no self-reload command. The daemon instead launches the repo installer in a
+bounded child process, drives the exact Reload or Load unpacked control in the
+already-open authenticated Chrome profile, validates the physical profile row,
+then independently waits for a new clean authenticated host registration. This
+path declares and requires foreground control, never launches a second Chrome
+profile, never clicks coordinates, and returns process/UI/hash evidence.
 
 Install/verify the local bridge registration with:
 
@@ -230,11 +227,10 @@ attach-capable debugger commands before queueing them. External
 operator attribution and policy shielding, and they must be suppressed by
 policy or `chrome.management` before popup-free normal-profile commands run.
 
-The lifecycle command `reloadSelf` is limited to self-reload. It validates the
-expected extension ID and expected build ID, acknowledges the request to the
-daemon, then schedules `chrome.runtime.reload()`. The daemon accepts the reload
-only after a separate post-reconnect host readback reports the expected build
-and the full required capability set.
+Extension lifecycle reload is host-owned. No bridge command can invoke
+`chrome.runtime.reload()`. Acceptance requires the installer readback and a
+separate daemon host snapshot reporting the expected extension ID, build ID,
+service-worker identity, and full required capability set.
 
 Attach-capable DOM commands (`snapshot`, `clickNode`, `typeNode`, and
 `nodeValue`) are unavailable in the normal end-user install. The normal service

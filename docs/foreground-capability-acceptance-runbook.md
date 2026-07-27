@@ -47,13 +47,14 @@ Get-Process | ? {$_.MainWindowHandle -ne 0} | % { "{0} {1} {2}" -f [int64]$_.Mai
 
 ## 2. Operator-safe Chrome-bridge bootstrap (#1011, unblocks #996/#997/#1000)
 
-The daemon ships the new bridge extension on disk
-(`extensions/synapse-chrome-debugger`, build
-`synapse-chrome-bridge-2026-06-15-1011-reload-self-997-type-active-v1`) which
-implements `targetInfo`, `typeActiveElement`, `navigateTab`, `openTab`,
-`closeTab`, and `reloadSelf`. **The currently *loaded* worker in the running
-Chrome predates `reloadSelf`**, so the background self-reload path cannot
-activate the new worker — this is the documented chicken-and-egg in #1011.
+The daemon ships the bridge extension on disk
+(`extensions/synapse-chrome-debugger`). Chrome 137+ branded builds ignore
+`--load-extension`, and an unpacked extension can remain unloaded after calling
+`chrome.runtime.reload()`. The worker therefore exposes no self-reload command.
+`browser_debugger operation=reload_bridge` owns the lifecycle transition from
+the host: it drives the exact Reload or Load unpacked control in the already-open
+authenticated Chrome profile, validates the physical profile row, and then
+waits for a new clean authenticated daemon host.
 
 The daemon already behaves correctly while stale (verified in `health`):
 - `chrome_bridge.status = "stale"`, `extension_stale = true`
@@ -62,20 +63,16 @@ The daemon already behaves correctly while stale (verified in `health`):
 - any bridge command requiring a missing capability fails with
   `CHROME_BRIDGE_EXTENSION_STALE` rather than foregrounding.
 
-**One-time operator activation (the only hands-on step; do it once):**
+**Agent-owned host activation:**
 1. Confirm the on-disk build matches the daemon's expected hash:
    `health` → `chrome_bridge.extension_build_sha256 expected=…`.
-2. In the already-open Chrome, open `chrome://extensions`, enable Developer
-   mode, and click **Reload** on "Synapse Chrome bridge" — OR fully quit and
-   reopen Chrome. (This is unavoidable for the *first* activation because the
-   loaded worker has no `reloadSelf`; every subsequent update uses
-   `cdp_bridge_reload` with no foreground.)
+2. Through the real wired MCP client, set `profile=browser_debugger`, then call
+   `browser_debugger operation=reload_bridge`. The tool declares foreground use,
+   selects only the authenticated Chrome profile, invokes the exact extension
+   management control, and returns installer path/hash/UI/profile evidence.
 3. Re-read `health`: `chrome_bridge.status` must flip to `ok`,
-   `extension_capabilities` must list all six commands, `extension_build_id`
+   `extension_capabilities` must list the required commands, `extension_build_id`
    must equal the expected build.
-
-After activation, `cdp_bridge_reload` performs all future reloads in the
-background (`chrome.runtime.reload()`), so this manual step never recurs.
 
 Then verify #996/#997/#1000 (no new Chrome process, human foreground on a
 different window throughout):

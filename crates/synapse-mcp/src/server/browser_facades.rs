@@ -421,11 +421,16 @@ impl SynapseService {
                 Ok(Json(browser_debugger_response(
                     BrowserDebuggerOperation::ReloadBridge,
                     format!(
-                        "bridge reload before_host={} after_host={} reconnected={} waited_ms={}",
-                        response.before.host_id,
+                        "bridge host-control reload before_host={} after_host={} reconnected={} waited_ms={} control_surface={} profile={}",
+                        response
+                            .before
+                            .as_ref()
+                            .map_or("<none>", |before| before.host_id.as_str()),
                         response.after.host_id,
                         response.reconnected,
-                        response.waited_ms
+                        response.waited_ms,
+                        response.command_ack.control_surface,
+                        response.command_ack.active_profile
                     ),
                     |out| out.reload_bridge = Some(response),
                 )))

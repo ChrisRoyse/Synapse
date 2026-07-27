@@ -17,6 +17,10 @@ pub const A11Y_CDP_EXTENSION_DETACHED: &str = "A11Y_CDP_EXTENSION_DETACHED";
 pub const A11Y_CDP_EXTENSION_TIMEOUT: &str = "A11Y_CDP_EXTENSION_TIMEOUT";
 pub const A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED: &str = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 pub const CHROME_BRIDGE_EXTENSION_STALE: &str = "CHROME_BRIDGE_EXTENSION_STALE";
+/// The host-side exact Chrome extension management control could not reload or
+/// install the normal-profile bridge, or its independent profile/host readback
+/// did not prove the requested transition.
+pub const CHROME_BRIDGE_HOST_RELOAD_FAILED: &str = "CHROME_BRIDGE_HOST_RELOAD_FAILED";
 pub const CHROME_SCRIPTING_EXECUTE_FAILED: &str = "CHROME_SCRIPTING_EXECUTE_FAILED";
 pub const BROWSER_URL_SCHEME_UNSUPPORTED: &str = "BROWSER_URL_SCHEME_UNSUPPORTED";
 pub const CHROME_DOM_SELECTOR_INVALID: &str = "CHROME_DOM_SELECTOR_INVALID";

@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-17-exact-target-owner-ledger-v6";
-const BRIDGE_DECLARED_BUILD_SHA256 = "12e3388c6b9501bd3e7225b4a2b0167c5e4a3bb3279422b3e13b5710c4b66c5c";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-26-host-ui-reload-v1";
+const BRIDGE_DECLARED_BUILD_SHA256 = "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -67,7 +67,6 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "maintenancePauseReconnect",
   "domAction",
   "coordinateClick",
-  "reloadSelf",
   "typeActiveElement",
   "setFieldValue"
 ]);
@@ -1953,16 +1952,6 @@ function isMutationCapableCommand(kind) {
     "operatorPanicReadback",
     "operatorPanicEnable",
     "maintenancePauseReconnect",
-    // `reloadSelf` mutates no page and no owner: it calls chrome.runtime.reload(),
-    // which is precisely the primitive that re-runs owner reconciliation from a
-    // clean worker boot. Treating it as a mutation made the admission gate
-    // UNRECOVERABLE - once closed, the only documented repair
-    // (browser_debugger.reload_bridge, which setup and every staleness error
-    // point at) was refused by the very gate it exists to clear, leaving the
-    // bridge bricked with no facade-reachable recovery (#1828). A genuine
-    // operator panic is not laundered by this: `disableSequence` is durable, so
-    // the fresh worker re-reads it and stays disabled.
-    "reloadSelf",
     "listTabs"
   ].includes(String(kind || ""));
 }
@@ -2393,7 +2382,6 @@ async function handleCommand(command) {
   }
   try {
     let result;
-    let reloadAfterResponse = false;
     let closeWebSocketAfterResponse = null;
     if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED) {
       throw bridgeError(
@@ -2525,9 +2513,6 @@ async function handleCommand(command) {
       result = await handleDomAction(params);
     } else if (kind === "coordinateClick") {
       result = await handleCoordinateClick(params);
-    } else if (kind === "reloadSelf") {
-      result = handleReloadSelf(params);
-      reloadAfterResponse = true;
     } else {
       throw bridgeError(
         ERROR_EXTENSION_STALE,
@@ -2547,9 +2532,6 @@ async function handleCommand(command) {
           console.error(`Synapse post-response websocket close failed: ${errorMessage(error)}`);
         }
       }, WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS);
-    }
-    if (reloadAfterResponse) {
-      scheduleRuntimeReload(result.reload_delay_ms);
     }
   } catch (error) {
     await postResponse(id, false, null, errorPayload(error));
@@ -13912,31 +13894,6 @@ function promiseWithTimeout(promise, timeoutMs, message) {
   });
 }
 
-function handleReloadSelf(params = {}) {
-  const expectedExtensionId = String(params.expectedExtensionId || EXPECTED_EXTENSION_ID).trim();
-  if (expectedExtensionId !== chrome.runtime.id) {
-    throw bridgeError(
-      ERROR_EXTENSION_ID_MISMATCH,
-      `reloadSelf refused extension_id mismatch: actual=${chrome.runtime.id} expected=${expectedExtensionId}`
-    );
-  }
-  const expectedBuildId = String(params.expectedBuildId || BRIDGE_BUILD_ID).trim();
-  if (expectedBuildId && expectedBuildId !== BRIDGE_BUILD_ID) {
-    throw bridgeError(
-      ERROR_EXTENSION_STALE,
-      `reloadSelf refused stale loaded build: loaded_build_id=${BRIDGE_BUILD_ID} expected_build_id=${expectedBuildId}`
-    );
-  }
-  const delayMs = normalizeReloadDelay(params.reloadDelayMs);
-  return {
-    ok: true,
-    ...bridgeIdentity(),
-    host_id: hostId,
-    reload_requested_at_unix_ms: Date.now(),
-    reload_delay_ms: delayMs
-  };
-}
-
 async function handleMaintenancePauseReconnect(params = {}) {
   const pauseMs = normalizeMaintenanceReconnectPauseMs(params.pauseMs);
   const reason = normalizeMaintenanceReconnectPauseReason(params.reason);
@@ -13985,26 +13942,6 @@ async function handleMaintenancePauseReconnect(params = {}) {
     bridge_build_id: BRIDGE_BUILD_ID,
     extension_id: chrome.runtime.id
   };
-}
-
-function scheduleRuntimeReload(delayMs) {
-  const boundedDelayMs = normalizeReloadDelay(delayMs);
-  postDaemonMessage({
-    type: "event",
-    event: "extensionReloadScheduled",
-    ...bridgeIdentity(),
-    reload_delay_ms: boundedDelayMs,
-    scheduled_at_unix_ms: Date.now()
-  }).catch((error) => {
-    console.warn(`Synapse reload schedule event dropped: ${errorMessage(error)}`);
-  });
-  setTimeout(() => {
-    try {
-      chrome.runtime.reload();
-    } catch (error) {
-      console.error(`Synapse runtime.reload failed: ${errorMessage(error)}`);
-    }
-  }, boundedDelayMs);
 }
 
 async function selectTabTarget(params, options = {}) {
@@ -24773,17 +24710,6 @@ function buildStorageStateFromFrameResults(frames, cookies) {
       origins
     }
   };
-}
-
-function normalizeReloadDelay(value) {
-  if (value === undefined || value === null) {
-    return 100;
-  }
-  const number = Number(value);
-  if (!Number.isInteger(number) || number < 0 || number > 5000) {
-    throw bridgeError(ERROR_ATTACH_FAILED, "reloadDelayMs must be an integer from 0 through 5000");
-  }
-  return number;
 }
 
 function normalizeMaintenanceReconnectPauseMs(value) {

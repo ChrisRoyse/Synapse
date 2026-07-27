@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{ExitCode, Stdio},
     sync::{
         Arc, Mutex, OnceLock, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
@@ -20,6 +20,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +29,7 @@ use subtle::ConstantTimeEq;
 use synapse_core::{Rect, SubsystemHealth, error_codes};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    process::Command,
     sync::{Notify, RwLock, oneshot},
     time::{sleep, timeout},
 };
@@ -41,10 +43,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-07-17-exact-target-owner-ledger-v6";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-26-host-ui-reload-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "12e3388c6b9501bd3e7225b4a2b0167c5e4a3bb3279422b3e13b5710c4b66c5c";
+    "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -99,7 +100,6 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "mediaEmulation",
     "networkConditions",
     "maintenancePauseReconnect",
-    "reloadSelf",
     "targetInfo",
     "targetInfoPageText",
     "typeActiveElement",
@@ -114,6 +114,9 @@ const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_WS_COMMAND_WAIT: Duration = Duration::from_secs(25);
 const DEFAULT_RELOAD_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_RELOAD_WAIT_TIMEOUT_MS: u64 = 30_000;
+const HOST_UI_RELOAD_PROCESS_TIMEOUT: Duration = Duration::from_secs(75);
+const HOST_UI_RELOAD_INSTALLER_TIMEOUT_SECONDS: &str = "45";
+const HOST_UI_RELOAD_JSON_PREFIX: &str = "SYNAPSE_CHROME_BRIDGE_INSTALLER_JSON_V1=";
 const CHROME_PROFILE_SCAN_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAINTENANCE_RECONNECT_PAUSE_COMMAND: &str = "maintenancePauseReconnect";
 const DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 120_000;
@@ -126,7 +129,7 @@ const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
 const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension with scripts\\install-synapse-chrome-debugger.ps1; the installer deploys the bridge to %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory into the already-open active Chrome profile while refusing to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.downloads/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, exposes chrome.downloads list/wait/event capture for browser_downloads save/move, exposes browser_file_upload with target-scoped DOM.setFileInputFiles/Page.fileChooserOpened for session-owned Chrome bridge tabs, and has explicit browser_debugger-profile chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, Runtime.evaluate page evaluation, Page.addScriptToEvaluateOnNewDocument init scripts, Runtime.addBinding/Runtime.bindingCalled binding capture, Page.handleJavaScriptDialog dialog handling, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; browser_debugger facade operations require profile operation=set profile=browser_debugger with confirm_break_glass=true and a reason; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
-const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call browser_debugger.reload_bridge through the public facade after setting profile=browser_debugger; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop so it auto-loads the bundled unpacked extension into the existing active Chrome profile; if health reports installed=false, browser_debugger.reload_bridge cannot repair because Chrome has no loaded extension host to receive reloadSelf";
+const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon invokes the exact Reload or Load unpacked control in the already-open authenticated Chrome profile, never launches a second Chrome process/profile, and separately verifies the Chrome profile row plus a new authenticated bridge host";
 const SETUP_REPAIR_MCP_GUIDANCE: &str = "mcp_setup_repair=call public MCP tool setup with operation=repair from profile=maintenance and repair.reason=chrome_bridge_build_skew";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
@@ -199,6 +202,13 @@ impl ChromeDebuggerBridgeError {
     fn protocol(detail: impl Into<String>) -> Self {
         Self {
             code: error_codes::A11Y_CDP_ATTACH_FAILED,
+            detail: detail.into(),
+        }
+    }
+
+    fn host_reload_failed(detail: impl Into<String>) -> Self {
+        Self {
+            code: error_codes::CHROME_BRIDGE_HOST_RELOAD_FAILED,
             detail: detail.into(),
         }
     }
@@ -278,7 +288,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
             detail: format!(
-                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} setup_repair_guidance={} remediation=run the concrete setup repair command reported by setup status/doctor or call setup operation=repair, then call browser_debugger.reload_bridge through the public facade from a bridge that advertises reloadSelf; if the loaded worker predates reloadSelf, fail closed and wait for a Chrome restart/reload rather than using foreground chrome://extensions automation",
+                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} setup_repair_guidance={} remediation=call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon uses the exact Chrome extension management Reload control and separately verifies the profile row and replacement authenticated host without calling chrome.runtime.reload",
                 host.extension_id.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_version.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_protocol_version
@@ -846,7 +856,7 @@ fn scan_chrome_profiles_uncached() -> ChromeProfileScan {
     ChromeProfileScan {
         install_state: SynapseChromeProfileInstallState {
             detail: format!(
-                "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} active_profile_extension_path={} active_profile_service_worker_sha256={} active_profile_service_worker_error={} profile_dir_error_count={} profile_file_type_error_count={} preference_read_error_count={} parse_error_count={} reason={} cdp_bridge_reload_can_install_absent_extension=false remediation=run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension",
+                "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} active_profile_extension_path={} active_profile_service_worker_sha256={} active_profile_service_worker_error={} profile_dir_error_count={} profile_file_type_error_count={} preference_read_error_count={} parse_error_count={} reason={} browser_debugger_reload_bridge_can_install_absent_extension=true remediation=call browser_debugger operation=reload_bridge with profile=browser_debugger; the host-controlled path deploys the bundled bridge into %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id>, invokes the exact Load unpacked or Reload control in the already-open active profile, and separately verifies the profile row plus new authenticated host",
                 installed,
                 quote_detail_value(&user_data_root.to_string_lossy()),
                 profile_count,
@@ -1155,7 +1165,7 @@ fn external_chrome_popup_risk_host_unavailable_warning(rows: &[String]) -> Strin
         return "external_chrome_popup_risk_warning=false risk_count=0".to_owned();
     }
     format!(
-        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=host_unavailable_no_live_management risk_count={} external_chrome_popup_risk={} remediation=the active Synapse Chrome Bridge host is absent, so live Chrome management suppression state cannot be read; restore the already-open authenticated Chrome bridge host through the installed bridge reconnect path, or use browser_debugger.reload_bridge once a stale active host is present, then re-read health before classifying external debugger/nativeMessaging rows as suppressed or blocking",
+        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=host_unavailable_no_live_management risk_count={} external_chrome_popup_risk={} remediation=the active Synapse Chrome Bridge host is absent, so live Chrome management suppression state cannot be read; call browser_debugger operation=reload_bridge with profile=browser_debugger to invoke the exact host-side Reload or Load unpacked control, then re-read health before classifying external debugger/nativeMessaging rows as suppressed or blocking",
         rows.len(),
         format_external_chrome_popup_risks(rows)
     )
@@ -4269,34 +4279,29 @@ pub struct ChromeDebuggerFileUploadResult {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChromeBridgeReloadCommandAck {
     pub ok: bool,
-    #[serde(rename = "extensionId")]
+    pub control_surface: String,
+    pub required_foreground: bool,
+    pub installer_path: String,
+    pub installer_sha256: String,
+    pub installer_exit_code: i32,
+    pub installer_stdout_sha256: String,
+    pub installer_stderr_sha256: String,
+    pub installer_duration_ms: u64,
     pub extension_id: String,
-    pub version: String,
-    #[serde(rename = "protocolVersion")]
-    pub protocol_version: u32,
-    #[serde(rename = "buildId")]
-    pub build_id: String,
-    #[serde(rename = "buildSha256")]
-    pub build_sha256: String,
-    #[serde(default, rename = "declaredBuildSha256")]
-    pub declared_build_sha256: Option<String>,
-    #[serde(default, rename = "serviceWorkerSha256")]
-    pub service_worker_sha256: Option<String>,
-    #[serde(default, rename = "serviceWorkerSha256Status")]
-    pub service_worker_sha256_status: Option<String>,
-    #[serde(default, rename = "serviceWorkerSha256Source")]
-    pub service_worker_sha256_source: Option<String>,
-    #[serde(default, rename = "serviceWorkerByteLength")]
-    pub service_worker_byte_length: Option<u64>,
-    #[serde(default, rename = "serviceWorkerSha256Error")]
-    pub service_worker_sha256_error: Option<String>,
-    #[serde(default, rename = "debuggerApiAvailable")]
-    pub debugger_api_available: bool,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    pub host_id: Option<String>,
-    pub reload_requested_at_unix_ms: u64,
-    pub reload_delay_ms: u64,
+    pub extension_dir: String,
+    pub extension_service_worker_sha256: String,
+    pub active_profile: String,
+    pub reason: String,
+    pub chrome_window_pid: Option<u32>,
+    pub chrome_window_hwnd: Option<i64>,
+    pub profile_before_installed: bool,
+    pub profile_before_ready: bool,
+    pub profile_after_installed: bool,
+    pub profile_after_ready: bool,
+    pub ui_before_reload_button_present: Option<bool>,
+    pub ui_before_enable_toggle_on: Option<bool>,
+    pub ui_after_reload_button_present: Option<bool>,
+    pub ui_after_enable_toggle_on: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4333,7 +4338,7 @@ pub struct ChromeBridgeHostSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChromeBridgeReloadResult {
-    pub before: ChromeBridgeHostSnapshot,
+    pub before: Option<ChromeBridgeHostSnapshot>,
     pub command_ack: ChromeBridgeReloadCommandAck,
     pub after: ChromeBridgeHostSnapshot,
     pub reconnected: bool,
@@ -4980,15 +4985,6 @@ fn bridge_command_stale_reason_with_profile_state(
     ) {
         identity_reasons.push(reason);
     }
-    if kind == "reloadSelf" {
-        if host.extension_capabilities.contains(kind) {
-            return None;
-        }
-        return Some(format!(
-            "missing_capability=reloadSelf loaded_capabilities={}",
-            format_capabilities(&host.extension_capabilities)
-        ));
-    }
     if !identity_reasons.is_empty() {
         return Some(identity_reasons.join("|"));
     }
@@ -5235,11 +5231,324 @@ fn health_record_to_host_snapshot(host: &ChromeBridgeHealthRecord) -> ChromeBrid
     }
 }
 
-fn reload_self_expected_loaded_build_id(snapshot: &ChromeBridgeHostSnapshot) -> Option<&str> {
-    snapshot
-        .extension_build_id
-        .as_deref()
-        .filter(|build_id| !build_id.trim().is_empty())
+fn json_pointer_required_str<'a>(
+    value: &'a Value,
+    pointer: &str,
+) -> Result<&'a str, ChromeDebuggerBridgeError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_READBACK_INVALID field={pointer} expected=non_empty_string remediation=inspect the framed installer JSON and repair the named missing or mistyped field"
+            ))
+        })
+}
+
+fn json_pointer_required_bool(
+    value: &Value,
+    pointer: &str,
+) -> Result<bool, ChromeDebuggerBridgeError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_READBACK_INVALID field={pointer} expected=boolean remediation=inspect the framed installer JSON and repair the named missing or mistyped field"
+            ))
+        })
+}
+
+fn json_pointer_optional_bool(value: &Value, pointer: &str) -> Option<bool> {
+    value.pointer(pointer).and_then(Value::as_bool)
+}
+
+fn json_pointer_optional_u32(value: &Value, pointer: &str) -> Option<u32> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn json_pointer_optional_i64(value: &Value, pointer: &str) -> Option<i64> {
+    value.pointer(pointer).and_then(Value::as_i64)
+}
+
+fn process_diagnostic(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let chars = text.chars().count();
+    let bounded = if chars > 2_000 {
+        text.chars().skip(chars - 2_000).collect::<String>()
+    } else {
+        text.into_owned()
+    };
+    bounded.replace(['\r', '\n'], " | ")
+}
+
+#[cfg(windows)]
+async fn run_chrome_bridge_host_ui_reload()
+-> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_dir = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_SOURCE_DIR_INVALID cargo_manifest_dir={} remediation=rebuild synapse-mcp from a real Synapse checkout containing scripts\\install-synapse-chrome-debugger.ps1",
+                manifest_dir.display()
+            ))
+        })?;
+    let installer_path = source_dir
+        .join("scripts")
+        .join("install-synapse-chrome-debugger.ps1");
+    let installer_bytes = std::fs::read(&installer_path).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_INSTALLER_READ_FAILED path={} error={} remediation=restore the repo installer at the compiled source checkout and retry browser_debugger reload_bridge",
+            installer_path.display(),
+            error
+        ))
+    })?;
+    let installer_sha256 = sha256_hex_lower(&installer_bytes);
+
+    let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
+        ChromeDebuggerBridgeError::host_reload_failed(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_SYSTEM_ROOT_MISSING remediation=repair the Windows process environment so SystemRoot resolves Windows PowerShell",
+        )
+    })?;
+    let powershell_path = PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell_path.is_file() {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POWERSHELL_MISSING path={} remediation=repair the configured Windows PowerShell installation before retrying the exact Chrome UI control",
+            powershell_path.display()
+        )));
+    }
+
+    let mut command = Command::new(&powershell_path);
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&installer_path)
+        .args([
+            "-ReloadExistingExtensionViaUi",
+            "-AutoInstallTimeoutSeconds",
+            HOST_UI_RELOAD_INSTALLER_TIMEOUT_SECONDS,
+            "-OutputJson",
+        ])
+        .current_dir(source_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+
+    let started = Instant::now();
+    let child = command.spawn().map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_SPAWN_FAILED launcher={} installer={} error={} remediation=repair PowerShell or source-checkout process permissions and retry browser_debugger reload_bridge",
+            powershell_path.display(),
+            installer_path.display(),
+            error
+        ))
+    })?;
+    let child_pid = child.id().unwrap_or(0);
+    let output = timeout(HOST_UI_RELOAD_PROCESS_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_TIMEOUT pid={} timeout_ms={} installer={} installer_sha256={} remediation=the bounded exact Chrome UI control process was terminated; inspect the already-open Chrome window and rerun after repairing the named UI or profile condition",
+                child_pid,
+                HOST_UI_RELOAD_PROCESS_TIMEOUT.as_millis(),
+                installer_path.display(),
+                installer_sha256
+            ))
+        })?
+        .map_err(|error| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_WAIT_FAILED pid={} installer={} error={} remediation=inspect Windows process state and retry the exact Chrome UI control",
+                child_pid,
+                installer_path.display(),
+                error
+            ))
+        })?;
+    let installer_duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let installer_exit_code = output.status.code().unwrap_or(-1);
+    let installer_stdout_sha256 = sha256_hex_lower(&output.stdout);
+    let installer_stderr_sha256 = sha256_hex_lower(&output.stderr);
+    if !output.status.success() {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_FAILED pid={} exit_code={} installer={} installer_sha256={} stdout_sha256={} stderr_sha256={} stdout_tail={} stderr_tail={} remediation=repair the exact SYNAPSE_CHROME_* condition named by the installer output, then retry browser_debugger reload_bridge",
+            child_pid,
+            installer_exit_code,
+            installer_path.display(),
+            installer_sha256,
+            installer_stdout_sha256,
+            installer_stderr_sha256,
+            process_diagnostic(&output.stdout),
+            process_diagnostic(&output.stderr)
+        )));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_STDOUT_UTF8_INVALID pid={child_pid} stdout_sha256={installer_stdout_sha256} error={error} remediation=repair the installer process output encoding and retry"
+        ))
+    })?;
+    let payload_rows = stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(HOST_UI_RELOAD_JSON_PREFIX))
+        .collect::<Vec<_>>();
+    if payload_rows.len() != 1 {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_JSON_FRAME_INVALID pid={} frame_count={} stdout_sha256={} stderr_sha256={} stdout_tail={} remediation=the installer must emit exactly one {} frame after the physical UI action",
+            child_pid,
+            payload_rows.len(),
+            installer_stdout_sha256,
+            installer_stderr_sha256,
+            process_diagnostic(stdout.as_bytes()),
+            HOST_UI_RELOAD_JSON_PREFIX
+        )));
+    }
+    let payload = BASE64_STANDARD.decode(payload_rows[0]).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_JSON_BASE64_INVALID pid={child_pid} stdout_sha256={installer_stdout_sha256} error={error} remediation=repair the installer JSON frame encoder and retry"
+        ))
+    })?;
+    let readback: Value = serde_json::from_slice(&payload).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_JSON_INVALID pid={} payload_sha256={} error={} remediation=repair the installer JSON serializer and retry",
+            child_pid,
+            sha256_hex_lower(&payload),
+            error
+        ))
+    })?;
+
+    let ok = json_pointer_required_bool(&readback, "/ok")?;
+    let extension_id = json_pointer_required_str(&readback, "/extension_id")?.to_owned();
+    let extension_dir = json_pointer_required_str(&readback, "/extension_dir")?.to_owned();
+    let extension_service_worker_sha256 =
+        json_pointer_required_str(&readback, "/extension_deploy/service_worker_sha256")?.to_owned();
+    let active_profile =
+        json_pointer_required_str(&readback, "/synapse_chrome_auto_install/active_profile")?
+            .to_owned();
+    let reason =
+        json_pointer_required_str(&readback, "/synapse_chrome_auto_install/reason")?.to_owned();
+    let attempted =
+        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/attempted")?;
+    let changed = json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/changed")?;
+    let required_foreground = json_pointer_required_bool(
+        &readback,
+        "/synapse_chrome_auto_install/required_foreground",
+    )?;
+    let active_profile_installed = json_pointer_required_bool(
+        &readback,
+        "/synapse_chrome_profile_install_state/active_profile_installed",
+    )?;
+    let profile_before_installed =
+        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/before/installed")?;
+    let profile_before_ready =
+        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/before/ready")?;
+    let profile_after_installed =
+        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/after/installed")?;
+    let profile_after_ready =
+        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/after/ready")?;
+    let reason_accepted = matches!(
+        reason.as_str(),
+        "existing_ready_extension_ui_reload_invoked"
+            | "existing_ready_extension_nonstable_path_ui_reload_invoked"
+            | "migrated_existing_extension_to_credentialed_stable_path"
+            | "installed_unpacked_extension_in_active_profile"
+    );
+    if !ok
+        || extension_id != EXTENSION_ID
+        || extension_service_worker_sha256.len() != 64
+        || !attempted
+        || !changed
+        || !required_foreground
+        || !active_profile_installed
+        || !profile_after_installed
+        || !profile_after_ready
+        || !reason_accepted
+    {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POSTCONDITION_FAILED ok={} extension_id={} expected_extension_id={} service_worker_sha256={} attempted={} changed={} required_foreground={} active_profile={} active_profile_installed={} profile_after_installed={} profile_after_ready={} reason={} reason_accepted={} installer={} installer_sha256={} remediation=inspect the physical Chrome profile row and exact extension management UI state; the daemon refuses to accept a partial or no-op repair",
+            ok,
+            extension_id,
+            EXTENSION_ID,
+            extension_service_worker_sha256,
+            attempted,
+            changed,
+            required_foreground,
+            active_profile,
+            active_profile_installed,
+            profile_after_installed,
+            profile_after_ready,
+            reason,
+            reason_accepted,
+            installer_path.display(),
+            installer_sha256
+        )));
+    }
+
+    Ok(ChromeBridgeReloadCommandAck {
+        ok,
+        control_surface: "chrome_extensions_exact_reload_or_load_unpacked_control".to_owned(),
+        required_foreground,
+        installer_path: installer_path.display().to_string(),
+        installer_sha256,
+        installer_exit_code,
+        installer_stdout_sha256,
+        installer_stderr_sha256,
+        installer_duration_ms,
+        extension_id,
+        extension_dir,
+        extension_service_worker_sha256,
+        active_profile,
+        reason,
+        chrome_window_pid: json_pointer_optional_u32(
+            &readback,
+            "/synapse_chrome_auto_install/chrome_window_pid",
+        ),
+        chrome_window_hwnd: json_pointer_optional_i64(
+            &readback,
+            "/synapse_chrome_auto_install/chrome_window_hwnd",
+        ),
+        profile_before_installed,
+        profile_before_ready,
+        profile_after_installed,
+        profile_after_ready,
+        ui_before_reload_button_present: json_pointer_optional_bool(
+            &readback,
+            "/synapse_chrome_auto_install/ui_before/reload_button_present",
+        ),
+        ui_before_enable_toggle_on: json_pointer_optional_bool(
+            &readback,
+            "/synapse_chrome_auto_install/ui_before/enable_toggle_on",
+        ),
+        ui_after_reload_button_present: json_pointer_optional_bool(
+            &readback,
+            "/synapse_chrome_auto_install/ui_after/reload_button_present",
+        ),
+        ui_after_enable_toggle_on: json_pointer_optional_bool(
+            &readback,
+            "/synapse_chrome_auto_install/ui_after/enable_toggle_on",
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+async fn run_chrome_bridge_host_ui_reload()
+-> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
+    Err(ChromeDebuggerBridgeError::host_reload_failed(
+        "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_UNSUPPORTED_OS os=non_windows remediation=run the Chrome bridge host-control operation on the configured Windows Synapse host",
+    ))
 }
 
 impl ChromeDebuggerBridge {
@@ -5624,60 +5933,71 @@ impl ChromeDebuggerBridge {
         ))
     }
 
-    async fn reload_self(
+    async fn reload_via_host_ui(
         &self,
         wait_timeout_ms: u64,
     ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
         let wait_timeout = Duration::from_millis(wait_timeout_ms);
-        invalidate_chrome_profile_scan_cache("reload_self_before_snapshot");
-        let before = self.active_host_snapshot()?;
-        let mut params = json!({
-            "expectedExtensionId": EXTENSION_ID,
-            "reloadDelayMs": 100u64,
-        });
-        if let Some(loaded_build_id) = reload_self_expected_loaded_build_id(&before) {
-            params["expectedBuildId"] = json!(loaded_build_id);
-        }
-        let ack = self
-            .send_command("reloadSelf", params)
-            .await
-            .and_then(|result| {
-                serde_json::from_value::<ChromeBridgeReloadCommandAck>(result).map_err(|error| {
-                    ChromeDebuggerBridgeError::protocol(format!(
-                        "decode Chrome bridge reloadSelf acknowledgement: {error}"
-                    ))
-                })
-            })?;
-        invalidate_chrome_profile_scan_cache("reload_self_after_ack");
+        invalidate_chrome_profile_scan_cache("host_ui_reload_before_snapshot");
+        let before = self.active_host_snapshot().ok();
+        let ack = run_chrome_bridge_host_ui_reload().await?;
+        invalidate_chrome_profile_scan_cache("host_ui_reload_after_control");
         let started = Instant::now();
+        let mut last_observed = "no_active_chrome_bridge_host".to_owned();
         loop {
             if started.elapsed() >= wait_timeout {
-                return Err(ChromeDebuggerBridgeError::timeout("reloadSelf"));
+                let before_host = before
+                    .as_ref()
+                    .map_or("<none>", |snapshot| snapshot.host_id.as_str());
+                return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_TIMEOUT control_surface={} before_host_id={} wait_timeout_ms={} last_observed={} installer_path={} installer_sha256={} remediation=the exact Chrome extension management control completed, but the daemon did not observe a new clean authenticated bridge host within the bounded wait; inspect chrome://extensions for extension_id={}, the extension service-worker console, and daemon chrome_bridge health",
+                    ack.control_surface,
+                    before_host,
+                    wait_timeout_ms,
+                    last_observed,
+                    ack.installer_path,
+                    ack.installer_sha256,
+                    EXTENSION_ID
+                )));
             }
-            if let Ok(after) = self.active_host_snapshot()
-                && after.host_id != before.host_id
-                && after.extension_id.as_deref() == Some(EXTENSION_ID)
-                && after.last_disconnect_detail.is_none()
-            {
-                let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if after.extension_stale {
-                    return Err(ChromeDebuggerBridgeError {
-                        code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
-                        detail: format!(
-                            "Chrome bridge reconnected after reloadSelf but loaded extension is still stale; before_host_id={} after_host_id={} stale_reasons={} waited_ms={waited_ms}",
-                            before.host_id,
-                            after.host_id,
-                            after.extension_stale_reasons.join("|")
-                        ),
-                    });
+            match self.active_host_snapshot() {
+                Ok(after) => {
+                    let replacement_host = before
+                        .as_ref()
+                        .is_none_or(|snapshot| after.host_id != snapshot.host_id);
+                    let clean = replacement_host
+                        && after.extension_id.as_deref() == Some(EXTENSION_ID)
+                        && after.extension_build_id.as_deref() == Some(EXPECTED_EXTENSION_BUILD_ID)
+                        && after.last_disconnect_detail.is_none()
+                        && !after.extension_stale;
+                    last_observed = format!(
+                        "host_id={} replacement_host={} extension_id={} build_id={} stale={} stale_reasons={}",
+                        after.host_id,
+                        replacement_host,
+                        after.extension_id.as_deref().unwrap_or("<missing>"),
+                        after.extension_build_id.as_deref().unwrap_or("<missing>"),
+                        after.extension_stale,
+                        after.extension_stale_reasons.join("|")
+                    );
+                    if clean {
+                        let waited_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        return Ok(ChromeBridgeReloadResult {
+                            before,
+                            command_ack: ack,
+                            after,
+                            reconnected: true,
+                            waited_ms,
+                        });
+                    }
                 }
-                return Ok(ChromeBridgeReloadResult {
-                    before,
-                    command_ack: ack,
-                    after,
-                    reconnected: true,
-                    waited_ms,
-                });
+                Err(error) => {
+                    last_observed = format!(
+                        "host_read_error_code={} detail_sha256={}",
+                        error.code(),
+                        sha256_hex_lower(error.detail().as_bytes())
+                    );
+                }
             }
             sleep(RELOAD_RECONNECT_POLL_INTERVAL).await;
         }
@@ -8532,7 +8852,7 @@ fn validate_maintenance_reconnect_pause_reason(
 pub async fn reload_bridge(
     wait_timeout_ms: u64,
 ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
-    bridge().reload_self(wait_timeout_ms).await
+    bridge().reload_via_host_ui(wait_timeout_ms).await
 }
 
 pub async fn wait_for_active_bridge_host(

@@ -653,6 +653,7 @@ function Invoke-SynapseChromeBridgeUiRepair {
     $allowedReasons = @(
         'existing_ready_extension_ui_reload_invoked',
         'existing_ready_extension_nonstable_path_ui_reload_invoked',
+        'migrated_existing_extension_to_credentialed_stable_path',
         'installed_unpacked_extension_in_active_profile'
     )
     if ($allowedReasons -notcontains [string]$autoInstall.reason) {

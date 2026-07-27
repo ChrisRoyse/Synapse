@@ -1601,8 +1601,9 @@ pub struct WindowListResponse {
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeReloadParams {
     /// Optional reconnect wait budget. Defaults to 10000 ms and is capped at
-    /// 30000 ms. The tool returns only after a separate bridge host readback
-    /// observes a new extension registration.
+    /// 30000 ms. This budget starts after the bounded host-side Chrome extension
+    /// management control completes. The tool returns only after a separate
+    /// bridge host readback observes a new clean extension registration.
     #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
 }
@@ -1662,29 +1663,35 @@ pub struct CdpBridgeHostReadback {
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeReloadAckReadback {
     pub ok: bool,
+    pub control_surface: String,
+    pub required_foreground: bool,
+    pub installer_path: String,
+    pub installer_sha256: String,
+    pub installer_exit_code: i32,
+    pub installer_stdout_sha256: String,
+    pub installer_stderr_sha256: String,
+    pub installer_duration_ms: u64,
     pub extension_id: String,
-    pub version: String,
-    pub protocol_version: u32,
-    pub build_id: String,
-    pub build_sha256: String,
+    pub extension_dir: String,
+    pub extension_service_worker_sha256: String,
+    pub active_profile: String,
+    pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub declared_build_sha256: Option<String>,
+    pub chrome_window_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_worker_sha256: Option<String>,
+    pub chrome_window_hwnd: Option<i64>,
+    pub profile_before_installed: bool,
+    pub profile_before_ready: bool,
+    pub profile_after_installed: bool,
+    pub profile_after_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_worker_sha256_status: Option<String>,
+    pub ui_before_reload_button_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_worker_sha256_source: Option<String>,
+    pub ui_before_enable_toggle_on: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_worker_byte_length: Option<u64>,
+    pub ui_after_reload_button_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_worker_sha256_error: Option<String>,
-    pub debugger_api_available: bool,
-    pub capabilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_id: Option<String>,
-    pub reload_requested_at_unix_ms: u64,
-    pub reload_delay_ms: u64,
+    pub ui_after_enable_toggle_on: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1693,7 +1700,8 @@ pub struct CdpBridgeReloadResponse {
     pub session_id: String,
     pub required_foreground: bool,
     pub wait_timeout_ms: u64,
-    pub before: CdpBridgeHostReadback,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<CdpBridgeHostReadback>,
     pub command_ack: CdpBridgeReloadAckReadback,
     pub after: CdpBridgeHostReadback,
     pub reconnected: bool,

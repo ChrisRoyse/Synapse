@@ -378,8 +378,16 @@ async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
 
     match chrome_debugger_bridge::reload_bridge(30_000).await {
         Ok(result) => Ok(format!(
-            "chrome_bridge_preflight=reload_bridge_ok before_host={} after_host={} reconnected={} waited_ms={}",
-            result.before.host_id, result.after.host_id, result.reconnected, result.waited_ms
+            "chrome_bridge_preflight=host_ui_reload_ok before_host={} after_host={} reconnected={} waited_ms={} control_surface={} active_profile={}",
+            result
+                .before
+                .as_ref()
+                .map_or("<none>", |before| before.host_id.as_str()),
+            result.after.host_id,
+            result.reconnected,
+            result.waited_ms,
+            result.command_ack.control_surface,
+            result.command_ack.active_profile
         )),
         Err(error)
             if error.code() == error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE
@@ -391,14 +399,14 @@ async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
             )
         }
         Err(error) => Err(setup_repair_error(
-            "SYNAPSE_SETUP_REPAIR_CHROME_BRIDGE_RELOAD_FAILED",
-            "chrome_bridge_reload",
+            "SYNAPSE_SETUP_REPAIR_CHROME_BRIDGE_HOST_UI_RELOAD_FAILED",
+            "chrome_bridge_host_ui_reload",
             format!(
-                "setup repair could not reload the active Chrome bridge before external maintenance handoff; code={} detail={}",
+                "setup repair could not reconcile the Chrome bridge through the exact host UI control before external maintenance handoff; code={} detail={}",
                 error.code(),
                 error.detail()
             ),
-            "reload the already-open Synapse Chrome Bridge through browser_debugger.reload_bridge or repair the bridge host before retrying setup repair",
+            "repair the exact PowerShell/Chrome/profile/UI condition in detail and retry setup repair; chrome.runtime.reload is never used",
         )),
     }
 }

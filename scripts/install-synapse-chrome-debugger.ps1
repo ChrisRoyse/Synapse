@@ -17,6 +17,10 @@ param(
     # is already installed and ready but no daemon bridge host is registered, use
     # the already-open Chrome extensions page UI to invoke its Reload button.
     [switch]$ReloadExistingExtensionViaUi,
+    # Machine-readable process boundary used by the repo-built daemon. The
+    # payload is emitted as one base64-framed JSON record so PowerShell warning
+    # streams cannot corrupt or impersonate the result.
+    [switch]$OutputJson,
     [ValidateRange(5, 300)]
     [int]$AutoInstallTimeoutSeconds = 90
 )
@@ -1732,22 +1736,52 @@ function Invoke-SynapseChromeAddressBarNavigation {
         throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the selected Chrome window the foreground keyboard target after ordinary, attached-thread, and Alt-unlock foreground attempts; setup refuses to send browser navigation keys to an unverified foreground window"
     }
 
-    $previousClipboardText = $null
-    $restoreClipboard = $false
+    $addressBar = Find-SynapseAutomationElementByName `
+        -Root $Window.element `
+        -Name 'Address and search bar' `
+        -ControlType ([System.Windows.Automation.ControlType]::Edit)
+    if (-not $addressBar) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            purpose = $Purpose
+            target_url = $Url
+            chrome_window_hwnd = $Window.hwnd
+            chrome_window_pid = $Window.pid
+            foreground_acquired = $foregroundAcquired
+            navigation_before = $before
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_NAVIGATION_ADDRESS_BAR_NOT_FOUND detail=$detail remediation=the selected Chrome window did not expose its address edit through UI Automation; setup refuses to send unverified keyboard shortcuts"
+    }
+
+    $clipboardSnapshot = $null
+    $clipboardHadData = $false
     try {
-        try {
-            $previousClipboardText = Get-Clipboard -Raw -ErrorAction Stop
-            $restoreClipboard = $true
-        } catch {
-            $restoreClipboard = $false
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $clipboardSnapshot = [System.Windows.Forms.Clipboard]::GetDataObject()
+        $clipboardHadData = ($null -ne $clipboardSnapshot)
+    } catch {
+        throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_SNAPSHOT_FAILED purpose=$Purpose chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) error=$($_.Exception.Message) remediation=setup refuses to overwrite clipboard state it cannot snapshot and restore"
+    }
+
+    try {
+        $valuePattern = $addressBar.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        if ($valuePattern.Current.IsReadOnly) {
+            throw 'address_bar_value_pattern_read_only'
         }
-        Set-Clipboard -Value $Url
-        Send-SynapseNativeKeyTap -VirtualKey 0x1B
-        Start-Sleep -Milliseconds 200
-        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x4C))
-        Start-Sleep -Milliseconds 250
+        $addressBar.SetFocus()
+        Start-Sleep -Milliseconds 100
+        if (-not $addressBar.Current.HasKeyboardFocus) {
+            throw 'address_bar_keyboard_focus_not_observed'
+        }
+        [System.Windows.Forms.Clipboard]::SetText($Url)
+        Start-Sleep -Milliseconds 100
+        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x41))
+        Start-Sleep -Milliseconds 100
         Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x56))
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Milliseconds 150
+        $fieldValue = [string]$valuePattern.Current.Value
+        if ($fieldValue.Trim().TrimEnd('/') -ine $Url.Trim().TrimEnd('/')) {
+            throw "address_bar_value_readback_mismatch actual=$fieldValue expected=$Url"
+        }
         Send-SynapseNativeKeyTap -VirtualKey 0x0D
     } catch {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
@@ -1761,30 +1795,34 @@ function Invoke-SynapseChromeAddressBarNavigation {
         }) -Depth 8
         throw "SYNAPSE_CHROME_NAVIGATION_KEY_INPUT_FAILED detail=$detail remediation=Chrome navigation input failed after foreground readback; inspect clipboard and keyboard-input availability before retrying setup"
     } finally {
-        if ($restoreClipboard) {
-            try {
-                Set-Clipboard -Value $previousClipboardText
-            } catch {
-                $detail = ConvertTo-CompressedJson -Value ([ordered]@{
-                    purpose = $Purpose
-                    target_url = $Url
-                    chrome_window_hwnd = $Window.hwnd
-                    chrome_window_pid = $Window.pid
-                    error = $_.Exception.Message
-                }) -Depth 8
-                throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_RESTORE_FAILED detail=$detail remediation=setup changed the clipboard for Chrome address-bar navigation but could not restore the prior clipboard text"
+        try {
+            if ($clipboardHadData) {
+                [System.Windows.Forms.Clipboard]::SetDataObject($clipboardSnapshot, $true)
+            } else {
+                [System.Windows.Forms.Clipboard]::Clear()
             }
+        } catch {
+            $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+                purpose = $Purpose
+                target_url = $Url
+                chrome_window_hwnd = $Window.hwnd
+                chrome_window_pid = $Window.pid
+                clipboard_had_data = $clipboardHadData
+                error = $_.Exception.Message
+            }) -Depth 8
+            throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_RESTORE_FAILED detail=$detail remediation=setup changed the clipboard for exact Chrome address-bar navigation but could not restore the prior complete data object"
         }
     }
 
     $after = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 250 -Probe {
         $state = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
-        $titleMatches = $state.title -match $ExpectedTitlePattern
         $addressMatches = $false
         if (-not [string]::IsNullOrWhiteSpace([string]$state.address_bar_value)) {
-            $addressMatches = [string]$state.address_bar_value -like "$Url*"
+            $actualAddress = ([string]$state.address_bar_value).Trim().TrimEnd('/')
+            $expectedAddress = $Url.Trim().TrimEnd('/')
+            $addressMatches = $actualAddress -ieq $expectedAddress
         }
-        if ($titleMatches -or $addressMatches) {
+        if ($addressMatches) {
             return $state
         }
         return $null
@@ -1808,7 +1846,7 @@ function Invoke-SynapseChromeAddressBarNavigation {
     }
 
     [pscustomobject]@{
-        method = 'foreground_ctrl_l_clipboard_enter'
+        method = 'foreground_uia_focus_ctrl_a_clipboard_enter_exact_readback'
         purpose = $Purpose
         target_url = $Url
         expected_title_pattern = $ExpectedTitlePattern
@@ -2118,10 +2156,10 @@ function Invoke-SynapseChromeBridgeAutoInstall {
             return [pscustomobject]@{
                 attempted = $true
                 changed = $false
-                reason = 'existing_ready_extension_code_reload_deferred_to_daemon_reloadself'
+                reason = 'existing_ready_extension_host_ui_reload_deferred'
                 active_profile = $activeProfile
                 required_foreground = $false
-                bridge_self_reload_command = 'browser_debugger.reload_bridge'
+                bridge_host_reload_command = 'browser_debugger.reload_bridge'
                 before = $before
                 after = $before
             }
@@ -2129,7 +2167,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
 
         $missing = if ($before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $before.missing_active_api_permissions -join ',' }
         $disableReasons = if ($before.disable_reasons.Count -eq 0) { '<none>' } else { $before.disable_reasons -join ',' }
-        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; setup refuses to steal foreground for chrome://extensions repair. Enable/permission the existing extension in the already-open profile or remove it and rerun setup for a first-time Load unpacked install; once a live bridge host exists, setup uses the public browser_debugger.reload_bridge facade for code reconvergence."
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; invoke browser_debugger operation=reload_bridge so the host-controlled exact extension management path can fail with the physical UI/profile condition, or repair that named condition before retrying setup."
     }
 
     # Same extension ID already loaded, enabled, and fully permissioned, but registered
@@ -2155,10 +2193,13 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     }
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
 
+    # The explicit empty query prevents Chrome omnibox history completion from
+    # expanding the management root to the previously visited extension-details
+    # URL before Enter.
     $navigation = Invoke-SynapseChromeAddressBarNavigation `
         -Window $chromeWindow `
         -ChromeUserDataRoot $ChromeUserDataRoot `
-        -Url 'chrome://extensions' `
+        -Url 'chrome://extensions/?' `
         -ExpectedTitlePattern '^Extensions( - Google Chrome)?$' `
         -Deadline $deadline `
         -Purpose 'load_unpacked_extensions_page'
@@ -2254,6 +2295,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         changed = $true
         reason = $installReason
         active_profile = $activeProfile
+        required_foreground = $true
         chrome_window_hwnd = $chromeWindow.hwnd
         chrome_window_pid = $chromeWindow.pid
         chrome_window_user_data_dir = $chromeWindow.chrome_user_data_dir
@@ -2558,8 +2600,8 @@ $synapseChromeProfileInstallState = [pscustomobject]@{
     active_profile = $activeChromeProfile
     active_profile_installed = $synapseChromeActiveProfileInstalled
     reason = $synapseChromeProfileInstallReason
-    cdp_bridge_reload_can_install_absent_extension = $false
-    remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\synapse\chrome-extension\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension'
+    browser_debugger_reload_bridge_can_install_absent_extension = $true
+    remediation = 'call browser_debugger operation=reload_bridge with profile=browser_debugger; the host-controlled path deploys the bundled bridge, invokes the exact Reload or Load unpacked control in the already-open active profile, and separately verifies the physical profile row plus a new authenticated daemon host'
 }
 $staleBridgeBuildCleanup = Remove-SynapseStaleChromeBridgeBuildDirs `
     -StableRoot $stableRootFull `
@@ -2691,10 +2733,10 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
         stale_active_permissions = $staleSynapseActivePermissions
         chrome_policy_popup_shield = $chromePolicyPopupShield
     } | ConvertTo-Json -Depth 8 -Compress
-    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call browser_debugger.reload_bridge through the real Synapse MCP public facade when the live bridge advertises reloadSelf, otherwise keep normal browser commands failed closed until Chrome reloads the extension or restarts the already-open profile"
+    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call browser_debugger operation=reload_bridge through the real Synapse MCP public facade so the host controls the exact Chrome extension management Reload action and verifies the replacement profile/host state"
 }
 
-[pscustomobject]@{
+$result = [pscustomobject]@{
     ok = $true
     native_host = $hostName
     native_manifest = $null
@@ -2706,12 +2748,13 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     extension_deploy = $extensionDeploy
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
-    bridge_self_reload_command = 'browser_debugger.reload_bridge'
+    bridge_host_reload_command = 'browser_debugger.reload_bridge'
+    bridge_host_reload_control_surface = 'chrome_extensions_exact_reload_button'
     bridge_build_id_expected = $bridgeBuildId
     bridge_declared_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_service_worker_sha256_expected = $extensionDeploy.service_worker_sha256
-    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'operatorPanicDisable', 'operatorPanicCleanup', 'operatorPanicReadback', 'operatorPanicEnable', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'keyDispatch', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
+    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'operatorPanicDisable', 'operatorPanicCleanup', 'operatorPanicReadback', 'operatorPanicEnable', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'keyDispatch', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.downloads_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_downloads_waits_page_screenshots_and_chrome_debugger_runtime_evaluate_init_scripts_handle_dialog_file_upload_cdp_input_hover_tap_drag_page_print_to_pdf_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'
     attach_popup_prevention = 'normal_bridge_debugger_permission_scoped_to_Runtime_evaluate_Page_addScriptToEvaluateOnNewDocument_Runtime_addBinding_Page_handleJavaScriptDialog_DOM_setFileInputFiles_Page_fileChooserOpened_cdpInput_hover_tap_active_drag_pagePdf_printToPDF_viewportEmulation_deviceEmulation_geolocationEmulation_localeEmulation_mediaEmulation_and_networkConditions_inactive_synthetic_drag_no_helper_windows_no_nativeMessaging_permission_plus_external_popup_risk_suppression'
@@ -2758,4 +2801,12 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     external_debugger_extensions = $externalDebuggerExtensions
     external_native_messaging_processes = $externalNativeMessagingProcesses
     external_layout_infobar_processes = $externalLayoutInfobarProcesses
+}
+
+if ($OutputJson) {
+    $json = ConvertTo-CompressedJson -Value $result -Depth 24
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+    Write-Output "SYNAPSE_CHROME_BRIDGE_INSTALLER_JSON_V1=$payload"
+} else {
+    $result
 }

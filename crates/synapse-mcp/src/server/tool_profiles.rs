@@ -929,7 +929,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "reload_bridge",
                 true,
                 false,
-                "browser_debugger profile row + chrome.runtime.reload bridge command",
+                "browser_debugger profile row + exact host-controlled Chrome extension management Reload/Load unpacked control",
                 Some("bridge host before/after registration readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to browser_debugger and verify the bridge host reconnect readback",
