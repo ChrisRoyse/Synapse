@@ -2685,6 +2685,14 @@ const OPERATOR_PANIC_CLOSE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How often a still-refusing target re-logs, as a roll-up carrying the exact
 /// suppressed count and elapsed duration.
 const OPERATOR_PANIC_CLOSE_ROLLUP_INTERVAL: Duration = Duration::from_mins(5);
+/// An entry whose next probe was due this long ago has not been refused since,
+/// so its target is gone (session torn down, owner row deleted) and the entry is
+/// unreachable bookkeeping. Without this the map would grow without bound across
+/// a long-lived daemon's sessions.
+const OPERATOR_PANIC_CLOSE_ENTRY_TTL: Duration = Duration::from_hours(1);
+/// Only sweep once the map is large enough for growth to matter, so the common
+/// case stays a single hash lookup.
+const OPERATOR_PANIC_CLOSE_PRUNE_THRESHOLD: usize = 64;
 
 static OPERATOR_PANIC_CLOSE_BACKOFFS: std::sync::LazyLock<
     Mutex<std::collections::HashMap<String, OperatorPanicCloseBackoff>>,
@@ -2714,6 +2722,25 @@ fn note_operator_panic_close_refusal(key: &str) -> (bool, u64, u64, Duration) {
         // Unreadable state: log it. Never silently drop a fail-closed refusal.
         return (true, 1, 0, Duration::ZERO);
     };
+    // Drop entries for targets that stopped being refused entirely — their
+    // session ended or their owner row was deleted, so nothing will ever clear
+    // them through the normal success/other-error paths. Swept here rather than
+    // in the per-sweep deferral check so the hot path stays a lookup.
+    if guard.len() > OPERATOR_PANIC_CLOSE_PRUNE_THRESHOLD {
+        let before = guard.len();
+        guard.retain(|_key, entry| {
+            now.saturating_duration_since(entry.next_attempt_at) < OPERATOR_PANIC_CLOSE_ENTRY_TTL
+        });
+        let pruned = before.saturating_sub(guard.len());
+        if pruned > 0 {
+            tracing::debug!(
+                code = "MCP_SESSION_CDP_OPERATOR_PANIC_BACKOFF_PRUNED",
+                pruned,
+                retained = guard.len(),
+                "dropped operator-panic CDP backoff entries whose targets stopped being refused"
+            );
+        }
+    }
     match guard.get_mut(key) {
         None => {
             guard.insert(
