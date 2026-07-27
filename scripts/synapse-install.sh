@@ -27,6 +27,10 @@ die()  { printf '\033[31m[synapse-install] FATAL:\033[0m %s\n' "$*" >&2; exit 1;
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIND="127.0.0.1:7700"
+# Match the Windows setup daemon-start absolute ceiling. A real Calyx WAL
+# backlog has taken about 40 minutes; Codex's 10-second default cannot safely be
+# paired with required=true for this persistent daemon.
+CODEX_MCP_STARTUP_TIMEOUT_SECONDS=5400
 
 # --- 1. Environment checks --------------------------------------------------
 say "Checking environment"
@@ -119,17 +123,19 @@ fi'
 ensure_codex_synapse_policy() {
   local cfg="$1"
   local bind="$2"
+  local startup_timeout_seconds="$3"
   local tmp
   mkdir -p "$(dirname "$cfg")"
   [ -f "$cfg" ] || : > "$cfg"
   tmp="$(mktemp)" || die "Could not allocate a temp file to update $cfg."
-  awk -v bind="$bind" '
+  awk -v bind="$bind" -v startup_timeout_seconds="$startup_timeout_seconds" '
     function emit() {
       print "[mcp_servers.synapse]"
       print "url = \"http://" bind "/mcp\""
       print "bearer_token_env_var = \"SYNAPSE_BEARER_TOKEN\""
       print "required = true"
       print "default_tools_approval_mode = \"approve\""
+      print "startup_timeout_sec = " startup_timeout_seconds
       emitted = 1
     }
     BEGIN { in_synapse = 0; found = 0; emitted = 0 }
@@ -143,7 +149,7 @@ ensure_codex_synapse_policy() {
       in_synapse = 0
     }
     in_synapse {
-      if ($0 ~ /^[[:space:]]*(url|bearer_token_env_var|required|default_tools_approval_mode)[[:space:]]*=/) {
+      if ($0 ~ /^[[:space:]]*(url|bearer_token_env_var|required|default_tools_approval_mode|startup_timeout_sec)[[:space:]]*=/) {
         next
       }
       if ($0 ~ /^[[:space:]]*$/) {
@@ -175,6 +181,8 @@ ensure_codex_synapse_policy() {
     || die "Codex config $cfg missing required=true after repair."
   grep -Fqx 'default_tools_approval_mode = "approve"' "$cfg" \
     || die "Codex config $cfg missing default_tools_approval_mode=approve after repair."
+  [ "$(grep -Fxc "startup_timeout_sec = $startup_timeout_seconds" "$cfg")" -eq 1 ] \
+    || die "Codex config $cfg does not contain exactly one startup_timeout_sec=$startup_timeout_seconds after repair."
 }
 
 # --- 2. Sync source to a local Windows path ---------------------------------
@@ -221,8 +229,8 @@ CODEX_CFG="$HOME/.codex/config.toml"
 if command -v codex >/dev/null 2>&1; then
   codex mcp remove synapse >/dev/null 2>&1 || true
   codex mcp add synapse --url "http://$BIND/mcp" --bearer-token-env-var SYNAPSE_BEARER_TOKEN
-  ensure_codex_synapse_policy "$CODEX_CFG" "$BIND"
-  say "Codex (WSL) wired -> Streamable HTTP daemon with required=true and default_tools_approval_mode=approve."
+  ensure_codex_synapse_policy "$CODEX_CFG" "$BIND" "$CODEX_MCP_STARTUP_TIMEOUT_SECONDS"
+  say "Codex (WSL) wired -> Streamable HTTP daemon with required=true, default_tools_approval_mode=approve, and startup_timeout_sec=$CODEX_MCP_STARTUP_TIMEOUT_SECONDS."
 elif [ -f "$CODEX_CFG" ]; then
   die "Codex config exists at $CODEX_CFG but codex CLI is not on PATH, so the installer cannot safely replace stale synapse config. Install/repair Codex CLI, then re-run."
 else

@@ -152,6 +152,9 @@
   WAL-backlog paydown at open has been measured at ~40 minutes on this host, so
   the default is 5400s (90 minutes). Hitting this ceiling is reported as its own
   verdict (progress observed, budget exhausted) and never as a dead daemon.
+  Setup also writes the effective maximum of this value and
+  InstallHealthTimeoutSeconds as Codex's required-MCP startup timeout so a real
+  daemon cold start cannot outlive Codex's client bootstrap deadline.
 
 .PARAMETER InstallHealthProgressStallSeconds
   How long the daemon may make zero forward progress (no new startup log phase,
@@ -210,6 +213,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$CodexMcpStartupTimeoutSeconds = [Math]::Max($InstallHealthTimeoutSeconds, $InstallHealthMaxSeconds)
 $SynapseChromeBridgeMaintenancePauseMs = 720000
 $SynapseChromeBridgeMaintenanceCloseDrainMs = 7000
 $SynapseChromeBridgeMaintenanceResumeProbeAfterMs = 30000
@@ -2730,7 +2734,8 @@ fi
 function Test-CodexSynapseHttpConfig {
     param(
         [Parameter(Mandatory=$true)][string]$ConfigPath,
-        [Parameter(Mandatory=$true)][string]$Bind
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][int]$StartupTimeoutSec
     )
 
     $body = Get-CodexSynapseConfigBody -ConfigPath $ConfigPath
@@ -2738,10 +2743,16 @@ function Test-CodexSynapseHttpConfig {
         return $false
     }
     $bindUrlRegex = [regex]::Escape("http://$Bind/mcp")
+    $startupTimeoutRegex = [regex]::Escape([string]$StartupTimeoutSec)
+    $startupTimeoutMatches = [regex]::Matches(
+        $body,
+        "(?m)^\s*startup_timeout_sec\s*=\s*$startupTimeoutRegex(?:\.0+)?\s*$"
+    )
     return ($body -match "url\s*=\s*`"$bindUrlRegex`"" -and
         $body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"' -and
         $body -match '(?m)^\s*required\s*=\s*true\s*$' -and
-        $body -match '(?m)^\s*default_tools_approval_mode\s*=\s*"approve"\s*$')
+        $body -match '(?m)^\s*default_tools_approval_mode\s*=\s*"approve"\s*$' -and
+        $startupTimeoutMatches.Count -eq 1)
 }
 
 function Test-CodexSynapseHttpTransportConfig {
@@ -2785,7 +2796,8 @@ function Get-CodexSynapseConfigBody {
 function Set-CodexSynapseClientPolicy {
     param(
         [Parameter(Mandatory=$true)][string]$ConfigPath,
-        [Parameter(Mandatory=$true)][string]$Bind
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][int]$StartupTimeoutSec
     )
 
     $configDir = Split-Path -Parent $ConfigPath
@@ -2802,7 +2814,8 @@ function Set-CodexSynapseClientPolicy {
         ('url = "http://{0}/mcp"' -f $Bind),
         'bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"',
         'required = true',
-        'default_tools_approval_mode = "approve"'
+        'default_tools_approval_mode = "approve"',
+        ('startup_timeout_sec = {0}' -f $StartupTimeoutSec)
     )
     $sectionRegex = '(?ms)^\[mcp_servers\.synapse\]\s*(?<body>.*?)(?=^\[|\z)'
     $section = [regex]::Match($content, $sectionRegex)
@@ -2811,7 +2824,7 @@ function Set-CodexSynapseClientPolicy {
         $body = [string]$section.Groups['body'].Value
         $preserved = @()
         foreach ($line in ($body -split "`r?`n")) {
-            if ($line -match '^\s*(url|bearer_token_env_var|required|default_tools_approval_mode)\s*=') {
+            if ($line -match '^\s*(url|bearer_token_env_var|required|default_tools_approval_mode|startup_timeout_sec)\s*=') {
                 continue
             }
             if ([string]::IsNullOrWhiteSpace($line) -and $preserved.Count -eq 0) {
@@ -11129,16 +11142,16 @@ if (-not $SkipClientWiring) {
                 Info "WARN: codex mcp add exited $codexAddExit but Codex config now contains the required HTTP entry; continuing."
             }
         }
-        Set-CodexSynapseClientPolicy -ConfigPath $codexCfg -Bind $Bind
-        if (-not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
-            Die "SYNAPSE_CODEX_MCP_CONFIG_INCOMPLETE path=$codexCfg remediation=repair [mcp_servers.synapse] so it contains url=http://$Bind/mcp, bearer_token_env_var=SYNAPSE_BEARER_TOKEN, required=true, and default_tools_approval_mode=approve."
+        Set-CodexSynapseClientPolicy -ConfigPath $codexCfg -Bind $Bind -StartupTimeoutSec $CodexMcpStartupTimeoutSeconds
+        if (-not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind -StartupTimeoutSec $CodexMcpStartupTimeoutSeconds)) {
+            Die "SYNAPSE_CODEX_MCP_CONFIG_INCOMPLETE path=$codexCfg remediation=repair [mcp_servers.synapse] so it contains url=http://$Bind/mcp, bearer_token_env_var=SYNAPSE_BEARER_TOKEN, required=true, default_tools_approval_mode=approve, and exactly one startup_timeout_sec=$CodexMcpStartupTimeoutSeconds."
         }
         Install-CodexSynapseTokenLoader -CodexCommandPath $codex.Source -TokenPath $TokenPath
-        Info "Codex (Windows) wired via Streamable HTTP transport with required=true and default_tools_approval_mode=approve."
+        Info "Codex (Windows) wired via Streamable HTTP transport with required=true, default_tools_approval_mode=approve, and startup_timeout_sec=$CodexMcpStartupTimeoutSeconds."
     } elseif (Test-Path $codexCfg) {
         $c = Get-Content -Raw $codexCfg
         if ($c -match '(?m)^\[mcp_servers\.synapse\]' -and
-            -not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
+            -not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind -StartupTimeoutSec $CodexMcpStartupTimeoutSeconds)) {
             Die "Codex config exists at $codexCfg but codex CLI is not on PATH and the synapse entry is not the required HTTP transport/client policy. Install/repair Codex CLI, then re-run."
         }
         Info "Codex CLI not found; existing Codex config is already HTTP or has no synapse entry."
