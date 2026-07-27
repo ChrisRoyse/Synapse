@@ -849,9 +849,9 @@ pub struct ActRunShellJobStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_failure: Option<ActRunShellSpawnFailureReadback>,
     /// The synapse-mcp process that owns this job's monitor task and its
-    /// Windows kill-on-close job object. Recorded so a *later* daemon
-    /// incarnation can prove the previous owner is gone and publish an honest
-    /// terminal record instead of leaving `running` forever (#1808).
+    /// Windows named Job Object. A child-owned keeper handle preserves the
+    /// object and its complete process membership across daemon restarts so a
+    /// later incarnation can reopen and monitor it (#1807/#1808).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<ActRunShellSupervisorIdentity>,
     /// Startup/crash reconciliation evidence. Present only on records that a
@@ -862,17 +862,12 @@ pub struct ActRunShellJobStatus {
 
 /// Identity of the synapse-mcp supervisor process that owns a durable job.
 ///
-/// Every durable child is assigned to a Windows job object created with
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (see [`assign_owned_process_job`]). The
-/// kernel closes every handle of a dying process however it died — clean exit,
-/// unhandled exception, or `TerminateProcess` — so the owning supervisor's death
-/// destroys that job object and terminates the owned Windows process tree. That
-/// makes "the recorded supervisor incarnation is absent from the process table"
-/// a *proof* about the fate of the owned children, not a guess.
-///
-/// The kernel records no durable evidence of that reap (a job object dies with
-/// its owner, taking `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION` with it), so the
-/// attribution has to be written by us, ahead of time, into the job record.
+/// Every durable child starts inside an armed Windows Job Object. Once its
+/// running row is durable, Synapse duplicates a keeper handle into that exact
+/// child and disarms kill-on-close. The child therefore survives a daemon exit
+/// while keeping the named object and its descendant membership alive. A later
+/// daemon reopens the object, verifies exact child membership, and adopts both
+/// the process and tree before changing this durable owner row.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellSupervisorIdentity {
@@ -2354,7 +2349,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                 SHELL_REMOTE_CLEANUP_PRE_MARKER_TERMINAL.to_owned();
             status.remote_process_scope.remote_cleanup_error_code = None;
             status.remote_process_scope.remote_cleanup_message = Some(
-                "SSH tracking preflight refused the prepared plan before any child process was created"
+                "remote tracking preflight refused the prepared plan before any child process was created"
                     .to_owned(),
             );
             push_unique_evidence(
@@ -2378,7 +2373,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                             code = "M4_ACT_RUN_SHELL_PREFLIGHT_REFUSAL_PERSISTED",
                             job_id,
                             status_path = %paths.status_path.display(),
-                            "persisted and independently read back SSH tracking preflight refusal"
+                            "persisted and independently read back remote tracking preflight refusal"
                         );
                         None
                     }
@@ -2410,12 +2405,12 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
                     durable_detail,
                     policy_error = %error.message,
                     status_path = %paths.status_path.display(),
-                    "SSH tracking preflight refusal durable state could not be verified"
+                    "remote tracking preflight refusal durable state could not be verified"
                 );
                 return Err(shell_tool_error(
                     durable_error_code,
                     format!(
-                        "act_run_shell_start refused unsafe SSH tracking ({}) but could not verify its durable spawn_refused status: {durable_detail}",
+                        "act_run_shell_start refused unsafe remote tracking ({}) but could not verify its durable spawn_refused status: {durable_detail}",
                         error.message
                     ),
                     json!({
@@ -2440,6 +2435,7 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
     let spawned = match spawn_shell_job_child(
         &params,
         &spawn_plan,
+        &job_id,
         stdout_file,
         stderr_file,
         context,
@@ -2752,6 +2748,15 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
         started,
     )?;
 
+    handoff_shell_job_to_restart_survivable_monitoring(
+        &paths,
+        &mut status,
+        &mut child,
+        &local_process_identity,
+        &mut process_job,
+        started,
+    )?;
+
     let monitor_paths = paths.clone();
     let monitor_status = status.clone();
     let monitor_original_args = params.args.clone();
@@ -2963,7 +2968,10 @@ fn shell_job_status_diagnostics(
 fn shell_job_remote_command_exit_status_hints(job: &ActRunShellJobStatus) -> Vec<String> {
     if job.status != "exit_nonzero"
         || job.exit_code != Some(1)
-        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || !matches!(
+            job.remote_process_scope.transport.as_str(),
+            SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+        )
     {
         return Vec::new();
     }
@@ -3818,26 +3826,18 @@ fn run_corrupt_job_remote_liveness_probe(
     pgid: &str,
     operation: &str,
 ) -> Result<(CleanupCommandReadback, String), String> {
-    run_remote_liveness_probe(
-        &invocation.command,
-        &invocation.control_args,
-        pid,
-        pgid,
-        operation,
-    )
+    run_remote_liveness_probe(invocation, pid, pgid, operation)
 }
 
 fn run_remote_liveness_probe(
-    command: &str,
-    invocation_args: &[String],
+    invocation: &ShellRemoteCleanupInvocation,
     pid: &str,
     pgid: &str,
     operation: &str,
 ) -> Result<(CleanupCommandReadback, String), String> {
-    let mut args = hardened_ssh_automatic_replay_args(invocation_args)?;
-    args.push(ssh_remote_liveness_command(pid, pgid));
+    let args = remote_liveness_replay_args(invocation, pid, pgid)?;
     let readback = run_shell_cleanup_command_with_timeout(
-        command,
+        &invocation.command,
         &args,
         Duration::from_millis(SHELL_REMOTE_LIVENESS_TIMEOUT_MS),
     )?;
@@ -4179,8 +4179,7 @@ fn run_corrupt_job_identity_bound_remote_cleanup(
     pgid: &str,
     identity: &RemoteProcessOwnershipIdentity,
 ) -> Result<(CleanupCommandReadback, String), String> {
-    let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
-    args.push(ssh_remote_cleanup_command(pid, pgid, identity));
+    let args = remote_cleanup_replay_args(invocation, pid, pgid, identity)?;
     let readback = run_shell_cleanup_command_with_timeout(
         &invocation.command,
         &args,
@@ -4206,9 +4205,9 @@ fn run_corrupt_job_identity_bound_remote_cleanup(
 
 /// Inspect the durable request only when corrupt-status recovery otherwise has
 /// no remote ownership evidence. A typed local request can positively exclude
-/// SSH intent; missing, malformed, or redacted shell metadata is uncertainty
+/// SSH/WSL intent; missing, malformed, or redacted shell metadata is uncertainty
 /// and therefore cannot authorize quarantine.
-fn corrupt_shell_job_request_ssh_intent(
+fn corrupt_shell_job_request_remote_intent(
     paths: &ShellJobPaths,
     job_id: &str,
 ) -> Result<Option<String>, String> {
@@ -4216,29 +4215,35 @@ fn corrupt_shell_job_request_ssh_intent(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "request.json is absent for {job_id}; SSH intent cannot be excluded without a sidecar or process marker"
+                "request.json is absent for {job_id}; remote-process intent cannot be excluded without a sidecar or process marker"
             ));
         }
         Err(error) => {
             return Err(format!(
-                "could not read request.json while excluding SSH intent for {job_id}: {error}"
+                "could not read request.json while excluding remote-process intent for {job_id}: {error}"
             ));
         }
     };
     let request: Value = serde_json::from_slice(&request_bytes).map_err(|error| {
-        format!("could not decode request.json while excluding SSH intent for {job_id}: {error}")
+        format!("could not decode request.json while excluding remote-process intent for {job_id}: {error}")
     })?;
     let command = request
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             format!(
-                "request.json has no typed command metadata for {job_id}; SSH intent is unverifiable"
+                "request.json has no typed command metadata for {job_id}; remote-process intent is unverifiable"
             )
         })?;
     if let Some(client) = ssh_family_client_for_executable(command) {
         return Ok(Some(format!(
             "request_direct_ssh_family:{client}:{}",
+            executable_leaf(command)
+        )));
+    }
+    if is_wsl_executable(command) {
+        return Ok(Some(format!(
+            "request_direct_wsl:{}",
             executable_leaf(command)
         )));
     }
@@ -4248,14 +4253,14 @@ fn corrupt_shell_job_request_ssh_intent(
         Some(Value::Bool(redacted)) => *redacted,
         Some(_) => {
             return Err(format!(
-                "request.json args_redacted metadata is not boolean for {job_id}; SSH intent is unverifiable"
+                "request.json args_redacted metadata is not boolean for {job_id}; remote-process intent is unverifiable"
             ));
         }
     };
     let args = match request.get("args") {
         None => {
             return Err(format!(
-                "request.json has no typed args metadata for {job_id}; shell-wrapped SSH intent is unverifiable"
+                "request.json has no typed args metadata for {job_id}; shell-wrapped remote-process intent is unverifiable"
             ));
         }
         Some(Value::Array(values)) => values
@@ -4263,14 +4268,14 @@ fn corrupt_shell_job_request_ssh_intent(
             .map(|value| {
                 value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
                     format!(
-                        "request.json args metadata contains a non-string value for {job_id}; SSH intent is unverifiable"
+                        "request.json args metadata contains a non-string value for {job_id}; remote-process intent is unverifiable"
                     )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => {
             return Err(format!(
-                "request.json args metadata is not an array for {job_id}; SSH intent is unverifiable"
+                "request.json args metadata is not an array for {job_id}; remote-process intent is unverifiable"
             ));
         }
     };
@@ -4294,7 +4299,7 @@ fn corrupt_shell_job_request_ssh_intent(
         )
     {
         return Err(format!(
-            "request.json shell arguments are redacted for {job_id}; SSH intent cannot be excluded without a sidecar or process marker"
+            "request.json shell arguments are redacted for {job_id}; remote-process intent cannot be excluded without a sidecar or process marker"
         ));
     }
     Ok(None)
@@ -4317,7 +4322,7 @@ fn verify_corrupt_shell_job_remote_state(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return Err(format!(
-                "could not read stderr while excluding an SSH remote process marker for {job_id}: {error}"
+                "could not read stderr while excluding a remote process marker for {job_id}: {error}"
             ));
         }
     };
@@ -4349,9 +4354,9 @@ fn verify_corrupt_shell_job_remote_state(
                 "stderr contains a raw SYNAPSE_REMOTE_PROCESS_ marker for {job_id}, but no valid process identity and no remote-cleanup.json sidecar; remote state is unverifiable"
             ));
         }
-        if let Some(request_evidence) = corrupt_shell_job_request_ssh_intent(paths, job_id)? {
+        if let Some(request_evidence) = corrupt_shell_job_request_remote_intent(paths, job_id)? {
             return Err(format!(
-                "request.json records SSH intent for {job_id} ({request_evidence}), but no remote-cleanup.json sidecar or process marker proves remote ownership/state"
+                "request.json records remote-process intent for {job_id} ({request_evidence}), but no remote-cleanup.json sidecar or process marker proves remote ownership/state"
             ));
         }
         return Ok(ShellJobQuarantineRemoteVerification {
@@ -6613,6 +6618,17 @@ fn reap_stale_shell_jobs_with_ttl(ttl: Duration) -> Result<ShellJobReapReadback,
 }
 
 const SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT: &str = "windows_job_object_kill_on_job_close";
+/// The durable row has been committed while the daemon installs a named Job
+/// Object keeper handle into the exact suspended child. Before that keeper
+/// exists, daemon death closes the last armed handle and reaps the tree.
+const SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING: &str =
+    "windows_named_job_object_child_keeper_pending";
+/// The exact child owns a handle to its armed named Job Object. Daemon exit is
+/// therefore not the last close and the child survives. If the root exits while
+/// no daemon is present, its keeper becomes the last close and the still-armed
+/// object reaps every remaining descendant.
+const SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE: &str =
+    "windows_named_job_object_armed_child_keeper_restart_survivable";
 const SHELL_SUPERVISOR_CONTAINMENT_NONE: &str = "no_kill_on_close_containment";
 const SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX: &str = "unavailable:";
 const SHELL_SUPERVISOR_MARKER_FILE: &str = "supervisor.json";
@@ -6815,11 +6831,13 @@ pub struct ShellJobSupervisorRestartReadback {
     pub scanned_job_dirs: usize,
     pub live_status_jobs: usize,
     pub interrupted_jobs: usize,
+    pub adopted_jobs: usize,
     pub retained_live_child_jobs: usize,
     pub retained_unprovable_jobs: usize,
     pub retained_foreign_supervisor_jobs: usize,
     pub write_failures: usize,
     pub interrupted_job_ids_sample: Vec<String>,
+    pub adopted_job_ids_sample: Vec<String>,
     pub retained_job_ids_sample: Vec<String>,
 }
 
@@ -6880,11 +6898,13 @@ fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
         scanned_job_dirs: 0,
         live_status_jobs: 0,
         interrupted_jobs: 0,
+        adopted_jobs: 0,
         retained_live_child_jobs: 0,
         retained_unprovable_jobs: 0,
         retained_foreign_supervisor_jobs: 0,
         write_failures: 0,
         interrupted_job_ids_sample: Vec::new(),
+        adopted_job_ids_sample: Vec::new(),
         retained_job_ids_sample: Vec::new(),
     };
     if root.exists() {
@@ -6955,11 +6975,13 @@ fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
         scanned_job_dirs = readback.scanned_job_dirs,
         live_status_jobs = readback.live_status_jobs,
         interrupted_jobs = readback.interrupted_jobs,
+        adopted_jobs = readback.adopted_jobs,
         retained_live_child_jobs = readback.retained_live_child_jobs,
         retained_unprovable_jobs = readback.retained_unprovable_jobs,
         retained_foreign_supervisor_jobs = readback.retained_foreign_supervisor_jobs,
         write_failures = readback.write_failures,
         interrupted_job_ids_sample = ?readback.interrupted_job_ids_sample,
+        adopted_job_ids_sample = ?readback.adopted_job_ids_sample,
         retained_job_ids_sample = ?readback.retained_job_ids_sample,
         "readback=shell_job_supervisor_restart after=durable_job_root_scan"
     );
@@ -6976,7 +6998,10 @@ fn reconcile_one_orphaned_shell_job(
 ) {
     let job_id = job.job_id.clone();
     // 1. Is the supervisor that owned this record actually gone?
-    let (prior_state_label, prior_incarnation, prior_pid) = match job.supervisor.as_ref() {
+    let (prior_state_label, prior_incarnation, prior_pid, prior_containment) = match job
+        .supervisor
+        .as_ref()
+    {
         Some(owner) if owner.incarnation_id == identity.incarnation_id => {
             // This incarnation owns it; a live monitor task is authoritative.
             return;
@@ -7041,19 +7066,64 @@ fn reconcile_one_orphaned_shell_job(
                     local_process_identity_state_label(&other),
                     Some(owner.incarnation_id.clone()),
                     Some(owner.pid),
+                    Some(owner.child_containment.clone()),
                 ),
             }
         }
-        None => ("no_supervisor_recorded".to_owned(), None, None),
+        None => ("no_supervisor_recorded".to_owned(), None, None, None),
     };
 
     // 2. Is the child gone? Absence of the *exact creation identity* is the only
     //    proof accepted here; a bare pid can have been recycled.
-    let child_state_label = match job.local_process_identity.as_ref() {
+    let child_identity_snapshot = job.local_process_identity.clone();
+    let child_state_label = match child_identity_snapshot.as_ref() {
         Some(child_identity) => {
             let state = local_process_identity_state(child_identity);
             match state {
                 LocalProcessIdentityState::Match => {
+                    if matches!(
+                        prior_containment.as_deref(),
+                        Some(
+                            SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING
+                                | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
+                        )
+                    ) {
+                        match adopt_surviving_shell_job_after_supervisor_restart(
+                            job,
+                            paths,
+                            identity,
+                            prior_supervisor_state,
+                            prior_state_label,
+                            prior_incarnation,
+                            prior_pid,
+                            prior_containment,
+                            child_identity.clone(),
+                        ) {
+                            Ok(()) => {
+                                readback.adopted_jobs = readback.adopted_jobs.saturating_add(1);
+                                push_shell_job_recovery_sample(
+                                    &mut readback.adopted_job_ids_sample,
+                                    job_id,
+                                );
+                            }
+                            Err(error) => {
+                                readback.write_failures = readback.write_failures.saturating_add(1);
+                                push_shell_job_recovery_sample(
+                                    &mut readback.retained_job_ids_sample,
+                                    job_id.clone(),
+                                );
+                                tracing::error!(
+                                    code = "M4_SHELL_JOB_SUPERVISOR_RESTART_ADOPTION_FAILED",
+                                    job_id = %job_id,
+                                    pid = child_identity.pid,
+                                    detail = %error.message,
+                                    data = ?error.data,
+                                    "restart-survivable durable child could not be adopted; startup will fail closed"
+                                );
+                            }
+                        }
+                        return;
+                    }
                     readback.retained_live_child_jobs =
                         readback.retained_live_child_jobs.saturating_add(1);
                     push_shell_job_recovery_sample(
@@ -7064,7 +7134,7 @@ fn reconcile_one_orphaned_shell_job(
                         code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_SURVIVED",
                         job_id = %job_id,
                         pid = child_identity.pid,
-                        child_containment = %identity.child_containment,
+                        child_containment = ?prior_containment,
                         "durable shell job retained as live: its exact child creation identity is STILL \
                          RUNNING after the owning supervisor exited. On Windows that should be impossible \
                          under JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — the child either broke away from the \
@@ -7123,15 +7193,23 @@ fn reconcile_one_orphaned_shell_job(
     };
 
     // 3. Both proven gone: publish the honest terminal record.
-    let children_terminated_by =
-        if identity.child_containment == SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT {
-            "windows_job_object_kill_on_job_close_when_owning_supervisor_process_exited".to_owned()
-        } else {
-            "unknown_no_kill_on_close_containment_on_this_platform".to_owned()
-        };
+    let prior_containment_label = prior_containment
+        .as_deref()
+        .unwrap_or("unrecorded_child_containment");
+    let prior_job_object_contained = matches!(
+        prior_containment_label,
+        SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT
+            | SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING
+            | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
+    );
+    let children_terminated_by = if prior_job_object_contained {
+        "windows_job_object_kill_on_last_handle_close".to_owned()
+    } else {
+        "unknown_no_kill_on_close_containment_on_this_platform".to_owned()
+    };
     let cause = if job.local_process_identity.is_none() {
         "supervisor_restart_child_never_had_creation_identity"
-    } else if identity.child_containment == SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT {
+    } else if prior_job_object_contained {
         "supervisor_restart_children_reaped_by_job_object_close"
     } else {
         "supervisor_restart_child_absent_containment_unknown"
@@ -7145,7 +7223,7 @@ fn reconcile_one_orphaned_shell_job(
         prior_supervisor_identity_state: prior_state_label.clone(),
         reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
         reconciling_supervisor_pid: identity.pid,
-        child_containment: identity.child_containment.clone(),
+        child_containment: prior_containment_label.to_owned(),
         child_identity_state: child_state_label.clone(),
         children_terminated_by: children_terminated_by.clone(),
         // No exit status was ever observed for this child. Kubelet's rule: when
@@ -7183,7 +7261,7 @@ fn reconcile_one_orphaned_shell_job(
         prior_state = prior_state_label,
         this_incarnation = identity.incarnation_id,
         this_pid = identity.pid,
-        containment = identity.child_containment,
+        containment = prior_containment_label,
         child_state = child_state_label,
     ));
     job.supervisor_reconciliation = Some(reconciliation);
@@ -7193,21 +7271,62 @@ fn reconcile_one_orphaned_shell_job(
             "supervisor_restart_reconciliation:cause={cause}:prior_state={prior_supervisor_state}"
         ),
     );
-    // The transport wrapper died with the daemon, so nothing ever proved the
-    // remote payload stopped. Say so loudly instead of leaving a silent gap.
-    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL {
-        mark_shell_job_wsl_child_unverified(
-            &mut job,
-            "daemon_startup_supervisor_restart_reconciliation",
-        );
-    } else if job.remote_process_scope.remote_cleanup_required
+    // The local transport may have died before its monitor persisted a marker.
+    // Re-read the capture files, honor an exact remote exit marker, otherwise
+    // run the same identity-bound liveness/cleanup path used by explicit cancel.
+    if job.remote_process_scope.remote_cleanup_required
         && !job.remote_process_scope.remote_cleanup_verified
     {
-        mark_shell_job_remote_cleanup_unverified(
-            &mut job,
-            "daemon_startup_supervisor_restart_reconciliation",
-            "supervisor_restart_terminated_local_transport_before_remote_cleanup",
-        );
+        if let Err(error) = refresh_shell_job_remote_metadata_from_outputs(&mut job, paths) {
+            mark_shell_job_remote_cleanup_failed(
+                &mut job,
+                "daemon_startup_supervisor_restart_reconciliation",
+                "remote_metadata_read_failed",
+                &format!("{error:?}"),
+            );
+        } else {
+            let remote_exit_reconciled = reconcile_shell_job_remote_exit_marker(
+                &mut job,
+                paths,
+                false,
+                "daemon_startup_supervisor_restart_remote_exit_readback",
+            )
+            .unwrap_or_else(|error| {
+                mark_shell_job_remote_cleanup_failed(
+                    &mut job,
+                    "daemon_startup_supervisor_restart_remote_exit_readback",
+                    "remote_exit_marker_read_failed",
+                    &format!("{error:?}"),
+                );
+                false
+            });
+            if !remote_exit_reconciled
+                && job.remote_process_scope.remote_process_id.is_some()
+                && job.remote_process_scope.remote_process_group_id.is_some()
+            {
+                let _ = attempt_shell_job_remote_cleanup(
+                    &mut job,
+                    paths,
+                    "daemon_startup_supervisor_restart_reconciliation",
+                    None,
+                );
+            } else if !remote_exit_reconciled
+                && job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL
+                && job.remote_process_scope.remote_cleanup_status
+                    == SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED
+            {
+                mark_shell_job_wsl_child_unverified(
+                    &mut job,
+                    "daemon_startup_supervisor_restart_reconciliation",
+                );
+            } else if !remote_exit_reconciled && !job.remote_process_scope.remote_cleanup_verified {
+                mark_shell_job_remote_cleanup_unverified(
+                    &mut job,
+                    "daemon_startup_supervisor_restart_reconciliation",
+                    "supervisor_restart_terminated_local_transport_before_remote_cleanup",
+                );
+            }
+        }
     }
     match write_shell_job_reconciliation_status(paths, job) {
         Ok(persisted) => {
@@ -7242,6 +7361,113 @@ fn reconcile_one_orphaned_shell_job(
             );
         }
     }
+}
+
+#[cfg(windows)]
+fn adopt_surviving_shell_job_after_supervisor_restart(
+    mut job: ActRunShellJobStatus,
+    paths: &ShellJobPaths,
+    identity: &ActRunShellSupervisorIdentity,
+    prior_supervisor_state: &str,
+    prior_state_label: String,
+    prior_incarnation: Option<String>,
+    prior_pid: Option<u32>,
+    prior_containment: Option<String>,
+    child_identity: ActRunShellLocalProcessIdentity,
+) -> Result<(), ErrorData> {
+    // Bind the kernel handle before changing the durable owner row. A failure
+    // leaves the predecessor row authoritative and makes startup fail closed.
+    let child_handle = AdoptedShellChildHandle::open(&child_identity).map_err(|detail| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "daemon startup could not bind a monitor to restart-surviving shell child pid {}: {detail}",
+                child_identity.pid
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "job_id": job.job_id,
+                "pid": child_identity.pid,
+                "start_time": child_identity.start_time,
+                "reason": "restart_surviving_child_handle_open_failed",
+                "detail": detail,
+            }),
+        )
+    })?;
+    let prior_containment_label = prior_containment
+        .as_deref()
+        .unwrap_or(SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE);
+    let process_job = OwnedProcessJob::open_for_restart_adoption(
+        &job.job_id,
+        &child_handle,
+        prior_containment_label,
+    )?;
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    job.supervisor_reconciliation = Some(ActRunShellSupervisorReconciliation {
+        cause: "supervisor_restart_child_survived_and_adopted".to_owned(),
+        prior_supervisor_state: prior_supervisor_state.to_owned(),
+        prior_supervisor_incarnation_id: prior_incarnation,
+        prior_supervisor_pid: prior_pid,
+        prior_supervisor_identity_state: prior_state_label,
+        reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
+        reconciling_supervisor_pid: identity.pid,
+        child_containment: prior_containment
+            .unwrap_or_else(|| SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned()),
+        child_identity_state: "match_running".to_owned(),
+        children_terminated_by: "not_terminated_restart_survival_handoff".to_owned(),
+        exit_code_trustworthy: true,
+        observation_source: "daemon_startup_exact_process_handle_adoption".to_owned(),
+        observed_at: observed_at.clone(),
+    });
+    let mut new_owner = identity.clone();
+    new_owner.child_containment = SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned();
+    job.supervisor = Some(new_owner);
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!(
+            "supervisor_restart_adopted:pid={}:start_time={}:at={observed_at}",
+            child_identity.pid, child_identity.start_time
+        ),
+    );
+    let persisted = write_shell_job_reconciliation_status(paths, job)?;
+    let monitor_paths = paths.clone();
+    let monitor_job_id = persisted.job_id.clone();
+    tokio::spawn(async move {
+        monitor_adopted_shell_job(child_handle, process_job, persisted, monitor_paths).await;
+    });
+    tracing::info!(
+        code = "M4_SHELL_JOB_SUPERVISOR_RESTART_CHILD_ADOPTED",
+        job_id = %monitor_job_id,
+        pid = child_identity.pid,
+        child_start_time = child_identity.start_time,
+        supervisor_incarnation_id = %identity.incarnation_id,
+        supervisor_pid = identity.pid,
+        "restart-surviving durable shell child was rebound to an exact process handle and monitor"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn adopt_surviving_shell_job_after_supervisor_restart(
+    _job: ActRunShellJobStatus,
+    _paths: &ShellJobPaths,
+    _identity: &ActRunShellSupervisorIdentity,
+    _prior_supervisor_state: &str,
+    _prior_state_label: String,
+    _prior_incarnation: Option<String>,
+    _prior_pid: Option<u32>,
+    _prior_containment: Option<String>,
+    child_identity: ActRunShellLocalProcessIdentity,
+) -> Result<(), ErrorData> {
+    Err(shell_tool_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        "restart-surviving shell-child adoption is unavailable on this platform",
+        json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "pid": child_identity.pid,
+            "reason": "restart_surviving_child_adoption_unsupported_platform",
+        }),
+    ))
 }
 
 /// Required corrupt-job recovery gate plus best-effort stale-job retention for
@@ -12871,11 +13097,15 @@ fn read_shell_remote_cleanup_invocation(
         serde_json::from_slice(&bytes).map_err(|error| {
             format!("failed to decode remote cleanup sidecar for {job_id}: {error}")
         })?;
-    if !matches!(invocation.schema_version, 1..=4) {
+    if !matches!(invocation.schema_version, 1..=5) {
         return Err(format!(
             "unsupported remote cleanup sidecar schema_version={} for {job_id}",
             invocation.schema_version
         ));
+    }
+    if invocation.schema_version == 5 {
+        validate_wsl_remote_cleanup_invocation(&invocation, paths, job_id)?;
+        return Ok(Some(invocation));
     }
     if invocation.transport != SHELL_REMOTE_TRANSPORT_SSH {
         return Err(format!(
@@ -13068,6 +13298,115 @@ fn read_shell_remote_cleanup_invocation(
         ));
     }
     Ok(Some(invocation))
+}
+
+fn validate_wsl_remote_cleanup_invocation(
+    invocation: &ShellRemoteCleanupInvocation,
+    paths: &ShellJobPaths,
+    job_id: &str,
+) -> Result<(), String> {
+    if invocation.transport != SHELL_REMOTE_TRANSPORT_WSL {
+        return Err(format!(
+            "remote cleanup sidecar v5 has unsupported transport={} for {job_id}",
+            invocation.transport
+        ));
+    }
+    let trusted_command = trusted_wsl_executable(&invocation.command).ok_or_else(|| {
+        format!(
+            "remote cleanup sidecar command is not the canonical System32 wsl.exe for {job_id}: {}",
+            invocation.command
+        )
+    })?;
+    if !Path::new(&invocation.command).is_absolute()
+        || fs::canonicalize(&invocation.command).ok().as_ref() != Some(&trusted_command)
+    {
+        return Err(format!(
+            "remote cleanup sidecar v5 does not bind the exact canonical WSL executable for {job_id}: recorded={} trusted={}",
+            invocation.command,
+            trusted_command.display()
+        ));
+    }
+    let distribution = wsl_distribution_from_control_args(&invocation.control_args)?;
+    let expected_identity = format!("wsl:{distribution}");
+    if invocation.remote_identity != expected_identity {
+        return Err(format!(
+            "remote cleanup sidecar identity differs from its parsed WSL distribution for {job_id}: recorded={} parsed={expected_identity}",
+            invocation.remote_identity
+        ));
+    }
+    validate_lower_sha256(&invocation.args_sha256, "args_sha256", job_id)?;
+    let actual_control_args_sha256 = shell_args_sha256(&invocation.control_args);
+    if actual_control_args_sha256 != invocation.args_sha256 {
+        return Err(format!(
+            "remote cleanup sidecar WSL control argv digest differs for {job_id}: recorded={} actual={actual_control_args_sha256}",
+            invocation.args_sha256
+        ));
+    }
+    let request_args_sha256 = invocation.request_args_sha256.as_deref().ok_or_else(|| {
+        format!("remote cleanup sidecar v5 lacks request_args_sha256 for {job_id}")
+    })?;
+    validate_lower_sha256(request_args_sha256, "request_args_sha256", job_id)?;
+    let request_bytes = fs::read(&paths.request_path).map_err(|error| {
+        format!(
+            "failed to read request JSON while validating WSL remote cleanup sidecar for {job_id}: {error}"
+        )
+    })?;
+    let request: Value = serde_json::from_slice(&request_bytes).map_err(|error| {
+        format!(
+            "failed to decode request JSON while validating WSL remote cleanup sidecar for {job_id}: {error}"
+        )
+    })?;
+    let recorded_request_args_sha256 = request
+        .get("args_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("request JSON lacks args_sha256 for {job_id}"))?;
+    if recorded_request_args_sha256 != request_args_sha256 {
+        return Err(format!(
+            "WSL remote cleanup sidecar is not bound to request argv for {job_id}: sidecar={request_args_sha256} request={recorded_request_args_sha256}"
+        ));
+    }
+    let effective_control_args = invocation.effective_control_args.as_ref().ok_or_else(|| {
+        format!("remote cleanup sidecar v5 lacks effective_control_args for {job_id}")
+    })?;
+    let expected_effective_control_args = wsl_cleanup_control_args(&invocation.control_args)?;
+    if effective_control_args != &expected_effective_control_args {
+        return Err(format!(
+            "WSL remote cleanup sidecar effective controls differ from the deterministic cleanup controls for {job_id}"
+        ));
+    }
+    let effective_distribution = wsl_distribution_from_control_args(effective_control_args)?;
+    if effective_distribution != distribution {
+        return Err(format!(
+            "WSL remote cleanup sidecar effective controls changed distribution for {job_id}: request={distribution} cleanup={effective_distribution}"
+        ));
+    }
+    let effective_args_sha256 = invocation.effective_args_sha256.as_deref().ok_or_else(|| {
+        format!("remote cleanup sidecar v5 lacks effective_args_sha256 for {job_id}")
+    })?;
+    validate_lower_sha256(effective_args_sha256, "effective_args_sha256", job_id)?;
+    let actual_effective_args_sha256 = shell_args_sha256(effective_control_args);
+    if effective_args_sha256 != actual_effective_args_sha256 {
+        return Err(format!(
+            "WSL remote cleanup sidecar effective argv digest differs for {job_id}: recorded={effective_args_sha256} actual={actual_effective_args_sha256}"
+        ));
+    }
+    if invocation.request_effective_config.is_some()
+        || invocation.cleanup_effective_config.is_some()
+    {
+        return Err(format!(
+            "WSL remote cleanup sidecar unexpectedly carries SSH effective-config fingerprints for {job_id}"
+        ));
+    }
+    let ownership_token = invocation
+        .ownership_token
+        .as_deref()
+        .ok_or_else(|| format!("remote cleanup sidecar v5 lacks ownership_token for {job_id}"))?;
+    if !valid_remote_ownership_token(ownership_token) {
+        return Err(format!(
+            "remote cleanup sidecar v5 ownership_token is malformed for {job_id}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ssh_effective_config_fingerprint(
@@ -13910,6 +14249,301 @@ fn wsl_distribution_from_args(args: &[String]) -> Option<String> {
     None
 }
 
+/// Split a direct WSL invocation into immutable launcher controls and literal
+/// Linux payload argv.  Durable mode requires an explicit distribution: replay
+/// against a mutable default distro would make later liveness/cancel probes
+/// target a different kernel namespace.
+fn wsl_command_parts(args: &[String]) -> Result<WslCommandParts, String> {
+    let mut control_args = Vec::new();
+    let mut distribution = None;
+    let mut index = 0_usize;
+    while let Some(raw) = args.get(index) {
+        let arg = trim_arg_quotes(raw);
+        if matches!(arg, "--" | "-e" | "--exec") {
+            let payload_args = args.get(index + 1..).unwrap_or_default().to_vec();
+            if payload_args.is_empty() {
+                return Err(
+                    "WSL durable execution requires a non-empty payload after --exec/--".to_owned(),
+                );
+            }
+            let distribution = distribution.ok_or_else(|| {
+                "WSL durable execution requires explicit -d/--distribution so recovery cannot drift to a different default distro".to_owned()
+            })?;
+            return Ok(WslCommandParts {
+                control_args,
+                distribution,
+                payload_args,
+            });
+        }
+        if let Some(value) = arg.strip_prefix("--distribution=") {
+            let value = trim_arg_quotes(value);
+            if value.is_empty() || value.contains('\0') {
+                return Err("WSL --distribution value is empty or contains NUL".to_owned());
+            }
+            if distribution.as_deref().is_some_and(|prior| prior != value) {
+                return Err("WSL invocation contains conflicting distribution selectors".to_owned());
+            }
+            distribution = Some(value.to_owned());
+            control_args.push(raw.clone());
+            index += 1;
+            continue;
+        }
+        if matches!(arg, "-d" | "--distribution") {
+            let value = args
+                .get(index + 1)
+                .map(|value| trim_arg_quotes(value))
+                .filter(|value| !value.is_empty() && !value.contains('\0'))
+                .ok_or_else(|| "WSL distribution selector lacks a valid value".to_owned())?;
+            if distribution.as_deref().is_some_and(|prior| prior != value) {
+                return Err("WSL invocation contains conflicting distribution selectors".to_owned());
+            }
+            distribution = Some(value.to_owned());
+            control_args.push(raw.clone());
+            control_args.push(args[index + 1].clone());
+            index += 2;
+            continue;
+        }
+        if matches!(arg, "-u" | "--user" | "--cd") {
+            let value = args
+                .get(index + 1)
+                .map(|value| trim_arg_quotes(value))
+                .filter(|value| !value.is_empty() && !value.contains('\0'))
+                .ok_or_else(|| format!("WSL option {arg} lacks a valid value"))?;
+            control_args.push(raw.clone());
+            control_args.push(value.to_owned());
+            index += 2;
+            continue;
+        }
+        if (arg.starts_with("--user=") || arg.starts_with("--cd="))
+            && arg
+                .split_once('=')
+                .is_some_and(|(_, value)| !value.is_empty())
+        {
+            control_args.push(raw.clone());
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!(
+                "WSL option {arg} is not replay-safe for durable execution; supported controls are explicit distribution, user, and working directory"
+            ));
+        }
+        let payload_args = args[index..].to_vec();
+        let distribution = distribution.ok_or_else(|| {
+            "WSL durable execution requires explicit -d/--distribution so recovery cannot drift to a different default distro".to_owned()
+        })?;
+        return Ok(WslCommandParts {
+            control_args,
+            distribution,
+            payload_args,
+        });
+    }
+    Err("WSL durable execution requires a non-empty literal payload argv".to_owned())
+}
+
+/// Validate that a persisted WSL control vector contains controls only and
+/// recover its explicit distribution using the same parser as admission.  The
+/// synthetic payload is never executed; it makes the parser prove that every
+/// persisted element was consumed as a replay-safe launcher control.
+fn wsl_distribution_from_control_args(control_args: &[String]) -> Result<String, String> {
+    let mut probe = control_args.to_vec();
+    probe.push("--exec".to_owned());
+    probe.push(":".to_owned());
+    let parts = wsl_command_parts(&probe)?;
+    if parts.control_args != control_args || parts.payload_args != [":".to_owned()] {
+        return Err(
+            "WSL cleanup control argv contains a payload or was not consumed exactly".to_owned(),
+        );
+    }
+    Ok(parts.distribution)
+}
+
+/// Cleanup/liveness do not depend on the payload working directory. Replaying
+/// `--cd` would make ownership recovery fail merely because the payload removed
+/// or renamed its original directory, so persist a second exact control vector
+/// containing only the immutable distribution and user selectors.
+fn wsl_cleanup_control_args(control_args: &[String]) -> Result<Vec<String>, String> {
+    let expected_distribution = wsl_distribution_from_control_args(control_args)?;
+    let mut cleanup = Vec::new();
+    let mut index = 0_usize;
+    while let Some(raw) = control_args.get(index) {
+        let arg = trim_arg_quotes(raw);
+        if arg == "--cd" {
+            if control_args.get(index + 1).is_none() {
+                return Err("WSL --cd control lacks a value".to_owned());
+            }
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--cd=") {
+            index += 1;
+            continue;
+        }
+        cleanup.push(raw.clone());
+        index += 1;
+    }
+    let actual_distribution = wsl_distribution_from_control_args(&cleanup)?;
+    if actual_distribution != expected_distribution {
+        return Err("WSL cleanup controls changed the explicit distribution".to_owned());
+    }
+    Ok(cleanup)
+}
+
+#[cfg(windows)]
+fn trusted_wsl_executable(command: &str) -> Option<PathBuf> {
+    let expected = fs::canonicalize(
+        PathBuf::from(std::env::var_os("SystemRoot")?)
+            .join("System32")
+            .join("wsl.exe"),
+    )
+    .ok()?;
+    if is_bare_windows_executable_name(command) && is_wsl_executable(command) {
+        return Some(expected);
+    }
+    let actual = fs::canonicalize(command).ok()?;
+    (actual == expected).then_some(actual)
+}
+
+#[cfg(not(windows))]
+fn trusted_wsl_executable(_command: &str) -> Option<PathBuf> {
+    None
+}
+
+fn trusted_remote_replay_executable(command: &str) -> Option<PathBuf> {
+    trusted_ssh_automatic_replay_executable(command).or_else(|| trusted_wsl_executable(command))
+}
+
+fn wsl_remote_guardian_args(
+    job_id: &str,
+    ownership_token: &str,
+    payload_args: &[String],
+) -> Vec<String> {
+    const SCRIPT: &str = r#"import hashlib
+import os
+import signal
+import subprocess
+import sys
+import time
+
+job_id = sys.argv[1]
+process_marker = sys.argv[2]
+exit_marker = sys.argv[3]
+payload_argv = sys.argv[4:]
+ownership_token = os.environ.get("SYNAPSE_REMOTE_JOB_TOKEN", "")
+child = None
+
+def fail(reason):
+    print(f"synapse_wsl_guardian_error error={reason}", file=sys.stderr, flush=True)
+    raise SystemExit(125)
+
+def read_boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+            value = handle.read().strip()
+    except OSError:
+        fail("boot_identity_unavailable")
+    if not value:
+        fail("boot_identity_unavailable")
+    return value
+
+def read_start_time(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="strict") as handle:
+            stat_line = handle.read().strip()
+    except OSError:
+        fail("proc_identity_unavailable")
+    _comm, separator, stat_tail = stat_line.rpartition(") ")
+    if not separator:
+        fail("proc_identity_unavailable")
+    fields = stat_tail.split()
+    if len(fields) < 20:
+        fail("proc_identity_unavailable")
+    return fields[19]
+
+def terminate_group(signum, _frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pgid = os.getpgrp()
+    if child is not None and child.poll() is None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if child.poll() is None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    raise SystemExit(128 + int(signum))
+
+if not payload_argv:
+    fail("payload_argv_empty")
+if not ownership_token or len(ownership_token) != 32 or any(ch not in "0123456789abcdef" for ch in ownership_token):
+    fail("remote_identity_prerequisite_unavailable")
+try:
+    os.setsid()
+except OSError:
+    if os.getpgrp() != os.getpid():
+        fail("guardian_scope_unavailable")
+
+boot_id = read_boot_id()
+pid = os.getpid()
+pgid = os.getpgrp()
+sid = os.getsid(0)
+start_time = read_start_time(pid)
+signal.signal(signal.SIGTERM, terminate_group)
+# A daemon crash can tear down the Windows-side WSL relay and deliver SIGHUP.
+# Durable ownership intentionally survives that transport event; only an exact
+# identity-bound cleanup sends SIGTERM to this guardian.
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGINT, terminate_group)
+payload_env = os.environ.copy()
+payload_env.pop("SYNAPSE_REMOTE_JOB_TOKEN", None)
+try:
+    child = subprocess.Popen(payload_argv, env=payload_env)
+except OSError:
+    fail("remote_payload_spawn_failed")
+
+ownership_token_sha256 = hashlib.sha256(ownership_token.encode("ascii")).hexdigest()
+print(
+    f"{process_marker} job_id={job_id} pid={pid} pgid={pgid} sid={sid} "
+    f"boot_id={boot_id} start_time={start_time} scope=setsid "
+    f"ownership_token_sha256={ownership_token_sha256}",
+    file=sys.stderr,
+    flush=True,
+)
+returncode = child.wait()
+exit_code = 1 if returncode is None else (128 + abs(returncode) if returncode < 0 else returncode)
+print(
+    f"{exit_marker} job_id={job_id} pid={pid} pgid={pgid} "
+    f"exit_code={exit_code} ownership_token_sha256={ownership_token_sha256}",
+    file=sys.stderr,
+    flush=True,
+)
+raise SystemExit(exit_code if 0 <= exit_code <= 255 else 1)
+"#;
+    let mut args = vec![
+        "env".to_owned(),
+        format!("SYNAPSE_REMOTE_JOB_TOKEN={ownership_token}"),
+        "python3".to_owned(),
+        "-c".to_owned(),
+        SCRIPT.to_owned(),
+        job_id.to_owned(),
+        SHELL_REMOTE_PROCESS_MARKER.to_owned(),
+        SHELL_REMOTE_EXIT_MARKER.to_owned(),
+    ];
+    args.extend_from_slice(payload_args);
+    args
+}
+
 /// Classify a `wsl.exe` job as its own remote transport.
 ///
 /// Recording it as `local` (the previous behavior) asserted two false things:
@@ -13922,6 +14556,7 @@ fn wsl_remote_process_scope(
     evidence: impl Into<String>,
 ) -> ActRunShellRemoteProcessScope {
     let distribution = wsl_distribution_from_args(args);
+    let tracked = wsl_command_parts(args).is_ok();
     let mut detection_evidence = vec![evidence.into()];
     detection_evidence.push(match distribution.as_deref() {
         Some(distribution) => format!("wsl_distribution:{distribution}"),
@@ -13934,12 +14569,22 @@ fn wsl_remote_process_scope(
         "wsl_wrapper_liveness_is_not_payload_liveness:wslhost_exe_assumes_lifetime_and_redirected_kill_sends_only_sighup"
             .to_owned(),
     );
+    detection_evidence.push(if tracked {
+        format!("remote_tracking_pending:setsid_stderr_marker:{SHELL_REMOTE_PROCESS_MARKER}")
+    } else {
+        "wsl_linux_child_identity_untracked:durable_preflight_will_refuse_spawn".to_owned()
+    });
     ActRunShellRemoteProcessScope {
         transport: SHELL_REMOTE_TRANSPORT_WSL.to_owned(),
         local_process_scope: "windows_wsl_exe_wrapper_process_tree_only".to_owned(),
         remote_cleanup_required: true,
         remote_cleanup_verified: false,
-        remote_cleanup_status: SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED.to_owned(),
+        remote_cleanup_status: if tracked {
+            SHELL_REMOTE_CLEANUP_TRACKING_PENDING
+        } else {
+            SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED
+        }
+        .to_owned(),
         remote_identity: Some(match distribution.as_deref() {
             Some(distribution) => format!("wsl:{distribution}"),
             None => "wsl:<default-distribution>".to_owned(),
@@ -14120,6 +14765,13 @@ struct SshCommandInvocation {
     evidence: &'static str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WslCommandParts {
+    control_args: Vec<String>,
+    distribution: String,
+    payload_args: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ShellRemoteCleanupInvocation {
@@ -14155,6 +14807,59 @@ struct ShellRemoteCleanupInvocation {
     created_at: String,
 }
 
+fn remote_liveness_replay_args(
+    invocation: &ShellRemoteCleanupInvocation,
+    pid: &str,
+    pgid: &str,
+) -> Result<Vec<String>, String> {
+    match invocation.transport.as_str() {
+        SHELL_REMOTE_TRANSPORT_SSH => {
+            let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
+            args.push(ssh_remote_liveness_command(pid, pgid));
+            Ok(args)
+        }
+        SHELL_REMOTE_TRANSPORT_WSL => {
+            let effective = invocation
+                .effective_control_args
+                .as_ref()
+                .ok_or_else(|| "WSL cleanup sidecar lacks effective controls".to_owned())?;
+            wsl_distribution_from_control_args(effective)?;
+            let mut args = effective.clone();
+            args.push("--exec".to_owned());
+            args.extend(remote_liveness_python_args(pid, pgid));
+            Ok(args)
+        }
+        transport => Err(format!("unsupported remote liveness transport={transport}")),
+    }
+}
+
+fn remote_cleanup_replay_args(
+    invocation: &ShellRemoteCleanupInvocation,
+    pid: &str,
+    pgid: &str,
+    identity: &RemoteProcessOwnershipIdentity,
+) -> Result<Vec<String>, String> {
+    match invocation.transport.as_str() {
+        SHELL_REMOTE_TRANSPORT_SSH => {
+            let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
+            args.push(ssh_remote_cleanup_command(pid, pgid, identity));
+            Ok(args)
+        }
+        SHELL_REMOTE_TRANSPORT_WSL => {
+            let effective = invocation
+                .effective_control_args
+                .as_ref()
+                .ok_or_else(|| "WSL cleanup sidecar lacks effective controls".to_owned())?;
+            wsl_distribution_from_control_args(effective)?;
+            let mut args = effective.clone();
+            args.push("--exec".to_owned());
+            args.extend(remote_cleanup_python_args(pid, pgid, identity));
+            Ok(args)
+        }
+        transport => Err(format!("unsupported remote cleanup transport={transport}")),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SshEffectiveConfigFingerprint {
@@ -14178,6 +14883,9 @@ fn shell_job_spawn_plan(
     params: &ActRunShellStartParams,
     job_id: &str,
 ) -> Result<ShellJobSpawnPlan, ErrorData> {
+    if is_wsl_executable(&params.command) {
+        return tracked_wsl_shell_job_spawn_plan(params, job_id);
+    }
     if let Some(invocation) = direct_ssh_command_invocation(&params.command, &params.args) {
         return tracked_direct_ssh_shell_job_spawn_plan(params, job_id, invocation);
     }
@@ -14195,6 +14903,84 @@ fn shell_job_spawn_plan(
         command: params.command.clone(),
         args: params.args.clone(),
         remote_cleanup_invocation: None,
+    })
+}
+
+fn tracked_wsl_shell_job_spawn_plan(
+    params: &ActRunShellStartParams,
+    job_id: &str,
+) -> Result<ShellJobSpawnPlan, ErrorData> {
+    let parts = wsl_command_parts(&params.args).map_err(|reason| {
+        shell_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!("durable WSL tracking refused the command before spawning: {reason}"),
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "job_id": job_id,
+                "command": params.command,
+                "args_sha256": shell_args_sha256(&params.args),
+                "reason": "wsl_durable_tracking_preflight_failed",
+                "detail": reason,
+            }),
+        )
+    })?;
+    let trusted_command = trusted_wsl_executable(&params.command).ok_or_else(|| {
+        shell_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "durable WSL tracking requires the canonical System32 wsl.exe",
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "job_id": job_id,
+                "command": params.command,
+                "reason": "wsl_executable_not_trusted_for_cleanup_replay",
+                "expected": std::env::var_os("SystemRoot").map(PathBuf::from).map(|root| root.join("System32").join("wsl.exe")),
+            }),
+        )
+    })?;
+    let trusted_command = trusted_command.to_string_lossy().into_owned();
+    let ownership_token = new_remote_ownership_token();
+    let cleanup_control_args = wsl_cleanup_control_args(&parts.control_args).map_err(|reason| {
+        shell_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!("durable WSL cleanup-control derivation failed before spawning: {reason}"),
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "job_id": job_id,
+                "command": params.command,
+                "reason": "wsl_cleanup_control_derivation_failed",
+                "detail": reason,
+                "no_child_spawned": true,
+            }),
+        )
+    })?;
+    let mut spawn_args = parts.control_args.clone();
+    spawn_args.push("--exec".to_owned());
+    spawn_args.extend(wsl_remote_guardian_args(
+        job_id,
+        &ownership_token,
+        &parts.payload_args,
+    ));
+    let remote_identity = format!("wsl:{}", parts.distribution);
+    let remote_cleanup_invocation = ShellRemoteCleanupInvocation {
+        schema_version: 5,
+        transport: SHELL_REMOTE_TRANSPORT_WSL.to_owned(),
+        command: trusted_command.clone(),
+        control_args: parts.control_args.clone(),
+        remote_identity,
+        source_evidence: "direct_command_wsl_explicit_distribution".to_owned(),
+        args_sha256: shell_args_sha256(&parts.control_args),
+        request_args_sha256: Some(shell_args_sha256(&params.args)),
+        effective_control_args: Some(cleanup_control_args.clone()),
+        effective_args_sha256: Some(shell_args_sha256(&cleanup_control_args)),
+        request_effective_config: None,
+        cleanup_effective_config: None,
+        ownership_token: Some(ownership_token),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    Ok(ShellJobSpawnPlan {
+        command: trusted_command,
+        args: spawn_args,
+        remote_cleanup_invocation: Some(remote_cleanup_invocation),
     })
 }
 
@@ -15150,9 +15936,12 @@ fn mark_shell_job_remote_cleanup_unverified(
     if !job.remote_process_scope.remote_cleanup_required {
         return;
     }
-    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL {
-        // WSL has its own failure mode and its own remediation; the SSH wording
-        // below would misdescribe it.
+    if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_WSL
+        && job.remote_process_scope.remote_cleanup_status
+            == SHELL_REMOTE_CLEANUP_WSL_CHILD_UNTRACKED
+    {
+        // Legacy WSL records predate the guardian and have no identity with
+        // which a destructive cleanup could be authorized.
         mark_shell_job_wsl_child_unverified(job, trigger);
         return;
     }
@@ -15162,8 +15951,8 @@ fn mark_shell_job_remote_cleanup_unverified(
         .as_deref()
         .unwrap_or("unknown_remote");
     let message = format!(
-        "{trigger} verified only the local process scope '{}' with local termination status '{local_termination_status}'; SSH remote cleanup for '{remote_identity}' is not tracked or verified because no remote pid/process-group metadata exists in the job status",
-        job.remote_process_scope.local_process_scope
+        "{trigger} verified only the local process scope '{}' with local termination status '{local_termination_status}'; {} remote cleanup for '{remote_identity}' is not verified because no identity-bound remote pid/process-group marker exists in the job status",
+        job.remote_process_scope.local_process_scope, job.remote_process_scope.transport,
     );
     job.remote_process_scope.remote_cleanup_verified = false;
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_UNVERIFIED.to_owned();
@@ -15253,8 +16042,8 @@ fn mark_shell_job_remote_pre_marker_terminal(
         .unwrap_or("unknown_remote");
     let suggested_readback = shell_remote_pre_marker_readback_hint(job);
     let message = format!(
-        "{trigger} classified SSH remote tracking as pre-marker terminal failure for '{remote_identity}'; terminal_status='{terminal_status}'; reason={}; no {SHELL_REMOTE_PROCESS_MARKER} pid/process-group marker was found, so Synapse did not acquire a remote cleanup handle and will not report remote cleanup as unresolved. suggested_safe_readback={suggested_readback}",
-        evidence.reason
+        "{trigger} classified {} remote tracking as pre-marker terminal failure for '{remote_identity}'; terminal_status='{terminal_status}'; reason={}; no {SHELL_REMOTE_PROCESS_MARKER} pid/process-group marker was found, so Synapse did not acquire a remote cleanup handle and will not report remote cleanup as unresolved. suggested_safe_readback={suggested_readback}",
+        job.remote_process_scope.transport, evidence.reason,
     );
     job.remote_process_scope.remote_cleanup_required = false;
     job.remote_process_scope.remote_cleanup_verified = false;
@@ -15281,8 +16070,10 @@ fn mark_shell_job_remote_pre_marker_terminal_if_detected(
     paths: &ShellJobPaths,
     trigger: &'static str,
 ) -> Result<bool, ErrorData> {
-    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
-        || job.remote_process_scope.remote_cleanup_status != SHELL_REMOTE_CLEANUP_TRACKING_PENDING
+    if !matches!(
+        job.remote_process_scope.transport.as_str(),
+        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+    ) || job.remote_process_scope.remote_cleanup_status != SHELL_REMOTE_CLEANUP_TRACKING_PENDING
         || job.remote_process_scope.remote_process_id.is_some()
         || job.remote_process_scope.remote_process_group_id.is_some()
     {
@@ -15370,6 +16161,17 @@ fn shell_remote_pre_marker_readback_hint(job: &ActRunShellJobStatus) -> String {
             return shell_command_line_from_parts(&invocation.command, &args);
         }
     }
+    if is_wsl_executable(&job.command) {
+        if let Ok(parts) = wsl_command_parts(&job.args) {
+            if let Ok(mut args) = wsl_cleanup_control_args(&parts.control_args) {
+                args.push("--exec".to_owned());
+                args.push("sh".to_owned());
+                args.push("-lc".to_owned());
+                args.push(remote_command);
+                return shell_command_line_from_parts(&job.command, &args);
+            }
+        }
+    }
     format!(
         "ssh {remote_identity} {}",
         posix_single_quote(&remote_command)
@@ -15411,7 +16213,10 @@ fn refresh_shell_job_remote_metadata_from_outputs(
     job: &mut ActRunShellJobStatus,
     paths: &ShellJobPaths,
 ) -> Result<bool, ErrorData> {
-    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH {
+    if !matches!(
+        job.remote_process_scope.transport.as_str(),
+        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+    ) {
         return Ok(false);
     }
     if job.remote_process_scope.remote_process_id.is_some()
@@ -15454,7 +16259,11 @@ fn reconcile_shell_job_remote_exit_marker(
     // the remote exit; the local budget overrun is downgraded to a warning
     // (`downgrade_local_timeout_after_remote_exit`). A deliberate `cancel` is
     // still honored as an explicit operator verdict and is not overridden here.
-    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH || job.cancel_requested {
+    if !matches!(
+        job.remote_process_scope.transport.as_str(),
+        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+    ) || job.cancel_requested
+    {
         return Ok(false);
     }
     let overriding_local_timeout = job.timed_out;
@@ -15511,7 +16320,10 @@ fn reconcile_shell_job_remote_exit_marker(
     // local verdict already reflects the failure honestly and is left untouched
     // so we never manufacture an "already gone" success out of a remote failure
     // (regression guard for issue1274_remote_exit_marker_nonzero_*).
-    if metadata.exit_code != 0 && !overriding_local_timeout {
+    if metadata.exit_code != 0
+        && !overriding_local_timeout
+        && job.status != SHELL_JOB_STATUS_INTERRUPTED
+    {
         return Ok(false);
     }
     if !running && job.status == "ok" && job.exit_code == Some(0) {
@@ -15595,11 +16407,11 @@ fn verify_shell_job_remote_cleanup_after_terminal(
     trigger: &'static str,
     original_args: Option<&[String]>,
 ) {
-    if shell_job_terminal_status(&job.status) {
-        mark_shell_job_wsl_child_unverified(job, trigger);
-    }
     if !shell_job_terminal_status(&job.status)
-        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || !matches!(
+            job.remote_process_scope.transport.as_str(),
+            SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+        )
         || !job.remote_process_scope.remote_cleanup_required
         || job.remote_process_scope.remote_cleanup_verified
         || job.remote_process_scope.remote_cleanup_status == SHELL_REMOTE_CLEANUP_FAILED
@@ -15770,7 +16582,10 @@ fn reconcile_shell_job_remote_already_gone_if_local_stale(
         || !shell_job_live_status(&job.status)
         || job.cancel_requested
         || job.timed_out
-        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || !matches!(
+            job.remote_process_scope.transport.as_str(),
+            SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+        )
         || !job.remote_process_scope.remote_cleanup_required
         || job.remote_process_scope.remote_cleanup_verified
         || matches!(
@@ -15836,24 +16651,30 @@ fn probe_shell_job_remote_liveness(
             return None;
         }
     };
-    let Some(invocation) = shell_job_cleanup_invocation(job, None, remote_cleanup.as_ref()) else {
+    let Some(invocation) = remote_cleanup.as_ref() else {
         push_unique_evidence(
             &mut job.remote_process_scope.detection_evidence,
-            "remote_liveness_probe_failed:ssh_destination_unavailable".to_owned(),
+            "remote_liveness_probe_failed:cleanup_sidecar_missing".to_owned(),
         );
         return None;
     };
-    let mut liveness_args = match hardened_ssh_automatic_replay_args(&invocation.args) {
+    if invocation.transport != job.remote_process_scope.transport {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            "remote_liveness_probe_failed:transport_mismatch".to_owned(),
+        );
+        return None;
+    }
+    let liveness_args = match remote_liveness_replay_args(invocation, pid, pgid) {
         Ok(args) => args,
         Err(_) => {
             push_unique_evidence(
                 &mut job.remote_process_scope.detection_evidence,
-                "remote_liveness_probe_failed:ssh_control_args_not_replay_safe".to_owned(),
+                "remote_liveness_probe_failed:control_args_not_replay_safe".to_owned(),
             );
             return None;
         }
     };
-    liveness_args.push(ssh_remote_liveness_command(pid, pgid));
     let readback = match run_shell_cleanup_command_with_timeout(
         &invocation.command,
         &liveness_args,
@@ -15910,7 +16731,8 @@ fn mark_shell_job_remote_already_gone_local_stale(
         .map(|exit_code| format!(" Remote exit code from {SHELL_REMOTE_EXIT_MARKER}={exit_code}."))
         .unwrap_or_else(|| " Remote exit code is unavailable from the stale transport.".to_owned());
     let message = format!(
-        "{trigger} verified remote pid {pid}, process group {pgid} on '{remote_identity}' is already gone while the local SSH transport was still live or reported a mismatched terminal state; local process-tree termination status={local_termination_status}.{exit_message}"
+        "{trigger} verified remote pid {pid}, process group {pgid} on '{remote_identity}' is already gone while the local {} transport was still live or reported a mismatched terminal state; local process-tree termination status={local_termination_status}.{exit_message}",
+        job.remote_process_scope.transport
     );
     job.status = SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE.to_owned();
     job.completed_at
@@ -16113,8 +16935,8 @@ fn apply_remote_process_metadata(job: &mut ActRunShellJobStatus, metadata: Remot
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_TRACKED.to_owned();
     job.remote_process_scope.remote_cleanup_error_code = None;
     job.remote_process_scope.remote_cleanup_message = Some(format!(
-        "SSH remote process group tracked for cleanup: job_id={} remote_pid={} remote_pgid={}",
-        metadata.job_id, metadata.pid, metadata.pgid
+        "{} remote process group tracked for cleanup: job_id={} remote_pid={} remote_pgid={}",
+        job.remote_process_scope.transport, metadata.job_id, metadata.pid, metadata.pgid
     ));
     push_unique_evidence(
         &mut job.remote_process_scope.detection_evidence,
@@ -16215,8 +17037,10 @@ fn attempt_shell_job_remote_cleanup(
     trigger: &'static str,
     original_args: Option<&[String]>,
 ) -> Option<String> {
-    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
-        || !job.remote_process_scope.remote_cleanup_required
+    if !matches!(
+        job.remote_process_scope.transport.as_str(),
+        SHELL_REMOTE_TRANSPORT_SSH | SHELL_REMOTE_TRANSPORT_WSL
+    ) || !job.remote_process_scope.remote_cleanup_required
         || job.remote_process_scope.remote_cleanup_verified
     {
         return None;
@@ -16257,40 +17081,65 @@ fn attempt_shell_job_remote_cleanup(
         );
         return Some("remote_cleanup_sidecar_missing".to_owned());
     };
-    let Some(invocation) = shell_job_cleanup_invocation(job, original_args, Some(remote_cleanup))
-    else {
+    if remote_cleanup.transport != job.remote_process_scope.transport {
         mark_shell_job_remote_cleanup_failed(
             job,
             trigger,
-            "ssh_destination_unavailable",
-            "remote process metadata exists but the original SSH destination could not be parsed",
-        );
-        return Some("remote_cleanup_destination_unavailable".to_owned());
-    };
-    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
-        mark_shell_job_remote_cleanup_failed(
-            job,
-            trigger,
-            "ssh_destination_unavailable",
-            "remote process metadata exists but the original SSH destination could not be parsed",
-        );
-        return Some("remote_cleanup_destination_unavailable".to_owned());
-    };
-    if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
-        mark_shell_job_remote_cleanup_failed(
-            job,
-            trigger,
-            "remote_cleanup_control_args_unsafe",
+            "remote_cleanup_transport_mismatch",
             &format!(
-                "automatic SSH cleanup refused control option {reason}; replay could execute or load mutable local code"
+                "status transport={} sidecar transport={}",
+                job.remote_process_scope.transport, remote_cleanup.transport
             ),
         );
-        return Some("remote_cleanup_control_args_unsafe".to_owned());
+        return Some("remote_cleanup_transport_mismatch".to_owned());
     }
-    if !matches!(remote_cleanup.schema_version, 3 | 4) {
+    if remote_cleanup.transport == SHELL_REMOTE_TRANSPORT_SSH {
+        let Some(invocation) =
+            shell_job_cleanup_invocation(job, original_args, Some(remote_cleanup))
+        else {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "ssh_destination_unavailable",
+                "remote process metadata exists but the original SSH destination could not be parsed or did not match the durable sidecar",
+            );
+            return Some("remote_cleanup_destination_unavailable".to_owned());
+        };
+        let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "ssh_destination_unavailable",
+                "remote process metadata exists but the original SSH destination could not be parsed",
+            );
+            return Some("remote_cleanup_destination_unavailable".to_owned());
+        };
+        if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "remote_cleanup_control_args_unsafe",
+                &format!(
+                    "automatic SSH cleanup refused control option {reason}; replay could execute or load mutable local code"
+                ),
+            );
+            return Some("remote_cleanup_control_args_unsafe".to_owned());
+        }
+    } else if let Some(original_args) = original_args {
+        let request_digest = shell_args_sha256(original_args);
+        if remote_cleanup.request_args_sha256.as_deref() != Some(request_digest.as_str()) {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "wsl_request_binding_mismatch",
+                "the caller's original WSL argv does not match the request-bound durable cleanup sidecar",
+            );
+            return Some("remote_cleanup_request_binding_mismatch".to_owned());
+        }
+    }
+    if !matches!(remote_cleanup.schema_version, 3..=5) {
         let liveness = run_remote_liveness_probe(
-            &invocation.command,
-            &invocation.args,
+            remote_cleanup,
             &pid,
             &pgid,
             "legacy remote cleanup liveness probe",
@@ -16302,8 +17151,11 @@ fn attempt_shell_job_remote_cleanup(
                     SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
                 job.remote_process_scope.remote_cleanup_error_code = None;
                 job.remote_process_scope.remote_cleanup_message = Some(format!(
-                    "{trigger} verified schema-{} SSH remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
-                    remote_cleanup.schema_version, readback.stdout_sha256, readback.stderr_sha256
+                    "{trigger} verified schema-{} {} remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
+                    remote_cleanup.schema_version,
+                    remote_cleanup.transport,
+                    readback.stdout_sha256,
+                    readback.stderr_sha256
                 ));
                 Some("remote_cleanup_already_gone".to_owned())
             }
@@ -16347,8 +17199,7 @@ fn attempt_shell_job_remote_cleanup(
         // liveness probe may prove the old process is gone, but an alive result
         // can never authorize a signal.
         let liveness = run_remote_liveness_probe(
-            &invocation.command,
-            &invocation.args,
+            remote_cleanup,
             &pid,
             &pgid,
             "legacy remote cleanup liveness probe",
@@ -16360,8 +17211,8 @@ fn attempt_shell_job_remote_cleanup(
                     SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
                 job.remote_process_scope.remote_cleanup_error_code = None;
                 job.remote_process_scope.remote_cleanup_message = Some(format!(
-                    "{trigger} verified legacy SSH remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
-                    readback.stdout_sha256, readback.stderr_sha256
+                    "{trigger} verified legacy {} remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
+                    remote_cleanup.transport, readback.stdout_sha256, readback.stderr_sha256
                 ));
                 if job.error_code.as_deref()
                     == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
@@ -16402,22 +17253,21 @@ fn attempt_shell_job_remote_cleanup(
             }
         };
     };
-    let cleanup_command = ssh_remote_cleanup_command(&pid, &pgid, &ownership_identity);
-    let mut cleanup_args = match hardened_ssh_automatic_replay_args(&parts.control_args) {
-        Ok(args) => args,
-        Err(message) => {
-            mark_shell_job_remote_cleanup_failed(
-                job,
-                trigger,
-                "remote_cleanup_control_args_unsafe",
-                &message,
-            );
-            return Some("remote_cleanup_control_args_unsafe".to_owned());
-        }
-    };
-    cleanup_args.push(cleanup_command);
+    let cleanup_args =
+        match remote_cleanup_replay_args(remote_cleanup, &pid, &pgid, &ownership_identity) {
+            Ok(args) => args,
+            Err(message) => {
+                mark_shell_job_remote_cleanup_failed(
+                    job,
+                    trigger,
+                    "remote_cleanup_control_args_unsafe",
+                    &message,
+                );
+                return Some("remote_cleanup_control_args_unsafe".to_owned());
+            }
+        };
     let output = run_shell_cleanup_command_with_timeout(
-        &invocation.command,
+        &remote_cleanup.command,
         &cleanup_args,
         Duration::from_millis(SHELL_REMOTE_CLEANUP_TIMEOUT_MS),
     );
@@ -16439,7 +17289,8 @@ fn attempt_shell_job_remote_cleanup(
                 SHELL_REMOTE_CLEANUP_VERIFIED.to_owned();
             job.remote_process_scope.remote_cleanup_error_code = None;
             job.remote_process_scope.remote_cleanup_message = Some(format!(
-                "{trigger} verified SSH remote cleanup for remote pid {pid}, process group {pgid}; cleanup command status={status}"
+                "{trigger} verified {} remote cleanup for remote pid {pid}, process group {pgid}; cleanup command status={status}",
+                remote_cleanup.transport
             ));
             push_unique_evidence(
                 &mut job.remote_process_scope.detection_evidence,
@@ -16459,7 +17310,8 @@ fn attempt_shell_job_remote_cleanup(
                 trigger,
                 "remote_process_still_running",
                 &format!(
-                    "SSH remote cleanup command returned still_running for pid {pid}, pgid {pgid}"
+                    "{} remote cleanup command returned still_running for pid {pid}, pgid {pgid}",
+                    remote_cleanup.transport
                 ),
             );
             Some("remote_cleanup_still_running".to_owned())
@@ -16470,7 +17322,8 @@ fn attempt_shell_job_remote_cleanup(
                 trigger,
                 "remote_process_ownership_identity_mismatch",
                 &format!(
-                    "SSH remote cleanup refused to signal pid {pid}, pgid {pgid}: boot/start/token identity did not match the live process"
+                    "{} remote cleanup refused to signal pid {pid}, pgid {pgid}: boot/start/token identity did not match the live process",
+                    remote_cleanup.transport
                 ),
             );
             Some("remote_cleanup_identity_mismatch".to_owned())
@@ -16481,7 +17334,8 @@ fn attempt_shell_job_remote_cleanup(
                 trigger,
                 "cleanup_readback_unrecognized",
                 &format!(
-                    "SSH remote cleanup command did not produce a verified cleanup marker; exit={:?}; stdout_sha256={}; stderr_sha256={}; stdout_excerpt={:?}; stderr_excerpt={:?}",
+                    "{} remote cleanup command did not produce a verified cleanup marker; exit={:?}; stdout_sha256={}; stderr_sha256={}; stdout_excerpt={:?}; stderr_excerpt={:?}",
+                    remote_cleanup.transport,
                     readback.exit_code,
                     readback.stdout_sha256,
                     readback.stderr_sha256,
@@ -16516,7 +17370,8 @@ fn mark_shell_job_remote_cleanup_failed(
         .as_deref()
         .unwrap_or("unknown_pgid");
     let message = format!(
-        "{trigger} could not verify SSH remote cleanup for {remote_identity}; remote_pid={pid}; remote_pgid={pgid}; reason={reason}; detail={detail}"
+        "{trigger} could not verify {} remote cleanup for {remote_identity}; remote_pid={pid}; remote_pgid={pgid}; reason={reason}; detail={detail}",
+        job.remote_process_scope.transport
     );
     job.remote_process_scope.remote_cleanup_verified = false;
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_FAILED.to_owned();
@@ -16853,21 +17708,21 @@ fn run_shell_cleanup_command_with_timeout(
     // Opportunistically advance any earlier exact-owner cleanup without ever
     // blocking this invocation on an unbounded wait.
     let _ = unresolved_shell_child_owner_report();
-    let spawn_command = trusted_ssh_automatic_replay_executable(command).ok_or_else(|| {
+    let spawn_command = trusted_remote_replay_executable(command).ok_or_else(|| {
         format!(
-            "cleanup SSH executable is not one of the canonical trusted platform installations: {command}"
+            "remote replay executable is not one of the canonical trusted SSH/WSL platform installations: {command}"
         )
     })?;
     let mut stdout_capture = tempfile::tempfile()
-        .map_err(|error| format!("create cleanup ssh stdout capture failed: {error}"))?;
+        .map_err(|error| format!("create remote replay stdout capture failed: {error}"))?;
     let mut stderr_capture = tempfile::tempfile()
-        .map_err(|error| format!("create cleanup ssh stderr capture failed: {error}"))?;
+        .map_err(|error| format!("create remote replay stderr capture failed: {error}"))?;
     let stdout_child = stdout_capture
         .try_clone()
-        .map_err(|error| format!("clone cleanup ssh stdout capture failed: {error}"))?;
+        .map_err(|error| format!("clone remote replay stdout capture failed: {error}"))?;
     let stderr_child = stderr_capture
         .try_clone()
-        .map_err(|error| format!("clone cleanup ssh stderr capture failed: {error}"))?;
+        .map_err(|error| format!("clone remote replay stderr capture failed: {error}"))?;
     let mut child = StdCommand::new(&spawn_command);
     child
         .args(args)
@@ -16880,7 +17735,7 @@ fn run_shell_cleanup_command_with_timeout(
     apply_no_window_std(&mut child);
     let mut child = child
         .spawn()
-        .map_err(|error| format!("spawn cleanup ssh failed: {error}"))?;
+        .map_err(|error| format!("spawn remote replay command failed: {error}"))?;
     let owned_root_pid = child.id();
     // As in durable spawn, establish containment while the exact child is
     // suspended before asking a second kernel API for creation identity.
@@ -16909,7 +17764,7 @@ fn run_shell_cleanup_command_with_timeout(
                 })
             });
             return Err(format!(
-                "cleanup ssh pid {owned_root_pid} job ownership failed before execution: {}; exact_child_cleanup={reap:?}; tree_cleanup_verified={tree_cleanup_verified}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}",
+                "remote replay pid {owned_root_pid} job ownership failed before execution: {}; exact_child_cleanup={reap:?}; tree_cleanup_verified={tree_cleanup_verified}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}",
                 assignment_error.message,
             ));
         }
@@ -16939,7 +17794,7 @@ fn run_shell_cleanup_command_with_timeout(
                 })
             });
             return Err(format!(
-                "cleanup ssh pid {owned_root_pid} identity capture failed before execution: {identity_error}; exact_child_cleanup={reap:?}; job_close={job_close:?}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+                "remote replay pid {owned_root_pid} identity capture failed before execution: {identity_error}; exact_child_cleanup={reap:?}; job_close={job_close:?}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
             ));
         }
     };
@@ -16966,7 +17821,7 @@ fn run_shell_cleanup_command_with_timeout(
             })
         });
         return Err(format!(
-            "cleanup ssh pid {owned_root_pid} contained resume failed: {resume_error}; {diagnostic}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+            "remote replay pid {owned_root_pid} contained resume failed: {resume_error}; {diagnostic}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
         ));
     }
     let started = Instant::now();
@@ -16988,7 +17843,7 @@ fn run_shell_cleanup_command_with_timeout(
                     cleanup,
                 );
                 return Err(format!(
-                    "cleanup ssh capture length inspection failed; stdout_error={:?}; stderr_error={:?}; {}",
+                    "remote replay capture length inspection failed; stdout_error={:?}; stderr_error={:?}; {}",
                     stdout_result.err(),
                     stderr_result.err(),
                     cleanup_diagnostic,
@@ -17013,7 +17868,7 @@ fn run_shell_cleanup_command_with_timeout(
                 cleanup,
             );
             return Err(format!(
-                "cleanup ssh diagnostic output exceeded the {SHELL_CLEANUP_CAPTURE_CAP_BYTES}-byte per-stream cap; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                "remote replay diagnostic output exceeded the {SHELL_CLEANUP_CAPTURE_CAP_BYTES}-byte per-stream cap; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
             ));
         }
         let poll = match child.try_wait() {
@@ -17034,7 +17889,7 @@ fn run_shell_cleanup_command_with_timeout(
                     cleanup,
                 );
                 return Err(format!(
-                    "poll cleanup ssh failed: {error}; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                    "poll remote replay command failed: {error}; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
                 ));
             }
         };
@@ -17056,7 +17911,7 @@ fn run_shell_cleanup_command_with_timeout(
                     cleanup,
                 );
                 return Err(format!(
-                    "cleanup ssh timed out after {} ms; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                    "remote replay command timed out after {} ms; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
                     timeout.as_millis(),
                 ));
             }
@@ -17072,7 +17927,7 @@ fn run_shell_cleanup_command_with_timeout(
         Err(error) => {
             let job_close = process_job.close_checked();
             return Err(format!(
-                "{error}; completed cleanup ssh job close readback={job_close:?}"
+                "{error}; completed remote replay job close readback={job_close:?}"
             ));
         }
     };
@@ -17085,13 +17940,13 @@ fn run_shell_cleanup_command_with_timeout(
         Err(error) => {
             let job_close = process_job.close_checked();
             return Err(format!(
-                "{error}; completed cleanup ssh job close readback={job_close:?}"
+                "{error}; completed remote replay job close readback={job_close:?}"
             ));
         }
     };
     process_job
         .close_checked()
-        .map_err(|error| format!("completed cleanup ssh job handle close failed: {error}"))?;
+        .map_err(|error| format!("completed remote replay job handle close failed: {error}"))?;
     Ok(CleanupCommandReadback {
         exit_code,
         stdout: stdout.text,
@@ -17132,22 +17987,22 @@ fn read_bounded_cleanup_capture(
 ) -> Result<BoundedCleanupCapture, String> {
     let len = file
         .metadata()
-        .map_err(|error| format!("read cleanup ssh {stream} capture metadata failed: {error}"))?
+        .map_err(|error| format!("read remote replay {stream} capture metadata failed: {error}"))?
         .len();
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek cleanup ssh {stream} capture failed: {error}"))?;
+        .map_err(|error| format!("seek remote replay {stream} capture failed: {error}"))?;
     let mut bytes = Vec::new();
     file.take(cap_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("read cleanup ssh {stream} capture failed: {error}"))?;
+        .map_err(|error| format!("read remote replay {stream} capture failed: {error}"))?;
     let buffered_len = u64::try_from(bytes.len()).map_err(|error| {
         format!(
-            "cleanup ssh {stream} buffered capture length cannot be represented: {error}; physical_bytes={len}"
+            "remote replay {stream} buffered capture length cannot be represented: {error}; physical_bytes={len}"
         )
     })?;
     if len > cap_bytes || buffered_len > cap_bytes {
         return Err(format!(
-            "cleanup ssh {stream} capture exceeded the {cap_bytes}-byte diagnostic cap (actual_bytes={len})"
+            "remote replay {stream} capture exceeded the {cap_bytes}-byte diagnostic cap (actual_bytes={len})"
         ));
     }
     Ok(BoundedCleanupCapture {
@@ -17157,11 +18012,11 @@ fn read_bounded_cleanup_capture(
     })
 }
 
-fn ssh_remote_cleanup_command(
+fn remote_cleanup_python_args(
     pid: &str,
     pgid: &str,
     identity: &RemoteProcessOwnershipIdentity,
-) -> String {
+) -> Vec<String> {
     // A pidfd is the stable kernel reference that numeric PIDs are not. The
     // script verifies boot/start/token both before and after pidfd_open, then
     // signals only that pidfd. The owned guardian's TERM trap performs the
@@ -17285,19 +18140,32 @@ finally:
             &SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS.to_string(),
         );
     let script = format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{cleanup_script}");
-    format!(
-        "python3 -c {} {} {} {} {} {} {}",
-        posix_single_quote(&script),
-        posix_single_quote(pid),
-        posix_single_quote(pgid),
-        posix_single_quote(&identity.boot_id),
-        posix_single_quote(&identity.start_time),
-        posix_single_quote(&identity.ownership_token),
-        posix_single_quote(SHELL_REMOTE_CLEANUP_MARKER),
-    )
+    vec![
+        "python3".to_owned(),
+        "-c".to_owned(),
+        script,
+        pid.to_owned(),
+        pgid.to_owned(),
+        identity.boot_id.clone(),
+        identity.start_time.clone(),
+        identity.ownership_token.clone(),
+        SHELL_REMOTE_CLEANUP_MARKER.to_owned(),
+    ]
 }
 
-fn ssh_remote_liveness_command(pid: &str, pgid: &str) -> String {
+fn ssh_remote_cleanup_command(
+    pid: &str,
+    pgid: &str,
+    identity: &RemoteProcessOwnershipIdentity,
+) -> String {
+    remote_cleanup_python_args(pid, pgid, identity)
+        .iter()
+        .map(|arg| posix_single_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn remote_liveness_python_args(pid: &str, pgid: &str) -> Vec<String> {
     const SCRIPT: &str = r#"pid_text = sys.argv[1]
 pgid_text = sys.argv[2]
 marker = sys.argv[3]
@@ -17336,13 +18204,22 @@ else:
     emit("already_gone", 0)
 "#;
     let script = format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{SCRIPT}");
-    format!(
-        "python3 -c {} {} {} {}",
-        posix_single_quote(&script),
-        posix_single_quote(pid),
-        posix_single_quote(pgid),
-        posix_single_quote(SHELL_REMOTE_LIVENESS_MARKER),
-    )
+    vec![
+        "python3".to_owned(),
+        "-c".to_owned(),
+        script,
+        pid.to_owned(),
+        pgid.to_owned(),
+        SHELL_REMOTE_LIVENESS_MARKER.to_owned(),
+    ]
+}
+
+fn ssh_remote_liveness_command(pid: &str, pgid: &str) -> String {
+    remote_liveness_python_args(pid, pgid)
+        .iter()
+        .map(|arg| posix_single_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_remote_cleanup_status(
@@ -17578,6 +18455,7 @@ fn spawn_failure_readback(
 fn spawn_shell_job_child(
     params: &ActRunShellStartParams,
     spawn_plan: &ShellJobSpawnPlan,
+    job_id: &str,
     stdout_file: fs::File,
     stderr_file: fs::File,
     context: Option<&ShellExecutionContext>,
@@ -17604,12 +18482,14 @@ fn spawn_shell_job_child(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        // The monitor and the kill-on-close job are the intended long-lived
-        // owners. Before job assignment succeeds, however, Tokio's exact child
-        // handle is the only authority available on several error paths. Keep
-        // kill-on-drop armed so an exceptional unwind/failed bounded reap
-        // cannot detach a suspended or uncontained child.
-        .kill_on_drop(true);
+        // The kill-on-close job is the fail-closed owner until the durable
+        // restart-survival handoff below is committed.  `kill_on_drop` must be
+        // disabled: Tokio drops monitor tasks during a graceful daemon restart,
+        // and killing the exact child there would recreate #1807/#1808 even
+        // after the job-object kill bit was correctly disarmed.  Every ordinary
+        // error path below explicitly terminates/reaps while the still-armed job
+        // handle is retained.
+        .kill_on_drop(false);
     apply_no_window_tokio(&mut command);
 
     let mut child = command
@@ -17689,11 +18569,7 @@ fn spawn_shell_job_child(
     // Containment only needs the exact suspended child's PID. Acquire and read
     // back the kill-on-close job before identity capture so a GetProcessTimes
     // failure cannot leave an uncontained suspended process behind.
-    let mut process_job = match assign_owned_process_job(
-        pid,
-        "act_run_shell_start",
-        params.job_id.as_deref(),
-    ) {
+    let mut process_job = match assign_owned_process_job(pid, "act_run_shell_start", Some(job_id)) {
         Ok(process_job) => process_job,
         Err(assignment_error) => {
             let cleanup = terminate_and_reap_tokio_child_bounded(
@@ -17963,6 +18839,36 @@ async fn monitor_shell_job(
             &format!("{error:?}"),
         );
     }
+    match process_job.terminate_members_and_close_checked(
+        "act_run_shell_monitor_finalize",
+        status.pid.unwrap_or_default(),
+        &status.job_id,
+    ) {
+        Ok(readback) => {
+            push_unique_evidence(
+                &mut status.remote_process_scope.detection_evidence,
+                format!("local_job_object_terminal_readback:{readback}"),
+            );
+        }
+        Err(error) => {
+            let prior_error = status.error_message.take();
+            status.status = "job_object_terminal_cleanup_failed".to_owned();
+            status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+            status.error_message = Some(match prior_error {
+                Some(prior) => {
+                    format!("{prior}; owned process Job Object terminal cleanup failed: {error}")
+                }
+                None => format!("owned process Job Object terminal cleanup failed: {error}"),
+            });
+            tracing::error!(
+                code = "M4_ACT_RUN_SHELL_JOB_OBJECT_TERMINAL_CLEANUP_FAILED",
+                job_id = %status.job_id,
+                pid = ?status.pid,
+                error,
+                "durable shell monitor could not verify terminal cleanup of its owned Windows process tree"
+            );
+        }
+    }
     persist_shell_job_local_terminal_status(&paths, &status);
     verify_shell_job_remote_cleanup_after_terminal(
         &mut status,
@@ -17970,22 +18876,6 @@ async fn monitor_shell_job(
         "act_run_shell_start_process_exit",
         Some(&original_args),
     );
-    if let Err(error) = process_job.close_checked() {
-        let prior_error = status.error_message.take();
-        status.status = "job_handle_close_failed".to_owned();
-        status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-        status.error_message = Some(match prior_error {
-            Some(prior) => format!("{prior}; owned process job close failed: {error}"),
-            None => format!("owned process job close failed: {error}"),
-        });
-        tracing::error!(
-            code = "M4_ACT_RUN_SHELL_JOB_HANDLE_CLOSE_FAILED",
-            job_id = %status.job_id,
-            pid = ?status.pid,
-            error,
-            "durable shell monitor could not verify owned Windows job handle closure"
-        );
-    }
     if let Err(error) = write_shell_job_status(&paths.status_path, &status) {
         tracing::error!(
             code = "M4_ACT_RUN_SHELL_JOB_FINAL_STATUS_WRITE_FAILED",
@@ -18003,6 +18893,194 @@ async fn monitor_shell_job(
             timed_out = status.timed_out,
             cancel_requested = status.cancel_requested,
             "readback=act_run_shell_start after=process_complete_status_persisted"
+        );
+    }
+}
+
+/// Continue monitoring a durable child whose exact process survived a daemon
+/// restart.  The handle was opened and identity-checked before the new owner row
+/// was committed, so exit code and kernel runtime remain observable even if the
+/// process exits immediately after adoption.
+#[cfg(windows)]
+async fn monitor_adopted_shell_job(
+    child: AdoptedShellChildHandle,
+    mut process_job: OwnedProcessJob,
+    mut status: ActRunShellJobStatus,
+    paths: ShellJobPaths,
+) {
+    let mut timed_out = false;
+    let mut wait_error = None;
+    let mut termination_deadline = None;
+    let exit_code = loop {
+        match child.poll() {
+            Ok(AdoptedShellChildPoll::Exited(code)) => break code,
+            Ok(AdoptedShellChildPoll::Running) => {}
+            Err(error) => {
+                wait_error = Some(format!("adopted_child_wait_failed:{error}"));
+                break None;
+            }
+        }
+
+        if let Some(deadline) = termination_deadline {
+            if Instant::now() >= deadline {
+                wait_error = Some(format!(
+                    "adopted child pid {} remained live beyond the {} ms timeout cleanup backstop",
+                    child.identity.pid, SHELL_CHILD_REAP_BACKSTOP_MS
+                ));
+                break None;
+            }
+        } else if status
+            .timeout_ms
+            .is_some_and(|timeout_ms| child.elapsed() >= Duration::from_millis(timeout_ms))
+        {
+            timed_out = true;
+            let identity = child.identity.clone();
+            let termination =
+                tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(&identity))
+                    .await;
+            match termination {
+                Ok(readback) => {
+                    tracing::warn!(
+                        code = "M4_ACT_RUN_SHELL_ADOPTED_TIMEOUT_TERMINATION",
+                        job_id = %status.job_id,
+                        pid = child.identity.pid,
+                        timeout_ms = ?status.timeout_ms,
+                        termination = ?readback,
+                        "restart-adopted durable job exceeded its original lifetime cap"
+                    );
+                }
+                Err(error) => {
+                    wait_error = Some(format!(
+                        "adopted child timeout termination task failed: {error}"
+                    ));
+                    break None;
+                }
+            }
+            termination_deadline =
+                Some(Instant::now() + Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    if let Ok(latest) = read_shell_job_status(&paths.status_path, &status.job_id) {
+        status.cancel_requested |= latest.cancel_requested;
+        if latest.status == "cancel_requested" {
+            status.status = latest.status;
+        }
+        if latest.remote_process_scope.remote_cleanup_required {
+            status.remote_process_scope = latest.remote_process_scope;
+        }
+        if latest.error_code.as_deref()
+            == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+            && status.error_code.is_none()
+        {
+            status.error_code = latest.error_code;
+            status.error_message = latest.error_message;
+        }
+    }
+    status.exit_code = exit_code;
+    status.timed_out = timed_out;
+    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    let duration = child.runtime().unwrap_or_else(|| child.elapsed());
+    status.duration_ms = Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    if let Some(error) = wait_error {
+        status.status = "wait_failed".to_owned();
+        status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+        status.error_message = Some(error);
+    } else if status.timed_out {
+        status.status =
+            terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
+                .to_owned();
+        let timeout_ms = status.timeout_ms.unwrap_or_default();
+        status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
+        status.error_message = Some(format!(
+            "durable job timeout_ms cap expired after {timeout_ms} ms across a daemon restart; the exact adopted process tree was terminated"
+        ));
+        mark_shell_job_remote_cleanup_unverified(
+            &mut status,
+            "act_run_shell_adopted_timeout",
+            "timeout_exact_adopted_process_tree_termination_requested",
+        );
+    } else {
+        status.status =
+            terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
+                .to_owned();
+    }
+    if let Err(error) = refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths) {
+        mark_shell_job_remote_cleanup_failed(
+            &mut status,
+            "act_run_shell_adopted_remote_metadata_readback",
+            "remote_metadata_read_failed",
+            &format!("{error:?}"),
+        );
+    } else if let Err(error) = reconcile_shell_job_remote_exit_marker(
+        &mut status,
+        &paths,
+        false,
+        "act_run_shell_adopted_remote_exit_readback",
+    ) {
+        mark_shell_job_remote_cleanup_failed(
+            &mut status,
+            "act_run_shell_adopted_remote_exit_readback",
+            "remote_exit_marker_read_failed",
+            &format!("{error:?}"),
+        );
+    }
+    match process_job.terminate_members_and_close_checked(
+        "act_run_shell_adopted_monitor_finalize",
+        child.identity.pid,
+        &status.job_id,
+    ) {
+        Ok(readback) => push_unique_evidence(
+            &mut status.remote_process_scope.detection_evidence,
+            format!("local_job_object_terminal_readback:{readback}"),
+        ),
+        Err(error) => {
+            let prior_error = status.error_message.take();
+            status.status = "job_object_terminal_cleanup_failed".to_owned();
+            status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+            status.error_message = Some(match prior_error {
+                Some(prior) => format!(
+                    "{prior}; adopted owned process Job Object terminal cleanup failed: {error}"
+                ),
+                None => {
+                    format!("adopted owned process Job Object terminal cleanup failed: {error}")
+                }
+            });
+            tracing::error!(
+                code = "M4_ACT_RUN_SHELL_ADOPTED_JOB_OBJECT_TERMINAL_CLEANUP_FAILED",
+                job_id = %status.job_id,
+                pid = child.identity.pid,
+                error,
+                "restart-adopted monitor could not verify terminal cleanup of its owned Windows process tree"
+            );
+        }
+    }
+    persist_shell_job_local_terminal_status(&paths, &status);
+    verify_shell_job_remote_cleanup_after_terminal(
+        &mut status,
+        &paths,
+        "act_run_shell_adopted_process_exit",
+        None,
+    );
+    if let Err(error) = write_shell_job_status(&paths.status_path, &status) {
+        tracing::error!(
+            code = "M4_ACT_RUN_SHELL_ADOPTED_FINAL_STATUS_WRITE_FAILED",
+            job_id = %status.job_id,
+            pid = ?status.pid,
+            error = ?error,
+            "restart-adopted durable shell monitor could not persist final job status"
+        );
+    } else {
+        tracing::info!(
+            code = "M4_ACT_RUN_SHELL_ADOPTED_COMPLETED",
+            job_id = %status.job_id,
+            pid = ?status.pid,
+            status = %status.status,
+            exit_code = ?status.exit_code,
+            timed_out = status.timed_out,
+            cancel_requested = status.cancel_requested,
+            "readback=act_run_shell_adopted after=process_complete_status_persisted"
         );
     }
 }
@@ -18094,6 +19172,192 @@ impl Drop for ChildRuntimeProbe {
         let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle()) };
     }
 }
+
+/// Exact kernel process handle retained by a new daemon after adopting a
+/// restart-surviving durable shell child.  Opening the handle while the child is
+/// still live preserves its exit code and kernel timings even after the process
+/// leaves the process table.
+#[cfg(windows)]
+struct AdoptedShellChildHandle {
+    raw: isize,
+    identity: ActRunShellLocalProcessIdentity,
+    creation_ticks_100ns: u64,
+}
+
+#[cfg(windows)]
+enum AdoptedShellChildPoll {
+    Running,
+    Exited(Option<i32>),
+}
+
+#[cfg(windows)]
+impl AdoptedShellChildHandle {
+    fn open(identity: &ActRunShellLocalProcessIdentity) -> Result<Self, String> {
+        use windows::Win32::{
+            Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{
+                GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            },
+        };
+
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                identity.pid,
+            )
+        }
+        .map_err(|error| {
+            format!(
+                "OpenProcess exact adopted child pid {} failed: {error}",
+                identity.pid
+            )
+        })?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if let Err(error) = unsafe {
+            GetProcessTimes(
+                handle,
+                std::ptr::addr_of_mut!(creation),
+                std::ptr::addr_of_mut!(exit),
+                std::ptr::addr_of_mut!(kernel),
+                std::ptr::addr_of_mut!(user),
+            )
+        } {
+            let close = unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "GetProcessTimes exact adopted child pid {} failed: {error}; close={close:?}",
+                identity.pid
+            ));
+        }
+        let creation_ticks_100ns = filetime_ticks_100ns(creation);
+        if creation_ticks_100ns != identity.start_time {
+            let close = unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "exact adopted child pid {} creation identity mismatch: expected={} actual={creation_ticks_100ns}; close={close:?}",
+                identity.pid, identity.start_time
+            ));
+        }
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        if wait == WAIT_FAILED {
+            let wait_error = windows::core::Error::from_thread();
+            let close = unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "WaitForSingleObject exact adopted child pid {} failed: {wait_error}; close={close:?}",
+                identity.pid
+            ));
+        }
+        if wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT {
+            let close = unsafe { CloseHandle(handle) };
+            return Err(format!(
+                "WaitForSingleObject exact adopted child pid {} returned unexpected state {wait:?}; close={close:?}",
+                identity.pid
+            ));
+        }
+        Ok(Self {
+            raw: handle.0 as isize,
+            identity: identity.clone(),
+            creation_ticks_100ns,
+        })
+    }
+
+    fn handle(&self) -> windows::Win32::Foundation::HANDLE {
+        windows::Win32::Foundation::HANDLE(self.raw as *mut core::ffi::c_void)
+    }
+
+    fn poll(&self) -> Result<AdoptedShellChildPoll, String> {
+        use windows::Win32::{
+            Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        };
+        let wait = unsafe { WaitForSingleObject(self.handle(), 0) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(AdoptedShellChildPoll::Running);
+        }
+        if wait == WAIT_FAILED {
+            return Err(format!(
+                "WaitForSingleObject adopted shell child pid {} failed: {}",
+                self.identity.pid,
+                windows::core::Error::from_thread()
+            ));
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(format!(
+                "WaitForSingleObject adopted shell child pid {} returned unexpected state {wait:?}",
+                self.identity.pid
+            ));
+        }
+        let mut code = 0_u32;
+        unsafe { GetExitCodeProcess(self.handle(), &raw mut code) }.map_err(|error| {
+            format!(
+                "GetExitCodeProcess adopted shell child pid {} failed: {error}",
+                self.identity.pid
+            )
+        })?;
+        const STILL_ACTIVE: u32 = 259;
+        if code == STILL_ACTIVE {
+            return Err(format!(
+                "adopted shell child pid {} was signaled but GetExitCodeProcess returned STILL_ACTIVE",
+                self.identity.pid
+            ));
+        }
+        Ok(AdoptedShellChildPoll::Exited(Some(i32::from_ne_bytes(
+            code.to_ne_bytes(),
+        ))))
+    }
+
+    fn elapsed(&self) -> Duration {
+        const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+        let creation_unix_100ns = self
+            .creation_ticks_100ns
+            .saturating_sub(WINDOWS_TO_UNIX_EPOCH_100NS);
+        let now_100ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_nanos() / 100).unwrap_or(u64::MAX)
+            });
+        Duration::from_nanos(
+            now_100ns
+                .saturating_sub(creation_unix_100ns)
+                .saturating_mul(100),
+        )
+    }
+
+    fn runtime(&self) -> Option<Duration> {
+        use windows::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetProcessTimes(
+                self.handle(),
+                std::ptr::addr_of_mut!(creation),
+                std::ptr::addr_of_mut!(exit),
+                std::ptr::addr_of_mut!(kernel),
+                std::ptr::addr_of_mut!(user),
+            )
+        }
+        .ok()?;
+        let creation = filetime_ticks_100ns(creation);
+        let exit = filetime_ticks_100ns(exit);
+        (exit != 0 && exit >= creation)
+            .then(|| Duration::from_nanos(exit.saturating_sub(creation).saturating_mul(100)))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AdoptedShellChildHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle()) };
+    }
+}
+
+#[cfg(windows)]
+unsafe impl Send for AdoptedShellChildHandle {}
 
 #[cfg(windows)]
 fn filetime_ticks_100ns(value: windows::Win32::Foundation::FILETIME) -> u64 {
@@ -20640,10 +21904,212 @@ fn persist_running_shell_job_status_or_cleanup(
     ))
 }
 
+/// Transfer a newly admitted Windows durable job from daemon-lifetime
+/// containment to restart-survivable monitoring.
+///
+/// The two durable writes around the kernel mutations are intentional. If the
+/// daemon dies before installing the child-owned keeper, the armed Job Object
+/// reaps the child. After the keeper exists, the named Job Object survives with
+/// its full membership even if the daemon dies before disarm. Recovery reopens
+/// it, verifies the exact child is a member, proves kill-on-close is still
+/// armed, and only then changes ownership. The final row is written only after
+/// that armed containment was independently read back.
+#[cfg(windows)]
+fn handoff_shell_job_to_restart_survivable_monitoring(
+    paths: &ShellJobPaths,
+    status: &mut ActRunShellJobStatus,
+    child: &mut tokio::process::Child,
+    local_process_identity: &ActRunShellLocalProcessIdentity,
+    process_job: &mut OwnedProcessJob,
+    started: Instant,
+) -> Result<(), ErrorData> {
+    let Some(supervisor) = status.supervisor.as_mut() else {
+        return fail_shell_job_restart_survival_handoff(
+            paths,
+            status,
+            child,
+            local_process_identity,
+            process_job,
+            started,
+            "supervisor_identity_missing",
+            "durable job status had no supervisor identity before the restart-survival handoff",
+            None,
+        );
+    };
+    supervisor.child_containment = SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING.to_owned();
+    persist_running_shell_job_status_or_cleanup(
+        paths,
+        status,
+        child,
+        local_process_identity,
+        process_job,
+        started,
+    )?;
+
+    if let Err(error) =
+        process_job.install_child_job_keeper_handle(local_process_identity, &status.job_id)
+    {
+        let detail = error.message.to_string();
+        return fail_shell_job_restart_survival_handoff(
+            paths,
+            status,
+            child,
+            local_process_identity,
+            process_job,
+            started,
+            "job_object_child_keeper_install_failed",
+            &detail,
+            error.data,
+        );
+    }
+
+    if let Err(error) = process_job.arm_kill_on_close(
+        "act_run_shell_start",
+        local_process_identity.pid,
+        Some(&status.job_id),
+    ) {
+        let detail = error.message.to_string();
+        return fail_shell_job_restart_survival_handoff(
+            paths,
+            status,
+            child,
+            local_process_identity,
+            process_job,
+            started,
+            "job_object_kill_on_close_keeper_readback_failed",
+            &detail,
+            error.data,
+        );
+    }
+
+    if let Some(supervisor) = status.supervisor.as_mut() {
+        supervisor.child_containment = SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned();
+    }
+    persist_running_shell_job_status_or_cleanup(
+        paths,
+        status,
+        child,
+        local_process_identity,
+        process_job,
+        started,
+    )?;
+    tracing::info!(
+        code = "M4_ACT_RUN_SHELL_RESTART_SURVIVAL_ARMED",
+        job_id = %status.job_id,
+        pid = local_process_identity.pid,
+        child_start_time = local_process_identity.start_time,
+        containment = SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE,
+        status_path = %paths.status_path.display(),
+        "durable shell child can survive daemon exit and was committed for exact-identity adoption"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn handoff_shell_job_to_restart_survivable_monitoring(
+    _paths: &ShellJobPaths,
+    _status: &mut ActRunShellJobStatus,
+    _child: &mut tokio::process::Child,
+    _local_process_identity: &ActRunShellLocalProcessIdentity,
+    _process_job: &mut OwnedProcessJob,
+    _started: Instant,
+) -> Result<(), ErrorData> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fail_shell_job_restart_survival_handoff(
+    paths: &ShellJobPaths,
+    status: &mut ActRunShellJobStatus,
+    child: &mut tokio::process::Child,
+    local_process_identity: &ActRunShellLocalProcessIdentity,
+    process_job: &mut OwnedProcessJob,
+    started: Instant,
+    reason: &'static str,
+    detail: &str,
+    underlying_data: Option<serde_json::Value>,
+) -> Result<(), ErrorData> {
+    let tree_termination = terminate_shell_job_process_tree(local_process_identity);
+    let initial_reap = terminate_and_reap_tokio_child_bounded(
+        child,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    );
+    let state_while_job_held = local_process_identity_state(local_process_identity);
+    let job_close = process_job.close_checked();
+    let post_job_close_reap = (!initial_reap.reaped
+        || !terminal_local_process_identity_state(&state_while_job_held))
+    .then(|| {
+        terminate_and_reap_tokio_child_bounded(
+            child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        )
+    });
+    let final_identity_state = local_process_identity_state(local_process_identity);
+    let exact_child_reaped = initial_reap.reaped
+        || post_job_close_reap
+            .as_ref()
+            .is_some_and(|readback| readback.reaped);
+    let cleanup_verified = exact_child_reaped
+        && tree_termination.remaining_process_ids.is_empty()
+        && terminal_local_process_identity_state(&final_identity_state)
+        && job_close.is_ok();
+    status.status = if cleanup_verified {
+        "restart_survival_handoff_failed_reaped".to_owned()
+    } else {
+        "restart_survival_handoff_failed_cleanup_unverified".to_owned()
+    };
+    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    status.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+    status.error_message = Some(format!(
+        "durable restart-survival handoff failed at {reason}: {detail}; cleanup_verified={cleanup_verified}; tree={tree_termination:?}; initial_reap={initial_reap:?}; state_while_job_held={state_while_job_held:?}; job_close={job_close:?}; post_job_close_reap={post_job_close_reap:?}; final_identity_state={final_identity_state:?}"
+    ));
+    let terminal_persistence = persist_and_verify_shell_job_status(&paths.status_path, status);
+    let terminal_status_persisted = terminal_persistence.is_ok();
+    let terminal_persistence_failure = terminal_persistence.err();
+    tracing::error!(
+        code = "M4_ACT_RUN_SHELL_RESTART_SURVIVAL_HANDOFF_FAILED",
+        job_id = %status.job_id,
+        pid = local_process_identity.pid,
+        reason,
+        detail,
+        cleanup_verified,
+        terminal_status_persisted,
+        terminal_persistence_failure = ?terminal_persistence_failure,
+        "durable shell restart-survival handoff failed closed and attempted exact owned cleanup"
+    );
+    Err(shell_tool_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!(
+            "act_run_shell_start could not establish restart-survivable ownership for pid {}; cleanup_verified={cleanup_verified}; terminal_status_persisted={terminal_status_persisted}: {detail}",
+            local_process_identity.pid
+        ),
+        json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "job_id": status.job_id,
+            "pid": local_process_identity.pid,
+            "reason": reason,
+            "detail": detail,
+            "underlying_data": underlying_data,
+            "cleanup_verified": cleanup_verified,
+            "tree_termination": tree_termination,
+            "initial_reap": initial_reap,
+            "state_while_job_held": state_while_job_held,
+            "job_close": format!("{job_close:?}"),
+            "post_job_close_reap": post_job_close_reap,
+            "final_identity_state": final_identity_state,
+            "terminal_status_persisted": terminal_status_persisted,
+            "terminal_persistence_failure": terminal_persistence_failure,
+            "status_path": paths.status_path,
+        }),
+    ))
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct OwnedProcessJob {
     handle: Option<windows::Win32::Foundation::HANDLE>,
+    name: Option<String>,
 }
 
 #[cfg(not(windows))]
@@ -20746,62 +22212,325 @@ impl OwnedProcessJob {
         pid: u32,
         resource_id: Option<&str>,
     ) -> Result<(), ErrorData> {
-        use windows::Win32::System::JobObjects::{
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
         let handle = self.handle(tool_name, pid)?;
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = Default::default();
-        let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-            .map_err(|error| {
-                shell_tool_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("{tool_name} failed to size Windows job object limits: {error}"),
-                    json!({
-                        "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "pid": pid,
-                        "resource_id": resource_id,
-                        "reason": "job_object_limit_size_failed",
-                    }),
-                )
-            })?;
-        unsafe {
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                limit_size,
-            )
-        }
-        .map_err(|error| {
-            shell_tool_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("{tool_name} failed to disarm Windows job object kill-on-close: {error}"),
-                json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "pid": pid,
-                    "resource_id": resource_id,
-                    "reason": "job_object_kill_on_close_disarm_failed",
-                }),
-            )
-        })?;
-        query_owned_process_job_kill_on_close(handle, false).map_err(|error| {
+        set_owned_process_job_kill_on_close(handle, false).map_err(|error| {
             shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
-                    "{tool_name} could not verify Windows job object kill-on-close disarm for pid {pid}: {error}"
+                    "{tool_name} failed to disarm and verify Windows job object kill-on-close: {error}"
                 ),
                 json!({
                     "code": error_codes::TOOL_INTERNAL_ERROR,
                     "pid": pid,
                     "resource_id": resource_id,
-                    "reason": "job_object_kill_on_close_disarm_readback_failed",
+                    "reason": "job_object_kill_on_close_disarm_failed",
                     "detail": error,
                 }),
             )
         })
+    }
+
+    fn arm_kill_on_close(
+        &self,
+        tool_name: &'static str,
+        pid: u32,
+        resource_id: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        let handle = self.handle(tool_name, pid)?;
+        set_owned_process_job_kill_on_close(handle, true).map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "{tool_name} failed to arm and verify Windows job object kill-on-close for pid {pid}: {error}"
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "resource_id": resource_id,
+                    "reason": "job_object_kill_on_close_arm_failed",
+                    "detail": error,
+                }),
+            )
+        })
+    }
+
+    fn install_child_job_keeper_handle(
+        &self,
+        identity: &ActRunShellLocalProcessIdentity,
+        job_id: &str,
+    ) -> Result<(), ErrorData> {
+        use windows::Win32::{
+            Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, HANDLE},
+            System::{
+                JobObjects::IsProcessInJob,
+                Threading::{
+                    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_DUP_HANDLE,
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                },
+            },
+        };
+
+        let job_handle = self.handle("act_run_shell_start", identity.pid)?;
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                identity.pid,
+            )
+        }
+        .map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell_start could not open exact child pid {} to install the restart-survival job keeper: {error}",
+                    identity.pid
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": identity.pid,
+                    "reason": "job_object_child_keeper_process_open_failed",
+                }),
+            )
+        })?;
+        let result = (|| {
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            unsafe {
+                GetProcessTimes(
+                    process,
+                    &raw mut creation,
+                    &raw mut exit,
+                    &raw mut kernel,
+                    &raw mut user,
+                )
+            }
+            .map_err(|error| format!("GetProcessTimes failed: {error}"))?;
+            let actual_start = filetime_ticks_100ns(creation);
+            if actual_start != identity.start_time {
+                return Err(format!(
+                    "child creation identity changed before keeper installation: expected={} actual={actual_start}",
+                    identity.start_time
+                ));
+            }
+            let mut in_job = windows::core::BOOL::default();
+            unsafe { IsProcessInJob(process, Some(job_handle), &raw mut in_job) }
+                .map_err(|error| format!("IsProcessInJob failed: {error}"))?;
+            if !in_job.as_bool() {
+                return Err("exact child is not a member of its named job object".to_owned());
+            }
+            let mut child_owned_handle = HANDLE::default();
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    job_handle,
+                    process,
+                    &raw mut child_owned_handle,
+                    0,
+                    false,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            }
+            .map_err(|error| format!("DuplicateHandle into exact child failed: {error}"))?;
+            if child_owned_handle.is_invalid() {
+                return Err("DuplicateHandle returned an invalid child-owned handle".to_owned());
+            }
+            Ok(child_owned_handle.0 as isize)
+        })();
+        let close = unsafe { CloseHandle(process) };
+        let child_handle_value = result.map_err(|detail| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell_start could not install the restart-survival job keeper for pid {}: {detail}; process_close={close:?}",
+                    identity.pid
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": identity.pid,
+                    "job_object_name": self.name,
+                    "reason": "job_object_child_keeper_install_failed",
+                    "detail": detail,
+                    "process_close": format!("{close:?}"),
+                }),
+            )
+        })?;
+        close.map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell_start installed child-owned job handle {child_handle_value:#x} but could not close the local exact-process handle: {error}"
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": identity.pid,
+                    "reason": "job_object_child_keeper_process_close_failed",
+                    "child_owned_handle": child_handle_value,
+                }),
+            )
+        })?;
+        tracing::info!(
+            code = "M4_ACT_RUN_SHELL_JOB_KEEPER_INSTALLED",
+            job_id,
+            pid = identity.pid,
+            job_object_name = ?self.name,
+            child_owned_handle = child_handle_value,
+            "exact child now keeps its named Job Object alive across supervisor exit"
+        );
+        Ok(())
+    }
+
+    fn open_for_restart_adoption(
+        job_id: &str,
+        child: &AdoptedShellChildHandle,
+        prior_containment: &str,
+    ) -> Result<Self, ErrorData> {
+        use windows::Win32::System::{
+            JobObjects::{IsProcessInJob, OpenJobObjectW},
+            SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_SET_ATTRIBUTES, JOB_OBJECT_TERMINATE},
+        };
+        use windows::core::PCWSTR;
+
+        let name = shell_job_object_name(job_id);
+        let name_wide = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            OpenJobObjectW(
+                JOB_OBJECT_QUERY | JOB_OBJECT_SET_ATTRIBUTES | JOB_OBJECT_TERMINATE,
+                false,
+                PCWSTR(name_wide.as_ptr()),
+            )
+        }
+        .map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "daemon startup could not reopen named Job Object {name} for restart-surviving pid {}: {error}",
+                    child.identity.pid
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": child.identity.pid,
+                    "job_object_name": name,
+                    "reason": "restart_adoption_job_object_open_failed",
+                }),
+            )
+        })?;
+        let owner = Self {
+            handle: Some(handle),
+            name: Some(name.clone()),
+        };
+        let mut in_job = windows::core::BOOL::default();
+        unsafe { IsProcessInJob(child.handle(), Some(handle), &raw mut in_job) }.map_err(
+            |error| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "daemon startup could not verify restart-surviving pid {} membership in {name}: {error}",
+                        child.identity.pid
+                    ),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "job_id": job_id,
+                        "pid": child.identity.pid,
+                        "job_object_name": name,
+                        "reason": "restart_adoption_job_membership_read_failed",
+                    }),
+                )
+            },
+        )?;
+        if !in_job.as_bool() {
+            return Err(shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "restart-surviving pid {} is not a member of its named Job Object {name}",
+                    child.identity.pid
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": child.identity.pid,
+                    "job_object_name": name,
+                    "reason": "restart_adoption_job_membership_mismatch",
+                }),
+            ));
+        }
+        let armed = read_owned_process_job_kill_on_close(handle).map_err(|detail| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "daemon startup could not read named Job Object containment for restart-surviving pid {}: {detail}",
+                    child.identity.pid
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": child.identity.pid,
+                    "job_object_name": name,
+                    "reason": "restart_adoption_job_limit_read_failed",
+                    "detail": detail,
+                }),
+            )
+        })?;
+        if !armed {
+            return Err(shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "named Job Object {name} is disarmed even though restart-survivable containment requires an armed child keeper"
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "job_id": job_id,
+                    "pid": child.identity.pid,
+                    "job_object_name": name,
+                    "reason": "restart_adoption_job_limit_state_mismatch",
+                    "prior_containment": prior_containment,
+                    "kill_on_close_armed": armed,
+                }),
+            ));
+        }
+        Ok(owner)
+    }
+
+    fn terminate_members_and_close_checked(
+        &mut self,
+        tool_name: &'static str,
+        pid: u32,
+        job_id: &str,
+    ) -> Result<String, String> {
+        use windows::Win32::System::JobObjects::TerminateJobObject;
+
+        let handle = self
+            .handle(tool_name, pid)
+            .map_err(|error| error.message.to_string())?;
+        let active_before = read_owned_process_job_active_processes(handle)?;
+        let arm = self
+            .arm_kill_on_close(tool_name, pid, Some(job_id))
+            .map_err(|error| error.message.to_string());
+        let terminate = unsafe { TerminateJobObject(handle, 1) }
+            .map_err(|error| format!("TerminateJobObject failed: {error}"));
+        let active_after = read_owned_process_job_active_processes(handle);
+        let close = self.close_checked();
+        let verified = arm.is_ok()
+            && terminate.is_ok()
+            && active_after.as_ref().is_ok_and(|active| *active == 0)
+            && close.is_ok();
+        let diagnostic = format!(
+            "job_object_name={:?}; active_before={active_before}; arm={arm:?}; terminate={terminate:?}; active_after={active_after:?}; close={close:?}; verified={verified}",
+            self.name
+        );
+        if verified {
+            Ok(diagnostic)
+        } else {
+            Err(diagnostic)
+        }
     }
 }
 
@@ -20819,6 +22548,53 @@ impl OwnedProcessJob {
     ) -> Result<(), ErrorData> {
         Ok(())
     }
+
+    fn arm_kill_on_close(
+        &self,
+        _tool_name: &'static str,
+        _pid: u32,
+        _resource_id: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        Ok(())
+    }
+
+    fn terminate_members_and_close_checked(
+        &mut self,
+        _tool_name: &'static str,
+        _pid: u32,
+        _job_id: &str,
+    ) -> Result<String, String> {
+        self.close_checked()?;
+        Ok("non_windows_no_job_object".to_owned())
+    }
+}
+
+#[cfg(windows)]
+fn set_owned_process_job_kill_on_close(
+    handle: windows::Win32::Foundation::HANDLE,
+    enabled: bool,
+) -> Result<(), String> {
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    if enabled {
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    }
+    let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+        .map_err(|error| format!("Windows job limit size conversion failed: {error}"))?;
+    unsafe {
+        SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            limit_size,
+        )
+    }
+    .map_err(|error| format!("SetInformationJobObject limit update failed: {error}"))?;
+    query_owned_process_job_kill_on_close(handle, enabled)
 }
 
 #[cfg(windows)]
@@ -20826,6 +22602,19 @@ fn query_owned_process_job_kill_on_close(
     handle: windows::Win32::Foundation::HANDLE,
     expected: bool,
 ) -> Result<(), String> {
+    let actual = read_owned_process_job_kill_on_close(handle)?;
+    if actual != expected {
+        return Err(format!(
+            "Windows job kill-on-close limit readback mismatch: expected={expected} actual={actual}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_owned_process_job_kill_on_close(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> Result<bool, String> {
     use windows::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, QueryInformationJobObject,
@@ -20855,13 +22644,43 @@ fn query_owned_process_job_kill_on_close(
         .BasicLimitInformation
         .LimitFlags
         .contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
-    if actual != expected {
+    Ok(actual)
+}
+
+#[cfg(windows)]
+fn read_owned_process_job_active_processes(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> Result<u32, String> {
+    use windows::Win32::System::JobObjects::{
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+        QueryInformationJobObject,
+    };
+
+    let size = u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+        .map_err(|error| format!("Windows job accounting size conversion failed: {error}"))?;
+    let mut readback = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    let mut returned_bytes = 0_u32;
+    unsafe {
+        QueryInformationJobObject(
+            Some(handle),
+            JobObjectBasicAccountingInformation,
+            (&raw mut readback).cast(),
+            size,
+            Some(&raw mut returned_bytes),
+        )
+    }
+    .map_err(|error| format!("QueryInformationJobObject accounting readback failed: {error}"))?;
+    if returned_bytes != size {
         return Err(format!(
-            "Windows job kill-on-close limit readback mismatch: expected={expected} actual={actual} limit_flags={:#x}",
-            readback.BasicLimitInformation.LimitFlags.0
+            "QueryInformationJobObject accounting returned {returned_bytes} bytes; expected {size}"
         ));
     }
-    Ok(())
+    Ok(readback.ActiveProcesses)
+}
+
+#[cfg(windows)]
+fn shell_job_object_name(job_id: &str) -> String {
+    format!("Local\\SynapseShellJob-{}", sha256_hex(job_id.as_bytes()))
 }
 
 #[cfg(windows)]
@@ -20872,7 +22691,7 @@ pub(crate) fn assign_owned_process_job(
 ) -> Result<OwnedProcessJob, ErrorData> {
     use windows::{
         Win32::{
-            Foundation::CloseHandle,
+            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
             System::{
                 JobObjects::{
                     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
@@ -20888,7 +22707,16 @@ pub(crate) fn assign_owned_process_job(
         core::{BOOL, PCWSTR},
     };
 
-    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(|error| {
+    let job_name = resource_id.map(shell_job_object_name);
+    let job_name_wide = job_name.as_ref().map(|name| {
+        name.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    });
+    let job_name_ptr = job_name_wide
+        .as_ref()
+        .map_or_else(PCWSTR::null, |name| PCWSTR(name.as_ptr()));
+    let job = unsafe { CreateJobObjectW(None, job_name_ptr) }.map_err(|error| {
         shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("{tool_name} failed to create a Windows job object: {error}"),
@@ -20900,7 +22728,27 @@ pub(crate) fn assign_owned_process_job(
             }),
         )
     })?;
-    let mut owner = OwnedProcessJob { handle: Some(job) };
+    if job_name.is_some() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let close = unsafe { CloseHandle(job) };
+        return Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "{tool_name} refused to reuse an existing named Windows job object for pid {pid}; close={close:?}"
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "pid": pid,
+                "resource_id": resource_id,
+                "job_object_name": job_name,
+                "reason": "job_object_name_already_exists",
+                "job_close": format!("{close:?}"),
+            }),
+        ));
+    }
+    let mut owner = OwnedProcessJob {
+        handle: Some(job),
+        name: job_name,
+    };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     let limit_size = match u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
