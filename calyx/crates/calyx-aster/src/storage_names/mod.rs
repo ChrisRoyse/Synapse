@@ -39,7 +39,7 @@
 //! `CALYX_ASTER_SST_ORDER_AMBIGUOUS` instead of guessing.
 
 use crate::cf::ColumnFamily;
-use calyx_core::{CalyxError, Result, SlotId};
+use calyx_core::{CalyxError, Result};
 use std::path::Path;
 
 /// Canonical SST file-name classes; each variant names the subsystem that
@@ -207,49 +207,13 @@ pub fn wal_segment_index(path: &Path) -> Result<Option<u64>> {
 /// [`ColumnFamily::name`] so a miszero-padded slot directory (which writers
 /// would never create) is rejected instead of silently aliasing another CF.
 pub fn parse_cf_dir_name(value: &str) -> Result<ColumnFamily> {
-    let cf = match value {
-        "base" => ColumnFamily::Base,
-        "collections" => ColumnFamily::Collections,
-        "relational" => ColumnFamily::Relational,
-        "document" => ColumnFamily::Document,
-        "kv" => ColumnFamily::Kv,
-        "timeseries" => ColumnFamily::TimeSeries,
-        "blob" => ColumnFamily::Blob,
-        "anchors" => ColumnFamily::Anchors,
-        "ledger" => ColumnFamily::Ledger,
-        "kernel" => ColumnFamily::Kernel,
-        "guard" => ColumnFamily::Guard,
-        "leapable" => ColumnFamily::Leapable,
-        "registry" => ColumnFamily::Registry,
-        "recurrence" => ColumnFamily::Recurrence,
-        "graph" => ColumnFamily::Graph,
-        "online" => ColumnFamily::Online,
-        "reactive" => ColumnFamily::Reactive,
-        "scalars" => ColumnFamily::Scalars,
-        "xterm" => ColumnFamily::XTerm,
-        "temporal_xterm" => ColumnFamily::TemporalXTerm,
-        "assay" => ColumnFamily::Assay,
-        "anneal_rollback" => ColumnFamily::AnnealRollback,
-        "anneal_health" => ColumnFamily::AnnealHealth,
-        "anneal_checksums" => ColumnFamily::AnnealChecksums,
-        "anneal_mistakes" => ColumnFamily::AnnealMistakes,
-        "anneal_replay" => ColumnFamily::AnnealReplay,
-        "anneal_heads" => ColumnFamily::AnnealHeads,
-        "anneal_bandit" => ColumnFamily::AnnealBandit,
-        "anneal_soak" => ColumnFamily::AnnealSoak,
-        "anneal_report" => ColumnFamily::AnnealReport,
-        "anneal_growth" => ColumnFamily::AnnealGrowth,
-        "anneal_operators" => ColumnFamily::AnnealOperators,
-        "time_index" => ColumnFamily::TimeIndex,
-        "index_btree" => ColumnFamily::IndexBtree,
-        "index_inverted" => ColumnFamily::IndexInverted,
-        _ if value.starts_with("slot_") => parse_slot_cf(value)?,
-        _ => {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "unknown durable CF directory {value}"
-            )));
-        }
-    };
+    // ColumnFamily owns the durable directory registry. Keeping a second
+    // hand-written list here caused newly added, valid CFs to be created by a
+    // commit and then rejected by the next router open (#1804). The canonical
+    // round-trip below still rejects aliases and malformed slot padding.
+    let cf = ColumnFamily::from_name(value).ok_or_else(|| {
+        CalyxError::aster_corrupt_shard(format!("unknown durable CF directory {value}"))
+    })?;
     if cf.name() != value {
         return Err(CalyxError::aster_corrupt_shard(format!(
             "non-canonical CF directory {value} (canonical form is {})",
@@ -257,19 +221,6 @@ pub fn parse_cf_dir_name(value: &str) -> Result<ColumnFamily> {
         )));
     }
     Ok(cf)
-}
-
-fn parse_slot_cf(value: &str) -> Result<ColumnFamily> {
-    let raw = value.ends_with(".raw");
-    let slot_text = value.trim_start_matches("slot_").trim_end_matches(".raw");
-    let slot = slot_text.parse::<u16>().map_err(|error| {
-        CalyxError::aster_corrupt_shard(format!("invalid slot CF directory {value}: {error}"))
-    })?;
-    if raw {
-        Ok(ColumnFamily::slot_raw(SlotId::new(slot)))
-    } else {
-        Ok(ColumnFamily::slot(SlotId::new(slot)))
-    }
 }
 
 fn classify_sst_stem(stem: &str) -> Option<SstName> {
