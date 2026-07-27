@@ -87,22 +87,26 @@ impl SearchDelta {
             if base.is_none() {
                 continue;
             }
+            let base = vault.get_base_at_snapshot(*cx_id, read.snapshot())?;
+            if base.panel_version != indexes.panel_version() {
+                continue;
+            }
+            let available_query_slots = query_slots
+                .iter()
+                .filter(|slot| base.slots.contains_key(slot))
+                .copied()
+                .collect::<BTreeSet<_>>();
             let cx = vault.get_selected_slots_at_snapshot(
                 *cx_id,
                 read.snapshot(),
-                query_slots.iter().copied(),
+                available_query_slots.iter().copied(),
             )?;
-            if cx.panel_version != indexes.panel_version() {
-                continue;
-            }
             for slot in query_slots {
-                let vector = cx.slots.get(slot).ok_or_else(|| {
-                    CalyxError::stale_derived(format!(
-                        "changed row {cx_id} in panel {} is missing queried slot {slot}",
-                        indexes.panel_version()
-                    ))
-                })?;
-                if !matches!(vector, SlotVector::Absent { .. }) {
+                if let Some(vector) = cx
+                    .slots
+                    .get(slot)
+                    .filter(|vector| !matches!(vector, SlotVector::Absent { .. }))
+                {
                     vectors
                         .get_mut(slot)
                         .expect("query slot initialized")
