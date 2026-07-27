@@ -10081,10 +10081,22 @@ function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
         return $null
     }
 
-    $logDir = Split-Path -Parent $SupervisorPath
-    $expectedLauncherPath = Join-Path $logDir 'synapse-daemon-launch-hidden.vbs'
+    # The launcher directory follows the supervisor. #1862 moved both out of the
+    # log directory, so a machine installed before that change still has a task
+    # registered against the LEGACY log-dir launcher. That legacy layout is a
+    # recognized setup-owned identity during upgrade -- refusing it would make
+    # the fix un-installable on exactly the machines that need it. It is accepted
+    # for ownership purposes only; section 7 then re-registers the task at the
+    # new location and deletes the legacy copies.
+    $launcherDir = Split-Path -Parent $SupervisorPath
     $expectedExecutablePath = Join-Path $env:SystemRoot 'System32\wscript.exe'
-    $expectedArguments = '//B //Nologo "{0}"' -f $expectedLauncherPath
+    $candidateLauncherDirs = @($launcherDir)
+    $legacyLauncherDir = $LogDir
+    if (-not [string]::IsNullOrWhiteSpace($legacyLauncherDir) -and
+        ([System.IO.Path]::GetFullPath($legacyLauncherDir).TrimEnd('\') -ine [System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\'))) {
+        $candidateLauncherDirs += $legacyLauncherDir
+    }
+
     $actions = @($task.Actions)
     if ($actions.Count -ne 1) {
         Die "SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task=$TaskName reason=$Reason expected_action_count=1 actual_action_count=$($actions.Count) remediation=the named task is not the single setup-owned Synapse daemon launcher; inspect the Task Scheduler action SoT and remove only the verified owner"
@@ -10101,22 +10113,38 @@ function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
     } catch {
         [string]$action.WorkingDirectory
     }
-    $expectedWorkingDirectory = [System.IO.Path]::GetFullPath($logDir).TrimEnd('\')
-    if ($actualExecutablePath -ine [System.IO.Path]::GetFullPath($expectedExecutablePath) -or
-        [string]$action.Arguments -cne $expectedArguments -or
-        $actualWorkingDirectory -ine $expectedWorkingDirectory) {
-        Die ("SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task={0} reason={1} expected_execute={2} actual_execute={3} expected_arguments={4} actual_arguments={5} expected_working_directory={6} actual_working_directory={7} remediation=the named task action is not the exact setup-owned Synapse hidden launcher; inspect Task Scheduler and refuse to stop or unregister an unverified task" -f `
+
+    $matchedLauncherDir = $null
+    foreach ($candidateDir in $candidateLauncherDirs) {
+        $candidateLauncher = Join-Path $candidateDir 'synapse-daemon-launch-hidden.vbs'
+        $candidateArguments = '//B //Nologo "{0}"' -f $candidateLauncher
+        $candidateWorkingDirectory = [System.IO.Path]::GetFullPath($candidateDir).TrimEnd('\')
+        if ($actualExecutablePath -ieq [System.IO.Path]::GetFullPath($expectedExecutablePath) -and
+            ([string]$action.Arguments -ceq $candidateArguments) -and
+            $actualWorkingDirectory -ieq $candidateWorkingDirectory) {
+            $matchedLauncherDir = $candidateWorkingDirectory
+            break
+        }
+    }
+
+    if (-not $matchedLauncherDir) {
+        $expectedRendering = (@($candidateLauncherDirs | ForEach-Object { '//B //Nologo "{0}"' -f (Join-Path $_ 'synapse-daemon-launch-hidden.vbs') }) -join ' | ')
+        Die ("SYNAPSE_TASK_HANDOFF_IDENTITY_MISMATCH task={0} reason={1} expected_execute={2} actual_execute={3} accepted_arguments={4} actual_arguments={5} accepted_working_directories={6} actual_working_directory={7} remediation=the named task action is not the exact setup-owned Synapse hidden launcher (current or pre-#1862 legacy layout); inspect Task Scheduler and refuse to stop or unregister an unverified task" -f `
             $TaskName,
             $Reason,
             $expectedExecutablePath,
             $action.Execute,
-            $expectedArguments,
+            $expectedRendering,
             $action.Arguments,
-            $expectedWorkingDirectory,
+            (@($candidateLauncherDirs) -join ' | '),
             $action.WorkingDirectory)
     }
 
-    Info "Synapse daemon scheduled task identity preflight verified: task=$TaskName state=$($task.State) reason=$Reason"
+    $isLegacyLayout = ($matchedLauncherDir -ine [System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\'))
+    if ($isLegacyLayout) {
+        Warn "SYNAPSE_TASK_HANDOFF_LEGACY_LAUNCHER_LAYOUT task=$TaskName reason=$Reason matched_launcher_dir=$matchedLauncherDir current_launcher_dir=$([System.IO.Path]::GetFullPath($launcherDir).TrimEnd('\')) effect=ownership accepted for this upgrade; the task will be re-registered against the runtime bin directory so log cleanup can no longer break autostart (#1862)"
+    }
+    Info "Synapse daemon scheduled task identity preflight verified: task=$TaskName state=$($task.State) reason=$Reason matched_launcher_dir=$matchedLauncherDir legacy_layout=$isLegacyLayout"
     return $task
 }
 
@@ -10503,7 +10531,7 @@ if ($ResumeChromeBridgePending) {
 if ($Remove) {
     Step "Removing scheduled task '$TaskName'"
     Assert-SynapseRestartAllowed -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart
-    $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+    $daemonSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
     Remove-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'remove'
     Stop-SynapseMcpProcesses -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
     if ($Purge) {
@@ -11116,7 +11144,7 @@ if (-not $liveDaemonHandoffRequired) {
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
     Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
-    $daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+    $daemonSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
     $null = Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'install_binary'
     if ($ForceRestart) {
         $null = Enter-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $token -Reason 'install_binary'
@@ -11308,7 +11336,13 @@ function Assert-SynapseAutostartLauncherIntegrity {
         [Parameter(Mandatory=$true)][string]$TaskName,
         [Parameter(Mandatory=$true)][string]$ExpectedLauncherPath,
         [Parameter(Mandatory=$true)][string]$LogDir,
-        [Parameter(Mandatory=$true)][string]$Phase
+        [Parameter(Mandatory=$true)][string]$Phase,
+        # Adoption preserves a live daemon's restart authority and does not
+        # re-register the task, so a machine still on the pre-#1862 layout must
+        # not be blocked from installing -- the defect is reported loudly and
+        # repaired by the next handoff run. On the post-register path the task
+        # was just written by this script, so the layout is enforced strictly.
+        [switch]$AllowLegacyLayout
     )
 
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -11326,16 +11360,30 @@ function Assert-SynapseAutostartLauncherIntegrity {
     }
     $registeredLauncher = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($match.Groups['path'].Value))
     $expected = [System.IO.Path]::GetFullPath($ExpectedLauncherPath)
-    if ($registeredLauncher -ine $expected) {
-        Die "SYNAPSE_AUTOSTART_LAUNCHER_PATH_MISMATCH task=$TaskName phase=$Phase registered=$registeredLauncher expected=$expected remediation=the registered task launches a different file than the one setup owns; re-run setup to re-register the task"
-    }
-    if (-not (Test-Path -LiteralPath $registeredLauncher -PathType Leaf)) {
-        Die "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task=$TaskName phase=$Phase task_state=$($task.State) registered_launcher=$registeredLauncher remediation=the autostart task is registered and reports State=$($task.State) but its launcher file does not exist, so it can never start the daemon; re-run setup to regenerate the launcher"
-    }
     $resolvedLogDir = [System.IO.Path]::GetFullPath($LogDir).TrimEnd('\')
     $launcherDir = [System.IO.Path]::GetFullPath((Split-Path -Parent $registeredLauncher)).TrimEnd('\')
-    if ($launcherDir -ieq $resolvedLogDir -or $launcherDir.StartsWith($resolvedLogDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-        Die "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher log_dir=$resolvedLogDir remediation=the daemon launcher must not live inside the log directory, where routine log cleanup silently deletes it; re-run setup so the launcher is written to the runtime bin directory"
+    $inLogDir = ($launcherDir -ieq $resolvedLogDir -or $launcherDir.StartsWith($resolvedLogDir + '\', [System.StringComparison]::OrdinalIgnoreCase))
+    $isLegacyLayout = ($registeredLauncher -ine $expected -and $inLogDir)
+
+    # Report the most specific defect. A registration that differs from what
+    # setup owns is either the known pre-#1862 log-dir layout -- in which case
+    # the useful message names that root cause -- or an unknown third-party
+    # action, which is an ownership problem.
+    if ($registeredLauncher -ine $expected -and -not $isLegacyLayout) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_PATH_MISMATCH task=$TaskName phase=$Phase registered=$registeredLauncher expected=$expected remediation=the registered task launches a different file than the one setup owns; re-run setup to re-register the task"
+    }
+    # A launcher that does not exist is the more urgent fact than where it lives:
+    # autostart is dead right now, not merely fragile.
+    if (-not (Test-Path -LiteralPath $registeredLauncher -PathType Leaf)) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task=$TaskName phase=$Phase task_state=$($task.State) registered_launcher=$registeredLauncher launcher_in_log_dir=$inLogDir remediation=the autostart task is registered and reports State=$($task.State) but its launcher file does not exist, so it can never start the daemon; re-run setup to regenerate the launcher"
+    }
+    if ($inLogDir -and -not $AllowLegacyLayout) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher expected=$expected log_dir=$resolvedLogDir remediation=the daemon launcher must not live inside the log directory, where routine log cleanup silently deletes it; re-run setup so the launcher is written to the runtime bin directory"
+    }
+    if ($inLogDir) {
+        # Adoption path on a pre-#1862 machine: the defect is real and must be
+        # visible, but blocking the install would leave it unfixable.
+        Warn "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher log_dir=$resolvedLogDir effect=autostart still lives in the log directory and remains vulnerable to log cleanup; it is repaired the next time setup performs a daemon handoff (run with -ForceRestart to repair now)"
     }
     $launcherHash = Get-SynapseFileSha256 -Path $registeredLauncher
     $launcherLength = (Get-Item -LiteralPath $registeredLauncher).Length
@@ -11396,7 +11444,7 @@ if (-not $liveDaemonHandoffRequired) {
     # Adoption preserves the running task, so its launcher must be proven intact
     # here too -- a Ready task with a deleted launcher would otherwise be adopted
     # as healthy and never start again after the next reboot (#1862).
-    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'adoption')
+    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'adoption' -AllowLegacyLayout)
     $liveAdoption = Assert-SynapseLiveDaemonAdoptionIdentity `
         -TaskName $TaskName `
         -HiddenLauncherPath $hiddenLauncher `
@@ -11669,7 +11717,7 @@ if (-not $ok) {
         $rollbackHealth = $null
         $rollbackLastHealthError = $null
         $rollbackLastSubsystemStatuses = '<none>'
-        $rollbackSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+        $rollbackSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
         $rollbackWatchdog = New-SynapseDaemonStartupWatchdog `
             -Phase 'rollback' `
             -LogDir $LogDir `
