@@ -1,4 +1,4 @@
-use super::{AsterVault, encode};
+use super::{AsterVault, encode, raw_commitment};
 use calyx_core::{CalyxError, Clock, Result, Seq};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -274,6 +274,12 @@ where
         let (cf, key, value) = crate::timetravel::entry_row(self.clock.now(), predicted);
         let mut all_rows = rows.to_vec();
         all_rows.push(encode::WriteRow { cf, key, value });
+        if !rows
+            .iter()
+            .any(|row| row.cf == crate::cf::ColumnFamily::Ledger)
+        {
+            all_rows.push(raw_commitment::commitment_row(predicted, &all_rows)?);
+        }
         let committed = match self.commit_prepared_rows(&all_rows) {
             Ok(committed) => committed,
             Err(error) => {

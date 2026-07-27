@@ -44,6 +44,7 @@ pub(crate) fn cf_tag(cf: ColumnFamily) -> Result<u8> {
         ColumnFamily::Guard => Ok(128),
         ColumnFamily::Leapable => Ok(129),
         ColumnFamily::Registry => Ok(130),
+        ColumnFamily::RawCommitment => Ok(131),
         ColumnFamily::Slot { slot, kind } => {
             let slot_id = slot.get();
             if slot_id > MAX_DURABLE_SLOT_ID {
@@ -98,6 +99,7 @@ pub(crate) fn decode_cf(tag: u8) -> Result<ColumnFamily> {
         128 => ColumnFamily::Guard,
         129 => ColumnFamily::Leapable,
         130 => ColumnFamily::Registry,
+        131 => ColumnFamily::RawCommitment,
         16..=63 => ColumnFamily::slot(SlotId::new((tag - 16) as u16)),
         64..=111 => ColumnFamily::slot_raw(SlotId::new((tag - 64) as u16)),
         _ => {

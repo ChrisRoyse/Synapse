@@ -18,7 +18,7 @@ Synapse is a Windows-native perception/action/autonomy daemon that *captures* ev
 - **Everything Synapse's storage did before, preserved exactly**: byte-identical keys, JSON values you can inspect, per-class TTLs (24 h events → 90 d timeline → never-expiring operator decisions), soft/hard byte caps, oldest-first GC, 4-level disk-pressure shedding, schema versioning, dump/inspect tooling with redaction.
 - **Calyx adds:**
   - **Time-travel reads** — MVCC snapshots let `replay` and debugging read the store *as it was*, consistently.
-  - **Tamper-evident history** — every mutation is an entry in an append-only hash chain with Merkle checkpoints; `audit` can `verify_chain` over the entire history and detect a single flipped byte.
+  - **Tamper-evident history** — intelligence-bearing mutations are entries in an append-only hash chain; high-frequency raw CF commits atomically retain fixed-size commitment rows that are Merkle-sealed into that chain at checkpoint cohorts. `audit` `verify_chain` independently reads both physical CFs and fails closed on a chain or cohort mismatch. See [RAW_BATCH_PROVENANCE.md](RAW_BATCH_PROVENANCE.md).
   - **Provable erasure** — `privacy` erase uses redaction tombstones: the content is unrecoverable, yet the provenance chain still verifies. Deletion you can audit.
   - **Reproducibility** — derived artifacts (kernels, calibrations) can be re-derived on demand with a bounded drift check: the system can *prove* its own outputs.
 
@@ -107,7 +107,7 @@ The substrate doesn't just answer questions — it drives decisions, under a str
 |---|---|
 | Nothing is claimed without grounding | anchors + provisional tagging + honesty gate |
 | No answer is unexplainable | per-slot contributions, evidence paths, answer traces |
-| No mutation is deniable | hash-chained ledger + Merkle checkpoints + verify_chain |
+| No mutation is deniable | semantic Ledger entries + raw-commitment CF + checkpoint-cohort Merkle seals + independent `verify_chain` readback |
 | No deletion is fake | redaction tombstones — erased content, intact chain |
 | No silent failure | closed `CALYX_*`/structured error catalog, fail-closed everywhere |
 | No frozen thing mutates | content-addressed lenses/records; drift ⇒ new identity |

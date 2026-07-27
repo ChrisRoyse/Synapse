@@ -33,11 +33,12 @@ use super::{
 };
 
 /// Physical Source of Truth for the ledger-backed audit operations.
-const LEDGER_SOT: &str = "CF_LEDGER append-only provenance hash chain";
+const LEDGER_SOT: &str =
+    "CF_LEDGER append-only provenance hash chain + raw_commitment checkpoint-cohort Merkle seals";
 #[tool_router(router = audit_replay_facade_tool_router, vis = "pub(in crate::server)")]
 impl SynapseService {
     #[tool(
-        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging); lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain against the stored bytes (full or an incremental from_seq/to_seq window, with optional read_seq entry readback) and returns a fail-closed intact/broken/corrupt verdict; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
+        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging); lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain, then verifies every raw_commitment Merkle cohort seal against the physical commitment CF (full or an incremental Ledger from_seq/to_seq window, with optional read_seq entry readback), and returns a fail-closed intact/broken/corrupt verdict plus the unsealed checkpoint-tail count; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
     )]
     pub async fn audit(
         &self,
@@ -234,12 +235,16 @@ impl SynapseService {
                 Ok(Json(audit_response(
                     operation,
                     format!(
-                        "CF_LEDGER verdict={} head_height={} verified=[{}..{}) entries={}",
+                        "CF_LEDGER verdict={} head_height={} verified=[{}..{}) entries={} raw_commitments={} raw_sealed={} raw_pending={} raw_seals={}",
                         response.verdict,
                         response.head_height,
                         response.verified_from_seq,
                         response.verified_to_seq,
                         response.entry_count,
+                        response.raw_commitment_count,
+                        response.raw_commitment_sealed_count,
+                        response.raw_commitment_pending_count,
+                        response.raw_commitment_seal_count,
                     ),
                     |out| out.verify_chain = Some(response),
                 )))
@@ -625,6 +630,15 @@ fn verify_chain_response(
         broken_expected_hash: verify.broken_expected_hash.clone(),
         broken_found_hash: verify.broken_found_hash.clone(),
         corrupt_reason: verify.corrupt_reason.clone(),
+        raw_commitments_intact: verify.raw_commitments_intact,
+        raw_commitment_seal_count: verify.raw_commitment_seal_count,
+        raw_commitment_count: verify.raw_commitment_count,
+        raw_commitment_sealed_count: verify.raw_commitment_sealed_count,
+        raw_commitment_pending_count: verify.raw_commitment_pending_count,
+        raw_commitment_coverage_from_seq: verify.raw_commitment_coverage_from_seq,
+        raw_commitment_sealed_through_seq: verify.raw_commitment_sealed_through_seq,
+        raw_commitment_first_pending_seq: verify.raw_commitment_first_pending_seq,
+        raw_commitment_failure: verify.raw_commitment_failure.clone(),
         entry_readback: entry.map(ledger_entry_readback),
     }
 }

@@ -88,11 +88,18 @@ pub enum ColumnFamily {
     /// Inverted secondary index (PH54): `0x11 || collection_id || index_id ||
     /// term_hash || pk -> f32_be`. A reserved all-ones term hash stores avgdl stats.
     IndexInverted,
+    /// Append-only raw-batch commitments: `seq_be -> version || seq || row_count || SHA-256`.
+    ///
+    /// This is an internal provenance surface. Callers cannot write it
+    /// directly; Aster adds one row atomically to every commit that carries no
+    /// Ledger row, and checkpoint maintenance seals ordered ranges of these
+    /// rows into the Ledger chain.
+    RawCommitment,
 }
 
 impl ColumnFamily {
     /// Static non-slot families in manifest order.
-    pub const STATIC: [Self; 35] = [
+    pub const STATIC: [Self; 36] = [
         Self::Base,
         Self::Collections,
         Self::Relational,
@@ -129,6 +136,7 @@ impl ColumnFamily {
         Self::Leapable,
         // Append only: these positions are durable keyspace tags.
         Self::Registry,
+        Self::RawCommitment,
     ];
 
     /// Creates a quantized slot column family such as `slot_00`.
@@ -193,6 +201,7 @@ impl ColumnFamily {
             Self::TimeIndex => "time_index".to_string(),
             Self::IndexBtree => "index_btree".to_string(),
             Self::IndexInverted => "index_inverted".to_string(),
+            Self::RawCommitment => "raw_commitment".to_string(),
         }
     }
 
@@ -266,7 +275,8 @@ impl ColumnFamily {
             | Self::IndexBtree
             | Self::IndexInverted
             | Self::Ledger
-            | Self::TimeIndex => false,
+            | Self::TimeIndex
+            | Self::RawCommitment => false,
         }
     }
 

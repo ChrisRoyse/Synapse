@@ -29,6 +29,7 @@ mod open;
 mod orphan_slot_gc;
 mod prepared;
 pub mod quota;
+mod raw_commitment;
 mod retention_horizon;
 mod router_bridge;
 mod scan;
@@ -80,7 +81,9 @@ pub use keyspace::{
 };
 pub use layer_commit::CfLedgerEntry;
 pub use ledger_anchor_batch::MultiCxAnchorBatchOutcome;
-pub use ledger_append::{AsterLedgerChainVerification, AsterProvenanceReproduction};
+pub use ledger_append::{
+    AsterLedgerChainVerification, AsterProvenanceReproduction, AsterRawCommitmentVerification,
+};
 pub use orphan_slot_gc::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
 };
@@ -158,6 +161,9 @@ pub const CALYX_ASTER_CONDITIONAL_WRITE_INVALID: &str = "CALYX_ASTER_CONDITIONAL
 /// Stable error code for attempts to bypass the append-only Ledger API and its
 /// persistent-hook reconciliation contract.
 pub const CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN: &str = "CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN";
+/// Stable error code for attempts to forge Aster's internal raw-commitment CF.
+pub const CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN: &str =
+    "CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN";
 
 /// One physical CF revision precondition.
 ///
@@ -293,6 +299,21 @@ fn reject_raw_ledger_rows(operation: &str, rows: &[encode::WriteRow]) -> Result<
             ),
         ));
     }
+    if let Some((row_index, row)) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.cf == ColumnFamily::RawCommitment)
+    {
+        return Err(CalyxError {
+            code: CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN,
+            message: format!(
+                "{operation}: raw commitment mutation is reserved: row_index={row_index} key_len={} value_len={}",
+                row.key.len(),
+                row.value.len()
+            ),
+            remediation: "write application rows through the normal Aster commit APIs; Aster derives the sequence-bound commitment row atomically and callers cannot supply or overwrite it",
+        });
+    }
     Ok(())
 }
 
@@ -309,6 +330,20 @@ fn reject_raw_ledger_guards(operation: &str, guards: &[CfRevisionGuard]) -> Resu
                 guard.key.len()
             ),
         ));
+    }
+    if let Some((guard_index, guard)) = guards
+        .iter()
+        .enumerate()
+        .find(|(_, guard)| guard.cf == ColumnFamily::RawCommitment)
+    {
+        return Err(CalyxError {
+            code: CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN,
+            message: format!(
+                "{operation}: raw commitment revision guard is reserved: guard_index={guard_index} key_len={}",
+                guard.key.len()
+            ),
+            remediation: "do not read/modify/write Aster's internal commitment rows; use verify_ledger_chain for their fail-closed readback",
+        });
     }
     Ok(())
 }
@@ -1110,6 +1145,27 @@ where
             let reserve_started = Instant::now();
             let prepared = self.with_durable_commit_lock(|| {
                 self.ensure_writeable("checkpoint")?;
+                if let Some(seal) = durable.pending_raw_commitment_seal()? {
+                    let ledger_ref = self.commit_rows_with_ledger_entry_locked(
+                        Vec::new(),
+                        calyx_ledger::EntryKind::BatchCommitment,
+                        calyx_ledger::SubjectId::Query(
+                            raw_commitment::RAW_COMMITMENT_SUBJECT.to_vec(),
+                        ),
+                        raw_commitment::encode_seal(&seal),
+                        calyx_ledger::ActorId::Service("calyx-aster".to_owned()),
+                    )?;
+                    tracing::info!(
+                        code = "CALYX_ASTER_RAW_COMMITMENT_COHORT_SEALED",
+                        operation,
+                        first_commit_seq = seal.first_seq,
+                        last_commit_seq = seal.last_seq,
+                        commitment_count = seal.commitment_count,
+                        ledger_seq = ledger_ref.seq,
+                        ledger_hash = ?ledger_ref.hash,
+                        "sealed the staged raw-commitment cohort into the append-only Ledger before checkpoint publication"
+                    );
+                }
                 durable.prepare_pending_checkpoint(durable::CHECKPOINT_DRAIN_MAX_BATCHES)
             })?;
             max_reserve_elapsed_ms =

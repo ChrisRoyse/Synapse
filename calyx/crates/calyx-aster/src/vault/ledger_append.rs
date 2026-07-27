@@ -1,4 +1,4 @@
-use super::{AsterVault, encode, ledger_hook};
+use super::{AsterVault, encode, ledger_hook, raw_commitment};
 use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
@@ -23,6 +23,24 @@ pub struct AsterLedgerChainVerification {
     pub tip_hash: Option<[u8; 32]>,
     /// The exact half-open sequence range that was walked and re-hashed.
     pub verified_range: Range<u64>,
+    /// Independent readback of the raw-write commitment CF and every
+    /// checkpoint-cohort seal carried by this Ledger.
+    pub raw_commitments: AsterRawCommitmentVerification,
+}
+
+/// Fail-closed verification of compact raw-write provenance commitments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsterRawCommitmentVerification {
+    pub intact: bool,
+    pub seal_count: u64,
+    pub commitment_count: u64,
+    pub sealed_commitment_count: u64,
+    /// Atomically committed rows newer than the last periodic checkpoint seal.
+    pub pending_commitment_count: u64,
+    pub coverage_from_seq: Option<u64>,
+    pub sealed_through_seq: Option<u64>,
+    pub first_pending_seq: Option<u64>,
+    pub failure: Option<String>,
 }
 
 /// Re-derivation verdict for one record's recorded provenance binding.
@@ -227,11 +245,144 @@ where
         let head_height = head.as_ref().map_or(0, |anchor| anchor.height);
         let verified_range = range.unwrap_or(0..head_height);
         let result = verify_chain(&store, verified_range.clone())?;
+        let raw_commitments = self.verify_raw_commitments(&store)?;
         Ok(AsterLedgerChainVerification {
             result,
             head_height,
             tip_hash: head.map(|anchor| anchor.tip_hash),
             verified_range,
+            raw_commitments,
+        })
+    }
+
+    fn verify_raw_commitments(
+        &self,
+        ledger_store: &AsterRawLedgerStore<'_, C>,
+    ) -> Result<AsterRawCommitmentVerification> {
+        let rows = self.scan_cf_at(self.latest_seq(), ColumnFamily::RawCommitment)?;
+        let mut commitments = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            match raw_commitment::decode_commitment(&key, &value) {
+                Ok(commitment) => commitments.push(commitment),
+                Err(error) => {
+                    return Ok(raw_commitment_failure(
+                        &commitments,
+                        0,
+                        0,
+                        format!(
+                            "raw commitment CF decode failed with error[{}]: {}",
+                            error.code, error.message
+                        ),
+                    ));
+                }
+            }
+        }
+        commitments.sort_by_key(|commitment| commitment.seq);
+        if let Some(window) = commitments
+            .windows(2)
+            .find(|window| window[0].seq >= window[1].seq)
+        {
+            return Ok(raw_commitment_failure(
+                &commitments,
+                0,
+                0,
+                format!(
+                    "raw commitment CF sequence is not strictly ordered: {} then {}",
+                    window[0].seq, window[1].seq
+                ),
+            ));
+        }
+
+        let ledger_rows = ledger_store.scan()?;
+        let mut cursor = 0_usize;
+        let mut seal_count = 0_u64;
+        let mut sealed_through_seq = None;
+        for ledger_row in ledger_rows {
+            let entry = match decode_ledger_entry(&ledger_row.bytes) {
+                Ok(entry) => entry,
+                // The primary Ledger verifier already classifies malformed
+                // entry bytes. Avoid inventing a second, less precise error.
+                Err(_) => continue,
+            };
+            let seal = match raw_commitment::ledger_seal(&entry) {
+                Ok(Some(seal)) => seal,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Ok(raw_commitment_failure(
+                        &commitments,
+                        seal_count,
+                        cursor,
+                        format!(
+                            "raw commitment Ledger seal {} failed decode with error[{}]: {}",
+                            entry.seq, error.code, error.message
+                        ),
+                    ));
+                }
+            };
+            let cohort_len = match usize::try_from(seal.commitment_count) {
+                Ok(count) => count,
+                Err(_) => {
+                    return Ok(raw_commitment_failure(
+                        &commitments,
+                        seal_count,
+                        cursor,
+                        format!(
+                            "raw commitment Ledger seal {} count {} does not fit this host",
+                            entry.seq, seal.commitment_count
+                        ),
+                    ));
+                }
+            };
+            let Some(end) = cursor.checked_add(cohort_len) else {
+                return Ok(raw_commitment_failure(
+                    &commitments,
+                    seal_count,
+                    cursor,
+                    format!(
+                        "raw commitment Ledger seal {} count overflows the verification cursor",
+                        entry.seq
+                    ),
+                ));
+            };
+            let Some(cohort) = commitments.get(cursor..end) else {
+                return Ok(raw_commitment_failure(
+                    &commitments,
+                    seal_count,
+                    cursor,
+                    format!(
+                        "raw commitment Ledger seal {} claims {} rows but only {} remain in the physical commitment CF",
+                        entry.seq,
+                        seal.commitment_count,
+                        commitments.len().saturating_sub(cursor)
+                    ),
+                ));
+            };
+            if !raw_commitment::seal_matches(&seal, cohort)? {
+                return Ok(raw_commitment_failure(
+                    &commitments,
+                    seal_count,
+                    cursor,
+                    format!(
+                        "raw commitment Ledger seal {} does not match physical commitment rows {}..={} count={}",
+                        entry.seq, seal.first_seq, seal.last_seq, seal.commitment_count
+                    ),
+                ));
+            }
+            cursor = end;
+            seal_count = seal_count.saturating_add(1);
+            sealed_through_seq = Some(seal.last_seq);
+        }
+
+        Ok(AsterRawCommitmentVerification {
+            intact: true,
+            seal_count,
+            commitment_count: usize_to_u64(commitments.len()),
+            sealed_commitment_count: usize_to_u64(cursor),
+            pending_commitment_count: usize_to_u64(commitments.len().saturating_sub(cursor)),
+            coverage_from_seq: commitments.first().map(|commitment| commitment.seq),
+            sealed_through_seq,
+            first_pending_seq: commitments.get(cursor).map(|commitment| commitment.seq),
+            failure: None,
         })
     }
 
@@ -637,6 +788,34 @@ where
         }
         Ok(ledger_ref)
     }
+}
+
+fn raw_commitment_failure(
+    commitments: &[raw_commitment::RawCommitment],
+    seal_count: u64,
+    sealed_count: usize,
+    failure: String,
+) -> AsterRawCommitmentVerification {
+    AsterRawCommitmentVerification {
+        intact: false,
+        seal_count,
+        commitment_count: usize_to_u64(commitments.len()),
+        sealed_commitment_count: usize_to_u64(sealed_count),
+        pending_commitment_count: usize_to_u64(commitments.len().saturating_sub(sealed_count)),
+        coverage_from_seq: commitments.first().map(|commitment| commitment.seq),
+        sealed_through_seq: sealed_count
+            .checked_sub(1)
+            .and_then(|index| commitments.get(index))
+            .map(|commitment| commitment.seq),
+        first_pending_seq: commitments
+            .get(sealed_count)
+            .map(|commitment| commitment.seq),
+        failure: Some(failure),
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn anchor_rows(

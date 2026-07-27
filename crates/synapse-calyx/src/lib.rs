@@ -874,6 +874,22 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub broken_found_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrupt_reason: Option<String>,
+    /// True only when every periodic raw-write Merkle seal matches the
+    /// append-only commitment rows retained in the physical commitment CF.
+    pub raw_commitments_intact: bool,
+    pub raw_commitment_seal_count: u64,
+    pub raw_commitment_count: u64,
+    pub raw_commitment_sealed_count: u64,
+    /// Atomically committed raw batches awaiting the next periodic seal.
+    pub raw_commitment_pending_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_coverage_from_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_sealed_through_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_first_pending_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_failure: Option<String>,
 }
 
 impl SynapseCalyxLedgerVerifyReport {
@@ -883,7 +899,9 @@ impl SynapseCalyxLedgerVerifyReport {
             head_height,
             tip_hash,
             verified_range,
+            raw_commitments,
         } = verification;
+        let raw_commitments_intact = raw_commitments.intact;
         let base = Self {
             intact: false,
             verdict: String::new(),
@@ -896,8 +914,17 @@ impl SynapseCalyxLedgerVerifyReport {
             broken_expected_hash: None,
             broken_found_hash: None,
             corrupt_reason: None,
+            raw_commitments_intact,
+            raw_commitment_seal_count: raw_commitments.seal_count,
+            raw_commitment_count: raw_commitments.commitment_count,
+            raw_commitment_sealed_count: raw_commitments.sealed_commitment_count,
+            raw_commitment_pending_count: raw_commitments.pending_commitment_count,
+            raw_commitment_coverage_from_seq: raw_commitments.coverage_from_seq,
+            raw_commitment_sealed_through_seq: raw_commitments.sealed_through_seq,
+            raw_commitment_first_pending_seq: raw_commitments.first_pending_seq,
+            raw_commitment_failure: raw_commitments.failure.clone(),
         };
-        match result {
+        let mut report = match result {
             VerifyResult::Intact { count } => Self {
                 intact: true,
                 verdict: "intact".to_owned(),
@@ -921,7 +948,13 @@ impl SynapseCalyxLedgerVerifyReport {
                 corrupt_reason: Some(reason),
                 ..base
             },
+        };
+        if report.intact && !raw_commitments_intact {
+            report.intact = false;
+            "corrupt".clone_into(&mut report.verdict);
+            report.corrupt_reason = raw_commitments.failure;
         }
+        report
     }
 }
 

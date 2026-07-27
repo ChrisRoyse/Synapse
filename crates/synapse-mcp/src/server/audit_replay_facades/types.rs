@@ -347,6 +347,19 @@ pub struct AuditVerifyChainResponse {
     pub broken_found_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrupt_reason: Option<String>,
+    pub raw_commitments_intact: bool,
+    pub raw_commitment_seal_count: u64,
+    pub raw_commitment_count: u64,
+    pub raw_commitment_sealed_count: u64,
+    pub raw_commitment_pending_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_coverage_from_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_sealed_through_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_first_pending_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_commitment_failure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_readback: Option<AuditLedgerEntryReadback>,
 }

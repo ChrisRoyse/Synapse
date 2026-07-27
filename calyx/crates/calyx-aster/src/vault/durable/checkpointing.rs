@@ -10,7 +10,7 @@
 //! half of that invariant; `flush_pending_checkpoints` writes every staged
 //! batch before the single manifest advance.
 
-use super::super::encode::WriteRow;
+use super::super::{encode::WriteRow, raw_commitment};
 use super::{DurableVault, storage_error};
 use crate::cf::ColumnFamily;
 use crate::security::value_crypto::seal_value;
@@ -92,6 +92,65 @@ pub(in crate::vault) struct CheckpointMaterialization {
 }
 
 impl DurableVault {
+    /// Builds the one outstanding Ledger seal for every raw commitment in the
+    /// current staged cohort. The caller holds Aster's durable commit lock, so
+    /// foreign WAL refresh and this snapshot share one authoritative sequence
+    /// boundary.
+    ///
+    /// A previously staged seal is authoritative even when earlier covered
+    /// batches have already been manifested by a bounded drain. In that case
+    /// no duplicate is appended; the WAL keeps the seal recoverable until the
+    /// manifest reaches its own sequence.
+    pub(in crate::vault) fn pending_raw_commitment_seal(
+        &self,
+    ) -> Result<Option<raw_commitment::RawCommitmentSeal>> {
+        let pending = self
+            .pending_checkpoint
+            .lock()
+            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
+        let mut commitments = Vec::new();
+        let mut outstanding_seals = 0_usize;
+        for (batch_seq, rows) in pending.iter() {
+            let mut commitment_in_batch = false;
+            for row in rows {
+                match row.cf {
+                    ColumnFamily::RawCommitment => {
+                        if commitment_in_batch {
+                            return Err(CalyxError::aster_corrupt_shard(format!(
+                                "checkpoint batch {batch_seq} contains more than one raw commitment row"
+                            )));
+                        }
+                        let commitment = raw_commitment::decode_commitment(&row.key, &row.value)?;
+                        if commitment.seq != *batch_seq {
+                            return Err(CalyxError::aster_corrupt_shard(format!(
+                                "raw commitment sequence {} does not match containing checkpoint batch {batch_seq}",
+                                commitment.seq
+                            )));
+                        }
+                        commitment_in_batch = true;
+                        commitments.push(commitment);
+                    }
+                    ColumnFamily::Ledger => {
+                        let entry = calyx_ledger::decode(&row.value)?;
+                        if raw_commitment::ledger_seal(&entry)?.is_some() {
+                            outstanding_seals = outstanding_seals.saturating_add(1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if outstanding_seals > 1 {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "checkpoint staging contains {outstanding_seals} outstanding raw-commitment Ledger seals; only one cohort may be in flight"
+            )));
+        }
+        if outstanding_seals == 1 || commitments.is_empty() {
+            return Ok(None);
+        }
+        raw_commitment::seal(&commitments).map(Some)
+    }
+
     /// Checkpoints a WAL-committed batch without allowing the manifest replay
     /// floor to jump past older staged batches. This is the post-WAL recovery
     /// path: stage the current committed batch alongside every predecessor,
@@ -331,10 +390,29 @@ impl DurableVault {
             )));
         }
 
+        // A raw-commitment Ledger seal is a hard cohort boundary. Commits that
+        // arrive after its sequence stay staged for the next seal, even when
+        // this chunk still has row/byte budget. This prevents checkpoint
+        // publication from making an unsealed successor durable behind an
+        // earlier cohort's seal.
+        let mut seal_boundary = None;
+        for (batch_index, (_, rows)) in pending.iter().enumerate() {
+            for row in rows.iter().filter(|row| row.cf == ColumnFamily::Ledger) {
+                let entry = calyx_ledger::decode(&row.value)?;
+                if raw_commitment::ledger_seal(&entry)?.is_some() {
+                    seal_boundary = Some(batch_index.saturating_add(1));
+                    break;
+                }
+            }
+            if seal_boundary.is_some() {
+                break;
+            }
+        }
+        let candidate_batches = seal_boundary.unwrap_or(pending.len()).min(max_batches);
         let mut selected = 0_usize;
         let mut selected_rows = 0_usize;
         let mut selected_bytes = 0_usize;
-        for (_, rows) in pending.iter().take(max_batches) {
+        for (_, rows) in pending.iter().take(candidate_batches) {
             let batch_rows = rows.len();
             let batch_bytes = rows.iter().fold(0_usize, |bytes, row| {
                 bytes.saturating_add(row.key.len().saturating_add(row.value.len()))

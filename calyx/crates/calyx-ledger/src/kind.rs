@@ -22,11 +22,13 @@ pub enum EntryKind {
     AgentForecast,
     Policy,
     Score,
+    /// Checkpoint-cohort Merkle root over Aster raw-batch commitment rows.
+    BatchCommitment,
 }
 
 impl EntryKind {
     /// All valid kinds in stable wire-code order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Ingest,
         Self::Measure,
         Self::Assay,
@@ -42,6 +44,7 @@ impl EntryKind {
         Self::AgentForecast,
         Self::Policy,
         Self::Score,
+        Self::BatchCommitment,
     ];
 
     /// Returns the stable one-byte discriminant used in ledger hashes/codecs.
@@ -62,6 +65,7 @@ impl EntryKind {
             Self::AgentForecast => 12,
             Self::Policy => 13,
             Self::Score => 14,
+            Self::BatchCommitment => 15,
         }
     }
 
@@ -83,6 +87,7 @@ impl EntryKind {
             12 => Some(Self::AgentForecast),
             13 => Some(Self::Policy),
             14 => Some(Self::Score),
+            15 => Some(Self::BatchCommitment),
             _ => None,
         }
     }
@@ -105,6 +110,7 @@ impl EntryKind {
             Self::AgentForecast => "agent_forecast",
             Self::Policy => "policy",
             Self::Score => "score",
+            Self::BatchCommitment => "batch_commitment",
         }
     }
 }
