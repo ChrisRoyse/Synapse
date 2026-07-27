@@ -66,10 +66,9 @@ pub(crate) struct RetainedShutdownTaskOwnerReport {
 }
 
 impl RetainedShutdownTaskOwnerReport {
-    /// A task reaches this ledger only after its surrounding shutdown owner was
-    /// lost. Even a later successful join cannot reconstruct or validate the
-    /// erased task output, so the incident permanently rejects a graceful
-    /// lifetime-lock verdict for this process.
+    /// Verdict-bearing outputs remain unresolved if their typed supervisor is
+    /// lost. Unit-output owners are removed from `retention_incidents` only
+    /// after the registry consumes their exact `Poll::Ready(Ok(()))` join.
     pub(crate) const fn safe_to_unlock(&self) -> bool {
         self.active_owner_count == 0 && self.retention_incident_count == 0
     }
@@ -78,6 +77,10 @@ impl RetainedShutdownTaskOwnerReport {
 struct RetainedShutdownTask {
     owner: RetainedShutdownTaskOwner,
     task: Box<dyn ErasedShutdownTaskOwner>,
+    /// A successful terminal join is the complete cleanup verdict for tasks
+    /// whose output is `()`. Verdict-bearing task outputs must still be
+    /// acknowledged by their original typed supervisor.
+    terminal_success_reconciles: bool,
 }
 
 #[derive(Default)]
@@ -126,7 +129,11 @@ fn with_retained_shutdown_task_registry<R>(
     operation(&mut registry)
 }
 
-fn retain_shutdown_task<T: Send + 'static>(label: &'static str, task: JoinHandle<T>) {
+fn retain_shutdown_task<T: Send + 'static>(
+    label: &'static str,
+    task: JoinHandle<T>,
+    terminal_success_reconciles: bool,
+) {
     let tokio_task_id = format!("{:?}", task.id());
     let task: Box<dyn ErasedShutdownTaskOwner> = Box::new(TypedShutdownTaskOwner { task });
     with_retained_shutdown_task_registry(|registry| {
@@ -136,19 +143,25 @@ fn retain_shutdown_task<T: Send + 'static>(label: &'static str, task: JoinHandle
             tokio_task_id,
         };
         registry.retention_incidents.push(owner.clone());
-        registry.push_evidence(
-            "retained_live_owner",
-            owner.clone(),
-            "surrounding shutdown future dropped before exact task reached a terminal join; this abnormal ownership transfer permanently rejects graceful lifetime-lock release"
-                .to_owned(),
-        );
-        registry.active.push(RetainedShutdownTask { owner, task });
+        let detail = if terminal_success_reconciles {
+            "surrounding shutdown future dropped before the exact unit-output task reached a terminal join; lifetime-lock release remains rejected until the retained JoinHandle yields Poll::Ready(Ok(()))"
+        } else {
+            "surrounding shutdown future dropped before exact task reached a terminal join; this abnormal ownership transfer permanently rejects graceful lifetime-lock release because its typed output verdict would be erased"
+        };
+        registry.push_evidence("retained_live_owner", owner.clone(), detail.to_owned());
+        registry.active.push(RetainedShutdownTask {
+            owner,
+            task,
+            terminal_success_reconciles,
+        });
     });
 }
 
 fn record_unacknowledged_terminal_shutdown_task<T: Send + 'static>(
     label: &'static str,
     task: JoinHandle<T>,
+    terminal_success_reconciles: bool,
+    terminal_success_observed: bool,
 ) {
     let tokio_task_id = format!("{:?}", task.id());
     with_retained_shutdown_task_registry(|registry| {
@@ -157,13 +170,22 @@ fn record_unacknowledged_terminal_shutdown_task<T: Send + 'static>(
             task_label: label,
             tokio_task_id,
         };
-        registry.retention_incidents.push(owner.clone());
-        registry.push_evidence(
-            "terminal_output_unacknowledged",
-            owner,
-            "the exact JoinHandle yielded Poll::Ready, but its surrounding shutdown phase was cancelled before acknowledging that the terminal output was incorporated into the cleanup verdict"
-                .to_owned(),
-        );
+        if terminal_success_reconciles && terminal_success_observed {
+            registry.push_evidence(
+                "terminal_unit_output_reconciled",
+                owner,
+                "the exact unit-output JoinHandle yielded Poll::Ready(Ok(())); that terminal join is the complete typed cleanup verdict even though the surrounding shutdown phase was cancelled before acknowledgement"
+                    .to_owned(),
+            );
+        } else {
+            registry.retention_incidents.push(owner.clone());
+            registry.push_evidence(
+                "terminal_output_unacknowledged",
+                owner,
+                "the exact JoinHandle yielded Poll::Ready, but its surrounding shutdown phase was cancelled before acknowledging that the terminal output was incorporated into the cleanup verdict"
+                    .to_owned(),
+            );
+        }
     });
     drop(task);
 }
@@ -178,13 +200,25 @@ pub(crate) fn retained_shutdown_task_owner_report() -> RetainedShutdownTaskOwner
                 continue;
             };
             let retained = registry.active.swap_remove(index);
+            let terminal_success = terminal_join.is_ok();
             let detail = match terminal_join {
-                Ok(()) => "retained exact JoinHandle reached a successful terminal join, but its erased output cannot restore a graceful shutdown verdict".to_owned(),
+                Ok(()) if retained.terminal_success_reconciles => {
+                    registry
+                        .retention_incidents
+                        .retain(|incident| incident.owner_id != retained.owner.owner_id);
+                    "retained exact unit-output JoinHandle reached Poll::Ready(Ok(())); the complete typed cleanup verdict is reconciled and no live owner remains".to_owned()
+                }
+                Ok(()) => "retained exact JoinHandle reached a successful terminal join, but its verdict-bearing output was erased and cannot restore a graceful shutdown verdict".to_owned(),
                 Err(error) => {
                     format!("retained exact JoinHandle reached terminal join error: {error}")
                 }
             };
-            registry.push_evidence("terminal_join_reaped", retained.owner, detail);
+            let event = if retained.terminal_success_reconciles && terminal_success {
+                "terminal_join_reconciled"
+            } else {
+                "terminal_join_reaped"
+            };
+            registry.push_evidence(event, retained.owner, detail);
         }
         RetainedShutdownTaskOwnerReport {
             active_owner_count: registry.active.len(),
@@ -207,7 +241,9 @@ pub(crate) struct ShutdownTaskOwner<T: Send + 'static> {
     label: &'static str,
     task: Option<JoinHandle<T>>,
     terminal_join_observed: bool,
+    terminal_success_observed: bool,
     terminal_outcome_acknowledged: bool,
+    terminal_success_reconciles: bool,
 }
 
 impl<T: Send + 'static> ShutdownTaskOwner<T> {
@@ -216,7 +252,9 @@ impl<T: Send + 'static> ShutdownTaskOwner<T> {
             label,
             task: Some(task),
             terminal_join_observed: false,
+            terminal_success_observed: false,
             terminal_outcome_acknowledged: false,
+            terminal_success_reconciles: false,
         }
     }
 
@@ -257,8 +295,9 @@ impl<T: Send + 'static> std::future::Future for ShutdownTaskOwner<T> {
             unreachable!("shutdown task owner must contain its exact JoinHandle");
         };
         let result = Pin::new(task).poll(context);
-        if result.is_ready() {
+        if let Poll::Ready(joined) = &result {
             this.terminal_join_observed = true;
+            this.terminal_success_observed = joined.is_ok();
         }
         result
     }
@@ -280,7 +319,12 @@ impl<T: Send + 'static> Drop for ShutdownTaskOwner<T> {
                 task = self.label,
                 "shutdown owner reached a terminal join but its output was not acknowledged into the surrounding cleanup verdict"
             );
-            record_unacknowledged_terminal_shutdown_task(self.label, task);
+            record_unacknowledged_terminal_shutdown_task(
+                self.label,
+                task,
+                self.terminal_success_reconciles,
+                self.terminal_success_observed,
+            );
             return;
         }
 
@@ -294,7 +338,24 @@ impl<T: Send + 'static> Drop for ShutdownTaskOwner<T> {
         // task output. Move every unobserved owner into the process-global
         // registry so cancellation cannot erase a join failure or cleanup
         // verdict in the finished-before-wrapper-poll race.
-        retain_shutdown_task(self.label, task);
+        retain_shutdown_task(self.label, task, self.terminal_success_reconciles);
+    }
+}
+
+impl ShutdownTaskOwner<()> {
+    /// Owns a task whose successful unit output is itself the complete cleanup
+    /// verdict. If an outer cancellation transfers this handle to the retained
+    /// registry, a later `Poll::Ready(Ok(()))` can therefore reconcile the
+    /// incident without guessing at erased typed state.
+    pub(crate) const fn new_unit(label: &'static str, task: JoinHandle<()>) -> Self {
+        Self {
+            label,
+            task: Some(task),
+            terminal_join_observed: false,
+            terminal_success_observed: false,
+            terminal_outcome_acknowledged: false,
+            terminal_success_reconciles: true,
+        }
     }
 }
 

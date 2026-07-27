@@ -2642,11 +2642,27 @@ pub(crate) fn spawn_periodic_transcript_ingest(
                 return;
             }
             run_cycle(&m3_state, &root, &cancel);
+            if cancel.is_cancelled() {
+                tracing::info!(
+                    code = "TRANSCRIPT_INGEST_PERIODIC_STOPPED",
+                    phase = "after_ingest",
+                    "periodic transcript ingestion stopped by daemon shutdown before cost/telemetry rollups"
+                );
+                return;
+            }
             // #1688: keep the cost TimeSeries rollups current off the async
             // runtime. This loop already runs on the blocking pool, and the
             // materializer takes the single rollup admission permit (skipping
             // when an operator backfill holds it), so it never races.
             run_cost_rollup_maintenance(&m3_state);
+            if cancel.is_cancelled() {
+                tracing::info!(
+                    code = "TRANSCRIPT_INGEST_PERIODIC_STOPPED",
+                    phase = "after_cost_rollup",
+                    "periodic transcript ingestion stopped by daemon shutdown before telemetry rollup"
+                );
+                return;
+            }
             // #1688 (telemetry half): materialize telemetry rollups off-runtime
             // and emit a rollup-served health-trend readback for the last sealed
             // hour, so telemetry/health trends never scan the sample stream.

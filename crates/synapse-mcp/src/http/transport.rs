@@ -1001,30 +1001,39 @@ async fn drain_http_background_tasks(
                 task.abort();
                 match time::timeout(HTTP_BACKGROUND_TASK_ABORT_TIMEOUT, &mut task).await {
                     Ok(result) => {
-                        let outcome = (
-                            name,
-                            false,
-                            true,
-                            true,
-                            Some(format!(
-                                "{name}: did not stop within {} ms after shutdown cancellation; abort_join={result:?}",
-                                stop_timeout.as_millis()
-                            )),
-                        );
+                        let failure = result.err().map(|error| {
+                            format!(
+                                "{name}: terminal join failed after abort request: {error}"
+                            )
+                        });
+                        let outcome = (name, false, true, true, failure);
                         task.acknowledge_terminal_outcome();
                         outcome
                     }
-                    Err(_elapsed) => (
-                        name,
-                        false,
-                        true,
-                        false,
-                        Some(format!(
-                            "{name}: did not stop within {} ms after shutdown cancellation and did not join within {} ms after abort; exact JoinHandle retained until process teardown",
-                            stop_timeout.as_millis(),
-                            HTTP_BACKGROUND_TASK_ABORT_TIMEOUT.as_millis()
-                        )),
-                    ),
+                    Err(_elapsed) => {
+                        // `transcript_ingest` is a spawn_blocking owner. Tokio
+                        // documents that an already-running blocking task
+                        // cannot be aborted, so dropping its JoinHandle here
+                        // would detach live storage authority. Keep the exact
+                        // owner and await its terminal result. The independent
+                        // process watchdog remains the hard deadline for a
+                        // genuinely non-terminating task.
+                        tracing::warn!(
+                            code = "MCP_HTTP_BACKGROUND_TASK_AWAITING_TERMINAL_JOIN",
+                            task = name,
+                            stop_timeout_ms = stop_timeout.as_millis(),
+                            abort_timeout_ms = HTTP_BACKGROUND_TASK_ABORT_TIMEOUT.as_millis(),
+                            "background task missed the nominal stop deadlines; retaining and awaiting its exact JoinHandle before storage and lifetime-lock release"
+                        );
+                        let result = (&mut task).await;
+                        let failure = result.err().map(|error| {
+                            format!(
+                                "{name}: terminal join failed after retained wait: {error}"
+                            )
+                        });
+                        task.acknowledge_terminal_outcome();
+                        (name, false, true, true, failure)
+                    }
                 }
             }
         }
@@ -1086,7 +1095,7 @@ impl HttpRuntimeStartupFailure {
 }
 
 fn own_http_background_task(name: &'static str, task: JoinHandle<()>) -> HttpBackgroundTaskOwner {
-    (name, ShutdownTaskOwner::new(name, task))
+    (name, ShutdownTaskOwner::new_unit(name, task))
 }
 
 fn configured_http_shutdown_watchdog_timeout() -> anyhow::Result<Duration> {
