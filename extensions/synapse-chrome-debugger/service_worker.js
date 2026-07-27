@@ -1,5 +1,5 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-26-host-ui-reload-v1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-27-maintenance-tab-ownership-v1";
 const BRIDGE_DECLARED_BUILD_SHA256 = "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
@@ -157,19 +157,85 @@ const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
 const LEGACY_DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV1";
 const DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY =
   "synapseOperatorPanicBrowserSessionTokenV1";
+const DURABLE_OWNER_LIFECYCLE_SIGNAL_TIMEOUT_MS = 10000;
 const DURABLE_OWNER_WORKER_BOOT_ID = typeof globalThis.crypto?.randomUUID === "function"
   ? globalThis.crypto.randomUUID()
   : `worker-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const DURABLE_OWNER_LIFECYCLE_EVENTS = [];
+let DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE = null;
+const DURABLE_OWNER_LIFECYCLE_SIGNAL = new Promise((resolve) => {
+  DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE = resolve;
+});
 let DURABLE_OWNER_STATE_LOADED = false;
 let DURABLE_OWNER_STATE_LOAD_ERROR = null;
 let DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = null;
 let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
+let DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = null;
 let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
 let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
 let DURABLE_OWNER_STALE_SESSION_REPAIR = null;
 let RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = null;
 let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
+
+function recordDurableOwnerLifecycleEvent(kind, reason = null) {
+  const event = {
+    kind,
+    reason,
+    worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+    recorded_at_unix_ms: Date.now()
+  };
+  DURABLE_OWNER_LIFECYCLE_EVENTS.push(event);
+  if (DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE) {
+    DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE(event);
+    DURABLE_OWNER_LIFECYCLE_SIGNAL_RESOLVE = null;
+  }
+  if (kind === "runtime.onStartup" && DURABLE_OWNER_STATE_LOADED) {
+    DURABLE_MUTATION_OWNERS_ENABLED = false;
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
+    DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
+    DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
+      source: kind,
+      lifecycle_reason: null,
+      session_token_present: false,
+      decision: "late_new_browser_session_fail_closed",
+      observed_at_unix_ms: Date.now()
+    };
+    STALE_BROWSER_SESSION_OWNER_COUNT = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+      (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      "runtime.onStartup arrived after durable-owner initialization; refusing mutation " +
+      "until the browser-session ledger is reloaded against the new profile session";
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
+      1,
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
+    );
+    chrome.storage.session.set({
+      [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
+        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+    }).catch((error) => {
+      DURABLE_OWNER_STATE_LOAD_ERROR +=
+        `; failed to persist late browser-session token: ${errorMessage(error)}`;
+    });
+  }
+  return event;
+}
+
+function handleSynapseRuntimeInstalled(details) {
+  recordDurableOwnerLifecycleEvent(
+    "runtime.onInstalled",
+    typeof details?.reason === "string" ? details.reason : null
+  );
+  startBridgeFromEvent();
+}
+
+function handleSynapseRuntimeStartup() {
+  recordDurableOwnerLifecycleEvent("runtime.onStartup");
+  startBridgeFromEvent();
+}
+
+chrome.runtime.onInstalled.addListener(handleSynapseRuntimeInstalled);
+chrome.runtime.onStartup.addListener(handleSynapseRuntimeStartup);
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
 let hostId = null;
@@ -1462,6 +1528,29 @@ function newDurableOwnerBrowserSessionId() {
     : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+async function waitForDurableOwnerLifecycleEvent() {
+  if (DURABLE_OWNER_LIFECYCLE_EVENTS.length > 0) {
+    return DURABLE_OWNER_LIFECYCLE_EVENTS[0];
+  }
+  let timeoutId = null;
+  try {
+    return await Promise.race([
+      DURABLE_OWNER_LIFECYCLE_SIGNAL,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(
+            "chrome.storage.session browser token is absent and no runtime.onInstalled/" +
+            `runtime.onStartup evidence arrived within ${DURABLE_OWNER_LIFECYCLE_SIGNAL_TIMEOUT_MS}ms; ` +
+            "refusing to infer browser-session continuity"
+          ));
+        }, DURABLE_OWNER_LIFECYCLE_SIGNAL_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
+}
+
 async function restoreDurableOwnerLedger() {
   try {
     if (!chrome.storage?.local || !chrome.storage?.session) {
@@ -1482,6 +1571,9 @@ async function restoreDurableOwnerLedger() {
       === "string"
       ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
       : "";
+    const lifecycleEvent = storedBrowserSessionId
+      ? null
+      : await waitForDurableOwnerLifecycleEvent();
     if (!hasLocalLedger && sessionStored?.[LEGACY_DURABLE_OWNER_STORAGE_KEY] !== undefined) {
       throw new Error(
         "legacy session-only durable owner ledger is present; refusing to claim continuity after storage migration"
@@ -1490,6 +1582,15 @@ async function restoreDurableOwnerLedger() {
     if (!hasLocalLedger) {
       DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
         storedBrowserSessionId || newDurableOwnerBrowserSessionId();
+      DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
+        source: storedBrowserSessionId
+          ? "chrome.storage.session"
+          : String(lifecycleEvent?.kind || "missing"),
+        lifecycle_reason: lifecycleEvent?.reason || null,
+        session_token_present: Boolean(storedBrowserSessionId),
+        decision: "new_ledger",
+        observed_at_unix_ms: Date.now()
+      };
       DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
       DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
@@ -1504,8 +1605,48 @@ async function restoreDurableOwnerLedger() {
       DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(
         localStored[DURABLE_OWNER_STORAGE_KEY]
       );
-      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
-        storedBrowserSessionId || newDurableOwnerBrowserSessionId();
+      if (storedBrowserSessionId) {
+        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = storedBrowserSessionId;
+        DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
+          source: "chrome.storage.session",
+          lifecycle_reason: null,
+          session_token_present: true,
+          decision: "compare_persisted_session_token",
+          observed_at_unix_ms: Date.now()
+        };
+      } else if (
+        lifecycleEvent?.kind === "runtime.onInstalled" &&
+        lifecycleEvent?.reason === "update"
+      ) {
+        // Chrome explicitly clears storage.session when an unpacked extension
+        // is reloaded and reports that lifecycle as onInstalled(reason=update).
+        // Chrome tab/window ids remain in the ledger's browser session. Re-seed
+        // only the volatile token; do not weaken the runtime.onStartup path.
+        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
+          DURABLE_OWNER_LEDGER.browserSessionId;
+        DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
+          source: lifecycleEvent.kind,
+          lifecycle_reason: lifecycleEvent.reason,
+          session_token_present: false,
+          decision: "preserve_ledger_session_after_extension_update",
+          observed_at_unix_ms: Date.now()
+        };
+      } else if (lifecycleEvent?.kind === "runtime.onStartup") {
+        DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
+        DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
+          source: lifecycleEvent.kind,
+          lifecycle_reason: null,
+          session_token_present: false,
+          decision: "new_browser_session",
+          observed_at_unix_ms: Date.now()
+        };
+      } else {
+        throw new Error(
+          "chrome.storage.session browser token is absent and lifecycle evidence cannot " +
+          `prove continuity; kind=${String(lifecycleEvent?.kind || "missing")} ` +
+          `reason=${String(lifecycleEvent?.reason || "missing")}`
+        );
+      }
       if (!storedBrowserSessionId) {
         await chrome.storage.session.set({
           [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
@@ -1599,7 +1740,6 @@ async function restoreDurableOwnerLedger() {
       } else if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
         STALE_BROWSER_SESSION_OWNER_COUNT = staleOwners;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
-        DURABLE_OWNER_LEDGER.enabled = false;
         DURABLE_OWNER_STATE_LOAD_ERROR =
           "durable owners belong to a prior browser session; stale tab ids will not be mutated; " +
           `stale_owner_count=${staleOwners} ` +
@@ -2215,8 +2355,6 @@ function requestWebSocketCloseAfterResponse(reason) {
   return result;
 }
 
-chrome.runtime.onInstalled.addListener(startBridgeFromEvent);
-chrome.runtime.onStartup.addListener(startBridgeFromEvent);
 if (chrome.alarms?.onAlarm?.addListener) {
   chrome.alarms.onAlarm.addListener(handleReconnectWakeAlarm);
 }
@@ -12720,6 +12858,8 @@ function operatorPanicOwnerReadback() {
     ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId,
     browser_session_continuity_matched:
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
+    browser_session_evidence: DURABLE_OWNER_BROWSER_SESSION_EVIDENCE,
+    lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
     stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
     stale_browser_session_repair: DURABLE_OWNER_STALE_SESSION_REPAIR,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
@@ -12766,6 +12906,8 @@ function operatorPanicGateErrorSummary() {
     `storage_state_loaded=${Boolean(readback.storage_state_loaded)} ` +
     `storage_state_load_error=${JSON.stringify(readback.storage_state_load_error || "")} ` +
     `browser_session_continuity_matched=${Boolean(readback.browser_session_continuity_matched)} ` +
+    `browser_session_evidence_source=${String(readback.browser_session_evidence?.source || "missing")} ` +
+    `browser_session_evidence_decision=${String(readback.browser_session_evidence?.decision || "missing")} ` +
     `owner_continuity_healthy=${Boolean(readback.owner_continuity_healthy)} ` +
     `persisted_state_revision=${Number(readback.persisted_state_revision || 0)} ` +
     `persisted_in_flight_mutation=${readback.persisted_in_flight_mutation ? "present" : "none"} ` +
@@ -13258,6 +13400,8 @@ async function handleOperatorPanicCleanup(params) {
     ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId,
     browser_session_continuity_matched:
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
+    browser_session_evidence: DURABLE_OWNER_BROWSER_SESSION_EVIDENCE,
+    lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
     stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,

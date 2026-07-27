@@ -43,7 +43,8 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-26-host-ui-reload-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str =
+    "synapse-chrome-bridge-2026-07-27-maintenance-tab-ownership-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -4302,6 +4303,8 @@ pub struct ChromeBridgeReloadCommandAck {
     pub ui_before_enable_toggle_on: Option<bool>,
     pub ui_after_reload_button_present: Option<bool>,
     pub ui_after_enable_toggle_on: Option<bool>,
+    pub maintenance_tab: Value,
+    pub maintenance_cleanup: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4343,6 +4346,36 @@ pub struct ChromeBridgeReloadResult {
     pub after: ChromeBridgeHostSnapshot,
     pub reconnected: bool,
     pub waited_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ChromeBridgeMaintenanceTabLease {
+    token: String,
+    marker_url: String,
+    marker_title: String,
+    tabs_before: Vec<ChromeDebuggerTabTarget>,
+}
+
+fn reload_preexisting_tabs_match(
+    expected: &[ChromeDebuggerTabTarget],
+    actual: &[ChromeDebuggerTabTarget],
+) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    expected.iter().all(|before| {
+        actual.iter().any(|after| {
+            before.target_id == after.target_id
+                && before.tab_id == after.tab_id
+                && before.chrome_window_id == after.chrome_window_id
+                && before.index == after.index
+                && before.target_type == after.target_type
+                && before.url == after.url
+                && before.active == after.active
+                && before.highlighted == after.highlighted
+                && before.pinned == after.pinned
+        })
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5260,6 +5293,21 @@ fn json_pointer_required_bool(
         })
 }
 
+fn json_pointer_required_u32(
+    value: &Value,
+    pointer: &str,
+) -> Result<u32, ChromeDebuggerBridgeError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_READBACK_INVALID field={pointer} expected=u32 remediation=inspect the framed installer JSON and repair the named missing, negative, overflowed, or mistyped field"
+            ))
+        })
+}
+
 fn json_pointer_optional_bool(value: &Value, pointer: &str) -> Option<bool> {
     value.pointer(pointer).and_then(Value::as_bool)
 }
@@ -5287,8 +5335,9 @@ fn process_diagnostic(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-async fn run_chrome_bridge_host_ui_reload()
--> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
+async fn run_chrome_bridge_host_ui_reload(
+    maintenance: &ChromeBridgeMaintenanceTabLease,
+) -> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -5338,10 +5387,17 @@ async fn run_chrome_bridge_host_ui_reload()
         .arg(&installer_path)
         .args([
             "-ReloadExistingExtensionViaUi",
+            "-MaintenanceTabToken",
+            &maintenance.token,
+            "-MaintenanceMarkerUrl",
+            &maintenance.marker_url,
+            "-MaintenanceMarkerTitle",
+            &maintenance.marker_title,
             "-AutoInstallTimeoutSeconds",
             HOST_UI_RELOAD_INSTALLER_TIMEOUT_SECONDS,
             "-OutputJson",
-        ])
+        ]);
+    command
         .current_dir(source_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -5459,6 +5515,38 @@ async fn run_chrome_bridge_host_ui_reload()
         json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/after/installed")?;
     let profile_after_ready =
         json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/after/ready")?;
+    let daemon_bridge_after_pid = json_pointer_required_u32(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/daemon_pid",
+    )?;
+    let daemon_bridge_after_host_id = json_pointer_required_str(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/active_host_id",
+    )?;
+    let daemon_bridge_after_host_count = json_pointer_required_u32(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/host_count",
+    )?;
+    let daemon_bridge_after_tab_control = json_pointer_required_bool(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/tab_control_available",
+    )?;
+    let daemon_bridge_after_extension_id = json_pointer_required_str(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/extension_id",
+    )?;
+    let daemon_bridge_after_build_id = json_pointer_required_str(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/extension_build_id",
+    )?;
+    let daemon_bridge_after_worker_sha256 = json_pointer_required_str(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/extension_service_worker_sha256",
+    )?;
+    let daemon_bridge_after_stale = json_pointer_required_bool(
+        &readback,
+        "/synapse_chrome_auto_install/daemon_bridge_after/extension_stale",
+    )?;
     let reason_accepted = matches!(
         reason.as_str(),
         "existing_ready_extension_ui_reload_invoked"
@@ -5475,10 +5563,18 @@ async fn run_chrome_bridge_host_ui_reload()
         || !active_profile_installed
         || !profile_after_installed
         || !profile_after_ready
+        || daemon_bridge_after_pid != std::process::id()
+        || daemon_bridge_after_host_id.is_empty()
+        || daemon_bridge_after_host_count != 1
+        || !daemon_bridge_after_tab_control
+        || daemon_bridge_after_extension_id != EXTENSION_ID
+        || daemon_bridge_after_build_id != EXPECTED_EXTENSION_BUILD_ID
+        || daemon_bridge_after_worker_sha256 != extension_service_worker_sha256
+        || daemon_bridge_after_stale
         || !reason_accepted
     {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POSTCONDITION_FAILED ok={} extension_id={} expected_extension_id={} service_worker_sha256={} attempted={} changed={} required_foreground={} active_profile={} active_profile_installed={} profile_after_installed={} profile_after_ready={} reason={} reason_accepted={} installer={} installer_sha256={} remediation=inspect the physical Chrome profile row and exact extension management UI state; the daemon refuses to accept a partial or no-op repair",
+            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POSTCONDITION_FAILED ok={} extension_id={} expected_extension_id={} service_worker_sha256={} attempted={} changed={} required_foreground={} active_profile={} active_profile_installed={} profile_after_installed={} profile_after_ready={} daemon_bridge_after_pid={} expected_daemon_pid={} daemon_bridge_after_host_id={} daemon_bridge_after_host_count={} daemon_bridge_after_tab_control={} daemon_bridge_after_extension_id={} daemon_bridge_after_build_id={} daemon_bridge_after_worker_sha256={} daemon_bridge_after_stale={} reason={} reason_accepted={} installer={} installer_sha256={} remediation=inspect the physical Chrome profile row, replacement host, and exact extension management UI state; the daemon refuses to accept a partial or no-op repair",
             ok,
             extension_id,
             EXTENSION_ID,
@@ -5490,6 +5586,15 @@ async fn run_chrome_bridge_host_ui_reload()
             active_profile_installed,
             profile_after_installed,
             profile_after_ready,
+            daemon_bridge_after_pid,
+            std::process::id(),
+            daemon_bridge_after_host_id,
+            daemon_bridge_after_host_count,
+            daemon_bridge_after_tab_control,
+            daemon_bridge_after_extension_id,
+            daemon_bridge_after_build_id,
+            daemon_bridge_after_worker_sha256,
+            daemon_bridge_after_stale,
             reason,
             reason_accepted,
             installer_path.display(),
@@ -5540,14 +5645,312 @@ async fn run_chrome_bridge_host_ui_reload()
             &readback,
             "/synapse_chrome_auto_install/ui_after/enable_toggle_on",
         ),
+        maintenance_tab: json!({
+            "token": maintenance.token,
+            "marker_url": maintenance.marker_url,
+            "marker_title": maintenance.marker_title,
+            "ownership_source": "verified_foreground_ctrl_t_marker_then_exact_chrome_tabs_token_resolution",
+            "preexisting_tab_count": maintenance.tabs_before.len(),
+            "script_lease": readback.pointer("/synapse_chrome_auto_install/maintenance_tab"),
+        }),
+        maintenance_cleanup: json!({
+            "attempted": false,
+            "absent_verified": false,
+            "reason": "pending_replacement_host_readback",
+        }),
     })
 }
 
+#[cfg(windows)]
+async fn run_chrome_bridge_host_ui_cleanup(
+    maintenance: &ChromeBridgeMaintenanceTabLease,
+    ack: &ChromeBridgeReloadCommandAck,
+) -> Result<Value, ChromeDebuggerBridgeError> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let installer_path = PathBuf::from(&ack.installer_path);
+    let installer_bytes = std::fs::read(&installer_path).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_INSTALLER_READ_FAILED path={} error={} remediation=restore the exact installer used by the maintenance operation before cleanup",
+            installer_path.display(),
+            error
+        ))
+    })?;
+    let installer_sha256 = sha256_hex_lower(&installer_bytes);
+    if installer_sha256 != ack.installer_sha256 {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_INSTALLER_HASH_DRIFT path={} expected_sha256={} actual_sha256={} remediation=cleanup refuses to execute installer bytes that changed after maintenance-tab creation",
+            installer_path.display(),
+            ack.installer_sha256,
+            installer_sha256
+        )));
+    }
+    let lease = ack
+        .maintenance_tab
+        .get("script_lease")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            ChromeDebuggerBridgeError::host_reload_failed(
+                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_MISSING remediation=the first installer process must return its exact UIA maintenance lease before daemon cleanup may recover",
+            )
+        })?;
+    let lease_token = lease.get("token").and_then(Value::as_str).unwrap_or("");
+    let lease_marker_url = lease
+        .get("marker_url")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let lease_marker_title = lease
+        .get("marker_title")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if lease_token != maintenance.token
+        || lease_marker_url != maintenance.marker_url
+        || lease_marker_title != maintenance.marker_title
+    {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_IDENTITY_MISMATCH token_matches={} marker_url_matches={} marker_title_matches={} remediation=cleanup refuses any lease that differs from the daemon-generated operation identity",
+            lease_token == maintenance.token,
+            lease_marker_url == maintenance.marker_url,
+            lease_marker_title == maintenance.marker_title,
+        )));
+    }
+    let ownership_source = lease
+        .get("ownership_source")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let created_via_ui = lease
+        .get("created_via_ui")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let chrome_window_hwnd = lease
+        .get("chrome_window_hwnd")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let chrome_window_pid = lease
+        .get("chrome_window_pid")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let expected_tab_count_after_cleanup = lease
+        .get("expected_tab_count_after_cleanup")
+        .and_then(Value::as_u64);
+    let owned_tab_runtime_id = lease
+        .get("owned_tab_runtime_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let selected_before = lease
+        .pointer("/tab_strip_before_create/tabs")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .filter(|tab| tab.get("selected").and_then(Value::as_bool) == Some(true))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let selected_runtime_id = selected_before
+        .first()
+        .and_then(|tab| tab.get("runtime_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if ownership_source != "verified_foreground_ctrl_t_marker"
+        || !created_via_ui
+        || chrome_window_hwnd <= 0
+        || chrome_window_pid == 0
+        || expected_tab_count_after_cleanup.is_none()
+        || owned_tab_runtime_id.is_empty()
+        || selected_before.len() != 1
+        || selected_runtime_id.is_empty()
+    {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} owned_runtime_id_present={} selected_before_count={} selected_runtime_id_present={} remediation=the first installer must return one exact UI-created lease plus the pre-operation selected-tab runtime identity",
+            ownership_source,
+            created_via_ui,
+            chrome_window_hwnd,
+            chrome_window_pid,
+            expected_tab_count_after_cleanup.is_some(),
+            !owned_tab_runtime_id.is_empty(),
+            selected_before.len(),
+            !selected_runtime_id.is_empty(),
+        )));
+    }
+    let cleanup_lease = json!({
+        "token": lease_token,
+        "ownership_source": ownership_source,
+        "created_via_ui": true,
+        "owned_tab_runtime_id": owned_tab_runtime_id,
+        "chrome_tab_id": Value::Null,
+        "chrome_window_id": Value::Null,
+        "chrome_window_hwnd": chrome_window_hwnd,
+        "chrome_window_pid": chrome_window_pid,
+        "marker_url": lease_marker_url,
+        "marker_title": lease_marker_title,
+        "expected_tab_count_after_cleanup": expected_tab_count_after_cleanup,
+        "tab_strip_before_create": {
+            "tabs": [{
+                "selected": true,
+                "runtime_id": selected_runtime_id,
+            }],
+        },
+    });
+    let lease_json = serde_json::to_vec(&cleanup_lease).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_SERIALIZE_FAILED error={error} remediation=repair the installer lease JSON shape"
+        ))
+    })?;
+    let lease_base64 = BASE64_STANDARD.encode(lease_json);
+
+    let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
+        ChromeDebuggerBridgeError::host_reload_failed(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_SYSTEM_ROOT_MISSING remediation=repair the Windows process environment so SystemRoot resolves Windows PowerShell",
+        )
+    })?;
+    let powershell_path = PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell_path.is_file() {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POWERSHELL_MISSING path={} remediation=repair Windows PowerShell before retrying cleanup",
+            powershell_path.display()
+        )));
+    }
+
+    let mut command = Command::new(&powershell_path);
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&installer_path)
+        .args([
+            "-CleanupOwnedMaintenanceTabViaUi",
+            "-MaintenanceTabToken",
+            &maintenance.token,
+            "-MaintenanceMarkerUrl",
+            &maintenance.marker_url,
+            "-MaintenanceMarkerTitle",
+            &maintenance.marker_title,
+            "-MaintenanceCleanupLeaseBase64",
+            &lease_base64,
+            "-AutoInstallTimeoutSeconds",
+            "30",
+            "-OutputJson",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(parent) = installer_path.parent() {
+        command.current_dir(parent);
+    }
+    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+
+    let child = command.spawn().map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_SPAWN_FAILED launcher={} installer={} error={} remediation=repair PowerShell process launch and retry exact cleanup",
+            powershell_path.display(),
+            installer_path.display(),
+            error
+        ))
+    })?;
+    let child_pid = child.id().unwrap_or(0);
+    let output = timeout(HOST_UI_RELOAD_PROCESS_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_TIMEOUT pid={} timeout_ms={} remediation=the exact token-scoped UI cleanup did not finish within its bound",
+                child_pid,
+                HOST_UI_RELOAD_PROCESS_TIMEOUT.as_millis(),
+            ))
+        })?
+        .map_err(|error| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_WAIT_FAILED pid={child_pid} error={error} remediation=inspect the exact spawned cleanup process"
+            ))
+        })?;
+    let stdout_sha256 = sha256_hex_lower(&output.stdout);
+    let stderr_sha256 = sha256_hex_lower(&output.stderr);
+    if !output.status.success() {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_FAILED pid={} exit_code={} stdout_sha256={} stderr_sha256={} stdout_tail={} stderr_tail={} remediation=repair the exact SYNAPSE_CHROME_MAINTENANCE_* condition; cleanup refuses to hide the surviving surface",
+            child_pid,
+            output.status.code().unwrap_or(-1),
+            stdout_sha256,
+            stderr_sha256,
+            process_diagnostic(&output.stdout),
+            process_diagnostic(&output.stderr),
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_STDOUT_UTF8_INVALID pid={child_pid} stdout_sha256={stdout_sha256} error={error}"
+        ))
+    })?;
+    let payload_rows = stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(HOST_UI_RELOAD_JSON_PREFIX))
+        .collect::<Vec<_>>();
+    if payload_rows.len() != 1 {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_JSON_FRAME_INVALID pid={} frame_count={} stdout_sha256={} stderr_sha256={} stdout_tail={} remediation=cleanup-only must emit exactly one framed JSON readback",
+            child_pid,
+            payload_rows.len(),
+            stdout_sha256,
+            stderr_sha256,
+            process_diagnostic(stdout.as_bytes()),
+        )));
+    }
+    let payload = BASE64_STANDARD.decode(payload_rows[0]).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_JSON_BASE64_INVALID pid={child_pid} error={error}"
+        ))
+    })?;
+    let readback: Value = serde_json::from_slice(&payload).map_err(|error| {
+        ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_JSON_INVALID pid={} payload_sha256={} error={}",
+            child_pid,
+            sha256_hex_lower(&payload),
+            error
+        ))
+    })?;
+    if readback.get("ok").and_then(Value::as_bool) != Some(true)
+        || readback.get("operation").and_then(Value::as_str)
+            != Some("cleanup_owned_maintenance_tab_via_ui")
+        || readback
+            .pointer("/maintenance_cleanup/absent_verified")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || readback
+            .pointer("/maintenance_cleanup/token")
+            .and_then(Value::as_str)
+            != Some(maintenance.token.as_str())
+    {
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POSTCONDITION_FAILED payload_sha256={} remediation=cleanup-only must prove exact token absence through independent tab-strip/address readback",
+            sha256_hex_lower(&payload),
+        )));
+    }
+    Ok(readback
+        .get("maintenance_cleanup")
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
 #[cfg(not(windows))]
-async fn run_chrome_bridge_host_ui_reload()
--> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
+async fn run_chrome_bridge_host_ui_reload(
+    _maintenance: &ChromeBridgeMaintenanceTabLease,
+) -> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
     Err(ChromeDebuggerBridgeError::host_reload_failed(
         "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_UNSUPPORTED_OS os=non_windows remediation=run the Chrome bridge host-control operation on the configured Windows Synapse host",
+    ))
+}
+
+#[cfg(not(windows))]
+async fn run_chrome_bridge_host_ui_cleanup(
+    _maintenance: &ChromeBridgeMaintenanceTabLease,
+    _ack: &ChromeBridgeReloadCommandAck,
+) -> Result<Value, ChromeDebuggerBridgeError> {
+    Err(ChromeDebuggerBridgeError::host_reload_failed(
+        "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_UNSUPPORTED platform=non_windows remediation=the exact Chrome foreground UI cleanup is supported only on Windows",
     ))
 }
 
@@ -5933,6 +6336,252 @@ impl ChromeDebuggerBridge {
         ))
     }
 
+    async fn list_tabs_for_reload_maintenance(
+        &self,
+    ) -> Result<ChromeDebuggerListTabsResult, ChromeDebuggerBridgeError> {
+        let result = self
+            .send_reload_maintenance_command("listTabs", json!({}))
+            .await?;
+        serde_json::from_value::<ChromeDebuggerListTabsResult>(result).map_err(|error| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_TAB_LIST_DECODE_FAILED error={error} remediation=the loaded bridge must return typed chrome.tabs.query readback before maintenance may mutate any tab"
+            ))
+        })
+    }
+
+    async fn prepare_reload_maintenance_tab(
+        &self,
+        has_active_host: bool,
+    ) -> Result<ChromeBridgeMaintenanceTabLease, ChromeDebuggerBridgeError> {
+        let token = Uuid::new_v4().simple().to_string();
+        let marker_title = format!("Synapse Bridge Maintenance {token}");
+        let marker_url =
+            format!("data:text/html,<title>Synapse%20Bridge%20Maintenance%20{token}</title>");
+        // Repair must not depend on the mutation lane that it is repairing.
+        // A live bridge may be stale or fail-closed by durable-owner recovery;
+        // use it only for a read-only pre-operation snapshot. The installer
+        // creates and proves its own exact UIA marker tab, and the replacement
+        // bridge resolves that session-unique marker to a Chrome tab identity
+        // before closing it.
+        let tabs_before = if has_active_host {
+            self.list_tabs_for_reload_maintenance().await?.tabs
+        } else {
+            Vec::new()
+        };
+        Ok(ChromeBridgeMaintenanceTabLease {
+            token,
+            marker_url,
+            marker_title,
+            tabs_before,
+        })
+    }
+
+    async fn cleanup_reload_maintenance_tab(
+        &self,
+        maintenance: &ChromeBridgeMaintenanceTabLease,
+    ) -> Result<Value, ChromeDebuggerBridgeError> {
+        let before_cleanup = self.list_tabs_for_reload_maintenance().await?;
+        let token_fragment = format!("synapse_maintenance_token={}", maintenance.token);
+        let token_matches = before_cleanup
+            .tabs
+            .iter()
+            .filter(|tab| tab.url.contains(&token_fragment))
+            .collect::<Vec<_>>();
+
+        if token_matches.is_empty()
+            && !maintenance.tabs_before.is_empty()
+            && reload_preexisting_tabs_match(&maintenance.tabs_before, &before_cleanup.tabs)
+        {
+            return Ok(json!({
+                "attempted": true,
+                "closed": false,
+                "absent_verified": true,
+                "reason": "operation_owned_tab_already_absent_with_exact_preexisting_state",
+                "token_sha256": sha256_hex_lower(maintenance.token.as_bytes()),
+                "tab_count_before_operation": maintenance.tabs_before.len(),
+                "tab_count_after_cleanup": before_cleanup.tabs.len(),
+                "preexisting_tabs_preserved_exact": true,
+                "token_absent": true,
+            }));
+        }
+        if token_matches.len() != 1 {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_UI_CREATED_TAB_NOT_UNIQUE token_sha256={} token_match_count={} tab_count={} remediation=the post-install bridge must find exactly one UI-created tab carrying the daemon-generated ownership token before closing anything",
+                sha256_hex_lower(maintenance.token.as_bytes()),
+                token_matches.len(),
+                before_cleanup.tabs.len(),
+            )));
+        }
+        let owned = token_matches[0];
+        let owned_before = (*owned).clone();
+        let close_value = self
+            .send_reload_maintenance_command(
+                "closeTab",
+                json!({
+                    "targetIdHint": owned.target_id,
+                }),
+            )
+            .await?;
+        let close =
+            serde_json::from_value::<ChromeDebuggerCloseTabResult>(close_value).map_err(|error| {
+                ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_MAINTENANCE_TAB_CLOSE_DECODE_FAILED tab_id={} target_id={} error={} remediation=the replacement bridge must return the exact chrome.tabs.remove absence acknowledgement",
+                    owned.tab_id, owned.target_id, error
+                ))
+            })?;
+        if close.tab_id != owned.tab_id
+            || close.target_id != owned.target_id
+            || close.target_count_after != 0
+        {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_TAB_CLOSE_ACK_MISMATCH expected_tab_id={} actual_tab_id={} expected_target_id={} actual_target_id={} target_count_after={} remediation=the replacement bridge acknowledged a different tab or did not read the exact target absent",
+                owned.tab_id,
+                close.tab_id,
+                owned.target_id,
+                close.target_id,
+                close.target_count_after,
+            )));
+        }
+
+        let mut prior_active_restore = json!({
+            "attempted": false,
+            "restored": false,
+            "reason": "no_preoperation_bridge_snapshot",
+        });
+        if !maintenance.tabs_before.is_empty() {
+            let prior_active = maintenance
+                .tabs_before
+                .iter()
+                .filter(|tab| tab.chrome_window_id == owned_before.chrome_window_id && tab.active)
+                .collect::<Vec<_>>();
+            if prior_active.len() != 1 {
+                return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_MAINTENANCE_PRIOR_ACTIVE_TAB_AMBIGUOUS chrome_window_id={:?} active_match_count={} remediation=cleanup closed the exact owned tab but cannot restore operator selection without one exact pre-operation active tab identity",
+                    owned_before.chrome_window_id,
+                    prior_active.len(),
+                )));
+            }
+            let active = prior_active[0];
+            let restore_value = self
+                .send_reload_maintenance_command(
+                    "activateTab",
+                    json!({
+                        "targetIdHint": active.target_id,
+                        "waitTimeoutMs": 10_000,
+                    }),
+                )
+                .await?;
+            let restored = serde_json::from_value::<ChromeDebuggerActivateTabResult>(
+                restore_value,
+            )
+            .map_err(|error| {
+                ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_MAINTENANCE_PRIOR_ACTIVE_RESTORE_DECODE_FAILED tab_id={} target_id={} error={} remediation=the replacement bridge must return exact chrome.tabs.update(active=true) readback for the pre-operation tab",
+                    active.tab_id, active.target_id, error
+                ))
+            })?;
+            if !restored.active
+                || restored.tab_id != active.tab_id
+                || restored.target_id != active.target_id
+                || restored.chrome_window_id != active.chrome_window_id
+            {
+                return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_MAINTENANCE_PRIOR_ACTIVE_RESTORE_MISMATCH expected_tab_id={} actual_tab_id={} expected_target_id={} actual_target_id={} expected_window_id={:?} actual_window_id={:?} active={} remediation=the exact pre-operation tab selection did not reconverge after maintenance cleanup",
+                    active.tab_id,
+                    restored.tab_id,
+                    active.target_id,
+                    restored.target_id,
+                    active.chrome_window_id,
+                    restored.chrome_window_id,
+                    restored.active,
+                )));
+            }
+            prior_active_restore = json!({
+                "attempted": true,
+                "restored": true,
+                "reason": "exact_chrome_tabs_update_active_readback",
+                "tab_id": active.tab_id,
+                "target_id": active.target_id,
+                "chrome_window_id": active.chrome_window_id,
+            });
+        }
+
+        let after_cleanup = self.list_tabs_for_reload_maintenance().await?;
+        let id_absent = !after_cleanup
+            .tabs
+            .iter()
+            .any(|tab| tab.tab_id == owned_before.tab_id);
+        let token_absent = !after_cleanup
+            .tabs
+            .iter()
+            .any(|tab| tab.url.contains(&token_fragment));
+        let preexisting_tabs_preserved_exact = maintenance.tabs_before.is_empty()
+            || reload_preexisting_tabs_match(&maintenance.tabs_before, &after_cleanup.tabs);
+        if !id_absent || !token_absent || !preexisting_tabs_preserved_exact {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_TAB_CLEANUP_POSTCONDITION_FAILED tab_id={} target_id={} id_absent={} token_absent={} expected_preexisting_count={} actual_count={} preexisting_tabs_preserved_exact={} remediation=inspect chrome.tabs.query; cleanup is accepted only when the owned tab/token are absent and every pre-existing tab identity is unchanged",
+                owned_before.tab_id,
+                owned_before.target_id,
+                id_absent,
+                token_absent,
+                maintenance.tabs_before.len(),
+                after_cleanup.tabs.len(),
+                preexisting_tabs_preserved_exact,
+            )));
+        }
+        Ok(json!({
+            "attempted": true,
+            "closed": true,
+            "absent_verified": true,
+            "reason": "exact_chrome_tabs_remove_and_query_absence",
+            "tab_id": owned_before.tab_id,
+            "target_id": owned_before.target_id,
+            "chrome_window_id": owned_before.chrome_window_id,
+            "url_sha256_before_close": sha256_hex_lower(owned_before.url.as_bytes()),
+            "tab_count_before_operation": if maintenance.tabs_before.is_empty() {
+                Value::Null
+            } else {
+                json!(maintenance.tabs_before.len())
+            },
+            "tab_count_before_cleanup": before_cleanup.tabs.len(),
+            "tab_count_after_cleanup": after_cleanup.tabs.len(),
+            "preexisting_tabs_preserved_count": maintenance.tabs_before.len(),
+            "preexisting_tabs_preserved_exact": preexisting_tabs_preserved_exact,
+            "token_absent": token_absent,
+            "id_absent": id_absent,
+            "prior_active_restore": prior_active_restore,
+        }))
+    }
+
+    async fn cleanup_reload_maintenance_tab_with_ui_recovery(
+        &self,
+        maintenance: &ChromeBridgeMaintenanceTabLease,
+        ack: &ChromeBridgeReloadCommandAck,
+    ) -> Result<Value, ChromeDebuggerBridgeError> {
+        match self.cleanup_reload_maintenance_tab(maintenance).await {
+            Ok(readback) => Ok(readback),
+            Err(bridge_error) => match run_chrome_bridge_host_ui_cleanup(maintenance, ack).await {
+                Ok(ui_readback) => Ok(json!({
+                    "attempted": true,
+                    "closed": true,
+                    "absent_verified": true,
+                    "reason": "exact_installer_ui_lease_cleanup_after_bridge_cleanup_failure",
+                    "bridge_cleanup_error_code": bridge_error.code(),
+                    "bridge_cleanup_error_detail_sha256":
+                        sha256_hex_lower(bridge_error.detail().as_bytes()),
+                    "ui_cleanup": ui_readback,
+                })),
+                Err(ui_error) => Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_MAINTENANCE_BRIDGE_AND_UI_CLEANUP_FAILED bridge_cleanup_code={} bridge_cleanup_detail={} ui_cleanup_code={} ui_cleanup_detail={} remediation=inspect the exact token/HWND lease; neither Chrome tab API nor independent UIA cleanup proved the operation-created maintenance tab absent",
+                    bridge_error.code(),
+                    bridge_error.detail(),
+                    ui_error.code(),
+                    ui_error.detail(),
+                ))),
+            },
+        }
+    }
+
     async fn reload_via_host_ui(
         &self,
         wait_timeout_ms: u64,
@@ -5940,7 +6589,44 @@ impl ChromeDebuggerBridge {
         let wait_timeout = Duration::from_millis(wait_timeout_ms);
         invalidate_chrome_profile_scan_cache("host_ui_reload_before_snapshot");
         let before = self.active_host_snapshot().ok();
-        let ack = run_chrome_bridge_host_ui_reload().await?;
+        let maintenance = self
+            .prepare_reload_maintenance_tab(before.is_some())
+            .await?;
+        let mut ack = match run_chrome_bridge_host_ui_reload(&maintenance).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                let installer_verified_cleanup = error.detail().contains("cleanup=verified_absent");
+                let cleanup = self.cleanup_reload_maintenance_tab(&maintenance).await;
+                return match cleanup {
+                    Ok(cleanup) => Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                        "{} maintenance_cleanup={}",
+                        error.detail(),
+                        cleanup
+                    ))),
+                    Err(cleanup_error) if installer_verified_cleanup => {
+                        Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                            "{} maintenance_cleanup=installer_ui_verified_absent bridge_readback_error={} remediation=the installer separately proved exact token/address/tab-strip absence before returning its operation error; repair the named operation failure and retry",
+                            error.detail(),
+                            cleanup_error.detail(),
+                        )))
+                    }
+                    Err(cleanup_error) if before.is_none() => {
+                        Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                            "{} maintenance_cleanup_bridge_readback_unavailable={} remediation=the absent-host UI path performs exact token/address/tab-strip cleanup before returning this installer error; inspect the named SYNAPSE_CHROME_MAINTENANCE_* evidence",
+                            error.detail(),
+                            cleanup_error.detail(),
+                        )))
+                    }
+                    Err(cleanup_error) => {
+                        Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                            "SYNAPSE_CHROME_MAINTENANCE_OPERATION_AND_CLEANUP_FAILED operation_error={} cleanup_error={} remediation=inspect the exact tab/token/window identities; repair refuses to hide an operation-created maintenance surface",
+                            error.detail(),
+                            cleanup_error.detail(),
+                        )))
+                    }
+                };
+            }
+        };
         invalidate_chrome_profile_scan_cache("host_ui_reload_after_control");
         let started = Instant::now();
         let mut last_observed = "no_active_chrome_bridge_host".to_owned();
@@ -5949,14 +6635,21 @@ impl ChromeDebuggerBridge {
                 let before_host = before
                     .as_ref()
                     .map_or("<none>", |snapshot| snapshot.host_id.as_str());
+                let cleanup = self
+                    .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
+                    .await;
                 return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_TIMEOUT control_surface={} before_host_id={} wait_timeout_ms={} last_observed={} installer_path={} installer_sha256={} remediation=the exact Chrome extension management control completed, but the daemon did not observe a new clean authenticated bridge host within the bounded wait; inspect chrome://extensions for extension_id={}, the extension service-worker console, and daemon chrome_bridge health",
+                    "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_TIMEOUT control_surface={} before_host_id={} wait_timeout_ms={} last_observed={} installer_path={} installer_sha256={} maintenance_cleanup={} remediation=the exact Chrome extension management control completed, but the daemon did not observe a new clean authenticated bridge host within the bounded wait; the operation-owned maintenance tab was separately cleanup-attempted, inspect chrome://extensions for extension_id={}, the extension service-worker console, and daemon chrome_bridge health",
                     ack.control_surface,
                     before_host,
                     wait_timeout_ms,
                     last_observed,
                     ack.installer_path,
                     ack.installer_sha256,
+                    cleanup.as_ref().map_or_else(
+                        |error| format!("failed:{}", error.detail()),
+                        Value::to_string
+                    ),
                     EXTENSION_ID
                 )));
             }
@@ -5982,6 +6675,10 @@ impl ChromeDebuggerBridge {
                     if clean {
                         let waited_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let maintenance_cleanup = self
+                            .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
+                            .await?;
+                        ack.maintenance_cleanup = maintenance_cleanup;
                         return Ok(ChromeBridgeReloadResult {
                             before,
                             command_ack: ack,
@@ -6170,7 +6867,7 @@ impl ChromeDebuggerBridge {
         kind: &str,
         params: Value,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
-        self.send_command_with_timeout(kind, params, COMMAND_TIMEOUT)
+        self.send_command_with_timeout_policy(kind, params, COMMAND_TIMEOUT, false)
             .await
     }
 
@@ -6185,6 +6882,38 @@ impl ChromeDebuggerBridge {
         kind: &str,
         params: Value,
         command_timeout: Duration,
+    ) -> Result<Value, ChromeDebuggerBridgeError> {
+        self.send_command_with_timeout_policy(kind, params, command_timeout, false)
+            .await
+    }
+
+    /// The reload path may need read-only state before replacement and exact
+    /// cleanup through the replacement worker even when either worker is stale
+    /// by build identity. Public commands remain fail-closed. This private lane
+    /// bypasses only the daemon's pre-enqueue stale-build guard; the extension
+    /// still has to recognize the typed command and return exact chrome.tabs
+    /// readback. Maintenance creation itself stays on the independently owned
+    /// foreground UI path so repair never depends on the mutation lane it fixes.
+    async fn send_reload_maintenance_command(
+        &self,
+        kind: &str,
+        params: Value,
+    ) -> Result<Value, ChromeDebuggerBridgeError> {
+        if !matches!(kind, "activateTab" | "listTabs" | "closeTab") {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_COMMAND_FORBIDDEN kind={kind} remediation=only the exact tab ownership primitives may cross the stale-worker repair boundary"
+            )));
+        }
+        self.send_command_with_timeout_policy(kind, params, COMMAND_TIMEOUT, true)
+            .await
+    }
+
+    async fn send_command_with_timeout_policy(
+        &self,
+        kind: &str,
+        params: Value,
+        command_timeout: Duration,
+        allow_stale_for_reload_maintenance: bool,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
         let id = format!(
             "chrome-cdp-{}-{}",
@@ -6215,7 +6944,9 @@ impl ChromeDebuggerBridge {
                 .hosts
                 .get(&host_id)
                 .ok_or_else(ChromeDebuggerBridgeError::unavailable)?;
-            if let Some(reason) = bridge_command_stale_reason(host, kind) {
+            if !allow_stale_for_reload_maintenance
+                && let Some(reason) = bridge_command_stale_reason(host, kind)
+            {
                 let error = ChromeDebuggerBridgeError::stale(kind, &host_id, host, &reason);
                 tracing::warn!(
                     code = error.code(),
