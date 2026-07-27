@@ -31,7 +31,7 @@ pub const MAX_INTERSECTING_SST_PAGE_SOURCES: usize = 512;
 /// See issue #1809: two daemon crashes at the shared abort trampoline, both with
 /// `SstReader::range` -> `RawVec::grow_one` -> `handle_alloc_error` on the
 /// faulting rayon worker.
-const MAX_RANGE_SCAN_BYTES: usize = 1 << 30;
+pub(super) const MAX_RANGE_SCAN_BYTES: usize = 1 << 30;
 
 /// Fail-closed error for a range scan that would exceed [`MAX_RANGE_SCAN_BYTES`].
 fn scan_budget_exceeded(scanned: usize, next_record: usize) -> CalyxError {
@@ -51,7 +51,7 @@ fn scan_budget_exceeded(scanned: usize, next_record: usize) -> CalyxError {
 ///
 /// Converts what would otherwise be an infallible `Vec` growth (aborting the
 /// process via `handle_alloc_error`) into a propagable structured error.
-fn scan_reserve_failed(err: std::collections::TryReserveError) -> CalyxError {
+pub(super) fn scan_reserve_failed(err: std::collections::TryReserveError) -> CalyxError {
     CalyxError {
         code: "CALYX_ASTER_SCAN_ALLOC",
         message: format!("SST range scan could not reserve memory for the next record: {err}"),
@@ -258,25 +258,48 @@ impl SstReader {
     }
 
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstEntry>> {
-        let start_at = self
-            .index
-            .partition_point(|entry| entry.key.as_slice() < start);
+        self.collect_range(start, Some(end))
+    }
+
+    fn collect_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<SstEntry>> {
         let mut rows = Vec::new();
         let mut scanned_bytes: usize = 0;
-        for entry in &self.index[start_at..] {
-            if entry.key.as_slice() >= end {
-                break;
-            }
-            let record = read_record(self.column.as_bytes(), entry.offset)?;
-            let record_bytes = record.key.len().saturating_add(record.value.len());
+        self.visit_range_until(start, end, |key, value| {
+            let record_bytes = materialized_entry_bytes::<SstEntry>(key, value);
             scanned_bytes = scanned_bytes.saturating_add(record_bytes);
             if scanned_bytes > MAX_RANGE_SCAN_BYTES {
                 return Err(scan_budget_exceeded(scanned_bytes, record_bytes));
             }
             rows.try_reserve(1).map_err(scan_reserve_failed)?;
-            rows.push(record);
-        }
+            rows.push(SstEntry {
+                key: clone_scan_bytes(key)?,
+                value: clone_scan_bytes(value)?,
+            });
+            Ok(())
+        })?;
         Ok(rows)
+    }
+
+    /// Visits an ordered range through borrowed, CRC-validated record slices.
+    /// The caller owns all retention and allocation policy; this method itself
+    /// never materializes the range.
+    pub(super) fn visit_range_until(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let start_at = self
+            .index
+            .partition_point(|entry| entry.key.as_slice() < start);
+        for entry in &self.index[start_at..] {
+            if end.is_some_and(|end| entry.key.as_slice() >= end) {
+                break;
+            }
+            let record = read_record_ref(self.column.as_bytes(), entry.offset)?;
+            visit(record.key, record.value)?;
+        }
+        Ok(())
     }
 
     /// Reads at most one record: the greatest key in the requested bound.
@@ -314,34 +337,26 @@ impl SstReader {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> Result<Vec<SstKeyState>> {
-        let start_at = self
-            .index
-            .partition_point(|entry| entry.key.as_slice() < start);
         let mut rows = Vec::new();
         let mut scanned_bytes: usize = 0;
-        for entry in &self.index[start_at..] {
-            if end.is_some_and(|end| entry.key.as_slice() >= end) {
-                break;
-            }
-            let record = read_record_ref(self.column.as_bytes(), entry.offset)?;
-            scanned_bytes = scanned_bytes.saturating_add(record.key.len());
+        self.visit_range_until(start, end, |key, value| {
+            let record_bytes = materialized_entry_bytes::<SstKeyState>(key, &[]);
+            scanned_bytes = scanned_bytes.saturating_add(record_bytes);
             if scanned_bytes > MAX_RANGE_SCAN_BYTES {
-                return Err(scan_budget_exceeded(scanned_bytes, record.key.len()));
+                return Err(scan_budget_exceeded(scanned_bytes, record_bytes));
             }
             rows.try_reserve(1).map_err(scan_reserve_failed)?;
             rows.push(SstKeyState {
-                key: record.key.to_vec(),
-                is_tombstone: crate::mvcc::is_tombstone_value(record.value),
+                key: clone_scan_bytes(key)?,
+                is_tombstone: crate::mvcc::is_tombstone_value(value),
             });
-        }
+            Ok(())
+        })?;
         Ok(rows)
     }
 
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
-        self.index
-            .iter()
-            .map(|entry| read_record(self.column.as_bytes(), entry.offset))
-            .collect()
+        self.collect_range(&[], None)
     }
 
     pub(crate) fn iter_with_offsets(&self) -> Result<Vec<(u64, SstEntry)>> {
@@ -387,6 +402,21 @@ impl SstReader {
     fn validated_index(&self) -> Vec<IndexEntry> {
         self.index.clone()
     }
+}
+
+pub(super) fn materialized_entry_bytes<T>(key: &[u8], value: &[u8]) -> usize {
+    std::mem::size_of::<T>()
+        .saturating_add(key.len())
+        .saturating_add(value.len())
+}
+
+pub(super) fn clone_scan_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(bytes.len())
+        .map_err(scan_reserve_failed)?;
+    owned.extend_from_slice(bytes);
+    Ok(owned)
 }
 
 struct SstRecordRef<'a> {

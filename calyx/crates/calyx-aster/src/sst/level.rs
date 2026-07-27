@@ -1,9 +1,10 @@
 use super::page;
 use super::shared_reader;
-use super::{SstEntry, SstKeyState, SstLookupMetadata, SstPageReader, SstPointReader};
-use calyx_core::Result;
-use rayon::prelude::*;
-use std::collections::BTreeMap;
+use super::{
+    MAX_RANGE_SCAN_BYTES, SstEntry, SstKeyState, SstLookupMetadata, SstPageReader, SstPointReader,
+    clone_scan_bytes, materialized_entry_bytes, scan_reserve_failed,
+};
+use calyx_core::{CalyxError, Result};
 use std::path::PathBuf;
 
 use crate::storage_names::{SstName, classify_sst};
@@ -20,6 +21,18 @@ pub(super) struct LevelFile {
     pub(super) path: PathBuf,
     lookup: Option<SstLookupMetadata>,
     lookup_retained: bool,
+}
+
+#[derive(Debug)]
+struct RankedRangeEntry {
+    source_index: usize,
+    entry: SstEntry,
+}
+
+#[derive(Debug)]
+struct RankedKeyState {
+    source_index: usize,
+    state: SstKeyState,
 }
 
 impl LevelFile {
@@ -253,27 +266,58 @@ impl SstLevel {
     }
 
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstEntry>> {
-        let mut per_file = self
-            .files
-            .par_iter()
-            .enumerate()
-            .filter(|(_, file)| file.may_intersect(start, Some(end)))
-            .map(|(index, file)| -> Result<(usize, Vec<SstEntry>)> {
-                Ok((index, shared_reader(&file.path)?.range(start, end)?))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        per_file.sort_by_key(|(index, _)| *index);
+        self.collect_range(start, Some(end))
+    }
 
-        let mut rows = BTreeMap::new();
-        for (_, entries) in per_file {
-            for entry in entries {
-                rows.entry(entry.key).or_insert(entry.value);
+    fn collect_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<SstEntry>> {
+        // A per-SST ceiling is insufficient here: parallel materialization can
+        // retain N individually legal vectors before the newest-wins merge, and
+        // BTreeMap growth has no fallible reservation API. Stream every source
+        // through borrowed validated rows into one fallibly grown aggregate,
+        // charging duplicates too because they physically occupy memory until
+        // the deterministic newest-wins sort/dedup completes.
+        let mut retained_bytes = 0_usize;
+        let mut ranked = Vec::<RankedRangeEntry>::new();
+        for (source_index, file) in self.files.iter().enumerate() {
+            if !file.may_intersect(start, end) {
+                continue;
             }
+            shared_reader(&file.path)?.visit_range_until(start, end, |key, value| {
+                let next_record = materialized_entry_bytes::<RankedRangeEntry>(key, value);
+                retained_bytes = retained_bytes.saturating_add(next_record);
+                if retained_bytes > MAX_RANGE_SCAN_BYTES {
+                    return Err(level_scan_budget_exceeded(retained_bytes, next_record));
+                }
+                ranked.try_reserve(1).map_err(scan_reserve_failed)?;
+                ranked.push(RankedRangeEntry {
+                    source_index,
+                    entry: SstEntry {
+                        key: clone_scan_bytes(key)?,
+                        value: clone_scan_bytes(value)?,
+                    },
+                });
+                Ok(())
+            })?;
         }
-        Ok(rows
-            .into_iter()
-            .map(|(key, value)| SstEntry { key, value })
-            .collect())
+
+        // Unstable sort is allocation-free. Source indices are part of the
+        // total order, so equal keys deterministically retain the newest SST
+        // (the level stores newest first) without relying on sort stability.
+        ranked.sort_unstable_by(|left, right| {
+            left.entry
+                .key
+                .cmp(&right.entry.key)
+                .then_with(|| left.source_index.cmp(&right.source_index))
+        });
+        ranked.dedup_by(|later, earlier| later.entry.key == earlier.entry.key);
+
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(ranked.len())
+            .map_err(scan_reserve_failed)?;
+        for row in ranked {
+            rows.push(row.entry);
+        }
+        Ok(rows)
     }
 
     pub(crate) fn predecessor(
@@ -305,30 +349,48 @@ impl SstLevel {
     }
 
     pub fn range_keys_until(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
-        let mut per_file = self
-            .files
-            .par_iter()
-            .enumerate()
-            .filter(|(_, file)| file.may_intersect(start, end))
-            .map(|(index, file)| -> Result<(usize, Vec<SstKeyState>)> {
-                Ok((
-                    index,
-                    shared_reader(&file.path)?.range_key_states_until(start, end)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        per_file.sort_by_key(|(index, _)| *index);
+        let mut retained_bytes = 0_usize;
+        let mut ranked = Vec::<RankedKeyState>::new();
+        for (source_index, file) in self.files.iter().enumerate() {
+            if !file.may_intersect(start, end) {
+                continue;
+            }
+            shared_reader(&file.path)?.visit_range_until(start, end, |key, value| {
+                let next_record = materialized_entry_bytes::<RankedKeyState>(key, &[]);
+                retained_bytes = retained_bytes.saturating_add(next_record);
+                if retained_bytes > MAX_RANGE_SCAN_BYTES {
+                    return Err(level_scan_budget_exceeded(retained_bytes, next_record));
+                }
+                ranked.try_reserve(1).map_err(scan_reserve_failed)?;
+                ranked.push(RankedKeyState {
+                    source_index,
+                    state: SstKeyState {
+                        key: clone_scan_bytes(key)?,
+                        is_tombstone: crate::mvcc::is_tombstone_value(value),
+                    },
+                });
+                Ok(())
+            })?;
+        }
 
-        let mut rows = BTreeMap::<Vec<u8>, bool>::new();
-        for (_, entries) in per_file {
-            for entry in entries {
-                rows.entry(entry.key).or_insert(entry.is_tombstone);
+        ranked.sort_unstable_by(|left, right| {
+            left.state
+                .key
+                .cmp(&right.state.key)
+                .then_with(|| left.source_index.cmp(&right.source_index))
+        });
+        ranked.dedup_by(|later, earlier| later.state.key == earlier.state.key);
+
+        let live_count = ranked.iter().filter(|row| !row.state.is_tombstone).count();
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(live_count)
+            .map_err(scan_reserve_failed)?;
+        for row in ranked {
+            if !row.state.is_tombstone {
+                rows.push(row.state.key);
             }
         }
-        Ok(rows
-            .into_iter()
-            .filter_map(|(key, is_tombstone)| (!is_tombstone).then_some(key))
-            .collect())
+        Ok(rows)
     }
 
     pub fn range_page_until(
@@ -379,16 +441,7 @@ impl SstLevel {
     }
 
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
-        let mut rows = BTreeMap::new();
-        for file in &self.files {
-            for entry in shared_reader(&file.path)?.iter()? {
-                rows.entry(entry.key).or_insert(entry.value);
-            }
-        }
-        Ok(rows
-            .into_iter()
-            .map(|(key, value)| SstEntry { key, value })
-            .collect())
+        self.collect_range(&[], None)
     }
 
     pub fn file_count(&self) -> usize {
@@ -397,6 +450,16 @@ impl SstLevel {
 
     pub(crate) fn file_paths_newest_first(&self) -> Vec<PathBuf> {
         self.files.iter().map(|file| file.path.clone()).collect()
+    }
+}
+
+fn level_scan_budget_exceeded(retained: usize, next_record: usize) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
+        message: format!(
+            "SST level range merge exceeded the {MAX_RANGE_SCAN_BYTES}-byte aggregate materialization budget (retained={retained} bytes, next_record={next_record} bytes); refusing to allocate further"
+        ),
+        remediation: "use the bounded range-page API or narrow the key range, then compact excessive SST fan-in before retrying; the level merge fails closed instead of risking an allocator abort",
     }
 }
 
