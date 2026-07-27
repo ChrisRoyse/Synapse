@@ -1037,6 +1037,8 @@ $restartFloorSeconds = 2
 $restartCeilingSeconds = 60
 $rapidFailureWindowSeconds = 60
 $rapidFailureLimit = 5
+$deadOwnerBindDrainSeconds = 30
+$deadOwnerBindDrainPollMilliseconds = 500
 $generation = 0
 $rapidFailures = New-Object 'System.Collections.Generic.Queue[datetime]'
 
@@ -1112,6 +1114,35 @@ function Get-BindParts {
 function Get-ProcessInfoForPid {
     param([Parameter(Mandatory=$true)][int]$ProcessId)
     Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
+}
+
+function Test-ExactBindAvailable {
+    param(
+        [Parameter(Mandatory=$true)][string]$Address,
+        [Parameter(Mandatory=$true)][int]$Port
+    )
+
+    $probe = $null
+    $available = $false
+    $errorText = $null
+    try {
+        $ipAddress = [System.Net.IPAddress]::Parse($Address)
+        $probe = [System.Net.Sockets.TcpListener]::new($ipAddress, $Port)
+        $probe.ExclusiveAddressUse = $true
+        $probe.Start()
+        $available = $true
+    } catch {
+        $errorText = ($_.Exception.Message -replace '\s+', ' ').Trim()
+    } finally {
+        if ($null -ne $probe) {
+            try { $probe.Stop() } catch { }
+        }
+    }
+
+    return [pscustomobject]@{
+        Available = $available
+        Error = $errorText
+    }
 }
 
 function Get-CommandLineArgumentValue {
@@ -1278,17 +1309,107 @@ Write-SupervisorEvent 'supervisor_start' @{ generation = $generation; exe_path =
 Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Supervisor process started.'
 
 while ($true) {
-    $listener = Get-NetTCPConnection -LocalAddress $bindParts.Address -LocalPort $bindParts.Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $listener) {
-        $ownerPid = [int]$listener.OwningProcess
-        $ownerInfo = Get-ProcessInfoForPid -ProcessId $ownerPid
-        if (Test-ExpectedDaemonProcess -ProcessInfo $ownerInfo) {
-            Wait-AdoptedDaemon -OwnerPid $ownerPid -Generation $generation
+    $listeners = @(Get-NetTCPConnection -LocalAddress $bindParts.Address -LocalPort $bindParts.Port -State Listen -ErrorAction SilentlyContinue |
+        Sort-Object OwningProcess, CreationTime)
+    if ($listeners.Count -gt 0) {
+        $expectedOwnerPid = $null
+        $unexpectedOwners = @()
+        $deadOwnerRows = @()
+        foreach ($listener in $listeners) {
+            $ownerPid = [int]$listener.OwningProcess
+            $ownerInfo = Get-ProcessInfoForPid -ProcessId $ownerPid
+            if ($null -eq $ownerInfo) {
+                $deadOwnerRows += $listener
+                continue
+            }
+            if (Test-ExpectedDaemonProcess -ProcessInfo $ownerInfo) {
+                if ($null -eq $expectedOwnerPid) {
+                    $expectedOwnerPid = $ownerPid
+                }
+                continue
+            }
+            $unexpectedOwners += $ownerInfo
+        }
+
+        if ($unexpectedOwners.Count -gt 0) {
+            $unexpectedSummary = @($unexpectedOwners | ForEach-Object {
+                'pid={0} exe={1} command={2}' -f [int]$_.ProcessId, [string]$_.ExecutablePath, (([string]$_.CommandLine -replace '\s+', ' ').Trim())
+            }) -join ' | '
+            throw "SYNAPSE_DAEMON_BIND_OCCUPIED bind=$Bind live_unexpected_owner_count=$($unexpectedOwners.Count) owners=$unexpectedSummary"
+        }
+
+        if ($null -ne $expectedOwnerPid) {
+            Wait-AdoptedDaemon -OwnerPid $expectedOwnerPid -Generation $generation
             continue
         }
-        $ownerExe = if ($null -eq $ownerInfo) { '<missing>' } else { [string]$ownerInfo.ExecutablePath }
-        $ownerCommand = if ($null -eq $ownerInfo) { '<missing>' } else { ([string]$ownerInfo.CommandLine -replace '\s+', ' ').Trim() }
-        throw "SYNAPSE_DAEMON_BIND_OCCUPIED bind=$Bind owner_pid=$ownerPid owner_exe=$ownerExe owner_command=$ownerCommand"
+
+        $staleOwnerPids = @($deadOwnerRows | ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
+        $staleCreationTimes = @($deadOwnerRows | ForEach-Object { [string]$_.CreationTime })
+        $drainStarted = Get-Date
+        $drainAttempts = 0
+        $lastBindProbeError = $null
+        Write-LogLine "SYNAPSE_DAEMON_DEAD_OWNER_BIND_DRAIN_START generation=$generation bind=$Bind stale_owner_pids=$($staleOwnerPids -join ',') listener_count=$($deadOwnerRows.Count) timeout_seconds=$deadOwnerBindDrainSeconds"
+        Write-SupervisorEvent 'dead_owner_bind_drain_start' @{
+            generation = $generation
+            stale_owner_pids = $staleOwnerPids
+            listener_count = $deadOwnerRows.Count
+            listener_creation_times = $staleCreationTimes
+            timeout_seconds = $deadOwnerBindDrainSeconds
+        }
+        while ($true) {
+            $drainAttempts += 1
+            $bindProbe = Test-ExactBindAvailable -Address $bindParts.Address -Port $bindParts.Port
+            if ($bindProbe.Available -eq $true) {
+                break
+            }
+            $lastBindProbeError = $bindProbe.Error
+
+            $drainListeners = @(Get-NetTCPConnection -LocalAddress $bindParts.Address -LocalPort $bindParts.Port -State Listen -ErrorAction SilentlyContinue |
+                Sort-Object OwningProcess, CreationTime)
+            $liveDrainOwners = @()
+            foreach ($drainListener in $drainListeners) {
+                $drainOwner = Get-ProcessInfoForPid -ProcessId ([int]$drainListener.OwningProcess)
+                if ($null -ne $drainOwner) {
+                    $liveDrainOwners += $drainOwner
+                }
+            }
+            if ($liveDrainOwners.Count -gt 0) {
+                $liveDrainSummary = @($liveDrainOwners | ForEach-Object {
+                    'pid={0} exe={1} command={2}' -f [int]$_.ProcessId, [string]$_.ExecutablePath, (([string]$_.CommandLine -replace '\s+', ' ').Trim())
+                }) -join ' | '
+                throw "SYNAPSE_DAEMON_BIND_OCCUPIED_DURING_DEAD_OWNER_DRAIN bind=$Bind owners=$liveDrainSummary bind_probe_error=$lastBindProbeError"
+            }
+
+            $drainElapsedMs = [int64]((Get-Date) - $drainStarted).TotalMilliseconds
+            if ($drainElapsedMs -ge ($deadOwnerBindDrainSeconds * 1000)) {
+                throw "SYNAPSE_DAEMON_DEAD_OWNER_BIND_DRAIN_TIMEOUT bind=$Bind stale_owner_pids=$($staleOwnerPids -join ',') attempts=$drainAttempts elapsed_ms=$drainElapsedMs bind_probe_error=$lastBindProbeError"
+            }
+            if ($drainAttempts -eq 1 -or ($drainAttempts % 10) -eq 0) {
+                Write-LogLine "SYNAPSE_DAEMON_DEAD_OWNER_BIND_DRAIN_PROGRESS generation=$generation bind=$Bind stale_owner_pids=$($staleOwnerPids -join ',') attempts=$drainAttempts elapsed_ms=$drainElapsedMs bind_probe_error=$lastBindProbeError"
+                Write-SupervisorEvent 'dead_owner_bind_drain_progress' @{
+                    generation = $generation
+                    stale_owner_pids = $staleOwnerPids
+                    attempts = $drainAttempts
+                    elapsed_ms = $drainElapsedMs
+                    bind_probe_error = $lastBindProbeError
+                }
+                Write-SupervisorState -State 'dead_owner_bind_drain' -Generation $generation -ChildPid $null -ExitCode $null -Message "Waiting for the kernel to release dead-owner TCP row(s) for pid(s) $($staleOwnerPids -join ','); attempt=$drainAttempts elapsed_ms=$drainElapsedMs last_bind_error=$lastBindProbeError"
+            }
+            Start-Sleep -Milliseconds $deadOwnerBindDrainPollMilliseconds
+        }
+
+        $drainElapsedMs = [int64]((Get-Date) - $drainStarted).TotalMilliseconds
+        Write-LogLine "SYNAPSE_DAEMON_DEAD_OWNER_BIND_DRAINED generation=$generation bind=$Bind stale_owner_pids=$($staleOwnerPids -join ',') listener_count=$($deadOwnerRows.Count) attempts=$drainAttempts elapsed_ms=$drainElapsedMs bind_probe=success"
+        Write-SupervisorEvent 'dead_owner_bind_drained' @{
+            generation = $generation
+            stale_owner_pids = $staleOwnerPids
+            listener_count = $deadOwnerRows.Count
+            listener_creation_times = $staleCreationTimes
+            attempts = $drainAttempts
+            elapsed_ms = $drainElapsedMs
+            bind_probe_ok = $true
+        }
+        Write-SupervisorState -State 'dead_owner_bind_drained' -Generation $generation -ChildPid $null -ExitCode $null -Message "Kernel release of $($deadOwnerRows.Count) dead-owner TCP listener row(s) for pid(s) $($staleOwnerPids -join ',') was verified by an exclusive bind probe after ${drainElapsedMs}ms."
     }
 
     $generation += 1

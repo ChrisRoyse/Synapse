@@ -49,6 +49,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
+use windows::Win32::Foundation::{
+    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+};
+#[cfg(windows)]
 use windows::Win32::Networking::WinSock::{
     SD_BOTH, SOCKET, WSAGetLastError, shutdown as winsock_shutdown,
 };
@@ -1828,6 +1832,20 @@ impl Listener for TrackedTcpListener {
         loop {
             match self.inner.accept().await {
                 Ok((stream, addr)) => {
+                    #[cfg(windows)]
+                    if let Err(error) =
+                        clear_and_verify_socket_inheritance(&stream, "accepted_http_socket")
+                    {
+                        tracing::error!(
+                            code = "MCP_HTTP_ACCEPTED_SOCKET_INHERITANCE_CLEAR_FAILED",
+                            error = %error,
+                            peer_addr = %addr,
+                            raw_socket = stream.as_raw_socket() as usize,
+                            "refusing an accepted HTTP socket whose inheritance flag could not be cleared and read back"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     if let Err(error) = stream.set_zero_linger() {
                         tracing::error!(
                             code = "MCP_HTTP_ACCEPTED_SOCKET_ZERO_LINGER_FAILED",
@@ -3018,6 +3036,9 @@ async fn bind_http_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind HTTP MCP transport to {addr}"))?;
+    #[cfg(windows)]
+    clear_and_verify_socket_inheritance(&listener, "http_listener")
+        .with_context(|| format!("make HTTP MCP listener {addr} non-inheritable"))?;
     // #1773: record the exact wall-clock instant the port became bound. The
     // issue's independent readback saw no listener on 7700; this edge is the
     // definitive proof-of-bind (and its absence, definitive proof of no-bind).
@@ -3029,6 +3050,46 @@ async fn bind_http_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
         "HTTP listener bound with normal bind path"
     );
     Ok(listener)
+}
+
+#[cfg(windows)]
+fn clear_and_verify_socket_inheritance<T>(socket: &T, socket_role: &'static str) -> io::Result<()>
+where
+    T: AsRawSocket,
+{
+    let raw_socket = socket.as_raw_socket();
+    let handle = HANDLE(raw_socket as *mut std::ffi::c_void);
+    unsafe {
+        SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).map_err(|error| {
+            io::Error::other(format!(
+                "{socket_role} raw_socket={} SetHandleInformation(HANDLE_FLAG_INHERIT=0) failed: {error}",
+                raw_socket as usize
+            ))
+        })?;
+    }
+
+    let mut flags = 0_u32;
+    unsafe { GetHandleInformation(handle, &raw mut flags) }.map_err(|error| {
+        io::Error::other(format!(
+            "{socket_role} raw_socket={} GetHandleInformation readback failed: {error}",
+            raw_socket as usize
+        ))
+    })?;
+    if flags & HANDLE_FLAG_INHERIT.0 != 0 {
+        return Err(io::Error::other(format!(
+            "{socket_role} raw_socket={} remained inheritable after SetHandleInformation; flags={flags:#x}",
+            raw_socket as usize
+        )));
+    }
+
+    tracing::debug!(
+        code = "MCP_HTTP_SOCKET_INHERITANCE_CLEARED",
+        socket_role,
+        raw_socket = raw_socket as usize,
+        handle_flags = flags,
+        "HTTP socket handle is non-inheritable"
+    );
+    Ok(())
 }
 
 fn router(
