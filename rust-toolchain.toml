@@ -3,8 +3,11 @@
 # across contributors (this repo has no CI to enforce a version). An unversioned
 # `stable` does not achieve this: each stable release formats slightly differently,
 # so `cargo fmt` on a newer stable produces spurious diffs on already-clean code
-# (see #1603). Bump this deliberately and re-run `cargo fmt --all` in the same PR.
+# (see #1603). Bump this deliberately, review the compiler release notes, and
+# re-run `cargo fmt --all` in the same PR. Rust 1.97.1 includes an upstream LLVM
+# optimization fix plus a conservative rustc-side revert; #1731 records why the
+# release build moved off the repeatedly crashing 1.96.1 compiler binary.
 # rustup auto-installs this version on a fresh checkout; `rustfmt` + `clippy` are
 # declared so it also has the components the workspace lints require.
-channel = "1.96.1"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

@@ -6035,6 +6035,51 @@ function Get-SynapseDaemonStagingDescriptor {
     }
 }
 
+function Get-SynapseWindowsMemoryReadback {
+    $readback = [ordered]@{
+        schema = 'synapse_setup_windows_memory_readback/v1'
+        observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        source_of_truth = 'Win32_OperatingSystem + Win32_PageFileUsage'
+        total_physical_bytes = $null
+        available_physical_bytes = $null
+        commit_limit_bytes = $null
+        commit_available_bytes = $null
+        commit_charge_bytes = $null
+        commit_percent = $null
+        pagefiles = @()
+        read_succeeded = $false
+        error = $null
+    }
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $totalPhysical = [uint64]$os.TotalVisibleMemorySize * [uint64]1024
+        $availablePhysical = [uint64]$os.FreePhysicalMemory * [uint64]1024
+        $commitLimit = [uint64]$os.TotalVirtualMemorySize * [uint64]1024
+        $commitAvailable = [uint64]$os.FreeVirtualMemory * [uint64]1024
+        $commitCharge = if ($commitLimit -ge $commitAvailable) {
+            $commitLimit - $commitAvailable
+        } else {
+            [uint64]0
+        }
+        $readback.total_physical_bytes = $totalPhysical
+        $readback.available_physical_bytes = $availablePhysical
+        $readback.commit_limit_bytes = $commitLimit
+        $readback.commit_available_bytes = $commitAvailable
+        $readback.commit_charge_bytes = $commitCharge
+        $readback.commit_percent = if ($commitLimit -gt 0) {
+            [math]::Round(([double]$commitCharge / [double]$commitLimit) * 100, 2)
+        } else {
+            $null
+        }
+        $readback.pagefiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop |
+            Select-Object Name, AllocatedBaseSize, CurrentUsage, PeakUsage, TempPageFile)
+        $readback.read_succeeded = $true
+    } catch {
+        $readback.error = $_.Exception.Message
+    }
+    return [pscustomobject]$readback
+}
+
 function Assert-SynapseDaemonStagingHasNoLiveExecutable {
     param([Parameter(Mandatory=$true)][string]$Path)
 
@@ -9757,9 +9802,9 @@ if (-not $SkipBuild) {
         # LLVM thin-LTO, rust-lld, CUDA/native build scripts, and a 260+ MB
         # embedded-model executable. On this 32-thread/128-GB Windows host the
         # final rustc process physically crashed with STATUS_ACCESS_VIOLATION at
-        # 32 jobs while 75+ GB remained free; the identical build completed at
-        # 8. Cap the evidence-backed automatic choice while preserving an
-        # explicit CARGO_BUILD_JOBS operator override.
+        # 32 jobs while 75+ GB remained free. Keep the resource cap, but do not
+        # treat it as the #1731 compiler fix: that fault later recurred at 8
+        # jobs. Preserve an explicit CARGO_BUILD_JOBS operator override.
         $logicalCpus = [Environment]::ProcessorCount
         $ramGb = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
         $memoryJobs = [math]::Max(1, [math]::Floor($ramGb / 1.5))
@@ -9773,6 +9818,13 @@ if (-not $SkipBuild) {
     # each new failure also writes an immutable per-attempt archive below.
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     Info "Build process tree is job-owned; log: $buildLog"
+    $buildMemoryBefore = Get-SynapseWindowsMemoryReadback
+    Info ("Release build memory before: read_succeeded={0} commit_charge_bytes={1} commit_limit_bytes={2} commit_percent={3} available_physical_bytes={4}" -f `
+        $buildMemoryBefore.read_succeeded,
+        $buildMemoryBefore.commit_charge_bytes,
+        $buildMemoryBefore.commit_limit_bytes,
+        $buildMemoryBefore.commit_percent,
+        $buildMemoryBefore.available_physical_bytes)
     $buildInvocationDiagnostics = $null
     $buildExit = Invoke-SynapseProcessInKillOnCloseJob `
         -FilePath $cargo `
@@ -9781,6 +9833,13 @@ if (-not $SkipBuild) {
         -TimeoutMinutes $BuildTimeoutMinutes `
         -LogPath $buildLog `
         -Diagnostics ([ref]$buildInvocationDiagnostics)
+    $buildMemoryAfter = Get-SynapseWindowsMemoryReadback
+    Info ("Release build memory after: read_succeeded={0} commit_charge_bytes={1} commit_limit_bytes={2} commit_percent={3} available_physical_bytes={4}" -f `
+        $buildMemoryAfter.read_succeeded,
+        $buildMemoryAfter.commit_charge_bytes,
+        $buildMemoryAfter.commit_limit_bytes,
+        $buildMemoryAfter.commit_percent,
+        $buildMemoryAfter.available_physical_bytes)
     $buildInvocationDiagnostics |
         ConvertTo-Json -Depth 32 |
         Set-Content -LiteralPath $buildInvocationPath -Encoding UTF8
@@ -9837,6 +9896,9 @@ if (-not $SkipBuild) {
             remediation = $failureKind.remediation
             diagnostics_archive = $buildDiagnosticsArchivePath
             compiler_environment = $releaseBuildCompilerEnvironment
+            cargo_build_jobs = $env:CARGO_BUILD_JOBS
+            memory_before = $buildMemoryBefore
+            memory_after = $buildMemoryAfter
             invocation = $buildInvocationDiagnostics
             log_signal = $buildLogSignal
             artifact_readback = $artifactReadback
