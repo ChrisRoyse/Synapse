@@ -13,11 +13,12 @@ use crate::{SynapseCalyxError, SynapseCalyxMathBackend, SynapseCalyxTuningConfig
 const MATH_BACKEND_REMEDIATION: &str = "inspect the SYNAPSE_CALYX_MATH_* structured events, health payload, CUDA driver state, and Calyx Forge error; use math_backend=\"cpu\" only when intentionally forcing CPU";
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 // CUDA context/module initialization is not routed through Forge's dispatch
-// allocator, so it needs a conservative, declared host-wide envelope while
-// its retained footprint is measured. This is intentionally independent from
-// the maximum runtime dispatch budget: reserving that entire ceiling makes a
-// candidate-before-handoff install impossible while a healthy daemon retains
-// its measured baseline.
+// allocator, so it needs a conservative, declared host-wide envelope for its
+// entire lifetime. On Windows WDDM, NVML reports device-global free memory but
+// cannot report per-process used GPU memory. A before/after global delta can be
+// changed by unrelated desktop GPU clients and therefore cannot prove a safe
+// smaller claim. This envelope is intentionally independent from the maximum
+// runtime dispatch budget: each dispatch still reserves its exact buffer shape.
 const CUDA_STARTUP_ENVELOPE_MIB: u64 = 4 * 1024;
 const CUDA_REPLACEMENT_RESERVATION_ENV: &str = "SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID";
 const PROBE_TOLERANCE: f32 = 0.0001;
@@ -346,14 +347,14 @@ fn cuda_runtime_candidate(
         "synapse-mcp",
         format!("synapse-daemon-pid-{}", std::process::id()),
         format!(
-            "synapse-mcp temporary CUDA startup envelope; envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; atomically resized after retained-footprint measurement"
+            "synapse-mcp CUDA context/module lifetime envelope; envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; retained conservatively because WDDM has no exact per-process VRAM readback"
         ),
         startup_envelope_mib,
     );
     if let Some(replacement_id) = cuda_replacement_reservation_id()? {
         request = request.replacing(replacement_id);
     }
-    let mut reservation = reservation_store.acquire(request).map_err(|error| {
+    let reservation = reservation_store.acquire(request).map_err(|error| {
         forge_error(
             "SYNAPSE_CALYX_MATH_HOST_RESERVATION_REFUSED",
             "atomically admit the embedded Synapse CUDA startup envelope",
@@ -386,9 +387,9 @@ fn cuda_runtime_candidate(
             ));
         }
     };
-    let baseline_basis = match warm_and_measure_cuda_baseline(
+    let baseline_basis = match warm_and_verify_cuda_startup_envelope(
         &backend,
-        &mut reservation,
+        &reservation,
         startup_envelope_mib,
         runtime_ceiling_mib,
     ) {
@@ -445,9 +446,9 @@ fn cuda_replacement_reservation_id() -> Result<Option<String>, SynapseCalyxError
 }
 
 #[cfg(feature = "calyx-cuda")]
-fn warm_and_measure_cuda_baseline(
+fn warm_and_verify_cuda_startup_envelope(
     backend: &VramBudgetedCudaBackend,
-    reservation: &mut HostGpuReservation,
+    reservation: &HostGpuReservation,
     startup_envelope_mib: u64,
     runtime_ceiling_mib: u64,
 ) -> Result<String, SynapseCalyxError> {
@@ -461,40 +462,25 @@ fn warm_and_measure_cuda_baseline(
         )
     })?;
     let free_after_warmup_mib = measured_snapshot.last_physical_free_mib;
-    if free_after_warmup_mib > free_before_cuda_mib {
-        return Err(SynapseCalyxError::new(
-            "SYNAPSE_CALYX_MATH_BASELINE_MEASUREMENT_DRIFT",
-            format!(
-                "physical free VRAM increased during the exclusive participating-process startup guard: before_mib={free_before_cuda_mib} after_mib={free_after_warmup_mib}; retained CUDA footprint is not provable"
-            ),
-            MATH_BACKEND_REMEDIATION,
-        ));
-    }
-    let retained_cuda_mib = free_before_cuda_mib
-        .saturating_sub(free_after_warmup_mib)
-        .max(1);
-    if retained_cuda_mib > startup_envelope_mib {
-        return Err(SynapseCalyxError::new(
-            "SYNAPSE_CALYX_MATH_STARTUP_ENVELOPE_EXCEEDED",
-            format!(
-                "measured retained CUDA startup footprint exceeds its admitted envelope: retained_mib={retained_cuda_mib} startup_envelope_mib={startup_envelope_mib} runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; refusing a runtime whose context allocation was not fully covered by the declared host claim"
-            ),
-            MATH_BACKEND_REMEDIATION,
-        ));
-    }
+    let global_free_delta_mib = if free_after_warmup_mib >= free_before_cuda_mib {
+        i64::try_from(free_after_warmup_mib - free_before_cuda_mib).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(free_before_cuda_mib - free_after_warmup_mib).unwrap_or(i64::MAX)
+    };
     let basis = format!(
-        "admitted_startup_envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; nvml_free_delta_after_cuda_context_and_warm_probe_rounded_up_to_mib_with_minimum_1mib_resolution; free_before_mib={free_before_cuda_mib}; free_after_mib={free_after_warmup_mib}; retained_mib={retained_cuda_mib}; measured_retained_within_startup_envelope=true; every dispatch separately reserves its exact device-buffer shape"
+        "admitted_cuda_context_lifetime_envelope_mib={startup_envelope_mib}; runtime_dispatch_ceiling_mib={runtime_ceiling_mib}; wddm_per_process_vram_readback=unavailable; nvml_device_global_free_before_mib={free_before_cuda_mib}; nvml_device_global_free_after_mib={free_after_warmup_mib}; nvml_device_global_free_delta_mib={global_free_delta_mib}; global_delta_used_for_attribution=false; conservative_envelope_retained=true; every_dispatch_separately_reserves_its_exact_device_buffer_shape=true"
     );
-    let command = format!("synapse-mcp retained CUDA baseline; {basis}");
-    reservation
-        .resize(retained_cuda_mib, &command)
-        .map_err(|error| {
-            forge_error(
-                "SYNAPSE_CALYX_MATH_BASELINE_RESIZE_FAILED",
-                "atomically resize the startup guard to the measured retained CUDA footprint",
-                &error,
-            )
-        })?;
+    tracing::info!(
+        code = "SYNAPSE_CALYX_MATH_STARTUP_ENVELOPE_RETAINED",
+        free_before_cuda_mib,
+        free_after_warmup_mib,
+        global_free_delta_mib,
+        startup_envelope_mib,
+        runtime_ceiling_mib,
+        reservation_id = reservation.reservation_id(),
+        source_of_truth = measured_snapshot.state_path,
+        "retained the pre-admitted CUDA context envelope because device-global NVML samples cannot isolate this process on WDDM"
+    );
     Ok(basis)
 }
 
