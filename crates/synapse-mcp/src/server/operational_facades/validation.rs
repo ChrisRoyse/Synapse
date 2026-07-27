@@ -69,10 +69,18 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
 
 pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorData> {
     match params.operation {
-        SetupOperation::Status if params.doctor.is_none() && params.repair.is_none() => {
+        SetupOperation::Status
+            if params.doctor.is_none()
+                && params.repair.is_none()
+                && params.host_transition.is_none() =>
+        {
             return Ok(());
         }
-        SetupOperation::Doctor if params.status.is_none() && params.repair.is_none() => {
+        SetupOperation::Doctor
+            if params.status.is_none()
+                && params.repair.is_none()
+                && params.host_transition.is_none() =>
+        {
             return Ok(());
         }
         _ => {}
@@ -84,6 +92,7 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
             ("status", params.status.is_some()),
             ("doctor", params.doctor.is_some()),
             ("repair", params.repair.is_some()),
+            ("host_transition", params.host_transition.is_some()),
         ],
     )
 }

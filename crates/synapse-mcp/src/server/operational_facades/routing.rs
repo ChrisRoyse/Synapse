@@ -46,7 +46,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public setup facade for the <=40 MCP surface. operation=status/doctor read host setup Source-of-Truth files, daemon pid/bind, and Codex MCP config. operation=repair is maintenance-gated and refuses normal-agent self-repair instead of silently mutating the running daemon."
+        description = "Public setup facade for the <=40 MCP surface. operation=status/doctor read host setup Source-of-Truth files, daemon pid/bind, and Codex MCP config. operation=repair is maintenance-gated. operation=host_transition action=status/configure/preflight/execute uses kernel boot identity, every durable shell status, configured WSL production leases/checkpoints, persisted authorization/intent records, and Windows Event 1074 to fail closed around planned restart/poweroff."
     )]
     pub async fn setup(
         &self,

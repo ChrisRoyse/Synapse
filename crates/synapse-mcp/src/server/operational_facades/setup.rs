@@ -23,6 +23,7 @@ use crate::{
 use super::{
     SETUP_SOT, SETUP_TOOL,
     errors::{facade_delegate_error, missing_spec},
+    host_transition,
     policy::require_maintenance_profile,
     response::setup_response,
     types::{FileReadback, SetupOperation, SetupParams, SetupResponse, SetupStatusResponse},
@@ -110,6 +111,20 @@ pub(super) async fn handle(
                 launched.readback_source_of_truth(),
                 |out| {
                     out.status = Some(status);
+                },
+            )))
+        }
+        SetupOperation::HostTransition => {
+            let spec = params
+                .0
+                .host_transition
+                .ok_or_else(|| missing_spec(SETUP_TOOL, "host_transition"))?;
+            let result = host_transition::handle(spec)?;
+            Ok(Json(setup_response(
+                operation,
+                result.source_of_truth.clone(),
+                |out| {
+                    out.host_transition = Some(result);
                 },
             )))
         }

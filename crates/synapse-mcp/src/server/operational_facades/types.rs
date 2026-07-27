@@ -293,6 +293,7 @@ pub enum SetupOperation {
     Status,
     Doctor,
     Repair,
+    HostTransition,
 }
 
 impl SetupOperation {
@@ -301,6 +302,7 @@ impl SetupOperation {
             Self::Status => "status",
             Self::Doctor => "doctor",
             Self::Repair => "repair",
+            Self::HostTransition => "host_transition",
         }
     }
 }
@@ -315,6 +317,92 @@ pub struct SetupRepairParams {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupHostTransitionAction {
+    Status,
+    Configure,
+    Preflight,
+    Execute,
+}
+
+impl SetupHostTransitionAction {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Configure => "configure",
+            Self::Preflight => "preflight",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupHostTransitionKind {
+    Restart,
+    Poweroff,
+}
+
+impl SetupHostTransitionKind {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::Poweroff => "poweroff",
+        }
+    }
+}
+
+/// A cross-project production lease whose physical kernel lock and application
+/// checkpoint must both be inspected before a planned host transition.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionGuardSpec {
+    pub id: String,
+    pub distribution: String,
+    pub lease_path: String,
+    pub lease_active_phase: String,
+    pub checkpoint_path: String,
+    pub checkpoint_complete_field: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionGuardAcceptance {
+    pub guard_id: String,
+    pub checkpoint_sha256: String,
+}
+
+/// Explicit destructive override. It is accepted only when every named
+/// checkpoint is complete and its separately read bytes match the supplied
+/// digest. The acceptance is persisted independently from reboot intent.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionOverride {
+    pub accepted_job_ids: Vec<String>,
+    pub guard_acceptances: Vec<SetupHostTransitionGuardAcceptance>,
+    pub reason: String,
+    pub confirmation: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionParams {
+    pub action: SetupHostTransitionAction,
+    #[serde(default)]
+    pub transition: Option<SetupHostTransitionKind>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub preflight_id: Option<String>,
+    #[serde(default)]
+    pub confirmation: Option<String>,
+    #[serde(default)]
+    pub guards: Option<Vec<SetupHostTransitionGuardSpec>>,
+    #[serde(default)]
+    pub override_acceptance: Option<SetupHostTransitionOverride>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetupParams {
@@ -325,6 +413,8 @@ pub struct SetupParams {
     pub doctor: Option<SetupStatusParams>,
     #[serde(default)]
     pub repair: Option<SetupRepairParams>,
+    #[serde(default)]
+    pub host_transition: Option<SetupHostTransitionParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -358,6 +448,56 @@ pub struct SetupStatusResponse {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionGuardReadback {
+    pub id: String,
+    pub distribution: String,
+    pub lease_path: String,
+    pub lease_active: bool,
+    pub lease_owner_pid: Option<u32>,
+    pub lease_owner_command: Option<String>,
+    pub lease_phase: String,
+    pub lease_released_unix_ns_present: bool,
+    pub lease_sha256: String,
+    pub checkpoint_path: String,
+    pub checkpoint_complete_field: String,
+    pub checkpoint_complete: bool,
+    pub checkpoint_len_bytes: u64,
+    pub checkpoint_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionIntentReadback {
+    pub intent_id: String,
+    pub transition: SetupHostTransitionKind,
+    pub status: String,
+    pub intent_path: String,
+    pub prior_host_boot_id: String,
+    pub current_host_boot_id: String,
+    pub event_1074_record_id: Option<u64>,
+    pub event_1074_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHostTransitionResponse {
+    pub action: SetupHostTransitionAction,
+    pub source_of_truth: String,
+    pub state_root: String,
+    pub current_host_boot_id: String,
+    pub guard_config_file: FileReadback,
+    pub durable_jobs: crate::m4::ShellJobHostTransitionSnapshot,
+    pub guards: Vec<SetupHostTransitionGuardReadback>,
+    pub authorized: bool,
+    pub safety_digest: String,
+    pub preflight_id: Option<String>,
+    pub preflight_path: Option<String>,
+    pub override_path: Option<String>,
+    pub intent: Option<SetupHostTransitionIntentReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetupResponse {
     pub operation: SetupOperation,
     pub source_of_truth: String,
@@ -366,6 +506,8 @@ pub struct SetupResponse {
     pub status: Option<SetupStatusResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor: Option<SetupStatusResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_transition: Option<SetupHostTransitionResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

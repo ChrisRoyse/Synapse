@@ -881,6 +881,14 @@ pub struct ActRunShellSupervisorIdentity {
     /// platforms: the kernel start-time value exposed by sysinfo.
     pub start_time: u64,
     pub start_time_source: String,
+    /// Kernel boot identity for the host that created this supervisor. On
+    /// Windows this is `SystemBootEnvironmentInformation.BootIdentifier`; on
+    /// Linux it is `/proc/sys/kernel/random/boot_id`.
+    ///
+    /// Legacy records deserialize as `None`. Absence is uncertainty and must
+    /// never be used to attribute child loss to Windows Job Object close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_boot_id: Option<String>,
     /// How this supervisor contains the job's owned children.
     pub child_containment: String,
     pub started_at: String,
@@ -895,6 +903,7 @@ pub struct ActRunShellSupervisorIdentity {
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellSupervisorReconciliation {
     /// `supervisor_restart_children_reaped_by_job_object_close` |
+    /// `host_reboot_controller_loss` |
     /// `supervisor_restart_child_absent_containment_unknown` |
     /// `supervisor_restart_child_never_had_creation_identity`
     pub cause: String,
@@ -907,6 +916,17 @@ pub struct ActRunShellSupervisorReconciliation {
     pub prior_supervisor_identity_state: String,
     pub reconciling_supervisor_incarnation_id: String,
     pub reconciling_supervisor_pid: u32,
+    /// Persisted boot identity of the prior owner, when the record was new
+    /// enough to carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_host_boot_id: Option<String>,
+    /// Legacy reconciliation records predate host-boot tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciling_host_boot_id: Option<String>,
+    /// `same_boot` | `boot_changed` | `same_boot_proven_by_surviving_exact_child`
+    /// | `prior_boot_identity_unrecorded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_boot_relation: Option<String>,
     pub child_containment: String,
     pub child_identity_state: String,
     pub children_terminated_by: String,
@@ -6635,6 +6655,130 @@ const SHELL_SUPERVISOR_MARKER_FILE: &str = "supervisor.json";
 
 static SHELL_JOB_SUPERVISOR_IDENTITY: OnceLock<ActRunShellSupervisorIdentity> = OnceLock::new();
 
+/// Read the physical host boot identity from the kernel.
+///
+/// This is intentionally not derived from wall-clock uptime: clock repair,
+/// hibernation, and coarse timestamp resolution can make timestamps ambiguous.
+/// An unreadable kernel Source of Truth is an error, never a synthetic id.
+#[cfg(windows)]
+pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
+    use windows::{
+        Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
+        core::GUID,
+    };
+
+    // SYSTEM_BOOT_ENVIRONMENT_INFORMATION starts with a GUID and has grown
+    // additional fields over Windows releases. A bounded oversized buffer
+    // preserves ABI compatibility while only reading the documented invariant
+    // first field.
+    let mut buffer = [0_u8; 64];
+    let mut returned = 0_u32;
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_INFORMATION_CLASS(90),
+            buffer.as_mut_ptr().cast(),
+            64,
+            &mut returned,
+        )
+    };
+    if status.is_err() {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "Windows kernel boot identity query failed with NTSTATUS 0x{:08x}",
+                status.0 as u32
+            ),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "windows_boot_identity_query_failed",
+                "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
+                "ntstatus": format!("0x{:08x}", status.0 as u32),
+                "remediation": "repair the Windows ntdll/system-information query failure and restart synapse-mcp; host transitions remain refused",
+            }),
+        ));
+    }
+    if returned < 16 {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "Windows kernel boot identity query returned {returned} bytes, fewer than the required 16-byte BootIdentifier"
+            ),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "windows_boot_identity_response_truncated",
+                "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
+                "returned_bytes": returned,
+                "required_bytes": std::mem::size_of::<GUID>(),
+                "remediation": "repair the Windows system-information API mismatch and restart synapse-mcp; host transitions remain refused",
+            }),
+        ));
+    }
+    let guid = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<GUID>()) };
+    if guid == GUID::zeroed() {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            "Windows kernel returned an all-zero BootIdentifier",
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "windows_boot_identity_zero",
+                "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
+                "remediation": "repair the Windows boot-environment identity Source of Truth and restart synapse-mcp; host transitions remain refused",
+            }),
+        ));
+    }
+    Ok(format!("{guid:?}").to_ascii_lowercase())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
+    const PATH: &str = "/proc/sys/kernel/random/boot_id";
+    let value = fs::read_to_string(PATH).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("Linux kernel boot identity {PATH} could not be read: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "linux_boot_identity_read_failed",
+                "source_of_truth": PATH,
+                "remediation": "restore readable procfs boot_id state and restart synapse-mcp; host transitions remain refused",
+            }),
+        )
+    })?;
+    let value = value.trim();
+    let valid = value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit()
+        });
+    if !valid || value.bytes().all(|byte| matches!(byte, b'0' | b'-')) {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("Linux kernel boot identity {PATH} is structurally invalid"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "linux_boot_identity_invalid",
+                "source_of_truth": PATH,
+                "observed_length": value.len(),
+                "remediation": "repair the procfs boot_id Source of Truth and restart synapse-mcp; host transitions remain refused",
+            }),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
+    Err(shell_tool_error(
+        error_codes::STORAGE_READ_FAILED,
+        "this platform has no implemented kernel boot-identity Source of Truth",
+        json!({
+            "code": error_codes::STORAGE_READ_FAILED,
+            "reason": "host_boot_identity_platform_unsupported",
+            "remediation": "implement a kernel-backed boot identity for this platform before enabling durable shell ownership or host transitions",
+        }),
+    ))
+}
+
 /// This daemon process's durable-shell-job supervisor identity, computed once.
 ///
 /// If the process cannot read its own kernel creation identity the record is
@@ -6669,6 +6813,18 @@ fn shell_job_supervisor_identity() -> &'static ActRunShellSupervisorIdentity {
             pid,
             start_time,
             start_time_source,
+            host_boot_id: match read_host_boot_identity() {
+                Ok(boot_id) => Some(boot_id),
+                Err(error) => {
+                    tracing::error!(
+                        code = "M4_HOST_BOOT_IDENTITY_UNAVAILABLE",
+                        detail = %error.message,
+                        data = ?error.data,
+                        "durable shell-job supervisor could not read the kernel host boot identity; daemon startup and host-transition authorization will fail closed"
+                    );
+                    None
+                }
+            },
             child_containment: if cfg!(windows) {
                 SHELL_SUPERVISOR_CONTAINMENT_JOB_OBJECT
             } else {
@@ -6729,6 +6885,8 @@ struct ShellJobSupervisorMarker {
     pid: u32,
     start_time: u64,
     start_time_source: String,
+    #[serde(default)]
+    host_boot_id: Option<String>,
     child_containment: String,
     started_at: String,
     clean_shutdown_at: Option<String>,
@@ -6743,11 +6901,12 @@ fn shell_job_supervisor_marker_for(
     clean_shutdown_at: Option<String>,
 ) -> ShellJobSupervisorMarker {
     ShellJobSupervisorMarker {
-        schema_version: 1,
+        schema_version: 2,
         incarnation_id: identity.incarnation_id.clone(),
         pid: identity.pid,
         start_time: identity.start_time,
         start_time_source: identity.start_time_source.clone(),
+        host_boot_id: identity.host_boot_id.clone(),
         child_containment: identity.child_containment.clone(),
         started_at: identity.started_at.clone(),
         clean_shutdown_at,
@@ -6825,8 +6984,11 @@ pub struct ShellJobSupervisorRestartReadback {
     pub incarnation_id: String,
     pub supervisor_pid: u32,
     pub supervisor_identity_provable: bool,
+    pub host_boot_id: String,
     pub prior_supervisor_state: String,
     pub prior_incarnation_id: Option<String>,
+    pub prior_host_boot_id: Option<String>,
+    pub marker_host_boot_relation: String,
     pub job_root: Option<String>,
     pub scanned_job_dirs: usize,
     pub live_status_jobs: usize,
@@ -6859,6 +7021,31 @@ pub struct ShellJobSupervisorRestartReadback {
 fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
 -> Result<ShellJobSupervisorRestartReadback, ErrorData> {
     let identity = shell_job_supervisor_identity();
+    let current_host_boot_id = identity.host_boot_id.as_deref().ok_or_else(|| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            "daemon startup refused because the durable shell-job supervisor has no kernel host boot identity",
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "startup_host_boot_identity_unavailable",
+                "remediation": "repair the kernel boot-identity query named in the preceding M4_HOST_BOOT_IDENTITY_UNAVAILABLE log and restart synapse-mcp",
+            }),
+        )
+    })?;
+    let physical_host_boot_id = read_host_boot_identity()?;
+    if physical_host_boot_id != current_host_boot_id {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            "daemon startup host boot identity changed during initialization",
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "startup_host_boot_identity_changed_during_initialization",
+                "supervisor_host_boot_id": current_host_boot_id,
+                "physical_host_boot_id": physical_host_boot_id,
+                "remediation": "inspect kernel boot state and restart synapse-mcp; durable ownership reconciliation remains refused",
+            }),
+        ));
+    }
     let marker_path = shell_job_supervisor_marker_path()?;
     let prior_marker = match read_shell_job_supervisor_marker(&marker_path) {
         Ok(marker) => marker,
@@ -6885,15 +7072,26 @@ fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
         Some(_) => "absent_no_clean_shutdown_marker",
         None => "absent_no_supervisor_recorded",
     };
+    let prior_marker_host_boot_id = prior_marker
+        .as_ref()
+        .and_then(|marker| marker.host_boot_id.clone());
+    let marker_host_boot_relation = match prior_marker_host_boot_id.as_deref() {
+        Some(prior) if prior == current_host_boot_id => "same_boot",
+        Some(_) => "boot_changed",
+        None => "prior_boot_identity_unrecorded",
+    };
     let root = shell_durable_job_root_dir()?;
     let mut readback = ShellJobSupervisorRestartReadback {
         incarnation_id: identity.incarnation_id.clone(),
         supervisor_pid: identity.pid,
         supervisor_identity_provable: shell_supervisor_identity_is_provable(identity),
+        host_boot_id: current_host_boot_id.to_owned(),
         prior_supervisor_state: prior_supervisor_state.to_owned(),
         prior_incarnation_id: prior_marker
             .as_ref()
             .map(|marker| marker.incarnation_id.clone()),
+        prior_host_boot_id: prior_marker_host_boot_id,
+        marker_host_boot_relation: marker_host_boot_relation.to_owned(),
         job_root: Some(path_string(&root)),
         scanned_job_dirs: 0,
         live_status_jobs: 0,
@@ -6956,6 +7154,8 @@ fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
                 &paths,
                 identity,
                 prior_supervisor_state,
+                prior_marker.as_ref(),
+                current_host_boot_id,
                 &mut readback,
             );
         }
@@ -6972,6 +7172,9 @@ fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
         supervisor_identity_provable = readback.supervisor_identity_provable,
         prior_supervisor_state = %readback.prior_supervisor_state,
         prior_incarnation_id = ?readback.prior_incarnation_id,
+        host_boot_id = %readback.host_boot_id,
+        prior_host_boot_id = ?readback.prior_host_boot_id,
+        marker_host_boot_relation = %readback.marker_host_boot_relation,
         scanned_job_dirs = readback.scanned_job_dirs,
         live_status_jobs = readback.live_status_jobs,
         interrupted_jobs = readback.interrupted_jobs,
@@ -6994,9 +7197,24 @@ fn reconcile_one_orphaned_shell_job(
     paths: &ShellJobPaths,
     identity: &ActRunShellSupervisorIdentity,
     prior_supervisor_state: &str,
+    prior_marker: Option<&ShellJobSupervisorMarker>,
+    current_host_boot_id: &str,
     readback: &mut ShellJobSupervisorRestartReadback,
 ) {
     let job_id = job.job_id.clone();
+    let owner_boot_id = job.supervisor.as_ref().and_then(|owner| {
+        owner.host_boot_id.clone().or_else(|| {
+            prior_marker
+                .filter(|marker| marker.incarnation_id == owner.incarnation_id)
+                .and_then(|marker| marker.host_boot_id.clone())
+        })
+    });
+    let mut host_boot_relation = match owner_boot_id.as_deref() {
+        Some(prior) if prior == current_host_boot_id => "same_boot",
+        Some(_) => "boot_changed",
+        None => "prior_boot_identity_unrecorded",
+    }
+    .to_owned();
     // 1. Is the supervisor that owned this record actually gone?
     let (prior_state_label, prior_incarnation, prior_pid, prior_containment) = match job
         .supervisor
@@ -7006,6 +7224,12 @@ fn reconcile_one_orphaned_shell_job(
             // This incarnation owns it; a live monitor task is authoritative.
             return;
         }
+        Some(owner) if host_boot_relation == "boot_changed" => (
+            "host_boot_changed:prior_supervisor_cannot_survive".to_owned(),
+            Some(owner.incarnation_id.clone()),
+            Some(owner.pid),
+            Some(owner.child_containment.clone()),
+        ),
         Some(owner) if !shell_supervisor_identity_is_provable(owner) => {
             readback.retained_unprovable_jobs = readback.retained_unprovable_jobs.saturating_add(1);
             push_shell_job_recovery_sample(&mut readback.retained_job_ids_sample, job_id.clone());
@@ -7081,6 +7305,23 @@ fn reconcile_one_orphaned_shell_job(
             let state = local_process_identity_state(child_identity);
             match state {
                 LocalProcessIdentityState::Match => {
+                    if host_boot_relation == "boot_changed" {
+                        readback.write_failures = readback.write_failures.saturating_add(1);
+                        push_shell_job_recovery_sample(
+                            &mut readback.retained_job_ids_sample,
+                            job_id.clone(),
+                        );
+                        tracing::error!(
+                            code = "M4_SHELL_JOB_BOOT_IDENTITY_CONTRADICTION",
+                            job_id = %job_id,
+                            prior_host_boot_id = ?owner_boot_id,
+                            current_host_boot_id,
+                            pid = child_identity.pid,
+                            start_time = child_identity.start_time,
+                            "durable shell job retained as live and daemon startup will fail closed: the record says the host boot changed but the exact prior child creation identity is present"
+                        );
+                        return;
+                    }
                     if matches!(
                         prior_containment.as_deref(),
                         Some(
@@ -7088,6 +7329,10 @@ fn reconcile_one_orphaned_shell_job(
                                 | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
                         )
                     ) {
+                        if host_boot_relation == "prior_boot_identity_unrecorded" {
+                            host_boot_relation =
+                                "same_boot_proven_by_surviving_exact_child".to_owned();
+                        }
                         match adopt_surviving_shell_job_after_supervisor_restart(
                             job,
                             paths,
@@ -7097,6 +7342,9 @@ fn reconcile_one_orphaned_shell_job(
                             prior_incarnation,
                             prior_pid,
                             prior_containment,
+                            owner_boot_id,
+                            host_boot_relation,
+                            current_host_boot_id,
                             child_identity.clone(),
                         ) {
                             Ok(()) => {
@@ -7202,14 +7450,18 @@ fn reconcile_one_orphaned_shell_job(
             | SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING
             | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
     );
-    let children_terminated_by = if prior_job_object_contained {
+    let children_terminated_by = if host_boot_relation == "boot_changed" {
+        "host_reboot_or_power_transition_not_job_object_attributed".to_owned()
+    } else if host_boot_relation == "same_boot" && prior_job_object_contained {
         "windows_job_object_kill_on_last_handle_close".to_owned()
     } else {
-        "unknown_no_kill_on_close_containment_on_this_platform".to_owned()
+        "unknown_without_same_boot_job_object_evidence".to_owned()
     };
-    let cause = if job.local_process_identity.is_none() {
+    let cause = if host_boot_relation == "boot_changed" {
+        "host_reboot_controller_loss"
+    } else if job.local_process_identity.is_none() {
         "supervisor_restart_child_never_had_creation_identity"
-    } else if prior_job_object_contained {
+    } else if host_boot_relation == "same_boot" && prior_job_object_contained {
         "supervisor_restart_children_reaped_by_job_object_close"
     } else {
         "supervisor_restart_child_absent_containment_unknown"
@@ -7223,6 +7475,9 @@ fn reconcile_one_orphaned_shell_job(
         prior_supervisor_identity_state: prior_state_label.clone(),
         reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
         reconciling_supervisor_pid: identity.pid,
+        prior_host_boot_id: owner_boot_id.clone(),
+        reconciling_host_boot_id: Some(current_host_boot_id.to_owned()),
+        host_boot_relation: Some(host_boot_relation.clone()),
         child_containment: prior_containment_label.to_owned(),
         child_identity_state: child_state_label.clone(),
         children_terminated_by: children_terminated_by.clone(),
@@ -7251,14 +7506,18 @@ fn reconcile_one_orphaned_shell_job(
         .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
     job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
     job.error_message = Some(format!(
-        "durable shell job was interrupted by a synapse-mcp supervisor restart and never produced an exit status. \
+        "durable shell job lost its controller and never produced an exit status. \
          Owning supervisor incarnation {owner_incarnation} (pid {owner_pid}) is {prior_state}; {prior_shutdown_sentence}. \
+         Host boot relation is {host_boot_relation} (prior={prior_host_boot_id}, current={current_host_boot_id}). \
          This daemon is incarnation {this_incarnation} (pid {this_pid}). Child containment was {containment}; \
          owned children were terminated by {children_terminated_by}. Child process identity readback: {child_state}. \
          exit_code is unknown and MUST NOT be read as success.",
         owner_incarnation = prior_incarnation.as_deref().unwrap_or("<unrecorded>"),
         owner_pid = prior_pid.map_or_else(|| "<unrecorded>".to_owned(), |pid| pid.to_string()),
         prior_state = prior_state_label,
+        host_boot_relation = host_boot_relation,
+        prior_host_boot_id = owner_boot_id.as_deref().unwrap_or("<unrecorded>"),
+        current_host_boot_id = identity.host_boot_id.as_deref().unwrap_or("<unreadable>"),
         this_incarnation = identity.incarnation_id,
         this_pid = identity.pid,
         containment = prior_containment_label,
@@ -7268,7 +7527,7 @@ fn reconcile_one_orphaned_shell_job(
     push_unique_evidence(
         &mut job.remote_process_scope.detection_evidence,
         format!(
-            "supervisor_restart_reconciliation:cause={cause}:prior_state={prior_supervisor_state}"
+            "supervisor_restart_reconciliation:cause={cause}:prior_state={prior_supervisor_state}:host_boot_relation={host_boot_relation}"
         ),
     );
     // The local transport may have died before its monitor persisted a marker.
@@ -7373,6 +7632,9 @@ fn adopt_surviving_shell_job_after_supervisor_restart(
     prior_incarnation: Option<String>,
     prior_pid: Option<u32>,
     prior_containment: Option<String>,
+    prior_host_boot_id: Option<String>,
+    host_boot_relation: String,
+    current_host_boot_id: &str,
     child_identity: ActRunShellLocalProcessIdentity,
 ) -> Result<(), ErrorData> {
     // Bind the kernel handle before changing the durable owner row. A failure
@@ -7411,6 +7673,9 @@ fn adopt_surviving_shell_job_after_supervisor_restart(
         prior_supervisor_identity_state: prior_state_label,
         reconciling_supervisor_incarnation_id: identity.incarnation_id.clone(),
         reconciling_supervisor_pid: identity.pid,
+        prior_host_boot_id,
+        reconciling_host_boot_id: Some(current_host_boot_id.to_owned()),
+        host_boot_relation: Some(host_boot_relation),
         child_containment: prior_containment
             .unwrap_or_else(|| SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE.to_owned()),
         child_identity_state: "match_running".to_owned(),
@@ -7457,6 +7722,9 @@ fn adopt_surviving_shell_job_after_supervisor_restart(
     _prior_incarnation: Option<String>,
     _prior_pid: Option<u32>,
     _prior_containment: Option<String>,
+    _prior_host_boot_id: Option<String>,
+    _host_boot_relation: String,
+    _current_host_boot_id: &str,
     child_identity: ActRunShellLocalProcessIdentity,
 ) -> Result<(), ErrorData> {
     Err(shell_tool_error(
@@ -7583,6 +7851,191 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
         ),
     }
     Ok(corrupt_readback)
+}
+
+/// Fail-closed inventory consumed by the planned host-transition authorization
+/// boundary. Unlike dashboard/retention scans, this inventory never skips a
+/// malformed or unreadable entry: one unknown durable record is enough to
+/// refuse a destructive host transition.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellJobHostTransitionSnapshot {
+    pub source_of_truth: String,
+    pub job_root: String,
+    pub scanned_job_dirs: usize,
+    pub live_jobs: Vec<ShellJobHostTransitionLiveJob>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellJobHostTransitionLiveJob {
+    pub job_id: String,
+    pub status: String,
+    pub status_path: String,
+    pub pid: Option<u32>,
+    pub local_process_start_time: Option<u64>,
+    pub started_at: String,
+    pub supervisor_incarnation_id: Option<String>,
+    pub supervisor_host_boot_id: Option<String>,
+    pub remote_transport: String,
+    pub remote_identity: Option<String>,
+    pub remote_process_id: Option<String>,
+    pub remote_process_group_id: Option<String>,
+    pub remote_boot_id: Option<String>,
+    pub remote_process_start_time: Option<String>,
+}
+
+pub(crate) fn shell_job_host_transition_snapshot()
+-> Result<ShellJobHostTransitionSnapshot, ErrorData> {
+    let root = shell_durable_job_root_dir()?;
+    let source_of_truth = format!(
+        "every durable shell status.json under {}",
+        path_string(&root)
+    );
+    if !root.exists() {
+        return Ok(ShellJobHostTransitionSnapshot {
+            source_of_truth,
+            job_root: path_string(&root),
+            scanned_job_dirs: 0,
+            live_jobs: Vec::new(),
+        });
+    }
+    let entries = fs::read_dir(&root).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "host-transition preflight could not enumerate durable shell-job root {}: {error}",
+                root.display()
+            ),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "host_transition_shell_job_root_read_failed",
+                "path": root,
+                "remediation": "repair the exact durable shell-job root permissions or filesystem error and retry; host transition remains refused",
+            }),
+        )
+    })?;
+    let mut scanned_job_dirs = 0_usize;
+    let mut live_jobs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "host-transition preflight could not read a durable shell-job directory entry under {}: {error}",
+                    root.display()
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "reason": "host_transition_shell_job_entry_read_failed",
+                    "path": root,
+                    "remediation": "repair the exact directory entry/filesystem failure and retry; host transition remains refused",
+                }),
+            )
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "host-transition preflight could not classify durable shell-job entry {}: {error}",
+                    path.display()
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "reason": "host_transition_shell_job_entry_type_failed",
+                    "path": path,
+                    "remediation": "repair the exact filesystem metadata failure and retry; host transition remains refused",
+                }),
+            )
+        })?;
+        if !file_type.is_dir() {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "host-transition preflight found an unexpected non-directory entry in the durable shell-job root: {}",
+                    path.display()
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "reason": "host_transition_unexpected_shell_job_root_entry",
+                    "path": path,
+                    "remediation": "inspect and explicitly disposition the unexpected entry; host transition remains refused",
+                }),
+            ));
+        }
+        let job_id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| {
+                shell_tool_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    "host-transition preflight found a non-Unicode durable shell-job directory name",
+                    json!({
+                        "code": error_codes::STORAGE_READ_FAILED,
+                        "reason": "host_transition_non_unicode_shell_job_id",
+                        "path": path,
+                        "remediation": "inspect and explicitly disposition the invalid durable job directory; host transition remains refused",
+                    }),
+                )
+            })?;
+        validate_shell_job_id(&job_id).map_err(|error| {
+            shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "host-transition preflight found invalid durable shell-job directory {job_id}: {}",
+                    error.message
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "reason": "host_transition_invalid_shell_job_id",
+                    "job_id": job_id,
+                    "path": path,
+                    "detail": error.message,
+                    "remediation": "inspect and explicitly disposition the invalid durable job directory; host transition remains refused",
+                }),
+            )
+        })?;
+        scanned_job_dirs = scanned_job_dirs.saturating_add(1);
+        let paths = shell_job_paths_from_root(&root, &job_id);
+        let job = read_shell_job_status(&paths.status_path, &job_id)?;
+        let job = reconcile_shell_job_process_state(job, &paths)?;
+        if !shell_job_live_status(&job.status) {
+            continue;
+        }
+        live_jobs.push(ShellJobHostTransitionLiveJob {
+            job_id: job.job_id,
+            status: job.status,
+            status_path: path_string(&paths.status_path),
+            pid: job.pid,
+            local_process_start_time: job
+                .local_process_identity
+                .as_ref()
+                .map(|identity| identity.start_time),
+            started_at: job.started_at,
+            supervisor_incarnation_id: job
+                .supervisor
+                .as_ref()
+                .map(|identity| identity.incarnation_id.clone()),
+            supervisor_host_boot_id: job
+                .supervisor
+                .as_ref()
+                .and_then(|identity| identity.host_boot_id.clone()),
+            remote_transport: job.remote_process_scope.transport,
+            remote_identity: job.remote_process_scope.remote_identity,
+            remote_process_id: job.remote_process_scope.remote_process_id,
+            remote_process_group_id: job.remote_process_scope.remote_process_group_id,
+            remote_boot_id: job.remote_process_scope.remote_boot_id,
+            remote_process_start_time: job.remote_process_scope.remote_process_start_time,
+        });
+    }
+    live_jobs.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+    Ok(ShellJobHostTransitionSnapshot {
+        source_of_truth,
+        job_root: path_string(&root),
+        scanned_job_dirs,
+        live_jobs,
+    })
 }
 
 pub fn shell_jobs_dashboard_snapshot(

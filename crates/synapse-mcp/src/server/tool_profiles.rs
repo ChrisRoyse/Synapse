@@ -2295,6 +2295,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to an explicit maintenance profile and run repair from an external process",
             ),
+            op(
+                "host_transition",
+                true,
+                false,
+                "kernel BootIdentifier + durable shell statuses + configured WSL kernel leases/checkpoints + persisted preflight/override/intent + Windows Event 1074",
+                Some(
+                    "atomic record readback plus post-boot BootIdentifier/Event 1074 reconciliation",
+                ),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "repair the exact unreadable job/boot/lease/checkpoint/event Source of Truth and run a fresh preflight; never bypass the persisted authorization boundary",
+            ),
         ],
     ),
     facade_contract(
