@@ -2432,15 +2432,15 @@ IF DEFINED _synapse_has_cfg (
   )
   SET "_synapse_surface_hash="
   SET "_synapse_surface_count="
-  FOR /F "tokens=2 delims=:" %%A IN ('%SystemRoot%\System32\findstr.exe /C:tool_surface_sha256 "%_synapse_surface%"') DO SET "_synapse_surface_hash=%%~A"
-  FOR /F "tokens=2 delims=:" %%A IN ('%SystemRoot%\System32\findstr.exe /C:tool_count "%_synapse_surface%"') DO SET "_synapse_surface_count=%%~A"
-  SET "_synapse_surface_hash=!_synapse_surface_hash:"=!"
-  SET "_synapse_surface_hash=!_synapse_surface_hash:,=!"
-  SET "_synapse_surface_hash=!_synapse_surface_hash: =!"
-  SET "_synapse_surface_count=!_synapse_surface_count:"=!"
-  SET "_synapse_surface_count=!_synapse_surface_count:,=!"
-  SET "_synapse_surface_count=!_synapse_surface_count: =!"
+  FOR /F "tokens=1,2 delims=;" %%A IN ('%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$j = Get-Content -LiteralPath $env:_synapse_surface -Raw | ConvertFrom-Json; $h = [string]$j.tool_surface_sha256; $c = [int]$j.tool_count; if ($h -notmatch '^[0-9a-fA-F]{64}$' -or $c -lt 1) { exit 1 }; [Console]::Out.Write(('{0};{1}' -f $h.ToLowerInvariant(), $c))"') DO (
+    SET "_synapse_surface_hash=%%A"
+    SET "_synapse_surface_count=%%B"
+  )
   IF NOT DEFINED _synapse_surface_hash (
+    ECHO SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=%_synapse_surface% remediation=delete the invalid snapshot and rerun scripts\synapse-setup.ps1 1>&2
+    EXIT /B 1
+  )
+  IF NOT DEFINED _synapse_surface_count (
     ECHO SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=%_synapse_surface% remediation=delete the invalid snapshot and rerun scripts\synapse-setup.ps1 1>&2
     EXIT /B 1
   )
