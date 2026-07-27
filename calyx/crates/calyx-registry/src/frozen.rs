@@ -4,6 +4,12 @@ use sha2::{Digest, Sha256};
 
 use crate::lens::{ensure_input_modality, ensure_vector_shape};
 
+/// Frozen wire policy for every TEI HTTP measurement.
+///
+/// Request-level truncation changes the bytes whose meaning the lens measures,
+/// so it is disabled explicitly instead of inheriting a server default.
+pub const TEI_HTTP_REQUEST_POLICY: &str = "tei-http-request-v2;truncate=false";
+
 /// Runtime dtype declared by a frozen lens contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,7 +133,7 @@ impl FrozenLensContract {
         Self::new(
             name,
             sha256_digest(&[endpoint.as_bytes()]),
-            sha256_digest(&[b"tei-http-runtime"]),
+            sha256_digest(&[TEI_HTTP_REQUEST_POLICY.as_bytes()]),
             SlotShape::Dense(dim),
             modality,
             LensDType::F32,

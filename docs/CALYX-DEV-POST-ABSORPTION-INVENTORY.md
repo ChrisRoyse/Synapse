@@ -351,3 +351,18 @@ git -C C:\code\Calyx-Dev rev-list --count 9894f84f..313860bc
 ```
 
 Expected result for the recorded head is `283`. The commit ledger is an inventory of source-history reality. It does not claim that the 135 applicable commits are shipped or manually verified. Issue #1760 remains open until each applicable row receives an evidence-backed terminal decision and every reachable native port has D1 manual FSV evidence.
+
+## Terminal checkpoint — upstream head `1fc85aa7` (2026-07-24)
+
+This original 283-row ledger remains immutable evidence for its stated `313860bc` endpoint. The
+later semantic audit at `docs/calyx/UPSTREAM_DELTA_AUDIT_2026-07-23.md` extends coverage first to
+`8e162519` and then, in Section 9, through authenticated Calyx-Dev head
+`1fc85aa7b435cff80eae8e5f2b632a4d28025a51`.
+
+Section 9 is the authoritative terminal-decision layer over conservative rows in this initial
+inventory. It records every reachable native port, every already-owned invariant, and the exact
+architectural evidence for superseded/not-applicable work. Its incremental range contains 67
+non-merge commits: 50 pruned-surface-only and 17 retained production candidates, with all 17
+receiving terminal decisions. Behavioral acceptance remains governed separately by D1 manual
+real-client FSV; this checkpoint closes source-history classification, not any pending runtime
+acceptance that requires a fresh strict Codex MCP session.

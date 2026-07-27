@@ -26,8 +26,8 @@ pub(super) fn model_inputs(
         return Err(WardError::InvalidInput {
             reason: format!(
                 "style input encoded to {len} tokens, exceeding the complete-coverage limit of \
-                 {STYLE_MAX_TOKENS}; split the input into segments of at most {STYLE_MAX_TOKENS} \
-                 tokens before style measurement"
+                {STYLE_MAX_TOKENS}; reject or shorten the input until its complete encoded \
+                 sequence is within the limit"
             ),
         });
     }

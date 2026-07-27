@@ -87,31 +87,91 @@ pub(super) fn distance_to_node(
 
 fn cosine_i8(a: &[f32], b: &[i8]) -> f32 {
     let len = a.len().min(b.len());
-    let mut dot = 0.0;
-    let mut an = 0.0;
-    let mut bn = 0.0;
-    for i in 0..len {
-        let x = a[i];
-        let y = f32::from(b[i]);
-        dot += x * y;
-        an += x * x;
-        bn += y * y;
-    }
+    let (dot, an, bn) = dot_norms_i8(&a[..len], &b[..len]);
     if an == 0.0 || bn == 0.0 {
         1.0
     } else {
-        (1.0 - dot / (an.sqrt() * bn.sqrt())).max(0.0)
+        ((1.0 - dot / (an.sqrt() * bn.sqrt())) as f32).max(0.0)
     }
 }
 
 fn l2_sq_i8(a: &[f32], b: &[i8]) -> f32 {
     let len = a.len().min(b.len());
-    let mut sum = 0.0;
-    for i in 0..len {
-        let d = a[i] - f32::from(b[i]);
-        sum += d * d;
+    let (dot, an, bn) = dot_norms_i8(&a[..len], &b[..len]);
+    ((an - 2.0 * dot + bn).max(0.0)) as f32
+}
+
+/// Asymmetric query-f32 by candidate-i8 fused dot product and squared norms.
+/// Candidate bytes stay packed and are sign-extended directly into SIMD lanes;
+/// accumulation uses f64 so dispatched and scalar paths agree at f32 precision.
+fn dot_norms_i8(a: &[f32], b: &[i8]) -> (f64, f64, f64) {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: feature detection proves AVX2 support, and the helper only
+        // loads within the equal-length slices established by the callers.
+        return unsafe { dot_norms_i8_avx2(a, b) };
     }
-    sum
+    let mut dot = 0.0_f64;
+    let mut an = 0.0_f64;
+    let mut bn = 0.0_f64;
+    for (x, y) in a.iter().zip(b) {
+        let x = f64::from(*x);
+        let y = f64::from(*y);
+        dot += x * y;
+        an += x * x;
+        bn += y * y;
+    }
+    (dot, an, bn)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_norms_i8_avx2(a: &[f32], b: &[i8]) -> (f64, f64, f64) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mut dot_lo = _mm256_setzero_pd();
+        let mut dot_hi = _mm256_setzero_pd();
+        let mut an_lo = _mm256_setzero_pd();
+        let mut an_hi = _mm256_setzero_pd();
+        let mut bn_lo = _mm256_setzero_pd();
+        let mut bn_hi = _mm256_setzero_pd();
+        let vectorized = a.len() / 8 * 8;
+        let mut index = 0_usize;
+        while index < vectorized {
+            let packed = _mm_loadl_epi64(b.as_ptr().add(index).cast::<__m128i>());
+            let widened = _mm256_cvtepi8_epi32(packed);
+            let code_lo = _mm256_cvtepi32_pd(_mm256_castsi256_si128(widened));
+            let code_hi = _mm256_cvtepi32_pd(_mm256_extracti128_si256::<1>(widened));
+            let query_lo = _mm256_cvtps_pd(_mm_loadu_ps(a.as_ptr().add(index)));
+            let query_hi = _mm256_cvtps_pd(_mm_loadu_ps(a.as_ptr().add(index + 4)));
+            dot_lo = _mm256_add_pd(dot_lo, _mm256_mul_pd(query_lo, code_lo));
+            dot_hi = _mm256_add_pd(dot_hi, _mm256_mul_pd(query_hi, code_hi));
+            an_lo = _mm256_add_pd(an_lo, _mm256_mul_pd(query_lo, query_lo));
+            an_hi = _mm256_add_pd(an_hi, _mm256_mul_pd(query_hi, query_hi));
+            bn_lo = _mm256_add_pd(bn_lo, _mm256_mul_pd(code_lo, code_lo));
+            bn_hi = _mm256_add_pd(bn_hi, _mm256_mul_pd(code_hi, code_hi));
+            index += 8;
+        }
+        let mut dot_quad = [0.0_f64; 4];
+        let mut an_quad = [0.0_f64; 4];
+        let mut bn_quad = [0.0_f64; 4];
+        _mm256_storeu_pd(dot_quad.as_mut_ptr(), _mm256_add_pd(dot_lo, dot_hi));
+        _mm256_storeu_pd(an_quad.as_mut_ptr(), _mm256_add_pd(an_lo, an_hi));
+        _mm256_storeu_pd(bn_quad.as_mut_ptr(), _mm256_add_pd(bn_lo, bn_hi));
+        let mut dot = dot_quad.iter().sum::<f64>();
+        let mut an = an_quad.iter().sum::<f64>();
+        let mut bn = bn_quad.iter().sum::<f64>();
+        for tail in index..a.len() {
+            let x = f64::from(a[tail]);
+            let y = f64::from(b[tail]);
+            dot += x * y;
+            an += x * x;
+            bn += y * y;
+        }
+        (dot, an, bn)
+    }
 }
 
 pub(super) fn sorted(mut hits: Vec<(u32, f32)>) -> Vec<(u32, f32)> {

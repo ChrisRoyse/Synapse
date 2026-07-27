@@ -1,5 +1,7 @@
 use super::*;
 
+const RECOVERY_FLUSH_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
 impl<C> AsterVault<C>
 where
     C: Clock,
@@ -201,6 +203,32 @@ where
                 rows.panel_content_seqs_snapshot()?,
             )?;
             durable.stage_recovered_wal_batches(wal_tail_batches)?;
+            if let Some(floor) = recovery.wal_tail_stream_floor {
+                let mut staged_bytes = 0_u64;
+                crate::wal::for_each_record_payload_after(
+                    vault_root.join("wal"),
+                    floor,
+                    |seq, payload| {
+                        let batch_rows = encode::decode_write_batch(payload)?;
+                        rows.restore_batch(
+                            seq,
+                            batch_rows
+                                .iter()
+                                .map(|row| (row.cf, row.key.clone(), row.value.clone())),
+                        )?;
+                        staged_bytes = staged_bytes.saturating_add(payload.len() as u64);
+                        durable.stage_recovered_wal_batch(seq, batch_rows)?;
+                        if staged_bytes >= RECOVERY_FLUSH_CHUNK_BYTES {
+                            durable.advance_panel_content_watermarks_to_at_least(
+                                &rows.panel_content_seqs_snapshot()?,
+                            )?;
+                            durable.flush()?;
+                            staged_bytes = 0;
+                        }
+                        Ok(true)
+                    },
+                )?;
+            }
             Some(durable)
         };
         // Data residency (PRD 30 §4): a caller-supplied pin is enforced against

@@ -48,6 +48,18 @@ impl SlotVector {
         }
     }
 
+    /// Returns true when the payload carries a concrete, index-consumable shape.
+    ///
+    /// This exhaustive match is the authoritative index-admission predicate.
+    /// Adding a vector shape therefore requires an explicit decision here
+    /// instead of silently diverging across search consumers.
+    pub const fn is_indexable(&self) -> bool {
+        match self {
+            Self::Dense { .. } | Self::Sparse { .. } | Self::Multi { .. } => true,
+            Self::Absent { .. } => false,
+        }
+    }
+
     /// Validates a stored vector payload against the Calyx record schema.
     pub fn validate_schema(&self) -> Result<()> {
         match self {

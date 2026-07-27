@@ -23,10 +23,6 @@ pub fn replay_dir_after(dir: impl AsRef<Path>, replay_floor_seq: u64) -> Result<
     replay_dir_locked_after(dir, replay_floor_seq)
 }
 
-pub(super) fn replay_dir_locked(dir: &Path) -> Result<ReplayOutcome> {
-    replay_dir_locked_after(dir, 0)
-}
-
 pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Result<ReplayOutcome> {
     let segments = segment::list_segments(dir)?;
     let mut records = Vec::new();

@@ -153,6 +153,7 @@ where
                 dedup_policy: None,
                 retention_horizon: crate::timetravel::RetentionHorizon::default(),
                 router_latest_readback: false,
+                wal_tail_stream_floor: None,
             },
             None,
         )

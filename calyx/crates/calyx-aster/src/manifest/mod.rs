@@ -428,6 +428,30 @@ pub struct RecoveryOutcome {
     pub degraded_rebuildable: bool,
 }
 
+/// Manifest plus header-only WAL-tip recovery used before bounded streaming
+/// replay. Payload checks remain mandatory in the subsequent stream.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RecoveryMetadataOutcome {
+    pub manifest: VaultManifest,
+    pub torn_tail: Option<TornTail>,
+    pub last_recovered_seq: u64,
+    pub degraded_rebuildable: bool,
+}
+
+pub(crate) fn recover_vault_metadata(
+    vault_dir: impl AsRef<Path>,
+) -> Result<RecoveryMetadataOutcome> {
+    let vault_dir = vault_dir.as_ref();
+    let manifest = ManifestStore::open(vault_dir).load_current()?;
+    let (wal_tip, torn_tail) = crate::wal::recover_tip_and_torn(vault_dir.join("wal"))?;
+    Ok(RecoveryMetadataOutcome {
+        last_recovered_seq: wal_tip.max(manifest.durable_seq),
+        degraded_rebuildable: manifest.degraded_rebuildable,
+        manifest,
+        torn_tail,
+    })
+}
+
 pub fn recover_vault(vault_dir: impl AsRef<Path>) -> Result<RecoveryOutcome> {
     let vault_dir = vault_dir.as_ref();
     let manifest = ManifestStore::open(vault_dir).load_current()?;

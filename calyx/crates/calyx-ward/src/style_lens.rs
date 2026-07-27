@@ -23,6 +23,8 @@ pub const DEFAULT_STYLE_MODEL_PATH: &str = "/var/lib/calyx/models/style/style-em
 pub const DEFAULT_STYLE_TOKENIZER_PATH: &str = "/var/lib/calyx/models/style/tokenizer.json";
 pub const STYLE_DIM: usize = 768;
 pub const STYLE_MAX_TOKENS: usize = 512;
+/// Stable preprocessing contract included in the frozen lens identity.
+pub const STYLE_INPUT_COVERAGE_POLICY: &str = "complete_input_or_error:max_encoded_tokens:v1";
 const STYLE_LENS_NAME: &str = "style-embed-v1";
 const STYLE_SOURCE_REPO: &str = "AnnaWegmann/Style-Embedding";
 const STYLE_SOURCE_REVISION: &str = "d7d0f5ca829316a8f5695e49dfce80b86db5e76c";
@@ -136,6 +138,7 @@ impl StyleLens {
                 actual: dim,
             });
         }
+        let max_tokens = (STYLE_MAX_TOKENS as u64).to_le_bytes();
         let corpus_hash = hash_parts(&[
             STYLE_SOURCE_REPO.as_bytes(),
             STYLE_SOURCE_REVISION.as_bytes(),
@@ -143,6 +146,8 @@ impl StyleLens {
             b"attention_mask",
             b"last_hidden_state",
             b"mean_pool_attention_mask",
+            STYLE_INPUT_COVERAGE_POLICY.as_bytes(),
+            &max_tokens,
         ]);
         let lens_id =
             LensId::from_parts(STYLE_LENS_NAME, &weights_sha256, &corpus_hash, OUTPUT_SHAPE);
@@ -245,10 +250,14 @@ impl OnnxStyleBackend {
         tokenizer_path: &Path,
         policy: StyleProviderPolicy,
     ) -> Result<Self, WardError> {
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|_| WardError::ModelNotFound {
                 path: tokenizer_path.to_path_buf(),
             })?;
+        tokenizer
+            .with_truncation(None)
+            .map(|_| ())
+            .map_err(runtime_error)?;
         let session = build_session(model_path, policy)?;
         let input_names = session
             .inputs()
@@ -280,6 +289,14 @@ impl OnnxStyleBackend {
 
     fn tokenize(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>), WardError> {
         let encoding = self.tokenizer.encode(text, true).map_err(runtime_error)?;
+        if !encoding.get_overflowing().is_empty() {
+            return Err(WardError::InvalidInput {
+                reason: format!(
+                    "style tokenizer retained {} overflow encoding(s); complete input coverage is unavailable",
+                    encoding.get_overflowing().len()
+                ),
+            });
+        }
         tokenization::model_inputs(encoding.get_ids(), encoding.get_attention_mask())
     }
 }

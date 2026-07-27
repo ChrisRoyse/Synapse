@@ -399,7 +399,7 @@ pub(crate) fn process_runtime_requires_golden(spec: &LensSpec) -> bool {
 
 fn process_runtime_golden_version(spec: &LensSpec) -> Option<&'static str> {
     match &spec.runtime {
-        LensRuntime::TeiHttp { .. } => Some("tei-http-golden-v1"),
+        LensRuntime::TeiHttp { .. } => Some("tei-http-golden-v2-no-truncate"),
         LensRuntime::ExternalCmd { .. } => Some("external-cmd-golden-v1"),
         _ => None,
     }

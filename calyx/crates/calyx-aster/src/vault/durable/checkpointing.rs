@@ -155,6 +155,27 @@ impl DurableVault {
         Ok(())
     }
 
+    /// Stages one strictly ordered batch from bounded streaming recovery.
+    pub(in crate::vault) fn stage_recovered_wal_batch(
+        &self,
+        seq: u64,
+        rows: Vec<WriteRow>,
+    ) -> Result<()> {
+        let mut pending = self
+            .pending_checkpoint
+            .lock()
+            .map_err(|_| CalyxError::disk_pressure("checkpoint staging lock poisoned"))?;
+        if let Some((last, _)) = pending.last()
+            && *last >= seq
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "streaming recovery staged seq {seq} out of order after {last}"
+            )));
+        }
+        pending.push((seq, rows));
+        Ok(())
+    }
+
     /// Materializes a whole staged prefix as **one SST per touched CF**.
     ///
     /// [`Self::write_rows`] writes one SST per `(seq, CF)`, and every durable

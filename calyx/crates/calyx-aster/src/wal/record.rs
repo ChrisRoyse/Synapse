@@ -27,6 +27,21 @@ pub(super) enum PayloadStatus {
     Torn { offset: u64, message: String },
 }
 
+/// Reusable-buffer payload decode result. The payload remains in the caller's
+/// buffer so scans do not allocate and retain one fresh vector per WAL record.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DecodeIntoStatus {
+    Complete {
+        seq: u64,
+        start_offset: u64,
+        end_offset: u64,
+    },
+    Torn {
+        offset: u64,
+        message: String,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct RecordHeader {
     pub seq: u64,
@@ -109,6 +124,44 @@ pub(super) fn decode_payload(
         start_offset: header.start_offset,
         end_offset: header.end_offset,
     }))
+}
+
+pub(super) fn decode_payload_into(
+    reader: &mut impl Read,
+    header: RecordHeader,
+    payload: &mut Vec<u8>,
+) -> io::Result<DecodeIntoStatus> {
+    payload.clear();
+    payload.resize(header.len as usize, 0);
+    if let Err(error) = reader.read_exact(payload) {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            return Ok(DecodeIntoStatus::Torn {
+                offset: header.start_offset,
+                message: format!(
+                    "partial WAL payload for seq {}: wanted {} bytes",
+                    header.seq, header.len
+                ),
+            });
+        }
+        return Err(error);
+    }
+
+    let actual_crc = payload_crc(header.seq, header.len, payload);
+    if actual_crc != header.expected_crc {
+        return Ok(DecodeIntoStatus::Torn {
+            offset: header.start_offset,
+            message: format!(
+                "crc mismatch for seq {}: expected {:08x}, got {actual_crc:08x}",
+                header.seq, header.expected_crc
+            ),
+        });
+    }
+
+    Ok(DecodeIntoStatus::Complete {
+        seq: header.seq,
+        start_offset: header.start_offset,
+        end_offset: header.end_offset,
+    })
 }
 
 /// Reads and authenticates a payload without retaining it. Recovery uses this

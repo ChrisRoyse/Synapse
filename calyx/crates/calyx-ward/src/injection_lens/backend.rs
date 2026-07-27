@@ -8,7 +8,7 @@ use ort::ep::{self, ArenaExtendStrategy, ExecutionProviderDispatch};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 
 use crate::error::WardError;
 
@@ -34,10 +34,11 @@ impl OnnxInjectionBackend {
         tokenizer_path: &Path,
         policy: InjectionProviderPolicy,
     ) -> Result<Self, WardError> {
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(tokenizer_path).map_err(|_| WardError::ModelNotFound {
                 path: tokenizer_path.to_path_buf(),
             })?;
+        disable_truncation(&mut tokenizer)?;
         let session = build_session(model_path, policy)?;
         let input_names = session
             .inputs()
@@ -67,26 +68,68 @@ impl OnnxInjectionBackend {
 
     fn tokenize(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>), WardError> {
         let encoding = self.tokenizer.encode(text, true).map_err(runtime_error)?;
-        let len = encoding.get_ids().len().min(INJECTION_MAX_TOKENS);
-        if len == 0 {
-            return Err(WardError::InvalidInput {
-                reason: "injection tokenizer emitted no tokens".to_string(),
-            });
-        }
-        let ids = encoding
-            .get_ids()
-            .iter()
-            .take(len)
-            .map(|value| i64::from(*value))
-            .collect::<Vec<_>>();
-        let attention = encoding
-            .get_attention_mask()
-            .iter()
-            .take(len)
-            .map(|value| i64::from(*value))
-            .collect::<Vec<_>>();
-        Ok((ids, attention))
+        encoding_inputs(&encoding)
     }
+}
+
+fn disable_truncation(tokenizer: &mut Tokenizer) -> Result<(), WardError> {
+    tokenizer
+        .with_truncation(None)
+        .map(|_| ())
+        .map_err(runtime_error)
+}
+
+fn encoding_inputs(encoding: &Encoding) -> Result<(Vec<i64>, Vec<i64>), WardError> {
+    if !encoding.get_overflowing().is_empty() {
+        return Err(WardError::InvalidInput {
+            reason: format!(
+                "injection tokenizer retained {} overflow encoding(s); complete input coverage is unavailable",
+                encoding.get_overflowing().len()
+            ),
+        });
+    }
+    model_inputs(encoding.get_ids(), encoding.get_attention_mask())
+}
+
+fn model_inputs(
+    token_ids: &[u32],
+    attention_mask: &[u32],
+) -> Result<(Vec<i64>, Vec<i64>), WardError> {
+    if token_ids.len() != attention_mask.len() {
+        return Err(WardError::InvalidInput {
+            reason: format!(
+                "injection tokenizer emitted {} token IDs but {} attention values",
+                token_ids.len(),
+                attention_mask.len()
+            ),
+        });
+    }
+
+    let len = token_ids.len();
+    if len == 0 {
+        return Err(WardError::InvalidInput {
+            reason: "injection tokenizer emitted no tokens".to_string(),
+        });
+    }
+    if len > INJECTION_MAX_TOKENS {
+        return Err(WardError::InvalidInput {
+            reason: format!(
+                "injection input encoded to {len} tokens, exceeding the complete-coverage limit \
+                 of {INJECTION_MAX_TOKENS}; reject or shorten the input until its complete encoded \
+                 sequence is within the limit"
+            ),
+        });
+    }
+
+    let ids = token_ids
+        .iter()
+        .map(|value| i64::from(*value))
+        .collect::<Vec<_>>();
+    let attention = attention_mask
+        .iter()
+        .map(|value| i64::from(*value))
+        .collect::<Vec<_>>();
+    Ok((ids, attention))
 }
 
 impl InjectionScoreBackend for OnnxInjectionBackend {

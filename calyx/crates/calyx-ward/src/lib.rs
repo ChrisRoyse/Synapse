@@ -45,8 +45,9 @@ pub use guard::{
 };
 pub use identity::{IdentityProfile, IdentitySlotConfig};
 pub use injection_lens::{
-    DEFAULT_INJECTION_MODEL_PATH, DEFAULT_INJECTION_TOKENIZER_PATH, INJECTION_LABELS,
-    INJECTION_MAX_TOKENS, InjectionLens, InjectionProviderPolicy, InjectionScoreBackend,
+    DEFAULT_INJECTION_MODEL_PATH, DEFAULT_INJECTION_TOKENIZER_PATH,
+    INJECTION_INPUT_COVERAGE_POLICY, INJECTION_LABELS, INJECTION_MAX_TOKENS, InjectionLens,
+    InjectionProviderPolicy, InjectionScoreBackend,
 };
 pub use ledger::{
     WardLedgerError, WardLedgerResult, append_calibration_provenance, append_guard_verdict,
@@ -78,7 +79,7 @@ pub use speaker_lens::{
     WAVLM_DIM, WAVLM_SAMPLE_RATE,
 };
 pub use style_lens::{
-    DEFAULT_STYLE_MODEL_PATH, DEFAULT_STYLE_TOKENIZER_PATH, STYLE_DIM, STYLE_MAX_TOKENS,
-    StyleEmbeddingBackend, StyleLens, StyleProviderPolicy,
+    DEFAULT_STYLE_MODEL_PATH, DEFAULT_STYLE_TOKENIZER_PATH, STYLE_DIM, STYLE_INPUT_COVERAGE_POLICY,
+    STYLE_MAX_TOKENS, StyleEmbeddingBackend, StyleLens, StyleProviderPolicy,
 };
 pub use verdict::{GuardVerdict, SlotVerdict};

@@ -83,12 +83,20 @@ impl GraphKeyspace {
         prefix_range(&self.kind_prefix(KIND_METADATA))
     }
 
+    pub(super) fn collection_range(&self) -> KeyRange {
+        prefix_range(&self.collection_prefix())
+    }
+
     pub(super) fn node_range(&self) -> KeyRange {
         prefix_range(&self.kind_prefix(KIND_NODE))
     }
 
     pub(super) fn edge_out_range(&self) -> KeyRange {
         prefix_range(&self.kind_prefix(KIND_EDGE_OUT))
+    }
+
+    pub(super) fn csr_segment_range(&self) -> KeyRange {
+        prefix_range(&self.kind_prefix(KIND_CSR_SEGMENT))
     }
 
     pub(super) fn edge_prefix(
@@ -167,6 +175,33 @@ impl GraphKeyspace {
         key.push(kind);
         key
     }
+}
+
+pub(super) fn all_graph_rows_range() -> KeyRange {
+    prefix_range(&[DISC])
+}
+
+pub(super) fn collection_from_key(key: &[u8]) -> Result<String> {
+    if key.len() < 4 || key[0] != DISC {
+        return Err(graph_corrupt("row is not a plain-graph key"));
+    }
+    let collection_len = u16::from_be_bytes([key[1], key[2]]) as usize;
+    let collection_end = 3usize
+        .checked_add(collection_len)
+        .ok_or_else(|| graph_corrupt("graph collection length overflow"))?;
+    let collection = key
+        .get(3..collection_end)
+        .ok_or_else(|| graph_corrupt("short graph collection key"))?;
+    let kind = *key
+        .get(collection_end)
+        .ok_or_else(|| graph_corrupt("graph key omits row kind"))?;
+    if kind > KIND_CSR_SEGMENT {
+        return Err(graph_corrupt(format!("unknown graph row kind {kind}")));
+    }
+    let collection = std::str::from_utf8(collection)
+        .map_err(|error| graph_corrupt(format!("invalid graph collection utf8: {error}")))?;
+    GraphKeyspace::new(collection)?;
+    Ok(collection.to_string())
 }
 
 pub(super) fn validate_edge_type(value: &str) -> Result<()> {

@@ -101,15 +101,10 @@ impl Lens for TeiHttpLens {
 
         let mut vectors = Vec::with_capacity(inputs.len());
         for chunk in texts.chunks(self.max_batch) {
-            // `truncate: true` = head truncation at the router's model max
-            // tokens, matching every local lens runtime (their tokenizers
-            // truncate at model max_len). Without it TEI fail-closes with
-            // HTTP 422 on inputs over the router limit (observed: 8192
-            // tokens on the :8088/:8090 lanes), which killed long-document
-            // ingest (#1468 Cuyahoga opinions). Request-level truncate is
-            // honored by TEI even without server-side --auto-truncate
-            // (verified by curl on both lanes, 2026-07-13).
-            let body = serde_json::to_vec(&json!({ "inputs": chunk, "truncate": true })).map_err(
+            // Complete input is part of the frozen measurement. Explicit false
+            // prevents a server default or upgrade from silently substituting
+            // a prefix; an oversized request must fail with the service error.
+            let body = serde_json::to_vec(&json!({ "inputs": chunk, "truncate": false })).map_err(
                 |err| CalyxError::lens_unreachable(format!("TEI request encode failed: {err}")),
             )?;
             let raw = post_json(&self.endpoint, &body, self.timeout)?;

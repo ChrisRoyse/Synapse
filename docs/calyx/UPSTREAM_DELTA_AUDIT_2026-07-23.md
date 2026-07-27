@@ -460,3 +460,60 @@ git -C C:/code/Calyx-Dev show <hash>
 Analysis scripts (`classify.py`, `presence.py`, `baseline_cmp.py`, `gen_table.py`, `gen_doc.py`)
 were run from the audit scratchpad; the verdict overrides (Section 5 / table) encode the manual
 work-stream corrections and are the authoritative layer over the automated signal.
+
+---
+
+## 9. Terminal adjudication and incremental audit through `1fc85aa7`
+
+This section supersedes the provisional `applicable` / `needs-review` language in Section 5.
+The product Source of Truth is the Synapse-owned `calyx/` tree; the separate Calyx-Dev checkout
+was inspected read-only and was neither merged nor synchronized.
+
+### 9.1 Previously queued work streams
+
+| Upstream stream | Terminal decision | Native evidence / action |
+|---|---|---|
+| `f35d2142`,`929a4ee8`,`320cb5db`,`e9af7df3`,`ddb1e6da` A37 | ported | Full coherent conditioning/convergence stream landed natively in `75373597`; no upstream tests or harnesses were imported. |
+| `71e43b1e` device-relative host cap | ported | Native device-capacity default landed in `0779d485`; the physical-free safety floor remains authoritative. |
+| `82be2993` spectral disconnected nodes | not applicable | The fork never adopted `27f7c730` row normalization or its zero-norm failure; importing the follow-up would change the fork's spectral algorithm rather than repair it. |
+| `e6655c2f`,`4e5ded95`,`3dc9e10e` WAL recovery | adapted and ported | Header-only tip/torn-tail recovery, reusable-buffer CRC-validating replay, reverse bounded point reads, and streamed latest-write recovery are now native. Recovery preserves ordered WAL semantics and advances content watermarks before each recovered chunk becomes durable. |
+| `75e02d0e` WAL pruning | already superseded | Synapse's bounded recycler already flushes, verifies the durable manifest floor, and truncates eligible non-active segments. Deleting through a second upstream API would duplicate the durability owner. |
+| `c8a2bf41`,`2b66b536`,`476eb838`,`69ed1cc2`,`0b095c88` graph-generation lifecycle | not applicable to the retained architecture | These commits require the pruned Weave CLI producer plus generation-isolated CF/XTerm publication. No retained producer constructs or writes generation lifecycle state; Synapse serves direct `PlainGraph` collections. Importing only the reader/reclaimer would create an unreachable partial protocol. |
+| `004d6fbc` compute-on-recall ingest sidecars | not applicable | Its only callers are in the pruned publish/ingest CLI surface; the retained core helper would be unreachable. |
+| `974b1abd` indexability | adapted and ported | `SlotVector::is_indexable` is now the exhaustive core predicate and the search caller no longer owns a divergent duplicate. |
+| `b8dff972` DiskANN i8 scoring | ported | Runtime-checked AVX2 dot/norm scoring with an f64-accumulating scalar path preserves the existing numerical contract on unsupported hosts. |
+| `e120057d` rebuild disk headroom | not applicable | The upstream implementation is Unix `statvfs` policy for the pruned law rebuild CLI; it is not a Windows Synapse runtime boundary. |
+| `afc723ca` graph erasure | adapted and ported | Per-context erasure now discovers every physical plain-graph collection, removes node plus both incident-edge directions, and invalidates CSR segments and metadata. This closes the retained legacy/direct graph privacy gap without importing the absent generation protocol. |
+| `19dcc189` TEI no-truncate meaning | adapted and ported | TEI requests now send `truncate:false`; the request policy is part of the frozen corpus identity so old truncated meaning cannot share a LensId. |
+| Tier-4 CUDA fragments | superseded | They are follow-ups to CUDA serving bases that the fork rewrote or never absorbed. No isolated fragment has a reachable, contract-compatible landing point. |
+
+### 9.2 Incremental range after the Phase-1 head
+
+- Prior audited head: `8e1625190adaaa2f54ee2a864cb08e871310591d`
+- Authenticated Calyx-Dev head inspected: `1fc85aa7b435cff80eae8e5f2b632a4d28025a51`
+- Range: `8e162519..1fc85aa7`, **67 non-merge commits**
+- Excluded as docs/web/deploy/law-demo/pruned-surface only: **50**
+- Retained-crate production candidates manually inspected: **17**
+
+| Commit | Subject | Terminal decision | Evidence / native action |
+|---|---|---|---|
+| `4d684755` | stream physical graph acceptance counts | not applicable | Depends on the absent generation writer and pruned Weave acceptance producer described above. |
+| `6e6ea46c` | bound exact recall ranking state | not applicable | Operates on `typed_kernel_index.rs`, which the fork never absorbed. |
+| `b8747394` | parallelize exact total-order sorts | not applicable | Operates only on absent typed-kernel ranking. |
+| `99e82b8e` | make completed kernel identity reproducible | adapted and ported | Completed identity now serializes a v2 semantic projection that excludes `kernel_id` and wall-clock `built_at_millis`; equal completed meaning is content-addressed equally. |
+| `3c5db4d5` | prepare exact recall scoring | not applicable | Requires absent `slot_similarity` and typed-kernel-index surfaces. |
+| `7de5883d` | stream terminal index lifecycle | not applicable | Requires absent typed-kernel immutable installer. |
+| `f896477c` | reuse exact rank workspace | not applicable | Requires absent typed-kernel ranking. |
+| `69a42445` | borrow recall member panels | not applicable | Requires absent typed-kernel recall path. |
+| `19038cdf` | rank kernel answers without evidence churn | not applicable | Requires absent typed-kernel answer-ranking pipeline. |
+| `948ca1e0` | reuse exact recall reference | not applicable | Requires absent typed-kernel recall path. |
+| `cff85faf` | compare immutable streams in place | not applicable | Modifies the upstream streaming immutable installer, absent from the retained fork. |
+| `48311ac0` | pin exact kernel ranking in resident | not applicable | Resident typed-kernel ranking is a pruned CLI/service contract. |
+| `2298df69` | traverse bounded grounded associations | not applicable | Couples absent typed law answers to the generation-isolated graph protocol that Synapse does not produce. |
+| `8290bce9` | ground inflected doctrinal queries | not applicable | Extends a provenance context-validation method/version absent from the retained provenance contract. |
+| `bdd4151c` | reject incomplete injection scoring | adapted and ported | Hidden tokenizer truncation is disabled; empty, overflowed, mismatched, or >512-token encodings fail explicitly. The complete-input policy and boundary are folded into LensId. |
+| `4cb88e52` | disable hidden style truncation | adapted and ported | Style tokenization disables truncation and rejects overflow; its complete-input policy and boundary are folded into LensId. |
+| `fbaeb8bb` | migrate relational backend to Turso | not applicable | Migrates the pruned SQLite/law CLI backend. Synapse owns Aster-native Relational CF storage; accompanying search changes depend on absent segmented-multi/law serving surfaces. |
+
+The 17 candidate rows above are exhaustive for retained production paths in the incremental
+range. No candidate remains in `applicable` or `needs-review` state after this adjudication.

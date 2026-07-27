@@ -16,8 +16,8 @@ use crate::cf::{ColumnFamily, KeyRange};
 use crate::vault::AsterVault;
 use assoc_graph::{assoc_graph_from_csr, flatten_csr_edges};
 use key::{
-    GraphKeyspace, MAX_TRAVERSE_COST, MAX_TRAVERSE_HOPS, graph_corrupt, graph_limit, graph_missing,
-    path_error, validate_edge_type, validate_value,
+    GraphKeyspace, MAX_TRAVERSE_COST, MAX_TRAVERSE_HOPS, all_graph_rows_range, collection_from_key,
+    graph_corrupt, graph_limit, graph_missing, path_error, validate_edge_type, validate_value,
 };
 
 pub use lifecycle::{
@@ -39,6 +39,41 @@ struct WeightedEdgeDraft {
     dst: CxId,
     edge_type: String,
     raw_weight: f32,
+}
+
+/// Discovers every plain-graph collection from physical Graph CF keys without
+/// materializing each collection. The cursor jumps to the end of the current
+/// length-delimited collection prefix, so discovery cost follows collection
+/// count instead of graph size.
+pub(crate) fn graph_storage_collections<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: Seq,
+) -> Result<Vec<String>> {
+    let all_rows = all_graph_rows_range();
+    let mut after_key = None::<Vec<u8>>;
+    let mut collections = BTreeSet::new();
+    loop {
+        let page = vault.scan_cf_range_page_at(
+            snapshot,
+            ColumnFamily::Graph,
+            &all_rows,
+            after_key.as_deref(),
+            1,
+        )?;
+        let Some((key, _)) = page.first() else {
+            break;
+        };
+        let collection = collection_from_key(key)?;
+        let keyspace = GraphKeyspace::new(&collection)?;
+        after_key = keyspace.collection_range().end;
+        if after_key.is_none() {
+            return Err(graph_corrupt(format!(
+                "graph collection {collection} has no finite key range"
+            )));
+        }
+        collections.insert(collection);
+    }
+    Ok(collections.into_iter().collect())
 }
 
 pub struct PlainGraph<'a, C: Clock> {
@@ -99,6 +134,65 @@ impl<'a, C: Clock> PlainGraph<'a, C> {
     ) -> Result<Option<Vec<u8>>> {
         let key = self.edge_out_key(src, edge_type, dst)?;
         self.vault.read_cf_at(snapshot, ColumnFamily::Graph, &key)
+    }
+
+    /// Enumerates every physical row that must be tombstoned when `node` is
+    /// erased. Incident edges are stored in forward and reverse forms, and all
+    /// collection-local CSR/metadata projections are invalidated if any live
+    /// graph row changes so they cannot retain the erased context indirectly.
+    pub(crate) fn erasure_keys_for_node(&self, snapshot: Seq, node: CxId) -> Result<Vec<Vec<u8>>> {
+        let mut keys = BTreeSet::new();
+        let node_key = self.node_key(node);
+        if self
+            .vault
+            .read_cf_at(snapshot, ColumnFamily::Graph, &node_key)?
+            .is_some()
+        {
+            keys.insert(node_key);
+        }
+
+        for key in self.scan_keys_at(snapshot, &self.keys.edge_prefix(true, node, None)?)? {
+            let edge = self.keys.decode_edge_out_key(&key)?;
+            keys.insert(key);
+            let reverse = self.keys.edge_in_key(edge.dst, &edge.edge_type, edge.src)?;
+            if self
+                .vault
+                .read_cf_at(snapshot, ColumnFamily::Graph, &reverse)?
+                .is_some()
+            {
+                keys.insert(reverse);
+            }
+        }
+
+        for key in self.scan_keys_at(snapshot, &self.keys.edge_prefix(false, node, None)?)? {
+            let edge = self.keys.decode_edge_in_key(&key)?;
+            keys.insert(key);
+            let forward = self
+                .keys
+                .edge_out_key(edge.src, &edge.edge_type, edge.dst)?;
+            if self
+                .vault
+                .read_cf_at(snapshot, ColumnFamily::Graph, &forward)?
+                .is_some()
+            {
+                keys.insert(forward);
+            }
+        }
+
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let csr_key = self.keys.csr_key();
+        if self
+            .vault
+            .read_cf_at(snapshot, ColumnFamily::Graph, &csr_key)?
+            .is_some()
+        {
+            keys.insert(csr_key);
+        }
+        keys.extend(self.scan_keys_at(snapshot, &self.keys.csr_segment_range())?);
+        keys.extend(self.scan_keys_at(snapshot, &self.keys.metadata_range())?);
+        Ok(keys.into_iter().collect())
     }
 
     pub fn out_neighbors(

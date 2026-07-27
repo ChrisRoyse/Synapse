@@ -18,8 +18,9 @@ pub use batch::GroupCommitBatcher;
 pub(crate) use point_read::WalWriteRowPointReader;
 pub use replay::replay_dir;
 pub use replay::replay_dir_after;
-use replay::{replay_dir_locked, replay_dir_locked_after};
-pub(crate) use stream_replay::{stream_records, stream_records_after};
+pub(crate) use stream_replay::{
+    for_each_record_payload_after, for_each_record_payload_reverse, stream_records_after,
+};
 
 pub(crate) const RECORD_HEADER_BYTES: u64 = record::HEADER_LEN as u64;
 
@@ -164,11 +165,9 @@ impl Wal {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|error| storage_error("create WAL directory", error))?;
         let _lock = crate::file_lock::FileLockGuard::acquire(&dir.join(".append.lock"))?;
-        let replay = replay_dir_locked_after(&dir, replay_floor_seq)?;
-        let last_replayed_seq = replay
-            .records
-            .last()
-            .map_or(replay_floor_seq, |record| record.seq);
+        // Opening an append handle needs only the physical tip sequence, not a
+        // second decoded copy of every post-checkpoint payload.
+        let last_replayed_seq = recover_tip_seq_locked(&dir)?.max(replay_floor_seq);
         let next_seq = last_replayed_seq.saturating_add(1).max(1);
         let segments = segment::list_segments(&dir)?;
         let active_index = segments.last().map_or(0, |(index, _)| *index);
@@ -299,8 +298,7 @@ impl Wal {
         if !self.external_appends_present()? {
             return Ok(());
         }
-        let replay = replay_dir_locked(&self.dir)?;
-        self.next_seq = replay.records.last().map_or(1, |record| record.seq + 1);
+        self.next_seq = recover_tip_seq_locked(&self.dir)?.saturating_add(1).max(1);
         let segments = segment::list_segments(&self.dir)?;
         let active_index = segments.last().map_or(0, |(index, _)| *index);
         if active_index != self.active_index {
@@ -417,6 +415,114 @@ fn read_segment_seq_bounds(path: &Path) -> Result<(Option<u64>, Option<u64>, usi
             }
         }
     }
+}
+
+/// Recovers the highest committed sequence using record headers only. The
+/// newest physical torn tail is truncated exactly at its record boundary;
+/// corruption in an older segment fails closed because later commits exist.
+fn recover_tip_seq_locked(dir: &Path) -> Result<u64> {
+    Ok(recover_tip_locked(dir)?.0)
+}
+
+fn recover_tip_locked(dir: &Path) -> Result<(u64, Option<TornTail>)> {
+    let segments = segment::list_segments(dir)?;
+    for (position, (_, path)) in segments.iter().enumerate().rev() {
+        let has_later_segments = position + 1 < segments.len();
+        let (last_seq, torn) = scan_segment_last_seq(path, has_later_segments)?;
+        if let Some(seq) = last_seq {
+            return Ok((seq, torn));
+        }
+        if torn.is_some() {
+            continue;
+        }
+    }
+    Ok((0, None))
+}
+
+/// Header-only WAL tip recovery for bounded vault-open planning. The later
+/// streaming replay authenticates every covered and post-floor payload.
+pub(crate) fn recover_tip_and_torn(dir: impl AsRef<Path>) -> Result<(u64, Option<TornTail>)> {
+    let dir = dir.as_ref();
+    let _lock = crate::file_lock::FileLockGuard::acquire(&dir.join(".append.lock"))?;
+    recover_tip_locked(dir)
+}
+
+fn scan_segment_last_seq(
+    path: &Path,
+    has_later_segments: bool,
+) -> Result<(Option<u64>, Option<TornTail>)> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| storage_error("open WAL segment for tip scan", error))?;
+    let physical_len = file
+        .metadata()
+        .map_err(|error| storage_error("stat WAL segment for tip scan", error))?
+        .len();
+    let mut offset = 0;
+    let mut last_seq = None;
+    loop {
+        match record::read_header_at(&mut file, offset)
+            .map_err(|error| storage_error("scan WAL header", error))?
+        {
+            record::HeaderStatus::Complete(header) if header.end_offset <= physical_len => {
+                last_seq = Some(header.seq);
+                offset = header.end_offset;
+            }
+            record::HeaderStatus::Complete(header) => {
+                return resolve_tip_torn(
+                    &file,
+                    path,
+                    header.start_offset,
+                    format!(
+                        "partial WAL payload for seq {}: record ends at {}, file ends at {physical_len}",
+                        header.seq, header.end_offset
+                    ),
+                    has_later_segments,
+                    last_seq,
+                );
+            }
+            record::HeaderStatus::Eof => return Ok((last_seq, None)),
+            record::HeaderStatus::Torn { offset, message } => {
+                return resolve_tip_torn(
+                    &file,
+                    path,
+                    offset,
+                    message,
+                    has_later_segments,
+                    last_seq,
+                );
+            }
+        }
+    }
+}
+
+fn resolve_tip_torn(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    message: String,
+    has_later_segments: bool,
+    last_seq: Option<u64>,
+) -> Result<(Option<u64>, Option<TornTail>)> {
+    if has_later_segments {
+        return Err(CalyxError::aster_torn_wal(format!(
+            "{} at byte {offset}: {message}",
+            path.display()
+        )));
+    }
+    let torn = TornTail {
+        segment_path: path.to_path_buf(),
+        offset,
+        code: CalyxErrorCode::AsterTornWal.code(),
+        message,
+    };
+    file.set_len(offset)
+        .map_err(|error| storage_error("truncate torn WAL tail", error))?;
+    file.sync_data()
+        .map_err(|error| storage_error("fsync truncated WAL tail", error))?;
+    Ok((last_seq, Some(torn)))
 }
 
 fn recyclable_segments(

@@ -28,8 +28,10 @@ use backend::{OnnxInjectionBackend, external_data_path, hash_parts, sha256_files
 pub const DEFAULT_INJECTION_MODEL_PATH: &str = "/var/lib/calyx/models/injection-guard/model.onnx";
 pub const DEFAULT_INJECTION_TOKENIZER_PATH: &str =
     "/var/lib/calyx/models/injection-guard/tokenizer.json";
-/// RoBERTa positional embeddings cap usable tokens at 512 (514 incl. specials).
+/// Maximum RoBERTa sequence length, including tokenizer-added special tokens.
 pub const INJECTION_MAX_TOKENS: usize = 512;
+/// Stable preprocessing contract included in the frozen lens identity.
+pub const INJECTION_INPUT_COVERAGE_POLICY: &str = "complete_input_or_error:max_encoded_tokens:v1";
 /// `RobertaForSequenceClassification` injection head: 2 logits.
 pub const INJECTION_LABELS: usize = 2;
 const BENIGN_LABEL: usize = 0;
@@ -58,6 +60,8 @@ impl InjectionProviderPolicy {
 /// Backend seam: production uses the pinned ONNX session; tests inject scores.
 pub trait InjectionScoreBackend: Send + Sync {
     /// Probability the text is BENIGN (`softmax(logits)[benign]`), in `[0, 1]`.
+    /// Implementations score the complete input or return an error when full
+    /// coverage is unavailable; they must never silently truncate input.
     fn benign_score(&self, text: &str) -> Result<f32, WardError>;
 
     fn input_names(&self) -> Vec<String> {
@@ -144,6 +148,7 @@ impl InjectionLens {
     where
         B: InjectionScoreBackend + 'static,
     {
+        let max_tokens = (INJECTION_MAX_TOKENS as u64).to_le_bytes();
         let corpus_hash = hash_parts(&[
             INJECTION_SOURCE_REPO.as_bytes(),
             INJECTION_SOURCE_REVISION.as_bytes(),
@@ -151,6 +156,8 @@ impl InjectionLens {
             b"attention_mask",
             b"logits",
             b"softmax_benign",
+            INJECTION_INPUT_COVERAGE_POLICY.as_bytes(),
+            &max_tokens,
         ]);
         let lens_id = LensId::from_parts(
             INJECTION_LENS_NAME,

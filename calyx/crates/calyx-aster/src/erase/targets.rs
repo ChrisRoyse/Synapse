@@ -3,6 +3,7 @@ use crate::cf::{
     ColumnFamily, KeyRange, anchor_prefix_range, base_key, recurrence_prefix_range, slot_key,
     temporal_xterm_prefix_range, xterm_prefix_range,
 };
+use crate::plain_graph::{PlainGraph, graph_storage_collections};
 use crate::vault::{AsterVault, encode};
 use calyx_core::{Clock, Constellation, CxId, Result};
 use calyx_ledger::SubjectId;
@@ -108,6 +109,7 @@ where
         &anchor_prefix_range(cx_id),
         &mut targets.rows,
     )?;
+    collect_graph_targets(vault, snapshot, cx_id, &mut targets.rows)?;
     collect_range_targets(
         vault,
         snapshot,
@@ -125,6 +127,24 @@ where
     collect_temporal_xterm_targets(vault, snapshot, cx_id, &mut targets.rows)?;
     collect_scalar_targets(vault, snapshot, cx_id, &mut targets.rows)?;
     Ok(targets)
+}
+
+fn collect_graph_targets<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    cx_id: CxId,
+    targets: &mut Vec<EraseTarget>,
+) -> Result<()>
+where
+    C: Clock,
+{
+    for collection in graph_storage_collections(vault, snapshot)? {
+        let graph = PlainGraph::new(vault, &collection)?;
+        for key in graph.erasure_keys_for_node(snapshot, cx_id)? {
+            push_unique(targets, ColumnFamily::Graph, key);
+        }
+    }
+    Ok(())
 }
 
 fn collect_slot_targets<C>(

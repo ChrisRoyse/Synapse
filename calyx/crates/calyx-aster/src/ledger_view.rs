@@ -22,7 +22,7 @@ use crate::compaction::TieringPolicy;
 use crate::manifest::ManifestStore;
 use crate::sst::SstEntry;
 use crate::vault::encode::decode_write_batch;
-use crate::wal::{replay_dir_after, stream_records};
+use crate::wal::{for_each_record_payload_after, for_each_record_payload_reverse};
 pub use point_read::{LedgerPointReadTierStats, LedgerPointReadTrace};
 use point_read::{read_complete_sst_ledger_rows, read_sst_ledger_rows, unresolved_seqs};
 pub use query_index::{LedgerQueryOpenStats, LedgerQuerySnapshot, LedgerQueryVisitStats};
@@ -147,18 +147,19 @@ impl AsterLedgerCfStore {
         }
 
         if layout.has_wal {
-            let replay = replay_dir_after(vault.join("wal"), layout.wal_replay_floor_seq)?;
-            if let Some(torn) = replay.torn_tail {
-                return Err(torn.error());
-            }
-            for record in replay.records {
-                for row in decode_write_batch(&record.payload)? {
-                    if row.cf == ColumnFamily::Ledger {
-                        let seq = parse_aster_ledger_seq(&row.key)?;
-                        insert_ledger_bytes(&mut rows, seq, row.value)?;
+            for_each_record_payload_after(
+                vault.join("wal"),
+                layout.wal_replay_floor_seq,
+                |_seq, payload| {
+                    for row in decode_write_batch(payload)? {
+                        if row.cf == ColumnFamily::Ledger {
+                            let seq = parse_aster_ledger_seq(&row.key)?;
+                            insert_ledger_bytes(&mut rows, seq, row.value)?;
+                        }
                     }
-                }
-            }
+                    Ok(true)
+                },
+            )?;
         }
 
         let rows = rows
@@ -269,21 +270,22 @@ fn read_wal_ledger_rows_after_floor(
     wanted: &BTreeSet<u64>,
     rows: &mut BTreeMap<u64, Vec<u8>>,
 ) -> CalyxResult<()> {
-    let replay = replay_dir_after(vault.join("wal"), wal_replay_floor_seq(vault)?)?;
-    if let Some(torn) = replay.torn_tail {
-        return Err(torn.error());
-    }
-    for record in replay.records {
-        for write in decode_write_batch(&record.payload)? {
-            if write.cf != ColumnFamily::Ledger {
-                continue;
+    for_each_record_payload_after(
+        vault.join("wal"),
+        wal_replay_floor_seq(vault)?,
+        |_record_seq, payload| {
+            for write in decode_write_batch(payload)? {
+                if write.cf != ColumnFamily::Ledger {
+                    continue;
+                }
+                let seq = parse_aster_ledger_seq(&write.key)?;
+                if wanted.contains(&seq) {
+                    insert_ledger_bytes(rows, seq, write.value)?;
+                }
             }
-            let seq = parse_aster_ledger_seq(&write.key)?;
-            if wanted.contains(&seq) {
-                insert_ledger_bytes(rows, seq, write.value)?;
-            }
-        }
-    }
+            Ok(true)
+        },
+    )?;
     Ok(())
 }
 
@@ -292,17 +294,18 @@ fn read_retained_wal_ledger_rows(
     wanted: &BTreeSet<u64>,
     rows: &mut BTreeMap<u64, Vec<u8>>,
 ) -> CalyxResult<()> {
-    stream_records(vault.join("wal"), |record| {
-        for write in decode_write_batch(&record.payload)? {
+    let mut remaining = wanted.clone();
+    for_each_record_payload_reverse(vault.join("wal"), |_seq, payload| {
+        for write in decode_write_batch(payload)? {
             if write.cf != ColumnFamily::Ledger {
                 continue;
             }
             let seq = parse_aster_ledger_seq(&write.key)?;
-            if wanted.contains(&seq) {
+            if remaining.remove(&seq) {
                 insert_ledger_bytes(rows, seq, write.value)?;
             }
         }
-        Ok(())
+        Ok(!remaining.is_empty())
     })?;
     Ok(())
 }

@@ -73,7 +73,7 @@ pub(crate) fn measure_query_vectors_with_slots_traced(
                     return Err(error.into());
                 }
             };
-            let is_indexable = indexable(&vector);
+            let is_indexable = vector.is_indexable();
             trace.emit_detail(
                 "query.measure_slot.done",
                 Some(slot.slot_id),
@@ -98,13 +98,6 @@ pub(crate) fn no_indexable_query_vectors() -> CalyxError {
 pub(crate) fn no_indexable_stored_vectors() -> CalyxError {
     CalyxError::stale_derived(
         "search has no indexable stored slot vectors matching active query lenses; reingest or backfill stale slot rows",
-    )
-}
-
-pub(crate) fn indexable(vector: &SlotVector) -> bool {
-    matches!(
-        vector,
-        SlotVector::Dense { .. } | SlotVector::Sparse { .. } | SlotVector::Multi { .. }
     )
 }
 

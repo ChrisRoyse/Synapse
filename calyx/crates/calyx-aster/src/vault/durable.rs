@@ -12,7 +12,7 @@ use super::encode::{WriteRow, decode_write_batch, encode_write_batch};
 use crate::cf::ColumnFamily;
 use crate::compaction::TieringPolicy;
 use crate::dedup::DedupPolicy;
-use crate::manifest::recover_vault;
+use crate::manifest::{recover_vault, recover_vault_metadata};
 use crate::pressure::DiskPressureGuard;
 use crate::resource::ResourceCounters;
 use crate::security::value_crypto::{SharedVaultContext, open_rows, seal_rows};
@@ -168,6 +168,9 @@ pub(super) struct RecoveredBatches {
     pub dedup_policy: Option<DedupPolicy>,
     pub retention_horizon: RetentionHorizon,
     pub router_latest_readback: bool,
+    /// A post-manifest WAL tail intentionally omitted from `batches`; open must
+    /// replay it through the bounded authenticated stream and stage it durably.
+    pub wal_tail_stream_floor: Option<u64>,
 }
 
 impl DurableVault {
@@ -284,6 +287,48 @@ impl DurableVault {
             stale_sst_temp::reclaim_stale_sst_temps(root, options.tiering_policy.as_ref())?;
         }
         if root.join("CURRENT").exists() {
+            if !options.restore_mvcc_rows && !options.read_only && options.value_crypto.is_none() {
+                let recovery = recover_vault_metadata(root)?;
+                if let Some(policy) = &recovery.manifest.dedup_policy {
+                    validate_dedup_policy(policy, options.panel.as_ref())?;
+                }
+                let migrate_derived_content_model =
+                    !recovery.manifest.uses_persistent_search_content_model();
+                let active_panel_version =
+                    read_manifest_panel_version(root, &recovery.manifest.panel_ref)?;
+                tracing::info!(
+                    code = "CALYX_ASTER_RECOVERY_STREAM_PLAN",
+                    vault_dir = %root.display(),
+                    durable_seq = recovery.manifest.durable_seq,
+                    last_recovered_seq = recovery.last_recovered_seq,
+                    active_panel_version,
+                    torn_tail = ?recovery.torn_tail,
+                    "planned bounded WAL-tail streaming recovery"
+                );
+                return Ok(RecoveredBatches {
+                    batches: Vec::new(),
+                    last_recovered_seq: recovery.last_recovered_seq,
+                    wal_replay_floor_seq: recovery.manifest.durable_seq,
+                    derived_content_floor_seq: if migrate_derived_content_model {
+                        0
+                    } else {
+                        recovery.manifest.effective_derived_content_seq()
+                    },
+                    panel_content_floor_seqs: if migrate_derived_content_model {
+                        BTreeMap::new()
+                    } else {
+                        recovery.manifest.panel_content_seqs
+                    },
+                    active_panel_version,
+                    migrate_derived_content_model,
+                    torn_tail: recovery.torn_tail,
+                    temporal_policy: recovery.manifest.temporal_policy,
+                    dedup_policy: recovery.manifest.dedup_policy,
+                    retention_horizon: recovery.manifest.retention_horizon,
+                    router_latest_readback: true,
+                    wal_tail_stream_floor: Some(recovery.manifest.durable_seq),
+                });
+            }
             let recovery = recover_vault(root)?;
             tracing::info!(
                 code = "CALYX_ASTER_RECOVERY_MANIFEST_LOADED",
@@ -363,6 +408,7 @@ impl DurableVault {
                 dedup_policy: recovery.manifest.dedup_policy,
                 retention_horizon: recovery.manifest.retention_horizon,
                 router_latest_readback,
+                wal_tail_stream_floor: None,
             });
         }
 
@@ -404,6 +450,7 @@ impl DurableVault {
             dedup_policy: options.dedup_policy.clone(),
             retention_horizon: options.retention_horizon.clone(),
             router_latest_readback: false,
+            wal_tail_stream_floor: None,
         })
     }
 
