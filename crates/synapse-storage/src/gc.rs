@@ -106,6 +106,50 @@ impl GcTask {
         readback.running = !self.handle.is_finished();
         readback
     }
+
+    /// Requests terminal shutdown and retains the exact task owner until the
+    /// periodic loop has joined.
+    ///
+    /// A maintenance attempt may already be running inside `spawn_blocking`.
+    /// Tokio cannot abort a started blocking closure, so dropping/aborting only
+    /// the async wrapper would let storage work outlive the vault it owns. This
+    /// method instead signals the loop and awaits its `JoinHandle`; an in-flight
+    /// attempt therefore finishes before the caller may close storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error if the task failed before reaching
+    /// its terminal join boundary.
+    pub async fn shutdown(mut self, task: &'static str) -> StorageResult<()> {
+        let shutdown_signal_sent = self
+            .shutdown
+            .take()
+            .is_some_and(|shutdown| shutdown.send(()).is_ok());
+        tracing::info!(
+            code = "STORAGE_MAINTENANCE_SHUTDOWN_REQUESTED",
+            task,
+            shutdown_signal_sent,
+            task_finished_before_join = self.handle.is_finished(),
+            "requested periodic storage-maintenance shutdown and retained its exact task owner"
+        );
+        let joined = (&mut self.handle).await;
+        match joined {
+            Ok(()) => {
+                tracing::info!(
+                    code = "STORAGE_MAINTENANCE_SHUTDOWN_JOINED",
+                    task,
+                    "periodic storage-maintenance task reached terminal state before vault close"
+                );
+                Ok(())
+            }
+            Err(error) => Err(StorageError::WriteFailed {
+                cf_name: "storage_maintenance".to_owned(),
+                detail: format!(
+                    "join periodic {task} task before vault close: {error}; the task is terminal but shutdown is not clean"
+                ),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +216,8 @@ pub fn spawn_runner(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {
                     let started = mark_gc_tick_started(&task_state);
                     let mut attempt = 0_u32;
@@ -234,7 +280,6 @@ pub fn spawn_runner(
                         );
                     }
                 }
-                _ = &mut shutdown_rx => break,
             }
         }
     });

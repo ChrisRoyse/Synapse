@@ -99,6 +99,44 @@ impl PressureTask {
     pub fn running(&self) -> bool {
         !self.handle.is_finished()
     }
+
+    /// Requests terminal shutdown and retains the exact task owner until any
+    /// already-started blocking pressure pass has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error if the task failed before reaching
+    /// its terminal join boundary.
+    pub async fn shutdown(mut self) -> StorageResult<()> {
+        let shutdown_signal_sent = self
+            .shutdown
+            .take()
+            .is_some_and(|shutdown| shutdown.send(()).is_ok());
+        tracing::info!(
+            code = "STORAGE_MAINTENANCE_SHUTDOWN_REQUESTED",
+            task = "disk_pressure",
+            shutdown_signal_sent,
+            task_finished_before_join = self.handle.is_finished(),
+            "requested periodic storage-maintenance shutdown and retained its exact task owner"
+        );
+        let joined = (&mut self.handle).await;
+        match joined {
+            Ok(()) => {
+                tracing::info!(
+                    code = "STORAGE_MAINTENANCE_SHUTDOWN_JOINED",
+                    task = "disk_pressure",
+                    "periodic storage-maintenance task reached terminal state before vault close"
+                );
+                Ok(())
+            }
+            Err(error) => Err(StorageError::WriteFailed {
+                cf_name: "storage_maintenance".to_owned(),
+                detail: format!(
+                    "join periodic disk-pressure task before vault close: {error}; the task is terminal but shutdown is not clean"
+                ),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +293,8 @@ fn spawn_with_probe(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {
                     let started = mark_pressure_probe_started(&state);
                     // A pressure transition can trigger a KV compaction that
@@ -284,7 +324,6 @@ fn spawn_with_probe(
                         tracing::warn!(error = %error, "storage disk-pressure tick failed");
                     }
                 }
-                _ = &mut shutdown_rx => break,
             }
         }
     });

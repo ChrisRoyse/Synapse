@@ -818,7 +818,7 @@ async fn drain_stdio_m2_owner(
     drain_m2_emitter_owner(owner.take(), "stdio", reason).await
 }
 
-fn close_stdio_calyx_vault(
+async fn close_stdio_calyx_vault(
     m3_state: &crate::m3::SharedM3State,
     reason: &'static str,
     expected_open: bool,
@@ -826,20 +826,37 @@ fn close_stdio_calyx_vault(
     bool,
     anyhow::Result<synapse_calyx::SynapseCalyxVaultCloseReadback>,
 ) {
-    let result = match m3_state.lock() {
-        Ok(mut state) => state
-            .close_calyx_vault_for_shutdown(reason, expected_open)
-            .map_err(anyhow::Error::new)
-            .and_then(|readback| {
-                crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
-                Ok(readback)
-            }),
-        Err(poisoned) => {
-            let detail =
-                format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
-            drop(poisoned);
-            Err(anyhow::anyhow!(detail))
+    let maintenance = crate::m3::shutdown_storage_maintenance_tasks(m3_state, reason).await;
+    let maintenance_verdict = maintenance.verdict();
+    let result = if maintenance.owners_quiescent() {
+        let close_result = match m3_state.lock() {
+            Ok(mut state) => state
+                .close_calyx_vault_for_shutdown(reason, expected_open)
+                .map_err(anyhow::Error::new)
+                .and_then(|readback| {
+                    crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
+                    Ok(readback)
+                }),
+            Err(poisoned) => {
+                let detail =
+                    format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
+                drop(poisoned);
+                Err(anyhow::anyhow!(detail))
+            }
+        };
+        match (maintenance_verdict, close_result) {
+            (Ok(()), close_result) => close_result,
+            (Err(maintenance_error), Ok(_readback)) => Err(maintenance_error.context(
+                "periodic storage-maintenance owner joined with a failure before the Calyx vault was closed; retaining the daemon lifetime locks",
+            )),
+            (Err(maintenance_error), Err(close_error)) => Err(anyhow::anyhow!(
+                "storage-maintenance shutdown failed ({maintenance_error:#}); Calyx vault close also failed ({close_error:#})"
+            )),
         }
+    } else {
+        Err(anyhow::anyhow!(
+            "refused to close Calyx vault because periodic storage-maintenance owner terminality is unproven: {maintenance:?}"
+        ))
     };
     let safe_to_unlock = result
         .as_ref()
@@ -1267,25 +1284,12 @@ async fn run_stdio(
             }
         };
         if let Err(error) = maintenance_result {
-            let calyx_cleanup = match m3_state.lock() {
-                Ok(mut state) => state
-                    .close_calyx_vault_for_shutdown(
-                        "stdio_storage_or_calyx_open_or_maintenance_start_failed",
-                        false,
-                    )
-                    .map_err(anyhow::Error::new)
-                    .and_then(|readback| {
-                        crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
-                        Ok(readback)
-                    }),
-                Err(poisoned) => {
-                    let detail = format!(
-                        "m3 service state lock poisoned while cleaning up Calyx vault after startup failure: {poisoned}"
-                    );
-                    drop(poisoned);
-                    Err(anyhow::anyhow!(detail))
-                }
-            };
+            let (_calyx_vault_closed, calyx_cleanup) = close_stdio_calyx_vault(
+                &m3_state,
+                "stdio_storage_or_calyx_open_or_maintenance_start_failed",
+                false,
+            )
+            .await;
             if let Err(cleanup_error) = &calyx_cleanup {
                 tracing::error!(
                     code = "STDIO_CALYX_STARTUP_FAILURE_CLEANUP_FAILED",
@@ -1356,7 +1360,8 @@ async fn run_stdio(
                 &m3_state_for_calyx,
                 "stdio_operator_hotkey_install_failed",
                 true,
-            );
+            )
+            .await;
             drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             drop(service);
@@ -1439,7 +1444,8 @@ async fn run_stdio(
                     &m3_state_for_calyx,
                     "stdio_connection_closed_before_init",
                     true,
-                );
+                )
+                .await;
                 drop(m3_state_for_calyx);
                 drop(authority_finalizer_service);
                 let (win_event_owners_quiescent, win_event_shutdown_history) =
@@ -1520,7 +1526,8 @@ async fn run_stdio(
                     &m3_state_for_calyx,
                     "stdio_start_failed_before_init",
                     true,
-                );
+                )
+                .await;
                 drop(m3_state_for_calyx);
                 drop(authority_finalizer_service);
                 let (win_event_owners_quiescent, win_event_shutdown_history) =
@@ -1604,7 +1611,8 @@ async fn run_stdio(
                 &m3_state_for_calyx,
                 "stdio_signal_before_init",
                 true,
-            );
+            )
+            .await;
             drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
@@ -1698,7 +1706,8 @@ async fn run_stdio(
                 &m3_state_for_calyx,
                 "stdio_service_completed",
                 true,
-            );
+            )
+            .await;
             drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =
@@ -1794,7 +1803,8 @@ async fn run_stdio(
                 &m3_state_for_calyx,
                 "stdio_signal_after_init",
                 true,
-            );
+            )
+            .await;
             drop(m3_state_for_calyx);
             drop(authority_finalizer_service);
             let (win_event_owners_quiescent, win_event_shutdown_history) =

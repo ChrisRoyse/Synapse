@@ -345,6 +345,132 @@ pub struct StorageMaintenanceReadback {
 }
 
 #[derive(Clone, Debug)]
+pub struct StorageMaintenanceShutdownReadback {
+    pub reason: &'static str,
+    pub gc_owner_present: bool,
+    pub checkpoint_owner_present: bool,
+    pub pressure_owner_present: bool,
+    pub owners_quiescent: bool,
+    pub failures: Vec<String>,
+}
+
+impl StorageMaintenanceShutdownReadback {
+    #[must_use]
+    pub const fn owners_quiescent(&self) -> bool {
+        self.owners_quiescent
+    }
+
+    #[must_use]
+    pub fn owner_count(&self) -> usize {
+        usize::from(self.gc_owner_present)
+            + usize::from(self.checkpoint_owner_present)
+            + usize::from(self.pressure_owner_present)
+    }
+
+    pub fn verdict(&self) -> Result<()> {
+        let owner_count = self.owner_count();
+        if !self.owners_quiescent || !self.failures.is_empty() {
+            bail!(
+                "storage maintenance shutdown failed before vault close: reason={} owner_count={} owners_quiescent={} failures={:?}",
+                self.reason,
+                owner_count,
+                self.owners_quiescent,
+                self.failures
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Stops every periodic storage producer and joins its exact task owner before
+/// the Calyx vault may be flushed or closed.
+///
+/// The task handles are removed atomically under the M3 state lock, then joined
+/// without retaining that lock. Each task's shutdown method waits through any
+/// already-started `spawn_blocking` closure, which Tokio cannot abort.
+pub async fn shutdown_storage_maintenance_tasks(
+    state: &SharedM3State,
+    reason: &'static str,
+) -> StorageMaintenanceShutdownReadback {
+    let (gc_task, checkpoint_task, pressure_task) = match state.lock() {
+        Ok(mut state) => (
+            state.storage_gc_task.take(),
+            state.storage_checkpoint_task.take(),
+            state.storage_pressure_task.take(),
+        ),
+        Err(poisoned) => {
+            let detail = format!(
+                "M3 service state lock poisoned while taking storage-maintenance owners: {poisoned}"
+            );
+            drop(poisoned);
+            let readback = StorageMaintenanceShutdownReadback {
+                reason,
+                gc_owner_present: false,
+                checkpoint_owner_present: false,
+                pressure_owner_present: false,
+                owners_quiescent: false,
+                failures: vec![detail],
+            };
+            tracing::error!(
+                code = "STORAGE_MAINTENANCE_SHUTDOWN_UNPROVEN",
+                readback = ?readback,
+                "could not take periodic storage-maintenance owners before vault close"
+            );
+            return readback;
+        }
+    };
+
+    let gc_owner_present = gc_task.is_some();
+    let checkpoint_owner_present = checkpoint_task.is_some();
+    let pressure_owner_present = pressure_task.is_some();
+    let gc_shutdown = async move {
+        match gc_task {
+            Some(task) => task.shutdown("garbage_collection").await.err(),
+            None => None,
+        }
+    };
+    let checkpoint_shutdown = async move {
+        match checkpoint_task {
+            Some(task) => task.shutdown("checkpoint").await.err(),
+            None => None,
+        }
+    };
+    let pressure_shutdown = async move {
+        match pressure_task {
+            Some(task) => task.shutdown().await.err(),
+            None => None,
+        }
+    };
+    let (gc_error, checkpoint_error, pressure_error) =
+        tokio::join!(gc_shutdown, checkpoint_shutdown, pressure_shutdown);
+    let failures = [
+        gc_error.map(|error| format!("garbage_collection: {error}")),
+        checkpoint_error.map(|error| format!("checkpoint: {error}")),
+        pressure_error.map(|error| format!("disk_pressure: {error}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    // Every present JoinHandle was awaited above. A JoinError is a failed task,
+    // but is still terminal and therefore cannot mutate the vault after close.
+    let readback = StorageMaintenanceShutdownReadback {
+        reason,
+        gc_owner_present,
+        checkpoint_owner_present,
+        pressure_owner_present,
+        owners_quiescent: true,
+        failures,
+    };
+    tracing::info!(
+        code = "STORAGE_MAINTENANCE_SHUTDOWN_READBACK",
+        owner_count = readback.owner_count(),
+        readback = ?readback,
+        "readback=periodic_storage_task_owners edge=shutdown before_vault_close"
+    );
+    readback
+}
+
+#[derive(Clone, Debug)]
 pub struct AuditSessionState {
     pub session_id: SessionId,
     pub started_at: DateTime<Utc>,

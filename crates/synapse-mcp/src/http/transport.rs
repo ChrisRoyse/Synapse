@@ -781,7 +781,7 @@ impl HttpOperatorOwnerDrain {
     }
 }
 
-fn close_http_calyx_vault(
+async fn close_http_calyx_vault(
     m3_state: &crate::m3::SharedM3State,
     reason: &'static str,
     expected_open: bool,
@@ -789,20 +789,37 @@ fn close_http_calyx_vault(
     bool,
     anyhow::Result<synapse_calyx::SynapseCalyxVaultCloseReadback>,
 ) {
-    let result = match m3_state.lock() {
-        Ok(mut state) => state
-            .close_calyx_vault_for_shutdown(reason, expected_open)
-            .map_err(anyhow::Error::new)
-            .and_then(|readback| {
-                crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
-                Ok(readback)
-            }),
-        Err(poisoned) => {
-            let detail =
-                format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
-            drop(poisoned);
-            Err(anyhow::anyhow!(detail))
+    let maintenance = crate::m3::shutdown_storage_maintenance_tasks(m3_state, reason).await;
+    let maintenance_verdict = maintenance.verdict();
+    let result = if maintenance.owners_quiescent() {
+        let close_result = match m3_state.lock() {
+            Ok(mut state) => state
+                .close_calyx_vault_for_shutdown(reason, expected_open)
+                .map_err(anyhow::Error::new)
+                .and_then(|readback| {
+                    crate::m3::record_calyx_vault_close_event(&readback, "closed")?;
+                    Ok(readback)
+                }),
+            Err(poisoned) => {
+                let detail =
+                    format!("m3 service state lock poisoned while closing Calyx vault: {poisoned}");
+                drop(poisoned);
+                Err(anyhow::anyhow!(detail))
+            }
+        };
+        match (maintenance_verdict, close_result) {
+            (Ok(()), close_result) => close_result,
+            (Err(maintenance_error), Ok(_readback)) => Err(maintenance_error.context(
+                "periodic storage-maintenance owner joined with a failure before the Calyx vault was closed; retaining the daemon lifetime locks",
+            )),
+            (Err(maintenance_error), Err(close_error)) => Err(anyhow::anyhow!(
+                "storage-maintenance shutdown failed ({maintenance_error:#}); Calyx vault close also failed ({close_error:#})"
+            )),
         }
+    } else {
+        Err(anyhow::anyhow!(
+            "refused to close Calyx vault because periodic storage-maintenance owner terminality is unproven: {maintenance:?}"
+        ))
     };
     let safe_to_unlock = result
         .as_ref()
@@ -1500,7 +1517,7 @@ async fn fail_http_startup_after_service(
     let session_input_owners_quiescent = authority_finalizers_quiescent && !lease_after.held;
 
     let (calyx_vault_closed, calyx_vault_close) =
-        close_http_calyx_vault(&m3_state, "http_startup_failure", false);
+        close_http_calyx_vault(&m3_state, "http_startup_failure", false).await;
     failures.inspect_result("calyx_vault_close", calyx_vault_close.map(|_readback| ()));
 
     drop(service);
@@ -2859,7 +2876,7 @@ pub(super) async fn serve(
     shutdown_failures.inspect_result("activity_owner_drain", activity_drain.verdict());
 
     let (calyx_vault_closed, calyx_vault_close) =
-        close_http_calyx_vault(&m3_state_for_recorder, shutdown_source, true);
+        close_http_calyx_vault(&m3_state_for_recorder, shutdown_source, true).await;
     shutdown_failures.inspect_result(
         "calyx_vault_close",
         calyx_vault_close
