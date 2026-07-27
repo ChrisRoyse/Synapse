@@ -2769,14 +2769,35 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let started = Instant::now();
-    match tokio::task::spawn_blocking(work).await {
+    let owned_session_id = session_id.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        tracing::info!(
+            code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_ADMITTED",
+            session_id = owned_session_id,
+            step,
+            execution_context = "tokio_spawn_blocking_closure",
+            "admitted a daemon-shutdown session step onto the dedicated blocking pool off the async runtime workers"
+        );
+        let value = work();
+        tracing::info!(
+            code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_COMPLETED",
+            session_id = owned_session_id,
+            step,
+            execution_context = "tokio_spawn_blocking_closure",
+            elapsed_ms = duration_millis_u64(started.elapsed()),
+            "completed a daemon-shutdown session step on the dedicated blocking pool"
+        );
+        value
+    })
+    .await
+    {
         Ok(value) => {
             tracing::debug!(
-                code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_ADMITTED",
+                code = "MCP_SESSION_SHUTDOWN_STORAGE_STEP_JOINED",
                 session_id,
                 step,
                 elapsed_ms = duration_millis_u64(started.elapsed()),
-                "admitted a daemon-shutdown session step onto the dedicated blocking pool off the async runtime workers"
+                "joined a completed daemon-shutdown session step from the blocking pool"
             );
             Ok(value)
         }
