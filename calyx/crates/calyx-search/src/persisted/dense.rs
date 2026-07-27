@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -280,6 +280,46 @@ fn exact_filtered_hits(
 
 pub(super) fn should_use_flat_dense_index(row_count: usize) -> bool {
     flat::should_use_index(row_count)
+}
+
+pub(super) fn score_replacements(
+    slot: SlotId,
+    query_vector: &SlotVector,
+    replacements: &BTreeMap<CxId, SlotVector>,
+    candidates: Option<&BTreeSet<CxId>>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    query_vector.validate_schema().map_err(|error| {
+        stale(format!(
+            "dense delta reconciliation query for slot {slot} is invalid: {error}"
+        ))
+    })?;
+    let SlotVector::Dense {
+        dim: query_dim,
+        data: query,
+    } = query_vector
+    else {
+        return Err(stale(format!(
+            "dense delta reconciliation for slot {slot} received non-dense query"
+        )));
+    };
+    replacements
+        .iter()
+        .filter(|(cx_id, _)| candidates.is_none_or(|allowed| allowed.contains(cx_id)))
+        .map(|(cx_id, vector)| {
+            let SlotVector::Dense { dim, data } = vector else {
+                return Err(stale(format!(
+                    "changed row {cx_id} for dense slot {slot} has a non-dense vector"
+                )));
+            };
+            validate_dense(slot, *cx_id, *dim, data)?;
+            if dim != query_dim {
+                return Err(stale(format!(
+                    "changed row {cx_id} for dense slot {slot} has dim {dim}, expected query dim {query_dim}"
+                )));
+            }
+            Ok((*cx_id, cosine(query, data)))
+        })
+        .collect()
 }
 
 pub(super) fn validate_dense(slot: SlotId, cx_id: CxId, dim: u32, data: &[f32]) -> CliResult {

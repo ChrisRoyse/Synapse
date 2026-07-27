@@ -108,6 +108,12 @@ pub struct VersionedCfStore {
     rows: RwLock<RowTable>,
     router: RwLock<Option<CfRouter>>,
     router_latest_readback: AtomicBool,
+    /// Earliest sequence after which the in-memory MVCC version chains are a
+    /// complete changed-key journal. Latest-only recovery serves older
+    /// checkpoint rows from the router without their original per-row
+    /// sequence, so a delta query below this floor must fail closed and rebase
+    /// instead of silently omitting checkpointed changes (#1842).
+    changed_key_history_floor: Seq,
     router_eager_lookup_on_refresh: AtomicBool,
     read_barriers: RwLock<Vec<ReadBarrier>>,
     leases: LeaseRegistry,
@@ -126,6 +132,7 @@ impl VersionedCfStore {
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(None),
             router_latest_readback: AtomicBool::new(false),
+            changed_key_history_floor: 0,
             router_eager_lookup_on_refresh: AtomicBool::new(true),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
@@ -154,6 +161,7 @@ impl VersionedCfStore {
             rows: RwLock::new(BTreeMap::new()),
             router: RwLock::new(Some(router)),
             router_latest_readback: AtomicBool::new(router_latest_readback),
+            changed_key_history_floor: if router_latest_readback { start_seq } else { 0 },
             router_eager_lookup_on_refresh: AtomicBool::new(eager_lookup_on_refresh),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),

@@ -2,9 +2,9 @@
 //!
 //! A hit document read is fully determined by (vault, cx_id, pinned snapshot
 //! seq, hydrated slot selection): MVCC guarantees the same snapshot seq reads
-//! identical bytes. Every per-hit reader-lease pin and index freshness check
-//! still runs on the cached path — only the redundant page readback is
-//! skipped. Any vault advance produces a new pinned seq and therefore a
+//! identical bytes. Search pins one reader lease and proves index/delta
+//! freshness before consulting this cache; only the redundant page readback
+//! is skipped. Any vault advance produces a new pinned seq and therefore a
 //! fresh read, so no staleness can hide behind this cache.
 
 use std::collections::{BTreeMap, VecDeque};

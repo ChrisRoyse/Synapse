@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -132,6 +132,56 @@ pub(super) fn ensure_bounded_sidecar(
         )?;
     }
     Ok(())
+}
+
+pub(super) fn score_replacements(
+    slot: SlotId,
+    query: &SlotVector,
+    replacements: &BTreeMap<CxId, SlotVector>,
+    candidates: Option<&BTreeSet<CxId>>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    let SlotVector::Multi {
+        token_dim,
+        tokens: query_tokens,
+    } = query
+    else {
+        return Err(stale(format!(
+            "multi delta reconciliation for slot {slot} received non-multi query"
+        )));
+    };
+    query.validate_schema().map_err(|error| {
+        stale(format!(
+            "multi delta query for slot {slot} is invalid: {}",
+            error.message
+        ))
+    })?;
+    replacements
+        .iter()
+        .filter(|(cx_id, _)| candidates.is_none_or(|allowed| allowed.contains(cx_id)))
+        .map(|(cx_id, vector)| {
+            let SlotVector::Multi {
+                token_dim: row_dim,
+                tokens,
+            } = vector
+            else {
+                return Err(stale(format!(
+                    "changed row {cx_id} for multi slot {slot} has a non-multi vector"
+                )));
+            };
+            vector.validate_schema().map_err(|error| {
+                stale(format!(
+                    "changed row {cx_id} for multi slot {slot} is invalid: {}",
+                    error.message
+                ))
+            })?;
+            if row_dim != token_dim {
+                return Err(stale(format!(
+                    "changed row {cx_id} for multi slot {slot} has token_dim {row_dim}, expected {token_dim}"
+                )));
+            }
+            Ok((*cx_id, MaxSimIndex::maxsim(query_tokens, tokens)))
+        })
+        .collect()
 }
 
 fn segments_manifest_file(

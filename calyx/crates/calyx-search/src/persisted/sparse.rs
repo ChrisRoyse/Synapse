@@ -144,6 +144,223 @@ pub(super) fn search(
     Ok(ranked(top_k(score(&index, entries, candidates)?, k)))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn search_reconciled(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    manifest_base_seq: u64,
+    slot: SlotId,
+    query: &SlotVector,
+    k: usize,
+    candidates: Option<&BTreeSet<CxId>>,
+    changed: &BTreeSet<CxId>,
+    replacements: &BTreeMap<CxId, SlotVector>,
+) -> CliResult<Vec<IndexSearchHit>> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let SlotVector::Sparse {
+        dim: query_dim,
+        entries: query_entries,
+    } = query
+    else {
+        return Err(stale(format!(
+            "sparse delta reconciliation for slot {slot} received non-sparse query"
+        )));
+    };
+    query.validate_schema().map_err(|error| {
+        stale(format!(
+            "sparse delta query for slot {slot} is invalid: {}",
+            error.message
+        ))
+    })?;
+    let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
+    if index.dim != *query_dim {
+        return Err(stale(format!(
+            "persistent sparse slot {slot} index dim {} != delta query dim {query_dim}",
+            index.dim
+        )));
+    }
+    validate_sparse_weights(query_entries, index.scoring, "delta query")?;
+    let replacement_rows = sparse_replacement_rows(slot, *query_dim, index.scoring, replacements)?;
+    let scored = match index.scoring {
+        SparseScoring::DotProduct => score_dot_reconciled(
+            &index,
+            query_entries,
+            candidates,
+            changed,
+            &replacement_rows,
+        )?,
+        SparseScoring::Bm25 => score_bm25_reconciled(
+            &index,
+            query_entries,
+            candidates,
+            changed,
+            &replacement_rows,
+        )?,
+    };
+    Ok(ranked(top_k(scored, k)))
+}
+
+fn sparse_replacement_rows(
+    slot: SlotId,
+    expected_dim: u32,
+    scoring: SparseScoring,
+    replacements: &BTreeMap<CxId, SlotVector>,
+) -> CliResult<BTreeMap<CxId, SparseRow>> {
+    replacements
+        .iter()
+        .map(|(cx_id, vector)| {
+            let SlotVector::Sparse { dim, entries } = vector else {
+                return Err(stale(format!(
+                    "changed row {cx_id} for sparse slot {slot} has a non-sparse vector"
+                )));
+            };
+            if *dim != expected_dim {
+                return Err(stale(format!(
+                    "changed row {cx_id} for sparse slot {slot} has dim {dim}, expected {expected_dim}"
+                )));
+            }
+            vector.validate_schema().map_err(|error| {
+                stale(format!(
+                    "changed row {cx_id} for sparse slot {slot} is invalid: {}",
+                    error.message
+                ))
+            })?;
+            let doc_len = validate_sparse_weights(entries, scoring, &format!("delta row {cx_id}"))?;
+            Ok((
+                *cx_id,
+                SparseRow {
+                    cx_id: *cx_id,
+                    doc_len,
+                    entries: entries.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn score_dot_reconciled(
+    index: &SparseIndex,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+    changed: &BTreeSet<CxId>,
+    replacements: &BTreeMap<CxId, SparseRow>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    let mut scores = score_dot_product(index, query, candidates)?
+        .into_iter()
+        .filter(|(cx_id, _)| !changed.contains(cx_id))
+        .collect::<BTreeMap<_, _>>();
+    for row in replacements.values() {
+        if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
+            continue;
+        }
+        let mut score = 0.0_f32;
+        for query_entry in query {
+            if let Some(entry) = row
+                .entries
+                .iter()
+                .find(|entry| entry.idx == query_entry.idx)
+            {
+                score += entry.val * query_entry.val;
+            }
+        }
+        if !score.is_finite() {
+            return Err(stale(format!(
+                "reconciled sparse dot-product score overflowed for {}",
+                row.cx_id
+            )));
+        }
+        if score != 0.0 {
+            scores.insert(row.cx_id, score);
+        }
+    }
+    Ok(scores.into_iter().collect())
+}
+
+fn score_bm25_reconciled(
+    index: &SparseIndex,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+    changed: &BTreeSet<CxId>,
+    replacements: &BTreeMap<CxId, SparseRow>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    let removed = index
+        .rows
+        .iter()
+        .filter(|row| changed.contains(&row.cx_id))
+        .collect::<Vec<_>>();
+    let total_docs = index
+        .rows
+        .len()
+        .saturating_sub(removed.len())
+        .saturating_add(replacements.len());
+    let old_total = index.doc_lengths.values().copied().sum::<f32>();
+    let removed_total = removed.iter().map(|row| row.doc_len).sum::<f32>();
+    let replacement_total = replacements.values().map(|row| row.doc_len).sum::<f32>();
+    let current_total = old_total - removed_total + replacement_total;
+    if !current_total.is_finite() || current_total < 0.0 {
+        return Err(stale(
+            "reconciled sparse BM25 corpus length is invalid; rebuild the search generation",
+        ));
+    }
+    let avg_doc_len = if total_docs == 0 {
+        0.0
+    } else {
+        current_total / total_docs as f32
+    };
+    let scorer = Bm25::default();
+    let mut scores = BTreeMap::<CxId, f32>::new();
+    for query_entry in query {
+        let old_postings = index.postings.get(&query_entry.idx);
+        let removed_df = removed
+            .iter()
+            .filter(|row| row.entries.iter().any(|entry| entry.idx == query_entry.idx))
+            .count();
+        let replacement_df = replacements
+            .values()
+            .filter(|row| row.entries.iter().any(|entry| entry.idx == query_entry.idx))
+            .count();
+        let df = old_postings
+            .map_or(0, Vec::len)
+            .saturating_sub(removed_df)
+            .saturating_add(replacement_df);
+        if let Some(postings) = old_postings {
+            for posting in postings {
+                if changed.contains(&posting.cx_id)
+                    || candidates.is_some_and(|allowed| !allowed.contains(&posting.cx_id))
+                {
+                    continue;
+                }
+                let len = *index.doc_lengths.get(&posting.cx_id).unwrap_or(&1.0);
+                *scores.entry(posting.cx_id).or_default() +=
+                    scorer.score_term(posting.tf, len, avg_doc_len, total_docs, df)
+                        * query_entry.val;
+            }
+        }
+        for row in replacements.values() {
+            if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
+                continue;
+            }
+            if let Some(entry) = row
+                .entries
+                .iter()
+                .find(|entry| entry.idx == query_entry.idx)
+            {
+                *scores.entry(row.cx_id).or_default() +=
+                    scorer.score_term(entry.val, row.doc_len, avg_doc_len, total_docs, df)
+                        * query_entry.val;
+            }
+        }
+    }
+    if let Some((cx_id, _)) = scores.iter().find(|(_, score)| !score.is_finite()) {
+        return Err(stale(format!(
+            "reconciled sparse BM25 score overflowed for {cx_id}"
+        )));
+    }
+    Ok(scores.into_iter().collect())
+}
+
 type SparsePinCache = Mutex<BTreeMap<(String, u16), (String, Arc<SparseIndex>)>>;
 
 fn cache() -> &'static SparsePinCache {

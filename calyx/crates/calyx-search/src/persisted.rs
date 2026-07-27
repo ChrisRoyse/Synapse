@@ -252,6 +252,74 @@ impl PersistedSearchIndexes {
         }
     }
 
+    /// Searches the immutable generation while replacing every key changed
+    /// after its base sequence with that key's vector from one newer pinned
+    /// MVCC snapshot. Changed tombstones/absent vectors are represented only
+    /// in `changed` and therefore remove their stale indexed form (#1842).
+    pub(crate) fn search_reconciled(
+        &self,
+        slot: SlotId,
+        query: &SlotVector,
+        k: usize,
+        candidates: Option<&BTreeSet<CxId>>,
+        changed: &BTreeSet<CxId>,
+        replacements: &BTreeMap<CxId, SlotVector>,
+    ) -> CliResult<Vec<IndexSearchHit>> {
+        if changed.is_empty() {
+            return match candidates {
+                Some(candidates) => self.search_filtered(slot, query, k, candidates),
+                None => self.search(slot, query, k),
+            };
+        }
+        let entry = self.require_entry(slot)?;
+        if matches!(query, SlotVector::Sparse { .. }) {
+            return sparse::search_reconciled(
+                &self.vault_dir,
+                entry,
+                self.manifest.base_seq,
+                slot,
+                query,
+                k,
+                candidates,
+                changed,
+                replacements,
+            );
+        }
+        let fetch_k = k.saturating_add(changed.len()).min(entry.len);
+        let indexed = match candidates {
+            Some(candidates) => self.search_filtered(slot, query, fetch_k, candidates)?,
+            None => self.search(slot, query, fetch_k)?,
+        };
+        let mut scored = indexed
+            .into_iter()
+            .filter(|hit| !changed.contains(&hit.cx_id))
+            .map(|hit| (hit.cx_id, hit.score))
+            .collect::<Vec<_>>();
+        let replacement_scores = match query {
+            SlotVector::Dense { .. } => {
+                dense::score_replacements(slot, query, replacements, candidates)?
+            }
+            SlotVector::Multi { .. } => {
+                multi::score_replacements(slot, query, replacements, candidates)?
+            }
+            SlotVector::Sparse { .. } => unreachable!("sparse returned above"),
+            SlotVector::Absent { .. } => {
+                return Err(stale(format!(
+                    "delta-reconciled search slot {slot} received an absent query vector"
+                )));
+            }
+        };
+        scored.extend(replacement_scores);
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
+        });
+        scored.truncate(k);
+        Ok(calyx_sextant::index::ranked(scored))
+    }
+
     pub fn filter_candidates(&self, filters: &QueryFilters) -> CliResult<Option<BTreeSet<CxId>>> {
         filter::candidates(
             &self.vault_dir,
@@ -259,6 +327,25 @@ impl PersistedSearchIndexes {
             self.manifest.base_seq,
             filters,
         )
+    }
+
+    pub(crate) fn filter_candidates_reconciled(
+        &self,
+        filters: &QueryFilters,
+        changed: &BTreeSet<CxId>,
+        replacements: &BTreeMap<CxId, Constellation>,
+    ) -> CliResult<Option<BTreeSet<CxId>>> {
+        let Some(mut candidates) = self.filter_candidates(filters)? else {
+            return Ok(None);
+        };
+        candidates.retain(|cx_id| !changed.contains(cx_id));
+        candidates.extend(
+            replacements
+                .values()
+                .filter(|cx| filter::constellation_matches(cx, filters))
+                .map(|cx| cx.cx_id),
+        );
+        Ok(Some(candidates))
     }
 
     pub fn max_len(&self) -> usize {

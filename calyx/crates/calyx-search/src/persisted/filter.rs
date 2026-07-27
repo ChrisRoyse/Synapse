@@ -84,6 +84,10 @@ pub(super) fn candidates(
     ))
 }
 
+pub(super) fn constellation_matches(cx: &Constellation, filters: &QueryFilters) -> bool {
+    FilterRow::from(cx).matches(filters)
+}
+
 fn read(
     vault_dir: &Path,
     entry: &FilterIndexEntry,

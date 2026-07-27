@@ -216,6 +216,56 @@ impl VersionedCfStore {
         Ok(rows.into_iter().collect())
     }
 
+    /// Returns keys with at least one committed version in
+    /// `(after_exclusive, snapshot.seq()]`, including keys whose latest
+    /// visible value is a tombstone.
+    ///
+    /// This is the exact MVCC delta surface used to reconcile an immutable
+    /// persisted search generation with a newer pinned snapshot (#1842). A
+    /// latest-only recovered router does not retain original per-row sequence
+    /// numbers below `changed_key_history_floor`, so such a
+    /// request fails closed and names the required rebase boundary.
+    pub fn changed_keys_after_at(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        after_exclusive: Seq,
+        clock: &dyn Clock,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.ensure_snapshot_live(snapshot, clock)?;
+        if after_exclusive > snapshot.seq() {
+            return Err(CalyxError::stale_derived(format!(
+                "changed-key lower bound {after_exclusive} exceeds pinned snapshot seq {} for {}; refusing an inverted MVCC delta",
+                snapshot.seq(),
+                cf.name()
+            )));
+        }
+        if after_exclusive < self.changed_key_history_floor {
+            return Err(CalyxError::stale_derived(format!(
+                "changed-key history for {} begins at recovered seq {}, but the requested delta starts after seq {after_exclusive}; rebuild the persisted search generation at or beyond the recovery floor before querying",
+                cf.name(),
+                self.changed_key_history_floor
+            )));
+        }
+        let table = self.rows.read().expect("mvcc row table poisoned");
+        let keys = table
+            .get(&cf)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter(|(_, versions)| {
+                versions
+                    .iter()
+                    .any(|version| version.seq > after_exclusive && version.seq <= snapshot.seq())
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        drop(table);
+        for key in &keys {
+            self.ensure_unbarriered(cf, key)?;
+        }
+        Ok(keys)
+    }
+
     /// Scans visible rows for one CF and key range at the pinned sequence.
     pub fn scan_cf_range_at(
         &self,

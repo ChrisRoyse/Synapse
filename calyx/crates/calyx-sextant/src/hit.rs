@@ -21,6 +21,10 @@ pub struct FreshnessTag {
     pub base_seq: u64,
     pub stale_by: u64,
     pub policy: String,
+    /// Immutable generation sequence when a bounded MVCC delta produced the
+    /// logical `built_at_seq` view. Absent for an exact immutable generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_from_seq: Option<u64>,
 }
 
 impl FreshnessTag {
@@ -30,6 +34,17 @@ impl FreshnessTag {
             base_seq: seq,
             stale_by: 0,
             policy: "fresh_derived".to_string(),
+            reconciled_from_seq: None,
+        }
+    }
+
+    pub fn fresh_reconciled(generation_seq: u64, pinned_seq: u64) -> Self {
+        Self {
+            built_at_seq: pinned_seq,
+            base_seq: pinned_seq,
+            stale_by: 0,
+            policy: "fresh_reconciled".to_string(),
+            reconciled_from_seq: Some(generation_seq),
         }
     }
 
@@ -39,6 +54,7 @@ impl FreshnessTag {
             base_seq,
             stale_by: base_seq.saturating_sub(built_at_seq),
             policy: "stale_ok".to_string(),
+            reconciled_from_seq: None,
         }
     }
 }

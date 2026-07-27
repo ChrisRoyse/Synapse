@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use calyx_aster::vault::AsterVault;
-use calyx_core::{CalyxError, Clock, Panel, SlotId, SlotVector, VaultStore};
+use calyx_core::{CalyxError, Clock, Panel, SlotId, SlotVector};
 use calyx_sextant::FusionContext;
 use calyx_sextant::{apply_in_region_guard_to_hits, fusion};
 
@@ -14,13 +14,15 @@ use crate::error::CliResult;
 use crate::persisted::PersistedSearchIndexes;
 use crate::provenance::attach_verified_provenance;
 
+use super::delta::{SearchDelta, search_slots_reconciled};
 use super::guard::{
     ResolvedGuard, apply_in_region_guard_traced, prefilter_in_region_candidates_traced,
     resolve_guard,
 };
 use super::hydration::hydrate_hit_docs_with_bounded_readbacks;
 use super::support::{
-    SearchReadSnapshot, is_stale_derived, renumber_and_truncate, vault_base_count_at,
+    SearchReadSnapshot, index_freshness_tag, is_stale_derived, renumber_and_truncate,
+    vault_base_count_at,
 };
 use super::{FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchOutcome};
 
@@ -77,15 +79,8 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         Err(error) => return Err(error),
     };
     let generation = indexes.generation()?;
-    trace.emit(
-        "indexes.open.done",
-        None,
-        Some(indexes.max_len_for_slots(allowed_slots)),
-    );
-    if indexes.max_len_for_slots(allowed_slots) == 0 {
-        trace.emit("indexes.empty", None, None);
-        return Ok(SearchOutcome::empty_with_generation(generation));
-    }
+    let indexed_max_len = indexes.max_len_for_slots(allowed_slots);
+    trace.emit("indexes.open.done", None, Some(indexed_max_len));
     trace.emit("indexes.ensure_bounded.start", None, None);
     indexes.ensure_search_bounded_for_slots(allowed_slots)?;
     trace.emit("indexes.ensure_bounded.done", None, None);
@@ -93,8 +88,43 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         trace.emit("query_vectors.empty", None, None);
         return Err(no_indexable_query_vectors().into());
     }
+    trace.emit("snapshot.pin.start", None, None);
+    let read = SearchReadSnapshot::pin(vault, panel.version)?;
+    trace.emit_detail(
+        "snapshot.pin.done",
+        None,
+        Some(read.seq() as usize),
+        Some(format!(
+            "lease_id={} max_age_ms={} expires_at={} panel_content_seq={}",
+            read.lease_id(),
+            read.lease_max_age_ms(),
+            read.lease_expires_at(),
+            read.derived_content_seq()
+        )),
+    );
+    let query_slots = query_vectors
+        .iter()
+        .map(|(slot, _)| *slot)
+        .collect::<BTreeSet<_>>();
+    let delta = if freshness == SearchFreshness::Fresh {
+        SearchDelta::collect(vault, &indexes, &read, &query_slots, trace)?
+    } else {
+        SearchDelta::empty()
+    };
+    let freshness_tag = index_freshness_tag(
+        &indexes,
+        read.seq(),
+        read.derived_content_seq(),
+        freshness,
+        delta.covered_to_seq(),
+    )?;
+    if indexed_max_len == 0 && delta.is_empty() {
+        trace.emit("indexes.empty", None, None);
+        return Ok(SearchOutcome::empty_with_generation(generation));
+    }
     trace.emit("filter_candidates.start", None, None);
-    let filter_candidates = indexes.filter_candidates(&filters)?;
+    let filter_candidates =
+        indexes.filter_candidates_reconciled(&filters, delta.changed(), delta.docs())?;
     trace.emit(
         "filter_candidates.done",
         None,
@@ -115,18 +145,29 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         Some(format!("search_k={search_k}")),
     );
     budget.check("before_search_slots", query_vectors.len())?;
-    let per_slot = search_slots_with_cache(
-        &indexes,
-        vault_dir,
-        query_vectors,
-        search_k,
-        guard,
-        freshness,
-        allowed_slots,
-        filter_candidates.as_ref(),
-        slot_cache,
-        trace,
-    )?;
+    let per_slot = if delta.is_empty() {
+        search_slots_with_cache(
+            &indexes,
+            vault_dir,
+            query_vectors,
+            search_k,
+            guard,
+            freshness,
+            allowed_slots,
+            filter_candidates.as_ref(),
+            slot_cache,
+            trace,
+        )?
+    } else {
+        search_slots_reconciled(
+            &indexes,
+            query_vectors,
+            search_k,
+            filter_candidates.as_ref(),
+            &delta,
+            trace,
+        )?
+    };
     let searched_hits = per_slot.values().map(Vec::len).sum();
     budget.check("after_search_slots", searched_hits)?;
     trace.emit("search_slots.done", None, Some(per_slot.len()));
@@ -151,7 +192,7 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         Some(format!("{strategy:?}")),
     );
     let mut hits = fusion::fuse(&per_slot, &context, &|cx_id| {
-        let cx = vault.get(cx_id, generation.base_seq)?;
+        let cx = vault.get_base_at_snapshot(cx_id, read.snapshot())?;
         if cx.panel_version != panel.version {
             return Err(CalyxError::stale_derived(format!(
                 "search generation panel {} produced hit {cx_id} from panel {}",
@@ -193,10 +234,10 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
     let (hit_docs, freshness_tag) = hydrate_hit_docs_with_bounded_readbacks(
         vault,
         vault_dir,
-        &indexes,
         &hits,
-        freshness,
         hydrate_hit_slots,
+        &read,
+        freshness_tag,
         trace,
         &mut budget,
     )?;

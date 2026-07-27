@@ -15,10 +15,22 @@ pub(super) fn index_freshness_tag(
     pinned_seq: u64,
     derived_content_seq: u64,
     freshness: SearchFreshness,
+    reconciled_to_seq: Option<u64>,
 ) -> CliResult<FreshnessTag> {
     match freshness {
         SearchFreshness::Fresh => {
-            indexes.ensure_fresh_at_snapshot(pinned_seq, derived_content_seq)?;
+            if derived_content_seq > pinned_seq || indexes.base_seq() > pinned_seq {
+                indexes.ensure_fresh_at_snapshot(pinned_seq, derived_content_seq)?;
+            }
+            if derived_content_seq > indexes.base_seq() {
+                if reconciled_to_seq != Some(pinned_seq) {
+                    indexes.ensure_fresh_at_snapshot(pinned_seq, derived_content_seq)?;
+                }
+                return Ok(FreshnessTag::fresh_reconciled(
+                    indexes.base_seq(),
+                    pinned_seq,
+                ));
+            }
             Ok(FreshnessTag::fresh(pinned_seq))
         }
         SearchFreshness::StaleOk => {

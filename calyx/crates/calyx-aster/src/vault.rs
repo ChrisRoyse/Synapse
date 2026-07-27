@@ -920,6 +920,19 @@ where
         self.rows.scan_cf_at(snapshot, cf, &self.clock)
     }
 
+    /// Returns every key changed after `after_exclusive` and no later than the
+    /// pinned snapshot, including tombstoned keys. The MVCC layer fails closed
+    /// when latest-only recovery cannot prove complete history for the range.
+    pub fn changed_cf_keys_after_snapshot(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        after_exclusive: Seq,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.rows
+            .changed_keys_after_at(snapshot, cf, after_exclusive, &self.clock)
+    }
+
     /// Scans visible raw CF rows from one atomic latest committed view.
     pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.rows.scan_cf_latest(cf)

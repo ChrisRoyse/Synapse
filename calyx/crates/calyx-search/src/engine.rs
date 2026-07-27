@@ -20,6 +20,7 @@ use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
 
 mod budget;
+mod delta;
 mod guard;
 mod hydration;
 mod hydration_cache;
@@ -73,9 +74,11 @@ pub fn search_outcome<C: Clock>(
     )
 }
 
-/// Run search with an explicit freshness policy. `Fresh` refuses stale derived
-/// indexes; `StaleOk` permits lag only while tagging every hit with the index
-/// build seq and current Base snapshot seq.
+/// Run search with an explicit freshness policy. `Fresh` serves one pinned
+/// snapshot by reconciling a complete bounded MVCC delta onto the immutable
+/// generation, and fails closed when that proof is unavailable. `StaleOk`
+/// permits lag only while tagging every hit with the index build seq and
+/// current Base snapshot seq.
 #[allow(clippy::too_many_arguments)]
 pub fn search_outcome_with_freshness<C: Clock>(
     vault: &AsterVault<C>,
