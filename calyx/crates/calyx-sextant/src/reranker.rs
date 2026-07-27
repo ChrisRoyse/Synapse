@@ -225,7 +225,7 @@ impl RerankerClient {
         let http = Zeroizing::new(format!(
             "POST /rerank HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len(),
-            body = &*body
+            body = *body
         ));
         stream.write_all(http.as_bytes()).map_err(|error| {
             sextant_error(

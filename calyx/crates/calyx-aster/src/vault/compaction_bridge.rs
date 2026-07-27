@@ -531,16 +531,54 @@ where
     /// the compaction boundary; newer commits remain WAL-authoritative and win
     /// by sequence while this older prefix is rewritten (issues #1806/#1832).
     pub fn purge_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
-        self.drain_checkpoints_paced("tombstone purge preflight")?;
         let mut unique = Vec::new();
         for cf in cfs {
             if !unique.contains(cf) {
                 unique.push(*cf);
             }
         }
+        if unique.is_empty() {
+            return Ok(());
+        }
+        self.drain_checkpoints_paced("tombstone purge preflight")?;
+        let (router_flush_watermark, router_flush_summaries) =
+            self.with_durable_commit_lock(|| {
+                self.ensure_writeable("freeze tombstone purge router prefix")?;
+                self.rows.flush_cfs_at_current_seq(&unique)
+            })?;
+        let router_flush_files = router_flush_summaries.len();
+        let router_flush_rows = router_flush_summaries
+            .iter()
+            .map(|summary| summary.entries)
+            .sum::<usize>();
+        let router_flush_bytes = router_flush_summaries
+            .iter()
+            .map(|summary| summary.bytes)
+            .sum::<u64>();
+        let minimum_durable_seq = if router_flush_files == 0 {
+            0
+        } else {
+            router_flush_watermark
+        };
+        tracing::info!(
+            code = "CALYX_ASTER_TOMBSTONE_PURGE_ROUTER_PREFIX_FLUSHED",
+            cfs = %unique.iter().map(|cf| cf.name()).collect::<Vec<_>>().join(","),
+            router_flush_watermark,
+            router_flush_files,
+            router_flush_rows,
+            router_flush_bytes,
+            "froze the affected router memtables before durable tombstone compaction"
+        );
+        if router_flush_files > 0 {
+            // Commits may advance after the short router flush boundary. A
+            // second paced drain makes at least the frozen watermark durable;
+            // newer mutable rows remain outside this compaction prefix and win
+            // by their later sequence.
+            self.drain_checkpoints_paced("tombstone purge router-prefix coverage")?;
+        }
         self.with_native_compaction_guard(|| {
             for cf in unique {
-                self.purge_tombstoned_cf_snapshot(cf)?;
+                self.purge_tombstoned_cf_snapshot(cf, minimum_durable_seq)?;
             }
             Ok(())
         })
@@ -548,13 +586,27 @@ where
 
     /// Captures one manifest-covered CF view under a short commit-lock read and
     /// runs all physical tombstone-purge work after releasing that lock.
-    fn purge_tombstoned_cf_snapshot(&self, cf: ColumnFamily) -> Result<()> {
+    fn purge_tombstoned_cf_snapshot(
+        &self,
+        cf: ColumnFamily,
+        minimum_durable_seq: u64,
+    ) -> Result<()> {
         let Some(durable) = &self.durable else {
             return Ok(());
         };
         let commit_lock_started = std::time::Instant::now();
         let durable_seq =
             self.with_durable_commit_lock(|| self.published_compaction_snapshot_seq(durable))?;
+        if durable_seq < minimum_durable_seq {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_TOMBSTONE_PURGE_ROUTER_PREFIX_NOT_DURABLE",
+                message: format!(
+                    "tombstone purge for {} froze router rows through commit {minimum_durable_seq}, but the published durable manifest only covers {durable_seq}",
+                    cf.name()
+                ),
+                remediation: "inspect the paced checkpoint publication events and retry only after the manifest covers the reported router flush watermark",
+            });
+        }
         let commit_lock_hold_us = commit_lock_started.elapsed().as_micros();
         let catalog_started = std::time::Instant::now();
         let catalog = catalog_from_vault_tiers_through_seq(
@@ -634,7 +686,28 @@ where
             return Ok(());
         };
         self.checkpoint_locked()?;
+        let (router_flush_watermark, router_flush_summaries) =
+            self.rows.flush_cfs_at_current_seq(cfs)?;
         let durable_seq = self.verified_durable_coverage_seq(durable)?;
+        if !router_flush_summaries.is_empty() && durable_seq < router_flush_watermark {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_TOMBSTONE_PURGE_ROUTER_PREFIX_NOT_DURABLE",
+                message: format!(
+                    "locked tombstone purge froze router rows through commit {router_flush_watermark}, but the published durable manifest only covers {durable_seq}"
+                ),
+                remediation: "preserve the vault and inspect locked checkpoint publication; physical tombstone reclaim cannot begin before the manifest covers the router prefix",
+            });
+        }
+        tracing::info!(
+            code = "CALYX_ASTER_TOMBSTONE_PURGE_ROUTER_PREFIX_FLUSHED",
+            cfs = %cfs.iter().map(|cf| cf.name()).collect::<Vec<_>>().join(","),
+            router_flush_watermark,
+            router_flush_files = router_flush_summaries.len(),
+            router_flush_rows = router_flush_summaries.iter().map(|summary| summary.entries).sum::<usize>(),
+            router_flush_bytes = router_flush_summaries.iter().map(|summary| summary.bytes).sum::<u64>(),
+            locked = true,
+            "froze the affected router memtables before locked durable tombstone compaction"
+        );
         let catalog = catalog_from_vault_tiers_through_seq(
             durable.root(),
             durable.tiering_policy(),

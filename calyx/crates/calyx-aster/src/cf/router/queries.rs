@@ -244,6 +244,28 @@ impl CfRouter {
             .iter()
             .filter_map(|(cf, table)| (!table.is_empty()).then_some(*cf))
             .collect::<Vec<_>>();
+        self.flush_pending_cfs_at(&cfs, commit_watermark)
+    }
+
+    /// Flushes only the selected non-empty memtables at `commit_watermark`.
+    ///
+    /// Tombstone purges use this to freeze the exact router prefix that their
+    /// complete durable compaction must cover. Leaving those rows mutable lets
+    /// the durable compaction remove a tombstone while a later process-close
+    /// flush writes the same tombstone back as a router-only row.
+    pub(crate) fn flush_pending_cfs_at(
+        &mut self,
+        cfs: &[ColumnFamily],
+        commit_watermark: u64,
+    ) -> Result<Vec<SstSummary>> {
+        let mut cfs = cfs.to_vec();
+        cfs.sort();
+        cfs.dedup();
+        cfs.retain(|cf| {
+            self.memtables
+                .get(cf)
+                .is_some_and(|table| !table.is_empty())
+        });
         let mut summaries = Vec::with_capacity(cfs.len());
         for cf in cfs {
             summaries.push(self.flush_cf_at(cf, commit_watermark)?);

@@ -1023,6 +1023,27 @@ impl VersionedCfStore {
         router.flush_pending_at(commit_watermark)
     }
 
+    /// Freezes the selected router memtables at the current commit watermark.
+    ///
+    /// The caller must serialize this with durable commit publication. The
+    /// returned watermark is the minimum manifest sequence that a subsequent
+    /// physical compaction must prove before reclaiming the flushed prefix.
+    pub(crate) fn flush_cfs_at_current_seq(
+        &self,
+        cfs: &[ColumnFamily],
+    ) -> Result<(Seq, Vec<SstSummary>)> {
+        let mut router = self.router.write().expect("mvcc router poisoned");
+        let Some(router) = router.as_mut() else {
+            return Ok((self.current_seq(), Vec::new()));
+        };
+        // Keep this read under the router lock for the same reason as
+        // `flush_all_cfs`: a commit cannot publish its sequence until every
+        // row has entered this router.
+        let commit_watermark = self.current_seq();
+        let summaries = router.flush_pending_cfs_at(cfs, commit_watermark)?;
+        Ok((commit_watermark, summaries))
+    }
+
     pub fn install_read_barrier(&self, barrier: ReadBarrier) {
         let mut barriers = self
             .read_barriers
