@@ -1,5 +1,5 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-27-maintenance-tab-ownership-v1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-27-reboot-stable-path-v1";
 const BRIDGE_DECLARED_BUILD_SHA256 = "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
@@ -83,6 +83,8 @@ const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
 const ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED =
   "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED";
+const ERROR_RECONNECT_WAKE_ALARM_INVALID =
+  "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID";
 const ERROR_CHROME_SCRIPTING_EXECUTE_FAILED = "CHROME_SCRIPTING_EXECUTE_FAILED";
 const ERROR_CHROME_DOM_SELECTOR_INVALID = "CHROME_DOM_SELECTOR_INVALID";
 const ERROR_CHROME_DOM_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
@@ -104,6 +106,7 @@ const DISCONNECTED_KEEPALIVE_MS = 20000;
 const RECONNECT_WAKE_ALARM_NAME = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_DELAY_MINUTES = 0.5;
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES = 0.5;
+const RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS = true;
 const MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY = "synapseMaintenanceReconnectPause";
 const WEBSOCKET_CLOSE_CODE_RECONNECT_CLEANUP = 3001;
 const WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS = 0;
@@ -256,6 +259,16 @@ let maintenanceReconnectPausedDaemonInstanceId = "";
 let maintenanceReconnectPauseLoaded = false;
 let maintenanceReconnectPauseLoadInFlight = null;
 let maintenanceReconnectResumeProbeInFlight = null;
+let reconnectWakeAlarmState = {
+  status: "not_checked",
+  reason: "not_checked",
+  name: RECONNECT_WAKE_ALARM_NAME,
+  period_minutes: null,
+  persist_across_sessions: null,
+  scheduled_time: null,
+  checked_at_unix_ms: 0,
+  error: null
+};
 const agentNavigationClaims = new Map();
 const recentNavigationKeys = [];
 const pageEventBuffers = new Map();
@@ -488,7 +501,7 @@ async function loadMaintenanceReconnectPause(reason) {
       maintenanceReconnectResumeProbeAfterMs = stored.resumeProbeAfterMs;
       maintenanceReconnectPausedDaemonPid = stored.pausedDaemonPid;
       maintenanceReconnectPausedDaemonInstanceId = stored.pausedDaemonInstanceId;
-      ensureReconnectWakeAlarm();
+      await requireReconnectWakeAlarm(`maintenance-pause-restore:${reason}`);
       console.warn(
         `Synapse daemon bridge restored persisted maintenance pause: ` +
           `remaining_ms=${stored.pauseUntilMs - now} reason=${stored.reason} ` +
@@ -518,19 +531,34 @@ async function startBridge() {
     );
     return;
   }
-  ensureReconnectWakeAlarm();
+  await requireReconnectWakeAlarm("startup");
   await loadMaintenanceReconnectPause("startup");
   await ensureExternalPopupRiskSuppression("startup");
   connectDaemon();
 }
 
 function startBridgeFromEvent() {
-  startBridge().catch((error) => {
-    console.error(`Synapse daemon bridge startup failed: ${errorMessage(error)}`);
-    if (!permanentlyDisabled) {
-      connectDaemon();
-    }
-  });
+  startBridge()
+    .then(async () => {
+      // The top-level bootstrap can register before runtime.onStartup is
+      // delivered. If a host already exists, publish the identity again so the
+      // daemon's durable health snapshot contains the lifecycle event and the
+      // separately read reconnect-alarm state from this exact browser startup.
+      if (hostId && bridgeToken) {
+        await postDaemonMessage({
+          type: "hello",
+          transport: "direct_http",
+          userAgent: navigator.userAgent,
+          ...bridgeIdentity()
+        });
+      }
+    })
+    .catch((error) => {
+      disableBridgePermanently(
+        `startup prerequisite failed: ${errorMessage(error)}`,
+        error?.code || ERROR_DAEMON_UNAVAILABLE
+      );
+    });
 }
 
 function connectDaemon() {
@@ -554,7 +582,12 @@ function connectDaemon() {
   }
   const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
   if (pauseRemainingMs > 0) {
-    ensureReconnectWakeAlarm();
+    void requireReconnectWakeAlarm("connectDaemon:maintenance-pause").catch((error) => {
+      disableBridgePermanently(
+        `reconnect alarm verification failed before maintenance reconnect pause: ${errorMessage(error)}`,
+        error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
+      );
+    });
     console.warn(
       `Synapse daemon bridge reconnect paused for maintenance: ` +
         `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason}`
@@ -654,7 +687,12 @@ function scheduleReconnect(detail, code) {
   if (pauseRemainingMs > 0) {
     clearReconnectTimer();
     stopDisconnectedKeepAlive();
-    ensureReconnectWakeAlarm();
+    void requireReconnectWakeAlarm("scheduleReconnect:maintenance-pause").catch((error) => {
+      disableBridgePermanently(
+        `reconnect alarm verification failed while maintenance-paused: ${errorMessage(error)}`,
+        error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
+      );
+    });
     console.warn(
       `Synapse daemon bridge reconnect suppressed during maintenance: code=${code} ` +
         `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
@@ -692,7 +730,12 @@ function resetReconnectState() {
   reconnectAttempt = 0;
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
-  ensureReconnectWakeAlarm();
+  void requireReconnectWakeAlarm("resetReconnectState").catch((error) => {
+    disableBridgePermanently(
+      `reconnect alarm verification failed after connection: ${errorMessage(error)}`,
+      error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
+    );
+  });
 }
 
 function maintenanceReconnectPauseRemainingMs(now = Date.now()) {
@@ -720,7 +763,7 @@ async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
     (maintenanceReconnectPauseStoredAtMs || now) + MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS
   );
   if (now < probeAfterMs) {
-    ensureReconnectWakeAlarm();
+    await requireReconnectWakeAlarm("maintenance-resume-probe:not-due");
     console.warn(
       `Synapse daemon bridge maintenance pause alarm fired before resume probe window: ` +
         `remaining_ms=${pauseRemainingMs} probe_after_unix_ms=${probeAfterMs} ` +
@@ -739,7 +782,7 @@ async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
         forceRegisterToken: true
       });
     } catch (error) {
-      ensureReconnectWakeAlarm();
+      await requireReconnectWakeAlarm("maintenance-resume-probe:daemon-unavailable");
       console.warn(
         `Synapse daemon bridge maintenance resume probe failed: ` +
           `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
@@ -758,7 +801,7 @@ async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
       daemonPid <= 0 ||
       !daemonInstanceId
     ) {
-      ensureReconnectWakeAlarm();
+      await requireReconnectWakeAlarm("maintenance-resume-probe:invalid-response");
       console.warn(
         `Synapse daemon bridge maintenance resume probe returned invalid response: ` +
           `response=${JSON.stringify(probe)} reason=${maintenanceReconnectPauseReason}`
@@ -771,7 +814,7 @@ async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
     const sameInstance = pausedInstanceId && daemonInstanceId === pausedInstanceId;
     const samePidWithoutInstance = !pausedInstanceId && pausedPid && daemonPid === pausedPid;
     if (sameInstance || samePidWithoutInstance) {
-      ensureReconnectWakeAlarm();
+      await requireReconnectWakeAlarm("maintenance-resume-probe:same-daemon");
       console.warn(
         `Synapse daemon bridge maintenance resume probe still sees pausing daemon: ` +
           `daemon_pid=${daemonPid} daemon_instance_id=${daemonInstanceId} ` +
@@ -2206,7 +2249,12 @@ function stopWebSocketKeepAlive() {
 }
 
 function startDisconnectedKeepAlive() {
-  ensureReconnectWakeAlarm();
+  void requireReconnectWakeAlarm("startDisconnectedKeepAlive").catch((error) => {
+    disableBridgePermanently(
+      `reconnect alarm verification failed before disconnected keepalive: ${errorMessage(error)}`,
+      error?.code || ERROR_RECONNECT_WAKE_ALARM_INVALID
+    );
+  });
   if (disconnectedKeepAliveTimer) {
     return;
   }
@@ -2237,26 +2285,74 @@ function stopDisconnectedKeepAlive() {
   }
 }
 
-function ensureReconnectWakeAlarm() {
-  if (!chrome.alarms?.create) {
-    console.error(
-      "Synapse daemon bridge cannot register reconnect wake alarm; " +
-        "manifest must include required chrome.alarms permission"
-    );
-    return;
-  }
+async function requireReconnectWakeAlarm(reason) {
+  const checkedAtUnixMs = Date.now();
+  let created = false;
   try {
-    const created = chrome.alarms.create(RECONNECT_WAKE_ALARM_NAME, {
-      delayInMinutes: RECONNECT_WAKE_ALARM_DELAY_MINUTES,
-      periodInMinutes: RECONNECT_WAKE_ALARM_PERIOD_MINUTES
-    });
-    if (created && typeof created.catch === "function") {
-      created.catch((error) => {
-        console.warn(`Synapse reconnect wake alarm setup failed: ${errorMessage(error)}`);
-      });
+    if (!chrome.alarms?.create || !chrome.alarms?.get) {
+      throw new Error(
+        "chrome.alarms.create/get unavailable; manifest permission and Chrome 150+ are required"
+      );
     }
+    let alarm = await chrome.alarms.get(RECONNECT_WAKE_ALARM_NAME);
+    if (
+      !alarm ||
+      Number(alarm.periodInMinutes) !== RECONNECT_WAKE_ALARM_PERIOD_MINUTES ||
+      alarm.persistAcrossSessions !== RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS
+    ) {
+      await chrome.alarms.create(RECONNECT_WAKE_ALARM_NAME, {
+        delayInMinutes: RECONNECT_WAKE_ALARM_DELAY_MINUTES,
+        periodInMinutes: RECONNECT_WAKE_ALARM_PERIOD_MINUTES,
+        persistAcrossSessions: RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS
+      });
+      created = true;
+      alarm = await chrome.alarms.get(RECONNECT_WAKE_ALARM_NAME);
+    }
+    const scheduledTime = Number(alarm?.scheduledTime);
+    if (
+      alarm?.name !== RECONNECT_WAKE_ALARM_NAME ||
+      Number(alarm.periodInMinutes) !== RECONNECT_WAKE_ALARM_PERIOD_MINUTES ||
+      alarm.persistAcrossSessions !== RECONNECT_WAKE_ALARM_PERSIST_ACROSS_SESSIONS ||
+      !Number.isFinite(scheduledTime) ||
+      scheduledTime <= checkedAtUnixMs
+    ) {
+      throw new Error(
+        `alarm readback mismatch name=${String(alarm?.name || "<missing>")} ` +
+          `period_minutes=${String(alarm?.periodInMinutes ?? "<missing>")} ` +
+          `persist_across_sessions=${String(alarm?.persistAcrossSessions ?? "<missing>")} ` +
+          `scheduled_time=${String(alarm?.scheduledTime ?? "<missing>")}`
+      );
+    }
+    reconnectWakeAlarmState = {
+      status: "ok",
+      reason,
+      name: alarm.name,
+      period_minutes: alarm.periodInMinutes,
+      persist_across_sessions: alarm.persistAcrossSessions,
+      scheduled_time: scheduledTime,
+      checked_at_unix_ms: checkedAtUnixMs,
+      created,
+      error: null
+    };
+    return reconnectWakeAlarmState;
   } catch (error) {
-    console.warn(`Synapse reconnect wake alarm setup threw: ${errorMessage(error)}`);
+    reconnectWakeAlarmState = {
+      status: "error",
+      reason,
+      name: RECONNECT_WAKE_ALARM_NAME,
+      period_minutes: null,
+      persist_across_sessions: null,
+      scheduled_time: null,
+      checked_at_unix_ms: checkedAtUnixMs,
+      created,
+      error: errorMessage(error)
+    };
+    throw bridgeError(
+      ERROR_RECONNECT_WAKE_ALARM_INVALID,
+      `required persistent reconnect alarm failed readback: reason=${reason} ` +
+        `error=${errorMessage(error)} remediation=run Chrome 150+ with the alarms permission, ` +
+        "reload the constant active Synapse extension directory, and inspect the service-worker console"
+    );
   }
 }
 
@@ -2265,13 +2361,13 @@ function handleReconnectWakeAlarm(alarm) {
     return;
   }
   loadMaintenanceReconnectPause("reconnectWakeAlarm")
-    .then(() => {
+    .then(async () => {
       if (permanentlyDisabled) {
         return;
       }
       const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
       if (pauseRemainingMs > 0) {
-        ensureReconnectWakeAlarm();
+        await requireReconnectWakeAlarm("reconnectWakeAlarm:maintenance-pause");
         attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs).catch((error) => {
           console.warn(
             `Synapse daemon bridge maintenance resume probe threw: ` +
@@ -2364,7 +2460,7 @@ if (chrome.alarms?.onAlarm?.addListener) {
 // would sit idle after such a restart and never register a bridge host (host_count=0),
 // because connectDaemon() is only reachable from those two events and the reconnect
 // alarm. Kicking off startBridge() here runs on every worker instantiation and is
-// idempotent (ensureReconnectWakeAlarm + connectDaemon both guard against duplicates),
+// idempotent (requireReconnectWakeAlarm + connectDaemon both guard against duplicates),
 // so a reloaded worker reconnects immediately instead of waiting for an event.
 startBridgeFromEvent();
 if (chrome.management?.onEnabled?.addListener) {
@@ -2801,7 +2897,14 @@ function bridgeIdentity() {
     debuggerApiAvailable: runtimeDebuggerApiAvailable(),
     capabilities: [...COMMAND_CAPABILITIES],
     commandCapabilities: [...COMMAND_CAPABILITIES],
-    popupRiskSuppression: popupRiskSuppressionSnapshot()
+    popupRiskSuppression: popupRiskSuppressionSnapshot(),
+    startupReadback: {
+      worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+      lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
+      reconnect_alarm: { ...reconnectWakeAlarmState },
+      minimum_chrome_version: chrome.runtime.getManifest().minimum_chrome_version || null,
+      captured_at_unix_ms: Date.now()
+    }
   };
 }
 
@@ -14060,7 +14163,7 @@ async function handleMaintenancePauseReconnect(params = {}) {
   const websocketClose = requestWebSocketCloseAfterResponse(
     "synapse maintenance reconnect pause"
   );
-  ensureReconnectWakeAlarm();
+  await requireReconnectWakeAlarm("maintenancePauseReconnect");
   console.warn(
     `Synapse daemon bridge reconnect paused for maintenance: ` +
       `pause_ms=${pauseMs} pause_until_unix_ms=${maintenanceReconnectPauseUntilMs} ` +

@@ -36,7 +36,10 @@ It does not require `nativeMessaging`. Element-scoped evaluation and deeper CDP
 work still require raw CDP from a dedicated
 Synapse-launched automation profile started with `--silent-debugger-extension-api`,
 or fail closed before touching the normal browser. It requires `chrome.alarms` so Chrome can wake the MV3 service worker
-after the daemon restarts or the worker is suspended, and
+after the daemon restarts, the worker is suspended, or the browser restarts. The
+extension requires Chrome 150 or newer, explicitly persists the reconnect alarm
+across browser sessions, and reads the alarm back before registering with the
+daemon. It also requires
 `chrome.management` so the bridge can disable external debugger/nativeMessaging
 extensions that would otherwise create Chrome warning surfaces. If the daemon
 is unavailable or the live Chrome profile is unsafe, the failure is
@@ -93,8 +96,12 @@ shield failure is not ignored: the loaded bridge uses `chrome.management` to
 disable enabled external `debugger`/`nativeMessaging` extensions, and normal
 commands fail closed if that suppression does not complete.
 
-The verifier also opens the already-running Chrome profile's extensions page
-and loads this directory as an unpacked extension when the active profile does
+The verifier atomically mirrors the bundled files into the constant
+`%LOCALAPPDATA%\synapse\chrome-extension\active` directory. Chrome records that
+checkout-independent path for every build, so its unpacked-extension Source of
+Truth remains present after update, browser restart, and OS reboot. The verifier
+also opens the already-running Chrome profile's extensions page and loads this
+directory as an unpacked extension when the active profile does
 not already contain the expected stable extension row. It refuses to launch a
 second Chrome profile as the repair path; open the intended authenticated
 profile first, then run the installer. This setup script is the canonical
@@ -107,8 +114,11 @@ keepalive. Commands execute only after the daemon asks through the fixed
 extension origin and daemon-issued bridge token. If registration, message post,
 or WebSocket keepalive fails, the bridge closes the stale token, logs the code
 and reconnect delay, and re-registers with bounded WebSocket reconnect. While
-disconnected it keeps a 30s `chrome.alarms` wake registered so a suspended MV3
-worker can re-register with the daemon without foreground Chrome automation.
+disconnected it keeps a persisted 30s `chrome.alarms` wake registered so a
+suspended MV3 worker can re-register with the daemon without foreground Chrome
+automation. Every authenticated hello includes the worker boot ID, lifecycle
+events, and a separate `chrome.alarms.get` readback; daemon health fails stale
+when that persisted alarm evidence is absent or mismatched.
 The normal bridge does not call `runtime.connectNative()`, so Chrome does not
 create a native-host `cmd.exe` wrapper on end-user systems.
 The verifier also removes stale Synapse native-host registration from every
@@ -230,7 +240,8 @@ policy or `chrome.management` before popup-free normal-profile commands run.
 Extension lifecycle reload is host-owned. No bridge command can invoke
 `chrome.runtime.reload()`. Acceptance requires the installer readback and a
 separate daemon host snapshot reporting the expected extension ID, build ID,
-service-worker identity, and full required capability set.
+service-worker identity, startup/alarm readback, and full required capability
+set.
 
 Attach-capable DOM commands (`snapshot`, `clickNode`, `typeNode`, and
 `nodeValue`) are unavailable in the normal end-user install. The normal service

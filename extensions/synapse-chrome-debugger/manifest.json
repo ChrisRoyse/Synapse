@@ -3,7 +3,7 @@
   "name": "Synapse Chrome Bridge",
   "description": "Local Synapse bridge for normal-profile Chrome tab control through direct localhost WebSocket.",
   "version": "0.1.1",
-  "minimum_chrome_version": "125",
+  "minimum_chrome_version": "150",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlPsVbOvnBPb92H1mJNYuXVOHJqd1HcjgvWcpsa5kSeZJI1XIsz3mER8DmLlzMuohkG8VhpzrPV79Rq3W7lOUA81pwLvYmH7hBw7+m5tjGx8FWiTryy6JjlgqAQkUevKJ58//uBZa6VTvZPVI9UwiBZuKG/1c00ElQjzhq7A9Q4y2fYqI+mCuoxA1iH0QZT3XLKA5SxYyQRt8E+QyVQeJzuyJ4JfId5JO+nVNS2iILP1BcZxt3r3JY8TidPD5viR5TkLGtmI7dv/ngMWjLLrLMd6LKMkMtyhD8AJZ3OogbD3xF8jM2GPmU/5WCYwzHv5FUzlJiPfOLYZvyhYBWU/2xwIDAQAB",
   "permissions": [
     "alarms",

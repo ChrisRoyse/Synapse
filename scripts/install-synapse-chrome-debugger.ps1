@@ -872,7 +872,7 @@ if (-not (Test-Path -LiteralPath $sourceServiceWorkerPath -PathType Leaf)) {
 $serviceWorkerSourceRead = Read-SynapseUtf8FileStrict -Path $sourceServiceWorkerPath
 $serviceWorkerSource = $serviceWorkerSourceRead.text
 if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_BUILD_ID\s*=\s*"([^"]+)";') {
-    throw "SYNAPSE_CHROME_EXTENSION_BUILD_ID_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_BUILD_ID so setup can deploy the unpacked extension to a stable build-id directory"
+    throw "SYNAPSE_CHROME_EXTENSION_BUILD_ID_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_BUILD_ID so setup can verify the build deployed into the constant active directory"
 }
 $bridgeBuildId = [string]$Matches[1]
 if ($bridgeBuildId -notmatch '^[A-Za-z0-9._-]+$') {
@@ -894,16 +894,82 @@ if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
 }
 $stableExtensionRoot = Join-Path $env:LOCALAPPDATA 'synapse\chrome-extension'
-$extensionDir = Join-Path $stableExtensionRoot $bridgeBuildId
+$extensionDir = Join-Path $stableExtensionRoot 'active'
+$localAppDataFull = [System.IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd(
+    [char[]]@(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+)
 $stableRootFull = [System.IO.Path]::GetFullPath($stableExtensionRoot)
 $extensionDirFull = [System.IO.Path]::GetFullPath($extensionDir)
 if (-not $extensionDirFull.StartsWith($stableRootFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_PATH_INVALID root=$stableRootFull path=$extensionDirFull"
 }
+foreach ($existingPath in @(
+        $localAppDataFull,
+        (Join-Path $localAppDataFull 'synapse'),
+        $stableRootFull,
+        $extensionDirFull
+    )) {
+    if (-not (Test-Path -LiteralPath $existingPath)) {
+        continue
+    }
+    $existingItem = Get-Item -LiteralPath $existingPath -Force -ErrorAction Stop
+    if (-not $existingItem.PSIsContainer) {
+        throw "SYNAPSE_CHROME_EXTENSION_DEPLOY_PATH_NOT_DIRECTORY path=$existingPath remediation=the constant extension deployment chain must contain only real directories"
+    }
+    if ($existingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_CHROME_EXTENSION_DEPLOY_REPARSE_POINT_FORBIDDEN path=$existingPath attributes=$($existingItem.Attributes) remediation=replace the link/junction with a real local directory before deploying extension bytes"
+    }
+}
 New-Item -ItemType Directory -Force -Path $extensionDirFull | Out-Null
-Get-ChildItem -LiteralPath $extensionSourceDir -Force |
-    Where-Object { $_.FullName -ne $sourceServiceWorkerPath } |
-    Copy-Item -Destination $extensionDirFull -Recurse -Force
+$extensionDirItem = Get-Item -LiteralPath $extensionDirFull -Force -ErrorAction Stop
+if (
+    -not $extensionDirItem.PSIsContainer -or
+    ($extensionDirItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+) {
+    throw "SYNAPSE_CHROME_EXTENSION_ACTIVE_DIRECTORY_INVALID path=$extensionDirFull attributes=$($extensionDirItem.Attributes) remediation=the constant active deployment path must be a real local directory, never a file, link, or junction"
+}
+$expectedDeployedRelativePaths = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+$staticDeployReadback = @()
+foreach ($sourceFile in @(Get-ChildItem -LiteralPath $extensionSourceDir -File -Recurse -Force -ErrorAction Stop)) {
+    $relativePath = $sourceFile.FullName.Substring($extensionSourceDir.Length).TrimStart(
+        [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+    )
+    if ([string]::IsNullOrWhiteSpace($relativePath)) {
+        throw "SYNAPSE_CHROME_EXTENSION_STATIC_RELATIVE_PATH_EMPTY source=$($sourceFile.FullName) remediation=every extension artifact must resolve below the extension source directory"
+    }
+    if (-not $expectedDeployedRelativePaths.Add($relativePath)) {
+        throw "SYNAPSE_CHROME_EXTENSION_DUPLICATE_RELATIVE_PATH source=$($sourceFile.FullName) relative_path=$relativePath remediation=the bundled extension source must map each case-insensitive Windows relative path exactly once"
+    }
+    if ($sourceFile.FullName -ieq $sourceServiceWorkerPath) {
+        continue
+    }
+    $destination = [System.IO.Path]::GetFullPath((Join-Path $extensionDirFull $relativePath))
+    if (-not $destination.StartsWith($extensionDirFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SYNAPSE_CHROME_EXTENSION_STATIC_PATH_ESCAPE source=$($sourceFile.FullName) destination=$destination active_dir=$extensionDirFull remediation=extension artifacts must remain inside the constant active deployment directory"
+    }
+    $destinationParent = [System.IO.Path]::GetDirectoryName($destination)
+    New-Item -ItemType Directory -Force -Path $destinationParent | Out-Null
+    $expectedBytes = [System.IO.File]::ReadAllBytes($sourceFile.FullName)
+    $writeReadback = Write-SynapseFileBytesAtomic -Path $destination -ExpectedBytes $expectedBytes
+    $staticDeployReadback += [pscustomobject]@{
+        relative_path = $relativePath
+        source_path = $sourceFile.FullName
+        deployed_path = $destination
+        byte_length = $writeReadback.byte_length
+        sha256 = $writeReadback.sha256
+        atomic_replace = $writeReadback.atomic_replace
+        atomic_mode = $writeReadback.atomic_mode
+        byte_exact_readback = $writeReadback.byte_exact_readback
+    }
+}
 $extensionDir = $extensionDirFull
 $manifestPath = Join-Path $extensionDir 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
@@ -918,11 +984,55 @@ $bridgeRegisterTokenReadback = Assert-SynapseChromeBridgeRegisterTokenReadback `
     -ExpectedRegisterToken $bridgeRegisterToken `
     -ExpectedServiceWorkerSha256 $bridgeRegisterTokenWrite.expected_sha256 `
     -ExpectedServiceWorkerByteLength $bridgeRegisterTokenWrite.expected_byte_length
+$obsoleteDeployCleanup = @()
+foreach ($deployedFile in @(Get-ChildItem -LiteralPath $extensionDirFull -File -Recurse -Force -ErrorAction Stop)) {
+    $relativePath = $deployedFile.FullName.Substring($extensionDirFull.Length).TrimStart(
+        [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+    )
+    if ($expectedDeployedRelativePaths.Contains($relativePath)) {
+        continue
+    }
+    $deployedFullPath = [System.IO.Path]::GetFullPath($deployedFile.FullName)
+    if (
+        -not $deployedFullPath.StartsWith(
+            $extensionDirFull + [System.IO.Path]::DirectorySeparatorChar,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        ($deployedFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    ) {
+        throw "SYNAPSE_CHROME_EXTENSION_OBSOLETE_FILE_UNSAFE path=$($deployedFile.FullName) active_dir=$extensionDirFull attributes=$($deployedFile.Attributes) remediation=cleanup refuses to follow or remove a path outside the real constant active directory"
+    }
+    Remove-Item -LiteralPath $deployedFullPath -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $deployedFullPath) {
+        throw "SYNAPSE_CHROME_EXTENSION_OBSOLETE_FILE_REMOVE_FAILED path=$deployedFullPath remediation=remove the exact obsolete file after proving it is inside the constant active extension directory"
+    }
+    $obsoleteDeployCleanup += $relativePath
+}
+$deployedDirectories = @(Get-ChildItem -LiteralPath $extensionDirFull -Directory -Recurse -Force -ErrorAction Stop |
+        Sort-Object { $_.FullName.Length } -Descending)
+foreach ($deployedDirectory in $deployedDirectories) {
+    if ($deployedDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_CHROME_EXTENSION_DEPLOYED_DIRECTORY_REPARSE_POINT_FORBIDDEN path=$($deployedDirectory.FullName) remediation=the constant active extension tree cannot contain links or junctions"
+    }
+    if (@(Get-ChildItem -LiteralPath $deployedDirectory.FullName -Force -ErrorAction Stop).Count -eq 0) {
+        Remove-Item -LiteralPath $deployedDirectory.FullName -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $deployedDirectory.FullName) {
+            throw "SYNAPSE_CHROME_EXTENSION_EMPTY_DIRECTORY_REMOVE_FAILED path=$($deployedDirectory.FullName) remediation=remove the exact empty directory after proving it is inside the constant active extension tree"
+        }
+    }
+}
 $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
 $extensionDeploy = [pscustomobject]@{
     source_dir = $extensionSourceDir
     deployed_dir = $extensionDir
     stable_root = $stableRootFull
+    path_contract = 'constant_active_directory'
+    static_artifacts = @($staticDeployReadback)
+    expected_relative_paths = @($expectedDeployedRelativePaths | Sort-Object)
+    obsolete_files_removed = @($obsoleteDeployCleanup)
     build_id = $bridgeBuildId
     declared_build_sha256 = $bridgeDeclaredBuildSha256
     build_sha256 = $bridgeDeclaredBuildSha256
@@ -1283,21 +1393,29 @@ function Get-SynapseChromeBridgeReferencedManifestPaths {
 
     $paths = @()
     if (-not (Test-Path -LiteralPath $ChromeUserDataRoot -PathType Container)) {
-        return @()
+        throw "SYNAPSE_CHROME_EXTENSION_REFERENCE_ROOT_MISSING user_data_root=$ChromeUserDataRoot remediation=cleanup refuses to classify any deployed build as unreferenced without the physical Chrome profile root"
     }
-    foreach ($profileDir in @(Get-ChildItem -LiteralPath $ChromeUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
+    try {
+        $profileDirs = @(Get-ChildItem -LiteralPath $ChromeUserDataRoot -Directory -ErrorAction Stop)
+    } catch {
+        throw "SYNAPSE_CHROME_EXTENSION_REFERENCE_PROFILE_ENUMERATION_FAILED user_data_root=$ChromeUserDataRoot error=$($_.Exception.Message) remediation=cleanup refuses to delete any build until every Chrome profile directory can be enumerated"
+    }
+    foreach ($profileDir in $profileDirs) {
         if ([string]$profileDir.Name -eq 'Snapshots') {
             continue
         }
+        $profileRowCount = 0
+        $profilePaths = @()
         foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
             $prefPath = Join-Path $profileDir.FullName $prefFileName
             if (-not (Test-Path -LiteralPath $prefPath -PathType Leaf)) {
                 continue
             }
             try {
-                $pref = Get-Content -Raw -LiteralPath $prefPath | ConvertFrom-Json -ErrorAction Stop
+                $pref = Get-Content -Raw -LiteralPath $prefPath -ErrorAction Stop |
+                    ConvertFrom-Json -ErrorAction Stop
             } catch {
-                continue
+                throw "SYNAPSE_CHROME_EXTENSION_REFERENCE_PROFILE_READ_FAILED profile=$($profileDir.Name) pref_file=$prefFileName path=$prefPath error=$($_.Exception.Message) remediation=cleanup refuses to delete any build while a Chrome profile source of truth is unreadable or invalid JSON"
             }
             if (-not $pref.extensions -or -not $pref.extensions.settings) {
                 continue
@@ -1306,15 +1424,21 @@ function Get-SynapseChromeBridgeReferencedManifestPaths {
             if (-not $property) {
                 continue
             }
+            $profileRowCount += 1
             $setting = $property.Value
             if ($setting.PSObject.Properties.Name -notcontains 'path') {
                 continue
             }
             $manifestPath = ConvertTo-SynapseComparablePath -Path ([string]$setting.path)
             if (-not [string]::IsNullOrWhiteSpace($manifestPath)) {
-                $paths += $manifestPath
+                $profilePaths += $manifestPath
             }
         }
+        $profilePaths = @($profilePaths | Sort-Object -Unique)
+        if ($profileRowCount -gt 0 -and $profilePaths.Count -eq 0) {
+            throw "SYNAPSE_CHROME_EXTENSION_REFERENCE_PATH_MISSING profile=$($profileDir.Name) extension_id=$ExtensionId row_count=$profileRowCount remediation=Chrome has extension metadata without a resolvable unpacked path; migrate the active profile to the constant active directory before deleting any deployed build"
+        }
+        $paths += $profilePaths
     }
     @($paths | Sort-Object -Unique)
 }
@@ -1352,13 +1476,32 @@ function Remove-SynapseStaleChromeBridgeBuildDirs {
     $removed = @()
     $failed = @()
 
-    foreach ($dir in @(Get-ChildItem -LiteralPath $StableRoot -Directory -ErrorAction SilentlyContinue)) {
+    try {
+        $candidateDirs = @(Get-ChildItem -LiteralPath $StableRoot -Directory -ErrorAction Stop)
+    } catch {
+        throw "SYNAPSE_CHROME_STALE_BUILD_ENUMERATION_FAILED stable_root=$StableRoot error=$($_.Exception.Message) remediation=stale-build cleanup refuses to mutate disk without an exact directory inventory"
+    }
+    foreach ($dir in $candidateDirs) {
+        $dirPath = ConvertTo-SynapseComparablePath -Path $dir.FullName
+        if ($dirPath -ieq $current) {
+            $preserved += [pscustomobject]@{ path = $dir.FullName; reason = 'current_active_directory' }
+            continue
+        }
         if ([string]$dir.Name -notlike 'synapse-chrome-bridge-*') {
             continue
         }
-        $dirPath = ConvertTo-SynapseComparablePath -Path $dir.FullName
-        if ($dirPath -ieq $current) {
-            $preserved += [pscustomobject]@{ path = $dir.FullName; reason = 'current_build' }
+        $stableRootComparable = ConvertTo-SynapseComparablePath -Path $StableRoot
+        if (
+            -not $dirPath.StartsWith(
+                $stableRootComparable + [System.IO.Path]::DirectorySeparatorChar,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or
+            ($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        ) {
+            $failed += [pscustomobject]@{
+                path = $dir.FullName
+                error = 'candidate_path_outside_stable_root_or_reparse_point'
+            }
             continue
         }
         if (@($referencedPaths | Where-Object { $_ -ieq $dirPath }).Count -gt 0) {
@@ -1367,10 +1510,25 @@ function Remove-SynapseStaleChromeBridgeBuildDirs {
         }
         try {
             Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $dir.FullName) {
+                throw 'directory_still_exists_after_remove'
+            }
             $removed += $dir.FullName
         } catch {
             $failed += [pscustomobject]@{ path = $dir.FullName; error = $_.Exception.Message }
         }
+    }
+
+    if ($failed.Count -gt 0) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            stable_root = $StableRoot
+            current_extension_dir = $CurrentExtensionDir
+            referenced_paths = @($referencedPaths)
+            preserved_dirs = @($preserved)
+            removed_dirs = @($removed)
+            failed_dirs = @($failed)
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_STALE_BUILD_CLEANUP_FAILED detail=$detail remediation=inspect every failed path and remove the exact stale non-reparse build directory only after proving no Chrome profile references it"
     }
 
     [pscustomobject]@{
@@ -2072,6 +2230,17 @@ function Invoke-SynapseChromeAddressBarNavigation {
             }) -Depth 8
             throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_RESTORE_FAILED detail=$detail remediation=setup changed the clipboard for exact Chrome address-bar navigation but could not restore the prior complete data object"
         }
+    }
+    if ($failed.Count -gt 0) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            stable_root = $StableRoot
+            current_extension_dir = $CurrentExtensionDir
+            referenced_paths = @($referencedPaths)
+            preserved_dirs = @($preserved)
+            removed_dirs = @($removed)
+            failed_dirs = @($failed)
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_STALE_BUILD_CLEANUP_FAILED detail=$detail remediation=inspect only the named versioned build directories; cleanup refuses to report success while any deletion target is ambiguous or remains on disk"
     }
 
     $after = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 250 -Probe {
@@ -3741,7 +3910,7 @@ $result = [pscustomobject]@{
     bridge_service_worker_sha256_expected = $extensionDeploy.service_worker_sha256
     bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'operatorPanicDisable', 'operatorPanicCleanup', 'operatorPanicReadback', 'operatorPanicEnable', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'keyDispatch', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.downloads_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_downloads_waits_page_screenshots_and_chrome_debugger_runtime_evaluate_init_scripts_handle_dialog_file_upload_cdp_input_hover_tap_drag_page_print_to_pdf_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
-    reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'
+    reconnect_driver = 'bounded_websocket_reconnect_with_persisted_read_verified_chrome_alarms_mv3_wake'
     attach_popup_prevention = 'normal_bridge_debugger_permission_scoped_to_Runtime_evaluate_Page_addScriptToEvaluateOnNewDocument_Runtime_addBinding_Page_handleJavaScriptDialog_DOM_setFileInputFiles_Page_fileChooserOpened_cdpInput_hover_tap_active_drag_pagePdf_printToPDF_viewportEmulation_deviceEmulation_geolocationEmulation_localeEmulation_mediaEmulation_and_networkConditions_inactive_synthetic_drag_no_helper_windows_no_nativeMessaging_permission_plus_external_popup_risk_suppression'
     normal_bridge_attach_commands_available = $true
     normal_bridge_debugger_api_calls_present = $true
