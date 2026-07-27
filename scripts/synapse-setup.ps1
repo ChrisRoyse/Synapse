@@ -957,6 +957,32 @@ function Vbs-Literal {
     return '"' + ($Value -replace '"', '""') + '"'
 }
 
+function Get-SynapseDaemonArgumentText {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$CalyxConfigPath
+    )
+
+    $daemonArguments = @(
+        '--mode', 'http',
+        '--bind', (Quote-WindowsCommandArgument $Bind),
+        '--db', (Quote-WindowsCommandArgument $DbPath),
+        '--profile-dir', (Quote-WindowsCommandArgument $ProfilesDir),
+        '--log-level', 'info'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
+        $daemonArguments += @('--calyx-config', (Quote-WindowsCommandArgument $CalyxConfigPath))
+    }
+    $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
+        $daemonArguments += @('--allowed-permissions', (Quote-WindowsCommandArgument $allowedPermissionsArgument))
+    }
+    return ($daemonArguments -join ' ')
+}
+
 function New-HiddenDaemonLauncher {
     param(
         [Parameter(Mandatory=$true)][string]$OutputPath,
@@ -976,21 +1002,13 @@ function New-HiddenDaemonLauncher {
     $supervisorPath = Join-Path (Split-Path -Parent $OutputPath) 'synapse-daemon-supervisor.ps1'
     $supervisorState = Join-Path $LogDir 'daemon-supervisor-current.json'
     $supervisorEvents = Join-Path $LogDir 'daemon-supervisor-events.jsonl'
-    $daemonArguments = @(
-        '--mode', 'http',
-        '--bind', (Quote-WindowsCommandArgument $Bind),
-        '--db', (Quote-WindowsCommandArgument $DbPath),
-        '--profile-dir', (Quote-WindowsCommandArgument $ProfilesDir),
-        '--log-level', 'info'
-    )
-    if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
-        $daemonArguments += @('--calyx-config', (Quote-WindowsCommandArgument $CalyxConfigPath))
-    }
     $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
-    if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
-        $daemonArguments += @('--allowed-permissions', (Quote-WindowsCommandArgument $allowedPermissionsArgument))
-    }
-    $daemonArgumentText = $daemonArguments -join ' '
+    $daemonArgumentText = Get-SynapseDaemonArgumentText `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -ProfilesDir $ProfilesDir `
+        -AllowedPermissions $AllowedPermissions `
+        -CalyxConfigPath $CalyxConfigPath
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
         Die "SYNAPSE_HIDDEN_SUPERVISOR_POWERSHELL_MISSING path=$powerShellExe remediation=repair Windows PowerShell before registering the daemon supervisor"
@@ -9454,6 +9472,152 @@ function Assert-SynapseDaemonTaskRestartAuthorityIdentity {
     return $task
 }
 
+function Assert-SynapseLiveDaemonAdoptionIdentity {
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$HiddenLauncherPath,
+        [Parameter(Mandatory=$true)][string]$SupervisorPath,
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$CalyxConfigPath
+    )
+
+    $task = Assert-SynapseDaemonTaskRestartAuthorityIdentity `
+        -TaskName $TaskName `
+        -SupervisorPath $SupervisorPath `
+        -Reason 'live_adoption'
+    if ($null -eq $task) {
+        Die "SYNAPSE_LIVE_ADOPTION_TASK_MISSING task=$TaskName remediation=the unchanged live daemon has no verified Task Scheduler restart authority; use an explicit handoff instead of silently adopting incomplete ownership"
+    }
+    if ([string]$task.State -ne 'Running') {
+        Die "SYNAPSE_LIVE_ADOPTION_TASK_STATE_INVALID task=$TaskName expected=Running actual=$($task.State) remediation=the unchanged daemon is not owned by a running setup task; use an explicit handoff to restore one authoritative supervisor"
+    }
+    foreach ($requiredFile in @($HiddenLauncherPath, $SupervisorPath)) {
+        if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+            Die "SYNAPSE_LIVE_ADOPTION_LAUNCHER_FILE_MISSING task=$TaskName path=$requiredFile remediation=the running task launcher chain is incomplete; use an explicit handoff to regenerate it safely"
+        }
+    }
+
+    $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
+    $supervisorCommand = @(
+        (Quote-WindowsCommandArgument $powerShellExe),
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', (Quote-WindowsCommandArgument $SupervisorPath)
+    ) -join ' '
+    $expectedWrapperAssignments = @(
+        "launcherLog = $(Vbs-Literal $launcherLog)",
+        "supervisorCommand = $(Vbs-Literal $supervisorCommand)"
+    )
+    $wrapperLines = @(Get-Content -LiteralPath $HiddenLauncherPath -ErrorAction Stop)
+    foreach ($expectedLine in $expectedWrapperAssignments) {
+        $assignmentName = ($expectedLine -split '\s*=\s*', 2)[0]
+        $actualLines = @($wrapperLines | Where-Object { $_ -match "^$([regex]::Escape($assignmentName))\s*=" })
+        if ($actualLines.Count -ne 1 -or [string]$actualLines[0] -cne $expectedLine) {
+            Die "SYNAPSE_LIVE_ADOPTION_WRAPPER_DRIFT task=$TaskName path=$HiddenLauncherPath assignment=$assignmentName expected=[$expectedLine] actual=[$($actualLines -join ' || ')] remediation=the running task wrapper does not name the exact expected supervisor/log; use an explicit handoff instead of overwriting a live launcher"
+        }
+    }
+
+    $requiredAssignments = @(
+        'ExePath',
+        'Bind',
+        'DbPath',
+        'ProfilesDir',
+        'DaemonLogDir',
+        'TokenPath',
+        'LauncherLog',
+        'SupervisorState',
+        'SupervisorEvents',
+        'MaintenanceLockPath',
+        'ExpectedCalyxConfigPath',
+        'DaemonArgumentText',
+        'ExpectedAllowedPermissions'
+    )
+    $actualAssignments = @{}
+    $assignmentPattern = '^\$(?<name>[A-Za-z][A-Za-z0-9]*)\s*=\s*''(?<value>(?:''''|[^''])*)''\s*$'
+    foreach ($line in @(Get-Content -LiteralPath $SupervisorPath -ErrorAction Stop)) {
+        if ($line -match $assignmentPattern -and
+            $requiredAssignments -contains $Matches.name) {
+            if ($actualAssignments.ContainsKey($Matches.name)) {
+                Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_ASSIGNMENT_DUPLICATE task=$TaskName path=$SupervisorPath assignment=$($Matches.name) remediation=the persisted supervisor is structurally ambiguous; use an explicit handoff to regenerate it"
+            }
+            $actualAssignments[$Matches.name] = $Matches.value.Replace("''", "'")
+        }
+    }
+    $supervisorStatePath = Join-Path $LogDir 'daemon-supervisor-current.json'
+    $supervisorEventsPath = Join-Path $LogDir 'daemon-supervisor-events.jsonl'
+    $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    $expectedCalyxConfig = if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) { '' } else { $CalyxConfigPath }
+    $expectedAssignments = [ordered]@{
+        ExePath = $ExePath
+        Bind = $Bind
+        DbPath = $DbPath
+        ProfilesDir = $ProfilesDir
+        DaemonLogDir = $LogDir
+        TokenPath = $TokenPath
+        LauncherLog = $launcherLog
+        SupervisorState = $supervisorStatePath
+        SupervisorEvents = $supervisorEventsPath
+        MaintenanceLockPath = $MaintenanceLockPath
+        ExpectedCalyxConfigPath = $expectedCalyxConfig
+        DaemonArgumentText = Get-SynapseDaemonArgumentText -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath
+        ExpectedAllowedPermissions = $expectedAllowed
+    }
+    $assignmentDrift = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $requiredAssignments) {
+        $actual = if ($actualAssignments.ContainsKey($name)) { [string]$actualAssignments[$name] } else { '<missing>' }
+        $expected = [string]$expectedAssignments[$name]
+        if ($actual -cne $expected) {
+            $assignmentDrift.Add("$name expected=[$expected] actual=[$actual]")
+        }
+    }
+    if ($assignmentDrift.Count -gt 0) {
+        Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_CONFIG_DRIFT task=$TaskName path=$SupervisorPath drift=$($assignmentDrift -join '; ') remediation=the persisted supervisor would launch different state on restart; use an explicit handoff instead of adopting it"
+    }
+
+    try {
+        $supervisorState = Get-Content -LiteralPath $supervisorStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_STATE_UNREADABLE task=$TaskName path=$supervisorStatePath error=$($_.Exception.Message) remediation=repair the supervisor state Source of Truth before live adoption"
+    }
+    $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    if ($listeners.Count -ne 1) {
+        Die "SYNAPSE_LIVE_ADOPTION_LISTENER_AMBIGUOUS task=$TaskName bind=$Bind listeners=$(Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners) remediation=live adoption requires exactly one listener owned by the persisted supervisor child"
+    }
+    $listenerPid = [int]$listeners[0].OwningProcess
+    if ([string]$supervisorState.state -notin @('running', 'adopted_existing') -or
+        [int]$supervisorState.child_pid -ne $listenerPid) {
+        Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_STATE_MISMATCH task=$TaskName state=$($supervisorState.state) supervisor_child_pid=$($supervisorState.child_pid) listener_pid=$listenerPid remediation=repair supervisor/daemon ownership before live adoption"
+    }
+    $supervisors = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
+    if ($supervisors.Count -ne 1 -or [int]$supervisors[0].ProcessId -ne [int]$supervisorState.supervisor_pid) {
+        Die "SYNAPSE_LIVE_ADOPTION_SUPERVISOR_PROCESS_MISMATCH task=$TaskName expected_pid=$($supervisorState.supervisor_pid) actual_count=$($supervisors.Count) actual=$(Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $supervisors) remediation=live adoption requires one exact supervisor process matching persisted state"
+    }
+    try {
+        $taskXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    } catch {
+        Die "SYNAPSE_LIVE_ADOPTION_TASK_EXPORT_FAILED task=$TaskName error=$($_.Exception.Message) remediation=repair Task Scheduler read access before live adoption"
+    }
+
+    return [pscustomobject]@{
+        TaskState = [string]$task.State
+        TaskDefinitionSha256 = Get-SynapseSha256Hex -Text ([string]$taskXml)
+        HiddenLauncherSha256 = Get-SynapseFileSha256 -Path $HiddenLauncherPath
+        SupervisorSha256 = Get-SynapseFileSha256 -Path $SupervisorPath
+        SupervisorPid = [int]$supervisorState.supervisor_pid
+        DaemonPid = $listenerPid
+        SupervisorState = [string]$supervisorState.state
+        DaemonArgumentText = [string]$expectedAssignments.DaemonArgumentText
+    }
+}
+
 function Remove-SynapseDaemonTaskRestartAuthority {
     param(
         [Parameter(Mandatory=$true)][string]$TaskName,
@@ -10387,54 +10551,74 @@ if ($script:SynapseBindPostExitContinuationRequired) {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Register + start the auto-start HTTP daemon (interactive desktop session)
+# 7. Verify adoption or register + start the auto-start HTTP daemon
 # ---------------------------------------------------------------------------
-Step "Registering auto-start daemon task '$TaskName'"
-if (-not $liveDaemonHandoffRequired) {
-    $existingTaskForAdoption = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($existingTaskForAdoption -and [string]$existingTaskForAdoption.State -eq 'Running') {
-        Die "SYNAPSE_TASK_RUNNING_LIVE_ADOPTION_REREGISTER_UNSAFE task=$TaskName remediation=the installed binary is unchanged, but the existing scheduled task is already running; rerun setup during an explicit daemon maintenance window so the old task can be stopped before registration is replaced"
-    }
-    Info "Live daemon adoption enabled for unchanged SkipBuild binary; setup will not wait for bind release before starting the supervisor task."
-} else {
-    Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 300
-}
 $legacyLauncher = Join-Path $LogDir 'synapse-daemon-launch.cmd'
 $hiddenLauncher = Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs'
 $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
-if (Test-Path $legacyLauncher) {
-    Remove-Item -LiteralPath $legacyLauncher -Force
-}
+$daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
 $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
 if (-not (Test-Path $wscriptExe)) {
     Die "SYNAPSE_HIDDEN_LAUNCHER_MISSING path=$wscriptExe remediation=repair Windows Script Host or run the daemon manually with a hidden process supervisor"
 }
-New-HiddenDaemonLauncher `
-    -OutputPath $hiddenLauncher `
-    -ExePath $ExePath `
-    -Bind $Bind `
-    -DbPath $DbPath `
-    -ProfilesDir $ProfilesDir `
-    -LogDir $LogDir `
-    -TokenPath $TokenPath `
-    -MaintenanceLockPath $MaintenanceLockPath `
-    -AllowedPermissions $AllowedPermissions `
-    -CalyxConfigPath $CalyxConfigPath
+if (-not $liveDaemonHandoffRequired) {
+    Step "Verifying live adoption of auto-start daemon task '$TaskName'"
+    $liveAdoption = Assert-SynapseLiveDaemonAdoptionIdentity `
+        -TaskName $TaskName `
+        -HiddenLauncherPath $hiddenLauncher `
+        -SupervisorPath $daemonSupervisorPath `
+        -ExePath $ExePath `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -ProfilesDir $ProfilesDir `
+        -LogDir $LogDir `
+        -TokenPath $TokenPath `
+        -MaintenanceLockPath $MaintenanceLockPath `
+        -AllowedPermissions $AllowedPermissions `
+        -CalyxConfigPath $CalyxConfigPath
+    Info ("SYNAPSE_LIVE_DAEMON_ADOPTION_VERIFIED task={0} task_state={1} task_definition_sha256={2} hidden_launcher_sha256={3} supervisor_sha256={4} supervisor_pid={5} daemon_pid={6} supervisor_state={7} daemon_arguments=[{8}] remediation=none; setup preserved the exact running task/supervisor/daemon instead of re-registering live restart authority" -f `
+        $TaskName,
+        $liveAdoption.TaskState,
+        $liveAdoption.TaskDefinitionSha256,
+        $liveAdoption.HiddenLauncherSha256,
+        $liveAdoption.SupervisorSha256,
+        $liveAdoption.SupervisorPid,
+        $liveAdoption.DaemonPid,
+        $liveAdoption.SupervisorState,
+        $liveAdoption.DaemonArgumentText)
+} else {
+    Step "Registering auto-start daemon task '$TaskName'"
+    Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 300
+    if (Test-Path $legacyLauncher) {
+        Remove-Item -LiteralPath $legacyLauncher -Force
+    }
+    New-HiddenDaemonLauncher `
+        -OutputPath $hiddenLauncher `
+        -ExePath $ExePath `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -ProfilesDir $ProfilesDir `
+        -LogDir $LogDir `
+        -TokenPath $TokenPath `
+        -MaintenanceLockPath $MaintenanceLockPath `
+        -AllowedPermissions $AllowedPermissions `
+        -CalyxConfigPath $CalyxConfigPath
 
-$action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-$princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-$set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-$set.Hidden = $true
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 `
+                -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $set.Hidden = $true
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    }
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $princ `
+        -Settings $set -Description "Synapse MCP HTTP daemon (loopback) - the single body controlling Windows + WSL programs." | Out-Null
+    Start-ScheduledTask -TaskName $TaskName
+    Info "Task registered and started."
 }
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $princ `
-    -Settings $set -Description "Synapse MCP HTTP daemon (loopback) - the single body controlling Windows + WSL programs." | Out-Null
-Start-ScheduledTask -TaskName $TaskName
-Info "Task registered and started."
 
 # ---------------------------------------------------------------------------
 # 8. Health verify (source of truth: the live daemon)
