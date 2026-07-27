@@ -6547,7 +6547,10 @@ function Stop-SynapseExactCandidateProcess {
 }
 
 function Get-SynapseCandidateReplacementReservationId {
-    param([Parameter(Mandatory=$true)][string]$Bind)
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token
+    )
 
     $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     if ($listeners.Count -eq 0) { return $null }
@@ -6558,30 +6561,66 @@ function Get-SynapseCandidateReplacementReservationId {
     if (-not $listener.OwnerExists -or -not (Test-SynapseMcpExecutableLeafName -Name $listener.OwnerName)) {
         Die "SYNAPSE_GPU_REPLACEMENT_LISTENER_INVALID bind=$Bind pid=$($listener.OwningProcess) owner=$($listener.OwnerName) remediation=the configured bind must be owned by the exact live Synapse daemon before replacement admission"
     }
+
+    $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $Token -TimeoutSec 10
+    if (-not $healthRead.Ok) {
+        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_UNREADABLE bind=$Bind live_pid=$($listener.OwningProcess) error=$($healthRead.Error) remediation=repair authenticated health for the exact live daemon before candidate validation"
+    }
+    $health = $healthRead.Health
+    if (-not $health.ok -or [int]$health.pid -ne [int]$listener.OwningProcess) {
+        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_IDENTITY_MISMATCH bind=$Bind listener_pid=$($listener.OwningProcess) health_ok=$($health.ok) health_pid=$($health.pid) remediation=repair the exact daemon process/socket/health identity before candidate validation"
+    }
+    $calyxHealth = $health.subsystems.calyx_vault
+    $selectedBackend = [string]$calyxHealth.calyx_math_backend
+    $healthReservationId = [string]$calyxHealth.calyx_gpu_reservation_id
+    if ([string]$calyxHealth.status -ne 'ok' -or [string]::IsNullOrWhiteSpace($selectedBackend)) {
+        Die "SYNAPSE_GPU_REPLACEMENT_CALYX_HEALTH_INVALID bind=$Bind live_pid=$($listener.OwningProcess) calyx_status=$($calyxHealth.status) selected_backend=$selectedBackend remediation=repair the live Calyx health state before candidate validation"
+    }
+
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
     if ([string]::IsNullOrWhiteSpace($programData)) {
         Die 'SYNAPSE_GPU_REPLACEMENT_ROOT_UNAVAILABLE remediation=Windows CommonApplicationData is required to verify the host GPU reservation ledger'
     }
     $statePath = Join-Path $programData 'Calyx\gpu-reservations\device-0\reservations.json'
-    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
-        Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_MISSING path=$statePath live_pid=$($listener.OwningProcess) remediation=repair the live daemon GPU reservation Source of Truth before candidate validation"
+    $state = $null
+    $statePresent = Test-Path -LiteralPath $statePath -PathType Leaf
+    if ($statePresent) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_UNREADABLE path=$statePath error=$($_.Exception.Message) remediation=repair the host GPU reservation Source of Truth before candidate validation"
+        }
     }
-    try {
-        $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_UNREADABLE path=$statePath error=$($_.Exception.Message) remediation=repair the host GPU reservation Source of Truth before candidate validation"
+
+    $pidRows = if ($null -eq $state) {
+        @()
+    } else {
+        @($state.reservations | Where-Object { [int]$_.pid -eq [int]$listener.OwningProcess })
     }
-    $matches = @($state.reservations | Where-Object {
-        [int]$_.pid -eq [int]$listener.OwningProcess -and
+    if ($selectedBackend -ine 'cuda') {
+        if (-not [string]::IsNullOrWhiteSpace($healthReservationId) -or $pidRows.Count -ne 0) {
+            Die "SYNAPSE_GPU_REPLACEMENT_NON_CUDA_STATE_CONFLICT path=$(if ($statePresent) { $statePath } else { '<absent>' }) live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) ledger_pid_row_count=$($pidRows.Count) remediation=repair the mixed Calyx backend/GPU reservation state before candidate validation"
+        }
+        Info "Candidate replacement reservation not required bind=$Bind live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=<none> ledger_pid_row_count=0 state_path=$(if ($statePresent) { $statePath } else { '<absent>' })"
+        return $null
+    }
+
+    if (-not $statePresent) {
+        Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_MISSING path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) remediation=repair the live CUDA daemon GPU reservation Source of Truth before candidate validation"
+    }
+    if ($healthReservationId -notmatch '^[0-9a-fA-F]{32}$') {
+        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_RESERVATION_INVALID path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) remediation=repair the live CUDA daemon health reservation identity before candidate validation"
+    }
+    $matches = @($pidRows | Where-Object {
         [string]$_.owner -eq 'synapse-mcp' -and
+        [string]$_.reservation_id -ieq $healthReservationId -and
         [string]::IsNullOrWhiteSpace([string]$_.replaces_reservation_id)
     })
-    if ($matches.Count -ne 1) {
-        Die "SYNAPSE_GPU_REPLACEMENT_RESERVATION_AMBIGUOUS path=$statePath live_pid=$($listener.OwningProcess) match_count=$($matches.Count) remediation=the live daemon must own exactly one primary device-0 reservation before candidate validation"
+    if ($pidRows.Count -ne 1 -or $matches.Count -ne 1) {
+        Die "SYNAPSE_GPU_REPLACEMENT_RESERVATION_AMBIGUOUS path=$statePath live_pid=$($listener.OwningProcess) health_reservation_id=$healthReservationId ledger_pid_row_count=$($pidRows.Count) exact_match_count=$($matches.Count) remediation=the live CUDA daemon must own exactly one primary device-0 reservation matching authenticated health before candidate validation"
     }
     $row = $matches[0]
-    if ([string]$row.reservation_id -notmatch '^[0-9a-fA-F]{32}$' -or
-        -not (Test-Path -LiteralPath ([string]$row.lease_file) -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath ([string]$row.lease_file) -PathType Leaf)) {
         Die "SYNAPSE_GPU_REPLACEMENT_RESERVATION_INVALID path=$statePath live_pid=$($listener.OwningProcess) reservation_id=$($row.reservation_id) lease=$($row.lease_file) remediation=repair the exact live reservation row/lease before candidate validation"
     }
     Info "Candidate replacement reservation verified bind=$Bind live_pid=$($listener.OwningProcess) reservation_id=$($row.reservation_id) requested_mib=$($row.requested_mib) state_path=$statePath"
@@ -10079,7 +10118,7 @@ if ($SkipBuild) {
 $candidateRuntimeFiles = @(Get-SynapseOrtRuntimeCompanions -ExecutablePath $installSourcePath)
 $candidateRuntimeSummary = ($candidateRuntimeFiles | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Sha256 }) -join ','
 Info "Candidate ONNX Runtime bundle verified files=$candidateRuntimeSummary"
-$replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind
+$replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind -Token $token
 $candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ReplacementReservationId $replacementReservationId
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
