@@ -275,6 +275,7 @@ impl SynapseService {
             self.public_tool_registry_health(),
         );
         subsystems.insert("facade_contract".to_owned(), self.facade_contract_health());
+        subsystems.insert("shell_jobs".to_owned(), Self::shell_job_recovery_health());
         let tool_surface = self.tool_surface_fingerprint(session_id);
         if let Some(error) = &tool_surface.error {
             subsystems.insert(
@@ -519,6 +520,50 @@ impl SynapseService {
             calyx_fixed_clock_unix_ms: tuning.and_then(|config| config.fixed_clock_unix_ms),
             calyx_rng_seed: tuning.map(|config| config.rng_seed),
             ..SubsystemHealth::default()
+        }
+    }
+
+    /// Surfaces durable shell-job recovery obligations that startup could not
+    /// discharge (#1858).
+    ///
+    /// Startup no longer refuses to run on an unprovable per-record
+    /// disposition, because refusing bought no safety and permanently bricked
+    /// the daemon. This subsystem is what keeps that from becoming silent: an
+    /// outstanding obligation reports `status = "error"`, which drives the
+    /// whole health payload's `ok` to false until it is discharged.
+    fn shell_job_recovery_health() -> SubsystemHealth {
+        match crate::m4::read_shell_job_recovery_obligations() {
+            Ok(None) => SubsystemHealth {
+                status: "ok".to_owned(),
+                detail: Some("no outstanding durable shell-job recovery obligations".to_owned()),
+                ..SubsystemHealth::default()
+            },
+            Ok(Some(ledger)) => {
+                let outstanding = ledger.get("outstanding").cloned().unwrap_or(Value::Null);
+                SubsystemHealth {
+                    status: "error".to_owned(),
+                    detail: Some(format!(
+                        "durable shell-job recovery obligations are outstanding and retried on every daemon start: outstanding={outstanding} first_observed_at={} last_observed_at={}",
+                        ledger
+                            .get("first_observed_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>"),
+                        ledger
+                            .get("last_observed_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>"),
+                    )),
+                    ..SubsystemHealth::default()
+                }
+            }
+            Err(error) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!(
+                    "durable shell-job recovery obligations ledger could not be read: {}",
+                    error.message
+                )),
+                ..SubsystemHealth::default()
+            },
         }
     }
 

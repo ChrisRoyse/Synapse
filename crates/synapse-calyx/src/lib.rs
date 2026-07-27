@@ -2204,6 +2204,16 @@ impl SynapseCalyxVault {
             "opening Synapse Calyx vault"
         );
         create_dir_all(&config.vault_dir)?;
+        // Classify the directory BEFORE taking the writer lock or writing a
+        // vault identity into it. Opening a legacy RocksDB store used to get as
+        // far as creating `vault.lock` and `vault-identity.json` inside that
+        // foreign directory and only then fail deep inside Aster recovery with
+        // `CALYX_ASTER_CORRUPT_SHARD: CURRENT does not point at immutable
+        // manifest file` and `remediation=restore from restic/snapshot`. Both
+        // halves were wrong: nothing was corrupt, and restoring a backup of a
+        // RocksDB store cannot produce a Calyx vault. Detect and say so exactly,
+        // without mutating the directory.
+        detect_foreign_store(&config.vault_dir)?;
         create_parent_dir(&config.machine_salt_path)?;
         let lock = VaultLockGuard::acquire(&config.vault_dir)?;
         tracing::info!(
@@ -4862,6 +4872,68 @@ fn read_optional_to_string(path: &Path) -> std::io::Result<String> {
 
 fn identity_path(vault_dir: &Path) -> PathBuf {
     vault_dir.join(IDENTITY_FILE_NAME)
+}
+
+/// Refuses to open a directory that physically holds a different storage
+/// engine's database.
+///
+/// Calyx replaced `RocksDB` as the authoritative Synapse backend, so a daemon
+/// pointed at a pre-migration `--db` path meets a complete `RocksDB` store. Aster
+/// would read `RocksDB`'s `CURRENT`, find the uppercase `MANIFEST-<n>` pointer
+/// instead of Calyx's `manifest-<20 digits>`, and report
+/// `CALYX_ASTER_CORRUPT_SHARD` with `remediation=restore from restic/snapshot` —
+/// a diagnosis that is both false (nothing is corrupt) and actively harmful
+/// (no backup of a `RocksDB` store is a Calyx vault, and restoring one would
+/// destroy the operator's real data while not fixing anything).
+///
+/// The `RocksDB` signature required here is deliberately conjunctive so it cannot
+/// fire on a Calyx vault or on an unrelated file that merely shares a name:
+/// `IDENTITY` and `CURRENT` must both exist, and `CURRENT` must point at an
+/// existing uppercase `MANIFEST-<digits>` file. A Calyx vault never satisfies
+/// this, because its own pointer is lowercase `manifest-`. Any other directory
+/// content is left to the normal open path.
+fn detect_foreign_store(vault_dir: &Path) -> Result<(), SynapseCalyxError> {
+    let current_path = vault_dir.join("CURRENT");
+    let identity_marker = vault_dir.join("IDENTITY");
+    if !current_path.is_file() || !identity_marker.is_file() {
+        return Ok(());
+    }
+    // A real Calyx vault carries its own identity file; never misclassify one.
+    if identity_path(vault_dir).is_file() {
+        return Ok(());
+    }
+    let Ok(pointer_raw) = read_optional_to_string(&current_path) else {
+        return Ok(());
+    };
+    let pointer = pointer_raw.trim();
+    let Some(digits) = pointer.strip_prefix("MANIFEST-") else {
+        return Ok(());
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(());
+    }
+    if !vault_dir.join(pointer).is_file() {
+        return Ok(());
+    }
+    let sst_count = std::fs::read_dir(vault_dir).map_or(0_usize, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.to_ascii_lowercase().ends_with(".sst"))
+            })
+            .count()
+    });
+    Err(SynapseCalyxError::new(
+        "SYNAPSE_CALYX_VAULT_DIR_HOLDS_FOREIGN_STORE",
+        format!(
+            "{} is a RocksDB database, not a Calyx vault: it has an IDENTITY file and a CURRENT pointing at {pointer} ({sst_count} .sst files). Calyx replaced RocksDB as the authoritative backend and this directory was never migrated. Nothing here is corrupt and no Calyx artifact was written to it.",
+            vault_dir.display()
+        ),
+        "point --db / SYNAPSE_DB_PATH at a Calyx vault directory (an empty directory becomes a new vault), or migrate this RocksDB store first; do NOT restore a backup of this directory, because a RocksDB backup is not a Calyx vault and restoring it cannot make this path openable",
+    ))
 }
 
 fn lock_path(vault_dir: &Path) -> PathBuf {

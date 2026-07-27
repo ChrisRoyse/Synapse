@@ -25,8 +25,15 @@
       executable-relative profile lookup always resolves, and ALSO pass
       --profile-dir explicitly. A compile-time CARGO_MANIFEST_DIR profile path
       never exists on an installed host.
-    * Use a persistent CARGO_TARGET_DIR so re-installs are incremental, not a
-      repeated native dependency rebuild every time.
+    * Build into the SOURCE CHECKOUT'S OWN `target` tree by default. Re-installs
+      stay incremental (the tree persists across runs) and, because the tree
+      belongs to exactly one checkout, two checkouts can never share and poison
+      one fingerprint database -- the failure that originally motivated a
+      per-checkout %LOCALAPPDATA% cache. Keeping it in the checkout additionally
+      means the build artifacts are where the operator already accounts for
+      them, instead of growing a hidden multi-GB tree under %LOCALAPPDATA%
+      (#1857). Any other target directory is an explicit, footprint-reported
+      opt-in via -CargoTarget with -AllowAlternateBuildTarget.
 
   Nothing here silently falls back: every prerequisite is checked and throws a
   clear error naming exactly what failed and how to fix it.
@@ -169,6 +176,16 @@
   scheduled-task definition. This mode never builds, copies, drains, registers
   a task, or rewires clients.
 
+.PARAMETER CargoTarget
+  Cargo target directory for the release build. Defaults to the source
+  checkout's own `target` directory (`<SourceDir>\target`). Supplying any other
+  path additionally requires -AllowAlternateBuildTarget, and setup reports that
+  tree's measured on-disk footprint before using it.
+
+.PARAMETER AllowAlternateBuildTarget
+  Authorizes a -CargoTarget outside the source checkout. Without it setup fails
+  closed rather than silently growing a build tree the operator did not choose.
+
 .PARAMETER ChromeBridgePendingPath
   Durable, versioned Source-of-Truth file for a pending or completed
   chrome_bridge_activation phase.
@@ -180,7 +197,7 @@ param(
     [string]$Bind        = '127.0.0.1:7700',
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
-    [string]$CargoTarget = "$env:LOCALAPPDATA\synapse\build-target",
+    [string]$CargoTarget = '',
     [string]$DbPath      = "$env:LOCALAPPDATA\synapse\db-daemon",
     [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles",
     [string]$LogDir      = "$env:LOCALAPPDATA\synapse\logs",
@@ -207,6 +224,7 @@ param(
     [ValidateSet('normal','require_active_ack','force_unacknowledged')]
     [string]$ManualInstallHealthRollbackPauseMode = 'normal',
     [switch]$ResumeChromeBridgePending,
+    [switch]$AllowAlternateBuildTarget,
     [switch]$SkipClientWiring,
     [switch]$Remove,
     [switch]$Purge
@@ -474,6 +492,211 @@ function Add-SynapseNvccAppendFlag {
         return $RequiredFlag
     }
     return "$existing $RequiredFlag"
+}
+
+function Get-SynapseDirectoryFootprint {
+    <#
+      Measures a directory's exact on-disk footprint by enumerating its files.
+      Never estimates and never swallows enumeration failures: any unreadable
+      subtree is counted and named so a reported size is known to be complete
+      or known to be partial.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $result = [ordered]@{
+        path = $Path
+        exists = $false
+        file_count = 0
+        byte_len = [uint64]0
+        gib = 0.0
+        read_error_count = 0
+        read_errors_sample = @()
+        complete = $false
+        measured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { $result.complete = $true; return [pscustomobject]$result }
+    $result.exists = $true
+    $errors = @()
+    $files = Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable +errors
+    $sum = ($files | Measure-Object -Property Length -Sum)
+    $result.file_count = [int]$sum.Count
+    $result.byte_len = [uint64]([math]::Max(0, [int64]($sum.Sum)))
+    $result.gib = [math]::Round($result.byte_len / 1GB, 3)
+    $result.read_error_count = @($errors).Count
+    $result.read_errors_sample = @($errors | Select-Object -First 5 | ForEach-Object { $_.ToString() })
+    $result.complete = ($result.read_error_count -eq 0)
+    return [pscustomobject]$result
+}
+
+function Get-SynapseAlternateBuildTargetInventory {
+    <#
+      Inventories the legacy %LOCALAPPDATA%\synapse\build-target tree left by the
+      pre-#1857 default. Reports only: removal requires exact operator ownership
+      and age proof and is never performed implicitly by setup.
+    #>
+    param([string]$Root = (Join-Path $env:LOCALAPPDATA 'synapse\build-target'))
+
+    $inventory = [ordered]@{
+        schema = 'synapse_setup_alternate_build_target_inventory/v1'
+        root = $Root
+        exists = (Test-Path -LiteralPath $Root)
+        observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        trees = @()
+        total_byte_len = [uint64]0
+        total_gib = 0.0
+    }
+    if (-not $inventory.exists) { return [pscustomobject]$inventory }
+    $trees = @()
+    $total = [uint64]0
+    foreach ($dir in (Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)) {
+        $footprint = Get-SynapseDirectoryFootprint -Path $dir.FullName
+        $trees += [pscustomobject][ordered]@{
+            name = $dir.Name
+            path = $dir.FullName
+            created_utc = $dir.CreationTimeUtc.ToString('o')
+            last_write_utc = $dir.LastWriteTimeUtc.ToString('o')
+            age_days = [math]::Round(((Get-Date).ToUniversalTime() - $dir.LastWriteTimeUtc).TotalDays, 2)
+            footprint = $footprint
+        }
+        $total += $footprint.byte_len
+    }
+    $inventory.trees = $trees
+    $inventory.total_byte_len = $total
+    $inventory.total_gib = [math]::Round($total / 1GB, 3)
+    return [pscustomobject]$inventory
+}
+
+function Resolve-SynapseCargoTargetDirectory {
+    <#
+      Decides the exact Cargo target directory for the release build and proves
+      the decision. The default is the source checkout's own `target` tree: it
+      is inherently per-checkout (so it cannot reproduce the cross-checkout
+      fingerprint poisoning that motivated the old hashed %LOCALAPPDATA% cache)
+      and it is visible where the operator already accounts for build output.
+      Anything else is an authorized, footprint-reported deviation (#1857).
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$SourceDir,
+        [AllowEmptyString()][string]$Requested,
+        [bool]$AllowAlternate
+    )
+
+    $resolvedSource = (Resolve-Path -LiteralPath $SourceDir).Path.TrimEnd('\')
+    $canonical = Join-Path $resolvedSource 'target'
+    if ([string]::IsNullOrWhiteSpace($Requested)) {
+        return [pscustomobject][ordered]@{
+            path = $canonical
+            kind = 'canonical_checkout_target'
+            source_dir = $resolvedSource
+            authorized_by = 'default'
+            alternate_footprint = $null
+        }
+    }
+
+    $requestedFull = [System.IO.Path]::GetFullPath($Requested.TrimEnd('\'))
+    if ($requestedFull -eq $canonical) {
+        return [pscustomobject][ordered]@{
+            path = $canonical
+            kind = 'canonical_checkout_target'
+            source_dir = $resolvedSource
+            authorized_by = 'explicit_canonical_request'
+            alternate_footprint = $null
+        }
+    }
+
+    if (-not $AllowAlternate) {
+        Die ("SYNAPSE_BUILD_TARGET_ALTERNATE_NOT_AUTHORIZED requested={0} canonical={1} source_dir={2} remediation=setup builds into the source checkout's own target tree; an alternate build target is a separate multi-GB artifact tree and must be authorized explicitly with -AllowAlternateBuildTarget, or omit -CargoTarget to use {1}" -f `
+            $requestedFull, $canonical, $resolvedSource)
+    }
+
+    $footprint = Get-SynapseDirectoryFootprint -Path $requestedFull
+    Info ("Alternate build target AUTHORIZED: path={0} exists={1} existing_files={2} existing_bytes={3} existing_gib={4} measurement_complete={5} canonical_target_not_used={6}" -f `
+        $requestedFull, $footprint.exists, $footprint.file_count, $footprint.byte_len, $footprint.gib, $footprint.complete, $canonical)
+    if (-not $footprint.complete) {
+        Info ("WARN: alternate build target footprint measurement was incomplete ({0} unreadable entries); reported size is a lower bound. Sample: {1}" -f `
+            $footprint.read_error_count, ($footprint.read_errors_sample -join ' | '))
+    }
+    return [pscustomobject][ordered]@{
+        path = $requestedFull
+        kind = 'operator_authorized_alternate'
+        source_dir = $resolvedSource
+        authorized_by = 'AllowAlternateBuildTarget'
+        alternate_footprint = $footprint
+    }
+}
+
+function Get-SynapseCudaBuildCapability {
+    <#
+      Decides whether this build compiles the Calyx CUDA kernels, from physical
+      host evidence rather than an assumption (#1859).
+
+      calyx-forge's build script shells out to nvcc from a CUDA 13.3 toolkit
+      whenever its `cuda` feature is on, so enabling it unconditionally makes
+      the daemon unbuildable on any host without that toolkit. Both facts must
+      hold before the feature is selected:
+        1. an NVIDIA display device is physically present (PCI vendor 10DE), and
+        2. an nvcc executable is resolvable.
+
+      A partial match is reported explicitly, never silently downgraded past the
+      operator. SYNAPSE_CALYX_CUDA=require forces the feature on and fails
+      closed when the evidence is absent; SYNAPSE_CALYX_CUDA=off forces it off.
+    #>
+    $nvidiaDevices = @()
+    $deviceProbeError = $null
+    try {
+        $nvidiaDevices = @(Get-PnpDevice -ErrorAction Stop | Where-Object { $_.InstanceId -match 'VEN_10DE' } |
+            ForEach-Object { "{0}|{1}|{2}" -f $_.Status, $_.Class, $_.FriendlyName })
+    } catch {
+        $deviceProbeError = $_.Exception.Message
+    }
+
+    $nvcc = (Get-Command nvcc -ErrorAction SilentlyContinue).Source
+    if (-not $nvcc -and -not [string]::IsNullOrWhiteSpace($env:CUDA_PATH)) {
+        $candidate = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $nvcc = $candidate }
+    }
+
+    $deviceProven = ($null -eq $deviceProbeError) -and ($nvidiaDevices.Count -gt 0)
+    $override = if ([string]::IsNullOrWhiteSpace($env:SYNAPSE_CALYX_CUDA)) { '' } else { $env:SYNAPSE_CALYX_CUDA.Trim().ToLowerInvariant() }
+    if ($override -notin @('', 'auto', 'require', 'off')) {
+        Die "SYNAPSE_CALYX_CUDA_OVERRIDE_INVALID value=$env:SYNAPSE_CALYX_CUDA remediation=set SYNAPSE_CALYX_CUDA to auto, require, or off"
+    }
+
+    $enabled = $deviceProven -and $nvcc
+    $basis = "nvidia_pnp_devices=$($nvidiaDevices.Count); device_probe_error=$(if ($deviceProbeError) { $deviceProbeError } else { 'none' }); nvcc=$(if ($nvcc) { $nvcc } else { 'not_found' }); cuda_path=$(if ($env:CUDA_PATH) { $env:CUDA_PATH } else { 'unset' }); override=$(if ($override) { $override } else { 'auto' })"
+
+    switch ($override) {
+        'require' {
+            if (-not $enabled) {
+                Die "SYNAPSE_CALYX_CUDA_REQUIRED_BUT_UNAVAILABLE basis=$basis remediation=install an NVIDIA driver and the CUDA 13.3 toolkit (set CUDA_PATH to its root) or unset SYNAPSE_CALYX_CUDA=require"
+            }
+            $enabled = $true
+        }
+        'off' { $enabled = $false }
+    }
+
+    if ($enabled) {
+        Info "Calyx CUDA kernels ENABLED for this build (--features calyx-cuda). Basis: $basis"
+    } else {
+        Info "Calyx CUDA kernels DISABLED for this build; the daemon will run CPU math. Basis: $basis"
+        if ($deviceProven -and -not $nvcc) {
+            Info "WARN: this host HAS an NVIDIA device but no nvcc, so the daemon will refuse math_backend=auto/cuda at runtime (SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED). Install the CUDA 13.3 toolkit and rerun setup to compile GPU kernels."
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        schema = 'synapse_setup_cuda_build_capability/v1'
+        enabled = [bool]$enabled
+        cargo_features = $(if ($enabled) { @('calyx-cuda') } else { @() })
+        nvidia_pnp_device_count = $nvidiaDevices.Count
+        nvidia_pnp_devices = $nvidiaDevices
+        device_probe_error = $deviceProbeError
+        nvcc_path = $nvcc
+        cuda_path_env = $env:CUDA_PATH
+        override = $(if ($override) { $override } else { 'auto' })
+        basis = $basis
+        observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
 }
 
 function Set-SynapseCudaBuildEnvironment {
@@ -7890,7 +8113,7 @@ function Start-SynapsePostExitSetupContinuation {
         [Parameter(Mandatory=$true)][string]$SourceDir,
         [Parameter(Mandatory=$true)][string]$ExePath,
         [Parameter(Mandatory=$true)][string]$ChromeNativeHostExePath,
-        [Parameter(Mandatory=$true)][string]$CargoTarget,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$CargoTarget,
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$LogDir,
@@ -7932,8 +8155,6 @@ function Start-SynapsePostExitSetupContinuation {
         $ExePath,
         '-ChromeNativeHostExePath',
         $ChromeNativeHostExePath,
-        '-CargoTarget',
-        $CargoTarget,
         '-DbPath',
         $DbPath,
         '-ProfilesDir',
@@ -7964,6 +8185,17 @@ function Start-SynapsePostExitSetupContinuation {
     }
     if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
         $args += @('-CalyxConfigPath', $CalyxConfigPath)
+    }
+    # Relay the resolved build tree only when one was actually resolved. The
+    # continuation always runs -SkipBuild, so this is provenance for the child's
+    # readbacks, not a build instruction; relaying an empty value would bind a
+    # blank -CargoTarget and relaying a resolved alternate must carry its
+    # authorization with it (#1857).
+    if (-not [string]::IsNullOrWhiteSpace($CargoTarget)) {
+        $args += @('-CargoTarget', $CargoTarget)
+        if ($AllowAlternateBuildTarget) {
+            $args += '-AllowAlternateBuildTarget'
+        }
     }
     if ($SkipClientWiring) {
         $args += '-SkipClientWiring'
@@ -10172,22 +10404,38 @@ if (-not $SkipBuild) {
     Info ("Release build compiler environment: RUST_MIN_STACK={0} source={1}" -f `
         $releaseBuildCompilerEnvironment.rust_min_stack,
         $releaseBuildCompilerEnvironment.rust_min_stack_source)
-    if (-not $PSBoundParameters.ContainsKey('CargoTarget')) {
-        # Key the persistent target by the source checkout so two checkouts
-        # can never share (and poison) one fingerprint database. Cargo
-        # freshness is mtime-based against the dep-info file list: a build
-        # from checkout A marks its units fresh for checkout A's files, and
-        # a later build from checkout B silently reuses crates whose sources
-        # differ (observed live 2026-06-12: a synapse-core compiled from a
-        # sibling clone shadowed new modules and broke the deploy build).
-        $resolvedSource = (Resolve-Path $SourceDir).Path.TrimEnd('\')
-        $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($resolvedSource.ToLowerInvariant())
-        $sourceHash = ([System.Security.Cryptography.SHA1]::Create().ComputeHash($sourceBytes) |
-            ForEach-Object { $_.ToString('x2') }) -join ''
-        $sourceLeaf = (Split-Path $resolvedSource -Leaf) -replace '[^A-Za-z0-9._-]', '_'
-        $CargoTarget = Join-Path $CargoTarget "$sourceLeaf-$($sourceHash.Substring(0,12))"
-        Info "Per-checkout build target: $CargoTarget (source: $resolvedSource)"
+    # The build target is the source checkout's own `target` tree unless the
+    # operator explicitly authorized an alternate. Because that tree belongs to
+    # exactly one checkout it is inherently per-checkout, so it cannot reproduce
+    # the cross-checkout fingerprint poisoning that the old hashed
+    # %LOCALAPPDATA% cache existed to prevent (observed live 2026-06-12: a
+    # synapse-core compiled from a sibling clone shadowed new modules and broke
+    # the deploy build). Cargo freshness is mtime-based against the dep-info
+    # file list, and a checkout-owned tree is only ever written by that one
+    # checkout's builds.
+    $cargoTargetResolution = Resolve-SynapseCargoTargetDirectory `
+        -SourceDir $SourceDir `
+        -Requested $CargoTarget `
+        -AllowAlternate ([bool]$AllowAlternateBuildTarget)
+    $CargoTarget = $cargoTargetResolution.path
+    Info ("Cargo target directory: {0} (kind={1} authorized_by={2} source_dir={3})" -f `
+        $cargoTargetResolution.path, $cargoTargetResolution.kind,
+        $cargoTargetResolution.authorized_by, $cargoTargetResolution.source_dir)
+
+    $alternateBuildTargetInventory = Get-SynapseAlternateBuildTargetInventory
+    if ($alternateBuildTargetInventory.exists -and @($alternateBuildTargetInventory.trees).Count -gt 0) {
+        Info ("Pre-existing alternate build trees under {0}: count={1} total_gib={2}. Setup never removes these implicitly; remove one only after proving exact ownership and age." -f `
+            $alternateBuildTargetInventory.root,
+            @($alternateBuildTargetInventory.trees).Count,
+            $alternateBuildTargetInventory.total_gib)
+        foreach ($tree in $alternateBuildTargetInventory.trees) {
+            Info ("  alternate_build_tree path={0} gib={1} files={2} last_write_utc={3} age_days={4}" -f `
+                $tree.path, $tree.footprint.gib, $tree.footprint.file_count, $tree.last_write_utc, $tree.age_days)
+        }
     }
+
+    $cudaBuildCapability = Get-SynapseCudaBuildCapability
+
     New-Item -ItemType Directory -Force -Path $CargoTarget, $LogDir | Out-Null
     $env:CARGO_TARGET_DIR = $CargoTarget
     if (-not $env:CARGO_BUILD_JOBS) {
@@ -10219,9 +10467,14 @@ if (-not $SkipBuild) {
         $buildMemoryBefore.commit_percent,
         $buildMemoryBefore.available_physical_bytes)
     $buildInvocationDiagnostics = $null
+    $cargoBuildArgs = @('build','--release','-p','synapse-mcp')
+    if (@($cudaBuildCapability.cargo_features).Count -gt 0) {
+        $cargoBuildArgs += @('--features', ($cudaBuildCapability.cargo_features -join ','))
+    }
+    Info ("Cargo invocation: {0} {1} (CARGO_TARGET_DIR={2})" -f $cargo, ($cargoBuildArgs -join ' '), $env:CARGO_TARGET_DIR)
     $buildExit = Invoke-SynapseProcessInKillOnCloseJob `
         -FilePath $cargo `
-        -ArgumentList @('build','--release','-p','synapse-mcp') `
+        -ArgumentList $cargoBuildArgs `
         -WorkingDirectory $SourceDir `
         -TimeoutMinutes $BuildTimeoutMinutes `
         -LogPath $buildLog `
@@ -10338,6 +10591,37 @@ if (-not $SkipBuild) {
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
+
+    # Durable readback naming the EXACT build tree and feature set used, so an
+    # operator can prove after the fact where artifacts landed (#1857) and which
+    # acceleration was compiled in (#1859) without re-deriving it from logs.
+    $buildTargetReadbackPath = Join-Path $LogDir 'setup-build-target.json'
+    $builtArtifact = Get-Item -LiteralPath $built
+    $buildTargetReadback = [ordered]@{
+        schema = 'synapse_setup_build_target_readback/v1'
+        observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        source_dir = $cargoTargetResolution.source_dir
+        cargo_target_dir = $cargoTargetResolution.path
+        cargo_target_dir_kind = $cargoTargetResolution.kind
+        cargo_target_dir_authorized_by = $cargoTargetResolution.authorized_by
+        cargo_target_dir_env = $env:CARGO_TARGET_DIR
+        canonical_checkout_target = (Join-Path $cargoTargetResolution.source_dir 'target')
+        alternate_target_footprint = $cargoTargetResolution.alternate_footprint
+        pre_existing_alternate_build_targets = $alternateBuildTargetInventory
+        cargo_invocation = ($cargoBuildArgs -join ' ')
+        cuda_build_capability = $cudaBuildCapability
+        artifact_path = $built
+        artifact_byte_len = $builtArtifact.Length
+        artifact_sha256 = (Get-SynapseFileSha256 -Path $built)
+        artifact_last_write_utc = $builtArtifact.LastWriteTimeUtc.ToString('o')
+    }
+    $buildTargetReadback | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $buildTargetReadbackPath -Encoding UTF8
+    Info ("Build target readback -> {0} (cargo_target_dir={1} kind={2} cuda_kernels={3} artifact_sha256={4})" -f `
+        $buildTargetReadbackPath,
+        $buildTargetReadback.cargo_target_dir,
+        $buildTargetReadback.cargo_target_dir_kind,
+        $cudaBuildCapability.enabled,
+        $buildTargetReadback.artifact_sha256)
     $embeddedModelRoot = Join-Path $env:LOCALAPPDATA 'synapse\build-models'
     $embeddedModels = @(Install-SynapsePinnedDetectionModels -Root $embeddedModelRoot)
     $embeddedGpuModel = @($embeddedModels | Where-Object { $_.Name -eq 'gpu' })[0]

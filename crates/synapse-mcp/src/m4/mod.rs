@@ -3559,6 +3559,17 @@ pub fn cleanup_shell_jobs_for_session(
     Ok(readback)
 }
 
+/// Schema version this binary writes into every durable `status.json`.
+///
+/// Reading is deliberately asymmetric to writing (#1858). Records at or below
+/// this version must decode: any field introduced after a version was first
+/// shipped therefore carries `#[serde(default)]` so an older record decodes as
+/// "that identity was never recorded" instead of "this file is corrupt".
+/// Records ABOVE this version were written by a newer daemon and are classified
+/// `job_status_future_schema` -- unreadable by this binary, but known-intact
+/// evidence that must never be quarantined, rewritten, or destroyed.
+const SHELL_JOB_STATUS_SCHEMA_VERSION: u32 = 4;
+
 const SHELL_JOB_QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const SHELL_JOB_RECOVERY_ID_SAMPLE_CAP: usize = 64;
 
@@ -3581,6 +3592,9 @@ pub struct ShellJobCorruptRecoveryReadback {
     pub unexpected_job_root_entries: usize,
     pub skipped_concurrently_mutated: usize,
     pub recovery_failures: usize,
+    /// Records written by a newer daemon than this binary. Intact evidence that
+    /// this reader must not interpret, quarantine, rewrite, or delete (#1858).
+    pub retained_future_schema_jobs: usize,
     pub bytes_quarantined: u64,
     pub quarantined_job_ids_sample: Vec<String>,
     pub retained_job_ids_sample: Vec<String>,
@@ -5803,6 +5817,7 @@ fn recover_corrupt_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryRead
         unexpected_job_root_entries: 0,
         skipped_concurrently_mutated: 0,
         recovery_failures: 0,
+        retained_future_schema_jobs: 0,
         bytes_quarantined: 0,
         quarantined_job_ids_sample: Vec::new(),
         retained_job_ids_sample: Vec::new(),
@@ -5968,6 +5983,28 @@ fn recover_corrupt_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryRead
                     );
                     continue;
                 };
+                if reason == "job_status_future_schema" {
+                    // Written by a newer daemon. The bytes are intact; this
+                    // binary simply cannot interpret them. Retain untouched and
+                    // never route into corrupt-job quarantine, which would
+                    // let an older binary destroy a newer daemon's evidence.
+                    readback.retained_future_schema_jobs =
+                        readback.retained_future_schema_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_STATUS_FUTURE_SCHEMA",
+                        job_id,
+                        status_path = %path_string(&paths.status_path),
+                        reader_schema_version = SHELL_JOB_STATUS_SCHEMA_VERSION,
+                        detail = %error.message,
+                        data = ?error.data,
+                        "startup retained a durable shell-job record written by a newer daemon; this binary will not interpret, quarantine, or modify it"
+                    );
+                    continue;
+                }
                 if reason != "job_status_decode_failed" {
                     readback.recovery_failures = readback.recovery_failures.saturating_add(1);
                     push_shell_job_recovery_sample(
@@ -7758,37 +7795,51 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
             return Err(error);
         }
     };
-    if corrupt_readback.retained_unverifiable_remote_jobs > 0
-        || corrupt_readback.unexpected_job_root_entries > 0
-        || corrupt_readback.skipped_concurrently_mutated > 0
-        || corrupt_readback.recovery_failures > 0
-    {
+    let outstanding = corrupt_readback.retained_unverifiable_remote_jobs
+        + corrupt_readback.unexpected_job_root_entries
+        + corrupt_readback.skipped_concurrently_mutated
+        + corrupt_readback.recovery_failures
+        + corrupt_readback.retained_future_schema_jobs;
+    if outstanding > 0 {
+        // These are per-record obligations, not a statement that the store is
+        // unreadable. Refusing to start on them was a P0 availability failure
+        // that bought no safety (#1858): the conditions are not self-healing --
+        // a remote host that is gone can never become verifiable, and a record
+        // written by a newer daemon never becomes older -- so every subsequent
+        // start re-failed identically and the supervisor restart-looped
+        // forever. Nothing about being down terminates an orphaned remote
+        // process; it only guarantees no daemon is ever alive to observe it,
+        // retry verification, or tell anyone.
+        //
+        // The fail-closed boundary that actually protects evidence is
+        // DESTRUCTIVE ACTION, and that is enforced separately and unchanged:
+        // this pass still refuses to delete, quarantine, or signal anything
+        // whose remote ownership it could not prove. What changes here is only
+        // that an unproven disposition is carried as a durable, retried,
+        // health-surfaced obligation instead of a permanently locked door.
+        //
+        // A whole-store failure (unreadable job root, unverifiable quarantine
+        // store) still returns Err above and still refuses startup, because
+        // there the daemon genuinely cannot know what it owns.
+        let obligations = record_shell_job_recovery_obligations(&corrupt_readback);
         tracing::error!(
-            code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_INCOMPLETE",
+            code = "M4_SHELL_JOB_STARTUP_RECOVERY_OBLIGATIONS_OUTSTANDING",
             corrupt_status_jobs = corrupt_readback.corrupt_status_jobs,
             quarantined_jobs = corrupt_readback.quarantined_jobs,
             retained_unverifiable_remote_jobs = corrupt_readback.retained_unverifiable_remote_jobs,
+            retained_future_schema_jobs = corrupt_readback.retained_future_schema_jobs,
             unexpected_job_root_entries = corrupt_readback.unexpected_job_root_entries,
             skipped_concurrently_mutated = corrupt_readback.skipped_concurrently_mutated,
             recovery_failures = corrupt_readback.recovery_failures,
+            outstanding_obligations = outstanding,
+            obligations_path = ?obligations,
+            job_root = ?corrupt_readback.job_root,
             retained_job_ids_sample = ?corrupt_readback.retained_job_ids_sample,
             unexpected_job_root_entries_sample = ?corrupt_readback.unexpected_job_root_entries_sample,
-            "refusing daemon startup because one or more durable shell-job evidence dispositions could not be verified"
+            "durable shell-job evidence dispositions remain unproven; retained untouched, recorded as outstanding obligations, and retried on every start"
         );
-        let code = if corrupt_readback.retained_unverifiable_remote_jobs > 0 {
-            error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED
-        } else {
-            error_codes::STORAGE_WRITE_FAILED
-        };
-        return Err(shell_tool_error(
-            code,
-            "daemon startup refused: corrupt durable shell-job recovery is incomplete",
-            json!({
-                "code": code,
-                "reason": "startup_corrupt_shell_job_recovery_incomplete",
-                "readback": corrupt_readback,
-            }),
-        ));
+    } else {
+        clear_shell_job_recovery_obligations();
     }
     tracing::info!(
         code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_COMPLETE",
@@ -7851,6 +7902,174 @@ pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadb
         ),
     }
     Ok(corrupt_readback)
+}
+
+/// Durable ledger of durable shell-job recovery obligations this daemon could
+/// not discharge at startup (#1858).
+///
+/// Startup no longer refuses to run on these, so this file plus the
+/// `M4_SHELL_JOB_STARTUP_RECOVERY_OBLIGATIONS_OUTSTANDING` event plus the
+/// health surface are what make them impossible to lose track of. It lives
+/// beside the job root rather than inside it, because every entry inside the
+/// job root must be a job directory.
+fn shell_job_recovery_obligations_path() -> Result<PathBuf, ErrorData> {
+    Ok(shell_job_root_dir()?.join("recovery-obligations.json"))
+}
+
+/// Writes the outstanding-obligation ledger, preserving `first_observed_at`
+/// from any prior generation so a long-lived obligation reports its true age
+/// rather than resetting on every restart.
+fn record_shell_job_recovery_obligations(
+    readback: &ShellJobCorruptRecoveryReadback,
+) -> Option<String> {
+    let path = match shell_job_recovery_obligations_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_PATH_FAILED",
+                detail = %error.message,
+                "could not resolve the durable shell-job recovery obligations ledger path"
+            );
+            return None;
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let first_observed_at = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("first_observed_at")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| now.clone());
+    let payload = json!({
+        "schema_version": 1,
+        "first_observed_at": first_observed_at,
+        "last_observed_at": now,
+        "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
+        "outstanding": {
+            "retained_unverifiable_remote_jobs": readback.retained_unverifiable_remote_jobs,
+            "retained_future_schema_jobs": readback.retained_future_schema_jobs,
+            "unexpected_job_root_entries": readback.unexpected_job_root_entries,
+            "skipped_concurrently_mutated": readback.skipped_concurrently_mutated,
+            "recovery_failures": readback.recovery_failures,
+        },
+        "readback": readback,
+        "remediation": "each obligation is retried on every daemon start. Inspect the M4_SHELL_JOB_STARTUP_* events for the exact job ids and paths. Evidence is retained untouched: nothing here is deleted, quarantined, or signalled without proven remote ownership.",
+    });
+    let bytes = match serde_json::to_vec_pretty(&payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_ENCODE_FAILED",
+                detail = %error,
+                "could not encode the durable shell-job recovery obligations ledger"
+            );
+            return None;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        tracing::error!(
+            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_WRITE_FAILED",
+            path = %path_string(&path),
+            detail = %error,
+            "could not create the directory for the shell-job recovery obligations ledger"
+        );
+        return None;
+    }
+    if let Err(error) = fs::write(&path, &bytes) {
+        tracing::error!(
+            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_WRITE_FAILED",
+            path = %path_string(&path),
+            detail = %error,
+            "could not write the shell-job recovery obligations ledger"
+        );
+        return None;
+    }
+    // Independent readback: the ledger is only reported as written once its
+    // bytes have been reread from the filesystem and matched.
+    match fs::read(&path) {
+        Ok(readback_bytes) if readback_bytes == bytes => Some(path_string(&path)),
+        Ok(readback_bytes) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_READBACK_MISMATCH",
+                path = %path_string(&path),
+                wrote_bytes = bytes.len(),
+                read_bytes = readback_bytes.len(),
+                "the shell-job recovery obligations ledger did not read back the bytes just written"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_READBACK_FAILED",
+                path = %path_string(&path),
+                detail = %error,
+                "could not reread the shell-job recovery obligations ledger after writing it"
+            );
+            None
+        }
+    }
+}
+
+/// Removes the ledger once a startup pass proved every disposition. Absence of
+/// the file is the assertion "nothing outstanding".
+fn clear_shell_job_recovery_obligations() {
+    let Ok(path) = shell_job_recovery_obligations_path() else {
+        return;
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => tracing::info!(
+            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_CLEARED",
+            path = %path_string(&path),
+            "every durable shell-job recovery obligation was discharged; cleared the outstanding ledger"
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => tracing::error!(
+            code = "M4_SHELL_JOB_RECOVERY_OBLIGATIONS_CLEAR_FAILED",
+            path = %path_string(&path),
+            detail = %error,
+            "could not clear the discharged shell-job recovery obligations ledger"
+        ),
+    }
+}
+
+/// Health-surface read of the outstanding-obligation ledger. `Ok(None)` means
+/// the ledger is absent, i.e. nothing outstanding. An unreadable or malformed
+/// ledger is an error, never silently treated as "nothing outstanding".
+pub fn read_shell_job_recovery_obligations() -> Result<Option<Value>, ErrorData> {
+    let path = shell_job_recovery_obligations_path()?;
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map(Some)
+            .map_err(|error| {
+                shell_tool_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "durable shell-job recovery obligations ledger is not valid JSON: {error}"
+                    ),
+                    json!({
+                        "code": error_codes::STORAGE_READ_FAILED,
+                        "path": path,
+                        "reason": "shell_job_recovery_obligations_decode_failed",
+                    }),
+                )
+            }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("durable shell-job recovery obligations ledger could not be read: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "path": path,
+                "reason": "shell_job_recovery_obligations_read_failed",
+            }),
+        )),
+    }
 }
 
 /// Fail-closed inventory consumed by the planned host-transition authorization
@@ -14482,6 +14701,20 @@ fn shell_status_replace_in_flight(path: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Extracts only `schema_version` from raw status bytes, tolerating every other
+/// field being unknown or malformed to this binary. Returns `None` when the
+/// bytes are not JSON at all or carry no usable `schema_version`, which is
+/// itself evidence of genuine corruption rather than schema drift.
+fn peek_shell_job_status_schema_version(bytes: &[u8]) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct SchemaVersionPeek {
+        schema_version: u32,
+    }
+    serde_json::from_slice::<SchemaVersionPeek>(bytes)
+        .ok()
+        .map(|peek| peek.schema_version)
+}
+
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
     let bytes = read_shell_status_bytes(path).map_err(|error| {
         let code = if error.kind() == io::ErrorKind::NotFound {
@@ -14506,17 +14739,62 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
         )
     })?;
     let mut job: ActRunShellJobStatus = serde_json::from_slice(&bytes).map_err(|error| {
-        shell_tool_error(
+        // Classify the failure before reporting it. A record written by a NEWER
+        // daemon is intact evidence this binary simply cannot interpret; a
+        // record at or below this binary's schema that still fails to decode is
+        // genuine corruption. Collapsing the two let a schema change turn every
+        // pre-existing record into "corrupt" and brick startup (#1858).
+        let peeked = peek_shell_job_status_schema_version(&bytes);
+        match peeked {
+            Some(version) if version > SHELL_JOB_STATUS_SCHEMA_VERSION => shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "act_run_shell job status was written by a newer daemon (record schema_version={version}, this binary reads up to {SHELL_JOB_STATUS_SCHEMA_VERSION}) and cannot be interpreted: {error}"
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "job_id": job_id,
+                    "path": path,
+                    "reason": "job_status_future_schema",
+                    "record_schema_version": version,
+                    "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
+                    "remediation": "run a daemon build at or above the record's schema version; this record is intact and must not be quarantined, rewritten, or deleted by an older binary",
+                }),
+            ),
+            _ => shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!("act_run_shell job status JSON is invalid: {error}"),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "job_id": job_id,
+                    "path": path,
+                    "reason": "job_status_decode_failed",
+                    "record_schema_version": peeked,
+                    "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
+                }),
+            ),
+        }
+    })?;
+    if job.schema_version > SHELL_JOB_STATUS_SCHEMA_VERSION {
+        // Structurally decodable but self-declared newer: refuse to interpret
+        // it rather than act on fields whose meaning may have changed.
+        return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
-            format!("act_run_shell job status JSON is invalid: {error}"),
+            format!(
+                "act_run_shell job status declares schema_version={} but this binary reads up to {SHELL_JOB_STATUS_SCHEMA_VERSION}",
+                job.schema_version
+            ),
             json!({
                 "code": error_codes::STORAGE_READ_FAILED,
                 "job_id": job_id,
                 "path": path,
-                "reason": "job_status_decode_failed",
+                "reason": "job_status_future_schema",
+                "record_schema_version": job.schema_version,
+                "reader_schema_version": SHELL_JOB_STATUS_SCHEMA_VERSION,
+                "remediation": "run a daemon build at or above the record's schema version; this record is intact and must not be quarantined, rewritten, or deleted by an older binary",
             }),
-        )
-    })?;
+        ));
+    }
     if job.job_id != job_id {
         return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
@@ -18769,7 +19047,7 @@ fn shell_job_status_record(
     context: Option<&ShellExecutionContext>,
 ) -> ActRunShellJobStatus {
     let status = ActRunShellJobStatus {
-        schema_version: 4,
+        schema_version: SHELL_JOB_STATUS_SCHEMA_VERSION,
         job_id: job_id.to_owned(),
         session_id: context.map(|context| context.session_id().to_owned()),
         status: status.to_owned(),

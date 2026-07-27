@@ -39,8 +39,9 @@ pub use budget::{
 pub use budgeted_backend::VramBudgetedCudaBackend;
 pub use host_reservation::{
     DEFAULT_HOST_CAP_MIB, DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
-    HOST_RESERVATION_ROOT_ENV, HostGpuReservation, HostGpuReservationRequest,
-    HostGpuReservationSnapshot, HostGpuReservationStore, HostGpuReservationView,
+    HOST_RESERVATION_ROOT_ENV, HostCudaDeviceVerdict, HostGpuReservation,
+    HostGpuReservationRequest, HostGpuReservationSnapshot, HostGpuReservationStore,
+    HostGpuReservationView, PhysicalGpuDevice, probe_host_cuda_device,
 };
 pub use lru_evict::{
     BlockDeallocator, BlockId, BlockKind, DevicePtr, GpuBlockRegistry, GpuBlockStats,

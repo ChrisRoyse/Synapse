@@ -14,6 +14,14 @@ path = "src/main.rs"
 name = "synapse-chrome-native-host"
 path = "src/bin/synapse-chrome-native-host.rs"
 
+[features]
+# Compiles the Calyx CUDA kernels into the daemon. Off by default because
+# calyx-forge's build script requires a CUDA 13.3 toolkit (#1859);
+# scripts/synapse-setup.ps1 turns it on only after proving this host has both an
+# NVIDIA device and nvcc.
+default = []
+calyx-cuda = ["synapse-calyx/calyx-cuda"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

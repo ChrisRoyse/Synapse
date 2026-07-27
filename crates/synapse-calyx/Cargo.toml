@@ -7,7 +7,18 @@ license-file.workspace = true
 repository.workspace = true
 
 [features]
-default = ["calyx-cuda"]
+# CUDA kernel compilation is NOT a default. `calyx-forge`'s build script shells
+# out to `nvcc` from a CUDA 13.3 toolkit, so making it default made every
+# `cargo build -p synapse-mcp` physically impossible on any host without that
+# toolkit installed -- including hosts with no NVIDIA device at all, where the
+# compiled kernels could never run. Acceleration is a host capability, so it is
+# selected at build time by evidence (scripts/synapse-setup.ps1 detects the
+# NVIDIA driver plus nvcc and passes `--features calyx-cuda`).
+#
+# This is not a silent CPU fallback: a build without this feature still refuses
+# `math_backend="cuda"`, and `math_backend="auto"` only resolves to CPU after
+# NVML proves this host has no CUDA device (see src/math.rs).
+default = []
 calyx-cuda = ["calyx-forge/cuda"]
 
 [dependencies]

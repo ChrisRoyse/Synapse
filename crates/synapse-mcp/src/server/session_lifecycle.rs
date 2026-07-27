@@ -354,6 +354,14 @@ pub struct SessionCdpCleanupReport {
     pub stale_prior_session_owner_reclaimed: usize,
     pub persisted_rows_deleted: usize,
     pub failed: usize,
+    /// Closes refused because operator panic disabled mutation admission
+    /// (#1801). Counted inside `failed`: this is a fail-closed retention, not a
+    /// success, and the owner row is kept for retry once panic clears.
+    pub operator_panic_refused: usize,
+    /// Closes not attempted this pass because a live operator-panic backoff
+    /// makes the attempt deterministically refusable. Also counted inside
+    /// `failed` so no caller can read a deferral as progress.
+    pub operator_panic_deferred: usize,
     pub target_ids: Vec<String>,
     pub error_messages: Vec<String>,
 }
@@ -2349,6 +2357,21 @@ async fn cleanup_session_cdp_targets(
         ..SessionCdpCleanupReport::default()
     };
     for (owner_key, owner) in owned {
+        // #1801: an operator-panic-refused close is deterministically refused
+        // until panic clears, so probing it every 250 ms produced ~30.4k
+        // ERROR/day carrying no new information. Defer the attempt while its
+        // backoff is live. This never changes the disposition: the owner row is
+        // retained exactly as before and teardown still reports failure.
+        let backoff_key = operator_panic_backoff_key(session_id, &owner_key, &owner.cdp_target_id);
+        if let Some(remaining) = operator_panic_close_deferred(&backoff_key) {
+            report.failed = report.failed.saturating_add(1);
+            report.operator_panic_deferred = report.operator_panic_deferred.saturating_add(1);
+            report.error_messages.push(format!(
+                "CDP close deferred by operator-panic backoff for {}ms; owner row retained (fail-closed)",
+                remaining.as_millis()
+            ));
+            continue;
+        }
         match close_cdp_target_for_cleanup(&owner.cdp_target_id, &owner).await {
             Ok(close_outcome) => {
                 match super::session_continuity::delete_persisted_cdp_target_owner_row(
@@ -2392,6 +2415,20 @@ async fn cleanup_session_cdp_targets(
                             report.stale_prior_session_owner_reclaimed.saturating_add(1);
                     }
                 }
+                // Resolved: drop any operator-panic backoff and record the
+                // transition out of refusal with its exact cost (#1801).
+                if let Some((refusals, elapsed)) = clear_operator_panic_close_backoff(&backoff_key)
+                {
+                    tracing::info!(
+                        code = "MCP_SESSION_CDP_OPERATOR_PANIC_REFUSAL_RESOLVED",
+                        session_id,
+                        cdp_target_id = %owner.cdp_target_id,
+                        close_outcome = close_outcome.as_str(),
+                        total_refusals = refusals,
+                        refused_for_ms = elapsed.as_millis() as u64,
+                        "CDP close succeeded after operator-panic mutation admission was restored"
+                    );
+                }
                 tracing::info!(
                     code = "MCP_SESSION_CDP_TARGET_CLEANUP",
                     session_id,
@@ -2405,15 +2442,55 @@ async fn cleanup_session_cdp_targets(
             Err(detail) => {
                 report.failed = report.failed.saturating_add(1);
                 report.error_messages.push(detail.clone());
-                tracing::error!(
-                    code = error_codes::A11Y_CDP_AXTREE_FAILED,
-                    session_id,
-                    hwnd = owner.window_hwnd,
-                    endpoint = %owner.endpoint,
-                    cdp_target_id = %owner.cdp_target_id,
-                    detail = %detail,
-                    "session lifecycle removed CDP owner but failed to close target"
-                );
+                #[cfg(windows)]
+                let panic_refused = chrome_bridge_close_refused_by_operator_panic(&detail);
+                #[cfg(not(windows))]
+                let panic_refused = false;
+                if panic_refused {
+                    // Fail-closed disposition is unchanged: the tab may still be
+                    // open, the owner row is retained, and teardown reports
+                    // failure. Only the LOG is transition-based (#1801).
+                    report.operator_panic_refused = report.operator_panic_refused.saturating_add(1);
+                    let (should_log, refusals, suppressed, elapsed) =
+                        note_operator_panic_close_refusal(&backoff_key);
+                    if should_log {
+                        tracing::error!(
+                            code = error_codes::A11Y_CDP_AXTREE_FAILED,
+                            session_id,
+                            hwnd = owner.window_hwnd,
+                            endpoint = %owner.endpoint,
+                            cdp_target_id = %owner.cdp_target_id,
+                            refusal_kind = "operator_panic_mutation_admission_disabled",
+                            consecutive_refusals = refusals,
+                            suppressed_since_last_log = suppressed,
+                            refused_for_ms = elapsed.as_millis() as u64,
+                            detail = %detail,
+                            "session lifecycle could not close CDP target: operator panic has mutation admission disabled; owner row retained (fail-closed) and retried with backoff until panic clears"
+                        );
+                    }
+                } else {
+                    if let Some((refusals, elapsed)) =
+                        clear_operator_panic_close_backoff(&backoff_key)
+                    {
+                        tracing::info!(
+                            code = "MCP_SESSION_CDP_OPERATOR_PANIC_REFUSAL_CHANGED",
+                            session_id,
+                            cdp_target_id = %owner.cdp_target_id,
+                            prior_consecutive_refusals = refusals,
+                            refused_for_ms = elapsed.as_millis() as u64,
+                            "CDP close stopped being refused by operator panic and now fails for a different reason"
+                        );
+                    }
+                    tracing::error!(
+                        code = error_codes::A11Y_CDP_AXTREE_FAILED,
+                        session_id,
+                        hwnd = owner.window_hwnd,
+                        endpoint = %owner.endpoint,
+                        cdp_target_id = %owner.cdp_target_id,
+                        detail = %detail,
+                        "session lifecycle removed CDP owner but failed to close target"
+                    );
+                }
             }
         }
     }
@@ -2557,6 +2634,134 @@ fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> b
         && detail.contains(target_id)
         && detail.contains("chrome.tabs tab id")
         && detail.contains("did not match")
+}
+
+/// Recognises the extension's operator-panic mutation-admission refusal (#1801).
+///
+/// This refusal is a GENUINE fail-closed retention: operator panic disabled
+/// mutation admission, the tab may well still be open, and the owner row must
+/// be kept so teardown is retried once panic clears. It is deliberately NOT a
+/// terminal outcome and is never reclassified as success. It is recognised only
+/// so the sweep can stop hammering an action whose precondition is currently
+/// unsatisfiable, and stop logging an expected steady state at ERROR cadence.
+///
+/// The stale-prior-browser-session variant carries its own continuity markers
+/// and is classified terminal elsewhere, so exclude it here.
+#[cfg(windows)]
+fn chrome_bridge_close_refused_by_operator_panic(detail: &str) -> bool {
+    detail.contains("refusing closeTab")
+        && detail.contains("operator panic disabled extension mutation admission")
+        && !chrome_bridge_close_refused_for_stale_prior_browser_session(detail)
+}
+
+/// Per-target state for an operator-panic-blocked CDP close (#1801).
+///
+/// The 250 ms stale-session sweep previously re-attempted a deterministically
+/// refused close on every tick and logged each refusal at ERROR (~30.4k/day on
+/// 2026-07-23). Both halves were wrong for the same reason: the refusal is a
+/// function of a global operator-panic condition that cannot change between
+/// ticks, so neither the attempt nor the log carried new information.
+///
+/// The fix is to report state TRANSITIONS and to back off between probes, while
+/// keeping the refusal fully visible: the first refusal still logs at ERROR, a
+/// periodic roll-up keeps the condition and its exact duration/attempt counts
+/// observable, and clearing logs an explicit resolution.
+#[derive(Debug)]
+struct OperatorPanicCloseBackoff {
+    first_refused_at: Instant,
+    refusals: u64,
+    suppressed_since_last_log: u64,
+    last_logged_at: Instant,
+    next_attempt_at: Instant,
+    backoff: Duration,
+}
+
+/// First retry delay after an operator-panic refusal. Equal to one sweep tick,
+/// so the very next tick still probes once before backing off.
+const OPERATOR_PANIC_CLOSE_BACKOFF_MIN: Duration = Duration::from_millis(250);
+/// Ceiling on the retry delay. Panic clears are operator-driven and rare, so a
+/// bounded 30 s probe keeps recovery prompt without a per-tick storm.
+const OPERATOR_PANIC_CLOSE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How often a still-refusing target re-logs, as a roll-up carrying the exact
+/// suppressed count and elapsed duration.
+const OPERATOR_PANIC_CLOSE_ROLLUP_INTERVAL: Duration = Duration::from_mins(5);
+
+static OPERATOR_PANIC_CLOSE_BACKOFFS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, OperatorPanicCloseBackoff>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn operator_panic_backoff_key(session_id: &str, owner_key: &str, target_id: &str) -> String {
+    format!("{session_id}|{owner_key}|{target_id}")
+}
+
+/// Whether this target's close attempt is currently deferred by backoff.
+///
+/// A poisoned lock returns `false` (attempt anyway): degrading to the old
+/// always-attempt behaviour is correct, because skipping a close on the basis
+/// of unreadable state would be the one outcome that could strand a tab.
+fn operator_panic_close_deferred(key: &str) -> Option<Duration> {
+    let guard = OPERATOR_PANIC_CLOSE_BACKOFFS.lock().ok()?;
+    let entry = guard.get(key)?;
+    let now = Instant::now();
+    (entry.next_attempt_at > now).then(|| entry.next_attempt_at.duration_since(now))
+}
+
+/// Records one operator-panic refusal and returns whether the caller should log
+/// it, plus the roll-up counters when it should.
+fn note_operator_panic_close_refusal(key: &str) -> (bool, u64, u64, Duration) {
+    let now = Instant::now();
+    let Ok(mut guard) = OPERATOR_PANIC_CLOSE_BACKOFFS.lock() else {
+        // Unreadable state: log it. Never silently drop a fail-closed refusal.
+        return (true, 1, 0, Duration::ZERO);
+    };
+    match guard.get_mut(key) {
+        None => {
+            guard.insert(
+                key.to_owned(),
+                OperatorPanicCloseBackoff {
+                    first_refused_at: now,
+                    refusals: 1,
+                    suppressed_since_last_log: 0,
+                    last_logged_at: now,
+                    next_attempt_at: now + OPERATOR_PANIC_CLOSE_BACKOFF_MIN,
+                    backoff: OPERATOR_PANIC_CLOSE_BACKOFF_MIN,
+                },
+            );
+            (true, 1, 0, Duration::ZERO)
+        }
+        Some(entry) => {
+            entry.refusals = entry.refusals.saturating_add(1);
+            entry.backoff = (entry.backoff * 2).min(OPERATOR_PANIC_CLOSE_BACKOFF_MAX);
+            entry.next_attempt_at = now + entry.backoff;
+            if now.duration_since(entry.last_logged_at) >= OPERATOR_PANIC_CLOSE_ROLLUP_INTERVAL {
+                let suppressed = entry.suppressed_since_last_log;
+                entry.suppressed_since_last_log = 0;
+                entry.last_logged_at = now;
+                (
+                    true,
+                    entry.refusals,
+                    suppressed,
+                    now.duration_since(entry.first_refused_at),
+                )
+            } else {
+                entry.suppressed_since_last_log = entry.suppressed_since_last_log.saturating_add(1);
+                (
+                    false,
+                    entry.refusals,
+                    entry.suppressed_since_last_log,
+                    now.duration_since(entry.first_refused_at),
+                )
+            }
+        }
+    }
+}
+
+/// Clears backoff state once this target stops being panic-refused, returning
+/// the total refusal count and elapsed duration for an explicit resolution log.
+fn clear_operator_panic_close_backoff(key: &str) -> Option<(u64, Duration)> {
+    let mut guard = OPERATOR_PANIC_CLOSE_BACKOFFS.lock().ok()?;
+    let entry = guard.remove(key)?;
+    Some((entry.refusals, entry.first_refused_at.elapsed()))
 }
 
 /// Terminal-refusal classifier for the 2026-07-23 session-leak livelock: the

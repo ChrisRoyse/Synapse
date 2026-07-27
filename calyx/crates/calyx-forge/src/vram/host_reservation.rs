@@ -45,6 +45,98 @@ pub const HOST_CAP_MIB_ENV: &str = "CALYX_GPU_HOST_CAP_MIB";
 /// Overrides the host ledger directory.
 pub const HOST_RESERVATION_ROOT_ENV: &str = "CALYX_GPU_RESERVATION_ROOT";
 
+/// Physical NVIDIA device readback taken through NVML.
+///
+/// Deliberately available whether or not the `cuda` feature is compiled in:
+/// NVML lives in the display driver, not the CUDA toolkit, so a build without
+/// CUDA kernels can still prove whether this host physically has a CUDA device.
+/// Callers use that distinction to separate "this binary has no CUDA compiled
+/// in" (a deployment error on a GPU host) from "this host has no CUDA device"
+/// (the only correct answer is CPU).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PhysicalGpuDevice {
+    pub device_index: u32,
+    pub uuid: String,
+    pub name: String,
+    pub total_mib: u64,
+    pub free_mib: u64,
+}
+
+/// Outcome of a host CUDA-device probe.
+///
+/// The three arms are deliberately distinct: "we proved there is no device" and
+/// "we could not tell" must never collapse into one another, because callers
+/// use `Absent` to justify selecting CPU math and uncertainty is not evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum HostCudaDeviceVerdict {
+    /// NVML read this exact device.
+    Present(PhysicalGpuDevice),
+    /// NVML proved this host has no usable CUDA device: either the NVIDIA
+    /// display driver (which owns NVML) is not installed, or it reports fewer
+    /// devices than `device_index + 1`.
+    Absent { basis: String },
+    /// NVML says devices exist but this exact device could not be read. The
+    /// host may well be CUDA-capable; the probe simply failed.
+    Indeterminate { basis: String },
+}
+
+/// Probes device `device_index` through NVML and classifies the result.
+///
+/// Available whether or not the `cuda` feature is compiled in, because NVML
+/// ships in the NVIDIA display driver rather than the CUDA toolkit.
+#[must_use]
+pub fn probe_host_cuda_device(device_index: u32) -> HostCudaDeviceVerdict {
+    let library = if cfg!(windows) {
+        "nvml.dll"
+    } else {
+        "libnvidia-ml.so.1"
+    };
+    let nvml = match nvml_wrapper::Nvml::builder()
+        .lib_path(std::ffi::OsStr::new(library))
+        .init()
+    {
+        Ok(nvml) => nvml,
+        Err(error) => {
+            return HostCudaDeviceVerdict::Absent {
+                basis: format!(
+                    "NVML init failed loading {library}: {error}; the NVIDIA display driver that owns NVML is not present on this host, so it has no usable CUDA device"
+                ),
+            };
+        }
+    };
+    let count = match nvml.device_count() {
+        Ok(count) => count,
+        Err(error) => {
+            return HostCudaDeviceVerdict::Indeterminate {
+                basis: format!(
+                    "NVML loaded from {library} but device_count() failed: {error}; device presence is unproven"
+                ),
+            };
+        }
+    };
+    if count <= device_index {
+        return HostCudaDeviceVerdict::Absent {
+            basis: format!(
+                "NVML loaded from {library} and reports device_count={count}, so device index {device_index} does not exist on this host"
+            ),
+        };
+    }
+    match read_physical_device(device_index) {
+        Ok(device) => HostCudaDeviceVerdict::Present(PhysicalGpuDevice {
+            device_index,
+            uuid: device.uuid,
+            name: device.name,
+            total_mib: device.total_mib,
+            free_mib: device.free_mib,
+        }),
+        Err(error) => HostCudaDeviceVerdict::Indeterminate {
+            basis: format!(
+                "NVML reports device_count={count} but reading device {device_index} failed: {error}"
+            ),
+        },
+    }
+}
+
 /// Immutable request for one host reservation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostGpuReservationRequest {

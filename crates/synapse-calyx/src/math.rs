@@ -2,15 +2,19 @@ use std::fmt;
 
 use calyx_forge::{
     Backend, CUDA_COMPILED, CpuBackend, DeviceInfo, ForgeError, HostGpuReservation,
-    HostGpuReservationRequest, HostGpuReservationSnapshot, HostGpuReservationStore, VramStats,
+    HostGpuReservationSnapshot, VramStats,
 };
+// Host GPU admission is only exercised by the CUDA runtime candidate.
 #[cfg(feature = "calyx-cuda")]
-use calyx_forge::{CudaBackend, VramBudgetedCudaBackend};
+use calyx_forge::{
+    CudaBackend, HostGpuReservationRequest, HostGpuReservationStore, VramBudgetedCudaBackend,
+};
 use serde::Serialize;
 
 use crate::{SynapseCalyxError, SynapseCalyxMathBackend, SynapseCalyxTuningConfig};
 
 const MATH_BACKEND_REMEDIATION: &str = "inspect the SYNAPSE_CALYX_MATH_* structured events, health payload, CUDA driver state, and Calyx Forge error; use math_backend=\"cpu\" only when intentionally forcing CPU";
+#[cfg(feature = "calyx-cuda")]
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 // CUDA context/module initialization is not routed through Forge's dispatch
 // allocator, so it needs a conservative, declared host-wide envelope for its
@@ -19,7 +23,9 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 // changed by unrelated desktop GPU clients and therefore cannot prove a safe
 // smaller claim. This envelope is intentionally independent from the maximum
 // runtime dispatch budget: each dispatch still reserves its exact buffer shape.
+#[cfg(feature = "calyx-cuda")]
 const CUDA_STARTUP_ENVELOPE_MIB: u64 = 4 * 1024;
+#[cfg(feature = "calyx-cuda")]
 const CUDA_REPLACEMENT_RESERVATION_ENV: &str = "SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID";
 const PROBE_TOLERANCE: f32 = 0.0001;
 const PROBE_DIM: usize = 3;
@@ -274,7 +280,18 @@ pub fn math_backend(
     }
 }
 
+/// Whether an error is positive proof that this host has no CUDA device — the
+/// only justification for `math_backend="auto"` resolving to CPU.
+///
+/// `SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT` is matched by code because the
+/// non-CUDA build raises it only after an NVML probe classified the host as
+/// device-absent. Probe malfunctions raise
+/// `SYNAPSE_CALYX_MATH_CUDA_DEVICE_INDETERMINATE` instead and deliberately do
+/// NOT match here: uncertainty is not evidence.
 fn error_proves_cuda_absent(error: &SynapseCalyxError) -> bool {
+    if error.code == "SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT" {
+        return true;
+    }
     let detail = error.message.to_ascii_lowercase();
     detail.contains("cuda_error_no_device")
         || detail.contains("no cuda-capable device is detected")
@@ -521,16 +538,47 @@ fn cleanup_optional_host_reservation_after_startup_failure(
     }
 }
 
+/// CUDA kernels are not compiled into this binary. That alone does not decide
+/// the outcome: the answer depends on whether this HOST physically has a CUDA
+/// device, which NVML can prove independently of the CUDA toolkit because it
+/// ships in the display driver.
+///
+///   * device present  -> hard failure. A CUDA-capable host running a CPU-only
+///     binary is a deployment error that must be surfaced, never absorbed.
+///   * device absent    -> `SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT`, which
+///     `error_proves_cuda_absent` recognises, so `math_backend="auto"` resolves
+///     to CPU on physical evidence and records the basis. Explicit
+///     `math_backend="cuda"` still fails.
+///   * probe malfunction -> hard failure. Uncertainty is never treated as absence.
 #[cfg(not(feature = "calyx-cuda"))]
 fn cuda_runtime_candidate(
     _config: &SynapseCalyxTuningConfig,
     _cpu_readback: CpuReadback,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
-    Err(SynapseCalyxError::new(
-        "SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED",
-        "the selected auto/cuda path requires a CUDA-enabled synapse-calyx build; CPU execution is available only through the explicit math_backend=\"cpu\" selection",
-        MATH_BACKEND_REMEDIATION,
-    ))
+    match calyx_forge::probe_host_cuda_device(0) {
+        calyx_forge::HostCudaDeviceVerdict::Present(device) => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED",
+            format!(
+                "this host exposes CUDA device 0 (name={}, uuid={}, total_mib={}) but this synapse-calyx build has no CUDA kernels compiled in; rebuild with --features calyx-cuda (a CUDA 13.3 toolkit must be installed so calyx-forge can run nvcc), or select math_backend=\"cpu\" explicitly to accept CPU math on a GPU host",
+                device.name, device.uuid, device.total_mib
+            ),
+            MATH_BACKEND_REMEDIATION,
+        )),
+        calyx_forge::HostCudaDeviceVerdict::Absent { basis } => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT",
+            format!(
+                "this synapse-calyx build has no CUDA kernels compiled in and NVML proved this host has no CUDA device: {basis}"
+            ),
+            MATH_BACKEND_REMEDIATION,
+        )),
+        calyx_forge::HostCudaDeviceVerdict::Indeterminate { basis } => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_CUDA_DEVICE_INDETERMINATE",
+            format!(
+                "this synapse-calyx build has no CUDA kernels compiled in and the NVML device probe could not prove whether this host has a CUDA device: {basis}"
+            ),
+            MATH_BACKEND_REMEDIATION,
+        )),
+    }
 }
 
 fn runtime_from_backend<B>(
