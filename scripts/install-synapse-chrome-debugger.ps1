@@ -78,6 +78,133 @@ function Get-SynapseSha256HexLower {
     }
 }
 
+function Test-SynapseByteArrayExactEqual {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Left,
+        [Parameter(Mandatory = $true)][byte[]]$Right
+    )
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Length; $index += 1) {
+        if ($Left[$index] -ne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Read-SynapseUtf8FileStrict {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "SYNAPSE_CHROME_UTF8_SOURCE_MISSING path=$Path remediation=restore the required Chrome bridge artifact and retry"
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+    } catch {
+        throw "SYNAPSE_CHROME_UTF8_SOURCE_READ_FAILED path=$Path error=$($_.Exception.Message) remediation=verify the Chrome bridge artifact is readable and retry"
+    }
+    if (
+        $bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF
+    ) {
+        throw "SYNAPSE_CHROME_UTF8_BOM_FORBIDDEN path=$Path byte_length=$($bytes.Length) remediation=store service_worker.js as canonical UTF-8 without a byte-order mark"
+    }
+    $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        $text = $utf8Strict.GetString($bytes)
+    } catch [System.Text.DecoderFallbackException] {
+        throw "SYNAPSE_CHROME_UTF8_INVALID path=$Path byte_length=$($bytes.Length) error=$($_.Exception.Message) remediation=repair service_worker.js as valid UTF-8 without lossy replacement characters"
+    }
+    [pscustomobject]@{
+        bytes = $bytes
+        text = $text
+        byte_length = $bytes.Length
+        sha256 = Get-SynapseSha256HexLower -Bytes $bytes
+    }
+}
+
+function Write-SynapseFileBytesAtomic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][byte[]]$ExpectedBytes
+    )
+    $destination = [System.IO.Path]::GetFullPath($Path)
+    $parent = [System.IO.Path]::GetDirectoryName($destination)
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "SYNAPSE_CHROME_ATOMIC_REPLACE_PARENT_MISSING path=$destination parent=$parent remediation=create and verify the stable extension directory before injecting its host-local credential"
+    }
+    $targetExisted = Test-Path -LiteralPath $destination -PathType Leaf
+    $tempName = '.{0}.synapse-{1}.tmp' -f [System.IO.Path]::GetFileName($destination), ([Guid]::NewGuid().ToString('N'))
+    $tempPath = Join-Path $parent $tempName
+    $backupPath = $null
+    try {
+        [System.IO.File]::WriteAllBytes($tempPath, $ExpectedBytes)
+        $tempReadback = [System.IO.File]::ReadAllBytes($tempPath)
+        if (-not (Test-SynapseByteArrayExactEqual -Left $ExpectedBytes -Right $tempReadback)) {
+            throw "SYNAPSE_CHROME_ATOMIC_STAGE_READBACK_MISMATCH path=$tempPath expected_length=$($ExpectedBytes.Length) actual_length=$($tempReadback.Length)"
+        }
+        if ($targetExisted) {
+            # Windows PowerShell 5.1's overload binder does not reliably pass
+            # `$null` as File.Replace's optional backup path. Use an exact,
+            # same-directory backup so the destination update remains atomic
+            # and the previous bytes remain available until readback succeeds.
+            $backupName = '.{0}.synapse-backup-{1}.tmp' -f [System.IO.Path]::GetFileName($destination), ([Guid]::NewGuid().ToString('N'))
+            $backupPath = Join-Path $parent $backupName
+            [System.IO.File]::Replace($tempPath, $destination, $backupPath, $true)
+        } else {
+            # A same-volume rename publishes a first deployment atomically.
+            [System.IO.File]::Move($tempPath, $destination)
+        }
+    } catch {
+        $backupState = if ($null -ne $backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+            "present:$backupPath"
+        } else {
+            'absent'
+        }
+        throw "SYNAPSE_CHROME_ATOMIC_REPLACE_FAILED path=$destination target_existed=$targetExisted temp_path=$tempPath backup_state=$backupState error=$($_.Exception.Message) remediation=verify the stable extension directory is writable and supports same-directory atomic replacement; if backup_state is present, preserve the named backup for exact recovery"
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            try {
+                [System.IO.File]::Delete($tempPath)
+            } catch {
+                throw "SYNAPSE_CHROME_ATOMIC_STAGE_CLEANUP_FAILED temp_path=$tempPath error=$($_.Exception.Message) remediation=remove only the named temporary file after confirming it is not the deployed worker, then retry"
+            }
+            if (Test-Path -LiteralPath $tempPath) {
+                throw "SYNAPSE_CHROME_ATOMIC_STAGE_CLEANUP_UNVERIFIED temp_path=$tempPath remediation=remove only the named temporary file after confirming it is not the deployed worker, then retry"
+            }
+        }
+    }
+    $actualBytes = [System.IO.File]::ReadAllBytes($destination)
+    if (-not (Test-SynapseByteArrayExactEqual -Left $ExpectedBytes -Right $actualBytes)) {
+        $backupState = if ($null -ne $backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+            "present:$backupPath"
+        } else {
+            'absent'
+        }
+        throw "SYNAPSE_CHROME_ATOMIC_REPLACE_READBACK_MISMATCH path=$destination backup_state=$backupState expected_length=$($ExpectedBytes.Length) actual_length=$($actualBytes.Length) expected_sha256=$(Get-SynapseSha256HexLower -Bytes $ExpectedBytes) actual_sha256=$(Get-SynapseSha256HexLower -Bytes $actualBytes) remediation=the deployed worker bytes changed after atomic replacement; preserve any named backup and refuse to load the extension"
+    }
+    if ($null -ne $backupPath -and (Test-Path -LiteralPath $backupPath)) {
+        try {
+            [System.IO.File]::Delete($backupPath)
+        } catch {
+            throw "SYNAPSE_CHROME_ATOMIC_BACKUP_CLEANUP_FAILED backup_path=$backupPath error=$($_.Exception.Message) remediation=remove only the named backup after confirming the deployed worker hash matches the expected hash"
+        }
+        if (Test-Path -LiteralPath $backupPath) {
+            throw "SYNAPSE_CHROME_ATOMIC_BACKUP_CLEANUP_UNVERIFIED backup_path=$backupPath remediation=remove only the named backup after confirming the deployed worker hash matches the expected hash"
+        }
+    }
+    [pscustomobject]@{
+        atomic_replace = $true
+        atomic_mode = if ($targetExisted) { 'replace_existing_with_backup' } else { 'move_new' }
+        byte_exact_readback = $true
+        byte_length = $actualBytes.Length
+        sha256 = Get-SynapseSha256HexLower -Bytes $actualBytes
+    }
+}
+
 function Get-SynapseChromeBridgeRegisterToken {
     param([Parameter(Mandatory = $true)][string]$BearerToken)
     $domainBytes = [System.Text.Encoding]::UTF8.GetBytes('synapse.chrome_bridge.register.v1')
@@ -102,25 +229,64 @@ function Get-SynapseChromeBridgeBearerToken {
     return $token
 }
 
-function Set-SynapseChromeBridgeRegisterToken {
+function New-SynapseChromeBridgeRegisterTokenDeployment {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ServiceWorkerPath,
+        [string]$SourceServiceWorkerPath,
         [Parameter(Mandatory = $true)]
         [string]$RegisterToken
     )
     if ($RegisterToken -notmatch '^[0-9a-f]{64}$') {
         throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_INVALID remediation=derived register token must be 64 lowercase hex chars"
     }
-    $text = Get-Content -Raw -LiteralPath $ServiceWorkerPath
-    $pattern = 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"[^"]*";'
-    if ($text -notmatch $pattern) {
-        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_PLACEHOLDER_MISSING path=$ServiceWorkerPath remediation=service_worker.js must declare BRIDGE_REGISTER_TOKEN so setup can inject the derived daemon registration credential"
+    $source = Read-SynapseUtf8FileStrict -Path $SourceServiceWorkerPath
+    $pattern = 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"";'
+    $matches = [System.Text.RegularExpressions.Regex]::Matches($source.text, $pattern)
+    if ($matches.Count -ne 1) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_PLACEHOLDER_COUNT_INVALID path=$SourceServiceWorkerPath count=$($matches.Count) remediation=service_worker.js must contain exactly one empty BRIDGE_REGISTER_TOKEN declaration; setup refuses ambiguous or already-stamped source bytes"
     }
     $replacement = 'const BRIDGE_REGISTER_TOKEN = "' + $RegisterToken + '";'
-    $updated = [System.Text.RegularExpressions.Regex]::Replace($text, $pattern, $replacement, 1)
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($ServiceWorkerPath, $updated, $encoding)
+    $updated = [System.Text.RegularExpressions.Regex]::Replace($source.text, $pattern, $replacement, 1)
+    $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+    $expectedBytes = $encoding.GetBytes($updated)
+    [pscustomobject]@{
+        expected_bytes = $expectedBytes
+        source_byte_length = $source.byte_length
+        source_sha256 = $source.sha256
+        expected_byte_length = $expectedBytes.Length
+        expected_sha256 = Get-SynapseSha256HexLower -Bytes $expectedBytes
+        placeholder_count = $matches.Count
+    }
+}
+
+function Set-SynapseChromeBridgeRegisterToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceWorkerPath,
+        [Parameter(Mandatory = $true)]
+        [object]$PreparedDeployment
+    )
+    $expectedBytes = [byte[]]$PreparedDeployment.expected_bytes
+    if ($expectedBytes.Length -le 0) {
+        throw "SYNAPSE_CHROME_BRIDGE_PREPARED_WORKER_EMPTY path=$ServiceWorkerPath remediation=prepare and validate the host-tokenized service worker before deploying it"
+    }
+    $expectedSha256 = Get-SynapseSha256HexLower -Bytes $expectedBytes
+    if ($expectedSha256 -ne [string]$PreparedDeployment.expected_sha256) {
+        throw "SYNAPSE_CHROME_BRIDGE_PREPARED_WORKER_HASH_MISMATCH path=$ServiceWorkerPath expected_sha256=$($PreparedDeployment.expected_sha256) actual_sha256=$expectedSha256 remediation=refuse deployment because prepared worker bytes changed in memory"
+    }
+    $writeReadback = Write-SynapseFileBytesAtomic -Path $ServiceWorkerPath -ExpectedBytes $expectedBytes
+    [pscustomobject]@{
+        source_byte_length = $PreparedDeployment.source_byte_length
+        source_sha256 = $PreparedDeployment.source_sha256
+        expected_byte_length = $PreparedDeployment.expected_byte_length
+        expected_sha256 = $PreparedDeployment.expected_sha256
+        placeholder_count = $PreparedDeployment.placeholder_count
+        atomic_replace = $writeReadback.atomic_replace
+        atomic_mode = $writeReadback.atomic_mode
+        byte_exact_readback = $writeReadback.byte_exact_readback
+        actual_byte_length = $writeReadback.byte_length
+        actual_sha256 = $writeReadback.sha256
+    }
 }
 
 function Assert-SynapseChromeBridgeRegisterTokenReadback {
@@ -128,13 +294,18 @@ function Assert-SynapseChromeBridgeRegisterTokenReadback {
         [Parameter(Mandatory = $true)]
         [string]$ServiceWorkerPath,
         [Parameter(Mandatory = $true)]
-        [string]$ExpectedRegisterToken
+        [string]$ExpectedRegisterToken,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedServiceWorkerSha256,
+        [Parameter(Mandatory = $true)]
+        [long]$ExpectedServiceWorkerByteLength
     )
-    $text = Get-Content -Raw -LiteralPath $ServiceWorkerPath
-    $match = [System.Text.RegularExpressions.Regex]::Match($text, 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"([^"]*)";')
-    if (-not $match.Success) {
-        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_READBACK_MISSING path=$ServiceWorkerPath remediation=deployed service_worker.js must contain exactly one BRIDGE_REGISTER_TOKEN declaration after setup injects the host-local credential"
+    $readback = Read-SynapseUtf8FileStrict -Path $ServiceWorkerPath
+    $matches = [System.Text.RegularExpressions.Regex]::Matches($readback.text, 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"([^"]*)";')
+    if ($matches.Count -ne 1) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_READBACK_COUNT_INVALID path=$ServiceWorkerPath count=$($matches.Count) remediation=deployed service_worker.js must contain exactly one BRIDGE_REGISTER_TOKEN declaration after setup injects the host-local credential"
     }
+    $match = $matches[0]
     $actual = [string]$match.Groups[1].Value
     $actualSha256 = if ($actual.Length -gt 0) {
         Get-SynapseSha256HexLower -Bytes ([System.Text.Encoding]::UTF8.GetBytes($actual))
@@ -145,10 +316,22 @@ function Assert-SynapseChromeBridgeRegisterTokenReadback {
     if ($actual -ne $ExpectedRegisterToken) {
         throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_READBACK_MISMATCH path=$ServiceWorkerPath actual_length=$($actual.Length) actual_sha256=$actualSha256 expected_length=$($ExpectedRegisterToken.Length) expected_sha256=$expectedSha256 remediation=setup copied or rewrote the unpacked extension without the derived daemon registration credential; rerun setup after verifying the deployed worker is writable"
     }
+    if ($ExpectedServiceWorkerSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "SYNAPSE_CHROME_BRIDGE_EXPECTED_WORKER_HASH_INVALID expected_sha256=$ExpectedServiceWorkerSha256 remediation=the atomic token injector must return a canonical lowercase SHA-256 before readback"
+    }
+    if ($readback.sha256 -ne $ExpectedServiceWorkerSha256) {
+        throw "SYNAPSE_CHROME_BRIDGE_WORKER_BYTE_READBACK_MISMATCH path=$ServiceWorkerPath expected_length=$ExpectedServiceWorkerByteLength actual_length=$($readback.byte_length) expected_sha256=$ExpectedServiceWorkerSha256 actual_sha256=$($readback.sha256) remediation=the deployed worker changed after atomic token injection; refuse to load the extension"
+    }
+    if ($readback.byte_length -ne $ExpectedServiceWorkerByteLength) {
+        throw "SYNAPSE_CHROME_BRIDGE_WORKER_BYTE_LENGTH_READBACK_MISMATCH path=$ServiceWorkerPath expected_length=$ExpectedServiceWorkerByteLength actual_length=$($readback.byte_length) expected_sha256=$ExpectedServiceWorkerSha256 actual_sha256=$($readback.sha256) remediation=the deployed worker byte length changed after atomic token injection; refuse to load the extension"
+    }
     [pscustomobject]@{
         length = $actual.Length
         sha256 = $actualSha256
         matches_expected = $true
+        service_worker_byte_length = $readback.byte_length
+        service_worker_sha256 = $readback.sha256
+        service_worker_matches_expected = $true
     }
 }
 
@@ -642,7 +825,8 @@ $sourceServiceWorkerPath = Join-Path $extensionSourceDir 'service_worker.js'
 if (-not (Test-Path -LiteralPath $sourceServiceWorkerPath -PathType Leaf)) {
     throw "SYNAPSE_CHROME_EXTENSION_SERVICE_WORKER_MISSING path=$sourceServiceWorkerPath"
 }
-$serviceWorkerSource = Get-Content -Raw -LiteralPath $sourceServiceWorkerPath
+$serviceWorkerSourceRead = Read-SynapseUtf8FileStrict -Path $sourceServiceWorkerPath
+$serviceWorkerSource = $serviceWorkerSourceRead.text
 if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_BUILD_ID\s*=\s*"([^"]+)";') {
     throw "SYNAPSE_CHROME_EXTENSION_BUILD_ID_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_BUILD_ID so setup can deploy the unpacked extension to a stable build-id directory"
 }
@@ -657,6 +841,11 @@ $bridgeDeclaredBuildSha256 = [string]$Matches[1]
 if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"";') {
     throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_NOT_EMPTY path=$sourceServiceWorkerPath remediation=repo service_worker.js must keep BRIDGE_REGISTER_TOKEN empty; setup injects the host-local derived credential only into the deployed copy"
 }
+$bridgeBearerToken = Get-SynapseChromeBridgeBearerToken -Path $TokenPath
+$bridgeRegisterToken = Get-SynapseChromeBridgeRegisterToken -BearerToken $bridgeBearerToken
+$bridgeRegisterTokenPrepared = New-SynapseChromeBridgeRegisterTokenDeployment `
+    -SourceServiceWorkerPath $sourceServiceWorkerPath `
+    -RegisterToken $bridgeRegisterToken
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
 }
@@ -668,20 +857,23 @@ if (-not $extensionDirFull.StartsWith($stableRootFull + [System.IO.Path]::Direct
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_PATH_INVALID root=$stableRootFull path=$extensionDirFull"
 }
 New-Item -ItemType Directory -Force -Path $extensionDirFull | Out-Null
-Get-ChildItem -LiteralPath $extensionSourceDir -Force | Copy-Item -Destination $extensionDirFull -Recurse -Force
+Get-ChildItem -LiteralPath $extensionSourceDir -Force |
+    Where-Object { $_.FullName -ne $sourceServiceWorkerPath } |
+    Copy-Item -Destination $extensionDirFull -Recurse -Force
 $extensionDir = $extensionDirFull
 $manifestPath = Join-Path $extensionDir 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_MANIFEST_MISSING source=$sourceManifestPath deployed=$manifestPath"
 }
 $deployedServiceWorkerPath = Join-Path $extensionDir 'service_worker.js'
-if (-not (Test-Path -LiteralPath $deployedServiceWorkerPath -PathType Leaf)) {
-    throw "SYNAPSE_CHROME_EXTENSION_STABLE_SERVICE_WORKER_MISSING source=$sourceServiceWorkerPath deployed=$deployedServiceWorkerPath"
-}
-$bridgeBearerToken = Get-SynapseChromeBridgeBearerToken -Path $TokenPath
-$bridgeRegisterToken = Get-SynapseChromeBridgeRegisterToken -BearerToken $bridgeBearerToken
-Set-SynapseChromeBridgeRegisterToken -ServiceWorkerPath $deployedServiceWorkerPath -RegisterToken $bridgeRegisterToken
-$bridgeRegisterTokenReadback = Assert-SynapseChromeBridgeRegisterTokenReadback -ServiceWorkerPath $deployedServiceWorkerPath -ExpectedRegisterToken $bridgeRegisterToken
+$bridgeRegisterTokenWrite = Set-SynapseChromeBridgeRegisterToken `
+    -ServiceWorkerPath $deployedServiceWorkerPath `
+    -PreparedDeployment $bridgeRegisterTokenPrepared
+$bridgeRegisterTokenReadback = Assert-SynapseChromeBridgeRegisterTokenReadback `
+    -ServiceWorkerPath $deployedServiceWorkerPath `
+    -ExpectedRegisterToken $bridgeRegisterToken `
+    -ExpectedServiceWorkerSha256 $bridgeRegisterTokenWrite.expected_sha256 `
+    -ExpectedServiceWorkerByteLength $bridgeRegisterTokenWrite.expected_byte_length
 $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
 $extensionDeploy = [pscustomobject]@{
     source_dir = $extensionSourceDir
@@ -692,6 +884,11 @@ $extensionDeploy = [pscustomobject]@{
     build_sha256 = $bridgeDeclaredBuildSha256
     manifest_sha256 = Get-SynapseFileSha256 -Path $manifestPath
     service_worker_sha256 = Get-SynapseFileSha256 -Path $deployedServiceWorkerPath
+    service_worker_source_sha256 = $bridgeRegisterTokenWrite.source_sha256
+    service_worker_expected_sha256 = $bridgeRegisterTokenWrite.expected_sha256
+    service_worker_byte_exact_readback = $bridgeRegisterTokenWrite.byte_exact_readback
+    service_worker_atomic_replace = $bridgeRegisterTokenWrite.atomic_replace
+    service_worker_atomic_mode = $bridgeRegisterTokenWrite.atomic_mode
     bridge_register_token_injected = $true
     bridge_register_token_length = $bridgeRegisterTokenReadback.length
     bridge_register_token_sha256 = $bridgeRegisterTokenReadback.sha256
