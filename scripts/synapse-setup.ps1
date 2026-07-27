@@ -59,6 +59,13 @@
   daemon's fail-closed read-only default. Use a whitespace/comma-separated list
   such as "READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE".
 
+.PARAMETER CalyxConfigPath
+  Optional Calyx tuning file passed explicitly to both the isolated candidate
+  and the installed daemon as --calyx-config. Defaults to
+  SYNAPSE_CALYX_CONFIG when set. Setup resolves the path and verifies the file
+  is readable before building; the real candidate daemon validates its TOML
+  content before handoff so candidate/live tuning cannot silently diverge.
+
 .PARAMETER Bind
   Loopback address the daemon binds. Default 127.0.0.1:7700.
 
@@ -186,6 +193,7 @@ param(
     [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
     [AllowNull()][string]$AllowedPermissions = $(if ([string]::IsNullOrWhiteSpace($env:SYNAPSE_MCP_ALLOWED_PERMISSIONS)) { 'READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE' } else { $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS }),
+    [AllowNull()][string]$CalyxConfigPath = $env:SYNAPSE_CALYX_CONFIG,
     [ValidateRange(60, 3600)]
     [int]$InstallHealthTimeoutSeconds = 600,
     [ValidateRange(600, 86400)]
@@ -959,7 +967,8 @@ function New-HiddenDaemonLauncher {
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
-        [AllowNull()][string]$AllowedPermissions
+        [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$CalyxConfigPath
     )
 
     $daemonLogDir = $LogDir
@@ -974,6 +983,9 @@ function New-HiddenDaemonLauncher {
         '--profile-dir', (Quote-WindowsCommandArgument $ProfilesDir),
         '--log-level', 'info'
     )
+    if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
+        $daemonArguments += @('--calyx-config', (Quote-WindowsCommandArgument $CalyxConfigPath))
+    }
     $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
     if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
         $daemonArguments += @('--allowed-permissions', (Quote-WindowsCommandArgument $allowedPermissionsArgument))
@@ -998,6 +1010,7 @@ $LauncherLog = __LAUNCHER_LOG__
 $SupervisorState = __SUPERVISOR_STATE__
 $SupervisorEvents = __SUPERVISOR_EVENTS__
 $MaintenanceLockPath = __MAINTENANCE_LOCK_PATH__
+$ExpectedCalyxConfigPath = __EXPECTED_CALYX_CONFIG_PATH__
 $DaemonArgumentText = __DAEMON_ARGUMENT_TEXT__
 $ExpectedAllowedPermissions = __EXPECTED_ALLOWED_PERMISSIONS__
 
@@ -1130,10 +1143,12 @@ function Test-ExpectedDaemonProcess {
     $actualBind = Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--bind'
     $actualDb = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--db')
     $actualProfiles = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
+    $actualCalyxConfig = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--calyx-config')
     $baseMatches = ($actualMode -ieq 'http') -and
         ($actualBind -ieq $Bind) -and
         ($actualDb -ieq (Normalize-PathArgument -Value $DbPath)) -and
-        ($actualProfiles -ieq (Normalize-PathArgument -Value $ProfilesDir))
+        ($actualProfiles -ieq (Normalize-PathArgument -Value $ProfilesDir)) -and
+        ($actualCalyxConfig -ieq (Normalize-PathArgument -Value $ExpectedCalyxConfigPath))
     if (-not $baseMatches) {
         return $false
     }
@@ -1329,6 +1344,7 @@ while ($true) {
         Replace('__SUPERVISOR_STATE__', (Quote-PowerShellSingleQuotedString $supervisorState)).
         Replace('__SUPERVISOR_EVENTS__', (Quote-PowerShellSingleQuotedString $supervisorEvents)).
         Replace('__MAINTENANCE_LOCK_PATH__', (Quote-PowerShellSingleQuotedString $MaintenanceLockPath)).
+        Replace('__EXPECTED_CALYX_CONFIG_PATH__', (Quote-PowerShellSingleQuotedString $CalyxConfigPath)).
         Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText)).
         Replace('__EXPECTED_ALLOWED_PERMISSIONS__', (Quote-PowerShellSingleQuotedString $allowedPermissionsArgument))
 
@@ -2810,10 +2826,12 @@ function Get-SynapseLiveDaemonArgumentDrift {
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$ExpectedExePath,
         [Parameter(Mandatory=$true)][string]$ExpectedSha256,
-        [AllowNull()][string]$AllowedPermissions
+        [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$CalyxConfigPath
     )
 
     $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+    $expectedCalyxConfig = Normalize-SynapseSetupPathForCompare -Path $CalyxConfigPath
     $expectedPath = Normalize-SynapseSetupPathForCompare -Path $ExpectedExePath
     $targets = @(Select-SynapseMcpDeployTargetProcesses -Snapshot $Snapshot -Bind $Bind -DbPath $DbPath)
     $drifts = @()
@@ -2822,6 +2840,7 @@ function Get-SynapseLiveDaemonArgumentDrift {
             -CommandLine $target.CommandLine `
             -Name '--allowed-permissions'
         $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $actualAllowedRaw
+        $actualCalyxConfig = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $target.CommandLine -Name '--calyx-config')
         $actualPath = Normalize-SynapseSetupPathForCompare -Path ([string]$target.ExecutablePath)
         $actualSha256 = '<not-read>'
         $hashError = $null
@@ -2838,7 +2857,8 @@ function Get-SynapseLiveDaemonArgumentDrift {
         $pathDrift = ($actualPath -ine $expectedPath)
         $hashDrift = ($actualSha256 -ine $ExpectedSha256)
         $permissionDrift = ($actualAllowed -ne $expectedAllowed)
-        if ($pathDrift -or $hashDrift -or $permissionDrift) {
+        $calyxConfigDrift = ($actualCalyxConfig -ine $expectedCalyxConfig)
+        if ($pathDrift -or $hashDrift -or $permissionDrift -or $calyxConfigDrift) {
             $drifts += [pscustomobject]@{
                 pid = $target.ProcessId
                 expected_executable_path = $expectedPath
@@ -2848,6 +2868,8 @@ function Get-SynapseLiveDaemonArgumentDrift {
                 executable_hash_error = if ($hashError) { $hashError } else { '<none>' }
                 expected_allowed_permissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
                 actual_allowed_permissions = if ([string]::IsNullOrWhiteSpace($actualAllowed)) { '<default-read-only>' } else { $actualAllowed }
+                expected_calyx_config_path = if ([string]::IsNullOrWhiteSpace($expectedCalyxConfig)) { '<defaults>' } else { $expectedCalyxConfig }
+                actual_calyx_config_path = if ([string]::IsNullOrWhiteSpace($actualCalyxConfig)) { '<defaults>' } else { $actualCalyxConfig }
                 command_line = $target.CommandLine
             }
         }
@@ -2857,6 +2879,7 @@ function Get-SynapseLiveDaemonArgumentDrift {
         HasDrift = ($drifts.Count -gt 0)
         TargetCount = $targets.Count
         DesiredAllowedPermissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
+        DesiredCalyxConfigPath = if ([string]::IsNullOrWhiteSpace($expectedCalyxConfig)) { '<defaults>' } else { $expectedCalyxConfig }
         Drifts = $drifts
     }
 }
@@ -2980,7 +3003,8 @@ function Get-SynapseInstalledDaemonIdentityReadback {
         [Parameter(Mandatory=$true)][string]$ExpectedExePath,
         [Parameter(Mandatory=$true)][string]$ExpectedSha256,
         [Parameter(Mandatory=$true)][string]$LogDir,
-        [AllowNull()][string]$AllowedPermissions
+        [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$CalyxConfigPath
     )
 
     $failures = [System.Collections.Generic.List[string]]::new()
@@ -3009,12 +3033,15 @@ function Get-SynapseInstalledDaemonIdentityReadback {
     $actualBind = Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--bind'
     $actualDb = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--db')
     $actualProfiles = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
+    $actualCalyxConfig = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--calyx-config')
     $expectedDb = Normalize-SynapseSetupPathForCompare -Path $DbPath
     $expectedProfiles = Normalize-SynapseSetupPathForCompare -Path $ProfilesDir
+    $expectedCalyxConfig = Normalize-SynapseSetupPathForCompare -Path $CalyxConfigPath
     if ($actualMode -ine 'http') { $failures.Add("mode expected=http actual=$(if ($actualMode) { $actualMode } else { '<missing>' })") }
     if ($actualBind -ine $Bind) { $failures.Add("bind expected=$Bind actual=$(if ($actualBind) { $actualBind } else { '<missing>' })") }
     if ($actualDb -ine $expectedDb) { $failures.Add("db expected=$expectedDb actual=$(if ($actualDb) { $actualDb } else { '<missing>' })") }
     if ($actualProfiles -ine $expectedProfiles) { $failures.Add("profiles_dir expected=$expectedProfiles actual=$(if ($actualProfiles) { $actualProfiles } else { '<missing>' })") }
+    if ($actualCalyxConfig -ine $expectedCalyxConfig) { $failures.Add("calyx_config expected=$(if ($expectedCalyxConfig) { $expectedCalyxConfig } else { '<defaults>' }) actual=$(if ($actualCalyxConfig) { $actualCalyxConfig } else { '<defaults>' })") }
     $expectedAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
     $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value (Get-SynapseCommandLineArgumentValue -CommandLine $commandLine -Name '--allowed-permissions')
     if ($actualAllowed -cne $expectedAllowed) {
@@ -6568,6 +6595,7 @@ function Test-SynapseCandidateDaemon {
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$LogDir,
         [AllowNull()][string]$AllowedPermissions,
+        [AllowNull()][string]$CalyxConfigPath,
         [AllowNull()][string]$ReplacementReservationId = $null
     )
 
@@ -6590,7 +6618,8 @@ function Test-SynapseCandidateDaemon {
     New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
-    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb calyx_vault=$candidateCalyxVault shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
+    $candidateCalyxConfig = if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) { '<defaults>' } else { $CalyxConfigPath }
+    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb calyx_vault=$candidateCalyxVault calyx_config=$candidateCalyxConfig shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
 
     $candidate = $null
     $health = $null
@@ -6608,6 +6637,9 @@ function Test-SynapseCandidateDaemon {
                 Set-Item "Env:$replacementEnvName" -Value $ReplacementReservationId
             }
             $candidateArgs = @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info')
+            if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
+                $candidateArgs += @('--calyx-config', $CalyxConfigPath)
+            }
             $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
             if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
                 $candidateArgs += @('--allowed-permissions', $allowedPermissionsArgument)
@@ -7674,6 +7706,7 @@ function Start-SynapsePostExitSetupContinuation {
         [Parameter(Mandatory=$true)][string]$CodexToolSurfaceSnapshotPath,
         [Parameter(Mandatory=$true)][string]$TaskName,
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [AllowNull()][string]$CalyxConfigPath,
         [string]$ActiveIssue,
         [object]$DeadOwnerDetail
     )
@@ -7736,6 +7769,9 @@ function Start-SynapsePostExitSetupContinuation {
     )
     if (-not [string]::IsNullOrWhiteSpace($ActiveIssue)) {
         $args += @('-ActiveIssue', $ActiveIssue)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
+        $args += @('-CalyxConfigPath', $CalyxConfigPath)
     }
     if ($SkipClientWiring) {
         $args += '-SkipClientWiring'
@@ -9648,6 +9684,25 @@ if ($ManualInstallHealthRollbackProbe) {
     }
     Info "Manual install-health rollback probe armed pause_mode=$ManualInstallHealthRollbackPauseMode; setup will reject the first installed daemon health readback and exit fail-loud after rollback readback"
 }
+if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
+    $CalyxConfigPath = $null
+} else {
+    try {
+        $CalyxConfigPath = [System.IO.Path]::GetFullPath($CalyxConfigPath)
+    } catch {
+        Die "SYNAPSE_CALYX_CONFIG_PATH_INVALID path=$CalyxConfigPath error=$($_.Exception.Message) remediation=pass an absolute or resolvable local TOML file path to -CalyxConfigPath"
+    }
+    if (-not (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf)) {
+        Die "SYNAPSE_CALYX_CONFIG_FILE_MISSING path=$CalyxConfigPath remediation=create the exact [calyx] TOML file or omit -CalyxConfigPath to use validated defaults"
+    }
+    try {
+        $configStream = [System.IO.File]::Open($CalyxConfigPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $configStream.Dispose()
+    } catch {
+        Die "SYNAPSE_CALYX_CONFIG_FILE_UNREADABLE path=$CalyxConfigPath error=$($_.Exception.Message) remediation=repair the exact file permissions before setup builds or touches the live daemon"
+    }
+    Info "Explicit Calyx tuning source verified path=$CalyxConfigPath; candidate and installed daemon will both receive --calyx-config."
+}
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 if (-not $SkipBuild) {
     if (-not (Test-Path $cargo)) {
@@ -10025,7 +10080,7 @@ $candidateRuntimeFiles = @(Get-SynapseOrtRuntimeCompanions -ExecutablePath $inst
 $candidateRuntimeSummary = ($candidateRuntimeFiles | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Sha256 }) -join ','
 Info "Candidate ONNX Runtime bundle verified files=$candidateRuntimeSummary"
 $replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind
-$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions -ReplacementReservationId $replacementReservationId
+$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ReplacementReservationId $replacementReservationId
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
 }
@@ -10047,15 +10102,17 @@ if ($SkipBuild) {
             -DbPath $DbPath `
             -ExpectedExePath $ExePath `
             -ExpectedSha256 $installSourceHash `
-            -AllowedPermissions $AllowedPermissions
+            -AllowedPermissions $AllowedPermissions `
+            -CalyxConfigPath $CalyxConfigPath
         if ($liveDaemonArgumentDrift.HasDrift) {
-            Info ("SkipBuild candidate is already installed, but live daemon launch arguments drifted; setup will perform a daemon handoff. path={0} sha256={1} desired_allowed_permissions={2} drift={3}" -f `
+            Info ("SkipBuild candidate is already installed, but live daemon launch arguments drifted; setup will perform a daemon handoff. path={0} sha256={1} desired_allowed_permissions={2} desired_calyx_config={3} drift={4}" -f `
                 $ExePath,
                 $installSourceHash,
                 $liveDaemonArgumentDrift.DesiredAllowedPermissions,
+                $liveDaemonArgumentDrift.DesiredCalyxConfigPath,
                 ($liveDaemonArgumentDrift.Drifts | ConvertTo-Json -Depth 6 -Compress))
         } else {
-            Info "SkipBuild candidate is already installed and live daemon launch arguments match; setup may let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash desired_allowed_permissions=$($liveDaemonArgumentDrift.DesiredAllowedPermissions)"
+            Info "SkipBuild candidate is already installed and live daemon launch arguments match; setup may let the generated supervisor adopt it. path=$ExePath sha256=$installSourceHash desired_allowed_permissions=$($liveDaemonArgumentDrift.DesiredAllowedPermissions) desired_calyx_config=$($liveDaemonArgumentDrift.DesiredCalyxConfigPath)"
         }
     }
 }
@@ -10278,6 +10335,7 @@ if ($script:SynapseBindPostExitContinuationRequired) {
         -CodexToolSurfaceSnapshotPath $CodexToolSurfaceSnapshotPath `
         -TaskName $TaskName `
         -MaintenanceLockPath $MaintenanceLockPath `
+        -CalyxConfigPath $CalyxConfigPath `
         -ActiveIssue $ActiveIssue `
         -DeadOwnerDetail $script:SynapseBindPostExitContinuationDetail
     Die ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_STARTED reason=install_binary bind={0} child_pid={1} manifest={2} stdout={3} stderr={4} remediation=the verified daemon bytes and profiles were installed, but Windows kept the dead-owner listener unavailable until this setup process exits. A hidden continuation has been launched and will wait for parent_pid={5}, reacquire the maintenance lock, start the daemon through the normal setup path, and write its own stdout/stderr/readbacks. Inspect the continuation manifest/logs and final process/socket SoT before accepting repair." -f `
@@ -10321,7 +10379,8 @@ New-HiddenDaemonLauncher `
     -LogDir $LogDir `
     -TokenPath $TokenPath `
     -MaintenanceLockPath $MaintenanceLockPath `
-    -AllowedPermissions $AllowedPermissions
+    -AllowedPermissions $AllowedPermissions `
+    -CalyxConfigPath $CalyxConfigPath
 
 $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
@@ -10391,7 +10450,8 @@ while ($true) {
                 -ExpectedExePath $ExePath `
                 -ExpectedSha256 $installedHash `
                 -LogDir $LogDir `
-                -AllowedPermissions $AllowedPermissions
+                -AllowedPermissions $AllowedPermissions `
+                -CalyxConfigPath $CalyxConfigPath
             if (-not $daemonIdentityReadback.Ok) {
                 $terminalDaemonIdentityFailure = $daemonIdentityReadback.Detail
                 $installHealthGateVerdict = 'daemon_identity_mismatch'
@@ -10504,7 +10564,8 @@ if (-not $ok) {
                 -LogDir $LogDir `
                 -TokenPath $TokenPath `
                 -MaintenanceLockPath $MaintenanceLockPath `
-                -AllowedPermissions $AllowedPermissions
+                -AllowedPermissions $AllowedPermissions `
+                -CalyxConfigPath $CalyxConfigPath
             Info "Manual install-health rollback probe restored normal daemon launcher before rollback stop path=$hiddenLauncher"
         }
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -10540,7 +10601,8 @@ if (-not $ok) {
                 -LogDir $LogDir `
                 -TokenPath $TokenPath `
                 -MaintenanceLockPath $MaintenanceLockPath `
-                -AllowedPermissions $AllowedPermissions
+                -AllowedPermissions $AllowedPermissions `
+                -CalyxConfigPath $CalyxConfigPath
             Info "Manual install-health rollback probe restored normal daemon launcher before rollback start path=$hiddenLauncher"
         }
         Start-ScheduledTask -TaskName $TaskName

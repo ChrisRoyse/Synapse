@@ -986,19 +986,61 @@ impl Drop for CalyxVaultRuntime {
 
 impl CalyxBackend {
     pub fn open(path: &Path, schema_version: u32) -> StorageResult<Self> {
-        // Honor the documented `--calyx-config` / `SYNAPSE_CALYX_CONFIG`
-        // tuning override at the authoritative vault open. 2026-07-23: the
-        // parsed tuning previously only reached the m3-side config object —
-        // this open always used default tuning, so an operator selecting
-        // `math_backend = "cpu"` (e.g. while the GPU is fully committed to
-        // another workload) was silently ignored and the daemon fail-closed
-        // on CUDA admission with no working escape hatch. Config read/parse
-        // failures abort the open loudly instead of falling back to defaults.
+        // Non-daemon callers retain the documented environment configuration
+        // path. The daemon resolves CLI/environment precedence once and calls
+        // `open_with_resolved_config` instead of using process environment as
+        // an implicit cross-layer message bus.
         let config = SynapseCalyxConfig::from_optional_vault_dir_and_config_path(
             Some(path.to_path_buf()),
             std::env::var_os("SYNAPSE_CALYX_CONFIG").map(std::path::PathBuf::from),
         )
         .map_err(|source| calyx_open_failed(path, &source))?;
+        Self::open_with_resolved_config(path, schema_version, config)
+    }
+
+    /// Opens the authoritative Calyx storage vault with configuration already
+    /// resolved by the application boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured open error when the resolved configuration names
+    /// a different vault or when Calyx cannot open the exact requested path.
+    pub fn open_with_resolved_config(
+        path: &Path,
+        schema_version: u32,
+        config: SynapseCalyxConfig,
+    ) -> StorageResult<Self> {
+        let requested_vault = std::path::absolute(path).map_err(|error| StorageError::OpenFailed {
+            path: path.to_path_buf(),
+            detail: format!(
+                "SYNAPSE_CALYX_STORAGE_PATH_RESOLUTION_FAILED: resolve authoritative storage vault path: {error}"
+            ),
+        })?;
+        let configured_vault =
+            std::path::absolute(&config.vault_dir).map_err(|error| StorageError::OpenFailed {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "SYNAPSE_CALYX_CONFIG_VAULT_PATH_RESOLUTION_FAILED: resolve configured Calyx vault {}: {error}",
+                    config.vault_dir.display()
+                ),
+            })?;
+        if configured_vault != requested_vault {
+            return Err(StorageError::OpenFailed {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "SYNAPSE_CALYX_RESOLVED_CONFIG_VAULT_MISMATCH: resolved configuration vault {} differs from authoritative storage vault {}; resolve CLI/environment precedence once for the storage DB path and pass that exact configuration",
+                    configured_vault.display(),
+                    requested_vault.display()
+                ),
+            });
+        }
+        tracing::info!(
+            code = "STORAGE_CALYX_RESOLVED_CONFIG_APPLIED",
+            storage_path = %requested_vault.display(),
+            math_backend = config.tuning.math_backend.as_str(),
+            vram_budget_bytes = config.tuning.vram_budget_bytes,
+            "applying one explicitly resolved Calyx configuration at the authoritative storage open"
+        );
         // Coherent multi-page scans pin an MVCC sequence while writers continue
         // advancing the vault. The writable backend must therefore restore
         // historical rows; latest-only recovery cannot honor those leases.

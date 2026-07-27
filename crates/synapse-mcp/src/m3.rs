@@ -48,6 +48,7 @@ use synapse_reflex::{
 };
 use synapse_storage::{
     Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask, StorageBackendKind,
+    StorageError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -785,7 +786,20 @@ impl M3State {
             return Ok(Arc::clone(db));
         }
         let db_path = self.db_path.clone().unwrap_or_else(default_db_path);
-        match Db::open_with_backend(&db_path, SCHEMA_VERSION, self.storage_backend) {
+        let Some(calyx_config) = self.calyx_vault_config.clone() else {
+            let error = StorageError::OpenFailed {
+                path: db_path,
+                detail: "SYNAPSE_CALYX_CONFIG_MISSING: the sole Calyx storage backend has no configuration resolved from CLI/environment; restart with a valid storage/Calyx configuration".to_owned(),
+            };
+            self.storage_last_error = Some(error.to_string());
+            return Err(error);
+        };
+        match Db::open_with_resolved_calyx_config(
+            &db_path,
+            SCHEMA_VERSION,
+            self.storage_backend,
+            calyx_config,
+        ) {
             Ok(db) => {
                 let db = Arc::new(db);
                 self.db = Some(Arc::clone(&db));

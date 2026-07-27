@@ -314,10 +314,43 @@ impl Db {
         schema_version: u32,
         backend_kind: StorageBackendKind,
     ) -> StorageResult<Self> {
+        Self::open_with_backend_config(path, schema_version, backend_kind, None)
+    }
+
+    /// Opens storage with the exact Calyx configuration already resolved by
+    /// the application boundary.
+    ///
+    /// This is the daemon path: command-line and environment precedence is
+    /// resolved once, then passed explicitly so the storage layer cannot
+    /// silently re-read a different source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured open error when the selected backend cannot serve
+    /// the `Db` API or the resolved configuration targets a different vault.
+    #[tracing::instrument(skip_all, fields(storage_path = %path.display(), schema_version, backend = backend_kind.as_str()))]
+    pub fn open_with_resolved_calyx_config(
+        path: &Path,
+        schema_version: u32,
+        backend_kind: StorageBackendKind,
+        calyx_config: synapse_calyx::SynapseCalyxConfig,
+    ) -> StorageResult<Self> {
+        Self::open_with_backend_config(path, schema_version, backend_kind, Some(calyx_config))
+    }
+
+    fn open_with_backend_config(
+        path: &Path,
+        schema_version: u32,
+        backend_kind: StorageBackendKind,
+        calyx_config: Option<synapse_calyx::SynapseCalyxConfig>,
+    ) -> StorageResult<Self> {
         let backend: Box<dyn backend::StorageBackend> = match backend_kind {
-            StorageBackendKind::Calyx => {
-                Box::new(backend::CalyxBackend::open(path, schema_version)?)
-            }
+            StorageBackendKind::Calyx => Box::new(match calyx_config {
+                Some(config) => {
+                    backend::CalyxBackend::open_with_resolved_config(path, schema_version, config)?
+                }
+                None => backend::CalyxBackend::open(path, schema_version)?,
+            }),
         };
         tracing::info!(
             code = "STORAGE_BACKEND_OPENED",
