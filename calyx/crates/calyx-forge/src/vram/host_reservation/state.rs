@@ -8,9 +8,8 @@ use super::support::{
     open_lock_file, reservation_identities, snapshot,
 };
 use super::{
-    DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
-    HostGpuReservationSnapshot, HostGpuReservationStore, PersistedState, STATE_LOCK_FILE_NAME,
-    STATE_SCHEMA_VERSION,
+    DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HostGpuReservationSnapshot,
+    HostGpuReservationStore, PersistedState, STATE_LOCK_FILE_NAME, STATE_SCHEMA_VERSION,
 };
 use crate::Result;
 
@@ -244,10 +243,18 @@ impl HostGpuReservationStore {
     /// this process, *after* [`Self::prune_stale`] has proven which
     /// reservations are actually live.
     ///
-    /// Changing the cap while real reservations are outstanding stays a hard
-    /// error: their owners were admitted against the old budget, so silently
-    /// re-basing it could let the live aggregate exceed a cap nobody was
-    /// admitted under. The correctness hinge is *when* that guard is evaluated.
+    /// A cap raise while reservations are live is safe exactly when the
+    /// already-proven effective reservation aggregate fits the capacity the
+    /// new cap would impose on the *same epoch*. A process that already owns a
+    /// live reservation from an older, lower-cap cohort may keep using the
+    /// monotonic higher ledger policy without rewriting it. A new process that
+    /// requests a live cap decrease fails closed. This keeps both generations
+    /// operational during handoff without allowing them to repeatedly rewrite
+    /// the cap in opposite directions and admit against an unstable policy.
+    /// New admissions still pass both projected-aggregate and current physical
+    /// free-memory gates after reconciliation.
+    ///
+    /// The correctness hinge is also *when* that guard is evaluated.
     /// A persisted row only proves a live owner once its lease lock has been
     /// probed — the OS releases those locks when the holder dies, including
     /// across a host reboot. Evaluating the guard against unprobed rows turned
@@ -261,16 +268,91 @@ impl HostGpuReservationStore {
         physical: &PhysicalDevice,
         host_cap_mib: u64,
     ) -> Result<()> {
+        if !state.reservations.is_empty() && state.host_cap_mib == host_cap_mib {
+            return Ok(());
+        }
         if !state.reservations.is_empty() {
-            if state.host_cap_mib != host_cap_mib {
-                return Err(config_error(format!(
-                    "{HOST_CAP_MIB_ENV} changed from {} to {} while {} reservation(s) remain live after stale-lease reaping: {}",
-                    state.host_cap_mib,
+            let previous_host_cap_mib = state.host_cap_mib;
+            let previous_epoch_capacity_mib = state.epoch_capacity_mib;
+            if host_cap_mib < previous_host_cap_mib {
+                let process_id = std::process::id();
+                let owned_live_reservations = state
+                    .reservations
+                    .iter()
+                    .filter(|reservation| reservation.pid == process_id)
+                    .count();
+                if owned_live_reservations > 0 {
+                    tracing::info!(
+                        code = "CALYX_FORGE_HOST_CAP_STALE_COHORT_RETAINED",
+                        device_index = self.device_index,
+                        process_id,
+                        requested_host_cap_mib = host_cap_mib,
+                        retained_host_cap_mib = previous_host_cap_mib,
+                        retained_epoch_capacity_mib = previous_epoch_capacity_mib,
+                        owned_live_reservations,
+                        live_reservations = state.reservations.len(),
+                        live = %reservation_identities(state),
+                        "retained the monotonic GPU host cap for an already-admitted older process cohort"
+                    );
+                    return Ok(());
+                }
+                tracing::error!(
+                    code = "CALYX_FORGE_HOST_CAP_DECREASE_REFUSED_LIVE",
+                    device_index = self.device_index,
+                    process_id,
+                    previous_host_cap_mib,
                     host_cap_mib,
+                    previous_epoch_capacity_mib,
+                    live_reservations = state.reservations.len(),
+                    live = %reservation_identities(state),
+                    "refused to decrease the GPU host cap while reservations remain live"
+                );
+                return Err(config_error(format!(
+                    "process {process_id} requested host cap decrease from {previous_host_cap_mib} to {host_cap_mib} but owns no reservation admitted under the live ledger policy; the decrease is refused while {} reservation(s) remain live after stale-lease reaping; wait for those exact leases to drain before adopting a lower cap; live={}",
                     state.reservations.len(),
                     reservation_identities(state)
                 )));
             }
+            let proposed_epoch_capacity_mib = host_cap_mib.min(
+                state
+                    .epoch_free_mib
+                    .saturating_sub(state.required_free_mib)
+                    .saturating_sub(state.headroom_mib),
+            );
+            let reserved_mib = effective_reserved_mib(state)?;
+            if reserved_mib > proposed_epoch_capacity_mib {
+                tracing::error!(
+                    code = "CALYX_FORGE_HOST_CAP_RECONCILIATION_REFUSED",
+                    device_index = self.device_index,
+                    previous_host_cap_mib,
+                    host_cap_mib,
+                    previous_epoch_capacity_mib,
+                    proposed_epoch_capacity_mib,
+                    reserved_mib,
+                    live_reservations = state.reservations.len(),
+                    live = %reservation_identities(state),
+                    "refused a live GPU host-cap reconciliation that would strand committed reservations"
+                );
+                return Err(config_error(format!(
+                    "requested host cap changed from {previous_host_cap_mib} to {host_cap_mib}, but the resulting epoch capacity {proposed_epoch_capacity_mib} MiB is below the {reserved_mib} MiB effective live reservation aggregate after stale-lease reaping; live={}",
+                    reservation_identities(state)
+                )));
+            }
+            state.host_cap_mib = host_cap_mib;
+            state.epoch_capacity_mib = proposed_epoch_capacity_mib;
+            tracing::info!(
+                code = "CALYX_FORGE_HOST_CAP_RECONCILED_LIVE",
+                device_index = self.device_index,
+                previous_host_cap_mib,
+                host_cap_mib,
+                previous_epoch_capacity_mib,
+                proposed_epoch_capacity_mib,
+                reserved_mib,
+                live_reservations = state.reservations.len(),
+                physical_free_mib = physical.free_mib,
+                live = %reservation_identities(state),
+                "reconciled a rolling GPU host-cap change without invalidating any live commitment"
+            );
             return Ok(());
         }
         if state.host_cap_mib != host_cap_mib {
