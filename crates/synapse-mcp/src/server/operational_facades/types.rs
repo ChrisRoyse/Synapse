@@ -444,6 +444,40 @@ pub struct SetupStatusResponse {
     pub token_env_len_bytes: Option<usize>,
     pub codex_mcp_config_mentions_synapse: bool,
     pub codex_mcp_config_mentions_bearer_env: bool,
+    /// Physical state of the daemon autostart task (#1862).
+    pub autostart: SetupAutostartReadback,
+}
+
+/// Whether the registered autostart task can actually start the daemon (#1862).
+///
+/// `Get-ScheduledTask` reports `State=Ready` for a task whose action points at a
+/// deleted file, so task state alone is not evidence of a working autostart.
+/// This reads the registered action and independently stats the file it names.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupAutostartReadback {
+    /// Scheduled task inspected.
+    pub task_name: String,
+    /// Whether the task is registered at all.
+    pub task_registered: bool,
+    /// Task state as Windows reports it (`Ready`, `Running`, `Disabled`, ...).
+    pub task_state: Option<String>,
+    /// Executable the registered action runs.
+    pub action_execute: Option<String>,
+    /// Arguments the registered action passes.
+    pub action_arguments: Option<String>,
+    /// Launcher script parsed out of the action arguments.
+    pub launcher_path: Option<String>,
+    /// Independent stat of that exact path.
+    pub launcher_file: Option<FileReadback>,
+    /// True only when the task is registered, names a launcher, and that
+    /// launcher physically exists.
+    pub can_start_daemon: bool,
+    /// True when the launcher sits inside the log directory, where routine log
+    /// cleanup deletes it. Always a defect (#1862).
+    pub launcher_in_log_dir: bool,
+    /// Empty when nominal; otherwise the exact defects with remediation.
+    pub problems: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

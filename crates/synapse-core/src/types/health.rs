@@ -322,6 +322,18 @@ pub struct SubsystemHealth {
     pub ring_buffer_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_model_loaded: Option<bool>,
+    /// Whether the optional speech-to-text model is packaged in this build
+    /// (#1863).
+    ///
+    /// Reported independently of `enable_audio`, because "you turned audio off"
+    /// and "this binary physically cannot transcribe" are different facts and an
+    /// operator enabling audio needs to know the second one in advance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_model_available: Option<bool>,
+    /// Why the STT model is unavailable, with the exact remediation. Present
+    /// only when `stt_model_available` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_model_unavailable_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

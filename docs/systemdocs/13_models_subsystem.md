@@ -50,28 +50,82 @@ A `Copy`-able compile-time descriptor of a known model (`crates/synapse-models/s
 | `source_repo` | `&'static str` | Upstream repository URL |
 | `input_shape` | `[usize; 4]` | NCHW input tensor shape |
 | `class_map` | `&'static [&'static str]` | Class-index → label table |
+| `required` | `bool` | Whether an install may complete without this model (#1863) |
 
 `RegisteredModel::descriptor(self)` converts the static entry into a runtime `ModelDescriptor`, resolving `path` to `default_model_dir().join(filename)`.
 
 ### 13.2.2 Registered models table
 
-`REGISTERED_MODELS` contains a single entry. There is **one registered model** (`crates/synapse-models/src/registry.rs:144`).
+`REGISTERED_MODELS` contains three entries, in the order below. **This order is
+the wire order of the embedded model bundle's slot table** (§13.2.5) — the
+installer writes slots positionally and the daemon reads them positionally, so
+reordering this table is a format change.
 
-| Property | Value |
-|----------|-------|
-| `id` | `rtdetr_v2_s_coco_onnx` |
-| `label` | `RT-DETRv2-S COCO ONNX` |
-| `filename` | `rtdetr_v2_s_coco.onnx` |
-| `sha256` | `sha256:583a236ac21c95a7fd94f284fc21485e42355bfef82c27011ba78fbc09ee87e2` |
-| `download_url` | `https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model.onnx` |
-| `license_spdx` | `Apache-2.0` |
-| `source_model` | `PekingU/rtdetr_v2_r18vd` |
-| `source_repo` | `https://github.com/lyuwenyu/RT-DETR` |
-| `input_shape` | `[1, 3, 640, 640]` (`DEFAULT_DETECTION_INPUT_SHAPE`) |
-| `class_map` | `COCO80_CLASS_MAP` (80 COCO classes) |
-| **File size** | Not determined from source (no size field exists in the registry) |
+| # | `id` | `filename` | `required` | Source |
+|---|------|-----------|-----------|--------|
+| 0 | `rtdetr_v2_s_coco_onnx` | `rtdetr_v2_s_coco.onnx` | yes | [HF onnx-community/rtdetr_v2_r18vd-ONNX `model.onnx`](https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model.onnx) |
+| 1 | `rtdetr_v2_s_coco_int8_cpu_onnx` | `rtdetr_v2_s_coco_int8_cpu.onnx` | yes | same repo, `model_int8.onnx` |
+| 2 | `whisper_tiny_int8` | `whisper-tiny-int8.onnx` | **no** | `recipe://scripts/build-whisper-e2e-onnx.ps1` |
 
 The default detection model id is `DEFAULT_DETECTION_MODEL_ID = "rtdetr_v2_s_coco_onnx"` (= `RTDETR_V2_S_COCO_ONNX_ID`).
+
+### 13.2.5 Embedded model bundle (`SYNMODEL_BUNDLE2`)
+
+`scripts/synapse-setup.ps1` appends the pinned models to the built executable and
+the daemon reads them back out of its own image. The format is self-describing:
+
+```text
+[slot payloads, concatenated in REGISTERED_MODELS order]
+[slot table: for each registered model]
+    u64  length_le            0 == the model is positively ABSENT
+    [32] sha256 raw digest    all-zero when absent
+u32  slot_count_le
+u32  format_version_le  (= 2)
+[16] magic "SYNMODEL_BUNDLE2"
+```
+
+Two properties matter:
+
+- **Absence is recorded, not inferred.** A zero-length slot is the packager
+  stating "this optional model is not in this build", which is distinguishable
+  from a truncated image. This is what allows an install to succeed without the
+  optional STT model.
+- **Each slot carries its own digest.** The executable states what it contains,
+  so the installer does not keep a second hardcoded copy of the hashes — that
+  duplication is where pin drift comes from.
+
+Readers: `synapse_models::embedded_model_bundle()` (running image) and
+`embedded_model_bundle_at(path)` (arbitrary binary). `RegisteredModel::embedded_bytes()`
+verifies the payload against the slot digest before returning it, and yields
+`ModelError::EmbeddedSlotAbsent` for an absent optional model. A pre-#1863
+`SYNMODEL_BUNDLE1` image is recognized and refused with
+`MODEL_EMBEDDED_BUNDLE_LEGACY_FORMAT` rather than being mistaken for an
+unpackaged binary.
+
+### 13.2.6 Required vs optional models (#1863)
+
+A **required** model missing is a build defect: packaging fails closed. An
+**optional** model missing is a capability gap: the install completes, and the
+dependent subsystem reports itself unavailable with the exact remediation.
+
+`whisper_tiny_int8` is the only optional model. It is an ONNX Runtime Extensions
+*end-to-end* graph (raw container bytes on `audio_stream` → text on `str`, with
+audio decode, log-mel, beam search and BPE detokenize fused in). No public
+repository publishes that artifact — every HuggingFace `whisper-tiny` ONNX repo
+ships the split encoder/decoder export, which does not satisfy the contract. It
+is therefore produced by the committed recipe `scripts/build-whisper-e2e-onnx.ps1`.
+
+Its pin lives in **one authored place**, `models/whisper-tiny-int8.pin.json`.
+`WHISPER_TINY_INT8_ONNX_SHA256` in `registry.rs` must equal it; setup verifies
+this and fails with `SYNAPSE_OPTIONAL_MODEL_PIN_DRIFT` if they disagree, so the
+installer can never package bytes the daemon would refuse at load time.
+
+Acquisition order used by setup: `$env:SYNAPSE_WHISPER_ONNX_SOURCE`, then
+`%LOCALAPPDATA%\synapse\models\`, then `<checkout>\models\`. If none holds a
+verified artifact, setup records the gap in
+`<LogDir>\synapse-setup-capability-gaps.json`, warns, and continues. Health then
+reports `audio.stt_model_available=false` with
+`stt_model_unavailable_reason`.
 
 ### 13.2.3 Class map
 

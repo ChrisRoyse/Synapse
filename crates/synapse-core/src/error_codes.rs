@@ -201,6 +201,17 @@ pub const MODEL_DOWNLOAD_FAILED: &str = "MODEL_DOWNLOAD_FAILED";
 pub const MODEL_HASH_MISMATCH: &str = "MODEL_HASH_MISMATCH";
 pub const MODEL_LOAD_FAILED: &str = "MODEL_LOAD_FAILED";
 pub const MODEL_BACKEND_UNAVAILABLE: &str = "MODEL_BACKEND_UNAVAILABLE";
+/// An OPTIONAL model slot is physically absent from this executable's embedded
+/// model bundle (#1863).
+///
+/// This is not corruption and not a build defect: the slot table explicitly
+/// records the model as not packaged, so the dependent capability is genuinely
+/// unavailable on this build. Required models can never produce this code —
+/// their absence is refused at package time.
+pub const MODEL_EMBEDDED_SLOT_ABSENT: &str = "MODEL_EMBEDDED_SLOT_ABSENT";
+/// The running executable carries a model bundle written by an older,
+/// incompatible packager (#1863).
+pub const MODEL_EMBEDDED_BUNDLE_LEGACY_FORMAT: &str = "MODEL_EMBEDDED_BUNDLE_LEGACY_FORMAT";
 pub const MODEL_TOOLS_UNSUPPORTED: &str = "MODEL_TOOLS_UNSUPPORTED";
 /// A local-model turn produced neither a tool call nor any message content.
 ///

@@ -36,6 +36,50 @@ pub struct HealthParams {
     pub detail: HealthDetail,
 }
 
+/// Whether this build can actually perform speech-to-text (#1863).
+///
+/// Returns `None` when STT is available, or `Some(reason)` carrying the exact
+/// remediation when it is not. Audio STT is an optional capability, so a build
+/// without the model is a legitimate install — but it must say so rather than
+/// reporting a healthy audio subsystem that would fail on first use.
+///
+/// Deliberately cheap: it reads the executable's slot table, or the length of an
+/// already-materialized model file. It is an availability signal, not the
+/// integrity gate — the load path still verifies the full SHA-256 of whatever it
+/// is about to hand to ONNX Runtime.
+fn stt_model_availability() -> Option<String> {
+    let expected_len = synapse_audio::stt::WHISPER_TINY_INT8_EXPECTED_LEN;
+    let materialized = synapse_audio::stt::default_model_path();
+    if let Ok(metadata) = std::fs::metadata(&materialized)
+        && metadata.is_file()
+        && metadata.len() == expected_len
+    {
+        return None;
+    }
+
+    match synapse_models::embedded_model_bundle() {
+        Ok(bundle) => match bundle.slot(synapse_models::WHISPER_TINY_INT8_ONNX_ID) {
+            Some(slot) if slot.is_present() => None,
+            Some(_) => Some(format!(
+                "the optional speech-to-text model is not packaged in {} and no verified model \
+                 exists at {}; produce it with {} and re-run scripts/synapse-setup.ps1 with \
+                 SYNAPSE_WHISPER_ONNX_SOURCE set to the produced file",
+                bundle.executable.display(),
+                materialized.display(),
+                synapse_models::WHISPER_TINY_INT8_ONNX_RECIPE,
+            )),
+            None => Some(format!(
+                "the embedded model bundle in {} has no speech-to-text slot; re-run \
+                 scripts/synapse-setup.ps1 from this checkout",
+                bundle.executable.display()
+            )),
+        },
+        Err(error) => Some(format!(
+            "speech-to-text model availability could not be determined: {error}"
+        )),
+    }
+}
+
 fn state_lock_unavailable_health<T>(
     state_name: &'static str,
     error: TryLockError<T>,
@@ -1134,10 +1178,16 @@ impl SynapseService {
     fn audio_health(&self) -> SubsystemHealth {
         match self.m3_state.try_lock() {
             Ok(state) => {
+                // Physical fact about this binary, independent of whether audio
+                // is switched on: is the optional STT model actually packaged?
+                // (#1863)
+                let stt_availability = stt_model_availability();
                 if let Some(error) = &state.audio_last_error {
                     return SubsystemHealth {
                         status: "error".to_owned(),
                         detail: Some(error.clone()),
+                        stt_model_available: Some(stt_availability.is_none()),
+                        stt_model_unavailable_reason: stt_availability,
                         ..SubsystemHealth::default()
                     };
                 }
@@ -1147,6 +1197,24 @@ impl SynapseService {
                         detail: Some("audio is disabled; start with --enable-audio".to_owned()),
                         ring_buffer_seconds: Some(synapse_audio::DEFAULT_RING_SECONDS),
                         stt_model_loaded: Some(false),
+                        stt_model_available: Some(stt_availability.is_none()),
+                        stt_model_unavailable_reason: stt_availability,
+                        ..SubsystemHealth::default()
+                    };
+                }
+                // Audio is enabled but this build cannot transcribe. Reporting
+                // "ok" here would be a silent capability lie, so it is called
+                // out as degraded with the exact acquisition remediation.
+                if let Some(reason) = stt_availability {
+                    return SubsystemHealth {
+                        status: "degraded".to_owned(),
+                        detail: Some(format!(
+                            "audio is enabled but speech-to-text is unavailable in this build: {reason}"
+                        )),
+                        ring_buffer_seconds: Some(synapse_audio::DEFAULT_RING_SECONDS),
+                        stt_model_loaded: Some(false),
+                        stt_model_available: Some(false),
+                        stt_model_unavailable_reason: Some(reason),
                         ..SubsystemHealth::default()
                     };
                 }
@@ -1159,6 +1227,7 @@ impl SynapseService {
                         ),
                         ring_buffer_seconds: Some(synapse_audio::DEFAULT_RING_SECONDS),
                         stt_model_loaded: Some(false),
+                        stt_model_available: Some(true),
                         ..SubsystemHealth::default()
                     };
                 };
@@ -1182,6 +1251,7 @@ impl SynapseService {
                     )),
                     ring_buffer_seconds: Some(runtime.config().ring_seconds),
                     stt_model_loaded: Some(runtime.stt_model_loaded()),
+                    stt_model_available: Some(true),
                     ..SubsystemHealth::default()
                 }
             }

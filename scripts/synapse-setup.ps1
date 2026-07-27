@@ -201,6 +201,11 @@ param(
     [string]$DbPath      = "$env:LOCALAPPDATA\synapse\db-daemon",
     [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles",
     [string]$LogDir      = "$env:LOCALAPPDATA\synapse\logs",
+    # Program artifacts the daemon's autostart depends on (the hidden launcher
+    # and the supervisor script). Deliberately NOT under $LogDir: that directory
+    # is what an operator or a retention sweep empties to reclaim space, and
+    # deleting logs must never be able to disable autostart (#1862).
+    [string]$RuntimeBinDir = "$env:LOCALAPPDATA\synapse\bin",
     [string]$TokenPath   = "$env:APPDATA\synapse\token.txt",
     [string]$CodexToolSurfaceSnapshotPath = "$env:APPDATA\synapse\codex-tool-surface.json",
     [string]$ActiveIssue = $env:SYNAPSE_ACTIVE_ISSUE,
@@ -357,6 +362,10 @@ function Write-SynapseSetupRepairManifestState {
 }
 
 function Info($m)  { Write-Host "[synapse-setup] $m" }
+# A non-fatal condition the operator must still see. Used for recorded
+# capability gaps: the install is correct but something is genuinely
+# unavailable, and silence would be dishonest (#1863).
+function Warn($m)  { Write-Host "[synapse-setup] WARNING: $m" -ForegroundColor Yellow }
 function Step($m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Die($m)   {
     if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath)) {
@@ -6651,32 +6660,142 @@ function Install-SynapsePinnedOrtGpuRuntime {
     return [pscustomobject]@{ Version = $version; NativeDir = $nativeDir; PackagePath = $packagePath; PackageSha256 = $packageReadback }
 }
 
-function Install-SynapsePinnedDetectionModels {
-    param([Parameter(Mandatory=$true)][string]$Root)
+function Get-SynapseOptionalModelPin {
+    <#
+        Reads the committed pin for an optional embedded model and proves it
+        agrees with the constant compiled into the daemon (#1863).
+
+        The pin used to live in two independent hardcoded copies -- one here and
+        one in registry.rs. Two copies of a supply-chain constant drift, and a
+        drifted pin means the installer packages bytes the daemon will refuse at
+        load time. The pin file is now the single authored value and this
+        function fails closed if the Rust constant does not match it.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$SourceDir,
+        [Parameter(Mandatory=$true)][string]$PinRelativePath,
+        [Parameter(Mandatory=$true)][string]$RustConstantName,
+        [Parameter(Mandatory=$true)][string]$RustSourceRelativePath
+    )
+
+    $pinPath = Join-Path $SourceDir $PinRelativePath
+    if (-not (Test-Path -LiteralPath $pinPath -PathType Leaf)) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_MISSING path=$pinPath remediation=restore the committed model pin file; it is the authoritative record of which bytes this checkout accepts"
+    }
+    try {
+        $pin = Get-Content -LiteralPath $pinPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_UNREADABLE path=$pinPath error=$($_.Exception.Message) remediation=the pin file is not valid JSON; repair it from version control"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$pin.sha256) -or ([string]$pin.sha256).Length -ne 64) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_INVALID path=$pinPath sha256=$($pin.sha256) remediation=sha256 must be exactly 64 hex characters"
+    }
+    if ([int64]$pin.length -le 0) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_INVALID path=$pinPath length=$($pin.length) remediation=length must be a positive byte count"
+    }
+    $pinSha = ([string]$pin.sha256).ToUpperInvariant()
+
+    $rustPath = Join-Path $SourceDir $RustSourceRelativePath
+    if (-not (Test-Path -LiteralPath $rustPath -PathType Leaf)) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_SOURCE_MISSING path=$rustPath remediation=the daemon model registry source is required to verify the pin agrees with the compiled constant"
+    }
+    $rustText = Get-Content -LiteralPath $rustPath -Raw -Encoding UTF8
+    $match = [regex]::Match($rustText, "(?s)$([regex]::Escape($RustConstantName))\s*:\s*&str\s*=\s*`"sha256:([0-9a-fA-F]{64})`"")
+    if (-not $match.Success) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_CONSTANT_NOT_FOUND constant=$RustConstantName path=$rustPath remediation=the daemon constant could not be located; the installer refuses to package a model whose runtime pin it cannot read"
+    }
+    $rustSha = $match.Groups[1].Value.ToUpperInvariant()
+    if ($rustSha -ne $pinSha) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_DRIFT pin_path=$pinPath pin_sha256=$pinSha rust_path=$rustPath rust_constant=$RustConstantName rust_sha256=$rustSha remediation=the committed pin and the compiled daemon constant disagree; run scripts/build-whisper-e2e-onnx.ps1 which rewrites both, or reconcile them by hand before installing"
+    }
+    Info "Optional model pin verified id=$($pin.id) sha256=$pinSha length=$($pin.length) pin=$pinPath rust_constant=$RustConstantName"
+    return [pscustomobject]@{
+        Id = [string]$pin.id
+        FileName = [string]$pin.filename
+        Sha256 = $pinSha
+        Length = [int64]$pin.length
+        Recipe = [string]$pin.recipe
+        OverrideEnv = [string]$pin.acquisition.override_env
+        PinPath = $pinPath
+    }
+}
+
+function Get-SynapseEmbeddedModelPins {
+    <#
+        The single authored description of every embedded model slot: what it
+        is, whether the install may complete without it, and the exact bytes
+        that count as legitimate. Both the packaging path and the -SkipBuild
+        validation path read this, so they can never disagree (#1863).
+    #>
+    param([Parameter(Mandatory=$true)][string]$SourceDir)
+
+    $whisperPin = Get-SynapseOptionalModelPin -SourceDir $SourceDir `
+        -PinRelativePath 'models\whisper-tiny-int8.pin.json' `
+        -RustConstantName 'WHISPER_TINY_INT8_ONNX_SHA256' `
+        -RustSourceRelativePath 'crates\synapse-models\src\registry.rs'
+
+    # Candidate sources for the optional artifact, in precedence order. The
+    # operator override comes first so a freshly produced artifact can be
+    # packaged without moving files into a magic location.
+    $whisperSources = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:SYNAPSE_WHISPER_ONNX_SOURCE)) {
+        $whisperSources += $env:SYNAPSE_WHISPER_ONNX_SOURCE
+    }
+    $whisperSources += (Join-Path $env:LOCALAPPDATA 'synapse\models\whisper-tiny-int8.onnx')
+    $whisperSources += (Join-Path $SourceDir 'models\whisper-tiny-int8.onnx')
 
     $models = @(
         [pscustomobject]@{
             Name = 'gpu'
+            Required = $true
             FileName = 'rtdetr_v2_s_coco.onnx'
             Url = 'https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model.onnx'
             Sha256 = '583A236AC21C95A7FD94F284FC21485E42355BFEF82C27011BA78FBC09EE87E2'
             Length = [int64]81057510
+            SourcePaths = @()
         },
         [pscustomobject]@{
             Name = 'cpu'
+            Required = $true
             FileName = 'rtdetr_v2_s_coco_int8_cpu.onnx'
             Url = 'https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/resolve/main/onnx/model_int8.onnx'
             Sha256 = 'FED736D2593CF2AB099F665EEEB6D315D909783EEA830F80A807FC1AC1C1B2EC'
             Length = [int64]20991219
+            SourcePaths = @()
         },
         [pscustomobject]@{
             Name = 'whisper'
-            FileName = 'whisper-tiny-int8.onnx'
-            SourcePath = Join-Path $env:LOCALAPPDATA 'synapse\models\whisper-tiny-int8.onnx'
-            Sha256 = '147AFAC751F89AD8E8F82133464EDC81ECFF9391E98CCDCAE2474384BE68EC86'
-            Length = [int64]77356651
+            Required = $false
+            Capability = 'audio_speech_to_text'
+            FileName = $whisperPin.FileName
+            Url = $null
+            Sha256 = $whisperPin.Sha256
+            Length = $whisperPin.Length
+            SourcePaths = @($whisperSources)
+            Recipe = $whisperPin.Recipe
+            OverrideEnv = $whisperPin.OverrideEnv
+            PinPath = $whisperPin.PinPath
         }
     )
+    return @($models)
+}
+
+function Install-SynapsePinnedDetectionModels {
+    <#
+        Acquires every embedded runtime model.
+
+        Required models must be obtained or the build fails. Optional models
+        (currently only the end-to-end STT graph) are acquired when a verified
+        source is available and are otherwise reported as an explicit capability
+        gap -- a disabled optional capability must never fail the whole install
+        (#1863).
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][string]$SourceDir
+    )
+
+    $models = @(Get-SynapseEmbeddedModelPins -SourceDir $SourceDir)
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     foreach ($model in $models) {
         $path = Join-Path $Root $model.FileName
@@ -6685,57 +6804,168 @@ function Install-SynapsePinnedDetectionModels {
             ((Get-SynapseFileSha256 -Path $path) -eq $model.Sha256)
         if (-not $valid) {
             $download = "$path.download-$PID"
+            $acquired = $false
+            $attempted = @()
             if ($model.Url) {
                 Invoke-WebRequest -Uri $model.Url -OutFile $download
-            } elseif ($model.SourcePath -and (Test-Path -LiteralPath $model.SourcePath -PathType Leaf)) {
-                Copy-Item -LiteralPath $model.SourcePath -Destination $download
+                $acquired = $true
+                $attempted += $model.Url
             } else {
-                Die "SYNAPSE_EMBEDDED_MODEL_SOURCE_MISSING model=$($model.Name) source=$($model.SourcePath) remediation=the build host must retain the pinned verified source artifact until it has been packaged into the executable"
+                foreach ($candidate in @($model.SourcePaths)) {
+                    $attempted += $candidate
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                        Copy-Item -LiteralPath $candidate -Destination $download -Force
+                        $acquired = $true
+                        break
+                    }
+                }
+            }
+            if (-not $acquired) {
+                if ($model.Required) {
+                    Die "SYNAPSE_EMBEDDED_MODEL_SOURCE_MISSING model=$($model.Name) attempted_sources=$($attempted -join ';') remediation=a required embedded model could not be acquired; restore the pinned source artifact or network access to its pinned URL"
+                }
+                # Optional and absent: record the capability gap and continue.
+                # The install is still correct; the dependent capability is not
+                # available and says so.
+                $model | Add-Member -NotePropertyName Path -NotePropertyValue $null -Force
+                $model | Add-Member -NotePropertyName Present -NotePropertyValue $false -Force
+                $model | Add-Member -NotePropertyName AbsenceReason -NotePropertyValue (
+                    "no verified source artifact found; searched: $($attempted -join '; ')"
+                ) -Force
+                Warn ("SYNAPSE_OPTIONAL_MODEL_ABSENT model={0} capability={1} expected_sha256={2} expected_length={3} searched={4} recipe={5} override_env={6} pin={7} effect=the install continues and this capability reports itself unavailable" -f `
+                    $model.Name, $model.Capability, $model.Sha256, $model.Length, ($attempted -join ';'), $model.Recipe, $model.OverrideEnv, $model.PinPath)
+                continue
             }
             $actualLength = (Get-Item -LiteralPath $download).Length
             $actualHash = Get-SynapseFileSha256 -Path $download
             if ($actualLength -ne $model.Length -or $actualHash -ne $model.Sha256) {
+                Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
                 Die "SYNAPSE_EMBEDDED_MODEL_DOWNLOAD_INVALID model=$($model.Name) path=$download expected_length=$($model.Length) actual_length=$actualLength expected_sha256=$($model.Sha256) actual_sha256=$actualHash remediation=refuse unverified model bytes; inspect the pinned upstream artifact"
             }
             Move-Item -LiteralPath $download -Destination $path -Force
         }
         $model | Add-Member -NotePropertyName Path -NotePropertyValue $path -Force
-        Info "Pinned embedded runtime model verified model=$($model.Name) path=$path length=$($model.Length) sha256=$($model.Sha256)"
+        $model | Add-Member -NotePropertyName Present -NotePropertyValue $true -Force
+        Info "Pinned embedded runtime model verified model=$($model.Name) required=$($model.Required) path=$path length=$($model.Length) sha256=$($model.Sha256)"
     }
     return @($models)
 }
 
+# Slot order is positional and MUST match REGISTERED_MODELS in
+# crates/synapse-models/src/registry.rs. The daemon reads the same table by
+# index, so reordering here without reordering there would silently mis-map
+# payloads; the daemon refuses a slot count that disagrees with its registry.
+$script:SynapseEmbeddedModelSlotOrder = @('gpu', 'cpu', 'whisper')
+$script:SynapseEmbeddedModelBundleMagicV1 = 'SYNMODEL_BUNDLE1'
+$script:SynapseEmbeddedModelBundleMagicV2 = 'SYNMODEL_BUNDLE2'
+$script:SynapseEmbeddedModelBundleFormatVersion = 2
+# [int64 length][32-byte sha256] per slot.
+$script:SynapseEmbeddedModelBundleSlotSize = 40
+# [uint32 slot_count][uint32 format_version][16-byte magic].
+$script:SynapseEmbeddedModelBundleFooterSize = 24
+
 function Get-SynapseExecutableModelBundle {
+    <#
+        Decodes the self-describing model bundle appended to an executable.
+
+        A slot whose length is 0 is a positive record of absence, which is what
+        allows an optional model to be missing without making the bundle
+        invalid. Returns $null when the executable carries no bundle at all
+        (#1863).
+    #>
     param([Parameter(Mandatory=$true)][string]$ExecutablePath)
 
-    $magic = [System.Text.Encoding]::ASCII.GetBytes('SYNMODEL_BUNDLE1')
+    $magicV1 = [System.Text.Encoding]::ASCII.GetBytes($script:SynapseEmbeddedModelBundleMagicV1)
+    $magicV2 = [System.Text.Encoding]::ASCII.GetBytes($script:SynapseEmbeddedModelBundleMagicV2)
+    $slotCountExpected = @($script:SynapseEmbeddedModelSlotOrder).Count
+    $tableSize = $slotCountExpected * $script:SynapseEmbeddedModelBundleSlotSize
+    $trailerSize = $tableSize + $script:SynapseEmbeddedModelBundleFooterSize
+
     $stream = [System.IO.File]::Open($ExecutablePath, 'Open', 'Read', 'ReadWrite')
     try {
-        if ($stream.Length -lt 40) {
+        if ($stream.Length -lt $script:SynapseEmbeddedModelBundleFooterSize) {
             return $null
         }
-        $stream.Position = $stream.Length - 40
-        $trailer = New-Object byte[] 40
-        if ($stream.Read($trailer, 0, 40) -ne 40) {
+        $stream.Position = $stream.Length - 16
+        $magic = New-Object byte[] 16
+        if ($stream.Read($magic, 0, 16) -ne 16) {
             Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_READ_FAILED path=$ExecutablePath remediation=inspect filesystem integrity; the executable trailer could not be read"
         }
+        $isV1 = $true
+        $isV2 = $true
         for ($index = 0; $index -lt 16; $index++) {
-            if ($trailer[24 + $index] -ne $magic[$index]) {
-                return $null
+            if ($magic[$index] -ne $magicV1[$index]) { $isV1 = $false }
+            if ($magic[$index] -ne $magicV2[$index]) { $isV2 = $false }
+        }
+        if ($isV1) {
+            # A pre-#1863 binary. Report it precisely instead of letting it look
+            # like an unpackaged executable, which would silently repackage from
+            # an unknown base length and corrupt the image.
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_LEGACY_FORMAT path=$ExecutablePath format=$($script:SynapseEmbeddedModelBundleMagicV1) remediation=this executable was packaged by an installer whose bundle cannot express optional models; rebuild from source through this setup script rather than repackaging the existing binary"
+        }
+        if (-not $isV2) {
+            return $null
+        }
+        if ($stream.Length -lt $trailerSize) {
+            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_INVALID path=$ExecutablePath executable_length=$($stream.Length) required_trailer=$trailerSize remediation=the executable is smaller than its own bundle trailer; rebuild and repackage it"
+        }
+        $stream.Position = $stream.Length - $script:SynapseEmbeddedModelBundleFooterSize
+        $footer = New-Object byte[] $script:SynapseEmbeddedModelBundleFooterSize
+        if ($stream.Read($footer, 0, $script:SynapseEmbeddedModelBundleFooterSize) -ne $script:SynapseEmbeddedModelBundleFooterSize) {
+            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_READ_FAILED path=$ExecutablePath remediation=inspect filesystem integrity; the executable bundle footer could not be read"
+        }
+        $slotCount = [BitConverter]::ToUInt32($footer, 0)
+        $formatVersion = [BitConverter]::ToUInt32($footer, 4)
+        if ($formatVersion -ne $script:SynapseEmbeddedModelBundleFormatVersion) {
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_FORMAT_UNSUPPORTED path=$ExecutablePath format_version=$formatVersion expected=$($script:SynapseEmbeddedModelBundleFormatVersion) remediation=the executable was packaged by a different installer version; rebuild from this checkout"
+        }
+        if ($slotCount -ne $slotCountExpected) {
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_SLOT_COUNT_MISMATCH path=$ExecutablePath slot_count=$slotCount expected=$slotCountExpected remediation=the executable and this installer disagree about the registered model set; rebuild from this checkout"
+        }
+
+        $stream.Position = $stream.Length - $trailerSize
+        $table = New-Object byte[] $tableSize
+        if ($stream.Read($table, 0, $tableSize) -ne $tableSize) {
+            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_READ_FAILED path=$ExecutablePath remediation=inspect filesystem integrity; the executable slot table could not be read"
+        }
+
+        $slots = @()
+        $payloadLength = [int64]0
+        for ($index = 0; $index -lt $slotCount; $index++) {
+            $base = $index * $script:SynapseEmbeddedModelBundleSlotSize
+            $length = [BitConverter]::ToInt64($table, $base)
+            if ($length -lt 0) {
+                Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_INVALID path=$ExecutablePath slot=$($script:SynapseEmbeddedModelSlotOrder[$index]) length=$length remediation=the executable advertises a negative model payload length; rebuild and repackage it"
+            }
+            $payloadLength += $length
+            $digest = ''
+            if ($length -gt 0) {
+                $digestBytes = New-Object byte[] 32
+                [Array]::Copy($table, $base + 8, $digestBytes, 0, 32)
+                $digest = ($digestBytes | ForEach-Object { $_.ToString('X2') }) -join ''
+            }
+            $slots += [pscustomobject]@{
+                Name = $script:SynapseEmbeddedModelSlotOrder[$index]
+                Length = [int64]$length
+                Sha256 = $digest
+                Present = ($length -gt 0)
+                Offset = [int64]0
             }
         }
-        $gpuLength = [BitConverter]::ToInt64($trailer, 0)
-        $cpuLength = [BitConverter]::ToInt64($trailer, 8)
-        $whisperLength = [BitConverter]::ToInt64($trailer, 16)
-        if ($gpuLength -le 0 -or $cpuLength -le 0 -or $whisperLength -le 0 -or $gpuLength -gt ($stream.Length - 40) -or $cpuLength -gt ($stream.Length - 40 - $gpuLength) -or $whisperLength -gt ($stream.Length - 40 - $gpuLength - $cpuLength)) {
-            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_INVALID path=$ExecutablePath executable_length=$($stream.Length) gpu_length=$gpuLength cpu_length=$cpuLength whisper_length=$whisperLength remediation=the executable advertises impossible model payload lengths; rebuild and repackage it"
+        $baseLength = [int64]($stream.Length - $trailerSize - $payloadLength)
+        if ($baseLength -lt 0) {
+            Die "SYNAPSE_EMBEDDED_MODEL_TRAILER_INVALID path=$ExecutablePath executable_length=$($stream.Length) payload_length=$payloadLength trailer_length=$trailerSize remediation=the executable advertises impossible model payload lengths; rebuild and repackage it"
+        }
+        $offset = $baseLength
+        foreach ($slot in $slots) {
+            $slot.Offset = [int64]$offset
+            $offset += $slot.Length
         }
         return [pscustomobject]@{
-            BaseLength = [int64]($stream.Length - 40 - $gpuLength - $cpuLength - $whisperLength)
-            GpuLength = [int64]$gpuLength
-            CpuLength = [int64]$cpuLength
-            WhisperLength = [int64]$whisperLength
+            BaseLength = $baseLength
             TotalLength = [int64]$stream.Length
+            PayloadLength = $payloadLength
+            Slots = @($slots)
         }
     } finally {
         $stream.Dispose()
@@ -6773,35 +7003,76 @@ function Get-SynapseExecutableRangeSha256 {
 }
 
 function Assert-SynapseExecutableModelBundle {
-    param([Parameter(Mandatory=$true)][string]$ExecutablePath)
+    <#
+        Re-reads the packaged executable and proves every present slot hashes to
+        what the slot table claims, that required models are present, and that
+        absent slots are optional. Verification is against the bundle's own
+        recorded digests plus the acquired models' verified digests -- no third
+        hardcoded copy of the hashes (#1863).
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$ExecutablePath,
+        [Parameter(Mandatory=$true)]$Models
+    )
 
     $bundle = Get-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath
     if (-not $bundle) {
-        Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_MISSING path=$ExecutablePath remediation=build through synapse-setup.ps1 so the pinned GPU and CPU models are packaged into the executable"
+        Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_MISSING path=$ExecutablePath remediation=build through synapse-setup.ps1 so the pinned models are packaged into the executable"
     }
-    $expectedGpuLength = [int64]81057510
-    $expectedCpuLength = [int64]20991219
-    $expectedWhisperLength = [int64]77356651
-    $expectedGpuHash = '583A236AC21C95A7FD94F284FC21485E42355BFEF82C27011BA78FBC09EE87E2'
-    $expectedCpuHash = 'FED736D2593CF2AB099F665EEEB6D315D909783EEA830F80A807FC1AC1C1B2EC'
-    $expectedWhisperHash = '147AFAC751F89AD8E8F82133464EDC81ECFF9391E98CCDCAE2474384BE68EC86'
-    $gpuHash = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset $bundle.BaseLength -Length $bundle.GpuLength
-    $cpuHash = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset ($bundle.BaseLength + $bundle.GpuLength) -Length $bundle.CpuLength
-    $whisperHash = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset ($bundle.BaseLength + $bundle.GpuLength + $bundle.CpuLength) -Length $bundle.WhisperLength
-    if ($bundle.GpuLength -ne $expectedGpuLength -or $bundle.CpuLength -ne $expectedCpuLength -or $bundle.WhisperLength -ne $expectedWhisperLength -or $gpuHash -ne $expectedGpuHash -or $cpuHash -ne $expectedCpuHash -or $whisperHash -ne $expectedWhisperHash) {
-        Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_INVALID path=$ExecutablePath gpu_length=$($bundle.GpuLength) cpu_length=$($bundle.CpuLength) whisper_length=$($bundle.WhisperLength) gpu_sha256=$gpuHash cpu_sha256=$cpuHash whisper_sha256=$whisperHash remediation=the executable does not contain the exact pinned models; rebuild and repackage it"
+    $summary = @()
+    foreach ($slot in $bundle.Slots) {
+        $model = @($Models | Where-Object { $_.Name -eq $slot.Name })[0]
+        if (-not $model) {
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_SLOT_UNKNOWN path=$ExecutablePath slot=$($slot.Name) remediation=the packaged slot table names a model this installer does not know; rebuild from this checkout"
+        }
+        if (-not $slot.Present) {
+            if ($model.Required) {
+                Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_REQUIRED_SLOT_ABSENT path=$ExecutablePath slot=$($slot.Name) remediation=a required model was not packaged; the executable is unusable — reacquire the model and repackage"
+            }
+            if ($model.Present) {
+                Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_SLOT_LOST path=$ExecutablePath slot=$($slot.Name) expected_length=$($model.Length) remediation=the model was acquired but is absent from the packaged bundle; the packaging step is defective"
+            }
+            $summary += "$($slot.Name)=absent"
+            continue
+        }
+        if (-not $model.Present) {
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_SLOT_UNEXPECTED path=$ExecutablePath slot=$($slot.Name) packaged_length=$($slot.Length) remediation=the bundle contains a payload for a model that was never acquired; the packaging step is defective"
+        }
+        if ($slot.Length -ne $model.Length) {
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_INVALID path=$ExecutablePath slot=$($slot.Name) packaged_length=$($slot.Length) expected_length=$($model.Length) remediation=the executable does not contain the exact pinned model; rebuild and repackage it"
+        }
+        $actual = Get-SynapseExecutableRangeSha256 -ExecutablePath $ExecutablePath -Offset $slot.Offset -Length $slot.Length
+        if ($actual -ne $model.Sha256 -or $actual -ne $slot.Sha256) {
+            Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_INVALID path=$ExecutablePath slot=$($slot.Name) offset=$($slot.Offset) length=$($slot.Length) payload_sha256=$actual slot_table_sha256=$($slot.Sha256) expected_sha256=$($model.Sha256) remediation=the executable does not contain the exact pinned model; rebuild and repackage it"
+        }
+        $summary += "$($slot.Name)=$actual"
     }
-    Info "Executable model bundle verified path=$ExecutablePath base_length=$($bundle.BaseLength) total_length=$($bundle.TotalLength) gpu_sha256=$gpuHash cpu_sha256=$cpuHash whisper_sha256=$whisperHash"
+    Info "Executable model bundle verified path=$ExecutablePath base_length=$($bundle.BaseLength) total_length=$($bundle.TotalLength) slots=$($summary -join ' ')"
     return $bundle
 }
 
 function Add-SynapseExecutableModelBundle {
+    <#
+        Appends the payloads and the slot table. Absent optional models occupy a
+        zero-length slot with a zero digest, which is how the daemon learns the
+        capability is genuinely not packaged rather than guessing (#1863).
+    #>
     param(
         [Parameter(Mandatory=$true)][string]$ExecutablePath,
-        [Parameter(Mandatory=$true)]$GpuModel,
-        [Parameter(Mandatory=$true)]$CpuModel,
-        [Parameter(Mandatory=$true)]$WhisperModel
+        [Parameter(Mandatory=$true)]$Models
     )
+
+    $ordered = @()
+    foreach ($name in $script:SynapseEmbeddedModelSlotOrder) {
+        $model = @($Models | Where-Object { $_.Name -eq $name })[0]
+        if (-not $model) {
+            Die "SYNAPSE_EMBEDDED_MODEL_SELECTION_FAILED slot=$name remediation=the pinned model acquisition did not return an entry for every registered slot"
+        }
+        if ($model.Required -and -not $model.Present) {
+            Die "SYNAPSE_EMBEDDED_MODEL_SELECTION_FAILED slot=$name remediation=a required model was not acquired; refusing to package an unusable executable"
+        }
+        $ordered += $model
+    }
 
     $existing = Get-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath
     if ($existing) {
@@ -6810,23 +7081,33 @@ function Add-SynapseExecutableModelBundle {
     }
     $output = [System.IO.File]::Open($ExecutablePath, 'Append', 'Write', 'None')
     try {
-        foreach ($model in @($GpuModel, $CpuModel, $WhisperModel)) {
-            $input = [System.IO.File]::OpenRead($model.Path)
-            try { $input.CopyTo($output) } finally { $input.Dispose() }
+        foreach ($model in $ordered) {
+            if (-not $model.Present) { continue }
+            $payload = [System.IO.File]::OpenRead($model.Path)
+            try { $payload.CopyTo($output) } finally { $payload.Dispose() }
         }
-        $gpuLengthBytes = [BitConverter]::GetBytes([int64]$GpuModel.Length)
-        $cpuLengthBytes = [BitConverter]::GetBytes([int64]$CpuModel.Length)
-        $whisperLengthBytes = [BitConverter]::GetBytes([int64]$WhisperModel.Length)
-        $magic = [System.Text.Encoding]::ASCII.GetBytes('SYNMODEL_BUNDLE1')
-        $output.Write($gpuLengthBytes, 0, $gpuLengthBytes.Length)
-        $output.Write($cpuLengthBytes, 0, $cpuLengthBytes.Length)
-        $output.Write($whisperLengthBytes, 0, $whisperLengthBytes.Length)
+        foreach ($model in $ordered) {
+            if ($model.Present) {
+                $output.Write([BitConverter]::GetBytes([int64]$model.Length), 0, 8)
+                $digestBytes = [byte[]]::new(32)
+                for ($index = 0; $index -lt 32; $index++) {
+                    $digestBytes[$index] = [Convert]::ToByte($model.Sha256.Substring($index * 2, 2), 16)
+                }
+                $output.Write($digestBytes, 0, 32)
+            } else {
+                $output.Write([BitConverter]::GetBytes([int64]0), 0, 8)
+                $output.Write([byte[]]::new(32), 0, 32)
+            }
+        }
+        $output.Write([BitConverter]::GetBytes([uint32]@($script:SynapseEmbeddedModelSlotOrder).Count), 0, 4)
+        $output.Write([BitConverter]::GetBytes([uint32]$script:SynapseEmbeddedModelBundleFormatVersion), 0, 4)
+        $magic = [System.Text.Encoding]::ASCII.GetBytes($script:SynapseEmbeddedModelBundleMagicV2)
         $output.Write($magic, 0, $magic.Length)
         $output.Flush($true)
     } finally {
         $output.Dispose()
     }
-    return Assert-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath
+    return Assert-SynapseExecutableModelBundle -ExecutablePath $ExecutablePath -Models $ordered
 }
 
 function New-SynapseStagedDaemonBinary {
@@ -10623,14 +10904,43 @@ if (-not $SkipBuild) {
         $cudaBuildCapability.enabled,
         $buildTargetReadback.artifact_sha256)
     $embeddedModelRoot = Join-Path $env:LOCALAPPDATA 'synapse\build-models'
-    $embeddedModels = @(Install-SynapsePinnedDetectionModels -Root $embeddedModelRoot)
-    $embeddedGpuModel = @($embeddedModels | Where-Object { $_.Name -eq 'gpu' })[0]
-    $embeddedCpuModel = @($embeddedModels | Where-Object { $_.Name -eq 'cpu' })[0]
-    $embeddedWhisperModel = @($embeddedModels | Where-Object { $_.Name -eq 'whisper' })[0]
-    if (-not $embeddedGpuModel -or -not $embeddedCpuModel -or -not $embeddedWhisperModel) {
-        Die "SYNAPSE_EMBEDDED_MODEL_SELECTION_FAILED root=$embeddedModelRoot remediation=the pinned model acquisition did not return GPU detection, CPU detection, and CPU Whisper artifacts"
+    $embeddedModels = @(Install-SynapsePinnedDetectionModels -Root $embeddedModelRoot -SourceDir $SourceDir)
+    foreach ($slotName in $script:SynapseEmbeddedModelSlotOrder) {
+        if (-not @($embeddedModels | Where-Object { $_.Name -eq $slotName })[0]) {
+            Die "SYNAPSE_EMBEDDED_MODEL_SELECTION_FAILED root=$embeddedModelRoot slot=$slotName remediation=the pinned model acquisition did not return an entry for every registered model slot"
+        }
     }
-    [void](Add-SynapseExecutableModelBundle -ExecutablePath $built -GpuModel $embeddedGpuModel -CpuModel $embeddedCpuModel -WhisperModel $embeddedWhisperModel)
+    [void](Add-SynapseExecutableModelBundle -ExecutablePath $built -Models $embeddedModels)
+
+    # Record the capability gaps this build ships with, next to the build
+    # readback, so "why is STT unavailable" is answerable from disk without
+    # re-deriving it (#1863).
+    $capabilityGaps = @($embeddedModels | Where-Object { -not $_.Present } | ForEach-Object {
+        [ordered]@{
+            model = $_.Name
+            capability = $_.Capability
+            required = $_.Required
+            expected_sha256 = $_.Sha256
+            expected_length = $_.Length
+            reason = $_.AbsenceReason
+            recipe = $_.Recipe
+            override_env = $_.OverrideEnv
+            pin_path = $_.PinPath
+        }
+    })
+    $capabilityGapPath = Join-Path $LogDir 'synapse-setup-capability-gaps.json'
+    ([ordered]@{
+        schema = 'synapse_setup_capability_gaps/v1'
+        observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        executable = $built
+        executable_sha256 = (Get-SynapseFileSha256 -Path $built)
+        absent_optional_models = @($capabilityGaps)
+    }) | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $capabilityGapPath -Encoding UTF8
+    if (@($capabilityGaps).Count -gt 0) {
+        Warn "SYNAPSE_BUILD_CAPABILITY_GAPS count=$(@($capabilityGaps).Count) readback=$capabilityGapPath models=$(@($capabilityGaps | ForEach-Object { $_.model }) -join ',')"
+    } else {
+        Info "Build capability gaps: none; every registered model was packaged (readback=$capabilityGapPath)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -10690,7 +11000,20 @@ if ($SkipBuild) {
     if (-not (Test-Path -LiteralPath $ExePath)) {
         Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$ExePath remediation=-SkipBuild requires a real local synapse-mcp.exe at -ExePath before setup can touch the live daemon"
     }
-    [void](Assert-SynapseExecutableModelBundle -ExecutablePath $ExePath)
+    # Validating a pre-built binary rather than packaging one: the expectations
+    # still come from the committed pins, and each slot's presence is read from
+    # the binary itself. A required slot that is absent still fails closed.
+    $skipBuildBundle = Get-SynapseExecutableModelBundle -ExecutablePath $ExePath
+    if (-not $skipBuildBundle) {
+        Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_MISSING path=$ExePath remediation=-SkipBuild requires a binary already packaged by this setup script; build without -SkipBuild to package one"
+    }
+    $skipBuildModels = @(Get-SynapseEmbeddedModelPins -SourceDir $SourceDir)
+    foreach ($skipBuildModel in $skipBuildModels) {
+        $slot = @($skipBuildBundle.Slots | Where-Object { $_.Name -eq $skipBuildModel.Name })[0]
+        $skipBuildModel | Add-Member -NotePropertyName Present -NotePropertyValue ([bool]($slot -and $slot.Present)) -Force
+        $skipBuildModel | Add-Member -NotePropertyName Path -NotePropertyValue $null -Force
+    }
+    [void](Assert-SynapseExecutableModelBundle -ExecutablePath $ExePath -Models $skipBuildModels)
     $installSourceHash = Get-SynapseFileSha256 -Path $ExePath
     Info "SkipBuild candidate binary path=$ExePath sha256=$installSourceHash"
 } else {
@@ -10969,19 +11292,111 @@ if ($script:SynapseBindPostExitContinuationRequired) {
         $PID)
 }
 
+function Assert-SynapseAutostartLauncherIntegrity {
+    <#
+        Proves the registered autostart task can actually start the daemon.
+
+        A scheduled task whose action points at a deleted file still reports
+        State=Ready, so any check that only inspects task state calls a dead
+        autostart healthy. That is exactly how log cleanup silently disabled
+        autostart here: the launcher lived in the log directory and went out with
+        the rotated logs. This asserts the registered action's target file
+        physically exists, is the exact launcher setup owns, and does not live in
+        a directory that log hygiene empties (#1862).
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$ExpectedLauncherPath,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$Phase
+    )
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        Die "SYNAPSE_AUTOSTART_TASK_MISSING task=$TaskName phase=$Phase remediation=the autostart task is not registered; re-run setup to register it"
+    }
+    $actions = @($task.Actions)
+    if ($actions.Count -ne 1) {
+        Die "SYNAPSE_AUTOSTART_TASK_ACTION_AMBIGUOUS task=$TaskName phase=$Phase action_count=$($actions.Count) remediation=the autostart task must have exactly one setup-owned action; inspect Task Scheduler"
+    }
+    $arguments = [string]$actions[0].Arguments
+    $match = [regex]::Match($arguments, '"(?<path>[^"]+\.vbs)"')
+    if (-not $match.Success) {
+        Die "SYNAPSE_AUTOSTART_TASK_ACTION_UNPARSEABLE task=$TaskName phase=$Phase arguments=$arguments remediation=the registered action does not name a quoted .vbs launcher; re-run setup to re-register the task"
+    }
+    $registeredLauncher = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($match.Groups['path'].Value))
+    $expected = [System.IO.Path]::GetFullPath($ExpectedLauncherPath)
+    if ($registeredLauncher -ine $expected) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_PATH_MISMATCH task=$TaskName phase=$Phase registered=$registeredLauncher expected=$expected remediation=the registered task launches a different file than the one setup owns; re-run setup to re-register the task"
+    }
+    if (-not (Test-Path -LiteralPath $registeredLauncher -PathType Leaf)) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task=$TaskName phase=$Phase task_state=$($task.State) registered_launcher=$registeredLauncher remediation=the autostart task is registered and reports State=$($task.State) but its launcher file does not exist, so it can never start the daemon; re-run setup to regenerate the launcher"
+    }
+    $resolvedLogDir = [System.IO.Path]::GetFullPath($LogDir).TrimEnd('\')
+    $launcherDir = [System.IO.Path]::GetFullPath((Split-Path -Parent $registeredLauncher)).TrimEnd('\')
+    if ($launcherDir -ieq $resolvedLogDir -or $launcherDir.StartsWith($resolvedLogDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Die "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task=$TaskName phase=$Phase registered_launcher=$registeredLauncher log_dir=$resolvedLogDir remediation=the daemon launcher must not live inside the log directory, where routine log cleanup silently deletes it; re-run setup so the launcher is written to the runtime bin directory"
+    }
+    $launcherHash = Get-SynapseFileSha256 -Path $registeredLauncher
+    $launcherLength = (Get-Item -LiteralPath $registeredLauncher).Length
+    Info "SYNAPSE_AUTOSTART_LAUNCHER_VERIFIED task=$TaskName phase=$Phase task_state=$($task.State) launcher=$registeredLauncher length=$launcherLength sha256=$launcherHash launcher_dir=$launcherDir log_dir=$resolvedLogDir"
+    return [pscustomobject]@{
+        TaskName = $TaskName
+        TaskState = [string]$task.State
+        LauncherPath = $registeredLauncher
+        LauncherSha256 = $launcherHash
+        LauncherLength = [int64]$launcherLength
+    }
+}
+
+function Remove-SynapseLegacyLogDirLauncherArtifacts {
+    <#
+        Removes launcher/supervisor copies left behind in the log directory by
+        pre-#1862 installs, once the runtime-bin copies exist. They are dead
+        program artifacts in a directory reserved for logs, and leaving them
+        there invites a future task registration to point back at a
+        cleanup-vulnerable path.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$RuntimeBinDir
+    )
+
+    foreach ($name in @('synapse-daemon-launch-hidden.vbs', 'synapse-daemon-supervisor.ps1')) {
+        $legacyPath = Join-Path $LogDir $name
+        $currentPath = Join-Path $RuntimeBinDir $name
+        if (-not (Test-Path -LiteralPath $legacyPath -PathType Leaf)) { continue }
+        if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) {
+            Warn "SYNAPSE_LEGACY_LAUNCHER_RETAINED legacy=$legacyPath reason=the replacement in $RuntimeBinDir does not exist yet; refusing to delete the only copy"
+            continue
+        }
+        $legacyHash = Get-SynapseFileSha256 -Path $legacyPath
+        Remove-Item -LiteralPath $legacyPath -Force
+        Info "SYNAPSE_LEGACY_LAUNCHER_REMOVED path=$legacyPath sha256=$legacyHash replacement=$currentPath reason=program artifacts must not live in the log directory (#1862)"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 7. Verify adoption or register + start the auto-start HTTP daemon
 # ---------------------------------------------------------------------------
+New-Item -ItemType Directory -Force -Path $RuntimeBinDir | Out-Null
 $legacyLauncher = Join-Path $LogDir 'synapse-daemon-launch.cmd'
-$hiddenLauncher = Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs'
+# Launcher and supervisor are executable program artifacts, so they live in the
+# runtime bin directory. $launcherLog stays in $LogDir because it genuinely is a
+# log (#1862).
+$hiddenLauncher = Join-Path $RuntimeBinDir 'synapse-daemon-launch-hidden.vbs'
 $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
-$daemonSupervisorPath = Join-Path $LogDir 'synapse-daemon-supervisor.ps1'
+$daemonSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
 $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
 if (-not (Test-Path $wscriptExe)) {
     Die "SYNAPSE_HIDDEN_LAUNCHER_MISSING path=$wscriptExe remediation=repair Windows Script Host or run the daemon manually with a hidden process supervisor"
 }
 if (-not $liveDaemonHandoffRequired) {
     Step "Verifying live adoption of auto-start daemon task '$TaskName'"
+    # Adoption preserves the running task, so its launcher must be proven intact
+    # here too -- a Ready task with a deleted launcher would otherwise be adopted
+    # as healthy and never start again after the next reboot (#1862).
+    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'adoption')
     $liveAdoption = Assert-SynapseLiveDaemonAdoptionIdentity `
         -TaskName $TaskName `
         -HiddenLauncherPath $hiddenLauncher `
@@ -11023,7 +11438,7 @@ if (-not $liveDaemonHandoffRequired) {
         -AllowedPermissions $AllowedPermissions `
         -CalyxConfigPath $CalyxConfigPath
 
-    $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $LogDir
+    $action  = New-ScheduledTaskAction -Execute $wscriptExe -Argument "//B //Nologo `"$hiddenLauncher`"" -WorkingDirectory $RuntimeBinDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -11037,6 +11452,8 @@ if (-not $liveDaemonHandoffRequired) {
         -Settings $set -Description "Synapse MCP HTTP daemon (loopback) - the single body controlling Windows + WSL programs." | Out-Null
     Start-ScheduledTask -TaskName $TaskName
     Info "Task registered and started."
+    [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'post_register')
+    Remove-SynapseLegacyLogDirLauncherArtifacts -LogDir $LogDir -RuntimeBinDir $RuntimeBinDir
 }
 
 # ---------------------------------------------------------------------------

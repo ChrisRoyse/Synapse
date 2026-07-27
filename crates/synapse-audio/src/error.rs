@@ -24,6 +24,14 @@ pub enum AudioError {
     ModelLoadFailed { path: PathBuf, detail: String },
     #[error("audio STT model backend unavailable; attempted {attempted:?}")]
     ModelBackendUnavailable { attempted: Vec<ModelBackend> },
+    /// The optional STT model is not packaged in this build (#1863).
+    ///
+    /// Distinct from [`Self::SttModelNotLoaded`], which means "present but not
+    /// loaded yet". This one means the capability does not exist here at all,
+    /// and it carries the acquisition remediation so the caller is told exactly
+    /// how to obtain it rather than seeing a generic load failure.
+    #[error("audio STT model is not available in this build: {detail}")]
+    SttModelUnavailable { detail: String },
 }
 
 impl AudioError {
@@ -37,6 +45,7 @@ impl AudioError {
             Self::ModelHashMismatch { .. } => error_codes::MODEL_HASH_MISMATCH,
             Self::ModelLoadFailed { .. } => error_codes::MODEL_LOAD_FAILED,
             Self::ModelBackendUnavailable { .. } => error_codes::MODEL_BACKEND_UNAVAILABLE,
+            Self::SttModelUnavailable { .. } => error_codes::MODEL_EMBEDDED_SLOT_ABSENT,
         }
     }
 }
@@ -54,6 +63,15 @@ impl From<ModelError> for AudioError {
                 actual,
             },
             ModelError::LoadFailed { path, detail } => Self::ModelLoadFailed { path, detail },
+            // Preserve the distinct "not packaged" meaning and its remediation
+            // instead of flattening it into a generic load failure (#1863).
+            ModelError::EmbeddedSlotAbsent {
+                id,
+                detail,
+                remediation,
+            } => Self::SttModelUnavailable {
+                detail: format!("model `{id}`: {detail}; remediation: {remediation}"),
+            },
             ModelError::BackendUnavailable { attempted, .. } => {
                 Self::ModelBackendUnavailable { attempted }
             }

@@ -23,6 +23,12 @@ use crate::{AudioError, AudioResult, AudioWindow};
 pub const WHISPER_TINY_INT8_FILENAME: &str = "whisper-tiny-int8.onnx";
 pub const WHISPER_TINY_INT8_SHA256: &str =
     "147afac751f89ad8e8f82133464edc81ecff9391e98ccdcae2474384be68ec86";
+/// Byte length of the pinned STT artifact.
+///
+/// Kept in step with `length` in `models/whisper-tiny-int8.pin.json`. Used only
+/// as a cheap availability probe in health (#1863); every path that actually
+/// loads the model verifies [`WHISPER_TINY_INT8_SHA256`] in full.
+pub const WHISPER_TINY_INT8_EXPECTED_LEN: u64 = 77_356_651;
 
 const SILENCE_RMS_DB: f32 = -70.0;
 const DEFAULT_LANGUAGE: &str = "en";

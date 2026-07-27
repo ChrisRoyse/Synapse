@@ -760,7 +760,159 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
         codex_mcp_config_mentions_synapse: codex_text.contains("[mcp_servers.synapse]")
             || codex_text.contains("synapse"),
         codex_mcp_config_mentions_bearer_env: codex_text.contains("SYNAPSE_BEARER_TOKEN"),
+        autostart: autostart_readback(),
     })
+}
+
+/// Reads the daemon autostart task and proves its launcher exists (#1862).
+///
+/// Task state is not evidence: a task whose action targets a deleted file still
+/// reports `Ready`. The launcher used to live in the log directory, so emptying
+/// logs deleted it and autostart died silently. This names the exact defect.
+#[cfg(windows)]
+fn autostart_readback() -> super::types::SetupAutostartReadback {
+    use super::types::SetupAutostartReadback;
+
+    const TASK_NAME: &str = "SynapseMcpDaemon";
+    let log_dir = localappdata_path(["synapse", "logs"]);
+    let mut problems = Vec::new();
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$t = Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue; \
+                 if (-not $t) {{ 'NOTREGISTERED' }} else {{ \
+                 $a = @($t.Actions)[0]; \
+                 \"$($t.State)`n$($a.Execute)`n$($a.Arguments)\" }}"
+            ),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .output();
+
+    let stdout = match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+        Ok(output) => {
+            problems.push(format!(
+                "SYNAPSE_AUTOSTART_QUERY_FAILED exit_code={:?} stderr={} remediation=inspect Task \
+                 Scheduler access for this account",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            String::new()
+        }
+        Err(error) => {
+            problems.push(format!(
+                "SYNAPSE_AUTOSTART_QUERY_FAILED error={error} remediation=inspect whether \
+                 powershell.exe is available to this daemon process"
+            ));
+            String::new()
+        }
+    };
+
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed == "NOTREGISTERED" {
+        if trimmed == "NOTREGISTERED" {
+            problems.push(format!(
+                "SYNAPSE_AUTOSTART_TASK_MISSING task={TASK_NAME} remediation=the daemon will not \
+                 start at logon; re-run scripts/synapse-setup.ps1 to register it"
+            ));
+        }
+        return SetupAutostartReadback {
+            task_name: TASK_NAME.to_owned(),
+            task_registered: false,
+            task_state: None,
+            action_execute: None,
+            action_arguments: None,
+            launcher_path: None,
+            launcher_file: None,
+            can_start_daemon: false,
+            launcher_in_log_dir: false,
+            problems,
+        };
+    }
+
+    let mut lines = trimmed.lines();
+    let task_state = lines.next().unwrap_or_default().trim().to_owned();
+    let action_execute = lines.next().unwrap_or_default().trim().to_owned();
+    let action_arguments = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
+
+    let launcher_path = action_arguments
+        .split('"')
+        .find(|segment| segment.to_ascii_lowercase().ends_with(".vbs"))
+        .map(str::to_owned);
+
+    let (launcher_file, can_start_daemon, launcher_in_log_dir) = match &launcher_path {
+        Some(path) => {
+            let readback = file_readback(PathBuf::from(path));
+            let exists = readback.exists;
+            if !exists {
+                problems.push(format!(
+                    "SYNAPSE_AUTOSTART_LAUNCHER_MISSING task={TASK_NAME} task_state={task_state} \
+                     launcher={path} remediation=the task is registered and reports \
+                     State={task_state}, but its launcher file does not exist so it can never \
+                     start the daemon; re-run scripts/synapse-setup.ps1"
+                ));
+            }
+            let in_log_dir = Path::new(path).starts_with(&log_dir);
+            if in_log_dir {
+                problems.push(format!(
+                    "SYNAPSE_AUTOSTART_LAUNCHER_IN_LOG_DIR task={TASK_NAME} launcher={path} \
+                     log_dir={} remediation=the launcher lives in the log directory, so routine \
+                     log cleanup will delete it and silently disable autostart; re-run \
+                     scripts/synapse-setup.ps1 to move it into the runtime bin directory",
+                    log_dir.display()
+                ));
+            }
+            (Some(readback), exists, in_log_dir)
+        }
+        None => {
+            problems.push(format!(
+                "SYNAPSE_AUTOSTART_TASK_ACTION_UNPARSEABLE task={TASK_NAME} \
+                 arguments={action_arguments} remediation=the registered action does not name a \
+                 quoted .vbs launcher; re-run scripts/synapse-setup.ps1"
+            ));
+            (None, false, false)
+        }
+    };
+
+    SetupAutostartReadback {
+        task_name: TASK_NAME.to_owned(),
+        task_registered: true,
+        task_state: Some(task_state),
+        action_execute: Some(action_execute),
+        action_arguments: Some(action_arguments),
+        launcher_path,
+        launcher_file,
+        can_start_daemon,
+        launcher_in_log_dir,
+        problems,
+    }
+}
+
+#[cfg(not(windows))]
+fn autostart_readback() -> super::types::SetupAutostartReadback {
+    super::types::SetupAutostartReadback {
+        task_name: String::new(),
+        task_registered: false,
+        task_state: None,
+        action_execute: None,
+        action_arguments: None,
+        launcher_path: None,
+        launcher_file: None,
+        can_start_daemon: false,
+        launcher_in_log_dir: false,
+        problems: vec![
+            "SYNAPSE_AUTOSTART_UNSUPPORTED_PLATFORM remediation=daemon autostart is registered \
+             through Windows Task Scheduler; this platform has no equivalent readback"
+                .to_owned(),
+        ],
+    }
 }
 
 fn active_daemon_run_file() -> Result<FileReadback, ErrorData> {

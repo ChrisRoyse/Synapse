@@ -223,12 +223,31 @@ Error mapping: `loopback_init` -> `LoopbackInitFailed`; `device_lost` -> `Device
 |---|---|
 | `WHISPER_TINY_INT8_FILENAME` | `whisper-tiny-int8.onnx` |
 | `WHISPER_TINY_INT8_SHA256` | `147afac751f89ad8e8f82133464edc81ecff9391e98ccdcae2474384be68ec86` |
+| `WHISPER_TINY_INT8_EXPECTED_LEN` | `77356651` |
 
 Model is **Whisper tiny, INT8 ONNX**, run with backend `ModelBackend::Cpu` (via
 `ModelLoader::new(vec![ModelBackend::Cpu])`). `default_model_path()` =
 `synapse_models::default_model_dir().join(WHISPER_TINY_INT8_FILENAME)`. The descriptor id
 is `whisper_tiny_int8`. See [13_models_subsystem.md](13_models_subsystem.md) for loading,
 hashing, and session management.
+
+This is **not** an off-the-shelf HuggingFace export. It is the ONNX Runtime
+Extensions *end-to-end* graph: `run_session` feeds raw container bytes on
+`audio_stream` and reads decoded text from the `str` output, so audio decoding,
+log-mel, beam search and BPE detokenization all live inside the graph. The split
+encoder/decoder exports published by `onnx-community`/`Xenova`/`optimum` take
+`input_features` and emit token ids; they do not satisfy this contract and cannot
+be substituted.
+
+**The model is optional (#1863).** Audio is off by default (`--enable-audio`), so
+a build without the artifact installs successfully. Health then reports
+`audio.stt_model_available = false` together with
+`stt_model_unavailable_reason`, and any attempt to load it fails with
+`MODEL_EMBEDDED_SLOT_ABSENT` carrying the acquisition remediation — it is never
+silently degraded. The artifact is produced by
+`scripts/build-whisper-e2e-onnx.ps1` and pinned in
+`models/whisper-tiny-int8.pin.json`; see
+[13_models_subsystem.md](13_models_subsystem.md) §13.2.5–13.2.6.
 
 Only language **`en`** is supported (`normalize_language`); empty input defaults to `en`,
 any other value yields `AudioError::LoopbackInitFailed` ("only `en` is wired in M3").
