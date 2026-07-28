@@ -6686,6 +6686,14 @@ const SHELL_SUPERVISOR_CONTAINMENT_KEEPER_PENDING: &str =
 /// object reaps every remaining descendant.
 const SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE: &str =
     "windows_named_job_object_armed_child_keeper_restart_survivable";
+/// The exact child reached terminal state before a keeper handle could be
+/// installed. Restart survival only protects a child that is still running, so
+/// there is nothing to arm and nothing was lost: the still-armed daemon-lifetime
+/// Job Object remains correct containment and the monitor reconciles the job
+/// from its already-persisted stdout/stderr/exit status. Deliberately NOT in the
+/// restart-adoption set — a terminal child must never be adopted as surviving.
+const SHELL_SUPERVISOR_CONTAINMENT_CHILD_TERMINAL_BEFORE_KEEPER: &str =
+    "windows_child_terminal_before_restart_survival_handoff";
 const SHELL_SUPERVISOR_CONTAINMENT_NONE: &str = "no_kill_on_close_containment";
 const SHELL_SUPERVISOR_IDENTITY_UNAVAILABLE_PREFIX: &str = "unavailable:";
 const SHELL_SUPERVISOR_MARKER_FILE: &str = "supervisor.json";
@@ -22677,10 +22685,47 @@ fn handoff_shell_job_to_restart_survivable_monitoring(
         started,
     )?;
 
+    // A child that exits this fast is a normal, expected outcome, not a
+    // control-plane fault. Check before attempting the kernel mutations, because
+    // every one of them can only fail against a dead process (#1866).
+    if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity) {
+        return complete_shell_job_handoff_child_terminal_before_keeper(
+            paths,
+            status,
+            child,
+            local_process_identity,
+            process_job,
+            started,
+            "before_keeper_install",
+            &terminal_state,
+            None,
+        );
+    }
+
     if let Err(error) =
         process_job.install_child_job_keeper_handle(local_process_identity, &status.job_id)
     {
         let detail = error.message.to_string();
+        // The authoritative re-check. The child can exit between the pre-check
+        // above and any of process creation, job-object assignment, handle
+        // duplication, or keeper acknowledgement; Windows then fails the
+        // duplication with ERROR_ACCESS_DENIED because a terminated process
+        // cannot receive new handles. Only a child that is NOT terminal makes
+        // this a real ownership failure.
+        if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity)
+        {
+            return complete_shell_job_handoff_child_terminal_before_keeper(
+                paths,
+                status,
+                child,
+                local_process_identity,
+                process_job,
+                started,
+                "job_object_child_keeper_install_failed",
+                &terminal_state,
+                Some(&detail),
+            );
+        }
         return fail_shell_job_restart_survival_handoff(
             paths,
             status,
@@ -22700,6 +22745,20 @@ fn handoff_shell_job_to_restart_survivable_monitoring(
         Some(&status.job_id),
     ) {
         let detail = error.message.to_string();
+        if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity)
+        {
+            return complete_shell_job_handoff_child_terminal_before_keeper(
+                paths,
+                status,
+                child,
+                local_process_identity,
+                process_job,
+                started,
+                "job_object_kill_on_close_keeper_readback_failed",
+                &terminal_state,
+                Some(&detail),
+            );
+        }
         return fail_shell_job_restart_survival_handoff(
             paths,
             status,
@@ -22745,6 +22804,71 @@ fn handoff_shell_job_to_restart_survivable_monitoring(
     _process_job: &mut OwnedProcessJob,
     _started: Instant,
 ) -> Result<(), ErrorData> {
+    Ok(())
+}
+
+/// Prove, against the OS rather than against a return value, whether the exact
+/// child creation identity has reached terminal state.
+///
+/// `Exited` (signaled, handle still open), `Absent` (gone entirely) and
+/// `Mismatch` (the pid now belongs to a different creation identity, so ours is
+/// gone) are all terminal for *our* child. `Unreadable` is deliberately not
+/// terminal: an unprovable state must never be reported as a clean completion.
+#[cfg(windows)]
+fn shell_child_terminal_state_for_handoff(
+    local_process_identity: &ActRunShellLocalProcessIdentity,
+) -> Option<LocalProcessIdentityState> {
+    let state = local_process_identity_state(local_process_identity);
+    terminal_local_process_identity_state(&state).then_some(state)
+}
+
+/// Reconcile a child that reached terminal state before restart-survival could
+/// be armed.
+///
+/// Restart survival exists solely to keep a *running* child alive across daemon
+/// exit. For a terminal child there is nothing to protect, so the already-armed
+/// daemon-lifetime Job Object stays correct containment and the monitor
+/// completes the job from the stdout/stderr/exit status it already persisted.
+/// Reporting TOOL_INTERNAL_ERROR here destroyed the real terminal result of a
+/// fast, expected failure (#1866).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn complete_shell_job_handoff_child_terminal_before_keeper(
+    paths: &ShellJobPaths,
+    status: &mut ActRunShellJobStatus,
+    child: &mut tokio::process::Child,
+    local_process_identity: &ActRunShellLocalProcessIdentity,
+    process_job: &mut OwnedProcessJob,
+    started: Instant,
+    stage: &'static str,
+    terminal_state: &LocalProcessIdentityState,
+    attempt_detail: Option<&str>,
+) -> Result<(), ErrorData> {
+    if let Some(supervisor) = status.supervisor.as_mut() {
+        supervisor.child_containment =
+            SHELL_SUPERVISOR_CONTAINMENT_CHILD_TERMINAL_BEFORE_KEEPER.to_owned();
+    }
+    persist_running_shell_job_status_or_cleanup(
+        paths,
+        status,
+        child,
+        local_process_identity,
+        process_job,
+        started,
+    )?;
+    tracing::info!(
+        code = "M4_ACT_RUN_SHELL_CHILD_TERMINAL_BEFORE_RESTART_SURVIVAL",
+        job_id = %status.job_id,
+        pid = local_process_identity.pid,
+        child_start_time = local_process_identity.start_time,
+        stage,
+        terminal_state = %local_process_identity_state_label(terminal_state),
+        attempt_detail = ?attempt_detail,
+        containment = SHELL_SUPERVISOR_CONTAINMENT_CHILD_TERMINAL_BEFORE_KEEPER,
+        status_path = %paths.status_path.display(),
+        "durable shell child reached terminal state before restart survival could be armed; \
+         the monitor reconciles it as a normal terminal job from its persisted output and exit status"
+    );
     Ok(())
 }
 
