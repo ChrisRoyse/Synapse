@@ -475,6 +475,20 @@ impl SessionRegistry {
     }
 }
 
+/// The canonical `last_action` label for a tool call (#1868).
+///
+/// Two independent writers stamp `last_action`: the HTTP transport, from the
+/// JSON-RPC envelope, and the #1800 per-call activity hook, from the decoded
+/// tool name. They must agree, because `act_spawn_agent`'s readiness predicate
+/// accepts a session only once `last_action` proves a real tool call by starting
+/// with `tools/call:`. While the hook wrote the bare tool name it clobbered the
+/// transport's prefixed label on every single call, so a target-less spawn could
+/// never observe readiness and killed a healthy, already-working agent at
+/// `wait_timeout_ms`. One definition, used by both writers.
+pub(crate) fn tool_call_action_label(tool_name: &str) -> String {
+    format!("tools/call:{tool_name}")
+}
+
 pub(crate) fn unix_time_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

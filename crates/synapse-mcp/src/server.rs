@@ -1631,7 +1631,11 @@ impl SynapseService {
         if let Ok(mut registry) = self.session_registry.lock() {
             registry.touch_seen_if_present(
                 session_id,
-                Some(tool_name.to_owned()),
+                // Must be the canonical `tools/call:` label, not the bare tool
+                // name: this hook fires on every call and would otherwise
+                // clobber the transport's label that spawn readiness reads
+                // (#1868).
+                Some(session_registry::tool_call_action_label(tool_name)),
                 session_registry::unix_time_ms_now(),
             );
         }

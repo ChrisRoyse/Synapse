@@ -454,7 +454,9 @@ fn jsonrpc_action_label(value: &serde_json::Value) -> Option<String> {
             .and_then(|params| params.get("name"))
             .and_then(serde_json::Value::as_str)
     {
-        return Some(format!("tools/call:{name}"));
+        return Some(crate::server::session_registry::tool_call_action_label(
+            name,
+        ));
     }
     Some(method.to_owned())
 }
