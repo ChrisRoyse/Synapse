@@ -12,12 +12,18 @@
 //! `SynapseCalyxVault` code, real WAL/MVCC commits, the real checkpoint sealer,
 //! and the real `verify_ledger_chain` verifier. Nothing is mocked or stubbed.
 //!
-//! The tampers are deliberately written **through the real storage write path**
-//! rather than by flipping bytes in an SST. An SST byte flip trips the storage
-//! layer's own record/body CRC and proves nothing about provenance. Writing a
-//! structurally valid row that carries a different commitment is the failure
-//! mode a naive recompute-and-compare is actually fooled by, and it is the one
-//! the Merkle seal exists to catch.
+//! The public write path refuses to touch either provenance CF at all —
+//! `CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN` and
+//! `CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN` — so the API-level tamper vector is
+//! already closed, and `mutate-commitment` / `mutate-ledger` exist to
+//! demonstrate exactly that. Placing tampered provenance in front of the
+//! verifier therefore means writing it *underneath* the API, which is also what
+//! real corruption and a real attacker do. A naive byte flip would only trip
+//! the storage layer's own record/body CRC and prove nothing about provenance,
+//! so `sst-patch-value` / `sst-drop-value` recompute both CRC layers: the
+//! storage layer accepts the file as intact, and a structurally valid row
+//! carrying a different commitment is left for the Merkle seal to catch. That
+//! is the failure mode a recompute-and-compare verifier is actually fooled by.
 //!
 //! Usage (run each step as its own process so every readback is an independent
 //! open of the durable bytes):
@@ -55,13 +61,13 @@ const USAGE: &str = "usage: provenance_tamper_fsv \
                      mutate-ledger|lineage|sst-patch-value|sst-drop-value> <dir> [args]";
 
 /// SST layout (`calyx-aster::sst`): `CXS1` | version u32 | entries u32 |
-/// index_offset u64 | bloom_offset u64 | body_crc u32, then records, then the
-/// index, then the bloom filter.
+/// `index_offset` u64 | `bloom_offset` u64 | `body_crc` u32, then records, then
+/// the index, then the bloom filter.
 const SST_MAGIC: &[u8; 4] = b"CXS1";
 const SST_HEADER_LEN: usize = 32;
 const SST_RECORD_HEADER_LEN: usize = 12;
 
-/// `CYXRAW01` + seq(8) + row_count(8) + batch_hash(32).
+/// `CYXRAW01` + seq(8) + `row_count`(8) + `batch_hash`(32).
 const RAW_COMMITMENT_VALUE_BYTES: usize = 8 + 8 + 8 + 32;
 const RAW_COMMITMENT_MAGIC: &[u8; 8] = b"CYXRAW01";
 const RAW_COMMITMENT_HASH_OFFSET: usize = 24;
@@ -94,9 +100,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             &parse_hex(args.get(2).ok_or("missing old value hex")?)?,
             &parse_hex(args.get(3).ok_or("missing new value hex")?)?,
         ),
-        "sst-drop-value" => {
-            sst_drop_value(&vault_dir, &parse_hex(args.get(2).ok_or("missing value hex")?)?)
-        }
+        "sst-drop-value" => sst_drop_value(
+            &vault_dir,
+            &parse_hex(args.get(2).ok_or("missing value hex")?)?,
+        ),
         _ => Err(USAGE.into()),
     }
 }
@@ -117,8 +124,6 @@ fn parse_hex(text: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 struct SstFile {
     version: u32,
     records: Vec<(Vec<u8>, Vec<u8>)>,
-    index_offset: usize,
-    bloom_offset: usize,
     bloom: Vec<u8>,
 }
 
@@ -130,8 +135,8 @@ fn parse_sst(bytes: &[u8]) -> Result<SstFile, Box<dyn Error>> {
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into()?);
     let entries = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
-    let index_offset = u64::from_le_bytes(bytes[12..20].try_into()?) as usize;
-    let bloom_offset = u64::from_le_bytes(bytes[20..28].try_into()?) as usize;
+    let index_offset = usize::try_from(u64::from_le_bytes(bytes[12..20].try_into()?))?;
+    let bloom_offset = usize::try_from(u64::from_le_bytes(bytes[20..28].try_into()?))?;
     if index_offset > bytes.len() || bloom_offset < index_offset || bloom_offset > bytes.len() {
         return Err("SST header offsets out of bounds".into());
     }
@@ -148,7 +153,10 @@ fn parse_sst(bytes: &[u8]) -> Result<SstFile, Box<dyn Error>> {
         let value_start = key_start + key_len;
         let value_end = value_start + value_len;
         let key = bytes.get(key_start..value_start).ok_or("key OOB")?.to_vec();
-        let value = bytes.get(value_start..value_end).ok_or("value OOB")?.to_vec();
+        let value = bytes
+            .get(value_start..value_end)
+            .ok_or("value OOB")?
+            .to_vec();
         if record_crc(&key, &value) != expected_crc {
             return Err(format!("SST record crc mismatch at offset {offset}").into());
         }
@@ -161,8 +169,6 @@ fn parse_sst(bytes: &[u8]) -> Result<SstFile, Box<dyn Error>> {
     Ok(SstFile {
         version,
         records,
-        index_offset,
-        bloom_offset,
         bloom: bytes[bloom_offset..].to_vec(),
     })
 }
@@ -195,7 +201,11 @@ fn encode_sst(file: &SstFile) -> Vec<u8> {
     let body_crc = section_crc(&bytes[SST_HEADER_LEN..]);
     bytes[0..4].copy_from_slice(SST_MAGIC);
     bytes[4..8].copy_from_slice(&file.version.to_le_bytes());
-    bytes[8..12].copy_from_slice(&u32::try_from(file.records.len()).unwrap_or(u32::MAX).to_le_bytes());
+    bytes[8..12].copy_from_slice(
+        &u32::try_from(file.records.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     bytes[12..20].copy_from_slice(&index_offset.to_le_bytes());
     bytes[20..28].copy_from_slice(&bloom_offset.to_le_bytes());
     bytes[28..32].copy_from_slice(&body_crc.to_le_bytes());
@@ -292,7 +302,12 @@ fn sst_drop_value(cf_dir: &PathBuf, value_to_drop: &[u8]) -> Result<(), Box<dyn 
         let before = file.records.len();
         for (key, value) in &file.records {
             if value.as_slice() == value_to_drop {
-                println!("SST_DROP path={} key={} value={}", path.display(), hex(key), hex(value));
+                println!(
+                    "SST_DROP path={} key={} value={}",
+                    path.display(),
+                    hex(key),
+                    hex(value)
+                );
             }
         }
         file.records
@@ -317,7 +332,9 @@ fn sst_drop_value(cf_dir: &PathBuf, value_to_drop: &[u8]) -> Result<(), Box<dyn 
 }
 
 fn parse_seq(arg: Option<&String>) -> Result<u64, Box<dyn Error>> {
-    Ok(arg.ok_or("this command requires a sequence number")?.parse()?)
+    Ok(arg
+        .ok_or("this command requires a sequence number")?
+        .parse()?)
 }
 
 /// Writes `batches` distinct raw CF batches and forces a checkpoint so the
