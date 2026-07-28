@@ -2375,6 +2375,137 @@ function Get-SynapseBuildToolProcessSnapshot {
         Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)
 }
 
+# Windows keeps a running executable image locked for write/delete, so cargo can
+# never replace its own link output while a process is running FROM the cargo
+# target tree (rust-lang/cargo#12485, #11544). That is an environment/ownership
+# fault, not a source defect, and it is fully knowable before a ~20 minute
+# release build starts. This enumerates every live process whose image resides
+# under the resolved target directory so both the preflight and the failure
+# classifier can name the exact PID and image path (#1865).
+function Get-SynapseBuildOutputImageHolders {
+    param([Parameter(Mandatory=$true)][string]$TargetDir)
+
+    $readback = [ordered]@{
+        schema = 'synapse_setup_build_output_image_holders/v1'
+        target_dir = $null
+        process_table_read = $false
+        process_table_error = $null
+        holders = @()
+        unreadable_path_processes = @()
+    }
+    try {
+        $targetFull = Get-SynapseFullPathForScopeCheck -Path $TargetDir
+    } catch {
+        $readback.target_dir = $TargetDir
+        $readback.process_table_error = "target_dir_unresolvable: $($_.Exception.Message)"
+        return [pscustomobject]$readback
+    }
+    $readback.target_dir = $targetFull
+    $prefix = $targetFull + [System.IO.Path]::DirectorySeparatorChar
+
+    $processes = $null
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate)
+        $readback.process_table_read = $true
+    } catch {
+        $readback.process_table_error = $_.Exception.Message
+        return [pscustomobject]$readback
+    }
+
+    $holders = @()
+    $unreadable = @()
+    foreach ($process in $processes) {
+        $exe = [string]$process.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($exe)) {
+            # A process whose image path cannot be read is not evidence of
+            # absence. Record it so the operator sees the exact gap instead of a
+            # silent "no holders" claim.
+            $unreadable += [pscustomobject]@{
+                pid = [int]$process.ProcessId
+                name = [string]$process.Name
+            }
+            continue
+        }
+        $exeFull = $null
+        try { $exeFull = [System.IO.Path]::GetFullPath($exe) } catch { $exeFull = $exe }
+        if (-not $exeFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $createdUtc = $null
+        try {
+            if ($process.CreationDate) { $createdUtc = ([datetime]$process.CreationDate).ToUniversalTime().ToString('o') }
+        } catch { $createdUtc = $null }
+        $holders += [pscustomobject]@{
+            pid = [int]$process.ProcessId
+            parent_pid = [int]$process.ParentProcessId
+            name = [string]$process.Name
+            executable_path = $exeFull
+            command_line = (([string]$process.CommandLine -replace '\s+', ' ').Trim())
+            created_at_utc = $createdUtc
+        }
+    }
+    $readback.holders = @($holders | Sort-Object pid)
+    $readback.unreadable_path_processes = @($unreadable | Sort-Object pid)
+    return [pscustomobject]$readback
+}
+
+function Format-SynapseBuildOutputImageHolders {
+    param([Parameter(Mandatory=$true)]$Readback)
+
+    if (@($Readback.holders).Count -eq 0) { return '<none>' }
+    return (@($Readback.holders | ForEach-Object {
+        'pid={0} image={1} cmd={2}' -f $_.pid, $_.executable_path, $_.command_line
+    }) -join ' | ')
+}
+
+# Cargo emits its own orchestration failures with the same `error:` prefix rustc
+# uses for real diagnostics. Treating every `^error:` line as a compiler
+# diagnostic is what made a locked link output report compiler_error=true with a
+# remediation pointing at compiler errors that do not exist (#1865). Cargo's
+# authoritative discriminator is `--message-format=json` (`reason` =
+# `compiler-message`), which the human-readable build log deliberately does not
+# use, so classify by shape instead: cargo orchestration failures are always
+# `error: failed to <filesystem/network verb>` or `error: could not <verb>`, and
+# never carry a rustc error code or a source span.
+$script:SynapseCargoOrchestrationErrorPatterns = @(
+    '(?i)^error:\s+failed to (remove|write|copy|rename|hardlink|link|create|open|read|move)\b',
+    '(?i)^error:\s+could not (remove|create|write|open|read|delete)\b',
+    '(?i)^error:\s+failed to (get|download|fetch|sync|update|load|select)\b',
+    '(?i)^error:\s+the lock file needs to be updated',
+    '(?i)^error:\s+no such command'
+)
+
+# `error: linking with `link.exe` failed` is rustc's wrapper around a separate
+# tool's failure. It is never a source diagnostic, so "repair the compiler error
+# lines" is the wrong remediation for it; it gets its own classification.
+$script:SynapseLinkerFailurePatterns = @(
+    '(?i)^error:\s+linking with .* failed',
+    '(?i)\bLNK\d{4}\b',
+    '(?i)^\s*=?\s*note:\s*rust-lld:\s*error:',
+    '(?i)^rust-lld:\s*error:'
+)
+
+# A locked build output is always an environment/ownership fault. `os error 5`
+# on the link output, MSVC LNK1104, and rust-lld output-write failures are the
+# concrete Windows shapes of "something is holding the file we must replace".
+$script:SynapseBuildOutputLockedPatterns = @(
+    '(?i)^error:\s+failed to (remove|write|copy|rename|hardlink|link) ',
+    '(?i)Access is denied\.\s*\(os error 5\)',
+    '(?i)\bLNK1104\b',
+    '(?i)rust-lld:\s*error:\s*failed to (write|open) output',
+    '(?i)\(os error 32\)'
+)
+
+function Test-SynapseLogLineMatchesAny {
+    param(
+        [Parameter(Mandatory=$true)][string]$Line,
+        [Parameter(Mandatory=$true)][string[]]$Patterns
+    )
+    foreach ($pattern in $Patterns) {
+        if ($Line -match $pattern) { return $true }
+    }
+    return $false
+}
+
 function Get-SynapseBuildLogSignal {
     param([string]$Path)
 
@@ -2383,6 +2514,12 @@ function Get-SynapseBuildLogSignal {
         exists = $false
         has_compiler_error = $false
         compiler_error_matches = @()
+        has_output_locked_error = $false
+        output_locked_matches = @()
+        output_locked_paths = @()
+        cargo_orchestration_error_matches = @()
+        has_linker_failure = $false
+        linker_failure_matches = @()
         tail_80 = ''
     }
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
@@ -2390,10 +2527,46 @@ function Get-SynapseBuildLogSignal {
     }
     $signal.exists = $true
     $signal.tail_80 = (Get-Content -LiteralPath $Path -Tail 80 -ErrorAction SilentlyContinue) -join "`n"
-    $matches = @(Select-String -LiteralPath $Path -Pattern '(?i)(^error(\[.*\])?:|^error:|fatal error|could not compile|failed to run custom build command|panicked at)' -ErrorAction SilentlyContinue |
-        Select-Object -First 20 LineNumber, Line)
-    $signal.has_compiler_error = ($matches.Count -gt 0)
-    $signal.compiler_error_matches = @($matches)
+
+    $candidates = @(Select-String -LiteralPath $Path -Pattern '(?i)(^error(\[.*\])?:|fatal error|could not compile|failed to run custom build command|panicked at|LNK\d{4}|Access is denied\.\s*\(os error 5\)|\(os error 32\)|rust-lld:\s*error:)' -ErrorAction SilentlyContinue |
+        Select-Object LineNumber, Line)
+
+    $compilerMatches = @()
+    $orchestrationMatches = @()
+    $lockedMatches = @()
+    $linkerMatches = @()
+    $lockedPaths = @()
+    foreach ($candidate in $candidates) {
+        $line = [string]$candidate.Line
+        $isLocked = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseBuildOutputLockedPatterns
+        $isOrchestration = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseCargoOrchestrationErrorPatterns
+        $isLinker = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseLinkerFailurePatterns
+        if ($isLocked) {
+            $lockedMatches += $candidate
+            # Tools quote the offending path differently: cargo uses backticks,
+            # MSVC LINK uses single quotes, rust-lld uses double quotes.
+            foreach ($quotePattern in @('`(?<path>[^`]+)`', "'(?<path>[^']+)'", '"(?<path>[^"]+)"')) {
+                $pathMatch = [regex]::Match($line, $quotePattern)
+                if ($pathMatch.Success) { $lockedPaths += $pathMatch.Groups['path'].Value; break }
+            }
+        }
+        if ($isLinker) { $linkerMatches += $candidate }
+        if ($isOrchestration) { $orchestrationMatches += $candidate }
+        # A line only counts as a compiler diagnostic when it is none of the
+        # non-source failure shapes above. Anything else reproduces the #1865
+        # misdirection where an ownership fault reads as compiler_error=true.
+        if ($isOrchestration -or $isLocked -or $isLinker) { continue }
+        $compilerMatches += $candidate
+    }
+
+    $signal.compiler_error_matches = @($compilerMatches | Select-Object -First 20)
+    $signal.has_compiler_error = (@($compilerMatches).Count -gt 0)
+    $signal.output_locked_matches = @($lockedMatches | Select-Object -First 20)
+    $signal.has_output_locked_error = (@($lockedMatches).Count -gt 0)
+    $signal.output_locked_paths = @($lockedPaths | Select-Object -Unique)
+    $signal.cargo_orchestration_error_matches = @($orchestrationMatches | Select-Object -First 20)
+    $signal.linker_failure_matches = @($linkerMatches | Select-Object -First 20)
+    $signal.has_linker_failure = (@($linkerMatches).Count -gt 0)
     return [pscustomobject]$signal
 }
 
@@ -2605,10 +2778,23 @@ function Get-SynapseReleaseBuildFailureKind {
     param(
         [Parameter(Mandatory=$true)]$Diagnostics,
         [Parameter(Mandatory=$true)]$LogSignal,
-        [Parameter(Mandatory=$true)]$ArtifactReadback
+        [Parameter(Mandatory=$true)]$ArtifactReadback,
+        [AllowNull()]$OutputImageHolders
     )
 
     $job = $Diagnostics.process_job
+    # Ranked above the compiler-error branch on purpose: a locked link output is
+    # an ownership fault whose fix is "stop the process holding the output", and
+    # cargo reports it through the same `error:` prefix as a real diagnostic
+    # (#1865).
+    if ($LogSignal.has_output_locked_error) {
+        $lockedPath = if (@($LogSignal.output_locked_paths).Count -gt 0) { @($LogSignal.output_locked_paths)[0] } else { '<unnamed>' }
+        $holderText = if ($OutputImageHolders) { Format-SynapseBuildOutputImageHolders -Readback $OutputImageHolders } else { '<not_enumerated>' }
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_OUTPUT_LOCKED'
+            remediation = ("the build output could not be replaced because it is locked by a live process; locked_path=$lockedPath live_images_under_target_dir=$holderText; stop the exact process holding the build output (a daemon started straight out of target\release locks its own image on Windows) and rerun setup. This is NOT a compiler error; there is nothing to repair in the source.")
+        }
+    }
     if ($job -and $job.completion_kind -eq 'timeout') {
         return [pscustomobject]@{
             code = 'SYNAPSE_RELEASE_BUILD_TIMEOUT'
@@ -2637,6 +2823,14 @@ function Get-SynapseReleaseBuildFailureKind {
         return [pscustomobject]@{
             code = 'SYNAPSE_RELEASE_BUILD_COMPILER_FAILED'
             remediation = 'repair the compiler error lines recorded in setup-build.log before rerunning setup'
+        }
+    }
+    # Ranked after the compiler branch: a genuine source defect can also fail the
+    # link, and the source diagnostic is the more actionable of the two.
+    if ($LogSignal.has_linker_failure) {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_LINKER_FAILED'
+            remediation = 'the linker failed with no rustc source diagnostic; inspect the linker_failure_matches lines in setup-build.log (missing symbol, missing native library, or unreadable input) and repair the link inputs or toolchain. There are no compiler error lines to repair.'
         }
     }
     if ($job -and [int]$job.exit_code_signed -eq -1) {
@@ -10743,6 +10937,26 @@ if (-not $SkipBuild) {
         }
     }
 
+    # Fail closed BEFORE burning a full release build: if any live process runs
+    # its image out of the cargo target tree, Windows will refuse to let cargo
+    # replace its own link output and the build dies at the very end (#1865).
+    # The collision is knowable here, so the operator never pays ~20 minutes to
+    # learn it.
+    $buildOutputImageHolders = Get-SynapseBuildOutputImageHolders -TargetDir $CargoTarget
+    if (-not $buildOutputImageHolders.process_table_read) {
+        Die ("SYNAPSE_RELEASE_BUILD_OUTPUT_HOLDER_PREFLIGHT_UNREADABLE cargo_target_dir={0} error={1} remediation=setup cannot prove no live process runs from the build output tree; repair Win32_Process access for this session before rerunning setup" -f `
+            $CargoTarget, $buildOutputImageHolders.process_table_error)
+    }
+    if (@($buildOutputImageHolders.holders).Count -gt 0) {
+        Die ("SYNAPSE_RELEASE_BUILD_OUTPUT_DIR_IMAGE_LIVE cargo_target_dir={0} holder_count={1} holders={2} remediation=Windows locks a running executable image, so cargo cannot replace its own link output; stop each PID listed above (verify it exited) and rerun setup. Running the daemon directly out of target\release is the usual cause; deploy through setup so the live daemon runs from the installed path instead." -f `
+            $buildOutputImageHolders.target_dir,
+            @($buildOutputImageHolders.holders).Count,
+            (Format-SynapseBuildOutputImageHolders -Readback $buildOutputImageHolders))
+    }
+    Info ("Build output holder preflight: cargo_target_dir={0} live_images_under_target=0 unreadable_path_processes={1}" -f `
+        $buildOutputImageHolders.target_dir,
+        @($buildOutputImageHolders.unreadable_path_processes).Count)
+
     $cudaBuildCapability = Get-SynapseCudaBuildCapability
 
     New-Item -ItemType Directory -Force -Path $CargoTarget, $LogDir | Out-Null
@@ -10809,10 +11023,15 @@ if (-not $SkipBuild) {
     if ($buildExit -ne 0) {
         $buildLogSignal = Get-SynapseBuildLogSignal -Path $buildLog
         $artifactReadback = Get-SynapseArtifactReadback -Path $built
+        # Re-enumerate at failure time: a process can have started running out of
+        # the target tree during the build itself, and the classifier must name
+        # the exact PID/image rather than assume the preflight state still holds.
+        $buildOutputImageHoldersAfter = Get-SynapseBuildOutputImageHolders -TargetDir $CargoTarget
         $failureKind = Get-SynapseReleaseBuildFailureKind `
             -Diagnostics $buildInvocationDiagnostics `
             -LogSignal $buildLogSignal `
-            -ArtifactReadback $artifactReadback
+            -ArtifactReadback $artifactReadback `
+            -OutputImageHolders $buildOutputImageHoldersAfter
         $buildFailureStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
         $buildFailureDir = Join-Path $LogDir 'setup-build-failures'
         New-Item -ItemType Directory -Force -Path $buildFailureDir | Out-Null
@@ -10857,6 +11076,8 @@ if (-not $SkipBuild) {
             invocation = $buildInvocationDiagnostics
             log_signal = $buildLogSignal
             artifact_readback = $artifactReadback
+            build_output_image_holders_preflight = $buildOutputImageHolders
+            build_output_image_holders_after = $buildOutputImageHoldersAfter
             rust_toolchain_readback = $rustToolchainReadback
             wer_crash_readback = $werCrashReadback
         }
@@ -10874,7 +11095,9 @@ if (-not $SkipBuild) {
         $ownedBuildToolCount = @($buildInvocationDiagnostics.job_owned_build_tool_processes_after).Count
         $unrelatedBuildToolCount = @($buildInvocationDiagnostics.unrelated_build_tool_processes_after).Count
         $recentWerDumpCount = if ($werCrashReadback) { [int]$werCrashReadback.recent_dump_count } else { 0 }
-        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
+        $outputLocked = if ($buildLogSignal.has_output_locked_error) { 'true' } else { 'false' }
+        $outputHolderText = Format-SynapseBuildOutputImageHolders -Readback $buildOutputImageHoldersAfter
+        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} output_locked={22} output_dir_live_images={23} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
             $failureKind.code,
             $buildExit,
             $childPid,
@@ -10896,7 +11119,9 @@ if (-not $SkipBuild) {
             $buildLogArchivePath,
             $recentWerDumpCount,
             $failureKind.remediation,
-            $buildLogSignal.tail_80)
+            $buildLogSignal.tail_80,
+            $outputLocked,
+            $outputHolderText)
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
