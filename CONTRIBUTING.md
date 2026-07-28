@@ -89,6 +89,25 @@ the roadmap (see the README "What's left on the docket" section).
    acceptance surface.
 5. Keep commits focused and write clear messages. Reference the issue number
    where applicable.
+6. **Check your research lane before you rely on it.** The workflow expects
+   independent best-practice research after a defect is diagnosed and before a
+   fix is proposed. The optional Exa MCP lane has repeatedly turned out to be
+   dead at the moment of use (issues #1864, #1856, #1833), costing each session a
+   fresh re-diagnosis. Probe it up front instead:
+   ```powershell
+   pwsh -File scripts\check-research-lane.ps1
+   ```
+   It drives the configured server through a real stdio JSON-RPC
+   `initialize`/`tools/list`/`tools/call` — registration is not service, so it
+   issues a real query — and writes a structured verdict to
+   `%TEMP%\synapse-research-lane-readback.json`. Launcher faults are reported
+   separately from service verdicts, so a broken `npx` is never mistaken for an
+   Exa outage.
+
+   Exa is a **supplement, not a prerequisite**: ordinary web search/fetch against
+   primary sources (Microsoft Learn for Win32 semantics, the Rust and Cargo
+   books, RFCs, upstream project docs) satisfies the research requirement on its
+   own. An Exa outage is not a reason to stop work. Record which lane you used.
 
 ## Pull requests
 
