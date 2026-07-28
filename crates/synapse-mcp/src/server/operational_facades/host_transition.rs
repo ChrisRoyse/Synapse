@@ -171,6 +171,8 @@ fn status_response(
         source_of_truth: host_transition_sot(&state_root),
         state_root: state_root.display().to_string(),
         current_host_boot_id,
+        #[cfg(windows)]
+        host_boot_identity_evidence: m4::host_boot_identity_evidence()?,
         guard_config_file: file_readback(state_root.join(CONFIG_FILE)),
         durable_jobs,
         guards,
@@ -336,6 +338,8 @@ fn preflight(params: SetupHostTransitionParams) -> Result<SetupHostTransitionRes
         source_of_truth: host_transition_sot(&state_root),
         state_root: state_root.display().to_string(),
         current_host_boot_id,
+        #[cfg(windows)]
+        host_boot_identity_evidence: m4::host_boot_identity_evidence()?,
         guard_config_file: file_readback(state_root.join(CONFIG_FILE)),
         durable_jobs,
         guards,
@@ -498,6 +502,8 @@ fn execute(params: SetupHostTransitionParams) -> Result<SetupHostTransitionRespo
         source_of_truth: host_transition_sot(&state_root),
         state_root: state_root.display().to_string(),
         current_host_boot_id: current_host_boot_id.clone(),
+        #[cfg(windows)]
+        host_boot_identity_evidence: m4::host_boot_identity_evidence()?,
         guard_config_file: file_readback(state_root.join(CONFIG_FILE)),
         durable_jobs,
         guards,

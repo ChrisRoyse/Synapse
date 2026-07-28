@@ -519,6 +519,8 @@ pub struct SetupHostTransitionResponse {
     pub source_of_truth: String,
     pub state_root: String,
     pub current_host_boot_id: String,
+    #[cfg(windows)]
+    pub host_boot_identity_evidence: crate::m4::HostBootIdentityEvidence,
     pub guard_config_file: FileReadback,
     pub durable_jobs: crate::m4::ShellJobHostTransitionSnapshot,
     pub guards: Vec<SetupHostTransitionGuardReadback>,

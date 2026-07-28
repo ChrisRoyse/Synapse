@@ -924,7 +924,9 @@ pub struct ActRunShellSupervisorReconciliation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciling_host_boot_id: Option<String>,
     /// `same_boot` | `boot_changed` | `same_boot_proven_by_surviving_exact_child`
-    /// | `prior_boot_identity_unrecorded`.
+    /// | `prior_boot_identity_unrecorded`
+    /// | `prior_boot_identity_incomparable_encoding` (written before #1869, so
+    /// it proves neither a reboot nor its absence).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_boot_relation: Option<String>,
     pub child_containment: String,
@@ -6712,13 +6714,27 @@ const SHELL_SUPERVISOR_MARKER_FILE: &str = "supervisor.json";
 
 static SHELL_JOB_SUPERVISOR_IDENTITY: OnceLock<ActRunShellSupervisorIdentity> = OnceLock::new();
 
-/// Read the physical host boot identity from the kernel.
-///
-/// This is intentionally not derived from wall-clock uptime: clock repair,
-/// hibernation, and coarse timestamp resolution can make timestamps ambiguous.
-/// An unreadable kernel Source of Truth is an error, never a synthetic id.
+/// Prefix of the composite Windows host boot-instance identity.
 #[cfg(windows)]
-pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
+pub(crate) const WINDOWS_HOST_BOOT_IDENTITY_PREFIX: &str = "winboot";
+
+/// Registry witness that corroborates the kernel boot counter. It is written by
+/// the prefetcher during boot, so it is a *second* observation of the same
+/// kernel fact, never the authority.
+#[cfg(windows)]
+pub(crate) const WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters\BootId";
+
+/// Read the physical host **installation** identity from the kernel.
+///
+/// `SYSTEM_BOOT_ENVIRONMENT_INFORMATION.BootIdentifier` is a UUIDv1 minted when
+/// the operating system is installed. On the configured host its embedded v1
+/// timestamp is `2025-04-13T03:12:28Z`, which is the OS `InstallDate` — and it
+/// was byte-identical either side of the real `2026-07-28T04:26:55Z` reboot.
+/// It therefore identifies the *installation*, and is used here only to keep a
+/// reimaged or restored OS (whose boot counter restarts near zero) from
+/// colliding with boot records written by the previous installation.
+#[cfg(windows)]
+pub(crate) fn read_host_installation_identity() -> Result<String, ErrorData> {
     use windows::{
         Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS},
         core::GUID,
@@ -6742,12 +6758,12 @@ pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
         return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
             format!(
-                "Windows kernel boot identity query failed with NTSTATUS 0x{:08x}",
+                "Windows kernel installation identity query failed with NTSTATUS 0x{:08x}",
                 status.0 as u32
             ),
             json!({
                 "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_boot_identity_query_failed",
+                "reason": "windows_installation_identity_query_failed",
                 "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
                 "ntstatus": format!("0x{:08x}", status.0 as u32),
                 "remediation": "repair the Windows ntdll/system-information query failure and restart synapse-mcp; host transitions remain refused",
@@ -6758,11 +6774,11 @@ pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
         return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
             format!(
-                "Windows kernel boot identity query returned {returned} bytes, fewer than the required 16-byte BootIdentifier"
+                "Windows kernel installation identity query returned {returned} bytes, fewer than the required 16-byte BootIdentifier"
             ),
             json!({
                 "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_boot_identity_response_truncated",
+                "reason": "windows_installation_identity_response_truncated",
                 "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
                 "returned_bytes": returned,
                 "required_bytes": std::mem::size_of::<GUID>(),
@@ -6777,13 +6793,269 @@ pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
             "Windows kernel returned an all-zero BootIdentifier",
             json!({
                 "code": error_codes::STORAGE_READ_FAILED,
-                "reason": "windows_boot_identity_zero",
+                "reason": "windows_installation_identity_zero",
                 "source_of_truth": "NtQuerySystemInformation(SystemBootEnvironmentInformation)",
                 "remediation": "repair the Windows boot-environment identity Source of Truth and restart synapse-mcp; host transitions remain refused",
             }),
         ));
     }
     Ok(format!("{guid:?}").to_ascii_lowercase())
+}
+
+/// Read the monotonic per-boot counter the kernel publishes in the read-only
+/// `KUSER_SHARED_DATA` page mapped into every user-mode process at the
+/// architecturally fixed address `0x7FFE0000`.
+///
+/// `winload` initialises `BootId` from the Boot Status Data log on every boot,
+/// so it advances by exactly one per boot and is immune to wall-clock repair —
+/// unlike `SYSTEM_TIMEOFDAY_INFORMATION.BootTime`, which the kernel re-bases
+/// when the system time is set and which would therefore make a single boot
+/// look like two.
+#[cfg(windows)]
+pub(crate) fn read_host_boot_counter() -> Result<u32, ErrorData> {
+    use windows::Wdk::System::SystemServices::KUSER_SHARED_DATA;
+
+    // The field is read through Microsoft's own win32-metadata layout rather
+    // than a hand-written offset. This assertion is the fail-closed guard on
+    // that layout: if a future `windows` crate release moves `BootId`, the
+    // build stops here instead of silently reading a neighbouring field --
+    // which is exactly how the install-scoped GUID shipped as a boot identity.
+    const {
+        assert!(
+            core::mem::offset_of!(KUSER_SHARED_DATA, BootId) == 0x2C4,
+            "KUSER_SHARED_DATA.BootId is no longer at the documented x64 offset 0x2C4"
+        );
+    }
+
+    const KUSER_SHARED_DATA_USER_ADDRESS: usize = 0x7FFE_0000;
+    let boot_counter = unsafe {
+        std::ptr::read_volatile(std::ptr::addr_of!(
+            (*(KUSER_SHARED_DATA_USER_ADDRESS as *const KUSER_SHARED_DATA)).BootId
+        ))
+    };
+
+    if boot_counter == 0 {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            "Windows kernel published a zero KUSER_SHARED_DATA.BootId, which no booted system can report",
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "reason": "windows_boot_counter_zero",
+                "source_of_truth": "KUSER_SHARED_DATA.BootId at 0x7FFE0000+0x2C4",
+                "registry_witness": WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS,
+                "remediation": "repair the Windows Boot Status Data log (C:\\Windows\\bootstat.dat) that winload uses to seed BootId, then restart synapse-mcp; durable shell ownership and host transitions remain refused",
+            }),
+        ));
+    }
+
+    Ok(boot_counter)
+}
+
+/// Read the physical host **boot-instance** identity from the kernel.
+///
+/// This is intentionally not derived from wall-clock uptime: clock repair,
+/// hibernation, and coarse timestamp resolution can make timestamps ambiguous.
+/// An unreadable kernel Source of Truth is an error, never a synthetic id.
+///
+/// The identity is the pair `(installation, boot counter)`, because neither
+/// component identifies a boot on its own: the boot-environment GUID never
+/// changes within an installation, and the boot counter restarts near zero
+/// after a reinstall. Equality of this string is what
+/// `classify_orphan_reconciliation` uses to separate "the daemon died inside
+/// one boot" from "the host rebooted", so it must contain no value that can
+/// move *within* a boot.
+#[cfg(windows)]
+pub(crate) fn read_host_boot_identity() -> Result<String, ErrorData> {
+    let installation = read_host_installation_identity()?;
+    let boot_counter = read_host_boot_counter()?;
+    Ok(format!(
+        "{WINDOWS_HOST_BOOT_IDENTITY_PREFIX}:{installation}:{boot_counter}"
+    ))
+}
+
+/// Relation between the boot identity a record was written under and the boot
+/// identity reconciling it now.
+///
+/// The fourth arm exists because #1869 changed the identity encoding. Records
+/// written before that fix carry a bare install-scoped GUID, which is *not
+/// comparable* to a `winboot:<installation>:<counter>` identity: it cannot
+/// prove a reboot happened and it cannot prove one did not. Treating an
+/// unparseable prior value as `boot_changed` would manufacture a host-reboot
+/// claim out of a mere encoding change — the same class of unfounded
+/// attribution as #1856 itself, pointing the opposite way. It is reported as
+/// its own state so the ambiguity is visible rather than laundered into a
+/// verdict.
+pub(crate) fn classify_host_boot_relation(
+    prior: Option<&str>,
+    current_host_boot_id: &str,
+) -> &'static str {
+    /// A comparable identity is one this build knows how to interpret.
+    fn comparable(value: &str) -> bool {
+        #[cfg(windows)]
+        {
+            value.starts_with(&format!("{WINDOWS_HOST_BOOT_IDENTITY_PREFIX}:"))
+        }
+        // On Linux the identity is the raw procfs boot_id and has always been
+        // written in that one encoding, so every recorded value is comparable.
+        #[cfg(not(windows))]
+        {
+            !value.is_empty()
+        }
+    }
+
+    match prior {
+        None => "prior_boot_identity_unrecorded",
+        Some(prior) if !comparable(prior) || !comparable(current_host_boot_id) => {
+            "prior_boot_identity_incomparable_encoding"
+        }
+        Some(prior) if prior == current_host_boot_id => "same_boot",
+        Some(_) => "boot_changed",
+    }
+}
+
+/// Every independent witness of the host boot-instance identity, published
+/// together so an operator can ground a `same_boot` / `boot_changed` verdict
+/// against physical evidence instead of trusting a single opaque string.
+///
+/// The witnesses are deliberately heterogeneous: the kernel shared page, the
+/// prefetcher's registry copy of the same counter, and the kernel boot instant
+/// that can be cross-read from Windows System event log `Microsoft-Windows-
+/// Kernel-General` id 12 and `Microsoft-Windows-Kernel-Boot` id 20
+/// (`LastBootId`). Agreement across them is the evidence; any one alone is not.
+#[cfg(windows)]
+#[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct HostBootIdentityEvidence {
+    /// The composite identity that reconciliation actually compares.
+    pub identity: String,
+    pub source_of_truth: &'static str,
+    /// Install-scoped UUIDv1; constant across reboots, so never a boot identity.
+    pub installation_identity: String,
+    pub installation_identity_source: &'static str,
+    pub installation_identity_scope: &'static str,
+    /// Monotonic per-boot counter: the only component that discriminates boots.
+    pub boot_counter: u32,
+    pub boot_counter_source: &'static str,
+    pub boot_counter_registry_witness: &'static str,
+    pub boot_counter_registry_value: Option<u32>,
+    /// `agree` | `disagree` | `absent`.
+    pub boot_counter_witness_agreement: &'static str,
+    /// Kernel boot instant. Corroboration only — the kernel re-bases it when
+    /// the system clock is set, so it must never enter the identity itself.
+    pub boot_time_filetime_utc: Option<i64>,
+    pub boot_time_utc: Option<String>,
+    pub boot_time_source: &'static str,
+    pub boot_time_excluded_from_identity_reason: &'static str,
+}
+
+#[cfg(windows)]
+fn read_boot_counter_registry_witness() -> Option<u32> {
+    use windows::{
+        Win32::{
+            Foundation::ERROR_SUCCESS,
+            System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW},
+        },
+        core::PCWSTR,
+    };
+
+    let subkey = wide_null(
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
+    );
+    let value_name = wide_null("BootId");
+    let mut value = 0_u32;
+    let mut size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(4);
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(std::ptr::addr_of_mut!(value).cast()),
+            Some(&raw mut size),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn read_host_boot_time_filetime() -> Option<i64> {
+    use windows::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
+    };
+
+    // SYSTEM_TIMEOFDAY_INFORMATION: BootTime is the leading LARGE_INTEGER.
+    let mut buffer = [0_u8; 64];
+    let mut returned = 0_u32;
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_INFORMATION_CLASS(3),
+            buffer.as_mut_ptr().cast(),
+            48,
+            &mut returned,
+        )
+    };
+    if status.is_err() || returned < 8 {
+        return None;
+    }
+    let boot_time = i64::from_le_bytes(buffer[..8].try_into().ok()?);
+    (boot_time > 0).then_some(boot_time)
+}
+
+/// Collect every witness of the boot identity, logging loudly when the
+/// registry witness contradicts the kernel shared page. Disagreement does not
+/// substitute a different value — the kernel page stays authoritative — but it
+/// is a real anomaly and is surfaced rather than absorbed.
+#[cfg(windows)]
+pub fn host_boot_identity_evidence() -> Result<HostBootIdentityEvidence, ErrorData> {
+    let installation_identity = read_host_installation_identity()?;
+    let boot_counter = read_host_boot_counter()?;
+    let registry_value = read_boot_counter_registry_witness();
+    let agreement = match registry_value {
+        Some(value) if value == boot_counter => "agree",
+        Some(value) => {
+            tracing::error!(
+                code = "M4_HOST_BOOT_COUNTER_WITNESS_DISAGREEMENT",
+                kernel_boot_counter = boot_counter,
+                registry_boot_counter = value,
+                registry_witness = WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS,
+                "the prefetcher's registry copy of the kernel boot counter disagrees with \
+                 KUSER_SHARED_DATA.BootId. The kernel shared page remains authoritative and no \
+                 substitute value is used, but investigate: this is either an early-boot write \
+                 race before the prefetcher republished the counter, or registry tampering."
+            );
+            "disagree"
+        }
+        None => "absent",
+    };
+    let boot_time = read_host_boot_time_filetime();
+    Ok(HostBootIdentityEvidence {
+        identity: format!(
+            "{WINDOWS_HOST_BOOT_IDENTITY_PREFIX}:{installation_identity}:{boot_counter}"
+        ),
+        source_of_truth: "KUSER_SHARED_DATA.BootId + NtQuerySystemInformation(SystemBootEnvironmentInformation)",
+        installation_identity,
+        installation_identity_source: "NtQuerySystemInformation(SystemBootEnvironmentInformation).BootIdentifier",
+        installation_identity_scope: "constant for the lifetime of this OS installation; verified byte-identical either side of a real reboot, so it is NOT a boot identity",
+        boot_counter,
+        boot_counter_source: "KUSER_SHARED_DATA.BootId at 0x7FFE0000+0x2C4, seeded by winload from the Boot Status Data log",
+        boot_counter_registry_witness: WINDOWS_BOOT_COUNTER_REGISTRY_WITNESS,
+        boot_counter_registry_value: registry_value,
+        boot_counter_witness_agreement: agreement,
+        boot_time_filetime_utc: boot_time,
+        boot_time_utc: boot_time.and_then(|filetime| {
+            chrono::DateTime::from_timestamp(
+                filetime / 10_000_000 - 11_644_473_600,
+                u32::try_from((filetime % 10_000_000) * 100).unwrap_or(0),
+            )
+            .map(|time| time.to_rfc3339())
+        }),
+        boot_time_source: "NtQuerySystemInformation(SystemTimeOfDayInformation).BootTime; cross-readable from System event log Microsoft-Windows-Kernel-General id 12",
+        boot_time_excluded_from_identity_reason: "the kernel re-bases KeBootTime when the system clock is set, so a single boot could otherwise present two identities",
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -7132,11 +7404,8 @@ fn reconcile_orphaned_shell_jobs_after_supervisor_restart()
     let prior_marker_host_boot_id = prior_marker
         .as_ref()
         .and_then(|marker| marker.host_boot_id.clone());
-    let marker_host_boot_relation = match prior_marker_host_boot_id.as_deref() {
-        Some(prior) if prior == current_host_boot_id => "same_boot",
-        Some(_) => "boot_changed",
-        None => "prior_boot_identity_unrecorded",
-    };
+    let marker_host_boot_relation =
+        classify_host_boot_relation(prior_marker_host_boot_id.as_deref(), current_host_boot_id);
     let root = shell_durable_job_root_dir()?;
     let mut readback = ShellJobSupervisorRestartReadback {
         incarnation_id: identity.incarnation_id.clone(),
@@ -7266,12 +7535,8 @@ fn reconcile_one_orphaned_shell_job(
                 .and_then(|marker| marker.host_boot_id.clone())
         })
     });
-    let mut host_boot_relation = match owner_boot_id.as_deref() {
-        Some(prior) if prior == current_host_boot_id => "same_boot",
-        Some(_) => "boot_changed",
-        None => "prior_boot_identity_unrecorded",
-    }
-    .to_owned();
+    let mut host_boot_relation =
+        classify_host_boot_relation(owner_boot_id.as_deref(), current_host_boot_id).to_owned();
     // 1. Is the supervisor that owned this record actually gone?
     let (prior_state_label, prior_incarnation, prior_pid, prior_containment) = match job
         .supervisor
@@ -7386,7 +7651,16 @@ fn reconcile_one_orphaned_shell_job(
                                 | SHELL_SUPERVISOR_CONTAINMENT_RESTART_SURVIVABLE
                         )
                     ) {
-                        if host_boot_relation == "prior_boot_identity_unrecorded" {
+                        // A surviving exact child creation identity is itself
+                        // proof the host never rebooted, so it resolves both
+                        // "no prior identity recorded" and the #1869
+                        // "recorded, but in an encoding this build cannot
+                        // compare" case.
+                        if matches!(
+                            host_boot_relation.as_str(),
+                            "prior_boot_identity_unrecorded"
+                                | "prior_boot_identity_incomparable_encoding"
+                        ) {
                             host_boot_relation =
                                 "same_boot_proven_by_surviving_exact_child".to_owned();
                         }

@@ -5773,7 +5773,19 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                 -NativeHostExePath $ChromeNativeHostExePath
         } catch {
             $uiRepairError = $_.Exception.Message
-            if ($uiRepairError -match 'SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW') {
+            # "no authenticated Chrome window is open" is a deferrable
+            # environment state, not an install failure: the daemon handoff is
+            # already committed above. It is checkpointed so the operator can
+            # open Chrome and resume just this phase.
+            #
+            # Both spellings are matched because they are the same physical
+            # condition reported by two layers. install-synapse-chrome-debugger.ps1
+            # raises SYNAPSE_CHROME_MAINTENANCE_NO_ELIGIBLE_WINDOW; the
+            # ..._UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW spelling this test
+            # originally used is thrown by nothing in the repository, so the
+            # checkpoint below was unreachable and every Chrome-closed deploy
+            # died with a bare rethrow and no resume command (#1870).
+            if ($uiRepairError -match 'SYNAPSE_CHROME_MAINTENANCE_NO_ELIGIBLE_WINDOW|SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW') {
                 $checkpointDaemonPid = [int]$currentHealth.pid
                 $checkpointDaemonProcess = Get-SynapseDaemonProcessIdentity -ProcessId $checkpointDaemonPid
                 $checkpointTask = Get-SynapseScheduledTaskIdentity -Name $TaskName
