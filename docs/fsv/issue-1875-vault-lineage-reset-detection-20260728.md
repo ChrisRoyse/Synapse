@@ -232,6 +232,75 @@ Absent vault: a no-op with an explicit line, not an error.
 | `-Purge` confirmed | record first, then delete | record written and outlives the vault |
 | `-Purge` absent vault | no-op | explicit skip line |
 
+## Production — the live daemon, the live vault
+
+Deployed through `scripts\synapse-setup.ps1 -SourceDir C:\code\synapse
+-ForceRestart` (exit 0). Installed binary
+`sha256=8BCA88E27CA842CCC2893B7E2D8F1235AFD6DAB2C733A619C8C1B49AA9D374E4`.
+
+**Before deploy** — SoT read directly:
+
+```
+lineage_files_before = 0
+db-daemon\vault-identity.json  vault_id = 01KYJPGWATPD4XNMZY3ERGTKQW
+CURRENT = manifest-00000000000000002571.json   durable_seq = 30783
+```
+
+**Setup's own candidate preflight** started the new binary against a fresh
+throwaway vault and it came up clean — independent evidence the lineage check
+does not break startup:
+
+```
+SYNAPSE_CALYX_VAULT_LINEAGE_SEEDED
+  vault_dir=…\setup-candidates\candidate-…\db  vault_id=01KYNAM5NFC1F5DY2WJ2TPP1EJ
+  latest_seq=0
+Candidate daemon health preflight passed pid=8140 tool_count=40
+```
+
+**Production vault, first open on the new binary:**
+
+```
+[WARN] SYNAPSE_CALYX_VAULT_LINEAGE_SEEDED
+  vault_dir=…\synapse\db-daemon
+  lineage_path=…\synapse\db-daemon.lineage.json
+  vault_id=01KYJPGWATPD4XNMZY3ERGTKQW  latest_seq=31095
+
+[INFO] SYNAPSE_CALYX_VAULT_OPENED
+  … lineage_path=…\db-daemon.lineage.json
+  vault_generation=1  vault_lineage_reset_count=0  chain_origin=lineage-seeded
+```
+
+`%LOCALAPPDATA%\synapse\db-daemon.lineage.json` (368 bytes) records generation 1
+with `vault_id 01KYJPGWATPD4XNMZY3ERGTKQW` — the same id in the vault's own
+identity file, and the same id named in this issue's original evidence.
+
+**Live `verify_chain` through the real wired MCP surface** (`tools/call`,
+`audit operation=verify_chain`, session `b5ea5235-…`):
+
+```json
+{"verdict":"intact","intact":true,"head_height":11625,"entry_count":11625,
+ "raw_commitments_intact":true,"raw_commitment_coverage_from_seq":1,
+ "covers_full_history":false,"chain_origin":"lineage-seeded",
+ "vault_generation":1,"vault_reset_count":0}
+```
+
+`coverage_from_seq=1` and `verdict=intact` are both still there, and they no
+longer read as full historical coverage.
+
+**Restart safety** — the case that would brick the host if the detector were
+wrong. A second deploy (`-SkipBuild -ForceRestart`) stopped and restarted the
+daemon (pid 18280 → 14296). The journal was updated in place, still generation 1,
+no reset, no failure:
+
+```
+last_observed_unix_ms  1785274770400 -> 1785274915210
+high_water_seq         31095         -> 31297
+```
+
+Post-restart live `verify_chain`: `verdict=intact`, `head_height=11674`,
+`covers_full_history=false`, `chain_origin=lineage-seeded`, `vault_generation=1`,
+`vault_reset_count=0`.
+
 ## What this does not fix
 
 The ~1.56M sequences lost on 2026-07-27 are unrecoverable; no backup exists.
