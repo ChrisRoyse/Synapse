@@ -177,6 +177,103 @@ the new meaning — exactly what the issue forbids. The superseded versions are
 kept as `SYN_PRE_1776_PANEL_VERSIONS` so the migration and any audit can name
 them exactly instead of by magic number.
 
+## The 47-slot ceiling was real, and the daemon caught me assuming otherwise
+
+The first deploy of this change **failed**, and it failed in the right place.
+`synapse-setup`'s candidate health preflight started the new binary against a
+throwaway vault, drove a real `tools/call`, and refused the handoff:
+
+```
+MCP_USAGE_STORAGE_FAILED ... SYNAPSE_CALYX_ASTER_CORRUPT_SHARD:
+slot id 82 exceeds durable CF tag maximum 47; allocate panel slots within
+0..=47 or extend the WAL CF tag codec before writing
+```
+
+The live daemon was never touched. The comment this change had replaced —
+"Calyx's durable slot CF tag codec currently supports 0..=47" — was accurate,
+and the replacement's claim that 47 was a Synapse-side ceiling was wrong.
+
+The real constraint: `vault::cf_codec` tags each WAL write-batch row's column
+family with **one byte**. `16..=63` are quantized slots 0..47, `64..=111` their
+raw sidecars, static CFs hold `0..=15` and `112..=131`. Only 124 single-byte
+tags remained, so widening the fixed slot range would have spent nearly all of
+them to buy a slightly higher ceiling.
+
+Extended slots now use the same escape shape the *keyspace* tag has always used
+(`ColumnFamily::keyspace_tag` = `0xF0 ‖ id_be ‖ kind`): `132 ‖ id_be(2) ‖ kind`,
+reaching the whole `u16` space for the cost of one tag. Tags `0..=131` keep
+their exact previous meanings, so records written by every previous build decode
+along the identical path.
+
+Verified at byte level, because getting this wrong makes every existing vault
+unreadable:
+
+```
+WAL_CF_TAG Base                      tag_bytes=1 first_tag_byte=0    round_trips=true
+WAL_CF_TAG Kv                        tag_bytes=1 first_tag_byte=120  round_trips=true
+WAL_CF_TAG slot_00                   tag_bytes=1 first_tag_byte=16   round_trips=true
+WAL_CF_TAG slot_47 (last compact)    tag_bytes=1 first_tag_byte=63   round_trips=true
+WAL_CF_TAG slot_47.raw               tag_bytes=1 first_tag_byte=111  round_trips=true
+WAL_CF_TAG slot_48 (first extended)  tag_bytes=4 first_tag_byte=132  round_trips=true
+WAL_CF_TAG slot_82 (mcp-usage)       tag_bytes=4 first_tag_byte=132  round_trips=true
+WAL_CF_TAG slot_102 (last allocated) tag_bytes=4 first_tag_byte=132  round_trips=true
+WAL_CF_TAG slot_102.raw              tag_bytes=4 first_tag_byte=132  round_trips=true
+WAL_CF_TAG slot_65535 (u16 max)      tag_bytes=4 first_tag_byte=132  round_trips=true
+WAL_CF_TAG_ALL_OK
+```
+
+The compact byte values are unchanged from the previous codec. A
+compactly-encodable slot arriving in escape form is rejected, so no CF can have
+two durable encodings.
+
+## Production acceptance
+
+Redeploy succeeded (`=== Done ===`), with the preflight that had failed now
+passing: `Candidate daemon health preflight passed pid=18612 tool_count=40`.
+Daemon pid 18800.
+
+Six real `tools/call` requests were then driven over the wired MCP surface, each
+publishing a grounded mcp-usage constellation.
+
+**Physical column families that did not exist before now do** — created by the
+real daemon writing real rows through the extended tag, end to end from encode
+through WAL, recovery, and SST fan-out:
+
+```
+slot_82  slot_83  slot_84  slot_85  slot_86  slot_87
+slot_88  slot_89  slot_90  slot_91  slot_92  slot_93   <- mcp-usage block
+slot_94  slot_95                                        <- recurrence-subject block
+```
+
+Audit after the deploy:
+
+```
+base_rows=9716 (was 9227) panels=9 distinct_slot_ids=51 (was 37)
+
+panel syn-mcp-usage-v1          slot_ids=1..12, 82..93   <- crossed to its block
+panel syn-recurrence-subject-v1 slot_ids=1,2, 94,95      <- crossed to its block
+panel syn-timeline-v1           slot_ids=1..7            <- owns 1..7, unchanged
+
+COLLISION slot_01 ... action=224 mcp-usage=135 observation=1 outcome=6
+                      process=2 recurrence-subject=7 timeline=183
+collision_slot_ids=8
+```
+
+The historical per-panel counts are **frozen** at their pre-change values
+(action 224, mcp-usage 135, observation 1, outcome 6, process 2) while total
+Base rows grew by 489. Only timeline's count moved (178 → 183), which is correct
+— it legitimately owns `1..=7`. Action, process, observation and outcome show
+only historical ids because no new source rows of those kinds arrived in the
+window; mcp-usage and recurrence-subject, which do write continuously, have
+visibly crossed over.
+
+Provenance chain after the codec change, live over MCP:
+`verdict=intact`, `head_height=12528`, `raw_commitments_intact=true`,
+`raw_commitment_count=21331`, `raw_seals=2770`.
+
+Vault lineage after this third restart: still generation 1, no reset,
+`high_water_seq` 31297 → 33734.
+
 ## What remains open
 
 The rows already written under the old panel-local ids are still physically in
