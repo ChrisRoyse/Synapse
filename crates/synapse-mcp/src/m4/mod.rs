@@ -2777,6 +2777,18 @@ pub(crate) fn start_authorized_shell_job_with_boundary(
         started,
     )?;
 
+    // The child has not executed an instruction until this point (#1867), so
+    // every containment guarantee above is established against a process that
+    // could not have exited, escaped its job, or spawned descendants.
+    resume_restart_survivable_shell_child(
+        &paths,
+        &mut status,
+        &mut child,
+        &local_process_identity,
+        &mut process_job,
+        started,
+    )?;
+
     let monitor_paths = paths.clone();
     let monitor_status = status.clone();
     let monitor_original_args = params.args.clone();
@@ -19191,6 +19203,17 @@ fn spawn_failure_readback(
     }
 }
 
+/// Create the durable shell job's exact child **suspended and contained**, and
+/// leave it suspended.
+///
+/// On Windows the child is created with `CREATE_SUSPENDED`, assigned to its
+/// named kill-on-close Job Object, and bound to its immutable kernel creation
+/// identity — all before it executes a single instruction. Resuming is the
+/// caller's decision and belongs *after* the restart-survival commit; see
+/// `resume_restart_survivable_shell_child`. Because the child is still
+/// suspended, the Job Object assignment cannot be raced either, which is the
+/// same guarantee `PROC_THREAD_ATTRIBUTE_JOB_LIST` would buy without replacing
+/// the process spawner.
 fn spawn_shell_job_child(
     params: &ActRunShellStartParams,
     spawn_plan: &ShellJobSpawnPlan,
@@ -19406,64 +19429,10 @@ fn spawn_shell_job_child(
             )));
         }
     };
-    if let Err(resume_error) = resume_suspended_shell_child(&local_process_identity) {
-        let initial_cleanup = terminate_and_reap_tokio_child_bounded(
-            &mut child,
-            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
-        );
-        let job_close = process_job.close_checked();
-        let state_after_job_close = local_process_identity_state(&local_process_identity);
-        let post_job_close_cleanup = (!initial_cleanup.reaped
-            || !terminal_local_process_identity_state(&state_after_job_close))
-        .then(|| {
-            terminate_and_reap_tokio_child_bounded(
-                &mut child,
-                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
-            )
-        });
-        let cleanup = merge_exact_child_reap_readbacks(initial_cleanup, post_job_close_cleanup);
-        let final_identity_state = local_process_identity_state(&local_process_identity);
-        let tree_cleanup_verified = cfg!(windows);
-        let cleanup_verified = cleanup.reaped
-            && job_close.is_ok()
-            && tree_cleanup_verified
-            && terminal_local_process_identity_state(&final_identity_state);
-        let readback = spawn_failure_readback(
-            "contained_child_resume_failed",
-            &cleanup,
-            true,
-            Some(&job_close),
-            tree_cleanup_verified,
-            Some(&final_identity_state),
-            cleanup_verified,
-        );
-        let error = shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "act_run_shell_start could not safely resume contained pid {pid}; cleanup_verified={cleanup_verified}; job_close={job_close:?}; final_identity_state={final_identity_state:?}: {resume_error}",
-            ),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "pid": pid,
-                "reason": "contained_child_resume_failed",
-                "resume_error": resume_error,
-                "job_close": format!("{job_close:?}"),
-                "cleanup_verified": cleanup_verified,
-                "cleanup": cleanup,
-                "final_identity_state": final_identity_state,
-            }),
-        );
-        return Err(SpawnShellJobChildFailure::AfterSpawn(Box::new(
-            PostSpawnShellJobChildFailure {
-                error,
-                child,
-                process_job: Some(process_job),
-                pid: Some(pid),
-                local_process_identity: Some(local_process_identity),
-                readback,
-            },
-        )));
-    }
+    // Deliberately NOT resumed here (#1867). The caller resumes only after the
+    // durable `running` row, the child-owned Job Object keeper handle and the
+    // kill-on-close readback are all committed, so a fast-exiting child cannot
+    // reach terminal state before restart survival exists.
     Ok(SpawnedShellChild {
         child,
         process_job,
@@ -22797,6 +22766,92 @@ fn handoff_shell_job_to_restart_survivable_monitoring(
 
 #[cfg(not(windows))]
 fn handoff_shell_job_to_restart_survivable_monitoring(
+    _paths: &ShellJobPaths,
+    _status: &mut ActRunShellJobStatus,
+    _child: &mut tokio::process::Child,
+    _local_process_identity: &ActRunShellLocalProcessIdentity,
+    _process_job: &mut OwnedProcessJob,
+    _started: Instant,
+) -> Result<(), ErrorData> {
+    Ok(())
+}
+
+/// Release the `CREATE_SUSPENDED` durable child, after — and only after —
+/// containment is fully committed (#1867).
+///
+/// Ordering rationale, re-derived rather than assumed: the kill-on-close Job
+/// Object is armed and membership-verified by `assign_owned_process_job` before
+/// this point, so daemon death anywhere in the pre-resume window still reaps the
+/// child, exactly as it did when the resume happened inside the spawner. A
+/// still-suspended child is in fact reaped *more* cleanly, because it cannot
+/// have created descendants or written anything. What the deferral removes is
+/// the window in which a fast child could reach terminal state before
+/// `install_child_job_keeper_handle`, where Windows fails `DuplicateHandle` with
+/// `ERROR_ACCESS_DENIED` because a terminated process cannot receive handles.
+///
+/// A resume failure here is a genuine control-plane fault: containment is
+/// committed but the child will never run, so it fails closed through the same
+/// exact-owned termination/reap path as any other handoff failure.
+#[cfg(windows)]
+fn resume_restart_survivable_shell_child(
+    paths: &ShellJobPaths,
+    status: &mut ActRunShellJobStatus,
+    child: &mut tokio::process::Child,
+    local_process_identity: &ActRunShellLocalProcessIdentity,
+    process_job: &mut OwnedProcessJob,
+    started: Instant,
+) -> Result<(), ErrorData> {
+    // Defence in depth for the #1866 path. A suspended child cannot exit on its
+    // own, but it can still be terminated externally, in which case the handoff
+    // above already reconciled it as a normal terminal job. There is nothing to
+    // resume, and treating an unresumable corpse as a control-plane fault would
+    // destroy exactly the terminal result #1866 recovered.
+    if let Some(terminal_state) = shell_child_terminal_state_for_handoff(local_process_identity) {
+        tracing::info!(
+            code = "M4_ACT_RUN_SHELL_CONTAINED_CHILD_TERMINAL_BEFORE_RESUME",
+            job_id = %status.job_id,
+            pid = local_process_identity.pid,
+            child_start_time = local_process_identity.start_time,
+            terminal_state = ?terminal_state,
+            status_path = %paths.status_path.display(),
+            "durable shell child was terminated before its post-commit resume; the monitor \
+             reconciles it from its persisted output and exit status"
+        );
+        return Ok(());
+    }
+    match resume_suspended_shell_child(local_process_identity) {
+        Ok(()) => {
+            tracing::info!(
+                code = "M4_ACT_RUN_SHELL_CONTAINED_CHILD_RESUMED",
+                job_id = %status.job_id,
+                pid = local_process_identity.pid,
+                child_start_time = local_process_identity.start_time,
+                containment = %status
+                    .supervisor
+                    .as_ref()
+                    .map_or(SHELL_SUPERVISOR_CONTAINMENT_NONE, |supervisor| {
+                        supervisor.child_containment.as_str()
+                    }),
+                "durable shell child resumed after its containment was durably committed"
+            );
+            Ok(())
+        }
+        Err(resume_error) => fail_shell_job_restart_survival_handoff(
+            paths,
+            status,
+            child,
+            local_process_identity,
+            process_job,
+            started,
+            "contained_child_resume_after_restart_survival_commit_failed",
+            &resume_error,
+            None,
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn resume_restart_survivable_shell_child(
     _paths: &ShellJobPaths,
     _status: &mut ActRunShellJobStatus,
     _child: &mut tokio::process::Child,
