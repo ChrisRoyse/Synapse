@@ -25,5 +25,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Used only by the provenance_tamper_fsv manual-FSV instrument, which must
+# rewrite an SST with correct record/body CRCs so the storage layer accepts the
+# bytes and the provenance verifier is the thing under test (issue #1874).
+crc32fast = "1"
+
 [lints]
 workspace = true

@@ -5342,6 +5342,7 @@ dependencies = [
  "calyx-core",
  "calyx-lenses",
  "calyx-registry",
+ "crc32fast",
  "fs2",
  "serde",
  "serde_json",
