@@ -42,8 +42,17 @@ use synapse_storage::{
     dump_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path>";
-const MAX_DURABLE_SLOT_ID: u16 = 47;
+const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path>";
+/// The episode panel's exclusive global slot block (#1776). The
+/// `--repair-bad-episode-slots` mode exists for episode constellations that
+/// historically wrote slots outside it; under the global allocation that is
+/// exactly "outside this range", not "above some shared ceiling".
+const EPISODE_SLOT_BLOCK_FIRST: u16 = 8;
+const EPISODE_SLOT_BLOCK_LAST: u16 = 22;
+
+const fn slot_in_episode_block(slot: u16) -> bool {
+    slot >= EPISODE_SLOT_BLOCK_FIRST && slot <= EPISODE_SLOT_BLOCK_LAST
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -100,6 +109,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
         return repair_bad_episode_slots(PathBuf::from(db_path));
+    }
+    if args.first().is_some_and(|arg| arg == "--panel-slot-audit") {
+        args.remove(0);
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return panel_slot_audit(PathBuf::from(db_path));
     }
     let include_expired = if args.first().is_some_and(|arg| arg == "--include-expired") {
         args.remove(0);
@@ -294,7 +312,7 @@ fn is_bad_episode_slot_constellation(constellation: &calyx_core::Constellation) 
         && constellation
             .slots
             .keys()
-            .any(|slot| slot.get() > MAX_DURABLE_SLOT_ID)
+            .any(|slot| !slot_in_episode_block(slot.get()))
 }
 
 fn count_bad_episode_slots(base_rows: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, Box<dyn Error>> {
@@ -330,7 +348,7 @@ fn collect_repair_targets(
         base_key(cx_id),
     )?;
     for &slot_id in slot_ids {
-        if slot_id.get() > MAX_DURABLE_SLOT_ID {
+        if !slot_in_episode_block(slot_id.get()) {
             continue;
         }
         let key = slot_key(cx_id);
@@ -487,6 +505,122 @@ fn dump_native_source(
     for cx_id in matches {
         dump_native_cx(db_path.clone(), &cx_id, reveal_metadata)?;
     }
+    Ok(())
+}
+
+/// Read-only measurement of the #1776 physical slot collision.
+///
+/// Synapse now allocates each panel an exclusive block of GLOBAL slot ids, but
+/// Calyx persists every vector in a global `cf/slot_<id>` column family keyed
+/// only by `CxId`, so rows written before that allocation can still sit in
+/// another panel's column family. This walks the Base CF, groups each
+/// constellation's declared slot ids by its `synapse_panel_name`, and reports
+/// every slot id claimed by more than one panel — each one a physical column
+/// family holding vectors of different shapes and meanings.
+///
+/// Read-only: it does not take the writer lock, so it can run against the live
+/// vault while the daemon owns it.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "audit owns the path while opening the vault read-only"
+)]
+fn panel_slot_audit(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    let vault = SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        SynapseCalyxConfig::from_vault_dir(db_path.clone()),
+        None,
+    )?;
+    let snapshot = vault.latest_seq();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "panel_slot_audit db_path={} mode=read_only vault_id={} snapshot={}",
+            db_path.display(),
+            vault.vault_id(),
+            snapshot
+        ),
+    )?;
+
+    // panel -> slot id -> row count, and slot id -> panel -> row count.
+    let mut per_panel: BTreeMap<String, BTreeMap<u16, u64>> = BTreeMap::new();
+    let mut per_slot: BTreeMap<u16, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut rows = 0_u64;
+    let mut undecodable = 0_u64;
+    let mut unlabelled = 0_u64;
+
+    for (_key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
+        rows += 1;
+        let Ok(constellation) = decode_constellation_base(&value) else {
+            undecodable += 1;
+            continue;
+        };
+        let panel = constellation.metadata.get(META_PANEL_NAME).map_or_else(
+            || {
+                unlabelled += 1;
+                "<unlabelled>".to_owned()
+            },
+            Clone::clone,
+        );
+        for slot in constellation.slots.keys() {
+            *per_panel
+                .entry(panel.clone())
+                .or_default()
+                .entry(slot.get())
+                .or_default() += 1;
+            *per_slot
+                .entry(slot.get())
+                .or_default()
+                .entry(panel.clone())
+                .or_default() += 1;
+        }
+    }
+
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "base_rows={rows} undecodable={undecodable} unlabelled_panel={unlabelled} panels={} distinct_slot_ids={}",
+            per_panel.len(),
+            per_slot.len()
+        ),
+    )?;
+
+    for (panel, slots) in &per_panel {
+        let ids = slots
+            .keys()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let total = slots.values().sum::<u64>();
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "panel name={panel} slot_count={} slot_ids={ids} slot_rows={total}",
+                slots.len()
+            ),
+        )?;
+    }
+
+    let mut collisions = 0_u64;
+    for (slot, panels) in &per_slot {
+        if panels.len() < 2 {
+            continue;
+        }
+        collisions += 1;
+        let detail = panels
+            .iter()
+            .map(|(panel, count)| format!("{panel}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "COLLISION physical_cf=slot_{slot:02} panel_count={} {detail}",
+                panels.len()
+            ),
+        )?;
+    }
+    write_stdout_line(&mut stdout, format_args!("collision_slot_ids={collisions}"))?;
     Ok(())
 }
 

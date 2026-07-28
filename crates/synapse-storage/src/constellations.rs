@@ -40,20 +40,44 @@ pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
 pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_665_001;
 pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_665_002;
+// #1776 moved these panels off their old panel-local slot ids onto exclusive
+// GLOBAL blocks. A panel_version identifies a slot layout, so the new layout
+// gets a new version: reusing the old one would make a single panel_version
+// mean two different slot maps, and every row written under it before the move
+// would be reinterpreted under the new meaning. The `_1776` generation is the
+// first that writes into the panel's own block.
 pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
-pub const SYN_ACTION_PANEL_VERSION: u32 = 1_666_001;
+pub const SYN_ACTION_PANEL_VERSION: u32 = 1_776_001;
 pub const SYN_REFLEX_PANEL_NAME: &str = "syn-reflex-v1";
-pub const SYN_REFLEX_PANEL_VERSION: u32 = 1_666_002;
+pub const SYN_REFLEX_PANEL_VERSION: u32 = 1_776_002;
 pub const SYN_PROCESS_PANEL_NAME: &str = "syn-process-v1";
-pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_666_003;
+pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_776_003;
 pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
-pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_666_004;
+pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_776_004;
 pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
-pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_669_001;
+pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_776_005;
 pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
-pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_691_001;
+pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_776_006;
 pub const SYN_RECURRENCE_SUBJECT_PANEL_NAME: &str = "syn-recurrence-subject-v1";
-pub const SYN_RECURRENCE_SUBJECT_PANEL_VERSION: u32 = 1_667_001;
+pub const SYN_RECURRENCE_SUBJECT_PANEL_VERSION: u32 = 1_776_007;
+
+/// Panel versions superseded by the #1776 global slot allocation.
+///
+/// Rows carrying these versions were written when slot ids were panel-local, so
+/// their vectors sit in `cf/slot_01`..`cf/slot_08` alongside other panels'. They
+/// are not readable as this panel's current layout and must never be compared
+/// with rows written under the current version. Kept as named constants so the
+/// migration and any audit can identify them exactly rather than by magic
+/// number.
+pub const SYN_PRE_1776_PANEL_VERSIONS: &[(&str, u32)] = &[
+    (SYN_ACTION_PANEL_NAME, 1_666_001),
+    (SYN_REFLEX_PANEL_NAME, 1_666_002),
+    (SYN_PROCESS_PANEL_NAME, 1_666_003),
+    (SYN_OBSERVATION_PANEL_NAME, 1_666_004),
+    (SYN_OUTCOME_PANEL_NAME, 1_669_001),
+    (SYN_MCP_USAGE_PANEL_NAME, 1_691_001),
+    (SYN_RECURRENCE_SUBJECT_PANEL_NAME, 1_667_001),
+];
 // Graph-structural / hierarchy encoder panels (#1685). These are derived panels
 // built off-line from a fingerprinted graph/hierarchy snapshot, not per source
 // row. The version constant is the family's first (snapshot-0) generation; a new
@@ -81,7 +105,13 @@ pub const META_RECENCY_BASIS: &str = "synapse_recency_basis";
 const POINTER_SCHEME: &str = "synapse";
 const TIME_BASIS_UTC: &str = "utc";
 const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100";
-const CALYX_DURABLE_SLOT_ID_MAX: u16 = 47;
+/// Highest global slot id any Synapse panel may durably claim.
+///
+/// This is a Synapse-side allocation ceiling, not a Calyx limit: `SlotId` is a
+/// `u16` and `cf/slot_<id>` directories are named from it, so there is ample
+/// headroom. Raise it when a new panel block needs room; the compile-time
+/// assertion on `PANEL_SLOT_BLOCKS` keeps the two in agreement.
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 102;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -144,74 +174,209 @@ const AT_SLOT_CACHE_READ_LOG1P: SlotId = SlotId::new(45);
 const AT_SLOT_CACHE_CREATION_LOG1P: SlotId = SlotId::new(46);
 const AT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(47);
 
-// Slot ids are local to each panel/constellation. Calyx's durable slot CF tag
-// codec currently supports 0..=47, so newer panels intentionally reuse local
-// slots instead of extending past the durable tag budget.
-const ACT_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
-const ACT_SLOT_TARGET_HASH: SlotId = SlotId::new(2);
-const ACT_SLOT_PARAMS_RECORD_VECTOR: SlotId = SlotId::new(3);
-const ACT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(4);
-const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(5);
+// Slot ids are GLOBAL, not panel-local (#1776).
+//
+// Calyx persists every measured vector in a physical `cf/slot_<id>` column
+// family keyed only by `CxId` (`calyx-aster::cf::slot_key`), and search/index
+// rebuild scans an entire global `ColumnFamily::slot(slot)`. Two panels sharing
+// a slot id therefore share one physical column family holding vectors of
+// different shapes and different meanings, and every association, assay, kernel
+// and search result computed over it compares incomparable things.
+//
+// This used to be treated as panel-local, which put seven panels into
+// `slot_01`..`slot_08` on the production vault. Each panel now owns an
+// exclusive contiguous block declared in `PANEL_SLOT_BLOCKS` below; the blocks
+// are checked disjoint at compile time, and `validate_panel_slot_allocation`
+// fails closed at write time if a constellation ever declares a slot outside
+// its own panel's block. The literal ids stay literal on purpose: they are
+// durable identities, so they must be greppable and must never be silently
+// recomputed.
+const ACT_SLOT_KIND_ONEHOT: SlotId = SlotId::new(48);
+const ACT_SLOT_TARGET_HASH: SlotId = SlotId::new(49);
+const ACT_SLOT_PARAMS_RECORD_VECTOR: SlotId = SlotId::new(50);
+const ACT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(51);
+const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(52);
 
-const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(1);
-const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(2);
-const RF_SLOT_LATENCY_LOG1P: SlotId = SlotId::new(3);
-const RF_SLOT_STEP_COUNT_LOG1P: SlotId = SlotId::new(4);
-const RF_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(5);
-const RF_SLOT_DOW_CYCLIC: SlotId = SlotId::new(6);
-const RF_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
+const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
+const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
+const RF_SLOT_LATENCY_LOG1P: SlotId = SlotId::new(55);
+const RF_SLOT_STEP_COUNT_LOG1P: SlotId = SlotId::new(56);
+const RF_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(57);
+const RF_SLOT_DOW_CYCLIC: SlotId = SlotId::new(58);
+const RF_SLOT_RECORD_VECTOR: SlotId = SlotId::new(59);
 
-const PR_SLOT_PROCESS_HASH: SlotId = SlotId::new(1);
-const PR_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(2);
-const PR_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(3);
-const PR_SLOT_DOW_CYCLIC: SlotId = SlotId::new(4);
-const PR_SLOT_UPTIME_LOG1P: SlotId = SlotId::new(5);
-const PR_SLOT_RECENCY_RANK: SlotId = SlotId::new(6);
-const PR_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
+const PR_SLOT_PROCESS_HASH: SlotId = SlotId::new(60);
+const PR_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(61);
+const PR_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(62);
+const PR_SLOT_DOW_CYCLIC: SlotId = SlotId::new(63);
+const PR_SLOT_UPTIME_LOG1P: SlotId = SlotId::new(64);
+const PR_SLOT_RECENCY_RANK: SlotId = SlotId::new(65);
+const PR_SLOT_RECORD_VECTOR: SlotId = SlotId::new(66);
 
-const OB_SLOT_APP_HASH: SlotId = SlotId::new(1);
-const OB_SLOT_ROLE_HISTOGRAM: SlotId = SlotId::new(2);
-const OB_SLOT_ENTITY_MULTI_HOT: SlotId = SlotId::new(3);
-const OB_SLOT_HUD_RECORD_VECTOR: SlotId = SlotId::new(4);
-const OB_SLOT_FLAGS_MULTI_HOT: SlotId = SlotId::new(5);
-const OB_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(6);
-const OB_SLOT_DOW_CYCLIC: SlotId = SlotId::new(7);
-const OB_SLOT_RECORD_VECTOR: SlotId = SlotId::new(8);
+const OB_SLOT_APP_HASH: SlotId = SlotId::new(67);
+const OB_SLOT_ROLE_HISTOGRAM: SlotId = SlotId::new(68);
+const OB_SLOT_ENTITY_MULTI_HOT: SlotId = SlotId::new(69);
+const OB_SLOT_HUD_RECORD_VECTOR: SlotId = SlotId::new(70);
+const OB_SLOT_FLAGS_MULTI_HOT: SlotId = SlotId::new(71);
+const OB_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(72);
+const OB_SLOT_DOW_CYCLIC: SlotId = SlotId::new(73);
+const OB_SLOT_RECORD_VECTOR: SlotId = SlotId::new(74);
 
-const OUT_SLOT_SOURCE_CF_ONEHOT: SlotId = SlotId::new(1);
-const OUT_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(2);
-const OUT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(3);
-const OUT_SLOT_TARGET_HASH: SlotId = SlotId::new(4);
-const OUT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(5);
-const OUT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(6);
-const OUT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(7);
+const OUT_SLOT_SOURCE_CF_ONEHOT: SlotId = SlotId::new(75);
+const OUT_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(76);
+const OUT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(77);
+const OUT_SLOT_TARGET_HASH: SlotId = SlotId::new(78);
+const OUT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(79);
+const OUT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(80);
+const OUT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(81);
 
-const MU_SLOT_TOOL_ONEHOT: SlotId = SlotId::new(1);
-const MU_SLOT_OPERATION_ONEHOT: SlotId = SlotId::new(2);
-const MU_SLOT_ROUTE_HASH: SlotId = SlotId::new(3);
-const MU_SLOT_PARAM_SHAPE_HASH: SlotId = SlotId::new(4);
-const MU_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(5);
-const MU_SLOT_ERROR_ONEHOT: SlotId = SlotId::new(6);
-const MU_SLOT_PROFILE_HASH: SlotId = SlotId::new(7);
-const MU_SLOT_SURFACE_HASH: SlotId = SlotId::new(8);
-const MU_SLOT_SESSION_SEQUENCE_RANK: SlotId = SlotId::new(9);
-const MU_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(10);
-const MU_SLOT_DOW_CYCLIC: SlotId = SlotId::new(11);
-const MU_SLOT_RECORD_VECTOR: SlotId = SlotId::new(12);
+const MU_SLOT_TOOL_ONEHOT: SlotId = SlotId::new(82);
+const MU_SLOT_OPERATION_ONEHOT: SlotId = SlotId::new(83);
+const MU_SLOT_ROUTE_HASH: SlotId = SlotId::new(84);
+const MU_SLOT_PARAM_SHAPE_HASH: SlotId = SlotId::new(85);
+const MU_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(86);
+const MU_SLOT_ERROR_ONEHOT: SlotId = SlotId::new(87);
+const MU_SLOT_PROFILE_HASH: SlotId = SlotId::new(88);
+const MU_SLOT_SURFACE_HASH: SlotId = SlotId::new(89);
+const MU_SLOT_SESSION_SEQUENCE_RANK: SlotId = SlotId::new(90);
+const MU_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(91);
+const MU_SLOT_DOW_CYCLIC: SlotId = SlotId::new(92);
+const MU_SLOT_RECORD_VECTOR: SlotId = SlotId::new(93);
 
-const RS_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
-const RS_SLOT_SUBJECT_HASH: SlotId = SlotId::new(2);
+const RS_SLOT_KIND_ONEHOT: SlotId = SlotId::new(94);
+const RS_SLOT_SUBJECT_HASH: SlotId = SlotId::new(95);
 
-// Graph-position panels (app / process). Slot 1 is the frozen dense structural
-// signature; slot 2 is the hashed neighbour-label histogram.
-const GP_SLOT_SIGNATURE: SlotId = SlotId::new(1);
-const GP_SLOT_NEIGHBORS: SlotId = SlotId::new(2);
+// Graph-position panels. App and process are two DISTINCT panels measuring
+// different graphs with the same lens family, so they need distinct blocks:
+// sharing ids would put an app-transition signature and a process-tree
+// signature in one physical CF. Low slot is the frozen dense structural
+// signature; high slot is the hashed neighbour-label histogram.
+const GP_APP_SLOT_SIGNATURE: SlotId = SlotId::new(96);
+const GP_APP_SLOT_NEIGHBORS: SlotId = SlotId::new(97);
+const GP_PROCESS_SLOT_SIGNATURE: SlotId = SlotId::new(98);
+const GP_PROCESS_SLOT_NEIGHBORS: SlotId = SlotId::new(99);
 
-// Path-hierarchy panel. Slot 1 is the frozen dense path signature; slot 2 is the
-// ancestor-set multi-hot; slot 3 is the leaf path hash.
-const PH_SLOT_SIGNATURE: SlotId = SlotId::new(1);
-const PH_SLOT_ANCESTORS: SlotId = SlotId::new(2);
-const PH_SLOT_PATH_HASH: SlotId = SlotId::new(3);
+// Path-hierarchy panel: frozen dense path signature, ancestor-set multi-hot,
+// leaf path hash.
+const PH_SLOT_SIGNATURE: SlotId = SlotId::new(100);
+const PH_SLOT_ANCESTORS: SlotId = SlotId::new(101);
+const PH_SLOT_PATH_HASH: SlotId = SlotId::new(102);
+
+/// One panel's exclusive, contiguous block of global slot ids.
+struct PanelSlotBlock {
+    panel: &'static str,
+    first: u16,
+    last: u16,
+}
+
+/// The global slot allocation: every Synapse panel and the physical
+/// `cf/slot_<id>` range it exclusively owns.
+///
+/// Adding a panel means adding a block here. The compile-time assertion below
+/// rejects any overlap, so the #1776 collision cannot be reintroduced by
+/// accident — a duplicate id fails the build, not the vault.
+const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
+    PanelSlotBlock {
+        panel: SYN_TIMELINE_PANEL_NAME,
+        first: 1,
+        last: 7,
+    },
+    PanelSlotBlock {
+        panel: SYN_EPISODE_PANEL_NAME,
+        first: 8,
+        last: 22,
+    },
+    PanelSlotBlock {
+        panel: SYN_AGENT_EVENT_PANEL_NAME,
+        first: 23,
+        last: 34,
+    },
+    PanelSlotBlock {
+        panel: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+        first: 35,
+        last: 47,
+    },
+    PanelSlotBlock {
+        panel: SYN_ACTION_PANEL_NAME,
+        first: 48,
+        last: 52,
+    },
+    PanelSlotBlock {
+        panel: SYN_REFLEX_PANEL_NAME,
+        first: 53,
+        last: 59,
+    },
+    PanelSlotBlock {
+        panel: SYN_PROCESS_PANEL_NAME,
+        first: 60,
+        last: 66,
+    },
+    PanelSlotBlock {
+        panel: SYN_OBSERVATION_PANEL_NAME,
+        first: 67,
+        last: 74,
+    },
+    PanelSlotBlock {
+        panel: SYN_OUTCOME_PANEL_NAME,
+        first: 75,
+        last: 81,
+    },
+    PanelSlotBlock {
+        panel: SYN_MCP_USAGE_PANEL_NAME,
+        first: 82,
+        last: 93,
+    },
+    PanelSlotBlock {
+        panel: SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+        first: 94,
+        last: 95,
+    },
+    PanelSlotBlock {
+        panel: SYN_GRAPHPOS_APP_PANEL_NAME,
+        first: 96,
+        last: 97,
+    },
+    PanelSlotBlock {
+        panel: SYN_GRAPHPOS_PROCESS_PANEL_NAME,
+        first: 98,
+        last: 99,
+    },
+    PanelSlotBlock {
+        panel: SYN_PATH_HIERARCHY_PANEL_NAME,
+        first: 100,
+        last: 102,
+    },
+];
+
+/// Compile-time proof that no two panels claim the same physical slot CF, that
+/// every block is well formed, and that every block stays inside the durable
+/// slot-id budget.
+const fn panel_slot_blocks_are_disjoint() -> bool {
+    let mut outer = 0;
+    while outer < PANEL_SLOT_BLOCKS.len() {
+        let block = &PANEL_SLOT_BLOCKS[outer];
+        if block.first == 0 || block.first > block.last || block.last > CALYX_DURABLE_SLOT_ID_MAX {
+            return false;
+        }
+        let mut inner = outer + 1;
+        while inner < PANEL_SLOT_BLOCKS.len() {
+            let other = &PANEL_SLOT_BLOCKS[inner];
+            if block.first <= other.last && other.first <= block.last {
+                return false;
+            }
+            inner += 1;
+        }
+        outer += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    panel_slot_blocks_are_disjoint(),
+    "PANEL_SLOT_BLOCKS must be well formed, within CALYX_DURABLE_SLOT_ID_MAX, and mutually \
+     disjoint: Calyx stores every slot in a global cf/slot_<id> column family, so two panels \
+     sharing an id share one physical column family (issue #1776)"
+);
 
 const GP_NEIGHBOR_HISTOGRAM_DIM: u32 = 2048;
 const PH_ANCESTOR_DIM: u32 = 2048;
@@ -593,6 +758,22 @@ impl GraphPositionKind {
             Self::Process => b"synapse-graphpos-process-v1",
         }
     }
+
+    /// App and process are distinct panels measuring distinct graphs, so their
+    /// signatures must land in distinct physical slot column families (#1776).
+    const fn signature_slot(self) -> SlotId {
+        match self {
+            Self::App => GP_APP_SLOT_SIGNATURE,
+            Self::Process => GP_PROCESS_SLOT_SIGNATURE,
+        }
+    }
+
+    const fn neighbors_slot(self) -> SlotId {
+        match self {
+            Self::App => GP_APP_SLOT_NEIGHBORS,
+            Self::Process => GP_PROCESS_SLOT_NEIGHBORS,
+        }
+    }
 }
 
 /// One node's structural position in a fingerprinted graph snapshot.
@@ -743,7 +924,7 @@ pub fn build_graph_position_constellation(
     };
     let mut slots = BTreeMap::new();
     slots.insert(
-        GP_SLOT_SIGNATURE,
+        kind.signature_slot(),
         measure_json(
             panel_name,
             AlgorithmicLens::syn_graph_signature(
@@ -755,7 +936,7 @@ pub fn build_graph_position_constellation(
         )?,
     );
     slots.insert(
-        GP_SLOT_NEIGHBORS,
+        kind.neighbors_slot(),
         optional_json_slice_slot(
             panel_name,
             AlgorithmicLens::syn_multi_hot(
@@ -2995,7 +3176,7 @@ fn constellation(
     scalars: BTreeMap<String, f64>,
     metadata: BTreeMap<String, String>,
 ) -> StorageResult<Constellation> {
-    validate_durable_slot_budget(panel_version, &pointer, &slots)?;
+    validate_panel_slot_allocation(panel_version, &pointer, &metadata, &slots)?;
     Ok(Constellation {
         cx_id: context.cx_id,
         vault_id: context.vault_id,
@@ -3024,18 +3205,58 @@ fn constellation(
     })
 }
 
-fn validate_durable_slot_budget(
+/// Fails closed when a constellation declares a slot id outside the block its
+/// own panel exclusively owns (#1776).
+///
+/// Slot ids are global: Calyx keys `cf/slot_<id>` by `CxId` alone, so a slot
+/// written by the wrong panel lands in another panel's physical column family
+/// and silently makes incomparable vectors look comparable. This is the write-
+/// time backstop behind the compile-time `PANEL_SLOT_BLOCKS` disjointness
+/// assertion — it catches a literal id typed into the wrong panel's builder,
+/// which the block table alone cannot see.
+fn validate_panel_slot_allocation(
     panel_version: u32,
     pointer: &str,
+    metadata: &BTreeMap<String, String>,
     slots: &BTreeMap<SlotId, SlotVector>,
 ) -> StorageResult<()> {
+    let Some(panel) = metadata.get(META_PANEL_NAME) else {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_constellation".to_owned(),
+            detail: format!(
+                "SYNAPSE_PANEL_SLOT_UNSCOPED: panel_version={panel_version} pointer={pointer} has \
+                 no {META_PANEL_NAME} metadata, so its slot ids cannot be checked against a panel \
+                 allocation; every constellation must name its panel (issue #1776)"
+            ),
+        });
+    };
+    let Some(block) = PANEL_SLOT_BLOCKS
+        .iter()
+        .find(|block| block.panel == panel.as_str())
+    else {
+        return Err(StorageError::WriteFailed {
+            cf_name: "calyx_constellation".to_owned(),
+            detail: format!(
+                "SYNAPSE_PANEL_SLOT_BLOCK_MISSING: panel_version={panel_version} pointer={pointer} \
+                 panel={panel} has no entry in PANEL_SLOT_BLOCKS; add its exclusive global slot \
+                 block in crates/synapse-storage/src/constellations.rs before writing it \
+                 (issue #1776)"
+            ),
+        });
+    };
     for slot in slots.keys() {
-        if slot.get() > CALYX_DURABLE_SLOT_ID_MAX {
+        let id = slot.get();
+        if id < block.first || id > block.last {
             return Err(StorageError::WriteFailed {
                 cf_name: "calyx_constellation".to_owned(),
                 detail: format!(
-                    "panel_version={panel_version} pointer={pointer} uses slot id {} beyond Calyx durable slot CF tag maximum {CALYX_DURABLE_SLOT_ID_MAX}; slot ids are local to each panel and must stay within 0..={CALYX_DURABLE_SLOT_ID_MAX}",
-                    slot.get()
+                    "SYNAPSE_PANEL_SLOT_OUT_OF_BLOCK: panel_version={panel_version} \
+                     pointer={pointer} panel={panel} declared slot id {id}, which is outside its \
+                     exclusive block {}..={}. Calyx stores every slot in a global cf/slot_{id:02} \
+                     column family keyed by CxId alone, so writing it here would mix this panel's \
+                     vectors into another panel's physical column family (issue #1776). Use an id \
+                     from this panel's block, or allocate a new block in PANEL_SLOT_BLOCKS",
+                    block.first, block.last
                 ),
             });
         }
