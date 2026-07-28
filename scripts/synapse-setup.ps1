@@ -39,12 +39,16 @@
   clear error naming exactly what failed and how to fix it.
 
 .PARAMETER SourceDir
-  Path to a LOCAL synapse source checkout to build from. Required unless
-  -SkipBuild is set. Must be on a real local drive (not \\wsl.localhost or a
-  pushd-mapped UNC drive).
+  Path to a LOCAL synapse source checkout. Required for every install path,
+  including -SkipBuild: candidate-daemon validation and embedded model-pin
+  verification both read the checkout, so it is not a build-only input. Must be
+  on a real local drive (not \\wsl.localhost or a pushd-mapped UNC drive).
 
 .PARAMETER SkipBuild
-  Do not build; require an already-installed synapse-mcp.exe at -ExePath.
+  Do not build. The already-installed synapse-mcp.exe at -ExePath is what gets
+  validated and deployed, so this does NOT pick up a fresh local
+  `cargo build --release` output; omit -SkipBuild to build and deploy the
+  checkout named by -SourceDir. -SourceDir is still required.
 
 .PARAMETER BuildTimeoutMinutes
   Maximum time to allow the release build to run. The build process tree is
@@ -10724,6 +10728,25 @@ function Stop-SynapseChromeNativeHostProcesses {
 # Uninstall path
 # ---------------------------------------------------------------------------
 $maintenanceReason = if ($Remove) { 'remove' } elseif ($ResumeChromeBridgePending) { 'resume_chrome_bridge' } else { 'setup' }
+
+# Validate the parameter combination before taking the maintenance lock or doing
+# any preflight work (#1873). -SourceDir is consumed by candidate validation and
+# model-pin verification, not only by the build, so -SkipBuild does not make it
+# optional. Discovering that inside a Mandatory parameter binding stranded the
+# operator with a raw PowerShell exception after several minutes of preflight,
+# and without naming the parameter, the reason, or the value to supply.
+if (-not $Remove -and [string]::IsNullOrWhiteSpace($SourceDir)) {
+    $sourceDirMessage = @(
+        ("SYNAPSE_SETUP_SOURCE_DIR_REQUIRED skip_build={0} remove={1}" -f [bool]$SkipBuild, [bool]$Remove),
+        'source_of_truth=-SourceDir parameter',
+        ('remediation=pass -SourceDir <path to the synapse source checkout containing Cargo.toml>. ' +
+         'It is required whether or not -SkipBuild is set, because candidate-daemon validation and ' +
+         'embedded model-pin verification both read the checkout. With -SkipBuild the already-installed ' +
+         'binary is what gets validated and deployed; omit -SkipBuild to build and deploy that checkout.')
+    ) -join ' '
+    Die $sourceDirMessage
+}
+
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
 Remove-SynapseStaleDaemonStagingArtifacts -LogDir $LogDir
