@@ -179,7 +179,22 @@ Durable record after adoption: `status=running`, `pid=14324`,
 `identity start=134296830124451014` (unchanged), `supervisor.pid=3172`,
 `supervisor.incarnation_id=dcb1c6deb4f44c56af344df27b2c1b06` (changed).
 
-Deferring the resume did not weaken restart survival.
+The adopted job then ran to its **natural** terminal state under the new
+incarnation:
+
+```
+status         = exit_nonzero
+exit_code      = 11                    (the synthetic expected value)
+pid            = 14324                 (unchanged across the restart)
+identity start = 134296830124451014    (unchanged)
+supervisor pid = 3172                  (gen2)
+duration_ms    = 241545
+child alive    = False
+```
+
+Deferring the resume did not weaken restart survival: the exact child identity
+survived daemon death, was re-adopted, ran for 241 s, and its exit code was
+captured correctly by the adopting daemon.
 
 ### Edge 3 — cancel of a live durable job
 
