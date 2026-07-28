@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 mod components;
 
 pub use super::anchor_codec::{decode_anchor, encode_anchor};
-use super::cf_codec::{cf_tag, decode_cf};
+use super::cf_codec::{SLOT_ESCAPE_TAG, decode_cf, read_escaped_slot, write_cf_tag};
 use super::cursor::Cursor;
 use components::*;
 
@@ -459,7 +459,7 @@ pub fn encode_write_batch(rows: &[WriteRow]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
     for row in rows {
-        out.push(cf_tag(row.cf)?);
+        write_cf_tag(row.cf, &mut out)?;
         put_bytes(&mut out, &row.key)?;
         put_bytes(&mut out, &row.value)?;
     }
@@ -483,8 +483,18 @@ pub(crate) fn decode_write_batch_refs(bytes: &[u8]) -> Result<Vec<EncodedWriteRo
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let encoded_offset = cursor.position();
+        // Slots above the compact tag ceiling carry `132 ‖ id_be(2) ‖ kind`;
+        // every other CF is still exactly one byte, so pre-existing records
+        // decode along the identical path they always did.
+        let tag = cursor.u8()?;
+        let cf = if tag == SLOT_ESCAPE_TAG {
+            let slot_id = cursor.u16()?;
+            read_escaped_slot(slot_id, cursor.u8()?)?
+        } else {
+            decode_cf(tag)?
+        };
         rows.push(EncodedWriteRow {
-            cf: decode_cf(cursor.u8()?)?,
+            cf,
             key: cursor.bytes_prefixed()?,
             value: cursor.bytes_prefixed()?,
             encoded_offset,

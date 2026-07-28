@@ -526,7 +526,7 @@ fn next_slot_id(panel: &Panel) -> Result<SlotId> {
         .map(SlotId::new)
         .ok_or_else(|| {
             CalyxError::lens_frozen_violation(format!(
-                "panel generation {} has exhausted all {} durable slot identifiers (0..={MAX_DURABLE_SLOT_ID}); retired identifiers remain reserved for historical decoding; create an explicitly migrated WAL CF codec before adding another lens",
+                "panel generation {} has exhausted all {} durable slot identifiers (0..={MAX_DURABLE_SLOT_ID}); retired identifiers remain reserved for historical decoding",
                 panel.version,
                 u32::from(MAX_DURABLE_SLOT_ID) + 1
             ))

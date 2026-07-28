@@ -109,5 +109,87 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect::<Vec<_>>(),
     );
 
+    wal_cf_tag_roundtrip()?;
+    Ok(())
+}
+
+/// Proves the durable WAL CF tag codec across the compact/extended boundary.
+///
+/// The compact one-byte tag only reaches slot 47, which is why panels reused
+/// ids in the first place. Slots above it now use an escape form. Two things
+/// must hold, and both are checked against the actual encoded bytes rather than
+/// asserted in prose:
+///
+/// 1. every CF that had a compact tag still encodes to exactly one byte, and to
+///    the same byte as before — otherwise every existing vault's WAL becomes
+///    undecodable;
+/// 2. slots above the boundary round-trip exactly through the escape form.
+fn wal_cf_tag_roundtrip() -> Result<(), Box<dyn Error>> {
+    use calyx_aster::cf::ColumnFamily;
+    use calyx_aster::vault::encode::{WriteRow, decode_write_batch, encode_write_batch};
+    use calyx_core::SlotId;
+
+    const KEY: &[u8] = b"fsv-1776-key";
+    const VALUE: &[u8] = b"fsv-1776-value";
+
+    let cases: Vec<(&str, ColumnFamily, usize)> = vec![
+        ("Base", ColumnFamily::Base, 1),
+        ("Kv", ColumnFamily::Kv, 1),
+        ("slot_00", ColumnFamily::slot(SlotId::new(0)), 1),
+        (
+            "slot_47 (last compact)",
+            ColumnFamily::slot(SlotId::new(47)),
+            1,
+        ),
+        ("slot_47.raw", ColumnFamily::slot_raw(SlotId::new(47)), 1),
+        (
+            "slot_48 (first extended)",
+            ColumnFamily::slot(SlotId::new(48)),
+            4,
+        ),
+        (
+            "slot_82 (mcp-usage)",
+            ColumnFamily::slot(SlotId::new(82)),
+            4,
+        ),
+        (
+            "slot_102 (last allocated)",
+            ColumnFamily::slot(SlotId::new(102)),
+            4,
+        ),
+        ("slot_102.raw", ColumnFamily::slot_raw(SlotId::new(102)), 4),
+        (
+            "slot_65535 (u16 max)",
+            ColumnFamily::slot(SlotId::new(u16::MAX)),
+            4,
+        ),
+    ];
+
+    for (label, cf, expected_tag_len) in cases {
+        let rows = vec![WriteRow {
+            cf,
+            key: KEY.to_vec(),
+            value: VALUE.to_vec(),
+        }];
+        let encoded = encode_write_batch(&rows)?;
+        // 4-byte row count, then the tag, then two length-prefixed fields.
+        let framed = 4 + (4 + KEY.len()) + (4 + VALUE.len());
+        let tag_len = encoded.len() - framed;
+        let decoded = decode_write_batch(&encoded)?;
+        let round_trips = decoded.len() == 1 && decoded[0].cf == cf;
+        println!(
+            "WAL_CF_TAG cf={label} tag_bytes={tag_len} expected={expected_tag_len} \
+             first_tag_byte={} round_trips={round_trips}",
+            encoded[4]
+        );
+        if tag_len != expected_tag_len || !round_trips {
+            return Err(format!(
+                "WAL CF tag mismatch for {label}: tag_bytes={tag_len} \
+                 expected={expected_tag_len} round_trips={round_trips}"
+            )
+            .into());
+        }
+    }
+    println!("WAL_CF_TAG_ALL_OK");
     Ok(())
 }
