@@ -2186,31 +2186,7 @@ pub(super) async fn serve(
         return Ok(ExitCode::from(4));
     }
     #[cfg(windows)]
-    if let Err(error) =
-        crate::server::operational_facades::host_transition::reconcile_pending_intent_on_startup()
-    {
-        let detail = error.message.to_string();
-        let error_data = error.data.unwrap_or(serde_json::Value::Null);
-        tracing::error!(
-            code = "MCP_DAEMON_STARTUP_HOST_TRANSITION_RECONCILIATION_FAILED",
-            mode = "http",
-            bind = %addr,
-            detail = %detail,
-            error_data = ?error_data,
-            "refusing to start: pending planned host transition did not reconcile against kernel boot identity and Windows System Event 1074"
-        );
-        crate::daemon_lifecycle::record_startup_exit(
-            "startup_host_transition_reconciliation_failed",
-            serde_json::json!({
-                "mode": "http",
-                "bind": addr.to_string(),
-                "detail": detail,
-                "error_data": error_data,
-            }),
-        )
-        .context("record daemon lifecycle startup host-transition reconciliation failure")?;
-        return Ok(ExitCode::from(4));
-    }
+    crate::server::operational_facades::host_transition::reconcile_pending_intent_on_startup();
 
     let startup_shell_job_reap_ms = startup_timer.mark("shell_job_reap");
 

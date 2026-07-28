@@ -510,6 +510,12 @@ pub struct SetupHostTransitionIntentReadback {
     pub current_host_boot_id: String,
     pub event_1074_record_id: Option<u64>,
     pub event_1074_sha256: Option<String>,
+    pub event_1074_time_created_utc: Option<String>,
+    pub event_1074_provider: Option<String>,
+    /// Exact reason the transition could not be attributed to this intent.
+    /// Present iff `status == "reconciliation_failed"`, in which case further
+    /// planned host transitions are refused.
+    pub reconciliation_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

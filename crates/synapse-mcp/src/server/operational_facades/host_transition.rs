@@ -109,6 +109,18 @@ struct IntentRecord {
     reconciled_host_boot_id: Option<String>,
     reconciled_unix_ms: Option<u64>,
     trigger_error: Option<String>,
+    /// Corroborating witnesses copied off the matched Event 1074 so a
+    /// `reconciled_after_boot` verdict can be re-grounded against the event log.
+    #[serde(default)]
+    event_1074_time_created_utc: Option<String>,
+    #[serde(default)]
+    event_1074_provider: Option<String>,
+    /// Exact reason the last reconciliation attempt could not attribute the
+    /// boot to this intent. Present iff `status == "reconciliation_failed"`.
+    #[serde(default)]
+    reconciliation_error: Option<String>,
+    #[serde(default)]
+    reconciliation_failed_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,12 +158,45 @@ pub(super) fn handle(
     }
 }
 
+/// Attribute a pending planned host transition to its exact Windows System
+/// Event 1074 at daemon startup.
+///
+/// This never blocks startup. Reconciliation is an observation about a
+/// transition that has *already* happened — the kernel boot identity is what
+/// proves the host rebooted — so an attribution gap is recorded, logged at
+/// ERROR, surfaced by `action=status`, and enforced by refusing any *further*
+/// transition (`ensure_prior_intent_reconciled`). Refusing to start instead
+/// turns an audit gap into a total outage and removes the very tool whose
+/// readback is the documented remediation.
 #[cfg(windows)]
-pub(crate) fn reconcile_pending_intent_on_startup() -> Result<(), ErrorData> {
-    let state_root = state_root()?;
-    let current_host_boot_id = m4::read_host_boot_identity()?;
-    let _ = reconcile_pending_intent(&state_root, &current_host_boot_id)?;
-    Ok(())
+pub(crate) fn reconcile_pending_intent_on_startup() {
+    let outcome = state_root().and_then(|state_root| {
+        let current_host_boot_id = m4::read_host_boot_identity()?;
+        reconcile_pending_intent(&state_root, &current_host_boot_id)
+    });
+    match outcome {
+        Ok(None) => {}
+        Ok(Some((intent, path))) => {
+            tracing::info!(
+                code = "MCP_DAEMON_STARTUP_HOST_TRANSITION_INTENT_READ",
+                intent_id = %intent.intent_id,
+                status = %intent.status,
+                prior_host_boot_id = %intent.prior_host_boot_id,
+                reconciled_host_boot_id = ?intent.reconciled_host_boot_id,
+                event_1074_record_id = ?intent.event_1074_record_id,
+                intent_path = %path.display(),
+                "readback=host_transition_pending_intent after=daemon_startup_reconciliation"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = "MCP_DAEMON_STARTUP_HOST_TRANSITION_RECONCILIATION_UNREADABLE",
+                detail = %error.message,
+                error_data = ?error.data,
+                "the pending planned host-transition record could not be read or written; planned host transitions stay refused until it is repaired"
+            );
+        }
+    }
 }
 
 fn status_response(
@@ -159,7 +204,11 @@ fn status_response(
 ) -> Result<SetupHostTransitionResponse, ErrorData> {
     let state_root = state_root()?;
     let current_host_boot_id = m4::read_host_boot_identity()?;
-    let intent = reconcile_pending_intent(&state_root, &current_host_boot_id)?.map(intent_readback);
+    // Always report the boot identity read from the kernel just now. Falling back
+    // to the intent's own prior identity would label a stale value "current" on
+    // exactly the unreconciled records an operator is trying to diagnose.
+    let intent = reconcile_pending_intent(&state_root, &current_host_boot_id)?
+        .map(|(intent, path)| intent_readback_at(intent, path, current_host_boot_id.clone()));
     let config = read_guard_config(&state_root)?;
     let durable_jobs = m4::shell_job_host_transition_snapshot()?;
     let guards = probe_guards(&config.guards)?;
@@ -233,6 +282,7 @@ fn preflight(params: SetupHostTransitionParams) -> Result<SetupHostTransitionRes
     let now = now_unix_ms()?;
     let preflight_id = format!("pf-{}-{}", now, uuid::Uuid::new_v4().simple());
     let current_host_boot_id = m4::read_host_boot_identity()?;
+    ensure_prior_intent_reconciled(&state_root, &current_host_boot_id)?;
     let config = read_guard_config(&state_root)?;
     let durable_jobs = m4::shell_job_host_transition_snapshot()?;
     let guards = probe_guards(&config.guards)?;
@@ -349,7 +399,7 @@ fn preflight(params: SetupHostTransitionParams) -> Result<SetupHostTransitionRes
         preflight_path: Some(path.display().to_string()),
         override_path,
         intent: reconcile_pending_intent(&state_root, record.host_boot_id.as_str())?
-            .map(intent_readback),
+            .map(|(intent, path)| intent_readback_at(intent, path, record.host_boot_id.clone())),
     })
 }
 
@@ -423,6 +473,7 @@ fn execute(params: SetupHostTransitionParams) -> Result<SetupHostTransitionRespo
             "run a fresh preflight on the current boot; the prior authorization cannot be replayed",
         ));
     }
+    ensure_prior_intent_reconciled(&state_root, &current_host_boot_id)?;
     let config = read_guard_config(&state_root)?;
     let durable_jobs = m4::shell_job_host_transition_snapshot()?;
     let guards = probe_guards(&config.guards)?;
@@ -468,6 +519,10 @@ fn execute(params: SetupHostTransitionParams) -> Result<SetupHostTransitionRespo
         reconciled_host_boot_id: None,
         reconciled_unix_ms: None,
         trigger_error: None,
+        event_1074_time_created_utc: None,
+        event_1074_provider: None,
+        reconciliation_error: None,
+        reconciliation_failed_unix_ms: None,
     };
     write_verified_json(&intent_path, &intent, "intent_archive")?;
     write_verified_json(&pending_path, &intent, "pending_intent")?;
@@ -1157,31 +1212,109 @@ fn reconcile_pending_intent(
     {
         return Ok(Some((intent, path)));
     }
-    let (record_id, event_sha256) = find_event_1074(&intent.intent_id)?;
-    intent.status = "reconciled_after_boot".to_owned();
-    intent.event_1074_record_id = Some(record_id);
-    intent.event_1074_sha256 = Some(event_sha256);
-    intent.reconciled_host_boot_id = Some(current_host_boot_id.to_owned());
-    intent.reconciled_unix_ms = Some(now_unix_ms()?);
-    write_verified_json(&path, &intent, "reconciled_pending_intent")?;
     let archive = state_root
         .join("intents")
         .join(format!("{}.json", intent.intent_id));
+    // `reconciliation_failed` is deliberately retryable: the event-log service can
+    // legitimately be unavailable in the first moments of a boot, and a condition
+    // that heals must be allowed to heal. Every attempt overwrites the recorded
+    // error, so the persisted text always describes the latest failure.
+    let matched = match find_event_1074(&intent.intent_id) {
+        Ok(matched) => matched,
+        Err(error) => {
+            let detail = error.message.to_string();
+            let error_data = error.data.unwrap_or(Value::Null);
+            intent.status = "reconciliation_failed".to_owned();
+            intent.reconciliation_error = Some(detail.clone());
+            intent.reconciliation_failed_unix_ms = Some(now_unix_ms()?);
+            write_verified_json(&path, &intent, "unreconciled_pending_intent")?;
+            write_verified_json(&archive, &intent, "unreconciled_intent_archive")?;
+            tracing::error!(
+                code = "SETUP_HOST_TRANSITION_RECONCILIATION_FAILED",
+                intent_id = %intent.intent_id,
+                prior_host_boot_id = %intent.prior_host_boot_id,
+                current_host_boot_id,
+                detail = %detail,
+                error_data = ?error_data,
+                intent_path = %path.display(),
+                "the host boot identity changed but the transition could not be attributed to this intent; further planned host transitions are refused until it reconciles"
+            );
+            return Ok(Some((intent, path)));
+        }
+    };
+    intent.status = "reconciled_after_boot".to_owned();
+    intent.event_1074_record_id = Some(matched.record_id);
+    intent.event_1074_sha256 = Some(matched.event_sha256);
+    intent.event_1074_time_created_utc = matched.time_created_utc;
+    intent.event_1074_provider = matched.provider;
+    intent.reconciled_host_boot_id = Some(current_host_boot_id.to_owned());
+    intent.reconciled_unix_ms = Some(now_unix_ms()?);
+    intent.reconciliation_error = None;
+    intent.reconciliation_failed_unix_ms = None;
+    write_verified_json(&path, &intent, "reconciled_pending_intent")?;
     write_verified_json(&archive, &intent, "reconciled_intent_archive")?;
     tracing::info!(
         code = "SETUP_HOST_TRANSITION_RECONCILED_AFTER_BOOT",
         intent_id = %intent.intent_id,
         prior_host_boot_id = %intent.prior_host_boot_id,
         current_host_boot_id,
-        event_1074_record_id = record_id,
+        event_1074_record_id = matched.record_id,
         event_1074_sha256 = ?intent.event_1074_sha256,
+        event_1074_time_created_utc = ?intent.event_1074_time_created_utc,
+        event_1074_provider = ?intent.event_1074_provider,
         intent_path = %path.display(),
-        "readback=host_transition_intent after=BootIdentifier_plus_System_Event_1074"
+        "readback=host_transition_intent after=kernel_boot_identity_plus_System_Event_1074"
     );
     Ok(Some((intent, path)))
 }
 
-fn find_event_1074(intent_id: &str) -> Result<(u64, String), ErrorData> {
+/// Fail-closed gate for *future* destructive transitions.
+///
+/// An intent that could not be attributed to a real Event 1074 means a host
+/// transition happened that Synapse cannot account for. That makes performing
+/// another one unsafe, so preflight and execute refuse — but it says nothing
+/// about whether the daemon may run, and it must never be allowed to stop the
+/// daemon that an operator needs in order to diagnose it.
+fn ensure_prior_intent_reconciled(
+    state_root: &Path,
+    current_host_boot_id: &str,
+) -> Result<(), ErrorData> {
+    let Some((intent, path)) = reconcile_pending_intent(state_root, current_host_boot_id)? else {
+        return Ok(());
+    };
+    if intent.status != "reconciliation_failed" {
+        return Ok(());
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        "a prior planned host transition is unreconciled; refusing to authorize another",
+        Some(json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "detail_code": "HOST_TRANSITION_PRIOR_INTENT_UNRECONCILED",
+            "source_of_truth": SETUP_SOT,
+            "operation": "host_transition",
+            "tool": "setup",
+            "intent_id": intent.intent_id,
+            "intent_path": path.display().to_string(),
+            "prior_host_boot_id": intent.prior_host_boot_id,
+            "current_host_boot_id": current_host_boot_id,
+            "reconciliation_error": intent.reconciliation_error,
+            "reconciliation_failed_unix_ms": intent.reconciliation_failed_unix_ms,
+            "remediation": "resolve the named reconciliation error so the prior transition can be attributed to its exact Windows System Event 1074; run setup operation=host_transition action=status to retry attribution",
+        })),
+    ))
+}
+
+/// One Windows System Event 1074 record proven to carry an exact planned
+/// host-transition intent id, plus the corroborating witnesses recorded with it.
+struct Event1074Match {
+    record_id: u64,
+    event_sha256: String,
+    time_created_utc: Option<String>,
+    provider: Option<String>,
+}
+
+fn find_event_1074(intent_id: &str) -> Result<Event1074Match, ErrorData> {
     #[cfg(windows)]
     {
         let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
@@ -1255,44 +1388,80 @@ fn find_event_1074(intent_id: &str) -> Result<(u64, String), ErrorData> {
             )
         })?;
         let marker = format!("intent={intent_id}");
-        let marker_index = xml.find(&marker).ok_or_else(|| {
-            host_error(
+        let mut matched: Vec<Event1074Match> = Vec::new();
+        for event in event_blocks(&xml)? {
+            // The marker must live in this event's own EventData, not merely
+            // somewhere in the concatenated query output.
+            let Some(event_data) = element_text(event, "EventData") else {
+                continue;
+            };
+            if !event_data.contains(&marker) {
+                continue;
+            }
+            // Event 1074 is written by User32, a classic (.mc-defined) provider, so
+            // Windows renders it as `<EventID Qualifiers='32768'>1074</EventID>`.
+            // The EventID must therefore be read as an element with optional
+            // attributes; a literal `<EventID>1074</EventID>` match can never
+            // succeed and silently rejects the exact event being looked for.
+            let event_id_text = element_text(event, "EventID").ok_or_else(|| {
+                host_error(
+                    "HOST_TRANSITION_EVENT_FIELD_MISSING",
+                    "event_1074",
+                    "matching planned-transition event has no EventID element".to_owned(),
+                    "inspect the Windows event XML and retry reconciliation",
+                )
+            })?;
+            let event_id = event_id_text.trim().parse::<u64>().map_err(|error| {
+                host_error(
+                    "HOST_TRANSITION_EVENT_FIELD_INVALID",
+                    "event_1074",
+                    format!(
+                        "matching planned-transition event EventID {event_id_text:?} is not u64: {error}"
+                    ),
+                    "inspect the Windows event XML and retry reconciliation",
+                )
+            })?;
+            if event_id != 1074 {
+                return Err(host_error(
+                    "HOST_TRANSITION_EVENT_ID_MISMATCH",
+                    "event_1074",
+                    format!(
+                        "planned-transition marker {marker} was carried by EventID {event_id}, not 1074"
+                    ),
+                    "inspect the Windows System event and retry reconciliation",
+                ));
+            }
+            let record_id = element_u64(event, "EventRecordID")?;
+            matched.push(Event1074Match {
+                record_id,
+                event_sha256: sha256_label(event.as_bytes()),
+                time_created_utc: open_tag(event, "TimeCreated")
+                    .and_then(|tag| attribute_value(tag, "SystemTime"))
+                    .map(str::to_owned),
+                provider: open_tag(event, "Provider")
+                    .and_then(|tag| attribute_value(tag, "Name"))
+                    .map(str::to_owned),
+            });
+        }
+        match matched.len() {
+            0 => Err(host_error(
                 "HOST_TRANSITION_EVENT_1074_NOT_FOUND",
                 "event_1074",
                 format!(
                     "no recent Windows System Event 1074 contains planned host-transition {marker}"
                 ),
                 "inspect the persisted intent and System/User32 Event 1074 records; do not claim the planned transition completed until the exact intent id is present",
-            )
-        })?;
-        let event_start = xml[..marker_index].rfind("<Event ").ok_or_else(|| {
-            host_error(
-                "HOST_TRANSITION_EVENT_1074_XML_BOUNDARY_MISSING",
+            )),
+            1 => Ok(matched.remove(0)),
+            count => Err(host_error(
+                "HOST_TRANSITION_EVENT_1074_AMBIGUOUS",
                 "event_1074",
-                "matching Event 1074 has no opening Event XML boundary".to_owned(),
-                "inspect/repair Windows event-log XML and retry reconciliation",
-            )
-        })?;
-        let relative_end = xml[marker_index..].find("</Event>").ok_or_else(|| {
-            host_error(
-                "HOST_TRANSITION_EVENT_1074_XML_BOUNDARY_MISSING",
-                "event_1074",
-                "matching Event 1074 has no closing Event XML boundary".to_owned(),
-                "inspect/repair Windows event-log XML and retry reconciliation",
-            )
-        })?;
-        let event_end = marker_index + relative_end + "</Event>".len();
-        let event = &xml[event_start..event_end];
-        if !event.contains("<EventID>1074</EventID>") {
-            return Err(host_error(
-                "HOST_TRANSITION_EVENT_ID_MISMATCH",
-                "event_1074",
-                "matching planned-transition event is not EventID 1074".to_owned(),
-                "inspect the Windows System event and retry reconciliation",
-            ));
+                format!(
+                    "{count} Windows System Event 1074 records carry planned host-transition {marker}; an intent id must identify exactly one transition"
+                ),
+                "inspect the duplicated System Event 1074 records; the transition cannot be attributed to a single event",
+            )),
         }
-        let record_id = xml_tag_u64(event, "EventRecordID")?;
-        Ok((record_id, sha256_label(event.as_bytes())))
     }
     #[cfg(not(windows))]
     {
@@ -1306,48 +1475,114 @@ fn find_event_1074(intent_id: &str) -> Result<(u64, String), ErrorData> {
     }
 }
 
-fn xml_tag_u64(xml: &str, tag: &'static str) -> Result<u64, ErrorData> {
-    let open = format!("<{tag}>");
+/// Split a `wevtutil /f:xml` result into its individual `<Event>…</Event>` blocks.
+///
+/// Every block boundary must be well formed; a truncated or interleaved event
+/// stream is reported rather than silently skipped, because a partial block
+/// could otherwise drop the very record being attributed.
+fn event_blocks(xml: &str) -> Result<Vec<&str>, ErrorData> {
+    const CLOSE: &str = "</Event>";
+    let mut blocks = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = find_open_tag_index(rest, "Event") {
+        let tail = &rest[start..];
+        let end = tail.find(CLOSE).ok_or_else(|| {
+            host_error(
+                "HOST_TRANSITION_EVENT_1074_XML_BOUNDARY_MISSING",
+                "event_1074",
+                "Windows event XML has an opening <Event> with no closing </Event>".to_owned(),
+                "inspect/repair Windows event-log XML and retry reconciliation",
+            )
+        })? + CLOSE.len();
+        blocks.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    Ok(blocks)
+}
+
+/// Byte index of the next `<tag>` or `<tag attr=…>` opening tag.
+///
+/// The name must end at the tag boundary so `<Event` never matches `<EventID`.
+fn find_open_tag_index(xml: &str, tag: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(found) = xml[offset..].find('<') {
+        let index = offset + found;
+        let after = &xml[index + 1..];
+        if let Some(remainder) = after.strip_prefix(tag)
+            && remainder
+                .chars()
+                .next()
+                .is_some_and(|next| next == '>' || next == '/' || next.is_whitespace())
+        {
+            return Some(index);
+        }
+        offset = index + 1;
+    }
+    None
+}
+
+/// The full opening tag slice (`<tag …>` or `<tag …/>`) for `tag`.
+fn open_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let start = find_open_tag_index(xml, tag)?;
+    let end = xml[start..].find('>')? + start + 1;
+    Some(&xml[start..end])
+}
+
+/// Inner text of `<tag …>text</tag>`, tolerating attributes on the opening tag.
+///
+/// Classic (`.mc`-defined) providers such as `User32` carry a `Qualifiers`
+/// attribute on `EventID`, so a literal `<EventID>` match is never correct.
+fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let start = find_open_tag_index(xml, tag)?;
+    let open_end = xml[start..].find('>')? + start + 1;
+    if xml[start..open_end].ends_with("/>") {
+        return None;
+    }
     let close = format!("</{tag}>");
-    let start = xml
-        .find(&open)
-        .map(|index| index + open.len())
-        .ok_or_else(|| {
-            host_error(
-                "HOST_TRANSITION_EVENT_FIELD_MISSING",
-                "event_1074",
-                format!("matching Event 1074 has no {tag} field"),
-                "inspect the Windows event XML and retry reconciliation",
-            )
-        })?;
-    let end = xml[start..]
-        .find(&close)
-        .map(|index| start + index)
-        .ok_or_else(|| {
-            host_error(
-                "HOST_TRANSITION_EVENT_FIELD_MISSING",
-                "event_1074",
-                format!("matching Event 1074 has no closing {tag} field"),
-                "inspect the Windows event XML and retry reconciliation",
-            )
-        })?;
-    xml[start..end].parse::<u64>().map_err(|error| {
+    let close_index = xml[open_end..].find(&close)? + open_end;
+    Some(&xml[open_end..close_index])
+}
+
+fn element_u64(xml: &str, tag: &'static str) -> Result<u64, ErrorData> {
+    let text = element_text(xml, tag).ok_or_else(|| {
+        host_error(
+            "HOST_TRANSITION_EVENT_FIELD_MISSING",
+            "event_1074",
+            format!("matching Event 1074 has no {tag} field"),
+            "inspect the Windows event XML and retry reconciliation",
+        )
+    })?;
+    text.trim().parse::<u64>().map_err(|error| {
         host_error(
             "HOST_TRANSITION_EVENT_FIELD_INVALID",
             "event_1074",
-            format!("matching Event 1074 {tag} is not u64: {error}"),
+            format!("matching Event 1074 {tag} {text:?} is not u64: {error}"),
             "inspect the Windows event XML and retry reconciliation",
         )
     })
 }
 
-fn intent_readback(value: (IntentRecord, PathBuf)) -> SetupHostTransitionIntentReadback {
-    let current = value
-        .0
-        .reconciled_host_boot_id
-        .clone()
-        .unwrap_or_else(|| value.0.prior_host_boot_id.clone());
-    intent_readback_at(value.0, value.1, current)
+/// Value of `attr` within an opening tag slice. Windows event XML quotes
+/// attributes with `'`, but `"` is equally legal XML, so both are accepted.
+fn attribute_value<'a>(open_tag: &'a str, attr: &str) -> Option<&'a str> {
+    let mut offset = 0usize;
+    while let Some(found) = open_tag[offset..].find(attr) {
+        let index = offset + found;
+        let preceded_by_boundary = open_tag[..index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+        let after = &open_tag[index + attr.len()..];
+        if preceded_by_boundary && let Some(rest) = after.strip_prefix('=') {
+            let quote = rest.chars().next()?;
+            if quote == '\'' || quote == '"' {
+                let value = &rest[quote.len_utf8()..];
+                return value.find(quote).map(|end| &value[..end]);
+            }
+        }
+        offset = index + attr.len();
+    }
+    None
 }
 
 fn intent_readback_at(
@@ -1364,6 +1599,9 @@ fn intent_readback_at(
         current_host_boot_id,
         event_1074_record_id: intent.event_1074_record_id,
         event_1074_sha256: intent.event_1074_sha256,
+        event_1074_time_created_utc: intent.event_1074_time_created_utc,
+        event_1074_provider: intent.event_1074_provider,
+        reconciliation_error: intent.reconciliation_error,
     }
 }
 

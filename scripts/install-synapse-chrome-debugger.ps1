@@ -2243,15 +2243,37 @@ function Invoke-SynapseChromeAddressBarNavigation {
         throw "SYNAPSE_CHROME_STALE_BUILD_CLEANUP_FAILED detail=$detail remediation=inspect only the named versioned build directories; cleanup refuses to report success while any deletion target is ambiguous or remains on disk"
     }
 
+    # Chrome normalises what the omnibox displays for internal pages: navigating to
+    # chrome://extensions/?id=<id>&synapse_maintenance_token=<token> leaves the
+    # address bar reading exactly "chrome://extensions". Requiring the omnibox to
+    # echo a query string back is therefore not a durable confirmation signal — it
+    # can never hold for a chrome:// URL. Accept the query/fragment-stripped form
+    # as well, and compensate for the weaker address evidence by additionally
+    # requiring the document title to match, which the caller supplies and which
+    # was previously recorded but never actually checked.
+    $expectedAddresses = New-Object System.Collections.Generic.List[string]
+    $expectedAddresses.Add($Url.Trim().TrimEnd('/')) | Out-Null
+    $strippedUrl = ($Url -split '[?#]')[0]
+    if (-not [string]::IsNullOrWhiteSpace($strippedUrl)) {
+        $strippedUrl = $strippedUrl.Trim().TrimEnd('/')
+        if (-not $expectedAddresses.Contains($strippedUrl)) {
+            $expectedAddresses.Add($strippedUrl) | Out-Null
+        }
+    }
     $after = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 250 -Probe {
         $state = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
         $addressMatches = $false
         if (-not [string]::IsNullOrWhiteSpace([string]$state.address_bar_value)) {
             $actualAddress = ([string]$state.address_bar_value).Trim().TrimEnd('/')
-            $expectedAddress = $Url.Trim().TrimEnd('/')
-            $addressMatches = $actualAddress -ieq $expectedAddress
+            foreach ($expectedAddress in $expectedAddresses) {
+                if ($actualAddress -ieq $expectedAddress) {
+                    $addressMatches = $true
+                    break
+                }
+            }
         }
-        if ($addressMatches) {
+        $titleMatches = ([string]$state.title) -match $ExpectedTitlePattern
+        if ($addressMatches -and $titleMatches) {
             return $state
         }
         return $null
@@ -2263,6 +2285,10 @@ function Invoke-SynapseChromeAddressBarNavigation {
             purpose = $Purpose
             target_url = $Url
             expected_title_pattern = $ExpectedTitlePattern
+            accepted_addresses = @($expectedAddresses)
+            observed_address = ([string]$latest.address_bar_value).Trim().TrimEnd('/')
+            observed_title = [string]$latest.title
+            observed_title_matches = (([string]$latest.title) -match $ExpectedTitlePattern)
             chrome_window_hwnd = $Window.hwnd
             chrome_window_pid = $Window.pid
             foreground_before = $foregroundBefore
@@ -2271,7 +2297,7 @@ function Invoke-SynapseChromeAddressBarNavigation {
             navigation_before = $before
             navigation_after = $latest
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_NOT_CONFIRMED detail=$detail remediation=Chrome did not visibly reach the requested internal page after verified foreground keyboard navigation; setup refuses to search extension controls on a stale page"
+        throw "SYNAPSE_CHROME_NAVIGATION_NOT_CONFIRMED detail=$detail remediation=Chrome did not visibly reach the requested internal page after verified foreground keyboard navigation; compare observed_address against accepted_addresses and observed_title against expected_title_pattern; setup refuses to search extension controls on a stale page"
     }
 
     [pscustomobject]@{
@@ -2420,6 +2446,76 @@ function Read-SynapseChromeExtensionDetailsUiState {
     }
 }
 
+# A Chrome window opened without --profile-directory after a non-clean exit is a
+# ProfilePickerView, not a browser window. It legitimately has no tab strip, so
+# reporting "tab strip unreadable" sends the operator to investigate Chrome
+# accessibility internals when the required action is simply to pick a profile.
+# Classification matters as much as detection (AGENTS.md), so this is read
+# explicitly rather than inferred from a zero tab count.
+function Read-SynapseChromeProfilePickerState {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window
+    )
+
+    $present = $false
+    $rootViewName = $null
+    $profileNames = @()
+    try {
+        $pickerCondition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+            'ProfilePickerView'
+        )
+        $picker = $Window.element.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $pickerCondition
+        )
+        $rootCondition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+            'RootView'
+        )
+        $rootView = $Window.element.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $rootCondition
+        )
+        if ($rootView) {
+            $rootViewName = [string]$rootView.Current.Name
+        }
+        # Chrome localises the picker heading, so the class name is the primary
+        # witness and the heading only corroborates it.
+        $present = ($null -ne $picker) -or ($rootViewName -match "^Who's using Chrome\?$")
+        if ($present) {
+            $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Button
+            )
+            $buttons = $Window.element.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $buttonCondition
+            )
+            foreach ($button in $buttons) {
+                $name = [string]$button.Current.Name
+                if (-not [string]::IsNullOrWhiteSpace($name)) {
+                    $profileNames += $name
+                }
+            }
+        }
+    } catch {
+        return [pscustomobject]@{
+            present = $false
+            root_view_name = $rootViewName
+            profile_buttons = @()
+            error = $_.Exception.Message
+        }
+    }
+    [pscustomobject]@{
+        present = $present
+        root_view_name = $rootViewName
+        profile_buttons = @($profileNames)
+        error = $null
+    }
+}
+
 function Read-SynapseChromeTabStripState {
     param(
         [Parameter(Mandatory = $true)]
@@ -2453,7 +2549,21 @@ function Read-SynapseChromeTabStripState {
             $tabItemCondition
         )
     } catch {
-        throw "SYNAPSE_CHROME_MAINTENANCE_TABSTRIP_READ_FAILED hwnd=$($Window.hwnd) pid=$($Window.pid) error=$($_.Exception.Message) remediation=Chrome must expose one exact TabContainerImpl browser tab strip; page-content ARIA tabs are intentionally excluded"
+        $tabStripError = $_.Exception.Message
+        $picker = Read-SynapseChromeProfilePickerState -Window $Window
+        if ($picker.present) {
+            $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+                hwnd = $Window.hwnd
+                pid = $Window.pid
+                window_title = [string]$Window.title
+                window_class_name = [string]$Window.class_name
+                root_view_name = $picker.root_view_name
+                offered_profiles = @($picker.profile_buttons)
+                tab_strip_error = $tabStripError
+            }) -Depth 8
+            throw "SYNAPSE_CHROME_MAINTENANCE_PROFILE_PICKER_ONLY detail=$detail remediation=this Chrome window is the profile picker, not a browser window, so it correctly has no tab strip; relaunch chrome.exe with --profile-directory set to the profile that has the Synapse bridge extension installed, or pick that profile in the open picker, then retry"
+        }
+        throw "SYNAPSE_CHROME_MAINTENANCE_TABSTRIP_READ_FAILED hwnd=$($Window.hwnd) pid=$($Window.pid) error=$tabStripError profile_picker_present=false remediation=Chrome must expose one exact TabContainerImpl browser tab strip; page-content ARIA tabs are intentionally excluded"
     }
     $rows = @()
     foreach ($item in $items) {
@@ -2765,12 +2875,31 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
     $markerAddress = ([string]$Lease.marker_url).Trim().TrimEnd('/')
     $tokenPattern = 'synapse_maintenance_token=' + [regex]::Escape([string]$Lease.token)
     $ownedAddress = ($addressBefore -ceq $markerAddress -or $addressBefore -match $tokenPattern)
-    if (-not $ownedAddress) {
+    # The address bar is not a sound ownership proof on its own: Chrome strips the
+    # query string from chrome:// URLs, so the token this lease was built around is
+    # erased from the omnibox by the very navigation the operation performs. The
+    # durable identity is the UIA runtime id of the exact tab this operation
+    # created, which is already what selection is verified against above. Refusing
+    # Ctrl+W against a tab we cannot prove we own stays correct and unchanged;
+    # this only stops a correctly-owned tab being disowned by URL normalisation.
+    # Read the strip again here rather than reusing the pre-selection snapshot, so
+    # the selected identity is the one that exists at the moment of the check.
+    $tabsAtOwnershipCheck = Read-SynapseChromeTabStripState -Window $window
+    $selectedTabs = @($tabsAtOwnershipCheck.tabs | Where-Object { $_.selected -eq $true })
+    $ownedRuntime = (
+        $selectedTabs.Count -eq 1 -and
+        [string]$selectedTabs[0].runtime_id -ceq [string]$Lease.owned_tab_runtime_id
+    )
+    if (-not ($ownedAddress -or $ownedRuntime)) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             lease = $Lease
             navigation_before = $navigationBefore
+            owned_by_address = $ownedAddress
+            owned_by_runtime_id = $ownedRuntime
+            expected_runtime_id = [string]$Lease.owned_tab_runtime_id
+            selected_runtime_ids = @($selectedTabs | ForEach-Object { [string]$_.runtime_id })
         }) -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_OWNERSHIP_LOST detail=$detail remediation=the operation-created tab is no longer the active exact marker/token tab; setup refuses Ctrl+W against an operator tab"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_OWNERSHIP_LOST detail=$detail remediation=the operation-created tab is neither the active exact marker/token tab nor the exact UIA runtime identity this operation created; setup refuses Ctrl+W against an operator tab"
     }
     $foreground = Wait-SynapseChromeForegroundAcquisition -Window $window -Deadline $Deadline
     if (-not $foreground.acquired) {
@@ -2785,8 +2914,17 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         $tabs = Read-SynapseChromeTabStripState -Window $current
         $navigation = Read-SynapseChromeNavigationState -Hwnd $current.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
         $address = ([string]$navigation.address_bar_value).Trim().TrimEnd('/')
+        # Absence of the exact owned runtime id is the positive proof that this
+        # operation's own tab is gone. The address checks alone would pass simply
+        # because Chrome stripped the token out of the omnibox.
+        $ownedRuntimeStillPresent = @(
+            $tabs.tabs | Where-Object {
+                [string]$_.runtime_id -ceq [string]$Lease.owned_tab_runtime_id
+            }
+        ).Count -gt 0
         if (
             $tabs.count -eq [int]$Lease.expected_tab_count_after_cleanup -and
+            -not $ownedRuntimeStillPresent -and
             $address -cne $markerAddress -and
             $address -notmatch $tokenPattern
         ) {
