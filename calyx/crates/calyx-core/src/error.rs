@@ -228,4 +228,14 @@ error_catalog! {
     DatasetSchemaMismatch, dataset_schema_mismatch, "CALYX_DATASET_SCHEMA_MISMATCH",
     "dataset columns/fields missing or malformed vs the pinned upstream contract",
     "re-acquire at the pinned revision; check upstream schema drift";
+
+    // A vault holding a durable column family this build does not know about is
+    // NOT damaged: its bytes are intact and a build that knows the CF reads it
+    // normally. Reporting that as CALYX_ASTER_CORRUPT_SHARD ("restore from
+    // restic/snapshot") sent an operator toward destroying an intact vault when
+    // no backup existed (issue #1875). Classify it as the version mismatch it is
+    // and say explicitly that deleting the vault is the wrong repair.
+    AsterVaultSchemaAhead, aster_vault_schema_ahead, "CALYX_ASTER_VAULT_SCHEMA_AHEAD",
+    "vault contains a durable column family this build does not know about",
+    "the vault is intact and newer than this build: do NOT delete, purge, or clear it. Run the build that created the named column family, or upgrade this build to one that registers it";
 }

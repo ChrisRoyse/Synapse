@@ -360,6 +360,19 @@ pub struct AuditVerifyChainResponse {
     pub raw_commitment_first_pending_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_commitment_failure: Option<String>,
+    /// True only when this chain provably covers the vault directory's whole
+    /// recorded history. When false, `intact` attests only the surviving chain:
+    /// the vault was replaced, or its lineage was not tracked from genesis
+    /// (issue #1875).
+    pub covers_full_history: bool,
+    /// `vault-genesis` | `lineage-seeded` | `post-reset`.
+    pub chain_origin: String,
+    pub vault_generation: u64,
+    pub vault_reset_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predecessor_vault_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predecessor_high_water_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_readback: Option<AuditLedgerEntryReadback>,
 }

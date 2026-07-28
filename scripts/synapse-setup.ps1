@@ -123,6 +123,15 @@
 
 .PARAMETER Purge
   With -Remove, also delete the daemon DB, deployed profiles, and token.
+  Destroying a populated vault additionally requires -ConfirmVaultDestruction:
+  the vault has no automatic backup, so a single flag must never be able to
+  delete captured history (issue #1875).
+
+.PARAMETER ConfirmVaultDestruction
+  Required alongside -Purge when the Calyx vault at -DbPath holds any durable
+  sequences. Setup writes a deletion record next to the vault directory (which
+  therefore survives the deletion) before removing anything, and refuses to
+  delete a populated vault it could not record.
 
 .PARAMETER ActiveIssue
   Optional current GitHub issue number/ref to preserve in Codex restart
@@ -236,7 +245,8 @@ param(
     [switch]$AllowAlternateBuildTarget,
     [switch]$SkipClientWiring,
     [switch]$Remove,
-    [switch]$Purge
+    [switch]$Purge,
+    [switch]$ConfirmVaultDestruction
 )
 
 $ErrorActionPreference = 'Stop'
@@ -3905,6 +3915,95 @@ function Get-SynapseCalyxPhysicalSnapshot {
         $snapshot.error = $_.Exception.Message
     }
     return [pscustomobject]$snapshot
+}
+
+function Write-SynapseVaultDeletionRecord {
+    <#
+      Records what a vault held immediately before setup deletes it, into a file
+      OUTSIDE the vault directory so the record survives the deletion, and
+      refuses to delete a populated vault without an explicit second flag.
+
+      Issue #1875: `-Purge` removed a vault holding ~1.56M durable sequences and
+      left no evidence anywhere that it had ever existed. Every marker of the
+      vault's existence lived inside the directory being deleted, so the next
+      open was an ordinary successful open of an empty directory. The vault has
+      no automatic backup, so the deletion has to be both deliberate and
+      recorded, and the record has to live where the delete cannot reach it.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [switch]$Confirmed
+    )
+
+    if (-not (Test-Path -LiteralPath $DbPath -PathType Container)) {
+        Info "Vault deletion record skipped: no vault directory at $DbPath"
+        return
+    }
+
+    $snapshot = Get-SynapseCalyxPhysicalSnapshot -Path $DbPath
+    $vaultId = $null
+    $identityPath = Join-Path $DbPath 'vault-identity.json'
+    if (Test-Path -LiteralPath $identityPath -PathType Leaf) {
+        try { $vaultId = ((Get-Content -LiteralPath $identityPath -Raw) | ConvertFrom-Json).vault_id }
+        catch { $vaultId = "read_or_decode_failed: $($_.Exception.Message)" }
+    }
+
+    $durableSeq = 0
+    if ($null -ne $snapshot.current_manifest_durable_seq) {
+        $durableSeq = [int64]$snapshot.current_manifest_durable_seq
+    }
+    $populated = ($durableSeq -gt 0) -or ($snapshot.cf_file_count -gt 0) -or ($snapshot.manifest_file_count -gt 1)
+
+    if ($populated -and -not $Confirmed) {
+        Die (@(
+            "SYNAPSE_SETUP_VAULT_PURGE_REFUSED",
+            ("vault_dir=$DbPath vault_id=$vaultId durable_seq=$durableSeq " +
+             "manifest_files=$($snapshot.manifest_file_count) cf_files=$($snapshot.cf_file_count) " +
+             "cf_bytes=$($snapshot.cf_bytes) wal_segments=$($snapshot.wal_segment_count)"),
+            'source_of_truth=physical vault directory contents read immediately before deletion',
+            ('remediation=this vault holds durable captured history and there is no automatic backup ' +
+             '(issue #1687). Take a backup first, then rerun with -ConfirmVaultDestruction to delete ' +
+             'it deliberately. -Purge alone will not destroy a populated vault.')
+        ) -join ' ')
+    }
+
+    $parent = Split-Path -Parent $DbPath
+    $leaf = Split-Path -Leaf $DbPath
+    if ([string]::IsNullOrWhiteSpace($parent)) { $parent = '.' }
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $recordPath = Join-Path $parent ("{0}.deleted-{1}.json" -f $leaf, $stamp)
+
+    $record = [ordered]@{
+        schema = 'synapse_vault_deletion_record/v1'
+        recorded_utc = (Get-Date).ToUniversalTime().ToString('o')
+        reason = $Reason
+        confirmed = [bool]$Confirmed
+        vault_dir = $DbPath
+        vault_id = $vaultId
+        deleted_by_pid = $PID
+        deleted_by_user = "$env:USERDOMAIN\$env:USERNAME"
+        physical_snapshot = $snapshot
+    }
+
+    try {
+        ($record | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $recordPath -Encoding UTF8
+    } catch {
+        Die (@(
+            "SYNAPSE_SETUP_VAULT_DELETION_RECORD_WRITE_FAILED",
+            "record_path=$recordPath error=$($_.Exception.Message)",
+            'source_of_truth=deletion record file next to the vault directory',
+            ('remediation=setup refuses to delete a vault it cannot record. Fix the write failure at ' +
+             'the path above, then retry.')
+        ) -join ' ')
+    }
+
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        Die "SYNAPSE_SETUP_VAULT_DELETION_RECORD_ABSENT record_path=$recordPath remediation=the deletion record did not exist after writing it; refusing to delete the vault"
+    }
+
+    Info ("Vault deletion recorded at $recordPath (vault_id=$vaultId durable_seq=$durableSeq " +
+          "cf_files=$($snapshot.cf_file_count) cf_bytes=$($snapshot.cf_bytes))")
 }
 
 function Format-SynapseCalyxPhysicalSnapshot {
@@ -10764,6 +10863,7 @@ if ($Remove) {
     Remove-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'remove'
     Stop-SynapseMcpProcesses -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
     if ($Purge) {
+        Write-SynapseVaultDeletionRecord -DbPath $DbPath -Reason 'setup-remove-purge' -Confirmed:$ConfirmVaultDestruction
         foreach ($p in @($DbPath, $ProfilesDir, (Split-Path -Parent $TokenPath))) {
             if (Test-Path $p) { Remove-Item -Recurse -Force $p; Info "Deleted $p" }
         }

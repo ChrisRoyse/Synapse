@@ -1049,6 +1049,7 @@ impl SessionLifecycleState {
             self.record_registry_closed(session_id, &registry_reason, &report.processes);
         report.finalize();
         if report.failure_count == 0 {
+            clear_teardown_failure_streak(session_id);
             tracing::info!(
                 code = "MCP_SESSION_TEARDOWN_COMPLETED",
                 session_id,
@@ -1057,14 +1058,36 @@ impl SessionLifecycleState {
                 "readback=session_lifecycle after=all_owned_resources_reclaimed"
             );
         } else {
-            tracing::error!(
-                code = "MCP_SESSION_TEARDOWN_FAILED",
-                session_id,
-                reason = %report.reason,
-                failure_count = report.failure_count,
-                report = ?report,
-                "session lifecycle teardown encountered cleanup failures"
-            );
+            // The 250 ms stale-session sweep re-drives teardown for the same
+            // session while a fail-closed cleanup keeps refusing. The outer
+            // retry loop already demotes its repeat to WARN after the first
+            // occurrence; this inner log did not, so every retry still emitted a
+            // fresh ERROR carrying no new information (#1801). Report the
+            // transition at ERROR and the steady state at WARN with its exact
+            // streak length, so the condition stays fully visible without a
+            // per-tick ERROR storm.
+            let streak = note_teardown_failure_streak(session_id);
+            if streak <= 1 {
+                tracing::error!(
+                    code = "MCP_SESSION_TEARDOWN_FAILED",
+                    session_id,
+                    reason = %report.reason,
+                    failure_count = report.failure_count,
+                    consecutive_teardown_failures = streak,
+                    report = ?report,
+                    "session lifecycle teardown encountered cleanup failures"
+                );
+            } else {
+                tracing::warn!(
+                    code = "MCP_SESSION_TEARDOWN_FAILED",
+                    session_id,
+                    reason = %report.reason,
+                    failure_count = report.failure_count,
+                    consecutive_teardown_failures = streak,
+                    report = ?report,
+                    "session lifecycle teardown still failing on the same session (first occurrence logged at ERROR)"
+                );
+            }
         }
         Ok(report)
     }
@@ -2652,6 +2675,52 @@ fn chrome_bridge_close_refused_by_operator_panic(detail: &str) -> bool {
     detail.contains("refusing closeTab")
         && detail.contains("operator panic disabled extension mutation admission")
         && !chrome_bridge_close_refused_for_stale_prior_browser_session(detail)
+}
+
+/// Consecutive failed teardown attempts per session id, with the last time each
+/// was observed so abandoned entries can be dropped (#1801).
+///
+/// An entry is inserted only for a session actively failing teardown and removed
+/// on its first success. A session that stops being retried (its owner rows were
+/// deleted, or the daemon stopped sweeping it) never reaches that success path,
+/// so stale entries are pruned by age once the map is large enough for growth to
+/// matter.
+static TEARDOWN_FAILURE_STREAKS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, (u64, Instant)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// A session whose teardown has not been retried for this long is not being
+/// swept any more; its streak entry is unreachable bookkeeping.
+const TEARDOWN_FAILURE_STREAK_TTL: Duration = Duration::from_hours(1);
+/// Only prune once the map is large enough for growth to matter.
+const TEARDOWN_FAILURE_STREAK_PRUNE_THRESHOLD: usize = 64;
+
+/// Records one failed teardown for `session_id` and returns the streak length.
+///
+/// A poisoned lock returns 1 (log at ERROR). Losing visibility of a fail-closed
+/// teardown failure is the one outcome worth extra noise.
+fn note_teardown_failure_streak(session_id: &str) -> u64 {
+    let Ok(mut guard) = TEARDOWN_FAILURE_STREAKS.lock() else {
+        return 1;
+    };
+    let now = Instant::now();
+    if guard.len() > TEARDOWN_FAILURE_STREAK_PRUNE_THRESHOLD {
+        guard.retain(|_id, (_streak, last_seen)| {
+            now.saturating_duration_since(*last_seen) < TEARDOWN_FAILURE_STREAK_TTL
+        });
+    }
+    let entry = guard.entry(session_id.to_owned()).or_insert((0, now));
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now;
+    entry.0
+}
+
+/// Clears the streak once this session tears down cleanly, so a later failure
+/// on the same id reports as a fresh transition at ERROR.
+fn clear_teardown_failure_streak(session_id: &str) {
+    if let Ok(mut guard) = TEARDOWN_FAILURE_STREAKS.lock() {
+        guard.remove(session_id);
+    }
 }
 
 /// Per-target state for an operator-panic-blocked CDP close (#1801).

@@ -9,6 +9,7 @@ pub use error_bridge::SYNAPSE_CALYX_BACKPRESSURE;
 mod find;
 mod grounding;
 mod intelligence;
+pub mod lineage;
 pub mod lowering;
 mod math;
 
@@ -63,6 +64,9 @@ use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
 };
 use fs2::FileExt as _;
+pub use lineage::{
+    ACKNOWLEDGE_RESET_ENV, SynapseCalyxVaultLineage, VaultLineageGeneration, lineage_path,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use ulid::Ulid;
@@ -890,10 +894,28 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub raw_commitment_first_pending_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_commitment_failure: Option<String>,
+    /// True only when the verified range provably covers the vault directory's
+    /// whole recorded history. False whenever the chain begins after a recorded
+    /// vault replacement, or before the lineage journal existed — in which case
+    /// `intact` attests the surviving chain, not the full history (#1875).
+    pub covers_full_history: bool,
+    /// `vault-genesis` | `lineage-seeded` | `post-reset`.
+    pub chain_origin: String,
+    /// 1-based lineage generation of the vault this chain lives in.
+    pub vault_generation: u64,
+    /// Recorded vault replacements preceding this generation.
+    pub vault_reset_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predecessor_vault_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predecessor_high_water_seq: Option<u64>,
 }
 
 impl SynapseCalyxLedgerVerifyReport {
-    fn from_aster(verification: calyx_aster::vault::AsterLedgerChainVerification) -> Self {
+    fn from_aster(
+        verification: calyx_aster::vault::AsterLedgerChainVerification,
+        lineage: &SynapseCalyxVaultLineage,
+    ) -> Self {
         let calyx_aster::vault::AsterLedgerChainVerification {
             result,
             head_height,
@@ -923,6 +945,12 @@ impl SynapseCalyxLedgerVerifyReport {
             raw_commitment_sealed_through_seq: raw_commitments.sealed_through_seq,
             raw_commitment_first_pending_seq: raw_commitments.first_pending_seq,
             raw_commitment_failure: raw_commitments.failure.clone(),
+            covers_full_history: lineage.chain_covers_full_history(),
+            chain_origin: lineage.chain_origin.clone(),
+            vault_generation: lineage.generation,
+            vault_reset_count: lineage.reset_count,
+            predecessor_vault_id: lineage.predecessor_vault_id.clone(),
+            predecessor_high_water_seq: lineage.predecessor_high_water_seq,
         };
         let mut report = match result {
             VerifyResult::Intact { count } => Self {
@@ -1778,6 +1806,7 @@ pub struct SynapseCalyxVault {
     lock: VaultLockGuard,
     math_runtime: SynapseCalyxMathRuntime,
     open_mode: SynapseCalyxVaultOpenMode,
+    lineage: SynapseCalyxVaultLineage,
 }
 
 #[derive(Debug)]
@@ -2269,6 +2298,29 @@ impl SynapseCalyxVault {
                 ));
             }
         };
+        // Compare the vault that is physically present against the lineage
+        // journal kept OUTSIDE the vault directory, before any caller can treat
+        // this open as normal. A vault whose substrate was replaced must never
+        // open silently (#1875).
+        let lineage = {
+            let now_unix_ms = match SynapseCalyxClock::from_tuning(&config.tuning) {
+                Ok(clock) => clock.now(),
+                Err(error) => return Err(cleanup_open_lock(lock, error)),
+            };
+            match lineage::evaluate_and_record(
+                &config.vault_dir,
+                &vault.vault_id().to_string(),
+                vault.latest_seq(),
+                now_unix_ms,
+                lineage::acknowledgement_from_env().as_deref(),
+            ) {
+                Ok(lineage) => lineage,
+                Err(error) => {
+                    drop(vault);
+                    return Err(cleanup_open_lock(lock, error));
+                }
+            }
+        };
         let math_runtime = match math_backend(&config.tuning) {
             Ok(runtime) => runtime,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
@@ -2319,6 +2371,10 @@ impl SynapseCalyxVault {
                 .math_backend
                 .as_ref()
                 .map_or("none", |math| math.probe.status.as_str()),
+            lineage_path = %lineage.lineage_path.display(),
+            vault_generation = lineage.generation,
+            vault_lineage_reset_count = lineage.reset_count,
+            chain_origin = %lineage.chain_origin,
             "opened durable Calyx Aster vault"
         );
         Ok(Self {
@@ -2327,7 +2383,16 @@ impl SynapseCalyxVault {
             lock,
             math_runtime,
             open_mode,
+            lineage,
         })
+    }
+
+    /// Lineage of the vault directory this handle has open: which generation it
+    /// is, how many recorded replacements precede it, and therefore how much
+    /// history a verified chain can honestly claim to cover.
+    #[must_use]
+    pub const fn lineage(&self) -> &SynapseCalyxVaultLineage {
+        &self.lineage
     }
 
     #[must_use]
@@ -3495,7 +3560,10 @@ impl SynapseCalyxVault {
             .vault
             .verify_ledger_chain(range)
             .map_err(|error| SynapseCalyxError::from_calyx("verify Calyx ledger chain", &error))?;
-        Ok(SynapseCalyxLedgerVerifyReport::from_aster(verification))
+        Ok(SynapseCalyxLedgerVerifyReport::from_aster(
+            verification,
+            &self.lineage,
+        ))
     }
 
     /// Reads and decodes one physical provenance-ledger entry by sequence.
@@ -4055,8 +4123,10 @@ impl SynapseCalyxVault {
             lock,
             math_runtime,
             open_mode: _,
+            lineage,
         } = self;
         let latest_seq = vault.latest_seq();
+        let closing_vault_id = vault.vault_id().to_string();
         let close_compaction = vault.compact_native_fanout_once().map_err(|error| {
             SynapseCalyxError::from_calyx(
                 "checkpoint and prepare Calyx SST fan-out before close",
@@ -4081,6 +4151,28 @@ impl SynapseCalyxVault {
             "flushed durable Calyx Aster vault before shutdown"
         );
         drop(vault);
+        // Record the closing high-water mark while it is still knowable. The
+        // vault is already flushed, so failing here cannot lose rows — but it
+        // must fail loudly, because after the directory is deleted this sibling
+        // journal is the only surviving evidence of how much was there (#1875).
+        let lineage_after_close = lineage::evaluate_and_record(
+            &config.vault_dir,
+            &closing_vault_id,
+            latest_seq,
+            SynapseCalyxClock::from_tuning(&config.tuning)?.now(),
+            None,
+        )?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_VAULT_LINEAGE_CLOSE_RECORDED",
+            reason,
+            vault_dir = %config.vault_dir.display(),
+            lineage_path = %lineage_after_close.lineage_path.display(),
+            vault_id = %closing_vault_id,
+            generation_at_open = lineage.generation,
+            generation = lineage_after_close.generation,
+            latest_seq,
+            "recorded the closing durable high-water mark in the vault lineage journal"
+        );
         let gpu_reservation_release = match math_runtime.close() {
             Ok(readback) => readback,
             Err(error) => {

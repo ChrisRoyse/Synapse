@@ -639,6 +639,12 @@ fn verify_chain_response(
         raw_commitment_sealed_through_seq: verify.raw_commitment_sealed_through_seq,
         raw_commitment_first_pending_seq: verify.raw_commitment_first_pending_seq,
         raw_commitment_failure: verify.raw_commitment_failure.clone(),
+        covers_full_history: verify.covers_full_history,
+        chain_origin: verify.chain_origin.clone(),
+        vault_generation: verify.vault_generation,
+        vault_reset_count: verify.vault_reset_count,
+        predecessor_vault_id: verify.predecessor_vault_id.clone(),
+        predecessor_high_water_seq: verify.predecessor_high_water_seq,
         entry_readback: entry.map(ledger_entry_readback),
     }
 }

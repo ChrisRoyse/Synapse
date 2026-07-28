@@ -212,7 +212,13 @@ pub fn parse_cf_dir_name(value: &str) -> Result<ColumnFamily> {
     // commit and then rejected by the next router open (#1804). The canonical
     // round-trip below still rejects aliases and malformed slot padding.
     let cf = ColumnFamily::from_name(value).ok_or_else(|| {
-        CalyxError::aster_corrupt_shard(format!("unknown durable CF directory {value}"))
+        // Not corruption: the directory is well formed, this build simply has no
+        // registration for it. Saying "corrupt shard / restore from snapshot"
+        // here is what pointed an operator at deleting an intact vault (#1875).
+        CalyxError::aster_vault_schema_ahead(format!(
+            "durable CF directory {value} is not registered in this build's ColumnFamily registry; \
+             the vault was written by a build that knows this column family"
+        ))
     })?;
     if cf.name() != value {
         return Err(CalyxError::aster_corrupt_shard(format!(
