@@ -359,10 +359,10 @@ const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
     },
     CalyxTuningKnobFacts {
         knob: "fusion_k",
-        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
-        declared_at: "calyx/crates/calyx-sextant/src/fusion/rrf.rs RRF_K (also calyx-ledger/src/reproduce/fusion.rs RRF_K and crates/synapse-calyx/src/find.rs SYNAPSE_FIND_RRF_K)",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: every fused query scores with the substrate's hardcoded RRF_K=60; threading this value requires an rrf_k on calyx_sextant::FusionContext plus a parameter through calyx-search into synapse-calyx find.rs",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "crates/synapse-calyx/src/find.rs -> calyx_search::FusionTuning::rrf_k -> calyx_sextant::FusionContext::rrf_k -> fusion::rrf::rrf_contribution; the untuned default is the single workspace declaration calyx_core::RRF_K_DEFAULT",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets the k in the Reciprocal Rank Fusion law score(d) = SUM w_s/(k + rank_s(d)) that every fused find scores with; the reported rrf_k and rrf_formula on each find report are interpolated from this same value, and each reproducible fusion payload records the k it ran under so retuning cannot change what a past query replays to",
     },
     CalyxTuningKnobFacts {
         knob: "temporal_boost_min",
@@ -920,10 +920,19 @@ impl SynapseService {
         }
         if publish.failure_total > 0 {
             reasons.push(format!(
-                "guard-threshold lowering publisher has {} failures (last {}: {})",
+                "guard-threshold lowering publisher has {} failures (last failure {} at unix_ms={}: {})",
                 publish.failure_total,
-                publish.last_error_code.as_deref().unwrap_or("unknown"),
-                publish.last_error.as_deref().unwrap_or("unknown")
+                publish
+                    .last_failure_code
+                    .as_deref()
+                    .unwrap_or("<not recorded: failure predates #1889 retention>"),
+                publish
+                    .last_failure_unix_ms
+                    .map_or_else(|| "<not recorded>".to_owned(), |ms| ms.to_string()),
+                publish
+                    .last_failure_detail
+                    .as_deref()
+                    .unwrap_or("<not recorded: failure predates #1889 retention>")
             ));
         }
         // A tick on the fail-closed defaults is only a *defect* once a publish

@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use calyx_core::{Constellation, CxId, SlotId, VaultStore};
 use calyx_registry::load_vault_panel_state;
 use calyx_search::{
-    FusionChoice, GuardChoice, PersistedSearchGeneration, PersistedSearchIndexes,
+    FusionChoice, FusionTuning, GuardChoice, PersistedSearchGeneration, PersistedSearchIndexes,
     REBUILD_REQUIRED_REMEDIATION, SearchBudget, SearchError, SearchFreshness, SearchOutcome,
     measure_query_vectors, read_rebuild_required_marker,
     search_outcome_with_query_vectors_freshness,
@@ -78,16 +78,32 @@ use crate::{
 /// candidate cap so a temporally-boosted find never exceeds the #1667 bound.
 pub const SYNAPSE_FIND_MAX_K: usize = 1_000;
 
-/// The RRF rank constant used by the Sextant substrate, surfaced for evidence.
-pub const SYNAPSE_FIND_RRF_K: u32 = 60;
+/// The RRF rank constant a vault uses when its `calyx_fusion_k` is untuned.
+///
+/// This is the workspace default re-exported, not a fourth declaration of it:
+/// before #1883 the constant was independently written down in
+/// `calyx-sextant`, `calyx-ledger`, here, and again as `DEFAULT_FUSION_K`, and
+/// the configured knob reached none of them. The value that actually scores a
+/// query is `SynapseCalyxTuningConfig::fusion_k`, reported per-query on
+/// `SynapseCalyxFindReport::rrf_k`.
+pub const SYNAPSE_FIND_RRF_K: u32 = calyx_core::RRF_K_DEFAULT;
 
-/// The exact rank-level fusion law the substrate applies.
+/// The exact rank-level fusion law the substrate applies, stated for the `k`
+/// the query actually ran under.
 ///
 /// Surfaced verbatim so a caller can recompute every reported score from the
 /// reported per-lens ranks. Cormack, Clarke & Buettcher (SIGIR 2009) define
-/// `RRFscore(d) = Σ 1/(k+r(d))` with `k = 60` and 1-based `r(d)`; the substrate
-/// adds the per-lens weight `w_s` (always `1.0` for plain RRF).
-pub const SYNAPSE_FIND_RRF_FORMULA: &str = "score(d) = SUM over consulted slots s of w_s / (60 + rank_s(d)), rank_s 1-based, k=60 (Cormack et al., SIGIR 2009)";
+/// `RRFscore(d) = Σ 1/(k+r(d))` with 1-based `r(d)`; the substrate adds the
+/// per-lens weight `w_s` (always `1.0` for plain RRF). The `k` is the vault's
+/// configured `calyx_fusion_k`, interpolated here rather than hardcoded so the
+/// reported law can never describe a different scoring than the one that ran
+/// (#1883).
+#[must_use]
+pub fn synapse_find_rrf_formula(rrf_k: u32) -> String {
+    format!(
+        "score(d) = SUM over consulted slots s of w_s / ({rrf_k} + rank_s(d)), rank_s 1-based, k={rrf_k} (Cormack et al., SIGIR 2009)"
+    )
+}
 
 /// Machine-readable state code reported when the Ward in-region guard seam is
 /// off, so a caller can branch on the guard state without parsing prose.
@@ -255,7 +271,7 @@ pub struct SynapseCalyxFindReport {
     pub k: usize,
     pub rrf_k: u32,
     /// The rank-level fusion law, so a caller can recompute every score from the
-    /// reported per-lens ranks ([`SYNAPSE_FIND_RRF_FORMULA`]).
+    /// reported per-lens ranks ([`synapse_find_rrf_formula`]).
     pub rrf_formula: String,
     /// Slots that carried a query vector and a persisted index — the lenses the
     /// fusion actually consulted.
@@ -389,6 +405,18 @@ impl SynapseCalyxVault {
         let substrate_k = if self_cx.is_some() { k + 1 } else { k };
         // Ward guarded search is a documented seam (#1677); keep it off so the
         // result is the honest fused recall, never a silently guarded subset.
+        // The configured knob, not a constant: `calyx_fusion_k` reaches the
+        // scoring law it names (#1883). Validated at config load, re-validated
+        // here so an out-of-domain value fails the query loudly rather than
+        // producing a silently misordered ranking.
+        let rrf_k = self.config.tuning.fusion_k;
+        let fusion_tuning = FusionTuning::new(rrf_k).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_FIND_FUSION_TUNING_INVALID",
+                format!("configured calyx_fusion_k={rrf_k} cannot score a fused query: {error}"),
+                "set calyx_fusion_k to a positive integer; the Cormack et al. default is 60",
+            )
+        })?;
         let outcome: SearchOutcome = search_outcome_with_query_vectors_freshness(
             &self.vault,
             vault_dir,
@@ -401,6 +429,7 @@ impl SynapseCalyxVault {
             params.explain,
             SearchFreshness::Fresh,
             SearchBudget::disabled(),
+            fusion_tuning,
             None,
         )
         .map_err(|error| find_index_error("run fused persisted search", &error))?;
@@ -437,8 +466,8 @@ impl SynapseCalyxVault {
             fusion: params.fusion.name().to_owned(),
             query_kind,
             k,
-            rrf_k: SYNAPSE_FIND_RRF_K,
-            rrf_formula: SYNAPSE_FIND_RRF_FORMULA.to_owned(),
+            rrf_k,
+            rrf_formula: synapse_find_rrf_formula(rrf_k),
             consulted_slots,
             temporal_applied,
             guard,

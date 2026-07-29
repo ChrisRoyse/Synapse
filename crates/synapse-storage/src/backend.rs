@@ -120,6 +120,11 @@ static CALYX_GC_PENDING_TOMBSTONE_ROWS: AtomicU64 = AtomicU64::new(0);
 static CALYX_GC_LAST_TOMBSTONE_PURGE_MS: AtomicU64 = AtomicU64::new(0);
 const CALYX_GC_PROTECTED_CF_POLICY_SKIPPED: &str = "protected_cf_policy_skipped";
 const CALYX_GC_CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
+/// GC kept a source row alive because a live derived constellation is
+/// content-addressed over its bytes and could not be re-derived without it
+/// (#1882).
+const CALYX_GC_SOURCE_ROW_RETAINED_FOR_DERIVED: &str =
+    "STORAGE_CALYX_GC_SOURCE_ROW_RETAINED_FOR_DERIVED";
 const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
 const CALYX_WRITE_BATCH_ROW_COUNT_BYTES: usize = 4;
 const CALYX_WRITE_BATCH_CF_TAG_BYTES: usize = 1;
@@ -7717,6 +7722,9 @@ struct CalyxRetentionState {
     tombstones: Vec<SynapseCalyxCfWrite>,
     before_live_bytes: u64,
     expired_rows: u64,
+    /// Rows GC declined to consider because a live derived constellation still
+    /// points at them (#1882). Neither evicted nor counted toward the caps.
+    retained_referenced_rows: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7803,11 +7811,99 @@ fn calyx_gc_budget(
     })
 }
 
+/// Builds the set of source rows that a live derived constellation still points
+/// at, keyed by the Synapse column family it names.
+///
+/// A constellation's `CxId` is content-addressed over the exact input bytes it
+/// was measured from, so once the source row is gone those bytes exist nowhere
+/// and the row can never be re-derived, re-encoded to a newer lens generation,
+/// or audited against its own derivation. Before #1882, eviction order decided
+/// this by accident: on the production vault 227 derived rows had already
+/// outlived their sources, including every `syn-process-v1` and
+/// `syn-observation-v1` row.
+///
+/// Built once per GC tick and shared across every CF budget, so the Base scan
+/// is paid once rather than per column family.
+fn collect_derived_source_references(
+    vault: &SynapseCalyxVault,
+) -> StorageResult<BTreeMap<String, BTreeSet<Vec<u8>>>> {
+    let snapshot = vault.latest_seq();
+    let rows = vault
+        .scan_cf_at(snapshot, ColumnFamily::Base)
+        .map_err(|source| {
+            calyx_write_failed(
+                CALYX_GC_CF,
+                "scan Base CF for derived source references",
+                &source,
+            )
+        })?;
+    let mut referenced: BTreeMap<String, BTreeSet<Vec<u8>>> = BTreeMap::new();
+    for (_, value) in rows {
+        let constellation =
+            calyx_aster::vault::encode::decode_constellation_base(&value).map_err(|source| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!("decode Base row while indexing derived source references: {source}"),
+                )
+            })?;
+        let (Some(source_cf), Some(source_key_hex)) = (
+            constellation
+                .metadata
+                .get(crate::constellations::META_SOURCE_CF),
+            constellation
+                .metadata
+                .get(crate::constellations::META_SOURCE_KEY_HEX),
+        ) else {
+            continue;
+        };
+        // A derived row that records an undecodable source key is a corrupt
+        // reference, not an absent one. Fail closed rather than let GC treat it
+        // as "nothing points here" and delete the source.
+        let source_key = decode_source_key_hex(source_key_hex).map_err(|detail| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "derived constellation {} records an undecodable {} for source CF {source_cf}: {detail}",
+                    constellation.cx_id,
+                    crate::constellations::META_SOURCE_KEY_HEX
+                ),
+            )
+        })?;
+        referenced
+            .entry(source_cf.clone())
+            .or_default()
+            .insert(source_key);
+    }
+    Ok(referenced)
+}
+
+/// Decodes a `synapse_source_key_hex` metadata value back to the raw source
+/// key bytes.
+///
+/// Written here rather than pulled from a hex crate so a malformed value is
+/// reported as the specific corruption it is instead of an opaque parse error.
+fn decode_source_key_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err(format!(
+            "hex length {} is odd, so it cannot encode whole bytes",
+            value.len()
+        ));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|error| format!("byte at hex offset {index} is not hex: {error}"))
+        })
+        .collect()
+}
+
 fn run_calyx_gc_budgets(
     vault: &SynapseCalyxVault,
     budgets: &[CalyxGcBudget],
 ) -> StorageResult<gc::GcReport> {
     let now_ms = calyx_clock_now_for_write(vault, CALYX_GC_CF)?;
+    let referenced = collect_derived_source_references(vault)?;
     let mut cf_reports = Vec::with_capacity(budgets.len());
     let mut tombstones = Vec::new();
     for budget in budgets {
@@ -7815,6 +7911,7 @@ fn run_calyx_gc_budgets(
             vault,
             *budget,
             now_ms,
+            referenced.get(budget.cf_name),
             &mut tombstones,
         )?);
     }
@@ -7917,6 +8014,7 @@ fn run_calyx_gc_budget(
     vault: &SynapseCalyxVault,
     budget: CalyxGcBudget,
     now_ms: u64,
+    referenced: Option<&BTreeSet<Vec<u8>>>,
     pending_tombstones: &mut Vec<SynapseCalyxCfWrite>,
 ) -> StorageResult<gc::GcCfReport> {
     let collection_id = calyx_collection_id_for_cf_write(budget.cf_name)?;
@@ -7926,7 +8024,16 @@ fn run_calyx_gc_budget(
         collection_id,
         now_ms,
         budget.protected,
+        referenced,
     )?;
+    if state.retained_referenced_rows > 0 {
+        tracing::info!(
+            code = CALYX_GC_SOURCE_ROW_RETAINED_FOR_DERIVED,
+            cf = budget.cf_name,
+            retained_referenced_rows = state.retained_referenced_rows,
+            "Calyx storage GC retained source rows that live derived constellations still point at"
+        );
+    }
     let before_live_rows = calyx_len_to_u64(
         budget.cf_name,
         "Calyx GC live row count",
@@ -8146,6 +8253,7 @@ fn collect_calyx_retention_state(
     collection_id: u64,
     now_ms: u64,
     protected: bool,
+    referenced: Option<&BTreeSet<Vec<u8>>>,
 ) -> StorageResult<CalyxRetentionState> {
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let rows = vault
@@ -8162,6 +8270,7 @@ fn collect_calyx_retention_state(
         tombstones: Vec::new(),
         before_live_bytes: 0,
         expired_rows: 0,
+        retained_referenced_rows: 0,
     };
     for (full_key, value) in rows {
         let user_key = decode_calyx_user_key(collection_id, &full_key).map_err(|detail| {
@@ -8182,6 +8291,17 @@ fn collect_calyx_retention_state(
                 format!("decode Calyx retention envelope: {detail}"),
             )
         })?;
+        // #1882: a source row a live derived constellation still points at is
+        // not garbage, however old it is. Deleting it destroys the only copy of
+        // the input bytes that row's CxId addresses, so re-derive, lazy
+        // backfill and derivation audit all become impossible with no error at
+        // the moment of loss. Retained rows are excluded from cap eviction too,
+        // and counted so the retention is reported rather than silent.
+        let referenced_by_derived = referenced.is_some_and(|keys| keys.contains(&user_key));
+        if referenced_by_derived {
+            state.retained_referenced_rows = state.retained_referenced_rows.saturating_add(1);
+            continue;
+        }
         if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
             if !protected {
                 state.tombstones.push(SynapseCalyxCfWrite::new(

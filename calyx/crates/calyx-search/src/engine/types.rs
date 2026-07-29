@@ -95,3 +95,46 @@ impl SearchOutcome {
         }
     }
 }
+
+/// Fusion parameters an operator can tune per vault.
+///
+/// Threaded rather than hardcoded so a configured `calyx_fusion_k` actually
+/// reaches the scoring law it names. Before #1883 the knob was validated,
+/// lowered to an artifact and echoed to health while every fused query scored
+/// with a constant, so tuning it changed nothing and reported success.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FusionTuning {
+    /// The Reciprocal Rank Fusion rank constant.
+    pub rrf_k: f32,
+}
+
+impl Default for FusionTuning {
+    fn default() -> Self {
+        Self {
+            rrf_k: DEFAULT_RRF_K_F32,
+        }
+    }
+}
+
+/// The workspace default rank constant in scoring form.
+///
+/// Resolved once here so no caller repeats the conversion, and so a default
+/// that stopped being exactly representable would fail loudly at first use
+/// rather than silently round.
+const DEFAULT_RRF_K_F32: f32 = match calyx_core::rrf_k_as_f32(calyx_core::RRF_K_DEFAULT) {
+    Some(value) => value,
+    None => panic!("the workspace default RRF k must be exactly representable in f32"),
+};
+
+impl FusionTuning {
+    /// Rejects a rank constant that would make RRF scoring undefined or
+    /// unfaithfully reported.
+    pub fn new(rrf_k: u32) -> calyx_core::Result<Self> {
+        let rrf_k = calyx_core::rrf_k_as_f32(rrf_k).ok_or_else(|| {
+            calyx_core::CalyxError::fusion_tuning_invalid(format!(
+                "fusion rrf_k must be in 1..=2^24 so it is exactly representable in the f32 the scoring law runs in, got {rrf_k}"
+            ))
+        })?;
+        Ok(Self { rrf_k })
+    }
+}

@@ -198,6 +198,16 @@ pub struct LoweringPublishReadback {
     pub last_source_ledger_seq: Option<u64>,
     pub last_error_code: Option<String>,
     pub last_error: Option<String>,
+    /// The last **failure**, retained across later successes.
+    ///
+    /// `failure_total` is a lifetime counter, so it stays non-zero forever once
+    /// a publish fails, while `last_error` is cleared by the next success. That
+    /// combination made health report `has 2 failures (last unknown: unknown)`
+    /// on the live daemon — a permanent alarm with its own evidence erased
+    /// (#1889). These fields are written only by a failure and never cleared.
+    pub last_failure_code: Option<String>,
+    pub last_failure_detail: Option<String>,
+    pub last_failure_unix_ms: Option<u64>,
 }
 
 /// Registers the storage handle whose Calyx vault the lowering pass reads.
@@ -244,6 +254,10 @@ fn record_lowering_skip(code: &'static str, detail: String) {
 
 fn record_lowering_failure(code: &'static str, detail: &str) {
     LOWERING_PUBLISH_FAILURE.fetch_add(1, Ordering::Relaxed);
+    let failed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok());
     tracing::error!(
         code,
         detail,
@@ -256,6 +270,9 @@ fn record_lowering_failure(code: &'static str, detail: &str) {
     };
     guard.last_error_code = Some(code.to_owned());
     guard.last_error = Some(detail.to_owned());
+    guard.last_failure_code = Some(code.to_owned());
+    guard.last_failure_detail = Some(detail.to_owned());
+    guard.last_failure_unix_ms = failed_at_unix_ms;
 }
 
 /// Runs one lowering publish, if a vault-backed source is registered.

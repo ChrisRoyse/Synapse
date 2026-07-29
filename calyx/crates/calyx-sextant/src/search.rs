@@ -23,6 +23,12 @@ use crate::search_support::{
 use crate::slot_index_map::SlotIndexMap;
 use crate::util::{event_time_secs_from_ts, hex32};
 
+/// The workspace default rank constant in scoring form, resolved once.
+const DEFAULT_RRF_K_F32: f32 = match calyx_core::rrf_k_as_f32(calyx_core::RRF_K_DEFAULT) {
+    Some(value) => value,
+    None => panic!("the workspace default RRF k must be exactly representable in f32"),
+};
+
 const DEFAULT_PIPELINE_RECALL_MULTIPLIER: usize = 10;
 
 struct SearchOutcome {
@@ -259,6 +265,7 @@ impl SearchEngine {
         let context = FusionContext {
             panel_version: self.panel.version,
             k: search_k,
+            rrf_k: DEFAULT_RRF_K_F32,
             explain: query.explain,
             strategy: strategy.clone(),
             weights,

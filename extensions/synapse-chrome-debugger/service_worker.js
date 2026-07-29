@@ -537,6 +537,19 @@ async function startBridge() {
   connectDaemon();
 }
 
+/// Host id this worker boot has already published a supplementary hello for.
+///
+/// #1880: the reconnect wake alarm fires every 30 s and called
+/// `startBridgeFromEvent`, which re-published a full `hello` unconditionally
+/// whenever a host already existed. That produced 2,679 HELLOs in 30 h across
+/// this host (~2,100/day, one per 30 s, 3.3% of every line the daemon wrote),
+/// each one a full re-registration: capability list, service-worker SHA
+/// verification, profile scan. The re-publish exists only to cover the
+/// bootstrap-before-`runtime.onStartup` ordering, which is a once-per-worker-
+/// boot condition — so it is now performed once per (worker boot, host id) and
+/// the alarm's remaining job is to confirm the connection, not to re-register.
+let supplementaryHelloPublishedForHostId = null;
+
 function startBridgeFromEvent() {
   startBridge()
     .then(async () => {
@@ -544,7 +557,10 @@ function startBridgeFromEvent() {
       // delivered. If a host already exists, publish the identity again so the
       // daemon's durable health snapshot contains the lifecycle event and the
       // separately read reconnect-alarm state from this exact browser startup.
-      if (hostId && bridgeToken) {
+      // Once per worker boot: a re-registration that changes nothing is not
+      // evidence, and at 30 s cadence it hides a real disconnect in the noise.
+      if (hostId && bridgeToken && supplementaryHelloPublishedForHostId !== hostId) {
+        supplementaryHelloPublishedForHostId = hostId;
         await postDaemonMessage({
           type: "hello",
           transport: "direct_http",

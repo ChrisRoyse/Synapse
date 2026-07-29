@@ -4,6 +4,7 @@ mod anchor_codec;
 mod anchor_compact;
 mod anchor_merge;
 mod backup;
+pub mod base_rewrite;
 mod batch_ingest;
 pub(crate) mod cf_codec;
 mod commit;

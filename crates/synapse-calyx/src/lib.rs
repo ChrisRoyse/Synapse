@@ -103,10 +103,10 @@ pub use drift::{
     SynapseCalyxLensDrift, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
 };
 pub use find::{
-    SYNAPSE_FIND_GUARD_DISABLED_CODE, SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_FORMULA,
-    SYNAPSE_FIND_RRF_K, SynapseCalyxFindFusion, SynapseCalyxFindGuard, SynapseCalyxFindHit,
+    SYNAPSE_FIND_GUARD_DISABLED_CODE, SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_K,
+    SynapseCalyxFindFusion, SynapseCalyxFindGuard, SynapseCalyxFindHit,
     SynapseCalyxFindLensContribution, SynapseCalyxFindParams, SynapseCalyxFindQuery,
-    SynapseCalyxFindReport, SynapseCalyxFindTemporal,
+    SynapseCalyxFindReport, SynapseCalyxFindTemporal, synapse_find_rrf_formula,
 };
 pub use grounding::{
     SYNAPSE_GROUNDING_COVERAGE_FLOOR, SYNAPSE_GROUNDING_MAX_UNGROUNDED_SLOTS,
@@ -1248,7 +1248,9 @@ const DEFAULT_GUARD_FAR_STYLISTIC: f32 = 0.05;
 const DEFAULT_GUARD_COLD_START_TAU: f32 = 0.7;
 const DEFAULT_KERNEL_FRACTION: f32 = 0.01;
 const DEFAULT_KERNEL_RECALL_GATE: f32 = 0.95;
-const DEFAULT_FUSION_K: u32 = 60;
+/// The vault's untuned `fusion_k`. Bound to the single workspace declaration
+/// rather than restated, so this cannot drift from what actually scores (#1883).
+const DEFAULT_FUSION_K: u32 = calyx_core::RRF_K_DEFAULT;
 const DEFAULT_TEMPORAL_BOOST_MIN: f32 = 0.0;
 const DEFAULT_TEMPORAL_BOOST_MAX: f32 = 0.10;
 const DEFAULT_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;

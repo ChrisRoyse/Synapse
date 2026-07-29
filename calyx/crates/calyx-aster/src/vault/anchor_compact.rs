@@ -33,23 +33,26 @@ where
             let mut rows = Vec::new();
             for (_, bytes) in self.scan_cf_at(snapshot, ColumnFamily::Base)? {
                 report.scanned += 1;
-                let mut constellation = encode::decode_constellation_base(&bytes)?;
-                let (deduped, conflicts) = dedup_anchors(&constellation);
+                // Carries the stored slot hashes through the rewrite (#1888).
+                let mut rewrite = super::base_rewrite::BaseRowRewrite::decode(&bytes)?;
+                let (deduped, conflicts) = dedup_anchors(rewrite.constellation());
                 if !conflicts.is_empty() {
                     report.conflicts.extend(conflicts);
                     continue;
                 }
-                if deduped.len() == constellation.anchors.len() {
+                if deduped.len() == rewrite.constellation().anchors.len() {
                     continue;
                 }
                 report.compacted += 1;
-                report.removed_duplicates += constellation.anchors.len() - deduped.len();
+                report.removed_duplicates += rewrite.constellation().anchors.len() - deduped.len();
+                let constellation = rewrite.constellation_mut();
                 constellation.anchors = deduped;
                 constellation.flags.ungrounded = constellation.anchors.is_empty();
+                let constellation = rewrite.constellation().clone();
                 rows.push(encode::WriteRow {
                     cf: ColumnFamily::Base,
                     key: base_key(constellation.cx_id),
-                    value: encode::encode_constellation_base(&constellation)?,
+                    value: rewrite.encode()?,
                 });
                 for anchor in &constellation.anchors {
                     rows.push(encode::WriteRow {

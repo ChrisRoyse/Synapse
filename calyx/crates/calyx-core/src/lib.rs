@@ -1,5 +1,43 @@
 //! Core Calyx identifiers, model contracts, and shared types.
 
+/// The Reciprocal Rank Fusion rank constant, declared **once** for the whole
+/// workspace.
+///
+/// Cormack, Clarke & Buettcher (SIGIR 2009) define
+/// `RRFscore(d) = Σ 1/(k + r(d))` with `k = 60` and 1-based `r(d)`; Calyx adds
+/// a per-lens weight `w_s`. This is the *default* only — the value that
+/// actually scores a query is carried on `calyx_sextant::FusionContext::rrf_k`
+/// and recorded on every reproducible fusion payload, so a tuned vault and its
+/// own replay path cannot disagree.
+///
+/// It lives here because `calyx-sextant` (which fuses) and `calyx-ledger`
+/// (which reproduces a fusion) share no other ancestor, and independently
+/// redeclaring it is exactly how the two silently desynchronised (issue #1883).
+pub const RRF_K_DEFAULT: u32 = 60;
+
+/// The only place in the workspace that converts a configured RRF rank constant
+/// to the `f32` the scoring law runs in.
+///
+/// `f32` represents every integer up to `2^24` exactly, and nothing above it.
+/// A `k` outside that range would be silently rounded, so two vaults configured
+/// differently could score identically and a reported `rrf_k` would not describe
+/// the arithmetic that ran. Returns `None` rather than rounding.
+///
+/// `k = 0` is rejected separately: under 1-based ranks it is merely extreme, but
+/// it is the boundary at which the law stops being the published one, so the
+/// domain starts at 1.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the range check immediately above proves this u32 is exactly representable in f32; this is the single audited conversion point"
+)]
+pub const fn rrf_k_as_f32(rrf_k: u32) -> Option<f32> {
+    if rrf_k == 0 || rrf_k > (1 << 24) {
+        return None;
+    }
+    Some(rrf_k as f32)
+}
+
 pub mod alloc;
 pub mod cache;
 pub mod cold_start;

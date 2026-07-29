@@ -4711,6 +4711,52 @@ pub struct ChromeDebuggerExtensionCleanupReadback {
     pub failures: Vec<String>,
 }
 
+/// The parts of a bridge registration whose change is worth an operator's
+/// attention.
+///
+/// A `hello` that reproduces all of these exactly is a re-registration that
+/// changed nothing. The reconnect wake alarm produced ~2,100 of those a day on
+/// this host, 3.3% of the daemon's entire log, which is enough volume to hide a
+/// genuine bridge fault (#1880). Capabilities and both service-worker digests
+/// are included because a silent change to any of them is precisely the event
+/// the HELLO line exists to announce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChromeBridgeHelloIdentity {
+    extension_id: Option<String>,
+    extension_version: Option<String>,
+    protocol_version: Option<u32>,
+    build_id: Option<String>,
+    declared_build_sha256: Option<String>,
+    service_worker_sha256: Option<String>,
+    service_worker_sha256_status: Option<String>,
+    running_service_worker_sha256: Option<String>,
+    running_service_worker_sha256_status: Option<String>,
+    debugger_api_available: Option<bool>,
+    capabilities: BTreeSet<String>,
+    transport: Option<String>,
+}
+
+impl ChromeBridgeHelloIdentity {
+    fn of(host: &HostRecord) -> Self {
+        Self {
+            extension_id: host.extension_id.clone(),
+            extension_version: host.extension_version.clone(),
+            protocol_version: host.extension_protocol_version,
+            build_id: host.extension_build_id.clone(),
+            declared_build_sha256: host.extension_declared_build_sha256.clone(),
+            service_worker_sha256: host.extension_service_worker_sha256.clone(),
+            service_worker_sha256_status: host.extension_service_worker_sha256_status.clone(),
+            running_service_worker_sha256: host.extension_running_service_worker_sha256.clone(),
+            running_service_worker_sha256_status: host
+                .extension_running_service_worker_sha256_status
+                .clone(),
+            debugger_api_available: host.extension_debugger_api_available,
+            capabilities: host.extension_capabilities.clone(),
+            transport: host.transport.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChromeDebuggerExtensionEnableReadback {
     #[serde(flatten)]
@@ -6114,6 +6160,13 @@ impl ChromeDebuggerBridge {
             .unwrap_or_default();
         match message_type {
             "hello" => {
+                // #1880: a re-registration that changes nothing is not evidence.
+                // Snapshot the identity this host is already registered under so
+                // the log can distinguish a real identity change (INFO) from a
+                // gratuitous repeat (DEBUG). At the 30 s reconnect cadence the
+                // repeats were 3.3% of every line the daemon wrote and would
+                // have hidden a genuine bridge fault completely.
+                let previous_identity = ChromeBridgeHelloIdentity::of(host);
                 host.extension_id = request
                     .message
                     .get("extensionId")
@@ -6198,8 +6251,26 @@ impl ChromeDebuggerBridge {
                     .extension_startup_readback
                     .as_ref()
                     .map_or_else(|| "not_seen_yet".to_owned(), Value::to_string);
+                let identity_changed = previous_identity != ChromeBridgeHelloIdentity::of(host);
+                if !identity_changed {
+                    // A repeat that reproduces the registered identity exactly.
+                    // Recorded so the cadence stays observable, but without the
+                    // full field dump and without spending the INFO budget on a
+                    // non-event (#1880).
+                    tracing::debug!(
+                        code = "CHROME_DEBUGGER_EXTENSION_HELLO_UNCHANGED",
+                        host_id = %request.host_id,
+                        origin = %host.origin,
+                        extension_id = host.extension_id.as_deref().unwrap_or_default(),
+                        last_seen_unix_ms = host.last_seen_unix_ms,
+                        registered_unix_ms = host.registered_unix_ms,
+                        "Chrome debugger extension re-registered with an identical identity"
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
                     code = "CHROME_DEBUGGER_EXTENSION_HELLO",
+                    identity_changed,
                     host_id = %request.host_id,
                     origin = %host.origin,
                     extension_id = host.extension_id.as_deref().unwrap_or_default(),

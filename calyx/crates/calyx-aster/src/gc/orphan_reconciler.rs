@@ -2,7 +2,8 @@
 
 use crate::cf::{ColumnFamily, base_key, slot_key};
 use crate::vault::AsterVault;
-use crate::vault::encode::{decode_constellation_base, encode_constellation_base};
+use crate::vault::base_rewrite::BaseRowRewrite;
+use crate::vault::encode::decode_constellation_base;
 use calyx_core::{CalyxError, Clock, CxId, Result, SlotId};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use std::collections::{BTreeMap, BTreeSet};

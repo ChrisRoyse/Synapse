@@ -29,7 +29,7 @@ mod support;
 mod types;
 pub use budget::SearchBudget;
 use search::search_outcome_with_measured_slots;
-pub use types::{FusionChoice, GuardChoice, SearchFreshness, SearchOutcome};
+pub use types::{FusionChoice, FusionTuning, GuardChoice, SearchFreshness, SearchOutcome};
 
 /// Historical flat in-region cosine threshold. Since #1094 this is NEVER
 /// applied implicitly: `--guard in-region` without an operator tau loads the
@@ -164,6 +164,7 @@ pub fn search_outcome_with_slots_traced<C: Clock>(
         freshness,
         SearchBudget::disabled(),
         None,
+        FusionTuning::default(),
         Some(&mut trace),
     )
 }
@@ -196,6 +197,7 @@ pub fn search_outcome_with_query_vectors<C: Clock>(
         explain,
         SearchFreshness::Fresh,
         SearchBudget::disabled(),
+        FusionTuning::default(),
         trace_sink,
     )
 }
@@ -213,6 +215,7 @@ pub fn search_outcome_with_query_vectors_freshness<C: Clock>(
     explain: bool,
     freshness: SearchFreshness,
     budget: SearchBudget<'_>,
+    tuning: FusionTuning,
     trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
 ) -> CliResult<SearchOutcome> {
     search_outcome_with_query_vectors_freshness_cached(
@@ -229,6 +232,7 @@ pub fn search_outcome_with_query_vectors_freshness<C: Clock>(
         freshness,
         budget,
         None,
+        tuning,
         trace_sink,
     )
 }
@@ -257,6 +261,7 @@ pub fn search_outcome_with_query_vectors_freshness_cached<C: Clock>(
     freshness: SearchFreshness,
     budget: SearchBudget<'_>,
     slot_cache: Option<&mut SearchSlotCache>,
+    tuning: FusionTuning,
     trace_sink: Option<&mut dyn FnMut(SearchTraceEvent)>,
 ) -> CliResult<SearchOutcome> {
     let allowed_slots = query_vectors
@@ -279,6 +284,7 @@ pub fn search_outcome_with_query_vectors_freshness_cached<C: Clock>(
         freshness,
         budget,
         slot_cache,
+        tuning,
         Some(&mut trace),
     )
 }

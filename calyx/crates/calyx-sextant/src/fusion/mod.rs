@@ -42,6 +42,9 @@ impl FusionStrategy {
 pub struct FusionContext {
     pub panel_version: u32,
     pub k: usize,
+    /// The RRF rank constant this query scores with. Defaults to
+    /// `calyx_core::RRF_K_DEFAULT`; a tuned vault overrides it (issue #1883).
+    pub rrf_k: f32,
     pub explain: bool,
     pub strategy: FusionStrategy,
     pub weights: BTreeMap<SlotId, f32>,

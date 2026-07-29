@@ -13,6 +13,10 @@ use super::cursor::Cursor;
 use components::*;
 
 pub const HEADER_LEN: usize = 102;
+
+/// One entry of a Base row's slot map: the slot and the `blake3` of the bytes
+/// stored for it in `cf/slot_<id>`.
+pub type SlotHashEntry = (SlotId, [u8; 32]);
 const IDENTITY_HASH_LEN: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,9 +162,16 @@ pub fn encode_constellation_base(cx: &Constellation) -> Result<Vec<u8>> {
     encode_constellation_base_with_slot_hashes(cx, &slot_hashes)
 }
 
-pub(super) fn encode_constellation_base_with_slot_hashes(
+/// Re-encodes a Base row from a constellation plus the **stored** slot hashes.
+///
+/// This is the only sound way to rewrite an existing Base row. Rebuilding the
+/// slot hashes from `cx.slots` is correct only when the caller genuinely holds
+/// the slot vectors; a constellation obtained from [`decode_constellation_base`]
+/// does not, and hashing its placeholders substitutes a constant for the real
+/// integrity record (issue #1888).
+pub fn encode_constellation_base_with_slot_hashes(
     cx: &Constellation,
-    slot_hashes: &[(SlotId, [u8; 32])],
+    slot_hashes: &[SlotHashEntry],
 ) -> Result<Vec<u8>> {
     validate_slot_hashes(cx, slot_hashes)?;
     let mut out = encode_header(cx);
@@ -185,16 +196,36 @@ pub(super) fn encode_constellation_base_with_slot_hashes(
     Ok(out)
 }
 
+/// Decodes a Base row.
+///
+/// **The returned `slots` map carries placeholders, not the stored vectors.**
+/// Membership and order are faithful; every value is
+/// `SlotVector::Absent { NotApplicable }` because the Base row stores only a
+/// hash per slot. Re-encoding this constellation with
+/// [`encode_constellation_base`] therefore fabricates slot hashes over those
+/// placeholders and destroys the row's integrity record. Any path that mutates
+/// and rewrites a Base row must go through
+/// [`super::base_rewrite::BaseRowRewrite`] instead (issue #1888).
 pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
+    decode_constellation_base_with_slot_hashes(bytes).map(|decoded| decoded.0)
+}
+
+/// Decodes a Base row and returns the stored `(slot_id, slot_hash)` map
+/// alongside it, so a rewrite can preserve the hashes it did not compute.
+pub fn decode_constellation_base_with_slot_hashes(
+    bytes: &[u8],
+) -> Result<(Constellation, Vec<SlotHashEntry>)> {
     let header = decode_header(bytes)?;
     let mut cursor = Cursor::new(&bytes[HEADER_LEN..]);
     let _identity = cursor.bytes(IDENTITY_HASH_LEN)?;
     let input_ref = decode_input_ref_tail(&mut cursor, header.input_hash)?;
     let slot_count = cursor.u16()? as usize;
     let mut slots = BTreeMap::new();
+    let mut slot_hashes = Vec::with_capacity(slot_count);
     for _ in 0..slot_count {
         let slot = SlotId::new(cursor.u16()?);
-        let _hash = cursor.bytes(IDENTITY_HASH_LEN)?;
+        let hash: [u8; 32] = cursor.array()?;
+        slot_hashes.push((slot, hash));
         slots.insert(
             slot,
             SlotVector::Absent {
@@ -227,20 +258,29 @@ pub fn decode_constellation_base(bytes: &[u8]) -> Result<Constellation> {
             "trailing bytes after constellation metadata",
         ));
     }
-    Ok(Constellation {
-        cx_id: header.cx_id,
-        vault_id: header.vault_id,
-        panel_version: header.panel_version,
-        created_at: header.created_at,
-        input_ref,
-        modality: header.modality,
-        slots,
-        scalars,
-        metadata,
-        anchors,
-        provenance,
-        flags: header.flags,
-    })
+    Ok((
+        Constellation {
+            cx_id: header.cx_id,
+            vault_id: header.vault_id,
+            panel_version: header.panel_version,
+            created_at: header.created_at,
+            input_ref,
+            modality: header.modality,
+            slots,
+            scalars,
+            metadata,
+            anchors,
+            provenance,
+            flags: header.flags,
+        },
+        slot_hashes,
+    ))
+}
+
+/// Reads the stored identity hash out of an encoded Base row without decoding
+/// the rest of it.
+pub fn base_identity_hash(bytes: &[u8]) -> Result<[u8; 32]> {
+    decode_identity(bytes).map(|(_, identity)| identity)
 }
 
 pub fn same_constellation_identity(left: &[u8], right: &[u8]) -> Result<bool> {
@@ -523,7 +563,7 @@ fn header_without_anchor_count(mut header: ConstellationHeader) -> Constellation
 
 fn identity_hash_with_slot_hashes(
     cx: &Constellation,
-    slot_hashes: &[(SlotId, [u8; 32])],
+    slot_hashes: &[SlotHashEntry],
 ) -> Result<blake3::Hash> {
     let mut bytes = encode_header(cx);
     bytes[50..58].copy_from_slice(&0_u64.to_be_bytes());
@@ -543,7 +583,7 @@ fn identity_hash_with_slot_hashes(
     Ok(blake3::hash(&bytes))
 }
 
-fn validate_slot_hashes(cx: &Constellation, slot_hashes: &[(SlotId, [u8; 32])]) -> Result<()> {
+fn validate_slot_hashes(cx: &Constellation, slot_hashes: &[SlotHashEntry]) -> Result<()> {
     if slot_hashes.len() != cx.slots.len()
         || !cx
             .slots
@@ -558,6 +598,8 @@ fn validate_slot_hashes(cx: &Constellation, slot_hashes: &[(SlotId, [u8; 32])]) 
     Ok(())
 }
 
-pub(super) fn hash_slot_bytes(bytes: &[u8]) -> [u8; 32] {
+/// The hash a Base row records for a slot: `blake3` over the slot CF's stored
+/// bytes exactly as written.
+pub fn hash_slot_bytes(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }

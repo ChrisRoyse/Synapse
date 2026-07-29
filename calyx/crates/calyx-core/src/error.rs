@@ -131,6 +131,10 @@ error_catalog! {
     AssayInsufficientSamples, assay_insufficient_samples, "CALYX_ASSAY_INSUFFICIENT_SAMPLES",
     "< quorum (50) anchors", "anchor more outcomes";
 
+    FusionTuningInvalid, fusion_tuning_invalid, "CALYX_FUSION_TUNING_INVALID",
+    "fusion tuning value is outside its defined domain",
+    "set a finite, strictly positive rrf_k; k<=0 divides by zero at the top rank and a negative k inverts the ranking";
+
     AssayLowSignal, assay_low_signal, "CALYX_ASSAY_LOW_SIGNAL",
     "lens < 0.05 bits", "park/retire lens";
 

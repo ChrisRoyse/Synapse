@@ -95,6 +95,12 @@ const SHELL_ENV_DURABLE_INVALID: &str = "SYNAPSE_SHELL_ENV_DURABLE_INVALID";
 /// than a broken install (#1881). Reported at INFO with the device evidence.
 const SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE: &str =
     "SYNAPSE_SHELL_ENV_CUDA_PATH_ABSENT_NO_CUDA_DEVICE";
+/// The durable-`CUDA_PATH` precondition was not enforced for a CUDA-relevant
+/// command because NVML proved this host has no CUDA device, so the variable is
+/// correctly absent and the precondition is unsatisfiable and irrelevant
+/// (#1887).
+const SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE: &str =
+    "SYNAPSE_SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE";
 const WINDOWS_DURABLE_ENV_OVERRIDE_KEYS: [&str; 6] = [
     "CUDA_PATH",
     "CUDA_PATH_V13_3",
@@ -11682,9 +11688,48 @@ fn shell_job_environment_diagnostics(
     ensure_child_temp_environment(&mut env);
     apply_requested_shell_environment(&mut env, &params.env);
     apply_shell_session_environment(&mut env, params.working_dir.as_deref(), context);
-    let diagnostics = configured_host_environment_diagnostics(&env, &params.env);
+    let mut diagnostics = configured_host_environment_diagnostics(&env, &params.env);
+    if let Some(skip) = cuda_precondition_skip_diagnostic(&env, &params.env, params) {
+        diagnostics.push(skip);
+    }
     log_shell_environment_diagnostics(&diagnostics);
     diagnostics
+}
+
+/// Reports, in the structured result, that this command was classified
+/// CUDA-relevant and its durable-`CUDA_PATH` precondition was **not** enforced
+/// because NVML proved the host has no CUDA device (#1887).
+///
+/// Emitted only when the gate actually made that decision, so its presence is
+/// evidence about this command rather than a standing note about the host.
+#[cfg(windows)]
+fn cuda_precondition_skip_diagnostic(
+    env: &BTreeMap<String, (String, String)>,
+    requested_env: &BTreeMap<String, String>,
+    params: &ActRunShellStartParams,
+) -> Option<ActRunShellEnvironmentDiagnostic> {
+    if !shell_command_requires_durable_cuda(&params.command, &params.args)
+        || env_map_contains_key(requested_env, "CUDA_PATH")
+        || !synapse_calyx::host_cuda::host_cuda_device_probe().device_absent_proven
+    {
+        return None;
+    }
+    Some(configured_host_environment_diagnostic(
+        "CUDA_PATH",
+        env,
+        requested_env,
+        SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE,
+        "info",
+    ))
+}
+
+#[cfg(not(windows))]
+const fn cuda_precondition_skip_diagnostic(
+    _env: &BTreeMap<String, (String, String)>,
+    _requested_env: &BTreeMap<String, String>,
+    _params: &ActRunShellStartParams,
+) -> Option<ActRunShellEnvironmentDiagnostic> {
+    None
 }
 
 #[cfg(windows)]
@@ -11697,6 +11742,23 @@ fn validate_configured_host_build_environment(
     if !shell_command_requires_durable_cuda(command_name, args)
         || env_map_contains_key(requested_env, "CUDA_PATH")
     {
+        return Ok(());
+    }
+    // #1887: the precondition is unsatisfiable AND irrelevant on a host NVML
+    // proves has no CUDA device. `CUDA_PATH`'s absence there is the correct
+    // state, so refusing work for it blocks legitimate commands for a variable
+    // that should be missing. Only a proven-absent device permits; a present
+    // device with no CUDA_PATH is a genuinely broken install, and an
+    // indeterminate probe is uncertainty, not evidence of absence.
+    let probe = synapse_calyx::host_cuda::host_cuda_device_probe();
+    if probe.device_absent_proven {
+        tracing::info!(
+            code = SHELL_CUDA_PRECONDITION_SKIPPED_NO_CUDA_DEVICE,
+            command = %command_name,
+            probe_code = probe.code,
+            probe_basis = %probe.basis,
+            "act_run_shell skipped the durable CUDA_PATH precondition because NVML proved this host has no CUDA device"
+        );
         return Ok(());
     }
     let Some(durable_cuda_path) = persisted_environment_value("CUDA_PATH") else {
@@ -11778,17 +11840,29 @@ fn validate_configured_host_build_environment(
     Ok(())
 }
 
+/// Decides whether a shell command actually needs a working CUDA toolchain.
+///
+/// `nvcc` is the CUDA compiler, so invoking it always needs one. `cargo` does
+/// **not**: this workspace's only CUDA code sits behind `calyx-forge`'s `cuda`
+/// feature, which is off by default and logs `cuda feature not enabled,
+/// skipping kernel compilation` on every ordinary build here. Classifying all
+/// of `cargo` as CUDA-relevant (the pre-#1887 behaviour) made a plain
+/// `cargo check` refuse on a host with no CUDA device.
+///
+/// A `cargo` invocation is CUDA-relevant only when it actually selects CUDA:
+/// a `--features`/`-F` list naming a cuda feature, or `--all-features`, which
+/// turns the cuda feature on by definition.
 fn shell_command_requires_durable_cuda(command_name: &str, args: &[String]) -> bool {
     let executable = Path::new(command_name)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command_name)
         .to_ascii_lowercase();
-    if matches!(
-        executable.as_str(),
-        "cargo" | "cargo.exe" | "nvcc" | "nvcc.exe"
-    ) {
+    if matches!(executable.as_str(), "nvcc" | "nvcc.exe") {
         return true;
+    }
+    if matches!(executable.as_str(), "cargo" | "cargo.exe") {
+        return cargo_args_select_cuda(args);
     }
     if !matches!(
         executable.as_str(),
@@ -11797,10 +11871,55 @@ fn shell_command_requires_durable_cuda(command_name: &str, args: &[String]) -> b
         return false;
     }
     let command_line = args.join(" ").to_ascii_lowercase();
-    command_line.contains("cargo ")
-        || command_line.contains("cargo.exe")
-        || command_line.contains("nvcc ")
-        || command_line.contains("nvcc.exe")
+    if command_line.contains("nvcc ") || command_line.contains("nvcc.exe") {
+        return true;
+    }
+    // A shell wrapper around cargo is CUDA-relevant on the same terms as cargo
+    // itself: the whole line is scanned because the wrapper's own tokens are
+    // interleaved with cargo's.
+    (command_line.contains("cargo ") || command_line.contains("cargo.exe"))
+        && cargo_args_select_cuda(args)
+}
+
+/// True when a cargo argument vector turns a cuda feature on.
+///
+/// Matches `--all-features`, `--features <list>`, `--features=<list>`, and the
+/// short `-F` forms, treating the list as comma/space separated exactly as
+/// cargo does. A feature counts as cuda when its name contains `cuda`, which
+/// covers `cuda`, `calyx-forge/cuda` and any future `*-cuda` feature.
+fn cargo_args_select_cuda(args: &[String]) -> bool {
+    let mut expecting_feature_list = false;
+    for arg in args {
+        let lowered = arg.to_ascii_lowercase();
+        if expecting_feature_list {
+            expecting_feature_list = false;
+            if feature_list_names_cuda(&lowered) {
+                return true;
+            }
+            continue;
+        }
+        if lowered == "--all-features" {
+            return true;
+        }
+        if lowered == "--features" || lowered == "-f" {
+            expecting_feature_list = true;
+            continue;
+        }
+        if let Some(list) = lowered
+            .strip_prefix("--features=")
+            .or_else(|| lowered.strip_prefix("-f="))
+            && feature_list_names_cuda(list)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a cargo feature list names a cuda feature.
+fn feature_list_names_cuda(list: &str) -> bool {
+    list.split([',', ' '])
+        .any(|feature| feature.contains("cuda"))
 }
 
 #[cfg(windows)]

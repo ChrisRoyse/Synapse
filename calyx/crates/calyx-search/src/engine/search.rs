@@ -24,7 +24,9 @@ use super::support::{
     SearchReadSnapshot, index_freshness_tag, is_stale_derived, renumber_and_truncate,
     vault_base_count_at,
 };
-use super::{FusionChoice, GuardChoice, SearchBudget, SearchFreshness, SearchOutcome};
+use super::{
+    FusionChoice, FusionTuning, GuardChoice, SearchBudget, SearchFreshness, SearchOutcome,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn search_outcome_with_measured_slots<C: Clock>(
@@ -42,6 +44,7 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
     freshness: SearchFreshness,
     mut budget: SearchBudget<'_>,
     slot_cache: Option<&mut SearchSlotCache>,
+    tuning: FusionTuning,
     trace: Option<&mut SearchTracer<'_>>,
 ) -> CliResult<SearchOutcome> {
     // Resolve (and for profile mode, load + validate) the guard BEFORE any
@@ -180,6 +183,7 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
     let context = FusionContext {
         panel_version: panel.version,
         k: k.max(64),
+        rrf_k: tuning.rrf_k,
         explain,
         strategy: strategy.clone(),
         weights: weights_for(&strategy, panel, &slots)?,

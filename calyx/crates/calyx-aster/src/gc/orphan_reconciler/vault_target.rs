@@ -165,9 +165,11 @@ where
                                 "Base row for orphan repair {cx_id} disappeared before the atomic repair batch"
                             )));
                         };
-                        let mut cx = decode_constellation_base(&bytes)?;
-                        if cx.flags.degraded
-                            && cx
+                        // Carries the stored slot hashes through the rewrite (#1888).
+                        let mut rewrite = BaseRowRewrite::decode(&bytes)?;
+                        if rewrite.constellation().flags.degraded
+                            && rewrite
+                                .constellation()
                                 .metadata
                                 .get(REBUILD_METADATA_KEY)
                                 .is_some_and(|state| state == REBUILD_METADATA_VALUE)
@@ -178,6 +180,7 @@ where
                             });
                             continue;
                         }
+                        let cx = rewrite.constellation_mut();
                         cx.flags.degraded = true;
                         cx.metadata.insert(
                             REBUILD_METADATA_KEY.to_string(),
@@ -185,11 +188,11 @@ where
                         );
                         let mut rebuild_key = REBUILD_PREFIX.to_vec();
                         rebuild_key.extend_from_slice(cx_id.as_bytes());
-                        let slot_count = cx.slots.len();
+                        let slot_count = rewrite.constellation().slots.len();
                         rows.push(WriteRow {
                             cf: ColumnFamily::Base,
                             key,
-                            value: encode_constellation_base(&cx)?,
+                            value: rewrite.encode()?,
                         });
                         rows.push(WriteRow {
                             cf: ColumnFamily::AnnealReplay,

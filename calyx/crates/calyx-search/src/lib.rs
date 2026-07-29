@@ -15,8 +15,8 @@ pub mod persisted;
 mod provenance;
 
 pub use engine::{
-    DEFAULT_IN_REGION_GUARD_TAU, FusionChoice, GuardChoice, SearchBudget, SearchFreshness,
-    SearchOutcome, SearchSlotCache, SearchSlotCacheDiagnostic, SearchTraceEvent,
+    DEFAULT_IN_REGION_GUARD_TAU, FusionChoice, FusionTuning, GuardChoice, SearchBudget,
+    SearchFreshness, SearchOutcome, SearchSlotCache, SearchSlotCacheDiagnostic, SearchTraceEvent,
     measure_query_vectors, measure_query_vectors_with_slots, search_outcome,
     search_outcome_with_freshness, search_outcome_with_query_vectors,
     search_outcome_with_query_vectors_freshness,

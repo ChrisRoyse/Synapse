@@ -14,10 +14,11 @@
 //! `cargo run -p synapse-storage --example dump_cf -- --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex>`
 //! `cargo run -p synapse-storage --example dump_cf -- --repair-bad-episode-slots <db_path>`
 //! `cargo run -p synapse-storage --example dump_cf -- --check-base-roundtrip <db_path>`
+//! `cargo run -p synapse-storage --example dump_cf -- --audit-slot-hashes [--repair] <db_path>`
 //! `cargo run -p synapse-storage --example dump_cf -- --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path>`
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     io::{self, Write},
@@ -28,9 +29,11 @@ use std::{
 use calyx_aster::{
     cf::{ColumnFamily, anchor_prefix_range, base_key, scalar_id_for_key, slot_key},
     mvcc::tombstone_value,
+    vault::base_rewrite::BaseRowRewrite,
     vault::encode::{
-        HEADER_LEN, decode_constellation_base, decode_slot_vector, encode_constellation_base,
-        encode_slot_vector, inspect_slot_vector,
+        HEADER_LEN, decode_constellation_base, decode_constellation_base_with_slot_hashes,
+        decode_slot_vector, encode_constellation_base, encode_slot_vector, hash_slot_bytes,
+        inspect_slot_vector,
     },
 };
 use calyx_core::{Constellation, CxId, SlotId, SlotVector};
@@ -47,10 +50,10 @@ use synapse_storage::{
         SYN_PROCESS_PANEL_NAME, SYN_RECURRENCE_SUBJECT_PANEL_NAME, SYN_REFLEX_PANEL_NAME,
         hex_encode, sha256_hex,
     },
-    dump_cf_read_only_with_expired,
+    dump_cf_read_only_with_expired, scan_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path>";
+const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path>";
 /// The episode panel's exclusive global slot block (#1776). The
 /// `--repair-bad-episode-slots` mode exists for episode constellations that
 /// historically wrote slots outside it; under the global allocation that is
@@ -161,6 +164,33 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
         return check_base_roundtrip(PathBuf::from(db_path));
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--audit-source-coverage")
+    {
+        args.remove(0);
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return audit_source_coverage(PathBuf::from(db_path));
+    }
+    if args.first().is_some_and(|arg| arg == "--audit-slot-hashes") {
+        args.remove(0);
+        let repair = if args.first().is_some_and(|arg| arg == "--repair") {
+            args.remove(0);
+            true
+        } else {
+            false
+        };
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return audit_slot_hashes(PathBuf::from(db_path), repair);
     }
     if args.first().is_some_and(|arg| arg == "--panel-slot-audit") {
         args.remove(0);
@@ -1986,4 +2016,426 @@ fn write_stdout_line(
         )
         .into()),
     }
+}
+
+/// Verdict for one declared slot of one constellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotHashVerdict {
+    /// The Base row's recorded hash covers the bytes actually in the slot CF.
+    Covered,
+    /// The Base row records a hash of something other than the stored bytes —
+    /// the `Absent` placeholder left behind by an un-updated backfill (#1888).
+    Mismatched,
+    /// The Base row declares the slot but the slot CF has no row for it.
+    SlotRowMissing,
+    /// The slot CF row is compression-tagged, so its stored bytes are not the
+    /// `encode_slot_vector` bytes a Base hash covers. Reported, never repaired.
+    Compressed,
+}
+
+impl fmt::Display for SlotHashVerdict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Covered => "covered",
+            Self::Mismatched => "mismatched",
+            Self::SlotRowMissing => "slot_row_missing",
+            Self::Compressed => "compressed",
+        };
+        formatter.write_str(text)
+    }
+}
+
+/// The compression tag `calyx-registry` writes ahead of a compressed slot
+/// payload. Named here rather than depended on, so the audit keeps working even
+/// if that crate leaves this binary's graph.
+const COMPRESSED_SLOT_TAG: u8 = 16;
+
+/// Counts — and optionally repairs — Base rows whose recorded slot hashes do
+/// not cover the vectors actually stored in the slot CFs (issue #1888).
+///
+/// This is the measurement `--check-base-roundtrip` could not make: that mode
+/// only visits pre-#1776 superseded rows, and only compares a re-encoding
+/// against the stored bytes. This one visits **every** Base row in the vault
+/// and compares each recorded slot hash against an independent hash of the
+/// bytes present in `cf/slot_<id>`, which is the property the hash exists to
+/// assert.
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "the audit owns its path and prints the whole scan, per-row verdict and per-panel tally inline"
+)]
+fn audit_slot_hashes(db_path: PathBuf, repair: bool) -> Result<(), Box<dyn Error>> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let config = SynapseCalyxConfig::from_vault_dir(db_path.clone());
+    // A repair needs the writer lock; an audit must stay pointable at a live
+    // vault, so only one of the two handles is ever opened.
+    let writable = if repair {
+        Some(SynapseCalyxVault::open(config.clone())?)
+    } else {
+        None
+    };
+    let read_only = if repair {
+        None
+    } else {
+        Some(SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+            config, None,
+        )?)
+    };
+
+    let snapshot = match (writable.as_ref(), read_only.as_ref()) {
+        (Some(vault), _) => vault.latest_seq(),
+        (None, Some(vault)) => vault.latest_seq(),
+        (None, None) => unreachable!("exactly one vault handle is opened"),
+    };
+    let vault_id = match (writable.as_ref(), read_only.as_ref()) {
+        (Some(vault), _) => vault.vault_id().to_string(),
+        (None, Some(vault)) => vault.vault_id().to_string(),
+        (None, None) => unreachable!("exactly one vault handle is opened"),
+    };
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "audit_slot_hashes db_path={} mode={} vault_id={vault_id} snapshot={snapshot}",
+            db_path.display(),
+            if repair { "writeable" } else { "read_only" },
+        ),
+    )?;
+
+    // panel -> (rows_checked, rows_with_at_least_one_bad_slot)
+    let mut tally: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut rows_checked = 0_u64;
+    let mut rows_bad = 0_u64;
+    let mut slots_checked = 0_u64;
+    let mut slots_mismatched = 0_u64;
+    let mut slots_missing = 0_u64;
+    let mut slots_compressed = 0_u64;
+    let mut repairs = Vec::<SynapseCalyxCfWrite>::new();
+    let mut repaired_rows = 0_u64;
+
+    let base_rows = match (writable.as_ref(), read_only.as_ref()) {
+        (Some(vault), _) => vault.scan_cf_at(snapshot, ColumnFamily::Base)?,
+        (None, Some(vault)) => vault.scan_cf_at(snapshot, ColumnFamily::Base)?,
+        (None, None) => unreachable!("exactly one vault handle is opened"),
+    };
+    for (key, value) in base_rows {
+        let (constellation, slot_hashes) = decode_constellation_base_with_slot_hashes(&value)
+            .map_err(|error| {
+                format!(
+                    "AUDIT_BASE_DECODE_FAILED key_hex={} value_len_bytes={} value_sha256={}: {error}",
+                    hex_encode(&key),
+                    value.len(),
+                    sha256_hex(&value)
+                )
+            })?;
+        if slot_hashes.is_empty() {
+            continue;
+        }
+        let cx_id = constellation.cx_id;
+        let panel = constellation
+            .metadata
+            .get(META_PANEL_NAME)
+            .cloned()
+            .unwrap_or_else(|| format!("panel_version={}", constellation.panel_version));
+        rows_checked = rows_checked.saturating_add(1);
+        let entry = tally.entry(panel.clone()).or_default();
+        entry.0 = entry.0.saturating_add(1);
+
+        let mut rewrite = BaseRowRewrite::decode(&value)?;
+        let mut row_bad = false;
+        let mut row_repairable = true;
+        for (slot, recorded) in &slot_hashes {
+            slots_checked = slots_checked.saturating_add(1);
+            let stored = match (writable.as_ref(), read_only.as_ref()) {
+                (Some(vault), _) => {
+                    vault.read_cf_at(snapshot, ColumnFamily::slot(*slot), &slot_key(cx_id))?
+                }
+                (None, Some(vault)) => {
+                    vault.read_cf_at(snapshot, ColumnFamily::slot(*slot), &slot_key(cx_id))?
+                }
+                (None, None) => unreachable!("exactly one vault handle is opened"),
+            };
+            let (verdict, actual) = match stored.as_deref() {
+                None => (SlotHashVerdict::SlotRowMissing, None),
+                Some(bytes) if bytes.first().copied() == Some(COMPRESSED_SLOT_TAG) => {
+                    (SlotHashVerdict::Compressed, None)
+                }
+                Some(bytes) => {
+                    let actual = hash_slot_bytes(bytes);
+                    if actual == *recorded {
+                        (SlotHashVerdict::Covered, Some(actual))
+                    } else {
+                        (SlotHashVerdict::Mismatched, Some(actual))
+                    }
+                }
+            };
+            match verdict {
+                SlotHashVerdict::Covered => continue,
+                SlotHashVerdict::Mismatched => {
+                    slots_mismatched = slots_mismatched.saturating_add(1);
+                }
+                SlotHashVerdict::SlotRowMissing => {
+                    slots_missing = slots_missing.saturating_add(1);
+                    row_repairable = false;
+                }
+                SlotHashVerdict::Compressed => {
+                    slots_compressed = slots_compressed.saturating_add(1);
+                    row_repairable = false;
+                }
+            }
+            row_bad = true;
+            write_stdout_line(
+                &mut stdout,
+                format_args!(
+                    "slot_hash_verdict cx_id={cx_id} panel={panel} slot={} verdict={verdict} recorded_blake3={} actual_blake3={} stored_len_bytes={}",
+                    slot.get(),
+                    hex_encode(recorded),
+                    actual
+                        .as_ref()
+                        .map_or_else(|| "none".to_owned(), |hash| hex_encode(hash)),
+                    stored
+                        .as_ref()
+                        .map_or_else(|| "none".to_owned(), |bytes| bytes.len().to_string()),
+                ),
+            )?;
+            if verdict == SlotHashVerdict::Mismatched
+                && let Some(bytes) = stored.as_deref()
+            {
+                rewrite.set_slot_hash(*slot, bytes)?;
+            }
+        }
+        if !row_bad {
+            continue;
+        }
+        rows_bad = rows_bad.saturating_add(1);
+        entry.1 = entry.1.saturating_add(1);
+        if repair {
+            if !row_repairable {
+                // Fail closed rather than write a partially-correct integrity
+                // record: a missing or compression-tagged slot row means the
+                // audit cannot state what the hash should be.
+                return Err(format!(
+                    "AUDIT_SLOT_HASH_UNREPAIRABLE cx_id={cx_id} panel={panel}: a declared slot is missing from its slot CF or is compression-tagged, so its Base hash cannot be restated; resolve that row before repairing"
+                )
+                .into());
+            }
+            repairs.push(SynapseCalyxCfWrite::new(
+                ColumnFamily::Base,
+                key.clone(),
+                rewrite.encode()?,
+            ));
+            repaired_rows = repaired_rows.saturating_add(1);
+        }
+    }
+
+    if repair && !repairs.is_empty() {
+        let vault = writable
+            .as_ref()
+            .ok_or("repair requested without a writable vault handle")?;
+        let commit_seq = vault.write_cf_batch(repairs)?;
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "audit_slot_hashes_repair repaired_rows={repaired_rows} commit_seq={commit_seq}"
+            ),
+        )?;
+    }
+
+    for (panel, (checked, bad)) in &tally {
+        write_stdout_line(
+            &mut stdout,
+            format_args!("slot_hash_panel panel={panel} rows_checked={checked} rows_bad={bad}"),
+        )?;
+    }
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "audit_slot_hashes_summary rows_checked={rows_checked} rows_bad={rows_bad} slots_checked={slots_checked} slots_mismatched={slots_mismatched} slots_missing={slots_missing} slots_compressed={slots_compressed} repaired_rows={repaired_rows}"
+        ),
+    )?;
+    if rows_bad > 0 && !repair {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "audit_slot_hashes_verdict FAIL rows_bad={rows_bad}: Base rows record slot hashes that do not cover their stored vectors; re-run with --repair against a stopped daemon"
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Measures how many derived constellations can still reach the source row
+/// they were derived from (issue #1882).
+///
+/// A constellation's `CxId` is content-addressed over the exact input bytes it
+/// was measured from. Once the source row is evicted those bytes exist nowhere,
+/// so the row can never be re-derived, re-encoded to a newer lens generation,
+/// or audited against its own derivation. Several designs assume otherwise
+/// (#1878 re-derive, #1668 lazy backfill, #1686 fingerprint regeneration), so
+/// the uncoverable population is the number that decides whether any of them is
+/// sound on this vault.
+///
+/// Read-only, and safe to point at the live vault: it builds one key set per
+/// referenced source CF and tests membership, rather than doing a lookup per
+/// row.
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "the audit owns its path and prints the whole scan and per-panel tally inline"
+)]
+fn audit_source_coverage(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let vault = SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        SynapseCalyxConfig::from_vault_dir(db_path.clone()),
+        None,
+    )?;
+    let snapshot = vault.latest_seq();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "audit_source_coverage db_path={} mode=read_only vault_id={} snapshot={snapshot}",
+            db_path.display(),
+            vault.vault_id(),
+        ),
+    )?;
+
+    // (panel, source_cf) -> (covered, uncoverable)
+    let mut tally: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    // source_cf -> set of present source keys, loaded once on first reference.
+    let mut source_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut rows_scanned = 0_u64;
+    let mut rows_unattributed = 0_u64;
+    let mut rows_covered = 0_u64;
+    let mut rows_uncoverable = 0_u64;
+    let mut rows_non_synapse_source = 0_u64;
+    let mut non_synapse_source_cfs: BTreeSet<String> = BTreeSet::new();
+
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
+        rows_scanned = rows_scanned.saturating_add(1);
+        let constellation = decode_constellation_base(&value).map_err(|error| {
+            format!(
+                "SOURCE_AUDIT_BASE_DECODE_FAILED key_hex={} value_len_bytes={} value_sha256={}: {error}",
+                hex_encode(&key),
+                value.len(),
+                sha256_hex(&value)
+            )
+        })?;
+        let panel = constellation
+            .metadata
+            .get(META_PANEL_NAME)
+            .cloned()
+            .unwrap_or_else(|| format!("panel_version={}", constellation.panel_version));
+        let (Some(source_cf), Some(source_key_hex)) = (
+            constellation.metadata.get(META_SOURCE_CF),
+            constellation.metadata.get(META_SOURCE_KEY_HEX),
+        ) else {
+            // A derived row that never recorded where it came from cannot be
+            // re-derived either, and is reported as its own class rather than
+            // folded into "covered".
+            rows_unattributed = rows_unattributed.saturating_add(1);
+            write_stdout_line(
+                &mut stdout,
+                format_args!(
+                    "source_unattributed cx_id={} panel={panel} has_source_cf={} has_source_key={}",
+                    constellation.cx_id,
+                    constellation.metadata.contains_key(META_SOURCE_CF),
+                    constellation.metadata.contains_key(META_SOURCE_KEY_HEX),
+                ),
+            )?;
+            continue;
+        };
+
+        if !source_keys.contains_key(source_cf) && !non_synapse_source_cfs.contains(source_cf) {
+            // `include_expired = true`: a row still physically present but past
+            // its TTL is not a row a re-derive can rely on, but counting it as
+            // already gone would overstate the loss. It is counted as present
+            // here and the TTL is reported separately by the GC surface.
+            // A source CF that is not part of the Synapse storage schema is a
+            // distinct fact from an evicted row, and is reported as such rather
+            // than counted as loss. `syn-recurrence-subject-v1` is the live
+            // example: it names CALYX_RECURRENCE_SUBJECT, a Calyx-internal
+            // derivation input with no Synapse CF behind it, so its rows have
+            // no Synapse source row to outlive in the first place.
+            match scan_cf_read_only_with_expired(
+                Path::new(&db_path),
+                synapse_core::SCHEMA_VERSION,
+                StorageBackendKind::Calyx,
+                source_cf,
+                true,
+            ) {
+                Ok(rows) => {
+                    let keys = rows
+                        .iter()
+                        .map(|(key, _)| hex_encode(key))
+                        .collect::<BTreeSet<_>>();
+                    write_stdout_line(
+                        &mut stdout,
+                        format_args!(
+                            "source_cf_loaded source_cf={source_cf} rows_present={}",
+                            keys.len()
+                        ),
+                    )?;
+                    source_keys.insert(source_cf.clone(), keys);
+                }
+                Err(error) => {
+                    write_stdout_line(
+                        &mut stdout,
+                        format_args!("source_cf_not_synapse source_cf={source_cf} detail={error}"),
+                    )?;
+                    non_synapse_source_cfs.insert(source_cf.clone());
+                }
+            }
+        }
+        if non_synapse_source_cfs.contains(source_cf) {
+            rows_non_synapse_source = rows_non_synapse_source.saturating_add(1);
+            continue;
+        }
+        let present = source_keys
+            .get(source_cf)
+            .is_some_and(|keys| keys.contains(source_key_hex));
+        let entry = tally.entry((panel.clone(), source_cf.clone())).or_default();
+        if present {
+            entry.0 = entry.0.saturating_add(1);
+            rows_covered = rows_covered.saturating_add(1);
+        } else {
+            entry.1 = entry.1.saturating_add(1);
+            rows_uncoverable = rows_uncoverable.saturating_add(1);
+        }
+    }
+
+    for ((panel, source_cf), (covered, uncoverable)) in &tally {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "source_coverage_panel panel={panel} source_cf={source_cf} derived_rows={} source_present={covered} source_evicted={uncoverable}",
+                covered.saturating_add(*uncoverable)
+            ),
+        )?;
+    }
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "audit_source_coverage_summary rows_scanned={rows_scanned} rows_attributed={} source_present={rows_covered} source_evicted={rows_uncoverable} rows_unattributed={rows_unattributed} rows_non_synapse_source={rows_non_synapse_source} non_synapse_source_cfs={}",
+            rows_covered.saturating_add(rows_uncoverable),
+            if non_synapse_source_cfs.is_empty() {
+                "<none>".to_owned()
+            } else {
+                non_synapse_source_cfs
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ),
+    )?;
+    if rows_uncoverable > 0 {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "audit_source_coverage_verdict UNCOVERABLE rows={rows_uncoverable}: these derived constellations can never be re-derived, re-encoded to a newer lens generation, or audited against their own derivation, because the input bytes their CxId addresses no longer exist anywhere (#1882)"
+            ),
+        )?;
+    }
+    Ok(())
 }

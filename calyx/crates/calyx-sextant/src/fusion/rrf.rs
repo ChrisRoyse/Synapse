@@ -7,10 +7,14 @@ use super::FusionContext;
 use crate::hit::{FreshnessTag, Hit, PerLensContribution, ProvenanceSource};
 use crate::index::IndexSearchHit;
 
-const RRF_K: f32 = 60.0;
-
-pub fn rrf_contribution(weight: f32, rank: usize) -> f32 {
-    weight / (rank as f32 + RRF_K)
+/// One lens's Reciprocal Rank Fusion contribution at `rank`, scored with the
+/// `rrf_k` the query is actually running under.
+///
+/// `rrf_k` is supplied rather than hardcoded so a tuned vault, its reproduce
+/// path and its reported formula cannot disagree (issue #1883). The workspace
+/// default is `calyx_core::RRF_K_DEFAULT`.
+pub fn rrf_contribution(weight: f32, rank: usize, rrf_k: f32) -> f32 {
+    weight / (rank as f32 + rrf_k)
 }
 
 pub fn rrf_fuse(
@@ -65,7 +69,7 @@ fn fuse_with_weights(
             continue;
         }
         for hit in hits {
-            let contribution = rrf_contribution(weight, hit.rank);
+            let contribution = rrf_contribution(weight, hit.rank, context.rrf_k);
             let entry = fused.entry(hit.cx_id).or_default();
             entry.0 += contribution;
             entry.1.push(PerLensContribution {

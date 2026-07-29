@@ -19,7 +19,15 @@ use crate::redaction::RedactionPolicy;
 
 pub const REPRODUCE_TOLERANCE: f64 = 1.0e-3;
 pub const REPRODUCE_PAYLOAD_TAG: &str = "reproduce_v1";
-const RRF_K: f32 = 60.0;
+/// The RRF rank constant a recorded fusion payload replays under when it does
+/// not carry one. Records written before `rrf_k` existed were all scored at the
+/// workspace default, so that is the only faithful value for them (#1883).
+fn recorded_rrf_k_default() -> f32 {
+    match calyx_core::rrf_k_as_f32(calyx_core::RRF_K_DEFAULT) {
+        Some(value) => value,
+        None => unreachable!("the workspace default RRF k is exactly representable in f32"),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +47,11 @@ pub struct SlotWeight {
 pub struct FusionWeights {
     pub mode: FusionMode,
     pub k: usize,
+    /// The RRF rank constant the original query scored with. Recorded so that
+    /// retuning `fusion_k` cannot silently change what a past query reproduces
+    /// to; absent on pre-#1883 records, which were all scored at the default.
+    #[serde(default = "recorded_rrf_k_default")]
+    pub rrf_k: f32,
     pub candidates: Vec<CxId>,
     #[serde(default)]
     pub weights: Vec<SlotWeight>,
@@ -90,7 +103,9 @@ pub fn rerun_fusion(
             let cx_id = fusion_weights.candidates[index];
             let contribution = match fusion_weights.mode {
                 FusionMode::SingleLens => dense[index],
-                FusionMode::Rrf | FusionMode::WeightedRrf => weight / ((rank + 1) as f32 + RRF_K),
+                FusionMode::Rrf | FusionMode::WeightedRrf => {
+                    weight / ((rank + 1) as f32 + fusion_weights.rrf_k)
+                }
             };
             *fused.entry(cx_id).or_default() += contribution;
         }

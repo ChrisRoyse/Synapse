@@ -33,8 +33,20 @@
 //! a rebuild-required marker is staked) until `storage operation=search_rebuild`
 //! runs.
 //!
+//! ## The #1883 discriminator
+//!
+//! The instrument is parameterised over `k` and runs **both** `k = 60` and
+//! `k = 5` in one pass. That is the discriminator #1883 asks for: at `k = 5`
+//! the same two rank lists fuse to the same order but to scores that separate
+//! an order of magnitude more sharply (`Y = 1/7 + 1/6 = 0.3095` versus
+//! `Y = 1/62 + 1/61 = 0.0325`). Before #1883 the substrate scored with a
+//! hardcoded 60 no matter what `calyx_fusion_k` said, so a `k = 5` pass
+//! produced `k = 60` scores; now it does not, and this pass proves it by
+//! computing both expectations from the RRF definition independently of the
+//! substrate.
+//!
 //! Exits non-zero, printing the exact divergence, if the shipped fusion does not
-//! produce the expected order and scores.
+//! produce the expected order and scores at either `k`.
 //!
 //! Usage:
 //! `cargo run -p synapse-calyx --example fused_find_rrf_order_fsv`
@@ -71,14 +83,19 @@ const fn candidates() -> [(&'static str, CxId); 4] {
 }
 
 /// Independently computed expected scores, written from the RRF definition
-/// rather than from the substrate's output: `Σ 1/(60 + rank)`, ranks 1-based.
-fn expected() -> Vec<(&'static str, f32)> {
-    vec![
-        ("Y", 1.0 / 62.0 + 1.0 / 61.0),
-        ("X", 1.0 / 61.0 + 1.0 / 63.0),
-        ("W", 1.0 / 62.0),
-        ("Z", 1.0 / 63.0),
-    ]
+/// rather than from the substrate's output: `Σ 1/(k + rank)`, ranks 1-based.
+///
+/// Given slot 1 `[X, Y, Z]` and slot 2 `[Y, W, X]`: X is rank 1 and rank 3, Y is
+/// rank 2 and rank 1, W is rank 2, Z is rank 3.
+fn expected(rrf_k: f32) -> Vec<(&'static str, f32)> {
+    let mut rows = vec![
+        ("Y", 1.0 / (rrf_k + 2.0) + 1.0 / (rrf_k + 1.0)),
+        ("X", 1.0 / (rrf_k + 1.0) + 1.0 / (rrf_k + 3.0)),
+        ("W", 1.0 / (rrf_k + 2.0)),
+        ("Z", 1.0 / (rrf_k + 3.0)),
+    ];
+    rows.sort_by(|left, right| right.1.total_cmp(&left.1));
+    rows
 }
 
 /// Well-formed descending per-lens raw scores. RRF consumes rank only — these
@@ -110,14 +127,14 @@ fn ranking(cx_ids: &[CxId]) -> Vec<IndexSearchHit> {
 
 /// Prints the fused hits with their per-lens rank contributions, so an operator
 /// can recompute every score by hand from the printed ranks.
-fn print_hits(hits: &[Hit], label_of: &BTreeMap<CxId, &str>) {
+fn print_hits(hits: &[Hit], label_of: &BTreeMap<CxId, &str>, rrf_k: f32) {
     println!(
         "fused_find_rrf_order_fsv: production calyx_sextant::fusion::fuse, FusionStrategy::Rrf"
     );
     println!(
         "  provenance in this instrument is SYNTHETIC (ordering law only, not a vault readback)"
     );
-    println!("  slot 1 recall = [X, Y, Z]   slot 2 recall = [Y, W, X]   k=60   1-based ranks");
+    println!("  slot 1 recall = [X, Y, Z]   slot 2 recall = [Y, W, X]   k={rrf_k}   1-based ranks");
     for hit in hits {
         let label = label_of.get(&hit.cx_id).copied().unwrap_or("<unknown>");
         let lenses = hit
@@ -143,12 +160,13 @@ fn print_hits(hits: &[Hit], label_of: &BTreeMap<CxId, &str>) {
 
 /// Asserts the fused order and every score against the independently written RRF
 /// definition, and asserts that each score is *assembled* from per-lens
-/// `weight / (60 + rank)` terms rather than merely landing near the right value.
+/// `weight / (k + rank)` terms rather than merely landing near the right value.
 fn assert_rrf_law(
     hits: &[Hit],
     expected: &[(&'static str, f32)],
     observed_order: &[&str],
     expected_order: &[&str],
+    rrf_k: f32,
 ) -> std::result::Result<(), Box<dyn Error>> {
     if observed_order != expected_order {
         return Err(format!(
@@ -174,10 +192,10 @@ fn assert_rrf_law(
             .into());
         }
         for lens in &hit.per_lens {
-            let want_contribution = lens.weight / (rank_as_f32(lens.rank)? + 60.0);
+            let want_contribution = lens.weight / (rank_as_f32(lens.rank)? + rrf_k);
             if (lens.contribution - want_contribution).abs() > SCORE_EPSILON {
                 return Err(format!(
-                    "RRF_LENS_LAW_MISMATCH: {label} slot {} rank {} contribution {:.7} != weight/(60+rank) {want_contribution:.7}",
+                    "RRF_LENS_LAW_MISMATCH: {label} slot {} rank {} contribution {:.7} != weight/({rrf_k}+rank) {want_contribution:.7}",
                     lens.slot.slot_id().get(),
                     lens.rank,
                     lens.contribution
@@ -189,23 +207,17 @@ fn assert_rrf_law(
     Ok(())
 }
 
-fn main() -> std::result::Result<(), Box<dyn Error>> {
-    let by_label: BTreeMap<&str, CxId> = candidates().into_iter().collect();
-    let label_of: BTreeMap<CxId, &str> = candidates().into_iter().map(|(l, id)| (id, l)).collect();
-
-    let mut per_slot: BTreeMap<SlotId, Vec<IndexSearchHit>> = BTreeMap::new();
-    per_slot.insert(
-        SlotId::new(1),
-        ranking(&[by_label["X"], by_label["Y"], by_label["Z"]]),
-    );
-    per_slot.insert(
-        SlotId::new(2),
-        ranking(&[by_label["Y"], by_label["W"], by_label["X"]]),
-    );
-
+/// Runs one full fusion pass at `rrf_k` and asserts the law against
+/// independently computed expectations.
+fn run_at_k(
+    per_slot: &BTreeMap<SlotId, Vec<IndexSearchHit>>,
+    label_of: &BTreeMap<CxId, &str>,
+    rrf_k: f32,
+) -> std::result::Result<Vec<(String, f32)>, Box<dyn Error>> {
     let context = FusionContext {
         panel_version: PANEL_VERSION,
         k: 4,
+        rrf_k,
         explain: true,
         strategy: FusionStrategy::Rrf,
         // Plain RRF assigns every consulted slot weight 1.0 inside the substrate;
@@ -224,23 +236,23 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         })
     };
 
-    let hits = fuse(&per_slot, &context, &provenance)?;
-    print_hits(&hits, &label_of);
+    let hits = fuse(per_slot, &context, &provenance)?;
+    print_hits(&hits, label_of, rrf_k);
 
     let observed_order: Vec<&str> = hits
         .iter()
         .map(|hit| label_of.get(&hit.cx_id).copied().unwrap_or("<unknown>"))
         .collect();
-    let expected = expected();
+    let expected = expected(rrf_k);
     let expected_order: Vec<&str> = expected.iter().map(|(label, _)| *label).collect();
 
     println!(
         "{}",
         json!({
             "instrument": "fused_find_rrf_order_fsv",
-            "issue": "1676",
+            "issue": "1676,1883",
             "fusion_entry_point": "calyx_sextant::fusion::fuse (FusionStrategy::Rrf)",
-            "rrf_k": 60,
+            "rrf_k": rrf_k,
             "rank_base": 1,
             "slot_1_ranking": ["X", "Y", "Z"],
             "slot_2_ranking": ["Y", "W", "X"],
@@ -261,7 +273,69 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         })
     );
 
-    assert_rrf_law(&hits, &expected, &observed_order, &expected_order)?;
-    println!("RRF_ORDER_OK expected_and_observed={expected_order:?}");
+    assert_rrf_law(&hits, &expected, &observed_order, &expected_order, rrf_k)?;
+    println!("RRF_ORDER_OK k={rrf_k} expected_and_observed={expected_order:?}");
+    Ok(hits
+        .iter()
+        .map(|hit| {
+            (
+                (*label_of.get(&hit.cx_id).unwrap_or(&"<unknown>")).to_owned(),
+                hit.score,
+            )
+        })
+        .collect())
+}
+
+fn main() -> std::result::Result<(), Box<dyn Error>> {
+    let by_label: BTreeMap<&str, CxId> = candidates().into_iter().collect();
+    let label_of: BTreeMap<CxId, &str> = candidates().into_iter().map(|(l, id)| (id, l)).collect();
+
+    let mut per_slot: BTreeMap<SlotId, Vec<IndexSearchHit>> = BTreeMap::new();
+    per_slot.insert(
+        SlotId::new(1),
+        ranking(&[by_label["X"], by_label["Y"], by_label["Z"]]),
+    );
+    per_slot.insert(
+        SlotId::new(2),
+        ranking(&[by_label["Y"], by_label["W"], by_label["X"]]),
+    );
+
+    let at_60 = run_at_k(&per_slot, &label_of, 60.0)?;
+    let at_5 = run_at_k(&per_slot, &label_of, 5.0)?;
+
+    // The #1883 discriminator. Before the fix the substrate ignored the context
+    // and scored both passes with a hardcoded 60, so these two vectors were
+    // byte-identical. They must now differ on every candidate.
+    for ((label_60, score_60), (label_5, score_5)) in at_60.iter().zip(at_5.iter()) {
+        if label_60 != label_5 {
+            return Err(format!(
+                "RRF_K_ORDER_DIVERGED: k=60 produced {label_60} where k=5 produced {label_5}; this instrument's inputs are chosen so the order is stable across k and only the scores separate"
+            )
+            .into());
+        }
+        if (score_60 - score_5).abs() <= SCORE_EPSILON {
+            return Err(format!(
+                "RRF_K_NOT_LOAD_BEARING: {label_60} scored {score_60:.7} at k=60 and {score_5:.7} at k=5; the configured rrf_k did not reach the scoring law (#1883)"
+            )
+            .into());
+        }
+    }
+    println!(
+        "{}",
+        json!({
+            "instrument": "fused_find_rrf_order_fsv",
+            "issue": "1883",
+            "claim": "the rrf_k on FusionContext reaches calyx_sextant::fusion::rrf::rrf_contribution",
+            "scores_at_k_60": at_60
+                .iter()
+                .map(|(label, score)| json!({ "label": label, "score": score }))
+                .collect::<Vec<_>>(),
+            "scores_at_k_5": at_5
+                .iter()
+                .map(|(label, score)| json!({ "label": label, "score": score }))
+                .collect::<Vec<_>>(),
+        })
+    );
+    println!("RRF_K_LOAD_BEARING_OK k=60 and k=5 produce different scores for every candidate");
     Ok(())
 }

@@ -26,10 +26,11 @@
 //!    filesystem I/O, no Calyx. Refreshes ([`LoweredArtifactHandle::refresh`])
 //!    happen off-tick and swap the pointer in place.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -715,9 +716,44 @@ fn lowered_dir(vault_dir: &Path) -> PathBuf {
     vault_dir.join(LOWERED_DIR_NAME)
 }
 
-/// Publishes `bytes` to `path` atomically: write a sibling temp file, flush it
-/// to disk, then rename it over the target. A reader either sees the previous
-/// artifact or the new one, never a partial write.
+/// Serialises publishes to one artifact path within this process.
+///
+/// Two publishers renaming over the same target is safe on its own; two
+/// publishers sharing a temp *name* is not. This lock makes the write-then-
+/// rename pair indivisible so the observed interleaving cannot recur even if a
+/// future caller reintroduces a shared temp name.
+static PUBLISH_LOCKS: LazyLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Monotonic discriminator for temp-file names, so two publishes in the same
+/// process and millisecond cannot collide.
+static PUBLISH_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn publish_lock_for(path: &Path) -> Arc<Mutex<()>> {
+    let mut guard = match PUBLISH_LOCKS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Arc::clone(
+        guard
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+/// Publishes `bytes` to `path` atomically: write a **uniquely named** sibling
+/// temp file, flush it to disk, then rename it over the target. A reader either
+/// sees the previous artifact or the new one, never a partial write.
+///
+/// The temp name carries the process id and a monotonic counter. A fixed
+/// `<name>.json.tmp` was observed failing on the live daemon: two concurrent
+/// publishers created the same temp path, the first renamed it away, and the
+/// second's rename found nothing —
+/// `STORAGE_LOWERING_PUBLISH_FAILED ... The system cannot find the file
+/// specified. (os error 2)`, twice in the 30h before this fix, which is what
+/// held `health.ok` at false. A shared temp path also means the loser can
+/// publish the winner's bytes under its own generation stamp, so this is a
+/// correctness bug and not only a spurious error.
 fn atomic_publish(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), SynapseCalyxError> {
     use std::io::Write as _;
 
@@ -730,7 +766,16 @@ fn atomic_publish(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), SynapseCa
             "repair filesystem access to the vault directory and retry the lowering pass",
         )
     })?;
-    let tmp_path = path.with_extension("json.tmp");
+    let path_lock = publish_lock_for(path);
+    let _publishing = match path_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let tmp_path = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        PUBLISH_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut file = std::fs::File::create(&tmp_path).map_err(|error| {
         SynapseCalyxError::with_io(
             "SYNAPSE_CALYX_LOWERING_WRITE_FAILED",

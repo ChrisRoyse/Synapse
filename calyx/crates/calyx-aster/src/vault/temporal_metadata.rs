@@ -1,3 +1,4 @@
+use super::base_rewrite::BaseRowRewrite;
 use super::{AsterVault, encode, ledger_hook};
 use crate::cf::{ColumnFamily, base_key};
 use calyx_core::{
@@ -53,7 +54,15 @@ where
         validate_temporal_metadata(id, expected_temporal)?;
         self.with_durable_commit_lock(|| {
             let snapshot = self.snapshot_handle(self.snapshot());
-            let mut stored = self.get_base_at_snapshot(id, snapshot.snapshot())?;
+            // Rewrites the stored Base row in place, carrying its slot hashes.
+            // `get_base_at_snapshot` clears `slots`, so re-encoding from it
+            // wrote a Base row declaring zero slots and orphaned every slot CF
+            // row of the constellation it migrated (issue #1888).
+            let base_bytes = self
+                .read_cf_snapshot(snapshot.snapshot(), ColumnFamily::Base, &base_key(id))?
+                .ok_or_else(|| mismatch(id, "Base row is missing"))?;
+            let mut rewrite = BaseRowRewrite::decode(&base_bytes)?;
+            let stored = rewrite.constellation();
             if stored.panel_version != expected_panel_version {
                 return Err(mismatch(
                     id,
@@ -88,10 +97,11 @@ where
             });
             if already_present {
                 return Ok(TemporalMetadataMigration::AlreadyPresent {
-                    ledger_ref: stored.provenance,
+                    ledger_ref: stored.provenance.clone(),
                 });
             }
 
+            let stored = rewrite.constellation_mut();
             for key in TEMPORAL_KEYS {
                 match expected_temporal.get(key) {
                     Some(value) => {
@@ -133,17 +143,17 @@ where
                     payload,
                     actor,
                 )?;
-                stored.provenance = ledger_ref.clone();
-                stored.validate_schema()?;
-                rows.push(base_row(id, &stored)?);
+                rewrite.constellation_mut().provenance = ledger_ref.clone();
+                rewrite.constellation().validate_schema()?;
+                rows.push(base_row(id, &rewrite)?);
                 self.commit_rows_locked(&rows)?;
                 return Ok(TemporalMetadataMigration::Backfilled { ledger_ref });
             };
 
             let (staged, ledger_ref) = staged.expect("hook branch returns staged rows");
-            stored.provenance = ledger_ref.clone();
-            stored.validate_schema()?;
-            rows.push(base_row(id, &stored)?);
+            rewrite.constellation_mut().provenance = ledger_ref.clone();
+            rewrite.constellation().validate_schema()?;
+            rows.push(base_row(id, &rewrite)?);
             self.commit_rows_locked(&rows)?;
             if let Some(hook) = hook_guard.take() {
                 self.commit_persistent_ledger_staged_locked(
@@ -195,11 +205,11 @@ fn validate_temporal_metadata(
     Ok(())
 }
 
-fn base_row(id: CxId, stored: &calyx_core::Constellation) -> Result<encode::WriteRow> {
+fn base_row(id: CxId, rewrite: &BaseRowRewrite) -> Result<encode::WriteRow> {
     Ok(encode::WriteRow {
         cf: ColumnFamily::Base,
         key: base_key(id),
-        value: encode::encode_constellation_base(stored)?,
+        value: rewrite.encode()?,
     })
 }
 

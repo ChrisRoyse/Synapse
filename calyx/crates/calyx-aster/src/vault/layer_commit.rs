@@ -172,9 +172,12 @@ fn attach_ledger_ref_to_base_rows(
     ledger_ref: &calyx_core::LedgerRef,
 ) -> Result<()> {
     for row in rows.iter_mut().filter(|row| row.cf == ColumnFamily::Base) {
-        let mut constellation = encode::decode_constellation_base(&row.value)?;
-        constellation.provenance = ledger_ref.clone();
-        row.value = encode::encode_constellation_base(&constellation)?;
+        // Carries the stored slot hashes through the rewrite. Re-encoding from
+        // a plain decode would substitute placeholder hashes for the real
+        // integrity record on a live group-commit path (issue #1888).
+        let mut rewrite = super::base_rewrite::BaseRowRewrite::decode(&row.value)?;
+        rewrite.constellation_mut().provenance = ledger_ref.clone();
+        row.value = rewrite.encode()?;
     }
     Ok(())
 }
