@@ -35,7 +35,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public prompt-injection hygiene facade for the <=40 MCP surface. Read operations flags/report are normal-profile visible. scan_text without persistence is read-only; scan_text persist=true and scan_storage write CF_KV flag rows and are maintenance-gated with readback."
+        description = "Public prompt-injection hygiene facade for the <=40 MCP surface. Read operations flags/report are normal-profile visible. scan_text without persistence is read-only; scan_text persist=true and scan_storage write CF_KV flag rows and are maintenance-gated with readback. operation=vault_verify is a read-only scheduled whole-vault verification (restore verifier + provenance hash chain, incremental by default, full_chain=true for a whole-Ledger re-hash) that runs under the vault maintenance guard shared with backup/erase and fails closed with SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED on any non-green surface."
     )]
     pub async fn hygiene(
         &self,

@@ -12,6 +12,7 @@ mod intelligence;
 pub mod lineage;
 pub mod lowering;
 mod math;
+pub mod vault_runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -76,8 +77,8 @@ pub use async_vault::{
     SynapseCalyxCfWrite, SynapseCalyxReaderLease,
 };
 pub use backup::{
-    SynapseCalyxBackupFile, SynapseCalyxBackupReport, SynapseCalyxVerifyReport,
-    verify_vault_restore,
+    SynapseCalyxBackupExclusion, SynapseCalyxBackupFile, SynapseCalyxBackupLineage,
+    SynapseCalyxBackupReport, SynapseCalyxVerifyReport, verify_vault_restore,
 };
 pub use drift::{
     SYNAPSE_BLIND_SPOT_ALPHA, SYNAPSE_BLIND_SPOT_MAX_ALERTS, SYNAPSE_BLIND_SPOT_MIN_SAMPLES,
@@ -909,6 +910,88 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub predecessor_vault_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predecessor_high_water_seq: Option<u64>,
+}
+
+/// Default incremental window for a scheduled vault verification: the most
+/// recent 4096 ledger entries. Routine checks must not re-hash the whole Ledger
+/// CF, or they stop being run at all.
+pub const VAULT_VERIFY_DEFAULT_TAIL_ENTRIES: u64 = 4_096;
+
+/// Combined verdict of one scheduled whole-vault verification.
+#[derive(Debug, Clone, Serialize)]
+pub struct SynapseCalyxVaultVerifyReport {
+    pub vault_dir: PathBuf,
+    pub vault_id: String,
+    /// `incremental_tail` | `full_chain`.
+    pub scan_mode: String,
+    /// Durable ledger head height at verify time.
+    pub ledger_head_height: u64,
+    /// Size of the incremental window requested (0 for a full-chain scan).
+    pub requested_tail_entries: u64,
+    /// Path of the lineage journal that proves vault identity.
+    pub lineage_path: PathBuf,
+    /// False when the journal that survives deleting the vault is itself gone —
+    /// the next open would silently re-seed instead of failing closed (#1875).
+    pub lineage_present: bool,
+    pub restore: SynapseCalyxVerifyReport,
+    pub chain: SynapseCalyxLedgerVerifyReport,
+}
+
+impl SynapseCalyxVaultVerifyReport {
+    /// True only when every checked surface verified. `covers_full_history` is
+    /// deliberately **not** part of this predicate: after an acknowledged reset
+    /// or a seeded journal it is permanently false, so folding it in would make
+    /// every scheduled run red forever and train the operator to ignore the
+    /// alarm. It is reported, not alarmed on.
+    #[must_use]
+    pub const fn green(&self) -> bool {
+        self.restore.success
+            && self.chain.intact
+            && self.chain.raw_commitments_intact
+            && self.lineage_present
+    }
+
+    /// Names every unmet criterion, so a failure says exactly what failed.
+    #[must_use]
+    pub fn failure_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        for reason in &self.restore.failure_reasons {
+            reasons.push(format!("restore_verify: {reason}"));
+        }
+        if !self.chain.intact {
+            reasons.push(format!(
+                "ledger_chain: verdict={} verified=[{}..{}) quarantine_seq={} corrupt_reason={}",
+                self.chain.verdict,
+                self.chain.verified_from_seq,
+                self.chain.verified_to_seq,
+                self.chain
+                    .quarantine_seq
+                    .map_or_else(|| "none".to_owned(), |seq| seq.to_string()),
+                self.chain.corrupt_reason.as_deref().unwrap_or("none")
+            ));
+        }
+        if !self.chain.raw_commitments_intact {
+            reasons.push(format!(
+                "raw_commitments: seals={} commitments={} sealed={} pending={} failure={}",
+                self.chain.raw_commitment_seal_count,
+                self.chain.raw_commitment_count,
+                self.chain.raw_commitment_sealed_count,
+                self.chain.raw_commitment_pending_count,
+                self.chain
+                    .raw_commitment_failure
+                    .as_deref()
+                    .unwrap_or("none")
+            ));
+        }
+        if !self.lineage_present {
+            reasons.push(format!(
+                "vault_lineage: journal {} is missing, so a replaced vault would no longer fail \
+                 closed on the next open",
+                self.lineage_path.display()
+            ));
+        }
+        reasons
+    }
 }
 
 impl SynapseCalyxLedgerVerifyReport {
@@ -3376,11 +3459,14 @@ impl SynapseCalyxVault {
     /// re-derived with the read-only restore verifier; a manifest with per-file
     /// SHA-256 digests is published only after verification passes. Vault
     /// residency is enforced: a pinned dataset refuses an off-dataset target.
+    /// The vault lineage journal is captured as a sidecar so the backup records
+    /// which vault it restores.
     ///
     /// # Errors
     ///
-    /// Fails closed on WAL sync failure, a residency violation, a busy
-    /// maintenance guard, any copy error, or a backup that does not verify.
+    /// Fails closed on WAL sync failure, a residency violation, a target inside
+    /// the vault, a busy maintenance guard, any copy error, a missing lineage
+    /// journal, or a backup that does not verify.
     pub fn backup(
         &self,
         target_root: &Path,
@@ -3393,15 +3479,26 @@ impl SynapseCalyxVault {
         // 2. Enforce vault residency against the backup vault directory.
         let residency_enforced =
             backup::authorize_residency(&self.config.vault_dir, &backup_vault_dir)?;
-        // 3. Consistent copy under the native-compaction guard.
+        // 3. Consistent copy under the native-compaction guard. The daemon's own
+        //    lock/pid/lifecycle files share the vault directory and are held with
+        //    mandatory byte-range locks, so they are excluded by name — never by
+        //    tolerating a read failure, which would let real data vanish.
+        let runtime_names = vault_runtime::daemon_runtime_file_names();
+        let runtime_refs = runtime_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<&str>>();
         let aster_report = self
             .vault
-            .backup_consistent(&backup_vault_dir, include_regenerable)
+            .backup_consistent(&backup_vault_dir, include_regenerable, &runtime_refs)
             .map_err(|error| SynapseCalyxError::from_calyx("back up Calyx vault", &error))?;
         let latest_seq = self.vault.latest_seq();
         // 4. Prove the copy restores byte-for-byte before publishing a manifest.
         let verify = backup::verify_vault_restore(&backup_vault_dir)?;
         backup::require_verified(&verify)?;
+        // 5. Capture vault identity. The lineage journal lives outside the vault
+        //    directory by design, so the tree copy cannot reach it.
+        let lineage = backup::capture_lineage(target_root, &self.lineage)?;
         let files = aster_report
             .files
             .into_iter()
@@ -3409,6 +3506,14 @@ impl SynapseCalyxVault {
                 relative_path: file.relative_path,
                 len_bytes: file.len_bytes,
                 sha256: file.sha256,
+            })
+            .collect();
+        let excluded_runtime = aster_report
+            .excluded_runtime
+            .into_iter()
+            .map(|entry| SynapseCalyxBackupExclusion {
+                relative_path: entry.relative_path,
+                reason: entry.reason.to_owned(),
             })
             .collect();
         let mut report = SynapseCalyxBackupReport {
@@ -3425,9 +3530,11 @@ impl SynapseCalyxVault {
             total_bytes: aster_report.total_bytes,
             residency_enforced,
             files,
+            excluded_runtime,
+            lineage,
             verify,
         };
-        // 5. Publish the manifest and record its own hash.
+        // 6. Publish the manifest and record its own hash.
         let (manifest_path, manifest_sha256) = backup::write_manifest(target_root, &report)?;
         report.manifest_path = manifest_path;
         report.manifest_sha256 = manifest_sha256;
@@ -3441,6 +3548,11 @@ impl SynapseCalyxVault {
             total_bytes = report.total_bytes,
             verify_success = report.verify.success,
             ledger_tip_hash = %report.verify.ledger_tip_hash,
+            lineage_sha256 = %report.lineage.sha256,
+            lineage_generation = report.lineage.generation,
+            lineage_chain_origin = %report.lineage.chain_origin,
+            covers_full_history = report.lineage.covers_full_history,
+            excluded_runtime_count = report.excluded_runtime.len(),
             "completed durable Calyx vault backup and restore verification"
         );
         Ok(report)
@@ -3564,6 +3676,71 @@ impl SynapseCalyxVault {
             verification,
             &self.lineage,
         ))
+    }
+
+    /// Runs the scheduled whole-vault verification: the read-only restore
+    /// verifier plus the provenance hash-chain verifier, both under the vault's
+    /// maintenance guard so a concurrent compaction/GC/backup/erase pass cannot
+    /// rewrite the tree mid-scan and be misreported as corruption.
+    ///
+    /// The chain verification is **incremental by default** — it re-hashes the
+    /// most recent `tail_entries` entries rather than the whole Ledger CF. That
+    /// is the same posture restic takes with `check --read-data-subset`: full
+    /// data re-reads are the expensive exception, so routine scheduled checks
+    /// sample recent state and the full scan is requested explicitly. Pass
+    /// `full_chain` to re-hash everything.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the maintenance guard is already held, when the vault
+    /// path is not a readable vault, or when the physical ledger cannot be read.
+    /// A non-green verdict is a normal report, not an error: the caller decides
+    /// how loudly to alarm.
+    pub fn verify_vault(
+        &self,
+        full_chain: bool,
+        tail_entries: u64,
+    ) -> Result<SynapseCalyxVaultVerifyReport, SynapseCalyxError> {
+        self.vault
+            .with_maintenance_guard(|| Ok(self.verify_vault_under_guard(full_chain, tail_entries)))
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("acquire Calyx vault maintenance guard", &error)
+            })?
+    }
+
+    fn verify_vault_under_guard(
+        &self,
+        full_chain: bool,
+        tail_entries: u64,
+    ) -> Result<SynapseCalyxVaultVerifyReport, SynapseCalyxError> {
+        let vault_dir = self.config.vault_dir.clone();
+        let restore = backup::verify_vault_restore(&vault_dir)?;
+        let head_height = calyx_aster::ledger_head::read_head_anchor(&vault_dir)
+            .map_err(|error| SynapseCalyxError::from_calyx("read Calyx ledger head", &error))?
+            .map_or(0, |anchor| anchor.height);
+        let tail_entries = tail_entries.max(1);
+        let range = if full_chain {
+            None
+        } else {
+            Some((head_height.saturating_sub(tail_entries), head_height))
+        };
+        let chain = self.verify_ledger_chain(range)?;
+        let lineage_path = self.lineage.lineage_path.clone();
+        Ok(SynapseCalyxVaultVerifyReport {
+            vault_dir,
+            vault_id: self.vault.vault_id().to_string(),
+            scan_mode: if full_chain {
+                "full_chain".to_owned()
+            } else {
+                "incremental_tail".to_owned()
+            },
+            ledger_head_height: head_height,
+            requested_tail_entries: if full_chain { 0 } else { tail_entries },
+            lineage_present: lineage_path.is_file(),
+            lineage_path,
+            restore,
+            chain,
+        })
     }
 
     /// Reads and decodes one physical provenance-ledger entry by sequence.

@@ -11,7 +11,7 @@ use crate::m3::{
         HygieneFlagsParams, HygieneFlagsResponse, HygieneGroundingGapParams,
         HygieneGroundingGapResponse, HygieneReportParams, HygieneReportResponse,
         HygieneScanStorageParams, HygieneScanStorageResponse, HygieneScanTextParams,
-        HygieneScanTextResponse,
+        HygieneScanTextResponse, HygieneVaultVerifyParams, HygieneVaultVerifyResponse,
     },
     local_models::{
         LocalModelListParams, LocalModelListResponse, LocalModelProbeParams,
@@ -229,6 +229,7 @@ pub enum HygieneOperation {
     GroundingGap,
     BlindSpot,
     Drift,
+    VaultVerify,
 }
 
 impl HygieneOperation {
@@ -241,6 +242,7 @@ impl HygieneOperation {
             Self::GroundingGap => "grounding_gap",
             Self::BlindSpot => "blind_spot",
             Self::Drift => "drift",
+            Self::VaultVerify => "vault_verify",
         }
     }
 }
@@ -263,6 +265,8 @@ pub struct HygieneParams {
     pub blind_spot: Option<HygieneBlindSpotParams>,
     #[serde(default)]
     pub drift: Option<HygieneDriftParams>,
+    #[serde(default)]
+    pub vault_verify: Option<HygieneVaultVerifyParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -285,6 +289,8 @@ pub struct HygieneResponse {
     pub blind_spot: Option<HygieneBlindSpotResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drift: Option<HygieneDriftResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify: Option<HygieneVaultVerifyResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

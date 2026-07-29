@@ -32,9 +32,15 @@ vault. It is not a raw `cp -r` of an open database directory:
    re-derived with the read-only `verify_restore` verifier. A manifest is
    published **only** if the ledger chain verifies and the sacred rows read
    back. A backup that does not verify is refused (`SYNAPSE_CALYX_BACKUP_VERIFY_FAILED`).
+5. **Vault identity captured** — the lineage journal is copied in as
+   `vault_lineage.json` and hashed into the manifest. A backup that cannot name
+   the vault it restores is refused (`SYNAPSE_CALYX_BACKUP_LINEAGE_MISSING`).
 
 Backups run **off the MCP Tokio runtime** on the blocking pool under a single
 admission permit; a concurrent backup fails closed (`STORAGE_BACKUP_IN_PROGRESS`).
+The target must also resolve **outside** the vault directory, or the copy would
+enumerate its own output (`CALYX_ASTER_BACKUP_TARGET_INSIDE_VAULT`); both paths
+are canonicalised before comparison so `..` and symlinks cannot defeat the check.
 
 ### On-disk layout of a backup target
 
@@ -46,14 +52,51 @@ admission permit; a concurrent backup fails closed (`STORAGE_BACKUP_IN_PROGRESS`
 │   ├── CURRENT, MANIFEST, manifest-*.json
 │   ├── cf/<CF_NAME>/*.sst      # per-column-family sorted tables (sacred rows)
 │   ├── wal/*.wal              # write-ahead log segments
+│   ├── locks/                 # present but EMPTY (lock tokens are not copied)
 │   └── ledger_head/current.json, latest_checkpoint.json
+├── vault_lineage.json         # sidecar copy of the vault lineage journal (§7)
 └── backup_manifest.json       # per-file SHA-256 + durable_seq + verify report
+                               # + lineage identity + excluded_runtime list
 ```
 
-Excluded from the copy: `vault.lock` and `vault.pid` (would block reopen), and —
-unless `include_regenerable=true` — the rebuildable `ann/`, `kernel/`, `guard/`
-directories. **`machine-salt.bin` lives in the parent data directory, outside
-`vault/`, and is not part of the vault backup** (see §5).
+`backup_manifest.json` is `schema_version=2`: version 1 recorded only bytes,
+version 2 also asserts the vault identity (`lineage`) and lists what was
+deliberately not copied (`excluded_runtime`).
+
+#### What is excluded, and why it is a named list
+
+Unless `include_regenerable=true`, the rebuildable `ann/`, `kernel/`, `guard/`
+directories are skipped. Beyond those, the vault directory is also the **runtime
+root of the daemon serving it**, and that runtime state is excluded by an
+explicit named list:
+
+| Entry | Owner | Why |
+| --- | --- | --- |
+| `vault.lock`, `vault.pid` | Aster substrate | Block reopen / bind the copy to the source process |
+| `daemon.lock`, `daemon.pid`, `daemon-lifecycle.lock` | Synapse daemon | Held with `LockFileEx` byte-range locks — **unreadable even by the locking process through a second handle** |
+| `daemon-run-current.json`, `daemon-tool-last.json` | Synapse daemon | Describe the run that is live *now*, not the one that will open the restored copy |
+| `daemon-tool-events.jsonl`, `daemon-exit.jsonl` (+ rotated `.1`…`.5`) | Synapse daemon | Host-scoped, rotated observability ledgers; not vault data, not covered by the ledger chain |
+| `locks/` **contents** | Aster substrate | Byte-range lock tokens, zero state. The directory itself *is* recreated, because the lock guard does not create its parent |
+| `.append.lock` (any depth, e.g. `wal/.append.lock`) | Aster substrate | Held around every WAL append, so a live writer can hold it for the instant the copy reads it — an intermittent failure, not a permanent one |
+
+This is **not** a "skip whatever cannot be read" rule. Any other unreadable file
+still fails the backup closed, so a genuinely damaged SST can never quietly drop
+out of a backup. Every skipped entry appears in the manifest's
+`excluded_runtime` array with a reason, so a restore operator can tell an
+intentional omission from a gap.
+
+Before this list existed, `storage operation=backup` **could not complete at all
+against a live daemon**: the copy died on `daemon.lock` with
+`CALYX_ASTER_BACKUP_IO … os error 33` (`ERROR_LOCK_VIOLATION`). Microsoft's
+`LockFileEx` contract is explicit — "if the locking process opens the file a
+second time, it cannot access the specified region through this second handle
+until it unlocks the region", and "locking a region that goes beyond the current
+end-of-file position is not an error", which is why even a 0-byte lock token
+failed. The exclusion follows the same reasoning PostgreSQL gives for omitting
+`postmaster.pid`/`postmaster.opts` from a base backup.
+
+**`machine-salt.bin` lives in the parent data directory, outside `vault/`, and is
+not part of the vault backup** (see §5).
 
 ---
 
@@ -99,8 +142,12 @@ Restore is a deliberate, offline operation.
    Copy-Item -Recurse "D:/synapse-backups/2026-07-23T18-00Z/vault" `
                       "D:/synapse-restore/data/vault"
    ```
-   Do **not** copy `backup_manifest.json` into the vault (it is a sidecar; the
-   vault ignores unknown files, but keep it beside the data dir for audit).
+   Do **not** copy `backup_manifest.json` or `vault_lineage.json` into the vault
+   (they are sidecars; the vault ignores unknown files, but keep them beside the
+   data dir for audit). **Read §7 before choosing the destination directory** —
+   restoring onto the existing production vault and restoring to a fresh
+   directory have different, non-obvious lineage outcomes, and only one of them
+   fails closed.
 4. **Provide the machine salt** (see §5). On the **same machine**, copy
    `machine-salt.bin` from the source data dir into `<data_dir>/`. Encryption is
    off (§6), so the salt does not gate value decryption, but restoring the
@@ -230,3 +277,145 @@ compliance obligation mandates field-level encryption. At that point:
 
 Until then, this decision is recorded as a deliberate, revisitable deferral —
 **not** a silent omission.
+
+---
+
+## 7. The vault lineage journal on restore (#1875)
+
+This section postdates the rest of this runbook. Every claim below was checked
+against `crates/synapse-calyx/src/lineage.rs` rather than inferred.
+
+`<vault-dir-name>.lineage.json` is a **sibling** of the vault directory, never a
+file inside it — on the production host,
+`%LOCALAPPDATA%\synapse\db-daemon.lineage.json` beside
+`%LOCALAPPDATA%\synapse\db-daemon\`. That placement is the whole point: it is the
+only witness of vault identity that survives `Remove-Item -Recurse -Force` on the
+vault. It records, per generation, the vault id and the highest durable sequence
+ever observed (`high_water_seq`).
+
+Because the journal lives outside the vault, **restoring a vault directory does
+not restore its lineage**, and the journal you already have on the host wins.
+That produces two materially different outcomes.
+
+### 7.1 Restoring ONTO the existing production vault directory → fails closed
+
+The backup carries the same `vault_id` as the journal's active generation, but a
+`latest_seq` at or below the moment the backup was taken, while the journal
+records the high-water mark the *live* vault reached. Same id, fewer sequences,
+so the next open refuses:
+
+```
+SYNAPSE_CALYX_VAULT_SEQ_REGRESSION
+vault <vault-id> at <vault-dir> opened at latest_seq=<N> but the lineage journal
+<journal-path> records high_water_seq=<M> for this same vault id: <M-N>
+sequences are missing
+```
+
+This is correct and desirable: an in-place restore *is* a rollback of committed
+rows, and the daemon refuses to serve it until an operator says so. Follow §7.3.
+
+If the backup came from a **different** vault, the id differs instead and you get
+`SYNAPSE_CALYX_VAULT_RESET_UNACKNOWLEDGED` — same procedure, but the id to
+acknowledge is the newly observed one.
+
+### 7.2 Restoring to a FRESH directory → starts a new lineage, does not fail
+
+A fresh vault directory has no sibling journal, so the first open **seeds one**
+and proceeds. It does not fail, and no operator acknowledgement is asked for.
+It is not literally silent — a warn record is emitted:
+
+```
+SYNAPSE_CALYX_VAULT_LINEAGE_SEEDED  (level=warn)
+seeded the vault lineage journal; nothing before this open is attested by it
+```
+
+— but nothing blocks, and it is easy to miss in a log. The seeded journal holds
+`generation=1`, `started_reason="lineage-seeded"`, and `high_water_seq` equal to
+whatever the restored copy happened to contain. From then on `verify_chain`
+reports `chain_origin="lineage-seeded"` and `covers_full_history=false`: the
+chain is intact, but the journal attests nothing before this open, so the vault
+cannot claim its full history.
+
+Practical note: `covers_full_history` is `true` only for
+`chain_origin="vault-genesis"`, and **no code path currently writes that
+origin** — a generation is created either by seeding (`lineage-seeded`) or by an
+acknowledged reset (`reset-acknowledged` → `post-reset`). So on any vault alive
+today `covers_full_history=false` is the expected steady state, not a symptom.
+Do not treat it as an alarm; `hygiene operation=vault_verify` deliberately
+excludes it from its green predicate for exactly this reason (§8).
+
+If you want the restored vault to be recognised as a *continuation* rather than a
+new lineage, copy `vault_lineage.json` from the backup target to
+`<parent-of-restored-vault>\<restored-vault-dir-name>.lineage.json` **before the
+first open**, and expect §7.1's regression check to then apply. The journal
+records the vault directory it describes and refuses to be applied to another
+one (`SYNAPSE_CALYX_VAULT_LINEAGE_PATH_MISMATCH`), so the file name must match
+the destination directory name.
+
+### 7.3 Acknowledging the reset (`SYNAPSE_CALYX_ACKNOWLEDGE_VAULT_RESET`)
+
+The acknowledgement is deliberately **not** a blanket switch: its value must be
+the **exact vault id echoed from the error text**, compared after trimming. A
+wrong, stale, or unrelated id is refused and the open still fails.
+
+1. Read the vault id out of the error. For a regression it is the id
+   immediately after `vault ` (`vault <vault-id> at <vault-dir> opened at
+   latest_seq=…`). For an unacknowledged reset it is the **new** id
+   (`now holds vault_id=<vault-id>`), not the recorded predecessor.
+2. Confirm the loss is understood and a better recovery source does not exist.
+   This step is the point of the whole mechanism; #1875 was a vault emptied with
+   no record and no backup.
+3. Set the variable for the **one** reopen and start the daemon:
+   ```pwsh
+   $env:SYNAPSE_CALYX_ACKNOWLEDGE_VAULT_RESET = "<vault-id-echoed-from-the-error>"
+   # start the daemon, confirm it opens
+   Remove-Item Env:\SYNAPSE_CALYX_ACKNOWLEDGE_VAULT_RESET
+   ```
+4. Confirm what was recorded, and clear the variable. The journal is rewritten on
+   that open, so leaving the variable set would pre-authorise the *next*
+   replacement too:
+   - **Sequence regression** — the active generation's `high_water_seq` is
+     lowered to the restored value and annotated
+     (`operator-acknowledged sequence regression from high_water_seq=… to
+     latest_seq=…`). No new generation is created; `chain_origin` is unchanged.
+   - **Vault replacement** — a **new generation** is appended with
+     `started_reason="reset-acknowledged"`, carrying `predecessor_vault_id` and
+     `predecessor_high_water_seq`. `SYNAPSE_CALYX_VAULT_RESET_RECORDED` is
+     logged, and `verify_chain` reports `chain_origin="post-reset"` with
+     `covers_full_history=false` from then on.
+
+Never delete the journal to clear one of these errors. Deleting it converts a
+fail-closed, fully described loss back into the silent one that cost ~1.56M
+sequences.
+
+---
+
+## 8. Scheduled verification (`hygiene operation=vault_verify`)
+
+Backups prove themselves at write time; the *live* vault needs a recurring check
+that it still verifies. `hygiene operation=vault_verify` runs the same two
+verifiers this runbook uses for restores — `verify_restore` over the live vault
+and the provenance hash-chain verifier — under the vault maintenance guard that
+backup, erase, and compaction already share, so a scan can never race a tree
+rewrite and misreport the torn intermediate state as corruption. A concurrent
+backup/erase therefore makes it fail closed rather than lie.
+
+```json
+{ "name": "hygiene", "arguments": {
+    "operation": "vault_verify",
+    "vault_verify": { "full_chain": false, "tail_entries": 4096 } } }
+```
+
+- **Incremental by default.** The chain scan re-hashes the newest
+  `tail_entries` ledger entries (default 4096), not the whole Ledger CF. A
+  routine check expensive enough to be skipped is a check that does not exist;
+  this is the posture restic recommends with `check --read-data-subset`.
+  Note the raw-write commitment seals are always re-derived in full — that scan
+  is bounded by the commitment CF, not by the ledger height.
+- **Full scan on request.** `full_chain: true` re-hashes the entire chain. Run it
+  after a restore, after any acknowledged reset, and on a slower cadence.
+- **Loud on failure.** Any non-green surface — restore verifier, chain verdict,
+  raw-write commitments, or a missing lineage journal — fails with
+  `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` naming exactly which one and the verified
+  window. There is no "mostly fine" verdict.
+- **`covers_full_history` is reported, not alarmed on** (§7.2).

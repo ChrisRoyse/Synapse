@@ -15,11 +15,15 @@ use serde_json::{Value, json};
 use synapse_core::SubsystemHealth;
 
 const SCHEMA_VERSION: u32 = 1;
-const RUN_CURRENT_FILE: &str = "daemon-run-current.json";
-const TOOL_LAST_FILE: &str = "daemon-tool-last.json";
-const TOOL_EVENTS_FILE: &str = "daemon-tool-events.jsonl";
-const EXIT_EVENTS_FILE: &str = "daemon-exit.jsonl";
-const LIFECYCLE_LOCK_FILE: &str = "daemon-lifecycle.lock";
+// These files live inside the vault directory, so their names are owned by
+// `synapse_calyx::vault_runtime`: a vault backup must exclude exactly this set
+// by name (they are the running process's state, never vault data) and the two
+// definitions must not be able to drift apart.
+const RUN_CURRENT_FILE: &str = synapse_calyx::vault_runtime::DAEMON_RUN_CURRENT_FILE;
+const TOOL_LAST_FILE: &str = synapse_calyx::vault_runtime::DAEMON_TOOL_LAST_FILE;
+const TOOL_EVENTS_FILE: &str = synapse_calyx::vault_runtime::DAEMON_TOOL_EVENTS_FILE;
+const EXIT_EVENTS_FILE: &str = synapse_calyx::vault_runtime::DAEMON_EXIT_EVENTS_FILE;
+const LIFECYCLE_LOCK_FILE: &str = synapse_calyx::vault_runtime::DAEMON_LIFECYCLE_LOCK_FILE;
 
 /// Maximum size in bytes the active daemon tool-event ledger
 /// (`daemon-tool-events.jsonl`) may reach before it is rotated to a numbered
@@ -34,7 +38,7 @@ const MAX_LEDGER_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 /// (`daemon-tool-events.jsonl.1` .. `.5`, newest suffix `.1`). Older segments
 /// are pruned during rotation, so total retained ledger bytes are bounded by
 /// roughly `MAX_LEDGER_SEGMENT_BYTES * (MAX_LEDGER_SEGMENTS + 1)`.
-const MAX_LEDGER_SEGMENTS: usize = 5;
+const MAX_LEDGER_SEGMENTS: usize = synapse_calyx::vault_runtime::MAX_LIFECYCLE_LEDGER_SEGMENTS;
 const MAX_RETAINED_LEDGER_FILES: usize = MAX_LEDGER_SEGMENTS + 1;
 
 static STATE: OnceLock<Mutex<Option<DaemonLifecycleState>>> = OnceLock::new();

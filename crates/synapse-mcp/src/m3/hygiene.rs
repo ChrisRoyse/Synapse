@@ -3742,3 +3742,148 @@ fn lock_runtime(
 fn invalid(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, detail.into())
 }
+
+/// Scheduled whole-vault verification request (#1687 + #1679).
+///
+/// Both knobs default to the routine posture: verify the live vault with an
+/// incremental tail scan of the provenance chain. A full re-hash of the whole
+/// Ledger CF is available but must be asked for, because a routine check that is
+/// too expensive to run on a schedule stops being run at all.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneVaultVerifyParams {
+    /// Re-hash the entire Ledger CF instead of the recent window.
+    #[serde(default)]
+    pub full_chain: bool,
+    /// Size of the incremental window, in ledger entries. Ignored when
+    /// `full_chain` is set. Defaults to
+    /// `synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES`.
+    #[serde(default)]
+    pub tail_entries: Option<u64>,
+}
+
+/// Physical verdict of one scheduled vault verification.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneVaultVerifyResponse {
+    pub source_of_truth: &'static str,
+    pub vault_dir: String,
+    pub vault_id: String,
+    /// True only when every checked surface verified.
+    pub green: bool,
+    /// `incremental_tail` | `full_chain`.
+    pub scan_mode: String,
+    pub tail_entries: u64,
+    pub ledger_head_height: u64,
+    pub verified_from_seq: u64,
+    pub verified_to_seq: u64,
+    pub chain_verdict: String,
+    pub chain_entry_count: u64,
+    pub ledger_tip_hash: String,
+    pub restore_success: bool,
+    pub chain_intact: bool,
+    pub raw_commitments_intact: bool,
+    /// False when the lineage journal that survives deleting the vault is gone.
+    pub lineage_present: bool,
+    pub lineage_path: String,
+    pub vault_generation: u64,
+    pub vault_reset_count: u64,
+    pub chain_origin: String,
+    /// Reported, never alarmed on: permanently false after a seeded journal or
+    /// an acknowledged reset.
+    pub covers_full_history: bool,
+    pub constellation_count: u64,
+    pub anchor_count: u64,
+    pub ledger_entry_count: u64,
+    pub wal_bytes_present: u64,
+    pub failure_reasons: Vec<String>,
+}
+
+/// Upper bound on the incremental window, so a "tail" request cannot silently
+/// become a full-vault re-hash that was never authorised.
+const MAX_VAULT_VERIFY_TAIL_ENTRIES: u64 = 1_000_000;
+
+#[must_use]
+pub fn required_permissions_vault_verify(
+    _params: &HygieneVaultVerifyParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+/// Verifies the live vault and fails closed on any non-green surface.
+///
+/// Delegates to the existing `verify_vault_restore` and `verify_ledger_chain`
+/// paths — nothing is re-implemented here — and converts a non-green verdict
+/// into `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` naming exactly what failed. A
+/// scheduled verification that returned a cheerful report on a broken vault
+/// would be worse than no verification at all.
+///
+/// # Errors
+///
+/// Returns a structured error when the vault cannot be read, when the vault
+/// maintenance guard is already held by a backup/erase/compaction pass, or when
+/// the verdict is not green.
+pub fn run_vault_verify(
+    db: &Db,
+    params: &HygieneVaultVerifyParams,
+) -> Result<HygieneVaultVerifyResponse, ErrorData> {
+    let tail_entries = params
+        .tail_entries
+        .unwrap_or(synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES)
+        .clamp(1, MAX_VAULT_VERIFY_TAIL_ENTRIES);
+    let report = db
+        .verify_calyx_vault(params.full_chain, tail_entries)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let response = HygieneVaultVerifyResponse {
+        source_of_truth: "live Calyx vault SST/WAL bytes + physical CF_LEDGER hash chain + vault \
+                          lineage journal",
+        vault_dir: report.vault_dir.display().to_string(),
+        vault_id: report.vault_id.clone(),
+        green: report.green(),
+        scan_mode: report.scan_mode.clone(),
+        tail_entries: report.requested_tail_entries,
+        ledger_head_height: report.ledger_head_height,
+        verified_from_seq: report.chain.verified_from_seq,
+        verified_to_seq: report.chain.verified_to_seq,
+        chain_verdict: report.chain.verdict.clone(),
+        chain_entry_count: report.chain.entry_count,
+        ledger_tip_hash: report.chain.tip_hash.clone().unwrap_or_default(),
+        restore_success: report.restore.success,
+        chain_intact: report.chain.intact,
+        raw_commitments_intact: report.chain.raw_commitments_intact,
+        lineage_present: report.lineage_present,
+        lineage_path: report.lineage_path.display().to_string(),
+        vault_generation: report.chain.vault_generation,
+        vault_reset_count: report.chain.vault_reset_count,
+        chain_origin: report.chain.chain_origin.clone(),
+        covers_full_history: report.chain.covers_full_history,
+        constellation_count: report.restore.constellation_count,
+        anchor_count: report.restore.anchor_count,
+        ledger_entry_count: report.restore.ledger_entry_count,
+        wal_bytes_present: report.restore.wal_bytes_present,
+        failure_reasons: report.failure_reasons(),
+    };
+    if response.green {
+        return Ok(response);
+    }
+    Err(mcp_error(
+        error_codes::HYGIENE_VAULT_VERIFY_FAILED,
+        format!(
+            "scheduled vault verification failed for vault_id={} at {}: scan_mode={} \
+             verified=[{}..{}) restore_success={} chain_intact={} raw_commitments_intact={} \
+             lineage_present={} reasons=[{}]; remediation=stop writers, preserve the vault \
+             directory and its lineage journal, and restore from a verified backup before \
+             trusting any read from this vault",
+            response.vault_id,
+            response.vault_dir,
+            response.scan_mode,
+            response.verified_from_seq,
+            response.verified_to_seq,
+            response.restore_success,
+            response.chain_intact,
+            response.raw_commitments_intact,
+            response.lineage_present,
+            response.failure_reasons.join("; ")
+        ),
+    ))
+}

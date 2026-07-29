@@ -35,8 +35,8 @@ use synapse_calyx::{
     SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
     SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
-    SynapseCalyxVaultStatus, SynapseCalyxVerifyReport, SynapseCalyxWeaveParams,
-    SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
+    SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport, SynapseCalyxVerifyReport,
+    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -433,6 +433,14 @@ pub trait StorageBackend: Send + Sync {
         include_regenerable: bool,
     ) -> StorageResult<SynapseCalyxBackupReport>;
     fn verify_calyx_restore(&self, vault_path: &Path) -> StorageResult<SynapseCalyxVerifyReport>;
+    /// Scheduled whole-vault verification of the *live* vault: restore verifier
+    /// plus provenance chain, under the vault maintenance guard. The chain scan
+    /// is incremental over the newest `tail_entries` unless `full_chain`.
+    fn verify_calyx_vault(
+        &self,
+        full_chain: bool,
+        tail_entries: u64,
+    ) -> StorageResult<SynapseCalyxVaultVerifyReport>;
     /// Verifies the live provenance-ledger hash chain against the stored bytes.
     /// `range` is an optional half-open `(from_seq, to_seq)` window; `None`
     /// verifies the full chain.
@@ -1956,6 +1964,20 @@ impl StorageBackend for CalyxBackend {
     fn verify_calyx_restore(&self, vault_path: &Path) -> StorageResult<SynapseCalyxVerifyReport> {
         synapse_calyx::verify_vault_restore(vault_path).map_err(|source| {
             calyx_write_failed("<calyx-vault>", "verify restored Calyx vault", &source)
+        })
+    }
+
+    fn verify_calyx_vault(
+        &self,
+        full_chain: bool,
+        tail_entries: u64,
+    ) -> StorageResult<SynapseCalyxVaultVerifyReport> {
+        self.with_vault("<calyx-vault>", "verify live Calyx vault", false, |vault| {
+            vault
+                .verify_vault(full_chain, tail_entries)
+                .map_err(|source| {
+                    calyx_read_failed("<calyx-vault>", "verify live Calyx vault", &source)
+                })
         })
     }
 

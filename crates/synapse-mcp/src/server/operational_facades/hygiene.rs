@@ -314,5 +314,66 @@ pub(super) async fn handle(
                 |out| out.drift = Some(response),
             )))
         }
+        HygieneOperation::VaultVerify => {
+            let spec = params
+                .0
+                .vault_verify
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "vault_verify"))?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_vault_verify(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_vault",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene vault_verify operation",
+                )
+            })?;
+            // The verification re-derives SST/WAL bytes and re-hashes a ledger
+            // window: strictly blocking CPU/IO work, exactly like the sibling
+            // backup and restore-verify operations, so it must not occupy a
+            // Tokio runtime worker serving MCP. Mutual exclusion with backup and
+            // erase is enforced one layer down by the vault maintenance guard
+            // those passes already share, so a scan can never race a tree
+            // rewrite and report the torn intermediate state as corruption.
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::hygiene::run_vault_verify(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_vault",
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("vault_verify blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the vault verification task terminated abnormally",
+                )
+            })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "vault_verify green={} scan_mode={} verified=[{}..{}) head_height={} restore_success={} chain_intact={} raw_commitments_intact={} lineage_present={} tip={}",
+                    response.green,
+                    response.scan_mode,
+                    response.verified_from_seq,
+                    response.verified_to_seq,
+                    response.ledger_head_height,
+                    response.restore_success,
+                    response.chain_intact,
+                    response.raw_commitments_intact,
+                    response.lineage_present,
+                    response.ledger_tip_hash,
+                ),
+                |out| out.vault_verify = Some(response),
+            )))
+        }
     }
 }

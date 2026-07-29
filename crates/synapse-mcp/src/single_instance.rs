@@ -30,10 +30,15 @@ use fs2::FileExt;
 
 /// Empty file created inside the Calyx vault directory used purely as the daemon
 /// single-instance advisory lock token.
-pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+///
+/// The name is owned by `synapse_calyx::vault_runtime` because vault backup must
+/// exclude exactly this file by name — a `LockFileEx` byte-range lock denies
+/// even this process a read through a second handle, so a backup that did not
+/// know the name died with `ERROR_LOCK_VIOLATION` against every live daemon.
+pub const DAEMON_LOCK_FILE: &str = synapse_calyx::vault_runtime::DAEMON_LOCK_FILE;
 
 /// Unlocked sidecar file holding the current lock holder's PID (diagnostics).
-pub const DAEMON_PID_FILE: &str = "daemon.pid";
+pub const DAEMON_PID_FILE: &str = synapse_calyx::vault_runtime::DAEMON_PID_FILE;
 
 /// Empty file inside the durable shell-job store used to exclude every other
 /// daemon, even when those daemons use different vault directories.

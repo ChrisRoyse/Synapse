@@ -13,7 +13,9 @@
 //! 4. Immediately re-derive the copy with `verify_restore` and refuse to publish
 //!    a manifest for a backup whose ledger chain does not verify or whose sacred
 //!    rows do not read back — a green report is the backup's proof of integrity.
-//! 5. Write `<target>/backup_manifest.json` (per-file SHA-256 + the verify
+//! 5. Copy the vault lineage journal in as a sidecar so the backup carries the
+//!    vault's identity, not just its bytes.
+//! 6. Write `<target>/backup_manifest.json` (per-file SHA-256 + the verify
 //!    report + the consistent point) and hash the manifest itself.
 
 use std::path::{Path, PathBuf};
@@ -28,9 +30,22 @@ use crate::SynapseCalyxError;
 pub const BACKUP_VAULT_SUBDIR: &str = "vault";
 /// Sidecar manifest file name written at the backup target root.
 pub const BACKUP_MANIFEST_FILE: &str = "backup_manifest.json";
+/// Sidecar copy of the vault lineage journal, written at the backup target root.
+///
+/// The live journal is deliberately a *sibling* of the vault directory (#1875)
+/// so deleting the vault cannot delete its own witness. That placement means a
+/// vault-tree copy walks straight past it, so a backup captured the vault's
+/// bytes and none of its identity. It is copied in explicitly here, next to the
+/// manifest rather than inside `vault/`, so restoring `vault/` never drags a
+/// foreign journal into place and the operator has to make the identity
+/// decision consciously.
+pub const BACKUP_LINEAGE_FILE: &str = "vault_lineage.json";
 
 const MANIFEST_REMEDIATION: &str =
     "inspect the backup target volume free space and permissions, then retry the backup";
+const LINEAGE_REMEDIATION: &str = "the vault lineage journal is the only record of vault identity that survives deleting the \
+     vault directory, so a backup without it cannot prove which vault it restores; repair or \
+     restore the journal named in this error beside the vault directory, then retake the backup";
 const VERIFY_REMEDIATION: &str = "the freshly written backup failed byte-level restore verification; discard this target and \
      retry the backup, and inspect the source vault's ledger chain if it recurs";
 
@@ -75,6 +90,39 @@ impl SynapseCalyxVerifyReport {
     }
 }
 
+/// One source-vault entry that was deliberately not copied because it is
+/// runtime state of the process serving the vault rather than vault data.
+#[derive(Debug, Clone, Serialize)]
+pub struct SynapseCalyxBackupExclusion {
+    pub relative_path: String,
+    pub reason: String,
+}
+
+/// The vault lineage journal captured beside the backup, with the identity it
+/// attests. Without this a backup proves only that *some* vault restored, never
+/// *which* one (#1875).
+#[derive(Debug, Clone, Serialize)]
+pub struct SynapseCalyxBackupLineage {
+    /// Path of the live journal that was copied.
+    pub source_path: PathBuf,
+    /// Path of the sidecar copy inside the backup target.
+    pub sidecar_path: PathBuf,
+    /// Name of the sidecar relative to the backup target root.
+    pub relative_path: String,
+    pub len_bytes: u64,
+    pub sha256: String,
+    /// 1-based lineage generation of the vault at backup time.
+    pub generation: u64,
+    /// Recorded vault replacements preceding this generation.
+    pub reset_count: u64,
+    /// `vault-genesis` | `lineage-seeded` | `post-reset`.
+    pub chain_origin: String,
+    /// False whenever the chain begins after a recorded replacement or before
+    /// the journal existed: the backup attests the surviving chain, not the
+    /// vault's whole history.
+    pub covers_full_history: bool,
+}
+
 /// Structured, self-verifying backup result.
 #[derive(Debug, Clone, Serialize)]
 pub struct SynapseCalyxBackupReport {
@@ -91,6 +139,9 @@ pub struct SynapseCalyxBackupReport {
     pub total_bytes: u64,
     pub residency_enforced: bool,
     pub files: Vec<SynapseCalyxBackupFile>,
+    /// Runtime artifacts present in the source vault and deliberately skipped.
+    pub excluded_runtime: Vec<SynapseCalyxBackupExclusion>,
+    pub lineage: SynapseCalyxBackupLineage,
     pub verify: SynapseCalyxVerifyReport,
 }
 
@@ -109,10 +160,22 @@ struct BackupManifest<'a> {
     total_bytes: u64,
     residency_enforced: bool,
     verify: &'a SynapseCalyxVerifyReport,
+    lineage: &'a SynapseCalyxBackupLineage,
+    excluded_runtime: &'a [SynapseCalyxBackupExclusion],
     files: &'a [SynapseCalyxBackupFile],
 }
 
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Manifest schema version.
+///
+/// * `1` — per-file SHA-256 digests, consistent point, verify report.
+/// * `2` — adds the `lineage` object (the vault identity the backup restores)
+///   and `excluded_runtime` (the runtime artifacts deliberately not copied).
+///
+/// Bumped rather than extended in place for the same reason `PostgreSQL` moved its
+/// backup manifest to version `2` when it added `System-Identifier`: a reader
+/// must be able to tell a manifest that *asserts* an identity from one that
+/// merely never recorded it.
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Runs the read-only aster restore verifier over a vault directory and maps its
 /// report into the Synapse-typed structure.
@@ -162,6 +225,8 @@ pub(crate) fn write_manifest(
         total_bytes: report.total_bytes,
         residency_enforced: report.residency_enforced,
         verify: &report.verify,
+        lineage: &report.lineage,
+        excluded_runtime: &report.excluded_runtime,
         files: &report.files,
     };
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
@@ -182,6 +247,62 @@ pub(crate) fn write_manifest(
         )
     })?;
     Ok((manifest_path, sha256_hex(&bytes)))
+}
+
+/// Copies the vault lineage journal into the backup target as
+/// [`BACKUP_LINEAGE_FILE`] and hashes it, so the backup records *which* vault it
+/// restores and at what history.
+///
+/// Fails closed when the journal is absent or unreadable: a backup that cannot
+/// name its vault is exactly the artifact that made #1875 unrecoverable, and
+/// publishing one silently would repeat that failure.
+pub(crate) fn capture_lineage(
+    target_root: &Path,
+    lineage: &crate::SynapseCalyxVaultLineage,
+) -> Result<SynapseCalyxBackupLineage, SynapseCalyxError> {
+    let source_path = lineage.lineage_path.clone();
+    let bytes = std::fs::read(&source_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_LINEAGE_MISSING",
+                format!(
+                    "vault lineage journal {} does not exist, so this backup cannot record which \
+                     vault it restores",
+                    source_path.display()
+                ),
+                LINEAGE_REMEDIATION,
+            )
+        } else {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_BACKUP_LINEAGE_READ_FAILED",
+                "read vault lineage journal for backup",
+                &source_path,
+                &error,
+                LINEAGE_REMEDIATION,
+            )
+        }
+    })?;
+    let sidecar_path = target_root.join(BACKUP_LINEAGE_FILE);
+    std::fs::write(&sidecar_path, &bytes).map_err(|error| {
+        SynapseCalyxError::with_io(
+            "SYNAPSE_CALYX_BACKUP_LINEAGE_WRITE_FAILED",
+            "write backup vault lineage sidecar",
+            &sidecar_path,
+            &error,
+            MANIFEST_REMEDIATION,
+        )
+    })?;
+    Ok(SynapseCalyxBackupLineage {
+        source_path,
+        sidecar_path,
+        relative_path: BACKUP_LINEAGE_FILE.to_owned(),
+        len_bytes: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+        generation: lineage.generation,
+        reset_count: lineage.reset_count,
+        chain_origin: lineage.chain_origin.clone(),
+        covers_full_history: lineage.chain_covers_full_history(),
+    })
 }
 
 /// Fails closed unless the freshly written backup passes byte-level restore

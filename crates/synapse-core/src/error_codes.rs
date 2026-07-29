@@ -186,6 +186,14 @@ pub const STORAGE_SEARCH_REBUILD_IN_PROGRESS: &str = "STORAGE_SEARCH_REBUILD_IN_
 pub const STORAGE_BACKUP_IN_PROGRESS: &str = "STORAGE_BACKUP_IN_PROGRESS";
 pub const STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS: &str = "STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS";
 
+/// Scheduled vault verification returned a non-green verdict (#1687/#1679).
+///
+/// Raised by `hygiene operation=vault_verify` when the restore verifier, the
+/// provenance hash chain, the raw-write commitments, or the vault lineage
+/// journal failed. Never downgraded to a warning — a vault that cannot prove
+/// itself is the #1875 condition arriving quietly.
+pub const HYGIENE_VAULT_VERIFY_FAILED: &str = "SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED";
+
 // === Episodes (derived activity spans, issues #846/#847) ===
 pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
 

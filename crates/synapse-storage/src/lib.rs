@@ -789,6 +789,27 @@ impl Db {
         self.backend.verify_calyx_restore(vault_path)
     }
 
+    /// Runs the scheduled whole-vault verification against the **live** vault:
+    /// the read-only restore verifier plus the provenance hash-chain verifier,
+    /// both under the vault maintenance guard so a concurrent backup, erase, or
+    /// compaction pass cannot be misreported as corruption. The chain scan is
+    /// incremental over the newest `tail_entries` entries unless `full_chain` is
+    /// requested. Blocking CPU/IO work: drive it off the async MCP runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the maintenance guard is held, the vault is
+    /// unreadable, or the physical ledger cannot be read. A non-green verdict is
+    /// a normal report.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn verify_calyx_vault(
+        &self,
+        full_chain: bool,
+        tail_entries: u64,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxVaultVerifyReport> {
+        self.backend.verify_calyx_vault(full_chain, tail_entries)
+    }
+
     /// Verifies the live provenance-ledger hash chain against the exact stored
     /// bytes, fail-closed. `range` is an optional half-open `(from_seq, to_seq)`
     /// window; `None` verifies the full chain. This is CPU/IO-heavy over the

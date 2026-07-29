@@ -2076,6 +2076,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to an explicit maintenance profile before persisting MMD drift findings",
             ),
+            op(
+                "vault_verify",
+                false,
+                false,
+                "live Calyx vault SST/WAL bytes + physical CF_LEDGER hash chain + vault lineage journal",
+                Some(
+                    "restore-verifier counts, chain verdict over the verified window, and lineage generation/origin",
+                ),
+                error_codes::HYGIENE_VAULT_VERIFY_FAILED,
+                "stop writers, preserve the vault directory and its lineage journal, and restore from a verified backup before trusting any read from this vault",
+            ),
         ],
     ),
     facade_contract(

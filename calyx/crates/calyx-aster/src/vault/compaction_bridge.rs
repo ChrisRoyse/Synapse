@@ -769,6 +769,23 @@ where
         Ok(())
     }
 
+    /// Runs `f` while holding the cross-process maintenance guard that
+    /// compaction, GC, tombstone purge, backup, and erase already serialize on.
+    ///
+    /// Exposed so an embedder can make a *read-only* whole-vault scan mutually
+    /// exclusive with those mutating passes: a verifier that re-derives SST and
+    /// WAL bytes while a compaction pass rewrites them would report a torn tree
+    /// as corruption. Admission is non-blocking, so an already-active pass
+    /// surfaces immediately as backpressure instead of queueing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the guard's backpressure error when a maintenance pass is already
+    /// active, or whatever `f` returns.
+    pub fn with_maintenance_guard<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_native_compaction_guard(f)
+    }
+
     pub(crate) fn with_native_compaction_guard<T>(
         &self,
         f: impl FnOnce() -> Result<T>,

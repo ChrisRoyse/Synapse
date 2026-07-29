@@ -63,6 +63,7 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("grounding_gap", params.grounding_gap.is_some()),
             ("blind_spot", params.blind_spot.is_some()),
             ("drift", params.drift.is_some()),
+            ("vault_verify", params.vault_verify.is_some()),
         ],
     )
 }
