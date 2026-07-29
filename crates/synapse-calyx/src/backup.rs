@@ -8,8 +8,12 @@
 //! 1. Barrier the WAL group-committer so every accepted write is durable.
 //! 2. Enforce vault residency: a pinned dataset refuses an off-dataset target
 //!    (`CALYX_RESIDENCY_VIOLATION`) unless the pin explicitly allows it.
-//! 3. Copy the sacred vault state under the native-compaction guard at a
-//!    consistent `durable_seq` into `<target>/vault`.
+//! 3. Pin the vault's `CURRENT` manifest generation and copy the sacred vault
+//!    state that snapshot names, under the native-compaction guard, at a
+//!    consistent `durable_seq` into `<target>/vault`. The live daemon rotates a
+//!    manifest generation every few seconds, so the copy is defined by the
+//!    pinned snapshot rather than by a directory listing — a listing-based copy
+//!    of a live vault loses that race eventually and certainly.
 //! 4. Immediately re-derive the copy with `verify_restore` and refuse to publish
 //!    a manifest for a backup whose ledger chain does not verify or whose sacred
 //!    rows do not read back — a green report is the backup's proof of integrity.
@@ -98,6 +102,40 @@ pub struct SynapseCalyxBackupExclusion {
     pub reason: String,
 }
 
+/// One entry that was enumerated in the source vault, found absent when the copy
+/// reached it, and tolerated on a stated justification.
+///
+/// A restore operator must be able to tell "this file is not here because the
+/// live vault legitimately reclaimed it and nothing in the restored vault can
+/// reach it" from "this file is not here and nobody looked". Only the first is
+/// ever recorded here; everything else fails the backup closed.
+#[derive(Debug, Clone, Serialize)]
+pub struct SynapseCalyxBackupToleratedAbsence {
+    pub relative_path: String,
+    pub reason: String,
+}
+
+/// The `CURRENT`-pinned manifest snapshot this backup restores to.
+///
+/// The live vault rotates its manifest generations continuously, so a backup
+/// that enumerated the directory and then copied what it enumerated would
+/// eventually always lose that race. The snapshot is pinned at one publication
+/// boundary instead, and this records which point the backup is.
+#[derive(Debug, Clone, Serialize)]
+pub struct SynapseCalyxBackupPinnedManifest {
+    pub pointer: String,
+    pub manifest_seq: u64,
+    pub durable_seq: u64,
+    pub generations_retained: u64,
+    /// Vault-relative assets the pinned generation references. All were copied;
+    /// any absence would have failed the backup.
+    pub referenced_paths: Vec<String>,
+    /// Where `CURRENT` had moved to by the end of the copy, when it moved. The
+    /// pinned snapshot stays valid and is not retaken: restoring to a slightly
+    /// older consistent point is what a backup is.
+    pub current_advanced_to: Option<String>,
+}
+
 /// The vault lineage journal captured beside the backup, with the identity it
 /// attests. Without this a backup proves only that *some* vault restored, never
 /// *which* one (#1875).
@@ -141,8 +179,73 @@ pub struct SynapseCalyxBackupReport {
     pub files: Vec<SynapseCalyxBackupFile>,
     /// Runtime artifacts present in the source vault and deliberately skipped.
     pub excluded_runtime: Vec<SynapseCalyxBackupExclusion>,
+    /// The consistent point this backup pins, absent only for a vault that has
+    /// never published a manifest.
+    pub pinned_manifest: Option<SynapseCalyxBackupPinnedManifest>,
+    /// Entries that vanished between enumeration and copy and were tolerated by
+    /// name and stated justification. Empty on a quiescent vault.
+    pub tolerated_absences: Vec<SynapseCalyxBackupToleratedAbsence>,
     pub lineage: SynapseCalyxBackupLineage,
     pub verify: SynapseCalyxVerifyReport,
+}
+
+/// The substrate copy report translated into Synapse-typed values, so the
+/// operator-facing flow stays a sequence of named steps rather than a field map.
+pub(crate) struct CopiedVaultState {
+    pub(crate) source_vault_dir: PathBuf,
+    pub(crate) durable_seq: u64,
+    pub(crate) file_count: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) files: Vec<SynapseCalyxBackupFile>,
+    pub(crate) excluded_runtime: Vec<SynapseCalyxBackupExclusion>,
+    pub(crate) pinned_manifest: Option<SynapseCalyxBackupPinnedManifest>,
+    pub(crate) tolerated_absences: Vec<SynapseCalyxBackupToleratedAbsence>,
+}
+
+impl CopiedVaultState {
+    pub(crate) fn from_aster(report: calyx_aster::vault::AsterBackupReport) -> Self {
+        Self {
+            source_vault_dir: report.source_vault_dir,
+            durable_seq: report.durable_seq,
+            file_count: report.file_count,
+            total_bytes: report.total_bytes,
+            files: report
+                .files
+                .into_iter()
+                .map(|file| SynapseCalyxBackupFile {
+                    relative_path: file.relative_path,
+                    len_bytes: file.len_bytes,
+                    sha256: file.sha256,
+                })
+                .collect(),
+            excluded_runtime: report
+                .excluded_runtime
+                .into_iter()
+                .map(|entry| SynapseCalyxBackupExclusion {
+                    relative_path: entry.relative_path,
+                    reason: entry.reason.to_owned(),
+                })
+                .collect(),
+            pinned_manifest: report
+                .pinned_manifest
+                .map(|pin| SynapseCalyxBackupPinnedManifest {
+                    pointer: pin.pointer,
+                    manifest_seq: pin.manifest_seq,
+                    durable_seq: pin.durable_seq,
+                    generations_retained: pin.generations_retained as u64,
+                    referenced_paths: pin.referenced_paths,
+                    current_advanced_to: pin.current_advanced_to,
+                }),
+            tolerated_absences: report
+                .tolerated_absences
+                .into_iter()
+                .map(|entry| SynapseCalyxBackupToleratedAbsence {
+                    relative_path: entry.relative_path,
+                    reason: entry.reason.to_owned(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Manifest bytes written to `<target>/backup_manifest.json`. Kept separate from
@@ -161,7 +264,9 @@ struct BackupManifest<'a> {
     residency_enforced: bool,
     verify: &'a SynapseCalyxVerifyReport,
     lineage: &'a SynapseCalyxBackupLineage,
+    pinned_manifest: Option<&'a SynapseCalyxBackupPinnedManifest>,
     excluded_runtime: &'a [SynapseCalyxBackupExclusion],
+    tolerated_absences: &'a [SynapseCalyxBackupToleratedAbsence],
     files: &'a [SynapseCalyxBackupFile],
 }
 
@@ -170,12 +275,18 @@ struct BackupManifest<'a> {
 /// * `1` — per-file SHA-256 digests, consistent point, verify report.
 /// * `2` — adds the `lineage` object (the vault identity the backup restores)
 ///   and `excluded_runtime` (the runtime artifacts deliberately not copied).
+/// * `3` — adds `pinned_manifest` (the exact `CURRENT` generation the backup is
+///   a snapshot of, and everything it references) and `tolerated_absences` (what
+///   vanished mid-copy and on what justification it was survivable).
 ///
 /// Bumped rather than extended in place for the same reason `PostgreSQL` moved its
 /// backup manifest to version `2` when it added `System-Identifier`: a reader
 /// must be able to tell a manifest that *asserts* an identity from one that
-/// merely never recorded it.
-const MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// merely never recorded it. The same argument applies to a tolerated absence: a
+/// v2 manifest is silent about mid-copy rotation because it could not survive
+/// one, and a v3 manifest with an empty `tolerated_absences` is a positive
+/// assertion that nothing vanished.
+const MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Runs the read-only aster restore verifier over a vault directory and maps its
 /// report into the Synapse-typed structure.
@@ -226,7 +337,9 @@ pub(crate) fn write_manifest(
         residency_enforced: report.residency_enforced,
         verify: &report.verify,
         lineage: &report.lineage,
+        pinned_manifest: report.pinned_manifest.as_ref(),
         excluded_runtime: &report.excluded_runtime,
+        tolerated_absences: &report.tolerated_absences,
         files: &report.files,
     };
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {

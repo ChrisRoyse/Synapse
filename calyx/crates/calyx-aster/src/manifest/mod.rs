@@ -17,11 +17,19 @@ use std::path::{Component, Path, PathBuf};
 
 use error::{format_version_unsupported, storage_error};
 
-const CURRENT_FILE: &str = "CURRENT";
-const MANIFEST_FILE: &str = "MANIFEST";
+/// Pointer file naming the immutable manifest generation a vault opens from.
+pub const CURRENT_FILE: &str = "CURRENT";
+/// Mirror of the generation `CURRENT` names, rewritten by every publication.
+pub const MANIFEST_FILE: &str = "MANIFEST";
 const MANIFEST_PREFIX: &str = "manifest-";
 const MANIFEST_SUFFIX: &str = ".json";
-const MANIFEST_GENERATIONS_RETAINED: usize = 32;
+/// Size of the rolling window of immutable manifest generations kept on disk.
+///
+/// Every publication reclaims the oldest generation beyond this window, so on a
+/// vault that checkpoints continuously a manifest file is *deleted* on the same
+/// cadence as the checkpoint. Anything that enumerates the vault directory and
+/// then reads what it enumerated must treat that deletion as normal operation.
+pub const MANIFEST_GENERATIONS_RETAINED: usize = 32;
 const SUPPORTED_MANIFEST_MAJOR: u16 = 1;
 const SUPPORTED_MANIFEST_MINOR: u16 = 0;
 /// Watermark model 3 tracks the exact panel generation whose persistent-search
@@ -404,6 +412,125 @@ impl ManifestStore {
         self.write_current(&manifest)?;
         Ok(manifest)
     }
+
+    /// Pins the `CURRENT` generation together with the exact bytes that
+    /// published it.
+    ///
+    /// Taken under the same `locks/manifest.publish.lock` that
+    /// [`Self::write_current`] holds, so `CURRENT` and the immutable generation
+    /// it names are read out of one publication state: a concurrent publish is
+    /// serialized wholly before or wholly after the pin, never through the
+    /// middle of it. Without that boundary a reader can observe `CURRENT`
+    /// naming generation *n* and then read a `MANIFEST` mirror already
+    /// rewritten to *n+1*.
+    ///
+    /// The pinned bytes are held in memory precisely because the on-disk
+    /// generation is *not* permanent: the rolling
+    /// [`MANIFEST_GENERATIONS_RETAINED`] window reclaims it once that many
+    /// further generations publish. A consumer that copies the file later,
+    /// rather than the bytes now, is racing a clock it will eventually lose.
+    ///
+    /// Returns `Ok(None)` for a vault that has never published a manifest.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when `CURRENT` is unreadable or does not name a well-formed
+    /// immutable generation, when that generation is unreadable or invalid, or
+    /// when any immutable ref it names is missing or hash-divergent.
+    pub fn pin_current(&self) -> Result<Option<PinnedManifest>> {
+        let current_path = self.vault_dir.join(CURRENT_FILE);
+        if !current_path.exists() {
+            return Ok(None);
+        }
+        let lock_dir = self.vault_dir.join("locks");
+        fs::create_dir_all(&lock_dir).map_err(|error| {
+            storage_error("create vault manifest lock directory", &lock_dir, error)
+        })?;
+        let _publish_guard =
+            crate::file_lock::FileLockGuard::acquire(&lock_dir.join("manifest.publish.lock"))?;
+        let current_bytes = fs::read(&current_path).map_err(|error| {
+            storage_error(
+                "read CURRENT to pin a manifest snapshot",
+                &current_path,
+                error,
+            )
+        })?;
+        let pointer = std::str::from_utf8(&current_bytes)
+            .map_err(|error| CalyxError::aster_corrupt_shard(format!("CURRENT utf8: {error}")))?
+            .trim()
+            .to_owned();
+        let Some(manifest_seq) = manifest_generation_seq(&pointer) else {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "CURRENT {} does not name an immutable manifest generation: expected \
+                 {MANIFEST_PREFIX}<20 digits>{MANIFEST_SUFFIX}, found {pointer:?}",
+                current_path.display()
+            )));
+        };
+        let manifest_path = self.vault_dir.join(&pointer);
+        let manifest_bytes = fs::read(&manifest_path).map_err(|error| {
+            storage_error("read pinned manifest generation", &manifest_path, error)
+        })?;
+        let manifest = decode_manifest(&manifest_bytes)?;
+        verify_immutable_refs(&self.vault_dir, &manifest)?;
+        Ok(Some(PinnedManifest {
+            current_bytes,
+            pointer,
+            manifest_seq,
+            manifest_bytes,
+            manifest,
+        }))
+    }
+}
+
+/// One `CURRENT` manifest generation captured as bytes, not as a file path.
+///
+/// This is the Aster analogue of the live-file set a RocksDB checkpoint takes
+/// from `GetLiveFilesStorageInfo`: the authoritative pointer, the generation it
+/// names, and everything that generation references, all resolved at one instant
+/// so a later copy cannot mix two snapshots.
+#[derive(Debug, Clone)]
+pub struct PinnedManifest {
+    /// Exact `CURRENT` bytes at pin time, reproduced verbatim by a consumer that
+    /// materializes this snapshot.
+    pub current_bytes: Vec<u8>,
+    /// `CURRENT`'s trimmed target, e.g. `manifest-00000000000000004577.json`.
+    pub pointer: String,
+    /// Immutable generation number parsed from [`Self::pointer`].
+    pub manifest_seq: u64,
+    /// Exact bytes of the pinned generation, which are also the exact bytes of
+    /// the `MANIFEST` mirror at pin time.
+    pub manifest_bytes: Vec<u8>,
+    /// The decoded generation. Its immutable refs were read back and
+    /// hash-verified while the pin was held.
+    pub manifest: VaultManifest,
+}
+
+impl PinnedManifest {
+    /// Vault-relative logical paths this generation references.
+    ///
+    /// A restore reads `CURRENT`, so these are exactly the assets the restored
+    /// vault needs to open. Each is mandatory: absence is corruption, never a
+    /// tolerable race.
+    #[must_use]
+    pub fn referenced_paths(&self) -> Vec<String> {
+        let mut paths = vec![self.manifest.panel_ref.logical_path.clone()];
+        if let Some(reference) = &self.manifest.registry_ref {
+            paths.push(reference.logical_path.clone());
+        }
+        for reference in &self.manifest.codebook_refs {
+            paths.push(reference.logical_path.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+/// Immutable generation number of a `manifest-<20 digits>.json` file name, or
+/// `None` when the name is not an immutable manifest generation.
+#[must_use]
+pub fn manifest_generation_seq(name: &str) -> Option<u64> {
+    manifest_sequence_from_filename(name)
 }
 
 /// Files produced by an atomic manifest swap.

@@ -3500,38 +3500,24 @@ impl SynapseCalyxVault {
         // 5. Capture vault identity. The lineage journal lives outside the vault
         //    directory by design, so the tree copy cannot reach it.
         let lineage = backup::capture_lineage(target_root, &self.lineage)?;
-        let files = aster_report
-            .files
-            .into_iter()
-            .map(|file| SynapseCalyxBackupFile {
-                relative_path: file.relative_path,
-                len_bytes: file.len_bytes,
-                sha256: file.sha256,
-            })
-            .collect();
-        let excluded_runtime = aster_report
-            .excluded_runtime
-            .into_iter()
-            .map(|entry| SynapseCalyxBackupExclusion {
-                relative_path: entry.relative_path,
-                reason: entry.reason.to_owned(),
-            })
-            .collect();
+        let copied = backup::CopiedVaultState::from_aster(aster_report);
         let mut report = SynapseCalyxBackupReport {
             vault_id: self.vault.vault_id().to_string(),
-            source_vault_dir: aster_report.source_vault_dir,
+            source_vault_dir: copied.source_vault_dir,
             target_root: target_root.to_path_buf(),
             backup_vault_dir,
             manifest_path: PathBuf::new(),
             manifest_sha256: String::new(),
-            durable_seq: aster_report.durable_seq,
+            durable_seq: copied.durable_seq,
             latest_seq,
             include_regenerable,
-            file_count: aster_report.file_count,
-            total_bytes: aster_report.total_bytes,
+            file_count: copied.file_count,
+            total_bytes: copied.total_bytes,
             residency_enforced,
-            files,
-            excluded_runtime,
+            files: copied.files,
+            excluded_runtime: copied.excluded_runtime,
+            pinned_manifest: copied.pinned_manifest,
+            tolerated_absences: copied.tolerated_absences,
             lineage,
             verify,
         };
@@ -3554,6 +3540,16 @@ impl SynapseCalyxVault {
             lineage_chain_origin = %report.lineage.chain_origin,
             covers_full_history = report.lineage.covers_full_history,
             excluded_runtime_count = report.excluded_runtime.len(),
+            pinned_manifest = report
+                .pinned_manifest
+                .as_ref()
+                .map_or("<none>", |pin| pin.pointer.as_str()),
+            current_advanced_to = report
+                .pinned_manifest
+                .as_ref()
+                .and_then(|pin| pin.current_advanced_to.as_deref())
+                .unwrap_or("<unchanged>"),
+            tolerated_absence_count = report.tolerated_absences.len(),
             "completed durable Calyx vault backup and restore verification"
         );
         Ok(report)
