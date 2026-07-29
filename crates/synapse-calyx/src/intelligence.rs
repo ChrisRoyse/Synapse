@@ -14,11 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use calyx_assay::{
     AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, DEFAULT_TE_LAGS,
     Direction, EstimatorKind, InterEventHazardReport, MiEstimate, MmdConfig, PeriodogramConfig,
-    RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution, TEResult, TrustTag, autocorrelation,
-    bin_event_counts, bits_report_with_anchor, entropy_bits, inter_event_hazard_with_alpha,
-    ksg_mi_continuous_discrete, lomb_scargle_with_config, mmd_change_point,
-    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution,
-    recurrence_rate_cusum, stable_rank, transfer_entropy_sweep,
+    RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport, TEResult, TrustTag,
+    autocorrelation, bin_event_counts, bits_report_with_anchor, entropy_bits,
+    inter_event_hazard_with_alpha, ksg_mi_continuous_discrete, lomb_scargle_with_config,
+    mmd_change_point, panel_sufficiency_with_anchor, partitioned_histogram_nmi,
+    per_sensor_attribution, recurrence_rate_cusum, stable_rank, synergy_pair, synergy_report,
+    transfer_entropy_sweep, unmeasured_synergy_pair,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
@@ -34,7 +35,7 @@ use calyx_lodestar::{
 };
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
-    StaticPairGainGate, plan_cross_terms,
+    StaticPairGainGate, cross_term_upper_bound, dda_signal_yield, plan_cross_terms,
 };
 use calyx_paths::AssocGraph;
 use num_traits::ToPrimitive;
@@ -50,6 +51,14 @@ pub const SYNAPSE_INTELLIGENCE_MAX_RECORDS: usize = 20_000;
 pub const SYNAPSE_KNN_DEFAULT_K: usize = 8;
 /// Global cap on persisted between-record kNN edges per weave pass.
 pub const SYNAPSE_KNN_MAX_EDGES: usize = 200_000;
+/// Cap on the number of blind-spot lens pairs listed in one weave report.
+pub const SYNAPSE_WEAVE_MAX_BLIND_SPOTS: usize = 32;
+/// Structured code raised when an intelligence time window is empty/inverted.
+pub const SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID: &str =
+    "SYNAPSE_CALYX_INTELLIGENCE_TIME_RANGE_INVALID";
+/// Structured code raised when a synergy pass is asked for an anchor no record
+/// in the panel carries.
+pub const SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS: &str = "SYNAPSE_CALYX_SYNERGY_NO_ANCHORED_RECORDS";
 
 const GRAPH_AGREEMENT_PREFIX: &[u8; 5] = b"GAGR1";
 const GRAPH_KNN_PREFIX: &[u8; 5] = b"GKNN1";
@@ -61,6 +70,12 @@ pub struct SynapseCalyxWeaveParams {
     pub max_records: usize,
     pub knn_k: usize,
     pub cache_capacity: usize,
+    /// Inclusive lower bound on a record's server-stamped `created_at`, in Unix
+    /// nanoseconds. `None` leaves the window open at that end.
+    pub since_ts_ns: Option<i64>,
+    /// Exclusive upper bound on a record's server-stamped `created_at`, in Unix
+    /// nanoseconds. `None` leaves the window open at that end.
+    pub until_ts_ns: Option<i64>,
 }
 
 impl SynapseCalyxWeaveParams {
@@ -71,7 +86,58 @@ impl SynapseCalyxWeaveParams {
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             knn_k: SYNAPSE_KNN_DEFAULT_K,
             cache_capacity: 4_096,
+            since_ts_ns: None,
+            until_ts_ns: None,
         }
+    }
+}
+
+/// Half-open `[since, until)` filter over a record's server-stamped
+/// `created_at`, expressed in Unix nanoseconds.
+///
+/// Calyx stamps `Constellation::created_at` in Unix **milliseconds**
+/// (`calyx_core::Ts`), so the comparison is done in nanoseconds against
+/// `created_at * 1_000_000`: a record is in the window iff
+/// `since <= created_at_ns < until`. Sub-millisecond bounds therefore select
+/// exactly the millisecond ticks they contain — no rounding, no ambiguity.
+#[derive(Clone, Copy, Debug, Default)]
+struct TimeWindowNs {
+    since: Option<i64>,
+    until: Option<i64>,
+}
+
+impl TimeWindowNs {
+    /// Builds the window, failing closed on an empty or inverted range rather
+    /// than silently returning zero records.
+    fn new(since: Option<i64>, until: Option<i64>) -> Result<Self, SynapseCalyxError> {
+        if let (Some(since), Some(until)) = (since, until)
+            && since >= until
+        {
+            return Err(SynapseCalyxError::new(
+                SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID,
+                format!(
+                    "intelligence time range is empty: since_ts_ns={since} must be strictly less \
+                     than until_ts_ns={until}"
+                ),
+                "pass a half-open [since_ts_ns, until_ts_ns) window with since < until, or omit \
+                 one bound to leave that end open",
+            ));
+        }
+        Ok(Self { since, until })
+    }
+
+    /// True when a `created_at` stamp (Unix milliseconds) falls in the window.
+    fn contains_created_at_ms(self, created_at_ms: u64) -> bool {
+        let Some(stamp_ns) = i64::try_from(created_at_ms)
+            .ok()
+            .and_then(|millis| millis.checked_mul(1_000_000))
+        else {
+            // A stamp that cannot be expressed in nanoseconds cannot be placed
+            // in the window; an open window still admits it.
+            return self.since.is_none() && self.until.is_none();
+        };
+        self.since.is_none_or(|since| stamp_ns >= since)
+            && self.until.is_none_or(|until| stamp_ns < until)
     }
 }
 
@@ -117,11 +183,32 @@ pub struct SynapseCalyxAbundanceReport {
     pub measured_count: usize,
     pub derived_count: usize,
     pub meaning_compression_yield: f32,
+    /// DDA signal yield `n * (N + C(N,2) + 1)`: the derived signals a corpus of
+    /// `n` inputs over `N` lenses can carry — every lens, every lens pair, and
+    /// the whole-constellation term, per input.
+    pub dda_signal_yield: usize,
     pub n_eff: SynapseCalyxNeffEstimate,
     pub dpi_ceiling_bits: Option<f32>,
     pub dpi_ceiling_provisional: bool,
+    /// Anchor kind whose persisted Assay bits pass produced the computed DPI
+    /// ceiling; `None` while the ceiling is still provisional.
+    pub dpi_ceiling_anchor_kind: Option<String>,
     pub xterm_cf_rows: usize,
     pub graph_cf_rows: usize,
+}
+
+/// One *coverage* blind spot in a woven panel: a lens pair that never co-occurs
+/// on any measured record, so no cross-term over it can ever be materialized.
+///
+/// This is a structural gap in what the weave could see. It is a different
+/// quantity from the drift module's `SynapseCalyxBlindSpotAlert`, which flags a
+/// per-record disagreement between two lenses that *did* both fire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxWeaveBlindSpotPair {
+    pub slot_a: u16,
+    pub slot_b: u16,
+    pub records_with_a: usize,
+    pub records_with_b: usize,
 }
 
 /// Result of one bounded Loom weave pass with physical CF readbacks.
@@ -136,6 +223,30 @@ pub struct SynapseCalyxWeaveReport {
     pub between_record_edges_persisted: usize,
     pub xterm_cf_rows_after: usize,
     pub graph_cf_rows_after: usize,
+    /// Effective half-open time window applied to `Base` rows, echoed back.
+    pub since_ts_ns: Option<i64>,
+    pub until_ts_ns: Option<i64>,
+    /// Panel rows the time window excluded from this pass.
+    pub records_outside_window: usize,
+    /// DDA signal yield `n * (N + C(N,2) + 1)` for the woven corpus.
+    pub dda_signal_yield: usize,
+    /// Lens pairs the panel can express, `C(N,2)`.
+    pub lens_pairs_possible: usize,
+    /// Lens pairs that co-occur on at least one measured record.
+    pub lens_pairs_co_present: usize,
+    /// Lens pairs that never co-occur, so no cross-term over them can exist.
+    pub blind_spot_pairs: usize,
+    /// `blind_spot_pairs / lens_pairs_possible`; `0.0` when `N < 2`.
+    pub blind_spot_fraction: f32,
+    /// Measured records carrying fewer than two lenses: they contribute a lens
+    /// reading but no within-record cross-term at all.
+    pub blind_spot_records: usize,
+    /// Lenses present on no measured record in the window, i.e. contributing
+    /// nothing to this weave.
+    pub blind_spot_slots: Vec<u16>,
+    /// The blind lens pairs themselves, capped at
+    /// [`SYNAPSE_WEAVE_MAX_BLIND_SPOTS`] and ordered by slot id.
+    pub blind_spot_pair_details: Vec<SynapseCalyxWeaveBlindSpotPair>,
     pub agreement_edges: Vec<SynapseCalyxAgreementEdge>,
     pub abundance: SynapseCalyxAbundanceReport,
 }
@@ -164,8 +275,12 @@ impl SynapseCalyxVault {
         let max_records = params
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
-        let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
+        let window = TimeWindowNs::new(params.since_ts_ns, params.until_ts_ns)?;
+        let corpus =
+            self.load_panel_dense_corpus_in_window(params.panel_version, max_records, window)?;
         let records_scanned = corpus.records_scanned;
+        let records_outside_window = corpus.records_outside_window;
+        let blind_spots = blind_spot_summary(&corpus);
 
         let mut store = LoomStore::new(params.cache_capacity.max(1));
         // interaction eager iff pair-gain >= bit floor; without grounded anchors
@@ -262,7 +377,7 @@ impl SynapseCalyxVault {
         let xterm_cf_rows_after = self.scan_cf_latest(ColumnFamily::XTerm)?.len();
         let graph_cf_rows_after = self.scan_cf_latest(ColumnFamily::Graph)?.len();
 
-        let abundance = build_abundance_report(
+        let abundance = self.build_abundance_report(
             params.panel_version,
             lens_ids.len(),
             corpus.records.len(),
@@ -271,7 +386,7 @@ impl SynapseCalyxVault {
             cross_terms_materialized,
             xterm_cf_rows_after,
             graph_cf_rows_after,
-        );
+        )?;
 
         Ok(SynapseCalyxWeaveReport {
             panel_version: params.panel_version,
@@ -283,6 +398,17 @@ impl SynapseCalyxVault {
             between_record_edges_persisted: between_record_edges.len(),
             xterm_cf_rows_after,
             graph_cf_rows_after,
+            since_ts_ns: params.since_ts_ns,
+            until_ts_ns: params.until_ts_ns,
+            records_outside_window,
+            dda_signal_yield: dda_signal_yield(corpus.records.len(), lens_ids.len()),
+            lens_pairs_possible: blind_spots.pairs_possible,
+            lens_pairs_co_present: blind_spots.pairs_co_present,
+            blind_spot_pairs: blind_spots.blind_pairs,
+            blind_spot_fraction: blind_spots.blind_fraction,
+            blind_spot_records: blind_spots.records_without_pair,
+            blind_spot_slots: blind_spots.dark_slots,
+            blind_spot_pair_details: blind_spots.blind_pair_details,
             agreement_edges,
             abundance,
         })
@@ -312,7 +438,7 @@ impl SynapseCalyxVault {
         }
         let xterm_cf_rows = self.scan_cf_latest(ColumnFamily::XTerm)?.len();
         let graph_cf_rows = self.scan_cf_latest(ColumnFamily::Graph)?.len();
-        Ok(build_abundance_report(
+        self.build_abundance_report(
             panel_version,
             lens_ids.len(),
             corpus.records.len(),
@@ -321,23 +447,152 @@ impl SynapseCalyxVault {
             xterm_cf_rows,
             xterm_cf_rows,
             graph_cf_rows,
-        ))
+        )
     }
 
-    /// Scans the `Base` CF once and returns the dense-slot corpus for a panel.
+    /// Assembles the abundance report, reading the DPI ceiling back out of the
+    /// physical Assay CF.
+    ///
+    /// The ceiling is the total grounded bits a completed bits pass measured
+    /// over this panel's lenses: by the data-processing inequality no derived
+    /// cross-term over those lenses can carry more information about the outcome
+    /// than the lenses themselves do (Cover & Thomas; `I(f(X);Y) <= I(X;Y)`).
+    /// With no bits pass on record the ceiling stays `Provisional` — it is never
+    /// guessed.
+    #[allow(clippy::too_many_arguments)]
+    fn build_abundance_report(
+        &self,
+        panel_version: u32,
+        n_lenses: usize,
+        n_constellations: usize,
+        materialized: usize,
+        measured_count: usize,
+        derived_count: usize,
+        xterm_cf_rows: usize,
+        graph_cf_rows: usize,
+    ) -> Result<SynapseCalyxAbundanceReport, SynapseCalyxError> {
+        let measured_ceiling = self.measured_dpi_ceiling(panel_version)?;
+        let dpi_ceiling = measured_ceiling.as_ref().map_or(
+            CeilingEstimate::Provisional { bits: 0.0 },
+            |ceiling| CeilingEstimate::Computed {
+                bits: ceiling.total_bits,
+            },
+        );
+        // The effective rank still requires an anchored redundancy pass; it is
+        // reported provisional here rather than faked.
+        let report = AbundanceReport::new(
+            n_lenses,
+            n_constellations,
+            materialized,
+            NeffEstimate::Provisional { value: 0.0 },
+            dpi_ceiling,
+            measured_count,
+            derived_count,
+        );
+        let (dpi_ceiling_bits, dpi_ceiling_provisional) = match report.dpi_ceiling {
+            CeilingEstimate::Computed { bits } => (Some(bits), false),
+            CeilingEstimate::Provisional { .. } => (None, true),
+        };
+        Ok(SynapseCalyxAbundanceReport {
+            panel_version,
+            n_lenses: report.n_lenses,
+            n_constellations: report.n_constellations,
+            c_n2_upper_bound: report.c_n2_upper_bound,
+            materialized: report.materialized,
+            measured_count: report.measured_count,
+            derived_count: report.derived_count,
+            meaning_compression_yield: report.meaning_compression_yield,
+            dda_signal_yield: dda_signal_yield(report.n_constellations, report.n_lenses),
+            n_eff: neff_estimate(&report.n_eff),
+            dpi_ceiling_bits,
+            dpi_ceiling_provisional,
+            dpi_ceiling_anchor_kind: measured_ceiling.map(|ceiling| ceiling.anchor_kind),
+            xterm_cf_rows,
+            graph_cf_rows,
+        })
+    }
+
+    /// Reads the physical Assay CF back and returns the largest completed
+    /// per-lens bits total recorded for this panel, with the anchor kind it was
+    /// measured against. `None` when no bits pass has run for the panel.
+    fn measured_dpi_ceiling(
+        &self,
+        panel_version: u32,
+    ) -> Result<Option<MeasuredCeiling>, SynapseCalyxError> {
+        let store = AssayStore::load_from_vault(&self.vault)
+            .map_err(|error| loom_math_error("load persisted Assay rows", &error))?;
+        // One bits pass writes one Lens row per measurable lens under a single
+        // cache key (panel + corpus shard + vault + anchor kind), so summing per
+        // cache key reproduces that pass's `total_bits` exactly. Panels measured
+        // against several anchors keep the largest total: the tightest bound the
+        // vault can actually prove.
+        let mut totals: BTreeMap<(String, u32), f32> = BTreeMap::new();
+        for row in store.rows() {
+            if row.cache_key.panel_version != panel_version
+                || row.cache_key.corpus_shard != ASSAY_CORPUS_SHARD
+                || !matches!(row.subject, AssaySubject::Lens { .. })
+                || row.estimate.estimator != EstimatorKind::Ksg
+            {
+                continue;
+            }
+            let anchor_kind = crate::grounding::anchor_kind_label(&row.cache_key.anchor);
+            *totals.entry((anchor_kind, panel_version)).or_default() += row.estimate.bits;
+        }
+        Ok(totals
+            .into_iter()
+            .max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.0.cmp(&right.0))
+            })
+            .map(|((anchor_kind, _), total_bits)| MeasuredCeiling {
+                anchor_kind,
+                total_bits,
+            }))
+    }
+
+    /// Scans the `Base` CF once and returns the dense-slot corpus for a panel,
+    /// restricted to the requested `created_at` window.
     fn load_panel_dense_corpus(
         &self,
         panel_version: u32,
         max_records: usize,
     ) -> Result<DenseCorpus, SynapseCalyxError> {
+        self.load_panel_dense_corpus_in_window(panel_version, max_records, TimeWindowNs::default())
+    }
+
+    /// Scans the `Base` CF once and returns the dense-slot corpus for a panel.
+    ///
+    /// `panel_dense_slots` records every dense lens the panel carries across all
+    /// scanned rows — including rows outside the window — so a lens that is dark
+    /// inside the window is reportable as a blind spot instead of silently
+    /// vanishing from the lens count.
+    fn load_panel_dense_corpus_in_window(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+        window: TimeWindowNs,
+    ) -> Result<DenseCorpus, SynapseCalyxError> {
         let rows = self.scan_cf_latest(ColumnFamily::Base)?;
         let mut records = Vec::new();
         let mut records_scanned = 0usize;
+        let mut records_outside_window = 0usize;
+        let mut panel_dense_slots: BTreeSet<SlotId> = BTreeSet::new();
         for (_, value) in rows {
             let constellation = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
             })?;
             if constellation.panel_version != panel_version {
+                continue;
+            }
+            for (slot, vector) in &constellation.slots {
+                if matches!(vector, SlotVector::Dense { .. }) {
+                    panel_dense_slots.insert(*slot);
+                }
+            }
+            if !window.contains_created_at_ms(constellation.created_at) {
+                records_outside_window += 1;
                 continue;
             }
             records_scanned += 1;
@@ -349,6 +604,8 @@ impl SynapseCalyxVault {
         Ok(DenseCorpus {
             records,
             records_scanned,
+            records_outside_window,
+            panel_dense_slots,
         })
     }
 
@@ -423,6 +680,10 @@ impl DenseRecord {
 struct DenseCorpus {
     records: Vec<DenseRecord>,
     records_scanned: usize,
+    /// Panel rows excluded by the `created_at` window.
+    records_outside_window: usize,
+    /// Every dense lens the panel carries across all scanned rows.
+    panel_dense_slots: BTreeSet<SlotId>,
 }
 
 fn dense_vector(vector: &SlotVector) -> Option<Vec<f32>> {
@@ -477,42 +738,87 @@ fn append_slot_knn_edges(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_abundance_report(
-    panel_version: u32,
-    n_lenses: usize,
-    n_constellations: usize,
-    materialized: usize,
-    measured_count: usize,
-    derived_count: usize,
-    xterm_cf_rows: usize,
-    graph_cf_rows: usize,
-) -> SynapseCalyxAbundanceReport {
-    // The DPI ceiling and effective rank require grounded bits; without an
-    // anchored assay pass they are reported provisional (honest, never faked).
-    let report = AbundanceReport::new(
-        n_lenses,
-        n_constellations,
-        materialized,
-        NeffEstimate::Provisional { value: 0.0 },
-        CeilingEstimate::Provisional { bits: 0.0 },
-        measured_count,
-        derived_count,
-    );
-    SynapseCalyxAbundanceReport {
-        panel_version,
-        n_lenses: report.n_lenses,
-        n_constellations: report.n_constellations,
-        c_n2_upper_bound: report.c_n2_upper_bound,
-        materialized: report.materialized,
-        measured_count: report.measured_count,
-        derived_count: report.derived_count,
-        meaning_compression_yield: report.meaning_compression_yield,
-        n_eff: neff_estimate(&report.n_eff),
-        dpi_ceiling_bits: None,
-        dpi_ceiling_provisional: matches!(report.dpi_ceiling, CeilingEstimate::Provisional { .. }),
-        xterm_cf_rows,
-        graph_cf_rows,
+/// The DPI ceiling proven by a completed bits pass, with the anchor it was
+/// measured against.
+struct MeasuredCeiling {
+    anchor_kind: String,
+    total_bits: f32,
+}
+
+/// Blind-spot summary for one woven panel.
+struct BlindSpotSummary {
+    pairs_possible: usize,
+    pairs_co_present: usize,
+    blind_pairs: usize,
+    blind_fraction: f32,
+    records_without_pair: usize,
+    dark_slots: Vec<u16>,
+    blind_pair_details: Vec<SynapseCalyxWeaveBlindSpotPair>,
+}
+
+/// Computes which lens pairs never co-occur on a measured record (so no
+/// cross-term over them can ever exist), which lenses are dark inside the woven
+/// window, and how many records carry too few lenses to weave at all.
+#[allow(clippy::cast_precision_loss)]
+fn blind_spot_summary(corpus: &DenseCorpus) -> BlindSpotSummary {
+    let mut present_counts: BTreeMap<SlotId, usize> = BTreeMap::new();
+    let mut co_present: BTreeSet<(SlotId, SlotId)> = BTreeSet::new();
+    let mut records_without_pair = 0usize;
+    for record in &corpus.records {
+        let slots: Vec<SlotId> = record.slots.keys().copied().collect();
+        if slots.len() < 2 {
+            records_without_pair += 1;
+        }
+        for slot in &slots {
+            *present_counts.entry(*slot).or_default() += 1;
+        }
+        for (index, a) in slots.iter().enumerate() {
+            for b in &slots[index + 1..] {
+                co_present.insert((*a, *b));
+            }
+        }
+    }
+
+    let lenses: Vec<SlotId> = present_counts.keys().copied().collect();
+    let pairs_possible = cross_term_upper_bound(lenses.len());
+    let pairs_co_present = co_present.len();
+    let blind_pairs = pairs_possible.saturating_sub(pairs_co_present);
+    let mut blind_pair_details = Vec::new();
+    'outer: for (index, a) in lenses.iter().enumerate() {
+        for b in &lenses[index + 1..] {
+            if co_present.contains(&(*a, *b)) {
+                continue;
+            }
+            if blind_pair_details.len() >= SYNAPSE_WEAVE_MAX_BLIND_SPOTS {
+                break 'outer;
+            }
+            blind_pair_details.push(SynapseCalyxWeaveBlindSpotPair {
+                slot_a: a.get(),
+                slot_b: b.get(),
+                records_with_a: present_counts.get(a).copied().unwrap_or_default(),
+                records_with_b: present_counts.get(b).copied().unwrap_or_default(),
+            });
+        }
+    }
+    let dark_slots = corpus
+        .panel_dense_slots
+        .iter()
+        .filter(|slot| !present_counts.contains_key(*slot))
+        .map(|slot| slot.get())
+        .collect();
+
+    BlindSpotSummary {
+        pairs_possible,
+        pairs_co_present,
+        blind_pairs,
+        blind_fraction: if pairs_possible == 0 {
+            0.0
+        } else {
+            blind_pairs as f32 / pairs_possible as f32
+        },
+        records_without_pair,
+        dark_slots,
+        blind_pair_details,
     }
 }
 
@@ -601,6 +907,13 @@ pub const SYNAPSE_ASSAY_MIN_SAMPLES: usize = 50;
 pub const SYNAPSE_KSG_DEFAULT_K: usize = 4;
 /// Histogram bins for the pairwise normalized-MI redundancy sketch.
 pub const SYNAPSE_REDUNDANCY_NMI_BINS: usize = 8;
+/// Record cap for one synergy pass. Every pair costs three quadratic KSG
+/// estimates, so the synergy budget is deliberately tighter than the shared
+/// [`SYNAPSE_INTELLIGENCE_MAX_RECORDS`] ceiling.
+pub const SYNAPSE_SYNERGY_MAX_RECORDS: usize = 2_000;
+/// Lens cap for one synergy pass: the lenses with the highest marginal bits are
+/// paired, and the truncation is reported (`n_lenses` vs `lenses_paired`).
+pub const SYNAPSE_SYNERGY_MAX_LENSES: usize = 8;
 
 const ASSAY_CORPUS_SHARD: &str = "synapse-intelligence";
 
@@ -648,7 +961,15 @@ pub struct SynapseCalyxBitsReport {
     pub anchored_records: usize,
     pub distinct_outcomes: usize,
     pub total_bits: f32,
+    /// Assay trust tag: whether *this measurement* had enough paired samples.
+    /// Distinct from `domain_provisional`, which is about anchor coverage.
     pub grounded: bool,
+    /// Control-doctrine marker (#1670): the domain's grounded anchor coverage is
+    /// below [`crate::SYNAPSE_GROUNDING_COVERAGE_FLOOR`], so this result may only
+    /// advise, never control.
+    pub domain_provisional: bool,
+    /// Fraction of the domain's measured records carrying a grounded anchor.
+    pub domain_grounded_fraction: f32,
     pub slots: Vec<SynapseCalyxSlotBits>,
     pub assay_cf_rows_after: usize,
 }
@@ -673,7 +994,12 @@ pub struct SynapseCalyxSufficiencyReport {
     pub anchor_entropy_bits: f32,
     pub sufficient: bool,
     pub deficit_bits: f32,
+    /// Assay trust tag for this measurement's sample count.
     pub grounded: bool,
+    /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
+    pub domain_provisional: bool,
+    /// Fraction of the domain's measured records carrying a grounded anchor.
+    pub domain_grounded_fraction: f32,
     pub deficits: Vec<SynapseCalyxSufficiencyDeficit>,
     pub assay_cf_rows_after: usize,
 }
@@ -697,6 +1023,10 @@ pub struct SynapseCalyxRedundancyReport {
     pub records_scanned: usize,
     pub effective_rank: f32,
     pub pairs_evaluated: usize,
+    /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
+    pub domain_provisional: bool,
+    /// Fraction of the domain's measured records carrying a grounded anchor.
+    pub domain_grounded_fraction: f32,
     pub redundant_pairs: Vec<SynapseCalyxRedundancyPair>,
     pub assay_cf_rows_after: usize,
 }
@@ -782,6 +1112,10 @@ impl SynapseCalyxVault {
             )
         });
         let total_bits = slot_bits.iter().map(|(_, bits)| *bits).sum();
+        // #1670: a result over an under-anchored domain may only advise. This is
+        // a different property from `grounded` above, which is the assay's own
+        // sample-count trust tag.
+        let verdict = self.domain_grounding_verdict(params.panel_version, max_records)?;
 
         let assay_cf_rows_after = self.persist_assay_store(&store)?;
         Ok(SynapseCalyxBitsReport {
@@ -791,6 +1125,8 @@ impl SynapseCalyxVault {
             distinct_outcomes: gathered.distinct_outcomes,
             total_bits,
             grounded,
+            domain_provisional: verdict.provisional,
+            domain_grounded_fraction: verdict.grounded_fraction,
             slots,
             assay_cf_rows_after,
         })
@@ -886,6 +1222,8 @@ impl SynapseCalyxVault {
             seq,
         );
         let assay_cf_rows_after = self.persist_assay_store(&store)?;
+        // #1670 control-doctrine marker; independent of the `trust` tag above.
+        let verdict = self.domain_grounding_verdict(params.panel_version, max_records)?;
 
         if let Some(anchor) = gathered.representative.as_ref() {
             let sufficiency = panel_sufficiency_with_anchor(
@@ -927,6 +1265,8 @@ impl SynapseCalyxVault {
                 sufficient: sufficiency.sufficient,
                 deficit_bits: sufficiency.deficit_bits,
                 grounded: matches!(trust, TrustTag::Trusted),
+                domain_provisional: verdict.provisional,
+                domain_grounded_fraction: verdict.grounded_fraction,
                 deficits,
                 assay_cf_rows_after,
             });
@@ -941,6 +1281,8 @@ impl SynapseCalyxVault {
             sufficient: panel_bits >= anchor_entropy_bits,
             deficit_bits: (anchor_entropy_bits - panel_bits).max(0.0),
             grounded: false,
+            domain_provisional: verdict.provisional,
+            domain_grounded_fraction: verdict.grounded_fraction,
             deficits: Vec::new(),
             assay_cf_rows_after,
         })
@@ -974,7 +1316,7 @@ impl SynapseCalyxVault {
                 sketches
                     .entry(*slot)
                     .or_default()
-                    .insert(index, project_scalar(slot.get(), vector));
+                    .insert(index, project_scalar(vector));
             }
         }
         let slot_ids: Vec<SlotId> = sketches.keys().copied().collect();
@@ -1041,6 +1383,8 @@ impl SynapseCalyxVault {
         let effective_rank = stable_rank(&matrix)
             .map_err(|error| loom_math_error("compute effective rank", &error))?
             .n_eff;
+        // #1670 control-doctrine marker for the domain this rank was read over.
+        let verdict = self.domain_grounding_verdict(params.panel_version, max_records)?;
         let assay_cf_rows_after = self.persist_assay_store(&store)?;
         Ok(SynapseCalyxRedundancyReport {
             panel_version: params.panel_version,
@@ -1048,9 +1392,165 @@ impl SynapseCalyxVault {
             records_scanned: corpus.records_scanned,
             effective_rank,
             pairs_evaluated,
+            domain_provisional: verdict.provisional,
+            domain_grounded_fraction: verdict.grounded_fraction,
             redundant_pairs,
             assay_cf_rows_after,
         })
+    }
+
+    /// Measures pairwise lens **synergy** about one outcome anchor: for each
+    /// evaluated lens pair, the bits the pair carries jointly minus the bits the
+    /// better single lens carries alone (`WholeMinusMax`, Griffith & Koch
+    /// arXiv:1205.4265), persists the synergistic pairs to the native Assay CF as
+    /// `PairGain` rows, and reads the CF back.
+    ///
+    /// All three terms of every pair are measured over the *same* record subset
+    /// — the records where both lenses and the anchor are present — so the
+    /// difference is a synergy and not an artefact of differing coverage. Two
+    /// lenses carrying identical vectors therefore give a gain of exactly
+    /// `0.0`: the KSG estimator is Chebyshev-metric, and concatenating a
+    /// duplicate coordinate block leaves every distance unchanged.
+    ///
+    /// The pass is bounded twice over: records are clamped to
+    /// [`SYNAPSE_SYNERGY_MAX_RECORDS`] and the lens set to the
+    /// [`SYNAPSE_SYNERGY_MAX_LENSES`] lenses with the highest marginal bits,
+    /// because each pair costs three quadratic KSG estimates. Both bounds are
+    /// reported (`n_lenses` vs `lenses_paired`), never silently applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS`] when no record in the
+    /// panel carries the requested anchor, or a structured Calyx-backed error
+    /// when the corpus cannot be read, the KSG estimator rejects the samples, or
+    /// the Assay CF write/readback fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn assay_synergy(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> Result<SynergyReport, SynapseCalyxError> {
+        let max_records = params.max_records.clamp(1, SYNAPSE_SYNERGY_MAX_RECORDS);
+        let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
+        let anchor_kind = parse_anchor_kind(&params.anchor_kind);
+        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind);
+        if gathered.anchored_records == 0 {
+            return Err(SynapseCalyxError::new(
+                SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS,
+                format!(
+                    "no record in panel_version={} carries a discrete anchor of kind {}; synergy \
+                     is undefined without a grounded outcome",
+                    params.panel_version, params.anchor_kind
+                ),
+                "write grounded outcome anchors of the requested kind onto the panel's records \
+                 (storage operation=anchors), then re-run operation=synergy",
+            ));
+        }
+        let ksg_k = params.ksg_k.max(1);
+        let n_lenses = gathered.by_slot.len();
+
+        // Rank the lenses by their own marginal bits so the bounded pair budget
+        // is spent on the lenses that actually carry signal.
+        let mut ranked: Vec<(SlotId, f32)> = Vec::with_capacity(n_lenses);
+        for (slot, samples) in &gathered.by_slot {
+            if samples.x.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
+                continue;
+            }
+            let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
+            let estimate = ksg_mi_continuous_discrete(&samples.x, &samples.labels, k)
+                .map_err(|error| loom_math_error("estimate KSG lens bits", &error))?;
+            ranked.push((*slot, estimate.bits));
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked.truncate(SYNAPSE_SYNERGY_MAX_LENSES);
+        let mut paired_slots: Vec<SlotId> = ranked.into_iter().map(|(slot, _)| slot).collect();
+        paired_slots.sort_unstable();
+
+        let anchored = anchored_records(&corpus, &anchor_kind);
+        let mut store = AssayStore::default();
+        let vault_id = self.vault_id_value();
+        let seq = self.latest_seq();
+        let mut pairs = Vec::new();
+        for (index, slot_a) in paired_slots.iter().enumerate() {
+            for slot_b in &paired_slots[index + 1..] {
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                let mut joint = Vec::new();
+                let mut labels = Vec::new();
+                for (slots, label) in &anchored {
+                    let (Some(a), Some(b)) = (slots.get(slot_a), slots.get(slot_b)) else {
+                        continue;
+                    };
+                    let mut concatenated = a.clone();
+                    concatenated.extend_from_slice(b);
+                    left.push(a.clone());
+                    right.push(b.clone());
+                    joint.push(concatenated);
+                    labels.push(*label);
+                }
+                if labels.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
+                    pairs.push(unmeasured_synergy_pair(*slot_a, *slot_b, labels.len()));
+                    continue;
+                }
+                let k = ksg_k.min(labels.len().saturating_sub(1)).max(1);
+                let pair_bits = ksg_mi_continuous_discrete(&joint, &labels, k)
+                    .map_err(|error| loom_math_error("estimate KSG pair bits", &error))?
+                    .bits;
+                let left_bits = ksg_mi_continuous_discrete(&left, &labels, k)
+                    .map_err(|error| loom_math_error("estimate KSG left lens bits", &error))?
+                    .bits;
+                let right_bits = ksg_mi_continuous_discrete(&right, &labels, k)
+                    .map_err(|error| loom_math_error("estimate KSG right lens bits", &error))?
+                    .bits;
+                let pair = synergy_pair(
+                    *slot_a,
+                    *slot_b,
+                    pair_bits,
+                    left_bits,
+                    right_bits,
+                    labels.len(),
+                )
+                .map_err(|error| loom_math_error("compute pair synergy gain", &error))?;
+                if pair.synergistic {
+                    // Only a pair that clears the gain floor earns a durable
+                    // PairGain row; a redundant pair is reported, not stored.
+                    store.put(
+                        AssayCacheKey::scoped(
+                            params.panel_version,
+                            ASSAY_CORPUS_SHARD,
+                            vault_id,
+                            anchor_kind.clone(),
+                        ),
+                        AssaySubject::Pair {
+                            a: *slot_a,
+                            b: *slot_b,
+                        },
+                        MiEstimate::point(
+                            pair.gain_bits,
+                            pair.n_samples,
+                            EstimatorKind::PairGain,
+                            TrustTag::Provisional,
+                        ),
+                        "synapse-assay-synergy",
+                        seq,
+                    );
+                }
+                pairs.push(pair);
+            }
+        }
+        self.persist_assay_store(&store)?;
+        Ok(synergy_report(
+            params.panel_version,
+            n_lenses,
+            paired_slots.len(),
+            gathered.anchored_records,
+            pairs,
+        ))
     }
 
     /// Persists an in-memory Assay store to the native Assay CF and returns the
@@ -1111,6 +1611,27 @@ fn gather_anchored_slot_samples(
         anchored_records,
         distinct_outcomes: interner.len(),
     }
+}
+
+/// Collects the anchored records of a corpus once: their dense slot maps paired
+/// with the interned discrete outcome label. Pair passes filter this list rather
+/// than re-walking and re-interning the corpus per pair.
+fn anchored_records<'corpus>(
+    corpus: &'corpus DenseCorpus,
+    anchor_kind: &AnchorKind,
+) -> Vec<(&'corpus BTreeMap<SlotId, Vec<f32>>, usize)> {
+    let mut interner: BTreeMap<String, usize> = BTreeMap::new();
+    let mut anchored = Vec::new();
+    for record in &corpus.records {
+        let Some(anchor) = anchor_of_kind(&record.anchors, anchor_kind) else {
+            continue;
+        };
+        let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
+            continue;
+        };
+        anchored.push((&record.slots, label));
+    }
+    anchored
 }
 
 /// Builds the joint panel samples for sufficiency: the concatenation of the
@@ -1181,12 +1702,18 @@ fn paired_sketches(a: &BTreeMap<usize, f32>, b: &BTreeMap<usize, f32>) -> (Vec<f
 /// random unit direction seeded by the slot id, reducing any-shape dense lens
 /// to a single scalar per record for the discrete NMI redundancy estimator.
 #[allow(clippy::cast_precision_loss)]
-fn project_scalar(slot: u16, vector: &[f32]) -> f32 {
+/// Reduces one dense lens vector to a deterministic 1-D random-projection
+/// sketch (JL-style).
+///
+/// The projection weights are seeded by **coordinate index only**, never by slot
+/// id: every lens is measured through the same linear functional, so two lenses
+/// carrying identical vectors collapse to identical sketches and their
+/// normalized MI is exactly `1.0`. A slot-seeded direction would have given two
+/// exact duplicates a different sketch each and understated their redundancy.
+fn project_scalar(vector: &[f32]) -> f32 {
     let mut acc = 0.0f32;
     for (index, value) in vector.iter().enumerate() {
-        let seed = splitmix64(
-            (u64::from(slot) << 40) ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        );
+        let seed = splitmix64((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         // Map the hashed bits into a symmetric weight in [-1, 1].
         let unit = ((seed >> 11) as f32 / (1u64 << 53) as f32).mul_add(2.0, -1.0);
         acc = value.mul_add(unit, acc);

@@ -20,8 +20,9 @@ pub use backend::{
     CalyxAnchorWriteReport, CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect,
     CalyxVaultInspect, GroundingAnchor, GroundingAnchorSource, GroundingAnchorValue,
     McpUsageGroundedPublicationReport, STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind,
-    StorageCfDump, StorageDumpRow, dump_cf_read_only, dump_cf_read_only_with_expired,
-    inspect_calyx_vault_read_only, scan_cf_read_only, scan_cf_read_only_with_expired,
+    StorageCfDump, StorageDumpRow, SynapseSynergyPair, SynapseSynergyReport, dump_cf_read_only,
+    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
+    scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
@@ -1093,6 +1094,22 @@ impl Db {
         params: &synapse_calyx::SynapseCalyxAssayParams,
     ) -> StorageResult<synapse_calyx::SynapseCalyxRedundancyReport> {
         self.backend.assay_redundancy_intelligence(params)
+    }
+
+    /// Measures pairwise lens synergy about one outcome anchor — the bits a lens
+    /// pair carries beyond its better half — persists the synergistic pairs to
+    /// the native Assay CF as `PairGain` rows, and reads the CF back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when no record carries the requested
+    /// anchor, the corpus cannot be read, the KSG estimator rejects the samples,
+    /// or the Assay write/readback fails.
+    pub fn assay_synergy_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseSynergyReport> {
+        self.backend.assay_synergy_intelligence(params)
     }
 
     /// Measures directed transfer entropy (KSG, lag sweep) between two activity

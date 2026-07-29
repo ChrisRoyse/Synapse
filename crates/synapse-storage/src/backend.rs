@@ -357,6 +357,46 @@ impl FromStr for StorageBackendKind {
     }
 }
 
+/// One measured lens pair from a synergy pass (#1672).
+///
+/// `gain_bits` is `pair_bits - max(left_bits, right_bits)` — the bits the pair
+/// carries about the outcome beyond what its better half carries alone
+/// (`WholeMinusMax`, Griffith & Koch arXiv:1205.4265). A negative gain is the
+/// redundant regime and is reported as measured, never clamped.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseSynergyPair {
+    pub slot_a: u16,
+    pub slot_b: u16,
+    pub pair_bits: f32,
+    pub left_bits: f32,
+    pub right_bits: f32,
+    pub gain_bits: f32,
+    pub n_samples: usize,
+    pub synergistic: bool,
+    pub provisional: bool,
+}
+
+/// Result of one Assay synergy pass, with the physical Assay CF readback and
+/// the #1670 domain grounding verdict the result must be read under.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseSynergyReport {
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    pub anchored_records: usize,
+    /// Lenses the panel carries.
+    pub n_lenses: usize,
+    /// Lenses actually paired under the bounded synergy budget.
+    pub lenses_paired: usize,
+    pub pairs_evaluated: usize,
+    pub synergistic_pairs: usize,
+    pub max_gain_bits: f32,
+    /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
+    pub domain_provisional: bool,
+    pub domain_grounded_fraction: f32,
+    pub pairs: Vec<SynapseSynergyPair>,
+    pub assay_cf_rows_after: usize,
+}
+
 pub trait StorageBackend: Send + Sync {
     fn kind(&self) -> StorageBackendKind;
     fn put_batch(&self, cf_name: &str, rows: Vec<RawRow>) -> StorageResult<()>;
@@ -667,6 +707,10 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: &SynapseCalyxAssayParams,
     ) -> StorageResult<SynapseCalyxRedundancyReport>;
+    fn assay_synergy_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseSynergyReport>;
     fn temporal_causality_intelligence(
         &self,
         params: &SynapseCalyxTemporalParams,
@@ -2232,6 +2276,73 @@ impl StorageBackend for CalyxBackend {
                         "measure native Calyx lens redundancy",
                         &source,
                     )
+                })
+            },
+        )
+    }
+
+    fn assay_synergy_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+    ) -> StorageResult<SynapseSynergyReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure native Calyx lens synergy",
+            true,
+            |vault| {
+                let report = vault.assay_synergy(params).map_err(|source| {
+                    calyx_write_failed("calyx_assay", "measure native Calyx lens synergy", &source)
+                })?;
+                // #1670: every assay result over an under-anchored domain is
+                // tagged provisional, so the synergy pass carries the same
+                // verdict the bits/sufficiency/redundancy reports do.
+                let verdict = vault
+                    .domain_grounding_verdict(params.panel_version, params.max_records)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_assay",
+                            "read native Calyx domain grounding verdict",
+                            &source,
+                        )
+                    })?;
+                // Physical readback: the Assay CF row count after the pass.
+                let assay_cf_rows_after = vault
+                    .scan_cf_latest(ColumnFamily::Assay)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_assay",
+                            "read back native Calyx Assay CF",
+                            &source,
+                        )
+                    })?
+                    .len();
+                Ok(SynapseSynergyReport {
+                    panel_version: report.panel_version,
+                    anchor_kind: params.anchor_kind.clone(),
+                    anchored_records: report.anchored_records,
+                    n_lenses: report.n_lenses,
+                    lenses_paired: report.lenses_paired,
+                    pairs_evaluated: report.pairs_evaluated,
+                    synergistic_pairs: report.synergistic_pairs,
+                    max_gain_bits: report.max_gain_bits,
+                    domain_provisional: verdict.provisional,
+                    domain_grounded_fraction: verdict.grounded_fraction,
+                    pairs: report
+                        .pairs
+                        .into_iter()
+                        .map(|pair| SynapseSynergyPair {
+                            slot_a: pair.a.get(),
+                            slot_b: pair.b.get(),
+                            pair_bits: pair.pair_bits,
+                            left_bits: pair.left_bits,
+                            right_bits: pair.right_bits,
+                            gain_bits: pair.gain_bits,
+                            n_samples: pair.n_samples,
+                            synergistic: pair.synergistic,
+                            provisional: pair.provisional,
+                        })
+                        .collect(),
+                    assay_cf_rows_after,
                 })
             },
         )

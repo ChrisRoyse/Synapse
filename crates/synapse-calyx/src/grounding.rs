@@ -281,7 +281,7 @@ fn grounded_anchor_kinds(anchors: &[Anchor]) -> BTreeSet<String> {
 
 /// Stable string label for an anchor kind, matching the `snake_case` serde names
 /// the assay path parses back (`Label(name)` reports the bare name).
-fn anchor_kind_label(kind: &AnchorKind) -> String {
+pub fn anchor_kind_label(kind: &AnchorKind) -> String {
     match kind {
         AnchorKind::TestPass => "test_pass".to_owned(),
         AnchorKind::TieFormed => "tie_formed".to_owned(),

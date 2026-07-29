@@ -682,6 +682,7 @@ pub enum StorageIntelligenceOperation {
     Bits,
     Sufficiency,
     Redundancy,
+    Synergy,
     Causality,
     Periodicity,
     Drift,
@@ -699,6 +700,7 @@ impl StorageIntelligenceOperation {
             Self::Bits => "bits",
             Self::Sufficiency => "sufficiency",
             Self::Redundancy => "redundancy",
+            Self::Synergy => "synergy",
             Self::Causality => "causality",
             Self::Periodicity => "periodicity",
             Self::Drift => "drift",
@@ -711,8 +713,9 @@ impl StorageIntelligenceOperation {
     #[must_use]
     pub const fn mutates_state(self) -> bool {
         // Abundance and kernel_answer are pure reads; every other operation
-        // persists derived rows (weave: XTerm/Graph; assay: Assay; temporal:
-        // Graph/TemporalXTerm; kernel: Kernel CF).
+        // persists derived rows (weave: XTerm/Graph; assay: Assay, including
+        // synergy's PairGain rows; temporal: Graph/TemporalXTerm; kernel:
+        // Kernel CF).
         !matches!(self, Self::Abundance | Self::KernelAnswer)
     }
 }
@@ -732,6 +735,17 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 64))]
     pub knn_k: Option<u32>,
+    /// Inclusive lower bound (Unix nanoseconds) on a record's server-stamped
+    /// `created_at` for the `weave` pass. Calyx stamps `created_at` in
+    /// milliseconds, so a record is in the window iff
+    /// `since_ts_ns <= created_at_ms * 1_000_000 < until_ts_ns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ts_ns: Option<i64>,
+    /// Exclusive upper bound (Unix nanoseconds) on `created_at` for `weave`.
+    /// Must be strictly greater than `since_ts_ns` when both are given; an
+    /// inverted window fails closed rather than returning zero records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ts_ns: Option<i64>,
     /// Grounded outcome anchor kind to measure bits about (bits/sufficiency).
     /// Synapse writes outcome anchors as a label string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -815,12 +829,29 @@ pub struct StorageIntelligenceAbundanceReport {
     pub measured_count: u64,
     pub derived_count: u64,
     pub meaning_compression_yield: f32,
+    /// `n * (N + C(N,2) + 1)`: the derived signals this corpus can carry.
+    pub dda_signal_yield: u64,
     pub n_eff: StorageIntelligenceNeffEstimate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpi_ceiling_bits: Option<f32>,
     pub dpi_ceiling_provisional: bool,
+    /// Anchor kind whose persisted Assay bits pass produced the DPI ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpi_ceiling_anchor_kind: Option<String>,
     pub xterm_cf_rows: u64,
     pub graph_cf_rows: u64,
+}
+
+/// A lens pair that never co-occurs on a measured record, so no cross-term over
+/// it can be materialized. Structural coverage gap, distinct from the drift
+/// scan's per-record blind-spot alerts.
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceWeaveBlindSpotPair {
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub records_with_a: u64,
+    pub records_with_b: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -847,6 +878,22 @@ pub struct StorageIntelligenceWeaveResponse {
     pub between_record_edges_persisted: u64,
     pub xterm_cf_rows_after: u64,
     pub graph_cf_rows_after: u64,
+    /// Effective half-open `created_at` window, echoed back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ts_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ts_ns: Option<i64>,
+    /// Panel rows the time window excluded from this pass.
+    pub records_outside_window: u64,
+    /// `n * (N + C(N,2) + 1)` over the woven corpus.
+    pub dda_signal_yield: u64,
+    pub lens_pairs_possible: u64,
+    pub lens_pairs_co_present: u64,
+    pub blind_spot_pairs: u64,
+    pub blind_spot_fraction: f32,
+    pub blind_spot_records: u64,
+    pub blind_spot_slots: Vec<u32>,
+    pub blind_spot_pair_details: Vec<StorageIntelligenceWeaveBlindSpotPair>,
     pub agreement_edges: Vec<StorageIntelligenceAgreementEdge>,
     pub abundance: StorageIntelligenceAbundanceReport,
 }
@@ -872,7 +919,12 @@ pub struct StorageIntelligenceBitsReport {
     pub anchored_records: u64,
     pub distinct_outcomes: u64,
     pub total_bits: f32,
+    /// Assay sample-count trust tag for this measurement.
     pub grounded: bool,
+    /// #1670 control-doctrine marker: the domain's grounded anchor coverage is
+    /// below the floor, so this result may only advise, never control.
+    pub domain_provisional: bool,
+    pub domain_grounded_fraction: f32,
     pub slots: Vec<StorageIntelligenceSlotBits>,
     pub assay_cf_rows_after: u64,
 }
@@ -899,7 +951,11 @@ pub struct StorageIntelligenceSufficiencyReport {
     pub anchor_entropy_bits: f32,
     pub sufficient: bool,
     pub deficit_bits: f32,
+    /// Assay sample-count trust tag for this measurement.
     pub grounded: bool,
+    /// #1670 control-doctrine marker: domain anchor coverage below the floor.
+    pub domain_provisional: bool,
+    pub domain_grounded_fraction: f32,
     pub deficits: Vec<StorageIntelligenceSufficiencyDeficit>,
     pub assay_cf_rows_after: u64,
 }
@@ -924,7 +980,48 @@ pub struct StorageIntelligenceRedundancyReport {
     pub records_scanned: u64,
     pub effective_rank: f32,
     pub pairs_evaluated: u64,
+    /// #1670 control-doctrine marker: domain anchor coverage below the floor.
+    pub domain_provisional: bool,
+    pub domain_grounded_fraction: f32,
     pub redundant_pairs: Vec<StorageIntelligenceRedundancyPair>,
+    pub assay_cf_rows_after: u64,
+}
+
+/// One measured lens pair from a synergy pass: the joint bits, both marginals
+/// over the same records, and `gain = pair_bits - max(left, right)`.
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceSynergyPair {
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub pair_bits: f32,
+    pub left_bits: f32,
+    pub right_bits: f32,
+    pub gain_bits: f32,
+    pub n_samples: u64,
+    pub synergistic: bool,
+    /// True when the pair had too few paired samples to measure at all.
+    pub provisional: bool,
+}
+
+/// Result of one Assay synergy pass with the physical Assay CF readback.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceSynergyReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    pub anchored_records: u64,
+    pub n_lenses: u64,
+    /// Lenses paired under the bounded synergy budget (top marginal bits).
+    pub lenses_paired: u64,
+    pub pairs_evaluated: u64,
+    pub synergistic_pairs: u64,
+    pub max_gain_bits: f32,
+    /// #1670 control-doctrine marker: domain anchor coverage below the floor.
+    pub domain_provisional: bool,
+    pub domain_grounded_fraction: f32,
+    pub pairs: Vec<StorageIntelligenceSynergyPair>,
     pub assay_cf_rows_after: u64,
 }
 
@@ -1111,6 +1208,8 @@ pub struct StorageIntelligenceResponse {
     pub sufficiency: Option<StorageIntelligenceSufficiencyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<StorageIntelligenceRedundancyReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synergy: Option<StorageIntelligenceSynergyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causality: Option<StorageIntelligenceCausalityReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1601,6 +1700,8 @@ pub fn run_intelligence_weave(
     if let Some(knn_k) = params.knn_k {
         weave.knn_k = knn_k as usize;
     }
+    weave.since_ts_ns = params.since_ts_ns;
+    weave.until_ts_ns = params.until_ts_ns;
     let report = db
         .weave_panel_intelligence(weave)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -1615,6 +1716,26 @@ pub fn run_intelligence_weave(
         between_record_edges_persisted: report.between_record_edges_persisted as u64,
         xterm_cf_rows_after: report.xterm_cf_rows_after as u64,
         graph_cf_rows_after: report.graph_cf_rows_after as u64,
+        since_ts_ns: report.since_ts_ns,
+        until_ts_ns: report.until_ts_ns,
+        records_outside_window: report.records_outside_window as u64,
+        dda_signal_yield: report.dda_signal_yield as u64,
+        lens_pairs_possible: report.lens_pairs_possible as u64,
+        lens_pairs_co_present: report.lens_pairs_co_present as u64,
+        blind_spot_pairs: report.blind_spot_pairs as u64,
+        blind_spot_fraction: report.blind_spot_fraction,
+        blind_spot_records: report.blind_spot_records as u64,
+        blind_spot_slots: report.blind_spot_slots.into_iter().map(u32::from).collect(),
+        blind_spot_pair_details: report
+            .blind_spot_pair_details
+            .into_iter()
+            .map(|pair| StorageIntelligenceWeaveBlindSpotPair {
+                slot_a: u32::from(pair.slot_a),
+                slot_b: u32::from(pair.slot_b),
+                records_with_a: pair.records_with_a as u64,
+                records_with_b: pair.records_with_b as u64,
+            })
+            .collect(),
         agreement_edges: report
             .agreement_edges
             .into_iter()
@@ -1686,6 +1807,8 @@ pub fn run_intelligence_bits(
         distinct_outcomes: report.distinct_outcomes as u64,
         total_bits: report.total_bits,
         grounded: report.grounded,
+        domain_provisional: report.domain_provisional,
+        domain_grounded_fraction: report.domain_grounded_fraction,
         slots: report
             .slots
             .into_iter()
@@ -1722,6 +1845,8 @@ pub fn run_intelligence_sufficiency(
         sufficient: report.sufficient,
         deficit_bits: report.deficit_bits,
         grounded: report.grounded,
+        domain_provisional: report.domain_provisional,
+        domain_grounded_fraction: report.domain_grounded_fraction,
         deficits: report
             .deficits
             .into_iter()
@@ -1755,6 +1880,8 @@ pub fn run_intelligence_redundancy(
         records_scanned: report.records_scanned as u64,
         effective_rank: report.effective_rank,
         pairs_evaluated: report.pairs_evaluated as u64,
+        domain_provisional: report.domain_provisional,
+        domain_grounded_fraction: report.domain_grounded_fraction,
         redundant_pairs: report
             .redundant_pairs
             .into_iter()
@@ -1765,6 +1892,46 @@ pub fn run_intelligence_redundancy(
                 mi_bits: pair.mi_bits,
                 n_samples: pair.n_samples as u64,
                 redundant: pair.redundant,
+            })
+            .collect(),
+        assay_cf_rows_after: report.assay_cf_rows_after as u64,
+    })
+}
+
+/// Measures pairwise lens synergy about one outcome anchor and persists the
+/// synergistic pairs as `PairGain` Assay rows.
+pub fn run_intelligence_synergy(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceSynergyReport, ErrorData> {
+    let report = db
+        .assay_synergy_intelligence(&assay_params(params)?)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceSynergyReport {
+        source_of_truth: "Calyx Assay CF rows",
+        panel_version: report.panel_version,
+        anchor_kind: report.anchor_kind,
+        anchored_records: report.anchored_records as u64,
+        n_lenses: report.n_lenses as u64,
+        lenses_paired: report.lenses_paired as u64,
+        pairs_evaluated: report.pairs_evaluated as u64,
+        synergistic_pairs: report.synergistic_pairs as u64,
+        max_gain_bits: report.max_gain_bits,
+        domain_provisional: report.domain_provisional,
+        domain_grounded_fraction: report.domain_grounded_fraction,
+        pairs: report
+            .pairs
+            .into_iter()
+            .map(|pair| StorageIntelligenceSynergyPair {
+                slot_a: u32::from(pair.slot_a),
+                slot_b: u32::from(pair.slot_b),
+                pair_bits: pair.pair_bits,
+                left_bits: pair.left_bits,
+                right_bits: pair.right_bits,
+                gain_bits: pair.gain_bits,
+                n_samples: pair.n_samples as u64,
+                synergistic: pair.synergistic,
+                provisional: pair.provisional,
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
@@ -2077,6 +2244,7 @@ fn storage_intelligence_abundance(
         measured_count: report.measured_count as u64,
         derived_count: report.derived_count as u64,
         meaning_compression_yield: report.meaning_compression_yield,
+        dda_signal_yield: report.dda_signal_yield as u64,
         n_eff: StorageIntelligenceNeffEstimate {
             value: report.n_eff.value,
             provisional: report.n_eff.provisional,
@@ -2085,6 +2253,7 @@ fn storage_intelligence_abundance(
         },
         dpi_ceiling_bits: report.dpi_ceiling_bits,
         dpi_ceiling_provisional: report.dpi_ceiling_provisional,
+        dpi_ceiling_anchor_kind: report.dpi_ceiling_anchor_kind,
         xterm_cf_rows: report.xterm_cf_rows as u64,
         graph_cf_rows: report.graph_cf_rows as u64,
     }

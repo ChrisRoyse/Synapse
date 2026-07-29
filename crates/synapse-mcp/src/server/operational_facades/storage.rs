@@ -743,6 +743,7 @@ pub(super) async fn handle(
                     bits: None,
                     sufficiency: None,
                     redundancy: None,
+                    synergy: None,
                     causality: None,
                     periodicity: None,
                     drift: None,
@@ -790,6 +791,14 @@ pub(super) async fn handle(
                                 ..base
                             },
                         )
+                    }
+                    StorageIntelligenceOperation::Synergy => {
+                        crate::m3::storage::run_intelligence_synergy(&db, &spec).map(|synergy| {
+                            StorageIntelligenceResponse {
+                                synergy: Some(synergy),
+                                ..base
+                            }
+                        })
                     }
                     StorageIntelligenceOperation::Causality => {
                         crate::m3::storage::run_intelligence_causality(&db, &spec).map(
@@ -857,7 +866,7 @@ pub(super) async fn handle(
             })??;
             let summary = if let Some(weave) = &response.weave {
                 format!(
-                    "intelligence weave panel={} records_woven={} cross_terms={} agreement_edges={} between_record_edges={} xterm_rows={} graph_rows={}",
+                    "intelligence weave panel={} records_woven={} cross_terms={} agreement_edges={} between_record_edges={} xterm_rows={} graph_rows={} dda_signal_yield={} blind_spot_pairs={}/{} blind_spot_records={} outside_window={}",
                     weave.panel_version,
                     weave.records_woven,
                     weave.cross_terms_materialized,
@@ -865,50 +874,79 @@ pub(super) async fn handle(
                     weave.between_record_edges_persisted,
                     weave.xterm_cf_rows_after,
                     weave.graph_cf_rows_after,
+                    weave.dda_signal_yield,
+                    weave.blind_spot_pairs,
+                    weave.lens_pairs_possible,
+                    weave.blind_spot_records,
+                    weave.records_outside_window,
                 )
             } else if let Some(abundance) = &response.abundance {
                 format!(
-                    "intelligence abundance panel={} n_lenses={} n_constellations={} c_n2={} materialized={} xterm_rows={} graph_rows={}",
+                    "intelligence abundance panel={} n_lenses={} n_constellations={} c_n2={} materialized={} dda_signal_yield={} dpi_ceiling_bits={:?} dpi_ceiling_provisional={} xterm_rows={} graph_rows={}",
                     abundance.panel_version,
                     abundance.n_lenses,
                     abundance.n_constellations,
                     abundance.c_n2_upper_bound,
                     abundance.materialized,
+                    abundance.dda_signal_yield,
+                    abundance.dpi_ceiling_bits,
+                    abundance.dpi_ceiling_provisional,
                     abundance.xterm_cf_rows,
                     abundance.graph_cf_rows,
                 )
             } else if let Some(bits) = &response.bits {
                 format!(
-                    "intelligence bits panel={} anchor={} anchored_records={} total_bits={:.4} grounded={} slots={} assay_rows={}",
+                    "intelligence bits panel={} anchor={} anchored_records={} total_bits={:.4} grounded={} domain_provisional={} domain_grounded_fraction={:.4} slots={} assay_rows={}",
                     bits.panel_version,
                     bits.anchor_kind,
                     bits.anchored_records,
                     bits.total_bits,
                     bits.grounded,
+                    bits.domain_provisional,
+                    bits.domain_grounded_fraction,
                     bits.slots.len(),
                     bits.assay_cf_rows_after,
                 )
             } else if let Some(sufficiency) = &response.sufficiency {
                 format!(
-                    "intelligence sufficiency panel={} anchor={} panel_bits={:.4} anchor_entropy_bits={:.4} sufficient={} deficit_bits={:.4} deficits={} assay_rows={}",
+                    "intelligence sufficiency panel={} anchor={} panel_bits={:.4} anchor_entropy_bits={:.4} sufficient={} deficit_bits={:.4} domain_provisional={} domain_grounded_fraction={:.4} deficits={} assay_rows={}",
                     sufficiency.panel_version,
                     sufficiency.anchor_kind,
                     sufficiency.panel_bits,
                     sufficiency.anchor_entropy_bits,
                     sufficiency.sufficient,
                     sufficiency.deficit_bits,
+                    sufficiency.domain_provisional,
+                    sufficiency.domain_grounded_fraction,
                     sufficiency.deficits.len(),
                     sufficiency.assay_cf_rows_after,
                 )
             } else if let Some(redundancy) = &response.redundancy {
                 format!(
-                    "intelligence redundancy panel={} n_lenses={} effective_rank={:.4} pairs_evaluated={} redundant_pairs={} assay_rows={}",
+                    "intelligence redundancy panel={} n_lenses={} effective_rank={:.4} pairs_evaluated={} redundant_pairs={} domain_provisional={} domain_grounded_fraction={:.4} assay_rows={}",
                     redundancy.panel_version,
                     redundancy.n_lenses,
                     redundancy.effective_rank,
                     redundancy.pairs_evaluated,
                     redundancy.redundant_pairs.len(),
+                    redundancy.domain_provisional,
+                    redundancy.domain_grounded_fraction,
                     redundancy.assay_cf_rows_after,
+                )
+            } else if let Some(synergy) = &response.synergy {
+                format!(
+                    "intelligence synergy panel={} anchor={} anchored_records={} n_lenses={} lenses_paired={} pairs_evaluated={} synergistic_pairs={} max_gain_bits={:.4} domain_provisional={} domain_grounded_fraction={:.4} assay_rows={}",
+                    synergy.panel_version,
+                    synergy.anchor_kind,
+                    synergy.anchored_records,
+                    synergy.n_lenses,
+                    synergy.lenses_paired,
+                    synergy.pairs_evaluated,
+                    synergy.synergistic_pairs,
+                    synergy.max_gain_bits,
+                    synergy.domain_provisional,
+                    synergy.domain_grounded_fraction,
+                    synergy.assay_cf_rows_after,
                 )
             } else if let Some(causality) = &response.causality {
                 format!(

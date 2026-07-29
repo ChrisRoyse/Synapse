@@ -44,6 +44,7 @@ pub mod store;
 pub mod stratified;
 mod subsample;
 pub mod sufficiency;
+pub mod synergy;
 pub mod total_correlation;
 pub mod transfer_entropy;
 
@@ -235,6 +236,10 @@ pub use sufficiency::{
     panel_sufficiency_from_estimate, panel_sufficiency_from_estimate_with_context,
     panel_sufficiency_with_anchor, panel_sufficiency_with_anchor_and_context,
     panel_sufficiency_with_context,
+};
+pub use synergy::{
+    CALYX_ASSAY_INVALID_SYNERGY, MIN_SYNERGY_GAIN_BITS, SynergyPair, SynergyReport, synergy_gain,
+    synergy_pair, synergy_report, unmeasured_synergy_pair,
 };
 pub use total_correlation::{
     CALYX_TC_INSUFFICIENT_SAMPLES, DEFAULT_TC_BOOTSTRAP_RESAMPLES, DEFAULT_TC_K, IIResult, IISign,
