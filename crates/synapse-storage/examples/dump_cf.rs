@@ -13,7 +13,8 @@
 //! `cargo run -p synapse-storage --example dump_cf -- --native-cx [--reveal-metadata] <db_path> <cx_id>`
 //! `cargo run -p synapse-storage --example dump_cf -- --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex>`
 //! `cargo run -p synapse-storage --example dump_cf -- --repair-bad-episode-slots <db_path>`
-//! `cargo run -p synapse-storage --example dump_cf -- --migrate-pre-1776-slots [--resume] <db_path>`
+//! `cargo run -p synapse-storage --example dump_cf -- --check-base-roundtrip <db_path>`
+//! `cargo run -p synapse-storage --example dump_cf -- --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path>`
 
 use std::{
     collections::BTreeMap,
@@ -28,7 +29,7 @@ use calyx_aster::{
     cf::{ColumnFamily, anchor_prefix_range, base_key, scalar_id_for_key, slot_key},
     mvcc::tombstone_value,
     vault::encode::{
-        decode_constellation_base, decode_slot_vector, encode_constellation_base,
+        HEADER_LEN, decode_constellation_base, decode_slot_vector, encode_constellation_base,
         encode_slot_vector, inspect_slot_vector,
     },
 };
@@ -49,13 +50,21 @@ use synapse_storage::{
     dump_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] <db_path>";
+const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path>";
 /// The episode panel's exclusive global slot block (#1776). The
 /// `--repair-bad-episode-slots` mode exists for episode constellations that
 /// historically wrote slots outside it; under the global allocation that is
 /// exactly "outside this range", not "above some shared ceiling".
 const EPISODE_SLOT_BLOCK_FIRST: u16 = 8;
 const EPISODE_SLOT_BLOCK_LAST: u16 = 22;
+
+/// Width of the identity hash `encode_constellation_base` writes straight after
+/// the header, and of every per-slot hash in the slot map. Both are `blake3`
+/// digests that `decode_constellation_base` skips, so they are exactly the
+/// bytes a decode-and-compare cannot see.
+const IDENTITY_HASH_LEN: usize = 32;
+/// One `(slot_id: u16, slot_hash: [u8; 32])` slot-map entry.
+const SLOT_MAP_ENTRY_LEN: usize = 2 + IDENTITY_HASH_LEN;
 
 const fn slot_in_episode_block(slot: u16) -> bool {
     slot >= EPISODE_SLOT_BLOCK_FIRST && slot <= EPISODE_SLOT_BLOCK_LAST
@@ -122,18 +131,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         .is_some_and(|arg| arg == "--migrate-pre-1776-slots")
     {
         args.remove(0);
-        let resume = if args.first().is_some_and(|arg| arg == "--resume") {
-            args.remove(0);
-            true
-        } else {
-            false
+        let mut options = MigrationOptions {
+            resume: false,
+            skip_unreproducible: false,
         };
+        while let Some(flag) = args.first() {
+            match flag.as_str() {
+                "--resume" => options.resume = true,
+                "--skip-unreproducible" => options.skip_unreproducible = true,
+                _ => break,
+            }
+            args.remove(0);
+        }
         let mut args = args.into_iter();
         let db_path = args.next().ok_or(USAGE)?;
         if let Some(extra) = args.next() {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
-        return migrate_pre_1776_slots(PathBuf::from(db_path), resume);
+        return migrate_pre_1776_slots(PathBuf::from(db_path), options);
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--check-base-roundtrip")
+    {
+        args.remove(0);
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return check_base_roundtrip(PathBuf::from(db_path));
     }
     if args.first().is_some_and(|arg| arg == "--panel-slot-audit") {
         args.remove(0);
@@ -772,7 +799,14 @@ struct SlotMove {
     clippy::needless_pass_by_value,
     reason = "the migration owns its path across the writeable pass and the independent read-only readback, and prints the full plan/move/readback flow inline so the run is auditable"
 )]
-fn migrate_pre_1776_slots(db_path: PathBuf, resume: bool) -> Result<(), Box<dyn Error>> {
+fn migrate_pre_1776_slots(
+    db_path: PathBuf,
+    options: MigrationOptions,
+) -> Result<(), Box<dyn Error>> {
+    let MigrationOptions {
+        resume,
+        skip_unreproducible,
+    } = options;
     verify_pre_1776_block_table()?;
     let vault = SynapseCalyxVault::open(SynapseCalyxConfig::from_vault_dir(db_path.clone()))?;
     let before_seq = vault.latest_seq();
@@ -826,8 +860,29 @@ fn migrate_pre_1776_slots(db_path: PathBuf, resume: bool) -> Result<(), Box<dyn 
     let mut moved_constellations = 0_u64;
     let mut moved_slot_rows = 0_u64;
     let mut moved_raw_rows = 0_u64;
+    let mut skipped = 0_u64;
     for (index, candidate) in pending.iter().enumerate() {
-        let report = migrate_one_constellation(&vault, candidate)?;
+        let report = match migrate_one_constellation(&vault, candidate) {
+            Ok(report) => report,
+            // The guard is never relaxed. `--skip-unreproducible` only chooses
+            // between "stop the whole run" and "leave this one row exactly as it
+            // is and name it", and a skipped row is still reported as
+            // unmigrated at the end. Nothing is written for it either way.
+            Err(error) if skip_unreproducible => {
+                skipped = skipped.saturating_add(1);
+                write_stdout_line(
+                    &mut stdout,
+                    format_args!(
+                        "unmigrated index={index} cx_id={} panel={} old_slot_ids={} error={error}",
+                        candidate.cx_id,
+                        candidate.panel,
+                        join_slot_ids(&candidate.old_slot_ids),
+                    ),
+                )?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         moved_constellations = moved_constellations.saturating_add(1);
         moved_slot_rows = moved_slot_rows.saturating_add(report.slot_rows);
         moved_raw_rows = moved_raw_rows.saturating_add(report.raw_rows);
@@ -876,7 +931,7 @@ fn migrate_pre_1776_slots(db_path: PathBuf, resume: bool) -> Result<(), Box<dyn 
     write_stdout_line(
         &mut stdout,
         format_args!(
-            "migrate_commit moved_constellations={moved_constellations} moved_slot_rows={moved_slot_rows} moved_raw_rows={moved_raw_rows} after_seq={after_seq} close_safe_to_unlock={} close_latest_seq={:?}",
+            "migrate_commit moved_constellations={moved_constellations} moved_slot_rows={moved_slot_rows} moved_raw_rows={moved_raw_rows} unmigrated={skipped} after_seq={after_seq} close_safe_to_unlock={} close_latest_seq={:?}",
             close_readback.safe_to_unlock, close_readback.latest_seq,
         ),
     )?;
@@ -906,7 +961,7 @@ fn migrate_pre_1776_slots(db_path: PathBuf, resume: bool) -> Result<(), Box<dyn 
     write_stdout_line(
         &mut stdout,
         format_args!(
-            "migrate_readback readonly_seq={readback_seq} base_rows_before={before_base_row_count} base_rows_after={after_base_row_count} remaining_pending={remaining_pending}"
+            "migrate_readback readonly_seq={readback_seq} base_rows_before={before_base_row_count} base_rows_after={after_base_row_count} remaining_pending={remaining_pending} unmigrated={skipped}"
         ),
     )?;
     if after_base_row_count != before_base_row_count {
@@ -918,15 +973,25 @@ fn migrate_pre_1776_slots(db_path: PathBuf, resume: bool) -> Result<(), Box<dyn 
         )
         .into());
     }
-    if remaining_pending != 0 {
+    if remaining_pending != skipped {
         return Err(format!(
             "SYNAPSE_MIGRATE_PRE_1776_READBACK_INCOMPLETE: {remaining_pending} pre-#1776 \
              constellation(s) still declare slot ids outside their panel's block after the \
-             migration committed (issue #1878)"
+             migration committed, but only {skipped} were explicitly left unmigrated \
+             (issue #1878)"
         )
         .into());
     }
     Ok(())
+}
+
+/// How a migration run is allowed to deviate from "move every pending row".
+struct MigrationOptions {
+    /// Continue a run that a previous invocation left half finished.
+    resume: bool,
+    /// Leave rows that cannot reproduce their own Base row exactly where they
+    /// are, naming each one, instead of stopping the whole run on the first.
+    skip_unreproducible: bool,
 }
 
 /// What one constellation's move actually did, for the audit line.
@@ -994,13 +1059,15 @@ fn migrate_one_constellation(
         .into());
     }
 
+    let declared = read_declared_slots(vault, snapshot, cx_id, panel, &candidate.old_slot_ids)?;
     let mut moves = Vec::with_capacity(width);
-    for (ordinal, &old) in candidate.old_slot_ids.iter().enumerate() {
+    for (ordinal, slot) in declared.into_iter().enumerate() {
         let offset = u16::try_from(ordinal).map_err(|error| {
             format!(
                 "SYNAPSE_MIGRATE_PRE_1776_ORDINAL_OVERFLOW: cx_id={cx_id} panel={panel}: {error}"
             )
         })?;
+        let old = slot.slot;
         let new = SlotId::new(block.first.saturating_add(offset));
         if !block.contains(new.get()) || block.contains(old.get()) {
             return Err(format!(
@@ -1011,58 +1078,21 @@ fn migrate_one_constellation(
             )
             .into());
         }
-        let Some(quantized) = vault.read_cf_at(snapshot, ColumnFamily::slot(old), &key)? else {
-            return Err(format!(
-                "SYNAPSE_MIGRATE_PRE_1776_SLOT_ROW_MISSING: cx_id={cx_id} panel={panel} declares \
-                 slot {old} in its Base row but cf/{} holds no row for it, so its vector cannot be \
-                 moved and its Base row cannot be reproduced (issue #1878)",
-                ColumnFamily::slot(old).name()
-            )
-            .into());
-        };
-        let vector = decode_slot_vector(&quantized).map_err(|error| {
-            format!(
-                "SYNAPSE_MIGRATE_PRE_1776_SLOT_DECODE_FAILED: cx_id={cx_id} panel={panel} slot={old} \
-                 value_len_bytes={} value_sha256={}: {error}",
-                quantized.len(),
-                sha256_hex(&quantized)
-            )
-        })?;
-        let reencoded = encode_slot_vector(&vector).map_err(|error| {
-            format!(
-                "SYNAPSE_MIGRATE_PRE_1776_SLOT_REENCODE_FAILED: cx_id={cx_id} panel={panel} \
-                 slot={old}: {error}"
-            )
-        })?;
-        if reencoded != quantized {
-            return Err(format!(
-                "SYNAPSE_MIGRATE_PRE_1776_SLOT_REENCODE_MISMATCH: cx_id={cx_id} panel={panel} \
-                 slot={old} re-encodes to {} bytes (sha256={}) but is stored as {} bytes \
-                 (sha256={}). The Base row's slot hashes are computed from the encoded vector, so \
-                 rewriting this row would change what its hashes cover (issue #1878)",
-                reencoded.len(),
-                sha256_hex(&reencoded),
-                quantized.len(),
-                sha256_hex(&quantized),
-            )
-            .into());
-        }
-        let raw = vault.read_cf_at(snapshot, ColumnFamily::slot_raw(old), &key)?;
         assert_destination_free(
             vault,
             snapshot,
             cx_id,
             panel,
             new,
-            &quantized,
-            raw.as_deref(),
+            &slot.quantized,
+            slot.raw.as_deref(),
         )?;
         moves.push(SlotMove {
             old,
             new,
-            quantized,
-            raw,
-            vector,
+            quantized: slot.quantized,
+            raw: slot.raw,
+            vector: slot.vector,
         });
     }
 
@@ -1071,22 +1101,18 @@ fn migrate_one_constellation(
     // return the stored Base row byte for byte. Anything else — a scalar, a
     // metadata entry, an anchor, the provenance hash — that did not survive the
     // round trip would show up here, before a single byte is written.
-    let mut constellation = decode_base_for_migration(&base_key(cx_id), &candidate.base_value)?;
-    constellation.slots = moves
+    let declared = moves
         .iter()
         .map(|slot_move| (slot_move.old, slot_move.vector.clone()))
-        .collect();
-    let reproduced = encode_constellation_base(&constellation).map_err(|error| {
-        format!(
-            "SYNAPSE_MIGRATE_PRE_1776_BASE_REENCODE_FAILED: cx_id={cx_id} panel={panel}: {error}"
-        )
-    })?;
+        .collect::<BTreeMap<_, _>>();
+    let (mut constellation, reproduced) =
+        reproduce_stored_base(cx_id, panel, &candidate.base_value, declared)?;
     if reproduced != candidate.base_value {
         return Err(format!(
             "SYNAPSE_MIGRATE_PRE_1776_BASE_REENCODE_MISMATCH: cx_id={cx_id} panel={panel} \
              re-encodes to {} bytes (sha256={}) but is stored as {} bytes (sha256={}). This row \
-             cannot be rewritten without changing content the migration must preserve \
-             (issue #1878)",
+             cannot be rewritten without changing content the migration must preserve. Run \
+             --check-base-roundtrip for the structural diff (issue #1878)",
             reproduced.len(),
             sha256_hex(&reproduced),
             candidate.base_value.len(),
@@ -1389,6 +1415,136 @@ fn verify_pre_1776_block_table() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Reads one raw CF row, whichever kind of vault handle is open.
+///
+/// The preflight audit runs read-only so it can be pointed at the live vault
+/// while the daemon owns it; the migration holds the writer lock. Both need the
+/// identical read/decode/re-encode path, and a path that differs between the
+/// dry run and the real run would make the dry run worthless.
+trait CfReader {
+    fn read_cf(
+        &self,
+        snapshot: u64,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error>>;
+}
+
+impl CfReader for SynapseCalyxVault {
+    fn read_cf(
+        &self,
+        snapshot: u64,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        Ok(self.read_cf_at(snapshot, cf, key)?)
+    }
+}
+
+impl CfReader for SynapseCalyxReadOnlyVault {
+    fn read_cf(
+        &self,
+        snapshot: u64,
+        cf: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        Ok(self.read_cf_at(snapshot, cf, key)?)
+    }
+}
+
+/// One physical slot row behind a Base row's declared slot id.
+struct DeclaredSlot {
+    slot: SlotId,
+    quantized: Vec<u8>,
+    raw: Option<Vec<u8>>,
+    vector: SlotVector,
+}
+
+/// Reads the physical vectors a Base row declares and proves each one
+/// re-encodes to exactly the bytes stored in its slot CF.
+///
+/// The Base row's per-slot hash is `blake3` over precisely these bytes
+/// (`vault/prepared.rs` hashes the same buffer it writes to `cf/slot_<id>`), so
+/// a vector that does not re-encode byte for byte cannot reproduce its own Base
+/// row either.
+fn read_declared_slots(
+    reader: &impl CfReader,
+    snapshot: u64,
+    cx_id: CxId,
+    panel: &str,
+    slot_ids: &[SlotId],
+) -> Result<Vec<DeclaredSlot>, Box<dyn Error>> {
+    let key = slot_key(cx_id);
+    let mut declared = Vec::with_capacity(slot_ids.len());
+    for &slot in slot_ids {
+        let Some(quantized) = reader.read_cf(snapshot, ColumnFamily::slot(slot), &key)? else {
+            return Err(format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_ROW_MISSING: cx_id={cx_id} panel={panel} declares \
+                 slot {slot} in its Base row but cf/{} holds no row for it, so its vector cannot \
+                 be moved and its Base row cannot be reproduced (issue #1878)",
+                ColumnFamily::slot(slot).name()
+            )
+            .into());
+        };
+        let vector = decode_slot_vector(&quantized).map_err(|error| {
+            format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_DECODE_FAILED: cx_id={cx_id} panel={panel} \
+                 slot={slot} value_len_bytes={} value_sha256={}: {error}",
+                quantized.len(),
+                sha256_hex(&quantized)
+            )
+        })?;
+        let reencoded = encode_slot_vector(&vector).map_err(|error| {
+            format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_REENCODE_FAILED: cx_id={cx_id} panel={panel} \
+                 slot={slot}: {error}"
+            )
+        })?;
+        if reencoded != quantized {
+            return Err(format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_REENCODE_MISMATCH: cx_id={cx_id} panel={panel} \
+                 slot={slot} re-encodes to {} bytes (sha256={}) but is stored as {} bytes \
+                 (sha256={}). The Base row's slot hashes are computed from the encoded vector, so \
+                 rewriting this row would change what its hashes cover (issue #1878)",
+                reencoded.len(),
+                sha256_hex(&reencoded),
+                quantized.len(),
+                sha256_hex(&quantized),
+            )
+            .into());
+        }
+        let raw = reader.read_cf(snapshot, ColumnFamily::slot_raw(slot), &key)?;
+        declared.push(DeclaredSlot {
+            slot,
+            quantized,
+            raw,
+            vector,
+        });
+    }
+    Ok(declared)
+}
+
+/// Re-encodes a stored Base row from its real vectors under its ORIGINAL slot
+/// ids, returning the decoded constellation and the reproduced bytes.
+///
+/// The caller compares. Equality is the licence to rewrite the row; inequality
+/// is a finding, never something to work around.
+fn reproduce_stored_base(
+    cx_id: CxId,
+    panel: &str,
+    stored: &[u8],
+    slots: BTreeMap<SlotId, SlotVector>,
+) -> Result<(Constellation, Vec<u8>), Box<dyn Error>> {
+    let mut constellation = decode_base_for_migration(&base_key(cx_id), stored)?;
+    constellation.slots = slots;
+    let reproduced = encode_constellation_base(&constellation).map_err(|error| {
+        format!(
+            "SYNAPSE_MIGRATE_PRE_1776_BASE_REENCODE_FAILED: cx_id={cx_id} panel={panel}: {error}"
+        )
+    })?;
+    Ok((constellation, reproduced))
+}
+
 fn decode_base_for_migration(key: &[u8], value: &[u8]) -> Result<Constellation, Box<dyn Error>> {
     decode_constellation_base(value).map_err(|error| {
         format!(
@@ -1400,6 +1556,214 @@ fn decode_base_for_migration(key: &[u8], value: &[u8]) -> Result<Constellation, 
         )
         .into()
     })
+}
+
+/// Read-only preflight for the #1878 migration: how many superseded rows can
+/// reproduce their own Base row, and for the ones that cannot, exactly which
+/// bytes differ.
+///
+/// The migration refuses to rewrite a Base row it cannot reproduce byte for
+/// byte, so this is the number that decides whether the migration can move all
+/// of the superseded rows or only some. It writes nothing and does not take the
+/// writer lock, so it can be pointed at the live vault.
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "the preflight owns its path and prints the whole scan, per-failure structural diff and per-panel tally inline"
+)]
+fn check_base_roundtrip(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
+    verify_pre_1776_block_table()?;
+    let vault = SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        SynapseCalyxConfig::from_vault_dir(db_path.clone()),
+        None,
+    )?;
+    let snapshot = vault.latest_seq();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "check_base_roundtrip db_path={} mode=read_only vault_id={} snapshot={snapshot}",
+            db_path.display(),
+            vault.vault_id(),
+        ),
+    )?;
+
+    // panel -> (pass, fail)
+    let mut tally: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut checked = 0_u64;
+    let mut failures = 0_u64;
+    for (key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
+        let constellation = decode_base_for_migration(&key, &value)?;
+        let (panel, slot_ids, migrated) = match classify_pre_1776_row(&constellation)? {
+            Pre1776Row::NotSuperseded | Pre1776Row::NoSlots => continue,
+            Pre1776Row::AlreadyInBlock => (
+                constellation
+                    .metadata
+                    .get(META_PANEL_NAME)
+                    .cloned()
+                    .unwrap_or_default(),
+                constellation.slots.keys().copied().collect::<Vec<_>>(),
+                true,
+            ),
+            Pre1776Row::Pending {
+                block,
+                old_slot_ids,
+            } => (block.panel.to_owned(), old_slot_ids, false),
+        };
+        let cx_id = constellation.cx_id;
+        checked = checked.saturating_add(1);
+        let entry = tally.entry(panel.clone()).or_default();
+
+        let outcome =
+            read_declared_slots(&vault, snapshot, cx_id, &panel, &slot_ids).and_then(|declared| {
+                let slots = declared
+                    .into_iter()
+                    .map(|slot| (slot.slot, slot.vector))
+                    .collect::<BTreeMap<_, _>>();
+                reproduce_stored_base(cx_id, &panel, &value, slots)
+            });
+        match outcome {
+            Ok((_, reproduced)) if reproduced == value => {
+                entry.0 = entry.0.saturating_add(1);
+            }
+            Ok((decoded, reproduced)) => {
+                entry.1 = entry.1.saturating_add(1);
+                failures = failures.saturating_add(1);
+                write_stdout_line(
+                    &mut stdout,
+                    format_args!(
+                        "roundtrip_fail cx_id={cx_id} panel={panel} panel_version={} already_in_block={migrated} slot_ids={} stored_len_bytes={} stored_sha256={} reencoded_len_bytes={} reencoded_sha256={}",
+                        decoded.panel_version,
+                        join_slot_ids(&slot_ids),
+                        value.len(),
+                        sha256_hex(&value),
+                        reproduced.len(),
+                        sha256_hex(&reproduced),
+                    ),
+                )?;
+                for region in classify_base_diff(&value, &reproduced, &decoded) {
+                    write_stdout_line(
+                        &mut stdout,
+                        format_args!("roundtrip_diff cx_id={cx_id} panel={panel} {region}"),
+                    )?;
+                }
+            }
+            Err(error) => {
+                entry.1 = entry.1.saturating_add(1);
+                failures = failures.saturating_add(1);
+                write_stdout_line(
+                    &mut stdout,
+                    format_args!("roundtrip_fail cx_id={cx_id} panel={panel} error={error}"),
+                )?;
+            }
+        }
+    }
+
+    for (panel, (pass, fail)) in &tally {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "roundtrip_panel panel={panel} checked={} pass={pass} fail={fail}",
+                pass.saturating_add(*fail)
+            ),
+        )?;
+    }
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "roundtrip_summary checked={checked} pass={} fail={failures}",
+            checked.saturating_sub(failures)
+        ),
+    )?;
+    Ok(())
+}
+
+/// Names the structural region of every byte range in which a stored Base row
+/// and its re-encoding disagree.
+///
+/// The layout is fixed by `encode_constellation_base`: a 102-byte header, a
+/// 32-byte identity hash, the input-ref tail, then the `(slot_id, slot_hash)`
+/// map. `decode_constellation_base` skips the identity hash and every slot
+/// hash, which is why a difference confined to those regions is invisible to a
+/// decode-and-compare and shows up only as a byte diff of equal length.
+fn classify_base_diff(
+    stored: &[u8],
+    reproduced: &[u8],
+    constellation: &Constellation,
+) -> Vec<String> {
+    let mut regions = Vec::new();
+    if stored.len() != reproduced.len() {
+        regions.push(format!(
+            "region=length stored_len_bytes={} reencoded_len_bytes={}",
+            stored.len(),
+            reproduced.len()
+        ));
+        return regions;
+    }
+    let pointer_len = constellation
+        .input_ref
+        .pointer
+        .as_ref()
+        .map_or(0, |pointer| 4 + pointer.len());
+    let slot_map = HEADER_LEN + IDENTITY_HASH_LEN + 2 + pointer_len;
+    let slot_ids = constellation.slots.keys().copied().collect::<Vec<_>>();
+    for (start, end) in differing_ranges(stored, reproduced) {
+        let label = base_region_label(start, slot_map, &slot_ids);
+        regions.push(format!(
+            "region={label} offset={start} len={} stored_hex={} reencoded_hex={}",
+            end - start,
+            hex_encode(&stored[start..end]),
+            hex_encode(&reproduced[start..end]),
+        ));
+    }
+    regions
+}
+
+/// Maps a byte offset to the field of the Base encoding that contains it.
+fn base_region_label(offset: usize, slot_map: usize, slot_ids: &[SlotId]) -> String {
+    if offset < HEADER_LEN {
+        return "header".to_owned();
+    }
+    if offset < HEADER_LEN + IDENTITY_HASH_LEN {
+        return "identity_hash".to_owned();
+    }
+    if offset < slot_map {
+        return "input_ref_tail".to_owned();
+    }
+    if offset < slot_map + 2 {
+        return "slot_count".to_owned();
+    }
+    let entry = (offset - slot_map - 2) / SLOT_MAP_ENTRY_LEN;
+    let within = (offset - slot_map - 2) % SLOT_MAP_ENTRY_LEN;
+    let Some(slot) = slot_ids.get(entry) else {
+        return format!("tail_after_slot_map entry_index={entry}");
+    };
+    if within < 2 {
+        format!("slot_map_id slot_id={slot}")
+    } else {
+        format!("slot_map_hash slot_id={slot}")
+    }
+}
+
+/// Maximal half-open ranges in which two equal-length buffers differ.
+fn differing_ranges(left: &[u8], right: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+        match (a == b, start) {
+            (false, None) => start = Some(index),
+            (true, Some(from)) => {
+                ranges.push((from, index));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        ranges.push((from, left.len()));
+    }
+    ranges
 }
 
 fn join_slot_ids(slot_ids: &[SlotId]) -> String {
