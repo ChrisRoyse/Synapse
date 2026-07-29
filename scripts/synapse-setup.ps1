@@ -3803,11 +3803,245 @@ function Format-SynapseDaemonStartupLogSignal {
     }) -join "`n")
 }
 
+function Ensure-SynapseFileSizeProbeType {
+    <#
+      Issue #1877: NTFS replicates a file's size into its directory entry as a
+      performance tweak for directory enumeration, and since Vista that
+      replication only happens when the LAST handle to the file object closes.
+      Get-ChildItem/Get-Item read the directory entry, so any file a live writer
+      holds open reports an arbitrarily stale size — on this host the current
+      daemon log read 0 bytes from the directory entry while its handle reported
+      1,400,283. Microsoft documents the remedy on FindFirstFile: "To be assured
+      of getting the current NTFS file system file attributes, call the
+      GetFileInformationByHandle function."
+
+      The vault WAL is exactly such a file, and its byte total is what the
+      pre-purge deletion record (#1875) quotes back to the operator deciding
+      whether to destroy a vault. Understating that is the wrong direction to be
+      wrong in, so sizes come from a handle, never from the directory entry.
+
+      Reproduced deterministically on this host: with a writer holding a .wal
+      open after 1,048,576 bytes of appends, `Get-ChildItem` reported 1,000
+      bytes and the handle reported 1,049,576.
+
+      LAST-WRITE TIME IS REPLICATED THE SAME WAY and goes stale the same way.
+      That matters beyond cosmetics: Get-SynapseVaultRecoveryFingerprint uses
+      the newest write timestamp as a startup-progress signal, so a stale one
+      makes an advancing vault look frozen. GetFileInformationByHandle returns
+      size and timestamps together and is what Microsoft names as the remedy, so
+      both come from the one call.
+
+      FILE_READ_ATTRIBUTES is the minimal access that satisfies it, and asking
+      for no data access at all is what lets this probe succeed against files an
+      exclusive writer holds open.
+    #>
+    if ('SynapseSetup.FileSizeProbe' -as [type]) { return }
+
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace SynapseSetup
+{
+    public static class FileSizeProbe
+    {
+        private const uint FILE_READ_ATTRIBUTES = 0x0080;
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFileW(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILETIME
+        {
+            public uint dwLowDateTime;
+            public uint dwHighDateTime;
+            public long ToTicks()
+            {
+                return (long)(((ulong)dwHighDateTime << 32) | (ulong)dwLowDateTime);
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BY_HANDLE_FILE_INFORMATION
+        {
+            public uint dwFileAttributes;
+            public FILETIME ftCreationTime;
+            public FILETIME ftLastAccessTime;
+            public FILETIME ftLastWriteTime;
+            public uint dwVolumeSerialNumber;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint nNumberOfLinks;
+            public uint nFileIndexHigh;
+            public uint nFileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+        /// <summary>
+        /// Returns { size_in_bytes, last_write_utc_filetime } read from the file
+        /// object itself. Throws Win32Exception naming the path and win32 code.
+        /// </summary>
+        public static long[] Probe(string path)
+        {
+            IntPtr handle = CreateFileW(
+                path,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero);
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                int err = Marshal.GetLastWin32Error();
+                throw new Win32Exception(err,
+                    "CreateFileW(FILE_READ_ATTRIBUTES) failed for '" + path + "': win32=" + err +
+                    " " + new Win32Exception(err).Message);
+            }
+            try
+            {
+                BY_HANDLE_FILE_INFORMATION info;
+                if (!GetFileInformationByHandle(handle, out info))
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(err,
+                        "GetFileInformationByHandle failed for '" + path + "': win32=" + err +
+                        " " + new Win32Exception(err).Message);
+                }
+                long size = (long)(((ulong)info.nFileSizeHigh << 32) | (ulong)info.nFileSizeLow);
+                return new long[] { size, info.ftLastWriteTime.ToTicks() };
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+
+        public static long Length(string path)
+        {
+            return Probe(path)[0];
+        }
+    }
+}
+'@
+}
+
+function Get-SynapseAuthoritativeFileLength {
+    <#
+      Issue #1877: the length of a file as its own handle reports it, not as the
+      directory entry cached it. Returns a structured result rather than
+      throwing, so a caller summing many files can report exactly which ones it
+      could not size instead of losing the whole total to one failure.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    Ensure-SynapseFileSizeProbeType
+    try {
+        $probe = [SynapseSetup.FileSizeProbe]::Probe($Path)
+        return [pscustomobject]@{
+            path = $Path
+            bytes = [int64]$probe[0]
+            last_write_utc = [datetime]::FromFileTimeUtc([int64]$probe[1])
+            source = 'handle:GetFileInformationByHandle'
+            error = $null
+        }
+    } catch {
+        return [pscustomobject]@{
+            path = $Path
+            bytes = $null
+            last_write_utc = $null
+            source = 'unavailable'
+            error = (($_.Exception.Message) -replace '\s+', ' ').Trim()
+        }
+    }
+}
+
+function Measure-SynapseAuthoritativeFileBytes {
+    <#
+      Issue #1877: sums file sizes read from handles, and reports incompleteness
+      loudly instead of silently substituting the stale directory-entry value.
+      `complete=$false` means the returned `bytes` is a LOWER BOUND and the
+      unsized files are named.
+    #>
+    param([AllowNull()][object[]]$Files)
+
+    $result = [ordered]@{
+        file_count = 0
+        bytes = [int64]0
+        byte_source = 'handle:GetFileInformationByHandle'
+        sized_file_count = 0
+        unsized_file_count = 0
+        unsized_files = @()
+        complete = $true
+        largest = $null
+        newest_write_utc_ticks = [int64]0
+    }
+    $items = @($Files | Where-Object { $null -ne $_ })
+    if ($items.Count -eq 0) { return [pscustomobject]$result }
+
+    $result.file_count = $items.Count
+    $unsized = New-Object System.Collections.Generic.List[object]
+    $largestBytes = [int64]-1
+    foreach ($file in $items) {
+        $probe = Get-SynapseAuthoritativeFileLength -Path $file.FullName
+        if ($null -eq $probe.bytes) {
+            $unsized.Add([ordered]@{ path = $probe.path; error = $probe.error }) | Out-Null
+            continue
+        }
+        $result.sized_file_count++
+        $result.bytes += [int64]$probe.bytes
+        # The enumeration entry's LastWriteTimeUtc is replicated metadata and
+        # goes stale exactly like the size does (#1877), so the timestamp comes
+        # from the same handle read, not from $file.
+        $writeTicks = [int64]$probe.last_write_utc.Ticks
+        if ($writeTicks -gt $result.newest_write_utc_ticks) { $result.newest_write_utc_ticks = $writeTicks }
+        if ([int64]$probe.bytes -gt $largestBytes) {
+            $largestBytes = [int64]$probe.bytes
+            $result.largest = [ordered]@{
+                name = $file.Name
+                bytes = [int64]$probe.bytes
+                last_write_utc = $probe.last_write_utc.ToString('o')
+                byte_source = 'handle:GetFileInformationByHandle'
+            }
+        }
+    }
+    if ($unsized.Count -gt 0) {
+        $result.unsized_file_count = $unsized.Count
+        # Cap the embedded detail so one broken directory cannot make the
+        # snapshot unreadable; the count above is never capped.
+        $result.unsized_files = @($unsized | Select-Object -First 8)
+        $result.complete = $false
+    }
+    return [pscustomobject]$result
+}
+
 function Get-SynapseCalyxPhysicalSnapshot {
     param([Parameter(Mandatory=$true)][string]$Path)
 
     $snapshot = [ordered]@{
-        schema = 'synapse_calyx_physical_snapshot/v1'
+        schema = 'synapse_calyx_physical_snapshot/v2'
         path = $Path
         exists = $false
         current_pointer = $null
@@ -3823,6 +4057,13 @@ function Get-SynapseCalyxPhysicalSnapshot {
         wal_segment_count = 0
         wal_bytes = 0
         largest_wal = $null
+        # Issue #1877: byte totals come from file handles, never directory
+        # entries. `bytes_complete=$false` means every *_bytes figure is a lower
+        # bound and `unsized_files` names what could not be read.
+        byte_source = 'handle:GetFileInformationByHandle'
+        bytes_complete = $true
+        unsized_file_count = 0
+        unsized_files = @()
         lock_path = (Join-Path $Path 'vault.lock')
         lock_exists = $false
         pid_path = (Join-Path $Path 'vault.pid')
@@ -3861,18 +4102,32 @@ function Get-SynapseCalyxPhysicalSnapshot {
             }
         }
 
+        $unsized = New-Object System.Collections.Generic.List[object]
+
         $manifestFiles = @(Get-ChildItem -LiteralPath $Path -Filter 'manifest-*.json' -File -ErrorAction SilentlyContinue)
         if ($manifestFiles.Count -gt 0) {
+            $manifestMeasure = Measure-SynapseAuthoritativeFileBytes -Files $manifestFiles
             $snapshot.manifest_file_count = $manifestFiles.Count
-            $snapshot.manifest_bytes = ($manifestFiles | Measure-Object Length -Sum).Sum
+            $snapshot.manifest_bytes = $manifestMeasure.bytes
+            if (-not $manifestMeasure.complete) {
+                $snapshot.bytes_complete = $false
+                $snapshot.unsized_file_count += $manifestMeasure.unsized_file_count
+                foreach ($u in @($manifestMeasure.unsized_files)) { $unsized.Add($u) | Out-Null }
+            }
         }
 
         $cfRoot = Join-Path $Path 'cf'
         if (Test-Path -LiteralPath $cfRoot -PathType Container) {
             $cfFiles = @(Get-ChildItem -LiteralPath $cfRoot -Recurse -File -ErrorAction SilentlyContinue)
             if ($cfFiles.Count -gt 0) {
+                $cfMeasure = Measure-SynapseAuthoritativeFileBytes -Files $cfFiles
                 $snapshot.cf_file_count = $cfFiles.Count
-                $snapshot.cf_bytes = ($cfFiles | Measure-Object Length -Sum).Sum
+                $snapshot.cf_bytes = $cfMeasure.bytes
+                if (-not $cfMeasure.complete) {
+                    $snapshot.bytes_complete = $false
+                    $snapshot.unsized_file_count += $cfMeasure.unsized_file_count
+                    foreach ($u in @($cfMeasure.unsized_files)) { $unsized.Add($u) | Out-Null }
+                }
             }
         }
 
@@ -3880,17 +4135,23 @@ function Get-SynapseCalyxPhysicalSnapshot {
         if (Test-Path -LiteralPath $walRoot -PathType Container) {
             $walFiles = @(Get-ChildItem -LiteralPath $walRoot -Filter '*.wal' -File -ErrorAction SilentlyContinue)
             if ($walFiles.Count -gt 0) {
+                # The WAL is the file the live daemon holds open and appends to
+                # continuously, so it is the one whose directory entry is most
+                # reliably wrong (#1877).
+                $walMeasure = Measure-SynapseAuthoritativeFileBytes -Files $walFiles
                 $snapshot.wal_segment_count = $walFiles.Count
-                $snapshot.wal_bytes = ($walFiles | Measure-Object Length -Sum).Sum
-                $largest = $walFiles | Sort-Object Length -Descending | Select-Object -First 1
-                if ($largest) {
-                    $snapshot.largest_wal = [ordered]@{
-                        name = $largest.Name
-                        bytes = $largest.Length
-                        last_write_utc = $largest.LastWriteTimeUtc.ToString('o')
-                    }
+                $snapshot.wal_bytes = $walMeasure.bytes
+                $snapshot.largest_wal = $walMeasure.largest
+                if (-not $walMeasure.complete) {
+                    $snapshot.bytes_complete = $false
+                    $snapshot.unsized_file_count += $walMeasure.unsized_file_count
+                    foreach ($u in @($walMeasure.unsized_files)) { $unsized.Add($u) | Out-Null }
                 }
             }
+        }
+
+        if ($unsized.Count -gt 0) {
+            $snapshot.unsized_files = @($unsized | Select-Object -First 12)
         }
 
         $snapshot.lock_exists = Test-Path -LiteralPath $snapshot.lock_path -PathType Leaf
@@ -3955,12 +4216,25 @@ function Write-SynapseVaultDeletionRecord {
     }
     $populated = ($durableSeq -gt 0) -or ($snapshot.cf_file_count -gt 0) -or ($snapshot.manifest_file_count -gt 1)
 
+    # Issue #1877: byte totals are read from handles, so they are current rather
+    # than the stale directory-entry values NTFS caches for open files. If any
+    # file could not be sized the totals are a LOWER BOUND, and the operator
+    # deciding whether to destroy this vault has to be told that explicitly.
+    $bytesQualifier = 'exact'
+    if (-not $snapshot.bytes_complete) {
+        $bytesQualifier = "lower_bound_unsized_files=$($snapshot.unsized_file_count)"
+        Warn ("Vault byte totals are incomplete: $($snapshot.unsized_file_count) file(s) could not be sized " +
+              "from a handle, so cf_bytes/wal_bytes below understate what is on disk. " +
+              "First failures: " + (($snapshot.unsized_files | ForEach-Object { "$($_.path) ($($_.error))" }) -join '; '))
+    }
+
     if ($populated -and -not $Confirmed) {
         Die (@(
             "SYNAPSE_SETUP_VAULT_PURGE_REFUSED",
             ("vault_dir=$DbPath vault_id=$vaultId durable_seq=$durableSeq " +
              "manifest_files=$($snapshot.manifest_file_count) cf_files=$($snapshot.cf_file_count) " +
-             "cf_bytes=$($snapshot.cf_bytes) wal_segments=$($snapshot.wal_segment_count)"),
+             "cf_bytes=$($snapshot.cf_bytes) wal_segments=$($snapshot.wal_segment_count) " +
+             "wal_bytes=$($snapshot.wal_bytes) byte_source=$($snapshot.byte_source) bytes=$bytesQualifier"),
             'source_of_truth=physical vault directory contents read immediately before deletion',
             ('remediation=this vault holds durable captured history and there is no automatic backup ' +
              '(issue #1687). Take a backup first, then rerun with -ConfirmVaultDestruction to delete ' +
@@ -4003,7 +4277,8 @@ function Write-SynapseVaultDeletionRecord {
     }
 
     Info ("Vault deletion recorded at $recordPath (vault_id=$vaultId durable_seq=$durableSeq " +
-          "cf_files=$($snapshot.cf_file_count) cf_bytes=$($snapshot.cf_bytes))")
+          "cf_files=$($snapshot.cf_file_count) cf_bytes=$($snapshot.cf_bytes) wal_bytes=$($snapshot.wal_bytes) " +
+          "byte_source=$($snapshot.byte_source) bytes=$bytesQualifier)")
 }
 
 function Format-SynapseCalyxPhysicalSnapshot {
@@ -4238,13 +4513,17 @@ function Get-SynapseVaultRecoveryFingerprint {
         if (Test-Path -LiteralPath $currentPath -PathType Leaf) {
             $currentPointer = ((Get-Content -LiteralPath $currentPath -Raw -ErrorAction Stop) -replace '\s+', '')
         }
+        # Issue #1877: this fingerprint is the stall detector — it decides whether
+        # a starting daemon is making physical progress. Directory-entry sizes go
+        # stale precisely on the file that proves progress (the WAL the daemon
+        # holds open), which makes a growing vault look frozen. Size from handles.
         $newestTicks = [int64]0
         $manifestFiles = @(Get-ChildItem -LiteralPath $Path -Filter 'manifest-*.json' -File -ErrorAction SilentlyContinue)
         $manifestBytes = [double]0
         if ($manifestFiles.Count -gt 0) {
-            $manifestBytes = [double](($manifestFiles | Measure-Object Length -Sum).Sum)
-            $newestManifest = [int64](@($manifestFiles | ForEach-Object { [int64]$_.LastWriteTimeUtc.Ticks } | Sort-Object -Descending)[0])
-            if ($newestManifest -gt $newestTicks) { $newestTicks = $newestManifest }
+            $manifestMeasure = Measure-SynapseAuthoritativeFileBytes -Files $manifestFiles
+            $manifestBytes = [double]$manifestMeasure.bytes
+            if ($manifestMeasure.newest_write_utc_ticks -gt $newestTicks) { $newestTicks = $manifestMeasure.newest_write_utc_ticks }
         }
         $cfCount = 0
         $cfBytes = [double]0
@@ -4252,10 +4531,10 @@ function Get-SynapseVaultRecoveryFingerprint {
         if (Test-Path -LiteralPath $cfRoot -PathType Container) {
             $cfFiles = @(Get-ChildItem -LiteralPath $cfRoot -Recurse -File -ErrorAction SilentlyContinue)
             if ($cfFiles.Count -gt 0) {
+                $cfMeasure = Measure-SynapseAuthoritativeFileBytes -Files $cfFiles
                 $cfCount = $cfFiles.Count
-                $cfBytes = [double](($cfFiles | Measure-Object Length -Sum).Sum)
-                $newestCf = [int64](@($cfFiles | ForEach-Object { [int64]$_.LastWriteTimeUtc.Ticks } | Sort-Object -Descending)[0])
-                if ($newestCf -gt $newestTicks) { $newestTicks = $newestCf }
+                $cfBytes = [double]$cfMeasure.bytes
+                if ($cfMeasure.newest_write_utc_ticks -gt $newestTicks) { $newestTicks = $cfMeasure.newest_write_utc_ticks }
             }
         }
         $walCount = 0
@@ -4264,10 +4543,10 @@ function Get-SynapseVaultRecoveryFingerprint {
         if (Test-Path -LiteralPath $walRoot -PathType Container) {
             $walFiles = @(Get-ChildItem -LiteralPath $walRoot -Filter '*.wal' -File -ErrorAction SilentlyContinue)
             if ($walFiles.Count -gt 0) {
+                $walMeasure = Measure-SynapseAuthoritativeFileBytes -Files $walFiles
                 $walCount = $walFiles.Count
-                $walBytes = [double](($walFiles | Measure-Object Length -Sum).Sum)
-                $newestWal = [int64](@($walFiles | ForEach-Object { [int64]$_.LastWriteTimeUtc.Ticks } | Sort-Object -Descending)[0])
-                if ($newestWal -gt $newestTicks) { $newestTicks = $newestWal }
+                $walBytes = [double]$walMeasure.bytes
+                if ($walMeasure.newest_write_utc_ticks -gt $newestTicks) { $newestTicks = $walMeasure.newest_write_utc_ticks }
             }
         }
         $fingerprint.Key = ("current={0} manifests={1}/{2} cf={3}/{4} wal={5}/{6} newest_write_ticks={7}" -f `
