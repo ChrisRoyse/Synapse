@@ -950,7 +950,7 @@ pub(super) async fn handle(
                 )
             } else if let Some(causality) = &response.causality {
                 format!(
-                    "intelligence causality panel={} a={} b={} best_lag={} t_a_to_b={:.4} t_b_to_a={:.4} direction={} grounded={} graph_rows={}",
+                    "intelligence causality panel={} a={} b={} best_lag={} t_a_to_b={:.4} t_b_to_a={:.4} direction={} estimator={} grounded={} graph_rows={}",
                     causality.panel_version,
                     causality.group_a,
                     causality.group_b,
@@ -958,6 +958,7 @@ pub(super) async fn handle(
                     causality.t_a_to_b,
                     causality.t_b_to_a,
                     causality.dominant_direction,
+                    causality.estimator,
                     causality.grounded,
                     causality.graph_cf_rows_after,
                 )

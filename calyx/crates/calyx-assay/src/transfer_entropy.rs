@@ -1,11 +1,26 @@
 //! Transfer entropy over recurrence streams (PRD `26 §4`, PH52).
 //!
 //! `T(A -> B) = I(B_future; A_past, B_past) - I(B_future; B_past)`.
-//! This module keeps the estimator honest by reusing the Assay KSG MI path and
-//! returning provisional, code-tagged readbacks below quorum instead of
-//! silently treating underpowered streams as causal evidence.
+//! This module keeps the estimator honest by returning provisional, code-tagged
+//! readbacks below quorum instead of silently treating underpowered streams as
+//! causal evidence.
+//!
+//! Two estimators live behind one entry point (issue #1673):
+//!
+//! * [`TeEstimator::ContinuousKsg`] — the Assay KSG k-nearest-neighbour MI path,
+//!   valid for samples from a joint density.
+//! * [`TeEstimator::DiscretePlugin`] — the plug-in / Miller-Madow estimator in
+//!   [`discrete`], valid for symbol streams such as binned occurrence counts, on
+//!   which KSG's k-th joint radius degenerates to zero.
+//!
+//! Which one ran is **always** reported on [`TEResult::estimator`], together
+//! with [`TEResult::estimator_selection`] and [`TEResult::estimator_reason`].
+//! An estimator is never swapped silently: [`TransferEntropyConfig::estimator`]
+//! either pins one, or asks for the documented auto rule whose verdict and
+//! reason then travel with the result.
 
 mod cuda;
+pub mod discrete;
 
 use rand::{SeedableRng, seq::SliceRandom};
 use rand_chacha::ChaCha8Rng;
@@ -18,6 +33,7 @@ use crate::estimate::TrustTag;
 use crate::ksg::{MIN_ASSAY_SAMPLES, ksg_mi_continuous_point};
 
 use self::cuda::transfer_entropy_with_config_cuda_strict_impl;
+use self::discrete::{integral_coordinate_counts, transfer_entropy_discrete};
 
 pub type Timestamp = Ts;
 pub type RecurrenceStream = [(Timestamp, f32)];
@@ -39,6 +55,96 @@ pub enum Direction {
     Unclear,
 }
 
+/// The estimator a caller asks [`transfer_entropy_with_config`] to use.
+///
+/// `Auto` is a *declared* rule, not a hidden fallback: its verdict and reason
+/// are reported on every [`TEResult`] it produces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeEstimatorChoice {
+    /// Pick from the observed sample domain and report why.
+    #[default]
+    Auto,
+    /// Always use the discrete plug-in / Miller-Madow estimator.
+    DiscretePlugin,
+    /// Always use the continuous KSG estimator.
+    ContinuousKsg,
+}
+
+/// The estimator that actually produced a [`TEResult`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeEstimator {
+    /// Plug-in entropy decomposition with a Miller-Madow bias correction.
+    DiscretePlugin,
+    /// Kraskov-Stögbauer-Grassberger k-nearest-neighbour mutual information.
+    ContinuousKsg,
+}
+
+impl TeEstimator {
+    /// Stable wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscretePlugin => "discrete_plugin",
+            Self::ContinuousKsg => "continuous_ksg",
+        }
+    }
+}
+
+/// Why the reported estimator was the one used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeEstimatorSelection {
+    /// The caller pinned the discrete plug-in estimator.
+    RequestedDiscretePlugin,
+    /// The caller pinned the continuous KSG estimator.
+    RequestedContinuousKsg,
+    /// Auto: every sampled coordinate is a finite integer, so the KSG k-th joint
+    /// radius would be degenerate.
+    AutoIntegralSamples,
+    /// Auto: some sampled coordinates are non-integral, so KSG applies.
+    AutoRealValuedSamples,
+    /// The lag failed before any estimator could be applied.
+    Unresolved,
+}
+
+impl TeEstimatorSelection {
+    /// Stable wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestedDiscretePlugin => "requested_discrete_plugin",
+            Self::RequestedContinuousKsg => "requested_continuous_ksg",
+            Self::AutoIntegralSamples => "auto_integral_samples",
+            Self::AutoRealValuedSamples => "auto_real_valued_samples",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// What a single lag attempted: the resolved estimator, why it was resolved that
+/// way, and how many paired samples reached it. Carried out of a *failed* lag
+/// too, so a terminal diagnostic keeps per-lag detail instead of erasing it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EstimatorPick {
+    pub(crate) estimator: Option<TeEstimator>,
+    pub(crate) selection: TeEstimatorSelection,
+    pub(crate) reason: String,
+    pub(crate) n_samples: usize,
+}
+
+impl EstimatorPick {
+    fn unresolved() -> Self {
+        Self {
+            estimator: None,
+            selection: TeEstimatorSelection::Unresolved,
+            reason: "the lag failed before an estimator was applied".to_string(),
+            n_samples: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TEResult {
     pub t_a_to_b: f32,
@@ -52,6 +158,13 @@ pub struct TEResult {
     pub provisional: bool,
     pub n_samples: usize,
     pub error_code: Option<String>,
+    /// The estimator that produced this row; `None` only when the lag failed
+    /// before one could be applied.
+    pub estimator: Option<TeEstimator>,
+    /// How that estimator came to be used.
+    pub estimator_selection: TeEstimatorSelection,
+    /// Human-readable justification for `estimator_selection`.
+    pub estimator_reason: String,
     pub trust: TrustTag,
     pub computed_at: Ts,
 }
@@ -62,6 +175,8 @@ pub struct TransferEntropyConfig {
     pub k: usize,
     pub bootstrap_resamples: usize,
     pub bootstrap_seed: u64,
+    /// Explicit estimator selection. Never silently overridden.
+    pub estimator: TeEstimatorChoice,
 }
 
 impl Default for TransferEntropyConfig {
@@ -71,6 +186,7 @@ impl Default for TransferEntropyConfig {
             k: DEFAULT_TE_K,
             bootstrap_resamples: DEFAULT_TE_BOOTSTRAP_RESAMPLES,
             bootstrap_seed: DEFAULT_TE_BOOTSTRAP_SEED,
+            estimator: TeEstimatorChoice::Auto,
         }
     }
 }
@@ -97,6 +213,20 @@ pub fn transfer_entropy_with_config(
     clock: &dyn Clock,
     config: &TransferEntropyConfig,
 ) -> Result<TEResult> {
+    let mut pick = EstimatorPick::unresolved();
+    transfer_entropy_inner(stream_a, stream_b, lag, clock, config, &mut pick)
+}
+
+/// Shared body. `pick` is filled the moment the estimator is resolved so a later
+/// failure still reports which estimator was applied instead of erasing it.
+fn transfer_entropy_inner(
+    stream_a: &RecurrenceStream,
+    stream_b: &RecurrenceStream,
+    lag: usize,
+    clock: &dyn Clock,
+    config: &TransferEntropyConfig,
+    pick: &mut EstimatorPick,
+) -> Result<TEResult> {
     if strict_cuda_requested() {
         return transfer_entropy_with_config_cuda_strict(stream_a, stream_b, lag, clock, config);
     }
@@ -104,17 +234,38 @@ pub fn transfer_entropy_with_config(
     let forward = lagged_samples(stream_a, stream_b, lag, config.window_size)?;
     let reverse = lagged_samples(stream_b, stream_a, lag, config.window_size)?;
     let n_samples = forward.len().min(reverse.len());
+    let forward = &forward[..n_samples];
+    let reverse = &reverse[..n_samples];
+    *pick = resolve_estimator(config, forward, reverse);
+    pick.n_samples = n_samples;
     if n_samples < MIN_TE_QUORUM || n_samples < MIN_ASSAY_SAMPLES {
         return Ok(provisional_result(
             lag,
             config.window_size,
             n_samples,
             clock,
+            pick,
         ));
     }
+    match pick.estimator {
+        Some(TeEstimator::DiscretePlugin) => {
+            transfer_entropy_discrete(forward, reverse, lag, clock, config, pick)
+        }
+        Some(TeEstimator::ContinuousKsg) | None => {
+            transfer_entropy_continuous(forward, reverse, lag, clock, config, pick)
+        }
+    }
+}
 
-    let forward = &forward[..n_samples];
-    let reverse = &reverse[..n_samples];
+fn transfer_entropy_continuous(
+    forward: &[LaggedSample],
+    reverse: &[LaggedSample],
+    lag: usize,
+    clock: &dyn Clock,
+    config: &TransferEntropyConfig,
+    pick: &EstimatorPick,
+) -> Result<TEResult> {
+    let n_samples = forward.len().min(reverse.len());
     let t_a_to_b = estimate_te(forward, config.k)?;
     let t_b_to_a = estimate_te(reverse, config.k)?;
     let ci_95 = bootstrap_ci(forward, t_a_to_b, config, config.bootstrap_seed)?;
@@ -143,9 +294,68 @@ pub fn transfer_entropy_with_config(
         provisional: false,
         n_samples,
         error_code: None,
+        estimator: Some(TeEstimator::ContinuousKsg),
+        estimator_selection: pick.selection,
+        estimator_reason: pick.reason.clone(),
         trust: TrustTag::Provisional,
         computed_at: clock.now(),
     })
+}
+
+/// The declared estimator-selection rule.
+///
+/// KSG needs a non-zero k-th joint radius, which integer-valued coordinates
+/// cannot supply once k or more samples coincide (Kraskov et al. 2004). So the
+/// auto rule keys on exactly that data property — are all sampled coordinates
+/// finite integers — and records the counts it saw in the reason. It never
+/// re-tries the other estimator after a failure.
+fn resolve_estimator(
+    config: &TransferEntropyConfig,
+    forward: &[LaggedSample],
+    reverse: &[LaggedSample],
+) -> EstimatorPick {
+    match config.estimator {
+        TeEstimatorChoice::DiscretePlugin => EstimatorPick {
+            estimator: Some(TeEstimator::DiscretePlugin),
+            selection: TeEstimatorSelection::RequestedDiscretePlugin,
+            reason: "the caller pinned the discrete plug-in estimator".to_string(),
+            n_samples: 0,
+        },
+        TeEstimatorChoice::ContinuousKsg => EstimatorPick {
+            estimator: Some(TeEstimator::ContinuousKsg),
+            selection: TeEstimatorSelection::RequestedContinuousKsg,
+            reason: "the caller pinned the continuous KSG estimator".to_string(),
+            n_samples: 0,
+        },
+        TeEstimatorChoice::Auto => {
+            let (forward_total, forward_integral) = integral_coordinate_counts(forward);
+            let (reverse_total, reverse_integral) = integral_coordinate_counts(reverse);
+            let total = forward_total + reverse_total;
+            let integral = forward_integral + reverse_integral;
+            if total == 0 {
+                EstimatorPick::unresolved()
+            } else if integral == total {
+                EstimatorPick {
+                    estimator: Some(TeEstimator::DiscretePlugin),
+                    selection: TeEstimatorSelection::AutoIntegralSamples,
+                    reason: format!(
+                        "auto: all {total} sampled coordinates are finite integers, so the continuous KSG k-th joint radius would be degenerate"
+                    ),
+                    n_samples: 0,
+                }
+            } else {
+                EstimatorPick {
+                    estimator: Some(TeEstimator::ContinuousKsg),
+                    selection: TeEstimatorSelection::AutoRealValuedSamples,
+                    reason: format!(
+                        "auto: {} of {total} sampled coordinates are non-integral, so the continuous KSG estimator applies",
+                        total - integral
+                    ),
+                    n_samples: 0,
+                }
+            }
+        }
+    }
 }
 
 pub fn transfer_entropy_with_config_cuda_strict(
@@ -175,12 +385,13 @@ pub fn transfer_entropy_sweep_with_config(
     config: &TransferEntropyConfig,
 ) -> Vec<TEResult> {
     lags.iter()
-        .map(
-            |&lag| match transfer_entropy_with_config(a, b, lag, clock, config) {
+        .map(|&lag| {
+            let mut pick = EstimatorPick::unresolved();
+            match transfer_entropy_inner(a, b, lag, clock, config, &mut pick) {
                 Ok(result) => result,
-                Err(error) => error_result(lag, config.window_size, clock, error),
-            },
-        )
+                Err(error) => error_result(lag, config.window_size, clock, &error, &pick),
+            }
+        })
         .collect()
 }
 
@@ -206,6 +417,7 @@ fn provisional_result(
     window_size: usize,
     n_samples: usize,
     clock: &dyn Clock,
+    pick: &EstimatorPick,
 ) -> TEResult {
     TEResult {
         t_a_to_b: 0.0,
@@ -219,14 +431,26 @@ fn provisional_result(
         provisional: true,
         n_samples,
         error_code: Some(CALYX_TE_INSUFFICIENT_SAMPLES.to_string()),
+        estimator: pick.estimator,
+        estimator_selection: pick.selection,
+        estimator_reason: pick.reason.clone(),
         trust: TrustTag::Provisional,
         computed_at: clock.now(),
     }
 }
 
-fn error_result(lag: usize, window_size: usize, clock: &dyn Clock, error: CalyxError) -> TEResult {
-    let mut result = provisional_result(lag, window_size, 0, clock);
+/// A failed lag still reports what was attempted: the estimator that had been
+/// resolved, the sample count that reached it, and the concrete failure code.
+fn error_result(
+    lag: usize,
+    window_size: usize,
+    clock: &dyn Clock,
+    error: &CalyxError,
+    pick: &EstimatorPick,
+) -> TEResult {
+    let mut result = provisional_result(lag, window_size, pick.n_samples, clock, pick);
     result.error_code = Some(error.code.to_string());
+    result.estimator_reason = format!("{}; failed: {}", pick.reason, error.message);
     result
 }
 
@@ -357,17 +581,19 @@ fn subsample_without_replacement(
     samples: &[LaggedSample],
     rng: &mut ChaCha8Rng,
 ) -> Vec<LaggedSample> {
-    let mut indices = (0..samples.len()).collect::<Vec<_>>();
-    indices.shuffle(rng);
-    indices.truncate(
-        (samples.len() * 4 / 5)
-            .max(MIN_ASSAY_SAMPLES)
-            .min(samples.len()),
-    );
-    indices
+    subsample_indices(samples.len(), rng)
         .into_iter()
         .map(|index| samples[index].clone())
         .collect()
+}
+
+/// The one m-out-of-n subsample sizing rule, shared by both estimators so their
+/// confidence intervals stay comparable.
+fn subsample_indices(n: usize, rng: &mut ChaCha8Rng) -> Vec<usize> {
+    let mut indices = (0..n).collect::<Vec<_>>();
+    indices.shuffle(rng);
+    indices.truncate((n * 4 / 5).max(MIN_ASSAY_SAMPLES).min(n));
+    indices
 }
 
 fn percentile_ci(mut estimates: Vec<f32>, point: f32) -> (f32, f32) {
@@ -399,4 +625,143 @@ fn dominant_direction(
 
 fn insufficient(message: impl Into<String>) -> CalyxError {
     CalyxError::assay_insufficient_samples(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use calyx_core::FixedClock;
+
+    /// Deterministic Bernoulli(p) draws — a small xorshift so the analytic
+    /// expectations below are reproducible without a random seed dependency.
+    fn bernoulli_stream(n: usize, p: f64, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let uniform = (state >> 11) as f64 / (1u64 << 53) as f64;
+                f32::from(uniform < p)
+            })
+            .collect()
+    }
+
+    fn as_stream(values: &[f32]) -> Vec<(Timestamp, f32)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as Timestamp, *value))
+            .collect()
+    }
+
+    /// `B[t] = A[t-3]` over Bernoulli(0.3) bins. At lag 3 the target future is
+    /// exactly the source past, so `T(A -> B) = H(0.3) = 0.8813` bits and
+    /// `T(B -> A) = 0`. Every other lag is analytically 0 in both directions.
+    #[test]
+    fn shifted_copy_resolves_lag_three_a_to_b() {
+        let a = bernoulli_stream(2000, 0.3, 0x5EED_1673);
+        let mut b = vec![0.0_f32; a.len()];
+        b[3..].copy_from_slice(&a[..a.len() - 3]);
+        let stream_a = as_stream(&a);
+        let stream_b = as_stream(&b);
+        let clock = FixedClock::new(0);
+        let config = TransferEntropyConfig {
+            bootstrap_resamples: 64,
+            ..TransferEntropyConfig::default()
+        };
+        let results = transfer_entropy_sweep_with_config(
+            &stream_a,
+            &stream_b,
+            &[1, 2, 3, 4],
+            &clock,
+            &config,
+        );
+        for result in &results {
+            assert_eq!(result.error_code, None, "lag {} errored", result.lag);
+            assert_eq!(result.estimator, Some(TeEstimator::DiscretePlugin));
+            assert_eq!(
+                result.estimator_selection,
+                TeEstimatorSelection::AutoIntegralSamples
+            );
+        }
+        let best = results
+            .iter()
+            .max_by(|left, right| {
+                (left.t_a_to_b - left.t_b_to_a)
+                    .abs()
+                    .total_cmp(&(right.t_a_to_b - right.t_b_to_a).abs())
+            })
+            .expect("a lag");
+        assert_eq!(best.lag, 3);
+        assert_eq!(best.dominant_direction, Direction::AToB);
+        assert!(
+            (best.t_a_to_b - 0.881_3).abs() < 0.02,
+            "expected H(0.3)=0.8813 bits, got {}",
+            best.t_a_to_b
+        );
+        assert!(best.t_b_to_a < 0.01, "reverse leaked {}", best.t_b_to_a);
+        assert!(best.t_a_to_b - best.t_b_to_a > 0.0);
+    }
+
+    /// Two independent Bernoulli streams carry no directed information, so the
+    /// estimator must report `Unclear` rather than invent a direction.
+    #[test]
+    fn independent_streams_stay_unclear() {
+        let a = bernoulli_stream(2000, 0.3, 0x5EED_1673);
+        let b = bernoulli_stream(2000, 0.3, 0x0BAD_C0DE);
+        let clock = FixedClock::new(0);
+        let config = TransferEntropyConfig {
+            bootstrap_resamples: 64,
+            ..TransferEntropyConfig::default()
+        };
+        let results = transfer_entropy_sweep_with_config(
+            &as_stream(&a),
+            &as_stream(&b),
+            &[1, 2, 3, 4],
+            &clock,
+            &config,
+        );
+        for result in &results {
+            assert_eq!(result.error_code, None, "lag {} errored", result.lag);
+            assert_eq!(
+                result.dominant_direction,
+                Direction::Unclear,
+                "lag {} invented a direction",
+                result.lag
+            );
+            assert!(result.t_a_to_b < 0.01 && result.t_b_to_a < 0.01);
+        }
+    }
+
+    /// Pinning the continuous estimator on the same integer-valued streams must
+    /// fail loudly (degenerate KSG radius), never silently fall back.
+    #[test]
+    fn pinned_continuous_estimator_fails_closed_on_counts() {
+        let a = bernoulli_stream(400, 0.3, 0x5EED_1673);
+        let mut b = vec![0.0_f32; a.len()];
+        b[3..].copy_from_slice(&a[..a.len() - 3]);
+        let clock = FixedClock::new(0);
+        let config = TransferEntropyConfig {
+            estimator: TeEstimatorChoice::ContinuousKsg,
+            bootstrap_resamples: 8,
+            ..TransferEntropyConfig::default()
+        };
+        let results = transfer_entropy_sweep_with_config(
+            &as_stream(&a),
+            &as_stream(&b),
+            &[3],
+            &clock,
+            &config,
+        );
+        let result = &results[0];
+        assert!(result.error_code.is_some());
+        assert_eq!(result.estimator, Some(TeEstimator::ContinuousKsg));
+        assert_eq!(
+            result.estimator_selection,
+            TeEstimatorSelection::RequestedContinuousKsg
+        );
+        assert_eq!(result.n_samples, 397);
+    }
 }

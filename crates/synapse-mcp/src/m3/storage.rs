@@ -1036,6 +1036,10 @@ pub struct StorageIntelligenceCausalityLag {
     pub direction: String,
     pub n_samples: u64,
     pub provisional: bool,
+    /// Transfer-entropy estimator this lag ran, or `unresolved`.
+    pub estimator: String,
+    /// Concrete `CALYX_*` failure code for this lag, when it failed.
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1057,6 +1061,10 @@ pub struct StorageIntelligenceCausalityReport {
     pub difference_ci_high: f32,
     pub dominant_direction: String,
     pub grounded: bool,
+    /// Transfer-entropy estimator behind `t_a_to_b` / `t_b_to_a`.
+    pub estimator: String,
+    /// Why that estimator was used. Never a silent choice.
+    pub estimator_reason: String,
     pub lags: Vec<StorageIntelligenceCausalityLag>,
     pub graph_cf_rows_after: u64,
 }
@@ -1986,6 +1994,8 @@ pub fn run_intelligence_causality(
         difference_ci_high: report.difference_ci_high,
         dominant_direction: report.dominant_direction,
         grounded: report.grounded,
+        estimator: report.estimator,
+        estimator_reason: report.estimator_reason,
         lags: report
             .lags
             .into_iter()
@@ -1998,6 +2008,8 @@ pub fn run_intelligence_causality(
                 direction: lag.direction,
                 n_samples: lag.n_samples as u64,
                 provisional: lag.provisional,
+                estimator: lag.estimator,
+                error_code: lag.error_code,
             })
             .collect(),
         graph_cf_rows_after: report.graph_cf_rows_after as u64,

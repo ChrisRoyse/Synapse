@@ -12,9 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
-    AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, DEFAULT_TE_LAGS,
-    Direction, EstimatorKind, InterEventHazardReport, MiEstimate, MmdConfig, PeriodogramConfig,
-    RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport, TEResult, TrustTag,
+    AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, Direction,
+    EstimatorKind, InterEventHazardReport, MiEstimate, MmdConfig, PeriodogramConfig, RateShift,
+    SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport, TEResult, TeEstimator, TrustTag,
     autocorrelation, bin_event_counts, bits_report_with_anchor, entropy_bits,
     inter_event_hazard_with_alpha, ksg_mi_continuous_discrete, lomb_scargle_with_config,
     mmd_change_point, panel_sufficiency_with_anchor, partitioned_histogram_nmi,
@@ -1799,6 +1799,11 @@ pub const SYNAPSE_TEMPORAL_MIN_EVENTS: usize = 8;
 pub const SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS: f64 = 3_600.0;
 /// Default maximum lag (in bins) swept by the transfer-entropy estimator.
 pub const SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG: usize = 8;
+/// Hard cap on the number of lags in one transfer-entropy sweep. The sweep is
+/// contiguous (`1..=max_lag`) because the delay it has to find is an unknown
+/// integer number of bins; a sparse power-of-two lag set silently cannot report
+/// a true lag of, say, 3. Bounding the count keeps the bootstrap cost finite.
+pub const SYNAPSE_TEMPORAL_MAX_LAGS: usize = 32;
 /// Cap on reported periodogram peaks.
 pub const SYNAPSE_TEMPORAL_MAX_PEAKS: usize = 4;
 /// Hard cap on the aligned transfer-entropy timeline. This admits more than 29
@@ -1869,6 +1874,11 @@ pub struct SynapseCalyxCausalityLag {
     pub direction: String,
     pub n_samples: usize,
     pub provisional: bool,
+    /// The estimator this lag ran (`discrete_plugin` / `continuous_ksg`), or
+    /// `unresolved` when the lag failed before one was applied.
+    pub estimator: String,
+    /// The concrete `CALYX_*` failure code for this lag, when it failed.
+    pub error_code: Option<String>,
 }
 
 /// Directed transfer-entropy result between two activity streams with the
@@ -1890,6 +1900,10 @@ pub struct SynapseCalyxCausalityReport {
     pub difference_ci_high: f32,
     pub dominant_direction: String,
     pub grounded: bool,
+    /// The transfer-entropy estimator behind `t_a_to_b` / `t_b_to_a`.
+    pub estimator: String,
+    /// Why that estimator was the one used. Never a silent choice.
+    pub estimator_reason: String,
     pub lags: Vec<SynapseCalyxCausalityLag>,
     pub graph_cf_rows_after: usize,
 }
@@ -2017,23 +2031,12 @@ impl SynapseCalyxVault {
         let bin = validated_bin_seconds(params.bin_seconds)?;
         let (stream_a, stream_b) = paired_binned_streams(&a_times, &b_times, bin)?;
         let n_bins = stream_a.len();
-        let mut lags: Vec<usize> = DEFAULT_TE_LAGS
-            .iter()
-            .copied()
-            .filter(|lag| *lag <= params.max_lag.max(1))
-            .collect();
-        if lags.is_empty() {
-            lags.push(1);
-        }
+        let lags: Vec<usize> = (1..=params.max_lag.clamp(1, SYNAPSE_TEMPORAL_MAX_LAGS)).collect();
         let clock = SystemClock;
         let results = transfer_entropy_sweep(&stream_a, &stream_b, &lags, &clock);
-        let best = choose_dominant_te(&results).ok_or_else(|| {
-            temporal_error(
-                "SYNAPSE_CALYX_TEMPORAL_TE_UNRESOLVED",
-                "transfer-entropy sweep returned no usable lag (all provisional or errored)",
-                "increase the binned series length (more occurrences or a smaller bin) so a lag reaches quorum",
-            )
-        })?;
+        let best = choose_dominant_te(&results)?;
+        let estimator = estimator_label(best.estimator);
+        let estimator_reason = best.estimator_reason.clone();
 
         let dominant_direction = direction_label(best.dominant_direction);
         let grounded = !best.provisional;
@@ -2049,6 +2052,7 @@ impl SynapseCalyxVault {
             "t_b_to_a": best.t_b_to_a,
             "dominant_direction": dominant_direction,
             "provisional": best.provisional,
+            "estimator": estimator,
         });
         self.persist_temporal_row(ColumnFamily::Graph, key, &out_edge)?;
         let graph_cf_rows_after = self.scan_cf_latest(ColumnFamily::Graph)?.len();
@@ -2069,6 +2073,8 @@ impl SynapseCalyxVault {
             difference_ci_high: best.difference_ci_95.1,
             dominant_direction,
             grounded,
+            estimator,
+            estimator_reason,
             lags: results.iter().map(causality_lag).collect(),
             graph_cf_rows_after,
         })
@@ -2499,9 +2505,16 @@ fn checked_temporal_bin_index(value: f64) -> Result<usize, SynapseCalyxError> {
 }
 
 /// Picks the transfer-entropy lag with the largest absolute directed asymmetry
-/// among non-provisional results, preferring a resolved direction.
-fn choose_dominant_te(results: &[TEResult]) -> Option<TEResult> {
-    results
+/// among the lags that actually produced an estimate.
+///
+/// When no lag produced one, the failure is *classified* and every lag's
+/// `{lag, error_code, n_samples}` is carried into the message. The previous
+/// version collapsed all of that into one `TE_UNRESOLVED` code whose remediation
+/// ("increase the binned series length") was wrong for the failure that actually
+/// happened — a degenerate KSG radius on integer counts, which more samples make
+/// worse, not better (issue #1673).
+fn choose_dominant_te(results: &[TEResult]) -> Result<TEResult, SynapseCalyxError> {
+    if let Some(best) = results
         .iter()
         .filter(|result| !result.provisional && result.error_code.is_none())
         .max_by(|left, right| {
@@ -2509,8 +2522,53 @@ fn choose_dominant_te(results: &[TEResult]) -> Option<TEResult> {
                 .abs()
                 .total_cmp(&(right.t_a_to_b - right.t_b_to_a).abs())
         })
-        .or_else(|| results.iter().find(|result| result.error_code.is_none()))
-        .cloned()
+    {
+        return Ok(best.clone());
+    }
+    let detail = per_lag_failure_detail(results);
+    let estimator_failed = results.iter().any(|result| {
+        result
+            .error_code
+            .as_deref()
+            .is_some_and(|code| code != calyx_assay::CALYX_TE_INSUFFICIENT_SAMPLES)
+    });
+    if estimator_failed {
+        Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_TEMPORAL_TE_ESTIMATOR_FAILED",
+            format!("every transfer-entropy lag failed inside the estimator: {detail}"),
+            "read the per-lag error_code: CALYX_TE_DISCRETE_STATE_QUORUM or CALYX_TE_DISCRETE_ALPHABET_TOO_LARGE means the count alphabet is too rich for the sample (widen bin_seconds), CALYX_ASSAY_DEGENERATE_INPUT means the continuous KSG estimator was applied to tied samples",
+        ))
+    } else {
+        Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_TEMPORAL_TE_UNRESOLVED",
+            format!("no transfer-entropy lag reached sample quorum: {detail}"),
+            "increase the binned series length (more occurrences or a smaller bin) so a lag reaches quorum",
+        ))
+    }
+}
+
+/// Renders `{lag, error_code, n_samples}` for every lag tried, in sweep order.
+fn per_lag_failure_detail(results: &[TEResult]) -> String {
+    if results.is_empty() {
+        return "no lags were tried".to_string();
+    }
+    results
+        .iter()
+        .map(|result| {
+            format!(
+                "{{lag={}, error_code={}, n_samples={}, estimator={}}}",
+                result.lag,
+                result.error_code.as_deref().unwrap_or("none"),
+                result.n_samples,
+                estimator_label(result.estimator),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn estimator_label(estimator: Option<TeEstimator>) -> String {
+    estimator.map_or_else(|| "unresolved".to_owned(), |kind| kind.as_str().to_owned())
 }
 
 /// Runs an MMD change-point over the 1-D activity-count series when it is long
@@ -2538,6 +2596,8 @@ fn causality_lag(result: &TEResult) -> SynapseCalyxCausalityLag {
         direction: direction_label(result.dominant_direction),
         n_samples: result.n_samples,
         provisional: result.provisional,
+        estimator: estimator_label(result.estimator),
+        error_code: result.error_code.clone(),
     }
 }
 

@@ -15,17 +15,25 @@ pub(super) fn transfer_entropy_with_config_cuda_strict_impl(
     let forward = lagged_samples(stream_a, stream_b, lag, config.window_size)?;
     let reverse = lagged_samples(stream_b, stream_a, lag, config.window_size)?;
     let n_samples = forward.len().min(reverse.len());
+    let forward = &forward[..n_samples];
+    let reverse = &reverse[..n_samples];
+    let mut pick = resolve_estimator(config, forward, reverse);
+    pick.n_samples = n_samples;
     if n_samples < MIN_TE_QUORUM || n_samples < MIN_ASSAY_SAMPLES {
         return Ok(provisional_result(
             lag,
             config.window_size,
             n_samples,
             clock,
+            &pick,
         ));
     }
+    // Strict CUDA only has a KSG kernel. Silently running the discrete estimator
+    // on the CPU would be exactly the hidden degradation the caller forbade.
+    if pick.estimator == Some(TeEstimator::DiscretePlugin) {
+        return Err(super::discrete::cuda_unsupported());
+    }
 
-    let forward = &forward[..n_samples];
-    let reverse = &reverse[..n_samples];
     let backend = calyx_forge::CudaBackend::new()
         .map_err(|err| crate::cuda_strict::forge_to_calyx("transfer entropy", err))?;
     let t_a_to_b = estimate_te_cuda(backend.context(), forward, config.k)?;
@@ -64,6 +72,9 @@ pub(super) fn transfer_entropy_with_config_cuda_strict_impl(
         provisional: false,
         n_samples,
         error_code: None,
+        estimator: Some(TeEstimator::ContinuousKsg),
+        estimator_selection: pick.selection,
+        estimator_reason: pick.reason.clone(),
         trust: TrustTag::Provisional,
         computed_at: clock.now(),
     })

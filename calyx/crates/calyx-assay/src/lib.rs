@@ -248,10 +248,16 @@ pub use total_correlation::{
     min_quorum_tc, n_eff_from_tc, total_correlation, total_correlation_with_config,
     total_correlation_with_config_cuda_strict,
 };
+pub use transfer_entropy::discrete::{
+    CALYX_TE_DISCRETE_ALPHABET_TOO_LARGE, CALYX_TE_DISCRETE_CUDA_UNSUPPORTED,
+    CALYX_TE_DISCRETE_MALFORMED_SAMPLE, CALYX_TE_DISCRETE_NON_FINITE_SAMPLE,
+    CALYX_TE_DISCRETE_STATE_QUORUM, MAX_TE_DISCRETE_ALPHABET, MIN_TE_DISCRETE_SAMPLES_PER_STATE,
+};
 pub use transfer_entropy::{
     CALYX_TE_INSUFFICIENT_SAMPLES, DEFAULT_TE_BOOTSTRAP_RESAMPLES, DEFAULT_TE_BOOTSTRAP_SEED,
     DEFAULT_TE_K, DEFAULT_TE_LAGS, DEFAULT_TE_WINDOW, Direction, MIN_TE_QUORUM, RecurrenceStream,
-    TEResult, Timestamp, TransferEntropyConfig, max_transfer_entropy_lag, transfer_entropy,
-    transfer_entropy_sweep, transfer_entropy_sweep_with_config, transfer_entropy_with_config,
+    TEResult, TeEstimator, TeEstimatorChoice, TeEstimatorSelection, Timestamp,
+    TransferEntropyConfig, max_transfer_entropy_lag, transfer_entropy, transfer_entropy_sweep,
+    transfer_entropy_sweep_with_config, transfer_entropy_with_config,
     transfer_entropy_with_config_cuda_strict,
 };
