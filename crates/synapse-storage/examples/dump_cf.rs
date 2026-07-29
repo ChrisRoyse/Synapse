@@ -13,6 +13,7 @@
 //! `cargo run -p synapse-storage --example dump_cf -- --native-cx [--reveal-metadata] <db_path> <cx_id>`
 //! `cargo run -p synapse-storage --example dump_cf -- --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex>`
 //! `cargo run -p synapse-storage --example dump_cf -- --repair-bad-episode-slots <db_path>`
+//! `cargo run -p synapse-storage --example dump_cf -- --migrate-pre-1776-slots [--resume] <db_path>`
 
 use std::{
     collections::BTreeMap,
@@ -26,9 +27,12 @@ use std::{
 use calyx_aster::{
     cf::{ColumnFamily, anchor_prefix_range, base_key, scalar_id_for_key, slot_key},
     mvcc::tombstone_value,
-    vault::encode::{decode_constellation_base, inspect_slot_vector},
+    vault::encode::{
+        decode_constellation_base, decode_slot_vector, encode_constellation_base,
+        encode_slot_vector, inspect_slot_vector,
+    },
 };
-use calyx_core::{CxId, SlotId};
+use calyx_core::{Constellation, CxId, SlotId, SlotVector};
 use synapse_calyx::{
     SynapseCalyxCfWrite, SynapseCalyxConfig, SynapseCalyxReadOnlyVault, SynapseCalyxVault,
 };
@@ -36,13 +40,16 @@ use synapse_storage::{
     StorageBackendKind,
     cf::CF_EPISODES,
     constellations::{
-        META_PANEL_NAME, META_SOURCE_CF, META_SOURCE_KEY_HEX, SYN_EPISODE_PANEL_NAME,
-        SYN_EPISODE_PANEL_VERSION, hex_encode, sha256_hex,
+        META_PANEL_NAME, META_SOURCE_CF, META_SOURCE_KEY_HEX, SYN_ACTION_PANEL_NAME,
+        SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION, SYN_MCP_USAGE_PANEL_NAME,
+        SYN_OBSERVATION_PANEL_NAME, SYN_OUTCOME_PANEL_NAME, SYN_PRE_1776_PANEL_VERSIONS,
+        SYN_PROCESS_PANEL_NAME, SYN_RECURRENCE_SUBJECT_PANEL_NAME, SYN_REFLEX_PANEL_NAME,
+        hex_encode, sha256_hex,
     },
     dump_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path>";
+const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] <db_path>";
 /// The episode panel's exclusive global slot block (#1776). The
 /// `--repair-bad-episode-slots` mode exists for episode constellations that
 /// historically wrote slots outside it; under the global allocation that is
@@ -109,6 +116,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
         return repair_bad_episode_slots(PathBuf::from(db_path));
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--migrate-pre-1776-slots")
+    {
+        args.remove(0);
+        let resume = if args.first().is_some_and(|arg| arg == "--resume") {
+            args.remove(0);
+            true
+        } else {
+            false
+        };
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return migrate_pre_1776_slots(PathBuf::from(db_path), resume);
     }
     if args.first().is_some_and(|arg| arg == "--panel-slot-audit") {
         args.remove(0);
@@ -622,6 +647,767 @@ fn panel_slot_audit(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
     }
     write_stdout_line(&mut stdout, format_args!("collision_slot_ids={collisions}"))?;
     Ok(())
+}
+
+/// One pre-#1776 panel and the exclusive global slot block it owns today.
+///
+/// This restates the seven blocks the migration needs from `PANEL_SLOT_BLOCKS`
+/// in `crates/synapse-storage/src/constellations.rs`, which is private and so
+/// unreachable from an example. The ids are the literal ones #1776 allocated —
+/// never recomputed — and [`verify_pre_1776_block_table`] fails the run closed
+/// if `SYN_PRE_1776_PANEL_VERSIONS` ever names a panel this table does not, so
+/// the two cannot drift apart silently.
+struct Pre1776PanelBlock {
+    panel: &'static str,
+    first: u16,
+    last: u16,
+}
+
+const PRE_1776_PANEL_BLOCKS: &[Pre1776PanelBlock] = &[
+    Pre1776PanelBlock {
+        panel: SYN_ACTION_PANEL_NAME,
+        first: 48,
+        last: 52,
+    },
+    Pre1776PanelBlock {
+        panel: SYN_REFLEX_PANEL_NAME,
+        first: 53,
+        last: 59,
+    },
+    Pre1776PanelBlock {
+        panel: SYN_PROCESS_PANEL_NAME,
+        first: 60,
+        last: 66,
+    },
+    Pre1776PanelBlock {
+        panel: SYN_OBSERVATION_PANEL_NAME,
+        first: 67,
+        last: 74,
+    },
+    Pre1776PanelBlock {
+        panel: SYN_OUTCOME_PANEL_NAME,
+        first: 75,
+        last: 81,
+    },
+    Pre1776PanelBlock {
+        panel: SYN_MCP_USAGE_PANEL_NAME,
+        first: 82,
+        last: 93,
+    },
+    Pre1776PanelBlock {
+        panel: SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+        first: 94,
+        last: 95,
+    },
+];
+
+impl Pre1776PanelBlock {
+    const fn width(&self) -> u16 {
+        self.last.saturating_sub(self.first).saturating_add(1)
+    }
+
+    const fn contains(&self, slot: u16) -> bool {
+        slot >= self.first && slot <= self.last
+    }
+}
+
+/// How one Base row relates to the #1776 migration.
+enum Pre1776Row {
+    /// Not written under a superseded panel version; the migration ignores it.
+    NotSuperseded,
+    /// Superseded but declares no slots, so it holds no colliding vector.
+    NoSlots,
+    /// Superseded and already sitting entirely inside its panel's block.
+    AlreadyInBlock,
+    /// Superseded and still sitting entirely outside its panel's block.
+    Pending {
+        block: &'static Pre1776PanelBlock,
+        old_slot_ids: Vec<SlotId>,
+    },
+}
+
+/// A constellation still to move, captured from the planning scan.
+struct MigrationCandidate {
+    cx_id: CxId,
+    panel: &'static str,
+    block: &'static Pre1776PanelBlock,
+    old_slot_ids: Vec<SlotId>,
+    base_value: Vec<u8>,
+}
+
+/// One slot's move, with the exact durable bytes that must survive it.
+struct SlotMove {
+    old: SlotId,
+    new: SlotId,
+    quantized: Vec<u8>,
+    raw: Option<Vec<u8>>,
+    vector: SlotVector,
+}
+
+/// Migrates pre-#1776 constellations out of the colliding physical slot CFs
+/// (#1878).
+///
+/// #1776 gave every panel an exclusive block of GLOBAL slot ids but did not
+/// move the rows already written under the old panel-local ids, which still sit
+/// in `cf/slot_01`..`cf/slot_08` alongside timeline's and episode's vectors.
+/// This walks the Base CF and, for each superseded row, copies its vectors and
+/// `.raw` sidecars to its panel's block, tombstones the vacated rows, and
+/// rewrites the Base row's slot map — one `write_cf_batch` per constellation,
+/// so a crash leaves each constellation wholly old or wholly new.
+///
+/// `panel_version` is deliberately left alone. `CxId::from_input(input_bytes,
+/// panel_version, vault_salt)` makes identity a function of the version, so
+/// rewriting it in place would produce a row whose stored `cx_id` is not the id
+/// its own derivation rule yields. `validate_panel_slot_allocation` resolves a
+/// panel's block by `synapse_panel_name`, not by version, so a row that keeps
+/// `panel_version=1666001` and `panel=syn-action-v1` validates correctly
+/// against block 48..=52.
+///
+/// The resume state is derived from the data, not from a cursor file: a
+/// constellation is pending exactly while its own Base row still declares
+/// out-of-block slot ids. A second run therefore finds nothing to do, and an
+/// interrupted run resumes with no external bookkeeping to lose.
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "the migration owns its path across the writeable pass and the independent read-only readback, and prints the full plan/move/readback flow inline so the run is auditable"
+)]
+fn migrate_pre_1776_slots(db_path: PathBuf, resume: bool) -> Result<(), Box<dyn Error>> {
+    verify_pre_1776_block_table()?;
+    let vault = SynapseCalyxVault::open(SynapseCalyxConfig::from_vault_dir(db_path.clone()))?;
+    let before_seq = vault.latest_seq();
+    let before_base_rows = vault.scan_cf_at(before_seq, ColumnFamily::Base)?;
+    let before_base_row_count = before_base_rows.len();
+
+    let mut pending = Vec::new();
+    let mut already_in_block = 0_u64;
+    let mut slotless = 0_u64;
+    for (key, value) in before_base_rows {
+        let constellation = decode_base_for_migration(&key, &value)?;
+        match classify_pre_1776_row(&constellation)? {
+            Pre1776Row::NotSuperseded => {}
+            Pre1776Row::NoSlots => slotless = slotless.saturating_add(1),
+            Pre1776Row::AlreadyInBlock => already_in_block = already_in_block.saturating_add(1),
+            Pre1776Row::Pending {
+                block,
+                old_slot_ids,
+            } => pending.push(MigrationCandidate {
+                cx_id: constellation.cx_id,
+                panel: block.panel,
+                block,
+                old_slot_ids,
+                base_value: value,
+            }),
+        }
+    }
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "migrate_pre_1776_slots db_path={} mode=writeable resume={resume} before_seq={before_seq} base_rows={before_base_row_count} pending={} already_in_block={already_in_block} superseded_without_slots={slotless}",
+            db_path.display(),
+            pending.len(),
+        ),
+    )?;
+
+    if !pending.is_empty() && already_in_block != 0 && !resume {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_PARTIAL_STATE: this vault already holds {already_in_block} \
+             migrated pre-#1776 constellation(s) and {} still-unmigrated one(s), which is the \
+             state an interrupted run leaves behind. Re-run with --resume to continue it \
+             deliberately (issue #1878)",
+            pending.len()
+        )
+        .into());
+    }
+
+    let mut moved_constellations = 0_u64;
+    let mut moved_slot_rows = 0_u64;
+    let mut moved_raw_rows = 0_u64;
+    for (index, candidate) in pending.iter().enumerate() {
+        let report = migrate_one_constellation(&vault, candidate)?;
+        moved_constellations = moved_constellations.saturating_add(1);
+        moved_slot_rows = moved_slot_rows.saturating_add(report.slot_rows);
+        moved_raw_rows = moved_raw_rows.saturating_add(report.raw_rows);
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "migrated index={index} cx_id={} panel={} panel_version={} old_slot_ids={} new_slot_ids={} slot_rows={} raw_rows={} base_value_len_bytes={} base_value_sha256={} commit_seq={}",
+                candidate.cx_id,
+                candidate.panel,
+                report.panel_version,
+                join_slot_ids(&report.old_slot_ids),
+                join_slot_ids(&report.new_slot_ids),
+                report.slot_rows,
+                report.raw_rows,
+                report.base_value_len_bytes,
+                report.base_value_sha256,
+                report.commit_seq,
+            ),
+        )?;
+        // Per-slot digests, so the "vector bytes are byte-identical before and
+        // after" check is externally checkable for every moved row and not just
+        // the one that gets spot-read: these are the same value_sha256 that
+        // `--native-cx` prints for the slot.
+        for slot in &report.slots {
+            write_stdout_line(
+                &mut stdout,
+                format_args!(
+                    "migrated_slot cx_id={} panel={} old_slot_id={} new_slot_id={} value_len_bytes={} value_sha256={} raw_len_bytes={} raw_sha256={}",
+                    candidate.cx_id,
+                    candidate.panel,
+                    slot.old,
+                    slot.new,
+                    slot.value_len_bytes,
+                    slot.value_sha256,
+                    slot.raw_len_bytes
+                        .map_or_else(|| "absent".to_owned(), |len| len.to_string()),
+                    slot.raw_sha256.as_deref().unwrap_or("absent"),
+                ),
+            )?;
+        }
+    }
+
+    vault.flush()?;
+    let after_seq = vault.latest_seq();
+    let close_readback = vault.close("migrate_pre_1776_slots")?;
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "migrate_commit moved_constellations={moved_constellations} moved_slot_rows={moved_slot_rows} moved_raw_rows={moved_raw_rows} after_seq={after_seq} close_safe_to_unlock={} close_latest_seq={:?}",
+            close_readback.safe_to_unlock, close_readback.latest_seq,
+        ),
+    )?;
+    drop(stdout);
+
+    // Independent readback through a fresh read-only handle: the migration is
+    // only done when a process that never held the writer lock agrees.
+    let readback = SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        SynapseCalyxConfig::from_vault_dir(db_path),
+        None,
+    )?;
+    let readback_seq = readback.latest_seq();
+    let after_base_rows = readback.scan_cf_at(readback_seq, ColumnFamily::Base)?;
+    let after_base_row_count = after_base_rows.len();
+    let mut remaining_pending = 0_u64;
+    for (key, value) in after_base_rows {
+        let constellation = decode_base_for_migration(&key, &value)?;
+        if matches!(
+            classify_pre_1776_row(&constellation)?,
+            Pre1776Row::Pending { .. }
+        ) {
+            remaining_pending = remaining_pending.saturating_add(1);
+        }
+    }
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "migrate_readback readonly_seq={readback_seq} base_rows_before={before_base_row_count} base_rows_after={after_base_row_count} remaining_pending={remaining_pending}"
+        ),
+    )?;
+    if after_base_row_count != before_base_row_count {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_BASE_ROW_COUNT_CHANGED: Base held {before_base_row_count} \
+             rows before the migration and {after_base_row_count} after. The migration only \
+             overwrites Base rows in place, so any change means a row was created or lost \
+             (issue #1878)"
+        )
+        .into());
+    }
+    if remaining_pending != 0 {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_READBACK_INCOMPLETE: {remaining_pending} pre-#1776 \
+             constellation(s) still declare slot ids outside their panel's block after the \
+             migration committed (issue #1878)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// What one constellation's move actually did, for the audit line.
+struct MigrationReport {
+    panel_version: u32,
+    old_slot_ids: Vec<SlotId>,
+    new_slot_ids: Vec<SlotId>,
+    slots: Vec<SlotMoveRecord>,
+    slot_rows: u64,
+    raw_rows: u64,
+    base_value_len_bytes: usize,
+    base_value_sha256: String,
+    commit_seq: u64,
+}
+
+/// The auditable digest of one moved slot row.
+struct SlotMoveRecord {
+    old: SlotId,
+    new: SlotId,
+    value_len_bytes: usize,
+    value_sha256: String,
+    raw_len_bytes: Option<usize>,
+    raw_sha256: Option<String>,
+}
+
+/// Moves one constellation's vectors into its panel's block in a single atomic
+/// batch, verifying byte identity before and after the write.
+///
+/// The load-bearing detail is that `decode_constellation_base` returns
+/// `SlotVector::Absent` PLACEHOLDERS, while `encode_constellation_base`
+/// recomputes each slot hash from the actual vector and embeds an identity hash
+/// over the `(slot_id, slot_hash)` pairs. Decoding, remapping and re-encoding
+/// naively would therefore write a Base row whose hashes cover Absent vectors
+/// and silently corrupt every migrated row. So each slot CF value is read,
+/// decoded into the real `SlotVector`, and re-encoded back to bytes that must
+/// equal what was stored; then the whole Base row is re-encoded under the
+/// ORIGINAL slot ids and must equal the stored Base row byte for byte. Only a
+/// row that reproduces itself exactly is allowed to be rewritten.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the read, the two byte-identity proofs, the atomic batch and the post-commit verification belong to one indivisible per-constellation step"
+)]
+fn migrate_one_constellation(
+    vault: &SynapseCalyxVault,
+    candidate: &MigrationCandidate,
+) -> Result<MigrationReport, Box<dyn Error>> {
+    let snapshot = vault.latest_seq();
+    let cx_id = candidate.cx_id;
+    let key = slot_key(cx_id);
+    let block = candidate.block;
+    let panel = candidate.panel;
+
+    let width = usize::from(block.width());
+    if candidate.old_slot_ids.len() != width {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_SLOT_COUNT_MISMATCH: cx_id={cx_id} panel={panel} declares \
+             {} slot id(s) ({}) but its exclusive block {}..={} is {width} wide, so the ordinal \
+             old->new mapping is ambiguous. Resolve this row by hand before re-running \
+             (issue #1878)",
+            candidate.old_slot_ids.len(),
+            join_slot_ids(&candidate.old_slot_ids),
+            block.first,
+            block.last,
+        )
+        .into());
+    }
+
+    let mut moves = Vec::with_capacity(width);
+    for (ordinal, &old) in candidate.old_slot_ids.iter().enumerate() {
+        let offset = u16::try_from(ordinal).map_err(|error| {
+            format!(
+                "SYNAPSE_MIGRATE_PRE_1776_ORDINAL_OVERFLOW: cx_id={cx_id} panel={panel}: {error}"
+            )
+        })?;
+        let new = SlotId::new(block.first.saturating_add(offset));
+        if !block.contains(new.get()) || block.contains(old.get()) {
+            return Err(format!(
+                "SYNAPSE_MIGRATE_PRE_1776_MAPPING_OUT_OF_BLOCK: cx_id={cx_id} panel={panel} \
+                 mapped slot {old} to {new}, which does not move it from outside block {}..={} to \
+                 inside it (issue #1878)",
+                block.first, block.last
+            )
+            .into());
+        }
+        let Some(quantized) = vault.read_cf_at(snapshot, ColumnFamily::slot(old), &key)? else {
+            return Err(format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_ROW_MISSING: cx_id={cx_id} panel={panel} declares \
+                 slot {old} in its Base row but cf/{} holds no row for it, so its vector cannot be \
+                 moved and its Base row cannot be reproduced (issue #1878)",
+                ColumnFamily::slot(old).name()
+            )
+            .into());
+        };
+        let vector = decode_slot_vector(&quantized).map_err(|error| {
+            format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_DECODE_FAILED: cx_id={cx_id} panel={panel} slot={old} \
+                 value_len_bytes={} value_sha256={}: {error}",
+                quantized.len(),
+                sha256_hex(&quantized)
+            )
+        })?;
+        let reencoded = encode_slot_vector(&vector).map_err(|error| {
+            format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_REENCODE_FAILED: cx_id={cx_id} panel={panel} \
+                 slot={old}: {error}"
+            )
+        })?;
+        if reencoded != quantized {
+            return Err(format!(
+                "SYNAPSE_MIGRATE_PRE_1776_SLOT_REENCODE_MISMATCH: cx_id={cx_id} panel={panel} \
+                 slot={old} re-encodes to {} bytes (sha256={}) but is stored as {} bytes \
+                 (sha256={}). The Base row's slot hashes are computed from the encoded vector, so \
+                 rewriting this row would change what its hashes cover (issue #1878)",
+                reencoded.len(),
+                sha256_hex(&reencoded),
+                quantized.len(),
+                sha256_hex(&quantized),
+            )
+            .into());
+        }
+        let raw = vault.read_cf_at(snapshot, ColumnFamily::slot_raw(old), &key)?;
+        assert_destination_free(
+            vault,
+            snapshot,
+            cx_id,
+            panel,
+            new,
+            &quantized,
+            raw.as_deref(),
+        )?;
+        moves.push(SlotMove {
+            old,
+            new,
+            quantized,
+            raw,
+            vector,
+        });
+    }
+
+    // Proof that this row reproduces itself: the same decode/encode round trip
+    // the migration is about to perform, run with the ORIGINAL slot ids, must
+    // return the stored Base row byte for byte. Anything else — a scalar, a
+    // metadata entry, an anchor, the provenance hash — that did not survive the
+    // round trip would show up here, before a single byte is written.
+    let mut constellation = decode_base_for_migration(&base_key(cx_id), &candidate.base_value)?;
+    constellation.slots = moves
+        .iter()
+        .map(|slot_move| (slot_move.old, slot_move.vector.clone()))
+        .collect();
+    let reproduced = encode_constellation_base(&constellation).map_err(|error| {
+        format!(
+            "SYNAPSE_MIGRATE_PRE_1776_BASE_REENCODE_FAILED: cx_id={cx_id} panel={panel}: {error}"
+        )
+    })?;
+    if reproduced != candidate.base_value {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_BASE_REENCODE_MISMATCH: cx_id={cx_id} panel={panel} \
+             re-encodes to {} bytes (sha256={}) but is stored as {} bytes (sha256={}). This row \
+             cannot be rewritten without changing content the migration must preserve \
+             (issue #1878)",
+            reproduced.len(),
+            sha256_hex(&reproduced),
+            candidate.base_value.len(),
+            sha256_hex(&candidate.base_value),
+        )
+        .into());
+    }
+
+    constellation.slots = moves
+        .iter()
+        .map(|slot_move| (slot_move.new, slot_move.vector.clone()))
+        .collect();
+    let new_base_value = encode_constellation_base(&constellation).map_err(|error| {
+        format!(
+            "SYNAPSE_MIGRATE_PRE_1776_REMAPPED_BASE_ENCODE_FAILED: cx_id={cx_id} panel={panel}: \
+             {error}"
+        )
+    })?;
+
+    let tombstone = tombstone_value();
+    let mut writes = Vec::new();
+    let mut raw_rows = 0_u64;
+    for slot_move in &moves {
+        writes.push(SynapseCalyxCfWrite::new(
+            ColumnFamily::slot(slot_move.new),
+            key.clone(),
+            slot_move.quantized.clone(),
+        ));
+        if let Some(raw) = &slot_move.raw {
+            raw_rows = raw_rows.saturating_add(1);
+            writes.push(SynapseCalyxCfWrite::new(
+                ColumnFamily::slot_raw(slot_move.new),
+                key.clone(),
+                raw.clone(),
+            ));
+            writes.push(SynapseCalyxCfWrite::new(
+                ColumnFamily::slot_raw(slot_move.old),
+                key.clone(),
+                tombstone.clone(),
+            ));
+        }
+        writes.push(SynapseCalyxCfWrite::new(
+            ColumnFamily::slot(slot_move.old),
+            key.clone(),
+            tombstone.clone(),
+        ));
+    }
+    writes.push(SynapseCalyxCfWrite::new(
+        ColumnFamily::Base,
+        base_key(cx_id),
+        new_base_value.clone(),
+    ));
+    let commit_seq = vault.write_cf_batch(writes)?;
+
+    verify_migrated_constellation(vault, cx_id, panel, &moves, &new_base_value)?;
+
+    Ok(MigrationReport {
+        panel_version: constellation.panel_version,
+        old_slot_ids: moves.iter().map(|slot_move| slot_move.old).collect(),
+        new_slot_ids: moves.iter().map(|slot_move| slot_move.new).collect(),
+        slots: moves
+            .iter()
+            .map(|slot_move| SlotMoveRecord {
+                old: slot_move.old,
+                new: slot_move.new,
+                value_len_bytes: slot_move.quantized.len(),
+                value_sha256: sha256_hex(&slot_move.quantized),
+                raw_len_bytes: slot_move.raw.as_ref().map(Vec::len),
+                raw_sha256: slot_move.raw.as_deref().map(sha256_hex),
+            })
+            .collect(),
+        slot_rows: u64::try_from(moves.len()).unwrap_or(u64::MAX),
+        raw_rows,
+        base_value_len_bytes: new_base_value.len(),
+        base_value_sha256: sha256_hex(&new_base_value),
+        commit_seq,
+    })
+}
+
+/// Refuses to overwrite a destination slot row that already holds something
+/// else.
+///
+/// A destination holding the identical bytes is the resumable case — the same
+/// move already committed — and is allowed through. Anything else means two
+/// different vectors claim one `(cf, key)`, which is exactly the collision this
+/// migration exists to end.
+fn assert_destination_free(
+    vault: &SynapseCalyxVault,
+    snapshot: u64,
+    cx_id: CxId,
+    panel: &str,
+    new: SlotId,
+    quantized: &[u8],
+    raw: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let key = slot_key(cx_id);
+    for (cf, expected) in [
+        (ColumnFamily::slot(new), Some(quantized)),
+        (ColumnFamily::slot_raw(new), raw),
+    ] {
+        let Some(existing) = vault.read_cf_at(snapshot, cf, &key)? else {
+            continue;
+        };
+        if expected == Some(existing.as_slice()) {
+            continue;
+        }
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_DESTINATION_OCCUPIED: cx_id={cx_id} panel={panel} would move \
+             a vector into cf/{} but that row already holds a different {}-byte value \
+             (sha256={}). Refusing to overwrite it (issue #1878)",
+            cf.name(),
+            existing.len(),
+            sha256_hex(&existing),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reads back everything the committed batch claimed to do, before the run is
+/// allowed to move on to the next constellation.
+fn verify_migrated_constellation(
+    vault: &SynapseCalyxVault,
+    cx_id: CxId,
+    panel: &str,
+    moves: &[SlotMove],
+    new_base_value: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let snapshot = vault.latest_seq();
+    let key = slot_key(cx_id);
+    for slot_move in moves {
+        expect_cf_value(
+            vault,
+            snapshot,
+            cx_id,
+            panel,
+            ColumnFamily::slot(slot_move.new),
+            &key,
+            Some(&slot_move.quantized),
+        )?;
+        expect_cf_value(
+            vault,
+            snapshot,
+            cx_id,
+            panel,
+            ColumnFamily::slot_raw(slot_move.new),
+            &key,
+            slot_move.raw.as_deref(),
+        )?;
+        expect_cf_value(
+            vault,
+            snapshot,
+            cx_id,
+            panel,
+            ColumnFamily::slot(slot_move.old),
+            &key,
+            None,
+        )?;
+        expect_cf_value(
+            vault,
+            snapshot,
+            cx_id,
+            panel,
+            ColumnFamily::slot_raw(slot_move.old),
+            &key,
+            None,
+        )?;
+    }
+    expect_cf_value(
+        vault,
+        snapshot,
+        cx_id,
+        panel,
+        ColumnFamily::Base,
+        &base_key(cx_id),
+        Some(new_base_value),
+    )
+}
+
+fn expect_cf_value(
+    vault: &SynapseCalyxVault,
+    snapshot: u64,
+    cx_id: CxId,
+    panel: &str,
+    cf: ColumnFamily,
+    key: &[u8],
+    expected: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let actual = vault.read_cf_at(snapshot, cf, key)?;
+    if actual.as_deref() == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "SYNAPSE_MIGRATE_PRE_1776_POST_COMMIT_VERIFY_FAILED: cx_id={cx_id} panel={panel} cf/{} \
+         reads back as {} after the migration batch committed, but the batch wrote {} \
+         (issue #1878)",
+        cf.name(),
+        describe_cf_value(actual.as_deref()),
+        describe_cf_value(expected),
+    )
+    .into())
+}
+
+fn describe_cf_value(value: Option<&[u8]>) -> String {
+    value.map_or_else(
+        || "absent".to_owned(),
+        |value| format!("{} bytes (sha256={})", value.len(), sha256_hex(value)),
+    )
+}
+
+/// Classifies one Base row against the #1776 slot allocation.
+///
+/// The rows to migrate are exactly those carrying a panel version in
+/// `SYN_PRE_1776_PANEL_VERSIONS`, so the version — not a slot-id heuristic — is
+/// what selects them. A row whose panel metadata disagrees with the version it
+/// carries, or whose panel has no declared block, stops the run rather than
+/// being guessed at.
+fn classify_pre_1776_row(constellation: &Constellation) -> Result<Pre1776Row, Box<dyn Error>> {
+    let Some(&(expected_panel, _)) = SYN_PRE_1776_PANEL_VERSIONS
+        .iter()
+        .find(|(_, version)| *version == constellation.panel_version)
+    else {
+        return Ok(Pre1776Row::NotSuperseded);
+    };
+    let cx_id = constellation.cx_id;
+    let Some(panel) = constellation.metadata.get(META_PANEL_NAME) else {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_PANEL_UNLABELLED: cx_id={cx_id} carries superseded \
+             panel_version={} but has no {META_PANEL_NAME} metadata, so its panel block cannot be \
+             resolved (issue #1878)",
+            constellation.panel_version
+        )
+        .into());
+    };
+    if panel.as_str() != expected_panel {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_PANEL_NAME_MISMATCH: cx_id={cx_id} carries superseded \
+             panel_version={} which belongs to panel={expected_panel}, but its {META_PANEL_NAME} \
+             metadata says panel={panel} (issue #1878)",
+            constellation.panel_version
+        )
+        .into());
+    }
+    let Some(block) = PRE_1776_PANEL_BLOCKS
+        .iter()
+        .find(|block| block.panel == expected_panel)
+    else {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_BLOCK_MISSING: cx_id={cx_id} panel={expected_panel} has no \
+             entry in PRE_1776_PANEL_BLOCKS in this example (issue #1878)"
+        )
+        .into());
+    };
+    let slot_ids = constellation.slots.keys().copied().collect::<Vec<_>>();
+    if slot_ids.is_empty() {
+        return Ok(Pre1776Row::NoSlots);
+    }
+    let inside = slot_ids
+        .iter()
+        .filter(|slot| block.contains(slot.get()))
+        .count();
+    if inside == slot_ids.len() {
+        return Ok(Pre1776Row::AlreadyInBlock);
+    }
+    if inside != 0 {
+        return Err(format!(
+            "SYNAPSE_MIGRATE_PRE_1776_MIXED_BLOCK_STATE: cx_id={cx_id} panel={expected_panel} \
+             declares slot ids {} of which {inside} are inside block {}..={} and the rest are \
+             outside. Each constellation moves in one atomic batch, so this half-moved shape \
+             cannot be produced by an interrupted run and must be resolved by hand (issue #1878)",
+            join_slot_ids(&slot_ids),
+            block.first,
+            block.last,
+        )
+        .into());
+    }
+    Ok(Pre1776Row::Pending {
+        block,
+        old_slot_ids: slot_ids,
+    })
+}
+
+/// Fails closed when this example's block table does not cover every superseded
+/// panel version the storage crate declares.
+fn verify_pre_1776_block_table() -> Result<(), Box<dyn Error>> {
+    for (panel, version) in SYN_PRE_1776_PANEL_VERSIONS {
+        if !PRE_1776_PANEL_BLOCKS
+            .iter()
+            .any(|block| block.panel == *panel)
+        {
+            return Err(format!(
+                "SYNAPSE_MIGRATE_PRE_1776_BLOCK_TABLE_INCOMPLETE: SYN_PRE_1776_PANEL_VERSIONS \
+                 declares panel={panel} version={version}, but PRE_1776_PANEL_BLOCKS in \
+                 crates/synapse-storage/examples/dump_cf.rs has no block for it. Add its block \
+                 from PANEL_SLOT_BLOCKS before migrating (issue #1878)"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn decode_base_for_migration(key: &[u8], value: &[u8]) -> Result<Constellation, Box<dyn Error>> {
+    decode_constellation_base(value).map_err(|error| {
+        format!(
+            "SYNAPSE_MIGRATE_PRE_1776_BASE_DECODE_FAILED key_hex={} value_len_bytes={} \
+             value_sha256={}: {error}",
+            hex_encode(key),
+            value.len(),
+            sha256_hex(value)
+        )
+        .into()
+    })
+}
+
+fn join_slot_ids(slot_ids: &[SlotId]) -> String {
+    slot_ids
+        .iter()
+        .map(|slot| slot.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[allow(
