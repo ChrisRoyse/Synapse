@@ -87,7 +87,8 @@ pub use drift::{
     SynapseCalyxLensDrift, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
 };
 pub use find::{
-    SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_K, SynapseCalyxFindFusion, SynapseCalyxFindHit,
+    SYNAPSE_FIND_GUARD_DISABLED_CODE, SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_FORMULA,
+    SYNAPSE_FIND_RRF_K, SynapseCalyxFindFusion, SynapseCalyxFindGuard, SynapseCalyxFindHit,
     SynapseCalyxFindLensContribution, SynapseCalyxFindParams, SynapseCalyxFindQuery,
     SynapseCalyxFindReport, SynapseCalyxFindTemporal,
 };

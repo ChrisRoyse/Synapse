@@ -7058,6 +7058,9 @@ fn set_field_text_locator_find_params(
         limit: Some(20),
         in_window: None,
         window_hwnd: Some(window_hwnd),
+        // Locator resolution is strictly perception recall over the live
+        // observation; fused memory recall would answer a different question.
+        similar: None,
     }
 }
 

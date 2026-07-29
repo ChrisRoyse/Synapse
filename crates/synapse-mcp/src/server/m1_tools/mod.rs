@@ -690,7 +690,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Search visible accessibility nodes and detected entities. If matched result text contains suspected prompt injection, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
+        description = "Find things. Without `similar`: perception recall over visible accessibility nodes and detected entities (needs a bound/explicit target); if matched result text contains suspected prompt injection, the response includes perceived_text_notice and suspected_injection annotations. With `similar`: fused MEMORY recall (#1676) over the persisted Calyx search generation - per-slot DiskANN + BM25 recall fused by Reciprocal Rank Fusion (k=60, 1-based ranks), returning per-lens rank contributions, agreeing/dissenting lenses, verified ledger provenance, the generation manifest, and an explicit Ward guard-state readback. The two modes read different sources of truth and cannot be combined in one call."
     )]
     pub async fn find(
         &self,
@@ -702,6 +702,21 @@ impl SynapseService {
             kind = "find",
             "tool.invocation kind=find"
         );
+        // Fused memory recall is answered before any perception work: it reads
+        // the persisted vault generation, not the screen, so resolving a capture
+        // target first would reject a perfectly valid memory query with
+        // CAPTURE_TARGET_INVALID.
+        if let Some(similar) = params.0.similar.clone() {
+            let perception_fields = params.0.present_perception_fields();
+            if !perception_fields.is_empty() {
+                return Err(
+                    crate::server::operational_facades::find::reject_mixed_find_request(
+                        &perception_fields,
+                    ),
+                );
+            }
+            return crate::server::operational_facades::find::run_fused_find(self, similar).await;
+        }
         let target = self.request_session_target(&request_context)?;
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         self.find_with_target(params, target, session_id.as_deref())

@@ -255,6 +255,54 @@ pub struct FindParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
+    /// Fused **memory** recall instead of perception (#1676): per-slot DiskANN
+    /// and BM25 recall over the persisted Calyx search generation, fused at the
+    /// rank level by Reciprocal Rank Fusion (`k = 60`, 1-based ranks). Answers
+    /// "which stored records are like this one / like this text", not "what is
+    /// on screen". Every hit carries its per-lens rank contributions, the lenses
+    /// that agreed and dissented, and verified ledger provenance.
+    ///
+    /// Mutually exclusive with every perception filter above: the two read
+    /// different sources of truth and are never merged. Fails closed (naming
+    /// `storage operation=search_rebuild`) when the persisted generation is
+    /// missing, stale, or marked rebuild-required.
+    #[serde(default)]
+    pub similar: Option<crate::m3::storage::StorageFindSimilarParams>,
+}
+
+impl FindParams {
+    /// Names the perception-only fields this request actually set, so a request
+    /// that mixes perception filters with fused memory recall can be refused by
+    /// exact field rather than with a vague parameter error.
+    #[must_use]
+    pub fn present_perception_fields(&self) -> Vec<&'static str> {
+        let mut present = Vec::new();
+        if self.query.is_some() {
+            present.push("query");
+        }
+        if self.role.is_some() {
+            present.push("role");
+        }
+        if self.name_substring.is_some() {
+            present.push("name_substring");
+        }
+        if self.automation_id.is_some() {
+            present.push("automation_id");
+        }
+        if self.scope.is_some() {
+            present.push("scope");
+        }
+        if self.limit.is_some() {
+            present.push("limit");
+        }
+        if self.in_window.is_some() {
+            present.push("in_window");
+        }
+        if self.window_hwnd.is_some() {
+            present.push("window_hwnd");
+        }
+        present
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -269,11 +317,19 @@ pub enum FindScope {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FindResponse {
+    /// Perception element/entity hits. Empty on a fused-memory (`similar`) call:
+    /// fused hits are a different kind of evidence over a different source of
+    /// truth and are never folded in here.
     pub results: Vec<FindResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspected_injection: Vec<synapse_core::SuspectedInjectionAnnotation>,
+    /// Present only for a fused-memory call (#1676): the RRF-fused hits with
+    /// per-lens contributions, the persisted generation manifest they were read
+    /// from, and the explicit Ward guard-state readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar: Option<crate::m3::storage::StorageFindSimilarResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -4623,6 +4679,7 @@ pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindRe
         results,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
+        similar: None,
     }
 }
 

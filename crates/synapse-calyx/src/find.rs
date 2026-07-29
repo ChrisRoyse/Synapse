@@ -37,9 +37,15 @@
 //! index built at rebuild time and are not re-parameterized per query.
 //!
 //! ## Seams
-//! * **Ward guarded search (#1677)** — always `GuardChoice::Off` here; the field
-//!   is wired so a follow-up can flip it to the calibrated in-region guard
-//!   without touching callers. See [`SynapseCalyxFindReport::guard_note`].
+//! * **Ward guarded search (#1677)** — always `GuardChoice::Off` here. The
+//!   disabled state is not left implicit: every report carries a
+//!   [`SynapseCalyxFindGuard`] block whose `applied=false` is *read back from
+//!   the substrate outcome* (no operator tau, no dropped candidates, no per-hit
+//!   guard verdict), together with the exact prerequisites for turning the
+//!   calibrated in-region guard on. A caller can therefore tell that hits are
+//!   unguarded instead of assuming they were guarded. If the substrate ever
+//!   returns guard evidence for a pass that asked for `Off`, the pass fails
+//!   closed rather than reporting a state it cannot prove.
 //! * **`MaxSim` late interaction** — the substrate already fuses any
 //!   `multi_maxsim` slot; the report reads back whether the live generation
 //!   carries one. The `Syn*` encoder catalog ships no multi-vector token slot
@@ -74,6 +80,34 @@ pub const SYNAPSE_FIND_MAX_K: usize = 1_000;
 
 /// The RRF rank constant used by the Sextant substrate, surfaced for evidence.
 pub const SYNAPSE_FIND_RRF_K: u32 = 60;
+
+/// The exact rank-level fusion law the substrate applies.
+///
+/// Surfaced verbatim so a caller can recompute every reported score from the
+/// reported per-lens ranks. Cormack, Clarke & Buettcher (SIGIR 2009) define
+/// `RRFscore(d) = Σ 1/(k+r(d))` with `k = 60` and 1-based `r(d)`; the substrate
+/// adds the per-lens weight `w_s` (always `1.0` for plain RRF).
+pub const SYNAPSE_FIND_RRF_FORMULA: &str = "score(d) = SUM over consulted slots s of w_s / (60 + rank_s(d)), rank_s 1-based, k=60 (Cormack et al., SIGIR 2009)";
+
+/// Machine-readable state code reported when the Ward in-region guard seam is
+/// off, so a caller can branch on the guard state without parsing prose.
+pub const SYNAPSE_FIND_GUARD_DISABLED_CODE: &str = "SYNAPSE_CALYX_FIND_GUARD_DISABLED";
+
+/// Guard mode this build asks the substrate for. Always `off` (#1677 is unwired).
+const SYNAPSE_FIND_GUARD_REQUESTED_MODE: &str = "off";
+
+/// Why the guard is off, stated as fact rather than as a promise.
+const SYNAPSE_FIND_GUARD_DISABLED_REASON: &str = "the Ward in-region guard (#1677) has no Synapse wiring: calyx-ward is not a direct dependency of any synapse-* crate, nothing in Synapse ever writes the Guard CF, and that CF is empty on the live vault; these hits are therefore the raw unguarded fused recall and were NOT filtered for in-region membership";
+
+/// Exact, ordered prerequisites for enabling the calibrated in-region guard.
+/// Each line names a physical artifact or code seam that must exist first.
+const SYNAPSE_FIND_GUARD_ENABLE_REQUIREMENTS: &[&str] = &[
+    "1. open the vault with ColumnFamily::Guard selected: calyx-search reads the profile via read_cf_at(Guard, b\"profile\\0default\") and an unselected CF returns None, which is indistinguishable from a missing profile",
+    "2. persist a calibrated calyx_ward::GuardProfile at Guard CF key profile\\0default whose panel_version equals the active panel; a missing/uncalibrated/panel-mismatched profile fails closed with CALYX_GUARD_PROVISIONAL",
+    "3. take calyx-ward as a direct dependency of a Synapse crate and wire a calibration pass (calyx_ward::calibrate) that produces that profile from real in-region/out-of-region evidence; today Ward reaches Synapse only transitively",
+    "4. thread an explicit guard mode (and optional operator cosine tau in (0.0, 1.0]) through SynapseCalyxFindParams to the GuardChoice argument, so guarding is a caller decision, never a silent default",
+    "5. surface SearchOutcome::dropped_guard_hits and each hit's guard verdict in the report, so a guarded result stays auditable instead of silently returning a smaller set",
+];
 
 /// Which record set the query is drawn from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +212,36 @@ pub struct SynapseCalyxFindHit {
     pub freshness_policy: String,
 }
 
+/// Explicit, observable state of the Ward guarded-search seam (#1677) for one
+/// fused find pass.
+///
+/// The seam is deliberately off. Leaving that implicit is the actual hazard: a
+/// caller reading a hit list cannot otherwise distinguish "guarded, and these
+/// survived" from "never guarded at all". Every field below is a readback of
+/// what the substrate physically did — the flat operator tau it applied (none),
+/// the candidates it dropped (none), and the per-hit guard verdicts it attached
+/// (none) — not a restatement of the mode this code requested.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SynapseCalyxFindGuard {
+    /// Guard mode this pass asked the substrate for. Always `off` today.
+    pub requested_mode: String,
+    /// Whether a guard actually filtered these hits. Always `false` today, and
+    /// derived from substrate evidence rather than from `requested_mode`.
+    pub applied: bool,
+    /// Machine-readable guard state ([`SYNAPSE_FIND_GUARD_DISABLED_CODE`]).
+    pub state_code: String,
+    /// Flat operator cosine tau the substrate applied, if any.
+    pub operator_tau: Option<f32>,
+    /// Candidates a profile-backed guard dropped, read back from the outcome.
+    pub dropped_candidates: usize,
+    /// Returned hits that carry a per-hit guard verdict, counted from the hits.
+    pub hits_with_guard_verdict: usize,
+    /// Why the guard is off, in operator terms.
+    pub disabled_reason: String,
+    /// Exact prerequisites for enabling the calibrated in-region guard.
+    pub enable_requirements: Vec<String>,
+}
+
 /// Result of one fused find-similar pass, with the physical generation readback.
 ///
 /// Serialize-only: it embeds the immutable [`PersistedSearchGeneration`] manifest
@@ -190,12 +254,15 @@ pub struct SynapseCalyxFindReport {
     pub query_kind: String,
     pub k: usize,
     pub rrf_k: u32,
+    /// The rank-level fusion law, so a caller can recompute every score from the
+    /// reported per-lens ranks ([`SYNAPSE_FIND_RRF_FORMULA`]).
+    pub rrf_formula: String,
     /// Slots that carried a query vector and a persisted index — the lenses the
     /// fusion actually consulted.
     pub consulted_slots: Vec<u16>,
     pub temporal_applied: bool,
-    /// Ward guarded-search seam (#1677): currently off.
-    pub guard_note: String,
+    /// Ward guarded-search seam (#1677): explicit, evidence-backed off state.
+    pub guard: SynapseCalyxFindGuard,
     /// `MaxSim` late-interaction seam readback.
     pub maxsim_note: String,
     /// Grounding / provisional-marker seam note (#1670).
@@ -338,6 +405,12 @@ impl SynapseCalyxVault {
         )
         .map_err(|error| find_index_error("run fused persisted search", &error))?;
 
+        // The guard state is asserted against what the substrate physically did,
+        // not against the mode this code passed. Guard evidence on a pass that
+        // requested `Off` means the substrate contract changed underneath us, so
+        // fail closed instead of reporting an unguarded result we cannot prove.
+        let guard = find_guard_readback(&outcome)?;
+
         let mut hits = build_find_hits(&outcome, &consulted_slots, self_cx);
         hits.truncate(k);
 
@@ -365,9 +438,10 @@ impl SynapseCalyxVault {
             query_kind,
             k,
             rrf_k: SYNAPSE_FIND_RRF_K,
+            rrf_formula: SYNAPSE_FIND_RRF_FORMULA.to_owned(),
             consulted_slots,
             temporal_applied,
-            guard_note: "seam (#1677): ward in-region guard is off; hits are the unguarded fused recall".to_owned(),
+            guard,
             maxsim_note,
             grounding_note: "grounded: every hit carries verified ledger provenance read from the Base SoT; fused retrieval needs no provisional marker (see #1670 for the derived-answer marker convention)".to_owned(),
             generation,
@@ -506,6 +580,51 @@ fn build_find_hits(
         hit.rank = index + 1;
     }
     out
+}
+
+/// Builds the explicit guard-state readback for one fused pass (#1677).
+///
+/// This never reports "off" on the strength of the requested mode alone: it
+/// counts the guard artifacts the substrate actually produced. Because the pass
+/// requests [`GuardChoice::Off`], every one of those counts must be zero.
+///
+/// # Errors
+///
+/// Fails closed with `SYNAPSE_CALYX_FIND_GUARD_STATE_INCONSISTENT` when the
+/// substrate attached guard evidence to an unguarded pass — a silent guard would
+/// mean the caller is being handed a filtered subset while told it is raw recall.
+fn find_guard_readback(
+    outcome: &SearchOutcome,
+) -> Result<SynapseCalyxFindGuard, SynapseCalyxError> {
+    let hits_with_guard_verdict = outcome
+        .hits
+        .iter()
+        .filter(|hit| hit.guard.is_some())
+        .count();
+    let dropped_candidates = outcome.dropped_guard_hits.len();
+    let operator_tau = outcome.guard_tau;
+    if operator_tau.is_some() || dropped_candidates > 0 || hits_with_guard_verdict > 0 {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_FIND_GUARD_STATE_INCONSISTENT",
+            format!(
+                "fused find requested guard={SYNAPSE_FIND_GUARD_REQUESTED_MODE} but the substrate returned guard evidence: operator_tau={operator_tau:?} dropped_candidates={dropped_candidates} hits_with_guard_verdict={hits_with_guard_verdict}"
+            ),
+            "the search substrate applied a guard to a pass that did not request one; inspect calyx-search's guard resolution before trusting any fused-find result set",
+        ));
+    }
+    Ok(SynapseCalyxFindGuard {
+        requested_mode: SYNAPSE_FIND_GUARD_REQUESTED_MODE.to_owned(),
+        applied: false,
+        state_code: SYNAPSE_FIND_GUARD_DISABLED_CODE.to_owned(),
+        operator_tau,
+        dropped_candidates,
+        hits_with_guard_verdict,
+        disabled_reason: SYNAPSE_FIND_GUARD_DISABLED_REASON.to_owned(),
+        enable_requirements: SYNAPSE_FIND_GUARD_ENABLE_REQUIREMENTS
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect(),
+    })
 }
 
 /// Maps a substrate search error onto a Synapse error, naming the rebuild

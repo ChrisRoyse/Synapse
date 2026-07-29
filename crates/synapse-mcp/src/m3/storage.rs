@@ -217,6 +217,24 @@ pub struct StorageFindGeneration {
     pub slots: Vec<StorageSearchRebuildSlot>,
 }
 
+/// Explicit, evidence-backed state of the Ward guarded-search seam (#1677).
+///
+/// Reported on every fused result so a caller can tell that hits are UNGUARDED
+/// rather than assume a guard filtered them. `applied` is derived from what the
+/// substrate physically did (operator tau, dropped candidates, per-hit verdicts),
+/// never from the mode the daemon requested.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindGuard {
+    pub requested_mode: String,
+    pub applied: bool,
+    pub state_code: String,
+    pub operator_tau: Option<f32>,
+    pub dropped_candidates: u64,
+    pub hits_with_guard_verdict: u64,
+    pub disabled_reason: String,
+    pub enable_requirements: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct StorageFindSimilarResponse {
     pub source_of_truth: &'static str,
@@ -225,9 +243,12 @@ pub struct StorageFindSimilarResponse {
     pub query_kind: String,
     pub k: u32,
     pub rrf_k: u32,
+    /// The exact rank-level fusion law, so a caller can recompute every reported
+    /// score from the reported per-lens ranks.
+    pub rrf_formula: String,
     pub consulted_slots: Vec<u32>,
     pub temporal_applied: bool,
-    pub guard_note: String,
+    pub guard: StorageFindGuard,
     pub maxsim_note: String,
     pub grounding_note: String,
     pub generation: StorageFindGeneration,
@@ -1455,9 +1476,19 @@ fn storage_find_similar_response(
         query_kind: report.query_kind,
         k: report.k as u32,
         rrf_k: report.rrf_k,
+        rrf_formula: report.rrf_formula,
         consulted_slots: report.consulted_slots.into_iter().map(u32::from).collect(),
         temporal_applied: report.temporal_applied,
-        guard_note: report.guard_note,
+        guard: StorageFindGuard {
+            requested_mode: report.guard.requested_mode,
+            applied: report.guard.applied,
+            state_code: report.guard.state_code,
+            operator_tau: report.guard.operator_tau,
+            dropped_candidates: report.guard.dropped_candidates as u64,
+            hits_with_guard_verdict: report.guard.hits_with_guard_verdict as u64,
+            disabled_reason: report.guard.disabled_reason,
+            enable_requirements: report.guard.enable_requirements,
+        },
         maxsim_note: report.maxsim_note,
         grounding_note: report.grounding_note,
         generation,

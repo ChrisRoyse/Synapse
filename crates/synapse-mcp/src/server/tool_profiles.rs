@@ -276,8 +276,11 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
 /// exactly equal the contract's declared operation list". Naming a real
 /// `*Operation` enum here for a flat tool (as the contracts historically did,
 /// with fabricated enum names like `HealthOperation` that never existed) is
-/// therefore rejected by the gate. Keep the single operation entry as the
-/// documented source-of-truth/error/remediation for the flat call.
+/// therefore rejected by the gate. The operation entries under a flat tool are
+/// the documented source-of-truth/error/remediation for each distinct call shape
+/// that tool answers — usually one, but `find` answers two (perception element
+/// recall and fused memory recall, #1676) selected by payload presence rather
+/// than by an `operation` discriminator.
 pub(crate) const FLAT_FACADE_OPERATION_ENUM: &str =
     "(none: single-purpose tool, no operation param)";
 
@@ -384,16 +387,29 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "find",
         FLAT_FACADE_OPERATION_ENUM,
-        "perception index over latest observation readback",
-        &[op(
-            "elements",
-            false,
-            true,
-            "latest observation payload + element index",
-            None,
-            error_codes::CAPTURE_TARGET_INVALID,
-            "capture or bind the intended target before querying elements",
-        )],
+        "perception index over latest observation readback + Calyx persisted search generation with Ledger provenance",
+        &[
+            op(
+                "elements",
+                false,
+                true,
+                "latest observation payload + element index",
+                None,
+                error_codes::CAPTURE_TARGET_INVALID,
+                "capture or bind the intended target before querying elements",
+            ),
+            op(
+                "similar",
+                false,
+                false,
+                "Calyx persisted search generation manifest (per-slot DiskANN dense + BM25 sparse indexes) + Base rows + Ledger provenance entries",
+                Some(
+                    "per-hit per-lens RRF contributions (score = SUM over consulted slots of w_s/(60 + rank_s), rank_s 1-based) + agree/disagree lenses + verified ledger seq/hash per hit + generation manifest sha256/base_seq + an explicit guard readback proving the Ward in-region guard (#1677) was NOT applied",
+                ),
+                "SYNAPSE_CALYX_FIND_REBUILD_REQUIRED",
+                "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; note the live vault's index_inverted CF is empty, so the BM25 sparse lane stays unbuilt until a rebuild materializes it; pass the `similar` block alone, never mixed with the perception filters",
+            ),
+        ],
     ),
     facade_contract(
         "read_text",
@@ -1885,6 +1901,88 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "switch to an explicit maintenance profile before running GC",
             ),
             op(
+                "anchors",
+                false,
+                false,
+                "Calyx Anchors CF rows joined to the exact named source CF row",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "pass an exact source cf_name/key_hex pair and inspect the source row before retrying",
+            ),
+            op(
+                "temporal_panels",
+                false,
+                false,
+                "Calyx Registry CF temporal panel-policy registrations",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect the native Registry CF and repair any malformed or missing panel contract",
+            ),
+            op(
+                "temporal_rerank",
+                false,
+                false,
+                "Calyx Base snapshot rows + the exact registered Registry CF temporal policy for the named panel generation",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "supply one bounded content-only candidate set from an exact registered panel generation with active source event time",
+            ),
+            op(
+                "temporal_backfill",
+                true,
+                false,
+                "Calyx Base rows migrated from the exact named authoritative source CF",
+                Some(
+                    "examined/inserted/backfilled/already-current row counts + the latest durable Base seq after the pass",
+                ),
+                error_codes::STORAGE_READ_FAILED,
+                "inspect the exact authoritative source row and registered panel before retrying",
+            ),
+            op(
+                "search_rebuild",
+                true,
+                false,
+                "Calyx durable panel state + the republished persisted search generation directory (per-slot DiskANN/id-map/raw-sidecar artifacts)",
+                Some(
+                    "published generation manifest sha256 (before and after), base_seq, per-slot descriptors, and raw-sidecar file digests",
+                ),
+                error_codes::STORAGE_SEARCH_REBUILD_IN_PROGRESS,
+                "hold an explicit maintenance profile, wait for any in-flight rebuild to publish its generation, then retry with the exact expected_panel_version",
+            ),
+            op(
+                "find_similar",
+                false,
+                false,
+                "Calyx persisted search generation manifest (per-slot DiskANN dense + BM25 sparse indexes) + Base rows + Ledger provenance entries",
+                Some(
+                    "per-hit per-lens RRF contributions (score = SUM over consulted slots of w_s/(60 + rank_s), rank_s 1-based) + agree/disagree lenses + verified ledger seq/hash per hit + generation manifest sha256/base_seq + an explicit guard readback proving the Ward in-region guard (#1677) was NOT applied",
+                ),
+                "SYNAPSE_CALYX_FIND_REBUILD_REQUIRED",
+                "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; the live vault's index_inverted CF is empty, so the BM25 sparse lane stays unbuilt until a rebuild materializes it",
+            ),
+            op(
+                "retire_orphan_slot_cfs",
+                true,
+                false,
+                "physical per-slot CF directories under the vault, compared against live Base slot membership",
+                Some(
+                    "base rows scanned + live/present slot id sets + per-retired-slot row/SST counts and removed directories + skipped-live slots with reasons",
+                ),
+                error_codes::STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS,
+                "hold an explicit maintenance profile, wait for any in-flight retirement pass to finish, then retry",
+            ),
+            op(
+                "intelligence",
+                true,
+                false,
+                "Calyx Base panel rows + the derived XTerm/Graph/Kernel CF rows the substrate math reads and (for weave) writes",
+                Some(
+                    "per-sub-operation physical CF readback: derived row counts after the pass, grounded flags, and the exact panel_version the report was computed for",
+                ),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "read-only sub-operations need only READ_STORAGE; the weave sub-operation persists derived rows, so switch to an explicit maintenance profile before running it",
+            ),
+            op(
                 "backup",
                 true,
                 false,
@@ -1968,16 +2066,27 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "cost",
         "CostOperation",
-        "CF_AGENT_TRANSCRIPTS transcript rows + CF_KV cost/price/v1 rows",
+        "CF_AGENT_TRANSCRIPTS transcript rows + CF_KV cost/price/v1 rows + CF_KV agent-cost/transcript-ts-index/v1 rows + CF_KV agent-cost/rollup/v1 rows",
         &[
             op(
                 "summarize",
                 false,
                 false,
-                "CF_AGENT_TRANSCRIPTS spawn-prefix scan + CF_KV price rows",
+                "with spawn_id: exact bounded CF_AGENT_TRANSCRIPTS spawn-prefix read + CF_KV cost/price/v1 rows; without spawn_id: the materialized CF_KV agent-cost/rollup/v1 hour-window cells (#1688 shipped), bounded and never a full corpus scan; all_history=true is the explicit operator-intended exact full scan",
                 None,
                 error_codes::TOOL_INTERNAL_ERROR,
-                "pass spawn_id for exact bounded cost read; fleet rollups require #1688 TimeSeries/OLAP aggregates",
+                "pass spawn_id for an exact bounded cost read; a fleet window is answered from the materialized rollups and fails closed when they are absent — run cost operation=rollup_backfill to materialize them rather than expecting a silent re-scan",
+            ),
+            op(
+                "rollup_backfill",
+                true,
+                false,
+                "CF_AGENT_TRANSCRIPTS transcript corpus aggregated into CF_KV agent-cost/rollup/v1 hour cells",
+                Some(
+                    "CF_KV agent-cost/rollup/v1/__meta + agent-cost/rollup/v1/cell/ hour rollup cells + agent-cost/rollup/v1/mark/ per-spawn contribution markers",
+                ),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile; a concurrent materialization fails closed, so wait for the in-flight pass instead of stacking a second one",
             ),
             op(
                 "price_list",
