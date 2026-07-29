@@ -31,7 +31,7 @@ use calyx_forge::{Backend, KnnMetric};
 use calyx_lodestar::{
     AnswerDerivation, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelGraphParams, KernelIndex,
     KernelParams, LodestarError, LpRoundParams, RecallEvalParams, RecallQuery, build_kernel_index,
-    build_kernel_pipeline, derive_kernel_answer, measure_kernel_recall,
+    build_kernel_pipeline, derive_kernel_answer, measure_kernel_recall, write_kernel_artifact,
 };
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
@@ -2701,7 +2701,7 @@ pub const SYNAPSE_KERNEL_DEFAULT_MAX_HOPS: usize = 4;
 /// Cap on member `cx_ids` echoed in a kernel report (the full set persists to CF).
 pub const SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS: usize = 256;
 
-const KERNEL_ROW_PREFIX: &[u8; 5] = b"KERN1";
+pub const KERNEL_ROW_PREFIX: &[u8; 5] = b"KERN1";
 
 /// Bounded request describing one grounding-kernel build or grounded answer.
 #[derive(Clone, Debug)]
@@ -2713,7 +2713,12 @@ pub struct SynapseCalyxKernelParams {
     pub knn: usize,
     pub edge_cos_threshold: f32,
     pub min_recall_ratio: f32,
-    /// Optional grounded outcome anchor kind stamped onto the kernel identity.
+    /// Optional grounded outcome anchor kind. This is a real domain *scope*
+    /// (calyx-lodestar `Scope::Domain { anchor_kind }`), not a cosmetic label:
+    /// when set, only concepts anchored on that outcome axis count as anchors,
+    /// so the selected kernel is the minimal generating core of that one domain
+    /// rather than of every anchored concept in the panel. It is also stamped
+    /// onto the kernel identity so the persisted artifact names its own scope.
     pub anchor_kind: Option<String>,
 }
 
@@ -2788,17 +2793,17 @@ pub struct SynapseCalyxKernelAnswerReport {
 /// The reusable kernel inputs assembled from the vault: the embedding rows, the
 /// proximity association graph, the selected kernel, its measured recall, and the
 /// kernel index — everything a build or an answer needs.
-struct DomainKernelInputs {
+pub struct DomainKernelInputs {
     rows: Vec<RecallQuery>,
-    anchors: Vec<CxId>,
+    pub anchors: Vec<CxId>,
     graph: AssocGraph,
-    kernel: Kernel,
+    pub kernel: Kernel,
     kernel_index: KernelIndex,
-    recall_kernel_only: f32,
-    recall_ratio: f32,
-    corpus_size: usize,
-    vault_corpus_size: usize,
-    corpus_fingerprint: String,
+    pub recall_kernel_only: f32,
+    pub recall_ratio: f32,
+    pub corpus_size: usize,
+    pub vault_corpus_size: usize,
+    pub corpus_fingerprint: String,
 }
 
 impl SynapseCalyxVault {
@@ -2872,6 +2877,16 @@ impl SynapseCalyxVault {
             kernel_row_key(params.panel_version, params.content_slot),
             &row,
         )?;
+        // The JSON row above is a *report*. `kernel_health` (PRD 08 §8) is
+        // defined to READ the persisted Kernel artifact and never recompute
+        // recall/groundedness, so the artifact itself has to be durable as
+        // well; otherwise health has nothing honest to read and would have to
+        // re-derive — exactly the fabrication that surface forbids.
+        write_kernel_artifact(
+            &inputs.kernel,
+            &crate::kernel_maintenance::VaultKernelArtifactStore::new(self),
+        )
+        .map_err(|error| kernel_math_error("persist the Kernel artifact", &error))?;
         let kernel_cf_rows_after = self.scan_cf_latest(ColumnFamily::Kernel)?.len();
 
         Ok(SynapseCalyxKernelReport {
@@ -3010,8 +3025,14 @@ impl SynapseCalyxVault {
     /// graph (GPU-preferred/CPU-fallback cosine), selects the kernel via the
     /// substrate MFVS pipeline, builds the kernel index, and measures kernel-only
     /// recall against the full corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the panel has fewer than two embedded
+    /// concepts, no anchored concept in the requested domain scope, or when the
+    /// substrate graph/kernel/recall math fails closed.
     #[allow(clippy::too_many_lines)]
-    fn build_domain_kernel_inputs(
+    pub fn build_domain_kernel_inputs(
         &self,
         params: &SynapseCalyxKernelParams,
     ) -> Result<DomainKernelInputs, SynapseCalyxError> {
@@ -3039,10 +3060,15 @@ impl SynapseCalyxVault {
                 // a grounded concept in this domain; it is excluded, never faked.
                 continue;
             };
-            let has_anchor = constellation
-                .anchors
-                .iter()
-                .any(|anchor| anchor.confidence > 0.0);
+            // Domain scope: with `anchor_kind` set only that outcome axis
+            // anchors the kernel, so a per-domain sweep selects one kernel per
+            // domain instead of one blended kernel over every anchored concept.
+            let has_anchor = constellation.anchors.iter().any(|anchor| {
+                anchor.confidence > 0.0
+                    && params.anchor_kind.as_deref().is_none_or(|kind| {
+                        crate::grounding::anchor_kind_label(&anchor.kind) == kind
+                    })
+            });
             let cx_id = constellation.cx_id;
             rows.push(RecallQuery { cx_id, vector });
             if has_anchor {
@@ -3068,8 +3094,13 @@ impl SynapseCalyxVault {
             return Err(SynapseCalyxError::new(
                 "SYNAPSE_CALYX_KERNEL_NO_ANCHOR",
                 format!(
-                    "panel {} slot {} has no anchored concept; a grounded kernel needs at least one outcome anchor",
-                    params.panel_version, params.content_slot
+                    "panel {} slot {} has no anchored concept in domain scope {}; a grounded kernel needs at least one outcome anchor",
+                    params.panel_version,
+                    params.content_slot,
+                    params
+                        .anchor_kind
+                        .as_deref()
+                        .unwrap_or("<all anchor kinds>")
                 ),
                 "anchor at least one concept (a grounded outcome) in this domain before building a kernel",
             ));
@@ -3211,7 +3242,7 @@ fn corpus_hash_bytes(rows: &[RecallQuery]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn kernel_row_key(panel_version: u32, content_slot: u16) -> Vec<u8> {
+pub fn kernel_row_key(panel_version: u32, content_slot: u16) -> Vec<u8> {
     let mut key = Vec::with_capacity(KERNEL_ROW_PREFIX.len() + 6);
     key.extend_from_slice(KERNEL_ROW_PREFIX);
     key.extend_from_slice(&panel_version.to_be_bytes());
@@ -3219,7 +3250,7 @@ fn kernel_row_key(panel_version: u32, content_slot: u16) -> Vec<u8> {
     key
 }
 
-fn kernel_math_error(action: &str, error: &LodestarError) -> SynapseCalyxError {
+pub fn kernel_math_error(action: &str, error: &LodestarError) -> SynapseCalyxError {
     SynapseCalyxError::new(
         error.code(),
         format!("{action}: {error}"),

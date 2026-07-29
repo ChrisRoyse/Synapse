@@ -35,6 +35,11 @@ calyx-paths = { path = "../../calyx/crates/calyx-paths" }
 calyx-registry = { path = "../../calyx/crates/calyx-registry" }
 calyx-search = { path = "../../calyx/crates/calyx-search" }
 calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }
+# The Ward guard (#1677). Until now no synapse-* crate depended on it, so the
+# Guard CF was never written and every profile-backed guarded search failed
+# closed with CALYX_GUARD_PROVISIONAL against an empty CF. src/ward.rs is the
+# writer that gives the already-wired calyx-search consumer something to load.
+calyx-ward = { path = "../../calyx/crates/calyx-ward" }
 fs2.workspace = true
 num-traits.workspace = true
 serde.workspace = true

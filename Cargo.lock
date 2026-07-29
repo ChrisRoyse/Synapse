@@ -5155,6 +5155,7 @@ dependencies = [
  "calyx-registry",
  "calyx-search",
  "calyx-sextant",
+ "calyx-ward",
  "fs2",
  "num-traits",
  "serde",

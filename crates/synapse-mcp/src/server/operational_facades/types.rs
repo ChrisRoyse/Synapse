@@ -9,9 +9,12 @@ use crate::m3::{
     hygiene::{
         HygieneBlindSpotParams, HygieneBlindSpotResponse, HygieneDriftParams, HygieneDriftResponse,
         HygieneFlagsParams, HygieneFlagsResponse, HygieneGroundingGapParams,
-        HygieneGroundingGapResponse, HygieneReportParams, HygieneReportResponse,
-        HygieneScanStorageParams, HygieneScanStorageResponse, HygieneScanTextParams,
-        HygieneScanTextResponse, HygieneVaultVerifyParams, HygieneVaultVerifyResponse,
+        HygieneGroundingGapResponse, HygieneGuardCalibrateParams, HygieneGuardCalibrateResponse,
+        HygieneGuardVerifyParams, HygieneGuardVerifyResponse, HygieneKernelParams,
+        HygieneKernelRebuildParams, HygieneKernelRebuildResponse, HygieneKernelResponse,
+        HygieneReportParams, HygieneReportResponse, HygieneScanStorageParams,
+        HygieneScanStorageResponse, HygieneScanTextParams, HygieneScanTextResponse,
+        HygieneVaultVerifyParams, HygieneVaultVerifyResponse,
     },
     local_models::{
         LocalModelListParams, LocalModelListResponse, LocalModelProbeParams,
@@ -230,6 +233,14 @@ pub enum HygieneOperation {
     BlindSpot,
     Drift,
     VaultVerify,
+    /// Read the persisted grounding-kernel artifact's health (#1675).
+    Kernel,
+    /// COLD per-domain grounding-kernel rebuild sweep (#1675).
+    KernelRebuild,
+    /// Calibrate and persist the Ward guard profile (#1677).
+    GuardCalibrate,
+    /// Evaluate one record against the persisted Ward guard profile (#1677).
+    GuardVerify,
 }
 
 impl HygieneOperation {
@@ -243,6 +254,10 @@ impl HygieneOperation {
             Self::BlindSpot => "blind_spot",
             Self::Drift => "drift",
             Self::VaultVerify => "vault_verify",
+            Self::Kernel => "kernel",
+            Self::KernelRebuild => "kernel_rebuild",
+            Self::GuardCalibrate => "guard_calibrate",
+            Self::GuardVerify => "guard_verify",
         }
     }
 }
@@ -267,6 +282,14 @@ pub struct HygieneParams {
     pub drift: Option<HygieneDriftParams>,
     #[serde(default)]
     pub vault_verify: Option<HygieneVaultVerifyParams>,
+    #[serde(default)]
+    pub kernel: Option<HygieneKernelParams>,
+    #[serde(default)]
+    pub kernel_rebuild: Option<HygieneKernelRebuildParams>,
+    #[serde(default)]
+    pub guard_calibrate: Option<HygieneGuardCalibrateParams>,
+    #[serde(default)]
+    pub guard_verify: Option<HygieneGuardVerifyParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -291,6 +314,14 @@ pub struct HygieneResponse {
     pub drift: Option<HygieneDriftResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_verify: Option<HygieneVaultVerifyResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<HygieneKernelResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_rebuild: Option<HygieneKernelRebuildResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_calibrate: Option<HygieneGuardCalibrateResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_verify: Option<HygieneGuardVerifyResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

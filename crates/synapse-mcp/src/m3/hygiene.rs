@@ -637,6 +637,490 @@ pub struct HygieneDriftResponse {
     pub drift_rows_persisted: u64,
 }
 
+/// Kernel-health request for one persisted domain kernel (#1675).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneKernelParams {
+    pub panel_version: u32,
+    /// Dense semantic-lens slot the kernel was selected on.
+    pub content_slot: u32,
+    /// Grounded outcome domain (anchor-kind label). Omit for the panel-default
+    /// kernel written by a single `storage.intelligence kernel` build.
+    #[serde(default)]
+    pub anchor_kind: Option<String>,
+}
+
+/// Cold per-domain kernel rebuild request over one panel (#1675).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneKernelRebuildParams {
+    pub panel_version: u32,
+    pub content_slot: u32,
+    #[serde(default)]
+    pub max_records: Option<u32>,
+    /// Kernel-only recall gate ratio; an ungrounded kernel is refused, not served.
+    #[serde(default)]
+    pub min_recall_ratio: Option<f32>,
+    #[serde(default)]
+    pub max_domains: Option<u32>,
+}
+
+/// Kernel health assembled from the persisted artifact - never recomputed.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneKernelResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub content_slot: u32,
+    pub anchor_kind: Option<String>,
+    pub kernel_id: String,
+    pub size: u64,
+    pub kernel_graph_size: u64,
+    pub recall_raw: f32,
+    pub recall_ratio: f32,
+    pub min_recall_ratio: f32,
+    pub n_queries_tested: u64,
+    pub recall_pass_mode: String,
+    pub grounded_fraction: f32,
+    pub unanchored_count: u64,
+    pub approx_factor: f64,
+    pub tau_star_estimate: u64,
+    pub tau_star_exact: bool,
+    pub built_at_millis: u64,
+    pub corpus_shard_hash: String,
+    pub trust: String,
+    pub warnings: Vec<String>,
+    pub artifact_bytes: u64,
+    pub kernel_cf_rows: u64,
+}
+
+/// One domain's outcome in a kernel rebuild sweep.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneKernelDomainOutcome {
+    pub anchor_kind: String,
+    pub anchored_records: u64,
+    pub built: bool,
+    pub kernel_id: Option<String>,
+    pub members: u64,
+    pub corpus_size: u64,
+    pub recall_kernel_only: f32,
+    pub recall_ratio: f32,
+    pub reached_anchor: f32,
+    pub refusal_code: Option<String>,
+    pub refusal: Option<String>,
+}
+
+/// Cold per-domain kernel rebuild report with the `Kernel` CF readback.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneKernelRebuildResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub content_slot: u32,
+    pub domains_discovered: u64,
+    pub domains_attempted: u64,
+    pub domains_built: u64,
+    pub domains_refused: u64,
+    pub all_domains_grounded: bool,
+    pub min_recall_ratio: f32,
+    pub domains: Vec<HygieneKernelDomainOutcome>,
+    pub artifacts_persisted: u64,
+    pub kernel_cf_rows_after: u64,
+}
+
+/// Operator-asserted aspect of a guarded slot (#1677). Never inferred: it sets
+/// the maximum permitted target FAR and is persisted as calibration provenance.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HygieneGuardAspect {
+    Identity,
+    Stylistic,
+    Content,
+}
+
+/// One slot to calibrate with its asserted aspect.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardSlotSpec {
+    pub slot: u32,
+    pub aspect: HygieneGuardAspect,
+}
+
+/// Ward guard calibration request over one panel (#1677).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardCalibrateParams {
+    pub panel_version: u32,
+    /// Dense active panel slots to guard, each with its asserted aspect.
+    pub slots: Vec<HygieneGuardSlotSpec>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Conformal miscoverage budget; the tau bounds the true FAR at `target_far`
+    /// with confidence `1 - alpha`.
+    #[serde(default)]
+    pub alpha: Option<f32>,
+    #[serde(default)]
+    pub target_far: Option<f32>,
+    #[serde(default)]
+    pub max_records: Option<u32>,
+    /// Dry run when false: the calibration is computed but the Guard CF is not
+    /// written.
+    #[serde(default)]
+    pub persist: Option<bool>,
+}
+
+/// One slot's calibration evidence.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardSlotCalibration {
+    pub slot: u32,
+    pub aspect: String,
+    pub target_far: f32,
+    pub tau: f32,
+    pub bad_accepts: u64,
+    pub achieved_far: f64,
+    pub achieved_frr: f64,
+    pub good_scores: u64,
+    pub bad_scores: u64,
+    pub clopper_pearson_tail: f64,
+    pub certifiable_min_bad_scores: u64,
+}
+
+/// Ward guard calibration report with the `Guard` CF readback.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardCalibrateResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub domain: String,
+    pub guard_id: String,
+    pub alpha: f32,
+    pub records_scanned: u64,
+    pub adjudicated_good: u64,
+    pub adjudicated_bad: u64,
+    pub unadjudicated: u64,
+    pub conflicting: u64,
+    pub estimator: String,
+    pub slots: Vec<HygieneGuardSlotCalibration>,
+    pub persisted: bool,
+    pub guard_cf_profile_bytes: u64,
+    pub guard_cf_rows_after: u64,
+    pub readback_calibrated: bool,
+}
+
+/// Ward guard verification request for one record (#1677).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardVerifyParams {
+    pub panel_version: u32,
+    pub query_cx_id: String,
+    /// High-stakes verification refuses provisional/partially-calibrated profiles.
+    #[serde(default)]
+    pub high_stakes: Option<bool>,
+    #[serde(default)]
+    pub max_records: Option<u32>,
+}
+
+/// One slot's verdict inside a guard verification.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardSlotVerdict {
+    pub slot: u32,
+    pub cos: f32,
+    pub tau: f32,
+    pub pass: bool,
+    pub matched_cx_id: String,
+}
+
+/// A Ward `GuardVerdict` produced against the persisted profile.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneGuardVerifyResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub query_cx_id: String,
+    pub guard_id: String,
+    pub domain: String,
+    pub high_stakes: bool,
+    pub overall_pass: bool,
+    pub provisional: bool,
+    pub policy: String,
+    pub required_slots: Vec<u32>,
+    pub per_slot: Vec<HygieneGuardSlotVerdict>,
+    pub failing_slots: Vec<u32>,
+    pub action: Option<String>,
+    pub calibration_far: Option<f32>,
+    pub calibration_frr: Option<f32>,
+    pub calibration_confidence: Option<f32>,
+    pub trusted_exemplars: u64,
+}
+
+#[must_use]
+pub fn required_permissions_kernel(_params: &HygieneKernelParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_kernel_rebuild(
+    _params: &HygieneKernelRebuildParams,
+) -> RequiredPermissions {
+    // The rebuild persists Kernel artifacts and per-domain index rows.
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_guard_calibrate(
+    params: &HygieneGuardCalibrateParams,
+) -> RequiredPermissions {
+    if params.persist.unwrap_or(true) {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    } else {
+        required([Permission::ReadStorage])
+    }
+}
+
+#[must_use]
+pub fn required_permissions_guard_verify(
+    _params: &HygieneGuardVerifyParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+/// Reports the health of one persisted domain kernel by reading its Kernel
+/// artifact from the vault. Read-only; never re-measures recall.
+///
+/// # Errors
+///
+/// Returns a structured error when no kernel is persisted for the domain or the
+/// artifact is missing/stale/undecodable.
+pub fn run_kernel(
+    db: &Db,
+    params: &HygieneKernelParams,
+) -> Result<HygieneKernelResponse, ErrorData> {
+    let report = db
+        .domain_kernel_health_intelligence(
+            params.panel_version,
+            clamp_slot(params.content_slot),
+            params.anchor_kind.as_deref(),
+        )
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneKernelResponse {
+        source_of_truth: "Calyx Kernel CF persisted kernel artifact",
+        panel_version: report.panel_version,
+        content_slot: u32::from(report.content_slot),
+        anchor_kind: report.anchor_kind,
+        kernel_id: report.kernel_id,
+        size: report.size as u64,
+        kernel_graph_size: report.kernel_graph_size as u64,
+        recall_raw: report.recall_raw,
+        recall_ratio: report.recall_ratio,
+        min_recall_ratio: report.min_recall_ratio,
+        n_queries_tested: report.n_queries_tested as u64,
+        recall_pass_mode: report.recall_pass_mode,
+        grounded_fraction: report.grounded_fraction,
+        unanchored_count: report.unanchored_count as u64,
+        approx_factor: report.approx_factor,
+        tau_star_estimate: report.tau_star_estimate as u64,
+        tau_star_exact: report.tau_star_exact,
+        built_at_millis: report.built_at_millis,
+        corpus_shard_hash: report.corpus_shard_hash,
+        trust: report.trust,
+        warnings: report.warnings,
+        artifact_bytes: report.artifact_bytes as u64,
+        kernel_cf_rows: report.kernel_cf_rows as u64,
+    })
+}
+
+/// Runs the COLD per-domain kernel rebuild sweep and reads the `Kernel` CF back.
+///
+/// # Errors
+///
+/// Returns a structured error when the panel has no grounded outcome domain,
+/// when every domain refused the recall gate, or when the CF write/readback
+/// fails.
+pub fn run_kernel_rebuild(
+    db: &Db,
+    params: &HygieneKernelRebuildParams,
+) -> Result<HygieneKernelRebuildResponse, ErrorData> {
+    let mut spec = synapse_calyx::SynapseCalyxKernelRebuildParams::new(
+        params.panel_version,
+        clamp_slot(params.content_slot),
+    );
+    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    if let Some(min_recall_ratio) = params.min_recall_ratio {
+        spec.min_recall_ratio = min_recall_ratio;
+    }
+    if let Some(max_domains) = params.max_domains {
+        spec.max_domains = max_domains.max(1) as usize;
+    }
+    let report = db
+        .rebuild_domain_kernels_intelligence(&spec)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneKernelRebuildResponse {
+        source_of_truth: "Calyx Kernel CF persisted kernel artifacts",
+        panel_version: report.panel_version,
+        content_slot: u32::from(report.content_slot),
+        domains_discovered: report.domains_discovered as u64,
+        domains_attempted: report.domains_attempted as u64,
+        domains_built: report.domains_built as u64,
+        domains_refused: report.domains_refused as u64,
+        all_domains_grounded: report.all_domains_grounded,
+        min_recall_ratio: report.min_recall_ratio,
+        domains: report
+            .domains
+            .into_iter()
+            .map(|domain| HygieneKernelDomainOutcome {
+                anchor_kind: domain.anchor_kind,
+                anchored_records: domain.anchored_records as u64,
+                built: domain.built,
+                kernel_id: domain.kernel_id,
+                members: domain.members as u64,
+                corpus_size: domain.corpus_size as u64,
+                recall_kernel_only: domain.recall_kernel_only,
+                recall_ratio: domain.recall_ratio,
+                reached_anchor: domain.reached_anchor,
+                refusal_code: domain.refusal_code,
+                refusal: domain.refusal,
+            })
+            .collect(),
+        artifacts_persisted: report.artifacts_persisted as u64,
+        kernel_cf_rows_after: report.kernel_cf_rows_after as u64,
+    })
+}
+
+/// Calibrates the Ward guard profile from the vault's adjudicated corpus and
+/// persists it to the `Guard` CF the guarded-search consumer reads.
+///
+/// # Errors
+///
+/// Fails closed when the adjudicated bad-case corpus is absent, below ward's
+/// minimum, or too small to certify the requested target FAR - never with a
+/// fabricated corpus.
+pub fn run_guard_calibrate(
+    db: &Db,
+    params: &HygieneGuardCalibrateParams,
+) -> Result<HygieneGuardCalibrateResponse, ErrorData> {
+    let slots = params
+        .slots
+        .iter()
+        .map(|spec| synapse_calyx::SynapseCalyxGuardSlotSpec {
+            slot: clamp_slot(spec.slot),
+            aspect: match spec.aspect {
+                HygieneGuardAspect::Identity => synapse_calyx::SynapseCalyxGuardAspect::Identity,
+                HygieneGuardAspect::Stylistic => synapse_calyx::SynapseCalyxGuardAspect::Stylistic,
+                HygieneGuardAspect::Content => synapse_calyx::SynapseCalyxGuardAspect::Content,
+            },
+        })
+        .collect();
+    let mut spec =
+        synapse_calyx::SynapseCalyxGuardCalibrateParams::new(params.panel_version, slots);
+    if let Some(domain) = &params.domain {
+        spec.domain.clone_from(domain);
+    }
+    if let Some(alpha) = params.alpha {
+        spec.alpha = alpha;
+    }
+    spec.target_far = params.target_far;
+    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    spec.persist = params.persist.unwrap_or(true);
+    let report = db
+        .guard_calibrate_intelligence(&spec)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneGuardCalibrateResponse {
+        source_of_truth: "Calyx Guard CF calibrated profile row",
+        panel_version: report.panel_version,
+        domain: report.domain,
+        guard_id: report.guard_id,
+        alpha: report.alpha,
+        records_scanned: report.records_scanned as u64,
+        adjudicated_good: report.adjudicated_good as u64,
+        adjudicated_bad: report.adjudicated_bad as u64,
+        unadjudicated: report.unadjudicated as u64,
+        conflicting: report.conflicting as u64,
+        estimator: report.estimator,
+        slots: report
+            .slots
+            .into_iter()
+            .map(|slot| HygieneGuardSlotCalibration {
+                slot: u32::from(slot.slot),
+                aspect: slot.aspect,
+                target_far: slot.target_far,
+                tau: slot.tau,
+                bad_accepts: slot.bad_accepts as u64,
+                achieved_far: slot.achieved_far,
+                achieved_frr: slot.achieved_frr,
+                good_scores: slot.good_scores as u64,
+                bad_scores: slot.bad_scores as u64,
+                clopper_pearson_tail: slot.clopper_pearson_tail,
+                certifiable_min_bad_scores: slot.certifiable_min_bad_scores as u64,
+            })
+            .collect(),
+        persisted: report.persisted,
+        guard_cf_profile_bytes: report.guard_cf_profile_bytes as u64,
+        guard_cf_rows_after: report.guard_cf_rows_after as u64,
+        readback_calibrated: report.readback_calibrated,
+    })
+}
+
+/// Verifies one record against the persisted Ward guard profile.
+///
+/// # Errors
+///
+/// Fails closed with `CALYX_GUARD_PROVISIONAL` when no calibrated profile is
+/// persisted, and with a named error when the record or a trusted exemplar is
+/// missing.
+pub fn run_guard_verify(
+    db: &Db,
+    params: &HygieneGuardVerifyParams,
+) -> Result<HygieneGuardVerifyResponse, ErrorData> {
+    let spec = synapse_calyx::SynapseCalyxGuardVerifyParams {
+        panel_version: params.panel_version,
+        query_cx_id: params.query_cx_id.clone(),
+        high_stakes: params.high_stakes.unwrap_or(false),
+        max_records: clamp_intelligence_hygiene_records(params.max_records),
+    };
+    let report = db
+        .guard_verify_intelligence(&spec)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(HygieneGuardVerifyResponse {
+        source_of_truth: "Calyx Guard CF calibrated profile row",
+        panel_version: report.panel_version,
+        query_cx_id: report.query_cx_id,
+        guard_id: report.guard_id,
+        domain: report.domain,
+        high_stakes: report.high_stakes,
+        overall_pass: report.overall_pass,
+        provisional: report.provisional,
+        policy: report.policy,
+        required_slots: report.required_slots.into_iter().map(u32::from).collect(),
+        per_slot: report
+            .per_slot
+            .into_iter()
+            .map(|slot| HygieneGuardSlotVerdict {
+                slot: u32::from(slot.slot),
+                cos: slot.cos,
+                tau: slot.tau,
+                pass: slot.pass,
+                matched_cx_id: slot.matched_cx_id,
+            })
+            .collect(),
+        failing_slots: report.failing_slots.into_iter().map(u32::from).collect(),
+        action: report.action,
+        calibration_far: report.calibration_far,
+        calibration_frr: report.calibration_frr,
+        calibration_confidence: report.calibration_confidence,
+        trusted_exemplars: report.trusted_exemplars as u64,
+    })
+}
+
+/// Narrows a wire slot id into the physical `u16` panel slot space. A value
+/// above the ceiling is pinned to `u16::MAX`, which no published panel defines,
+/// so the request fails closed downstream instead of silently guarding slot 0.
+fn clamp_slot(slot: u32) -> u16 {
+    u16::try_from(slot).unwrap_or(u16::MAX)
+}
+
 #[must_use]
 pub fn required_permissions_blind_spot(_params: &HygieneBlindSpotParams) -> RequiredPermissions {
     required([Permission::ReadStorage])

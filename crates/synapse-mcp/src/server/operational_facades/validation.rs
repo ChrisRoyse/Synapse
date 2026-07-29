@@ -64,6 +64,10 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("blind_spot", params.blind_spot.is_some()),
             ("drift", params.drift.is_some()),
             ("vault_verify", params.vault_verify.is_some()),
+            ("kernel", params.kernel.is_some()),
+            ("kernel_rebuild", params.kernel_rebuild.is_some()),
+            ("guard_calibrate", params.guard_calibrate.is_some()),
+            ("guard_verify", params.guard_verify.is_some()),
         ],
     )
 }

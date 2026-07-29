@@ -1253,6 +1253,71 @@ impl Db {
         self.backend.panel_drift_intelligence(params)
     }
 
+    /// Rebuilds one grounding kernel per grounded outcome domain in a panel on a
+    /// COLD maintenance path, persisting each Kernel artifact to the native
+    /// `Kernel` CF and reading the CF back (#1675).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the panel has no grounded outcome
+    /// domain, when every discovered domain refused the recall gate, or when the
+    /// `Kernel` CF write/readback fails.
+    pub fn rebuild_domain_kernels_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxKernelRebuildParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxKernelRebuildReport> {
+        self.backend.rebuild_domain_kernels_intelligence(params)
+    }
+
+    /// Reports one persisted domain kernel's health by READING its Kernel
+    /// artifact — recall and groundedness exactly as persisted, never re-measured.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when no kernel has been persisted for
+    /// the domain or when the artifact is missing/stale/undecodable.
+    pub fn domain_kernel_health_intelligence(
+        &self,
+        panel_version: u32,
+        content_slot: u16,
+        anchor_kind: Option<&str>,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxKernelHealthReport> {
+        self.backend
+            .domain_kernel_health_intelligence(panel_version, content_slot, anchor_kind)
+    }
+
+    /// Calibrates the Ward guard profile from the vault's adjudicated corpus and
+    /// persists it to the native `Guard` CF for the guarded-search consumer
+    /// (#1677). Fails closed rather than calibrate on a fabricated corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the adjudicated bad-case corpus is
+    /// absent, too small, or too small to certify the requested target FAR, when
+    /// a slot is not dense/active in the published panel, or when the `Guard` CF
+    /// write/readback fails.
+    pub fn guard_calibrate_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxGuardCalibrateParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxGuardCalibrateReport> {
+        self.backend.guard_calibrate_intelligence(params)
+    }
+
+    /// Verifies one record against the persisted Ward guard profile and returns
+    /// the full per-slot `GuardVerdict` decomposition (#1677).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when no calibrated profile is
+    /// persisted, when it was calibrated for another panel, or when the record or
+    /// a trusted exemplar is missing.
+    pub fn guard_verify_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxGuardVerifyParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxGuardVerifyReport> {
+        self.backend.guard_verify_intelligence(params)
+    }
+
     /// Flushes and explicitly closes the sole process-local Calyx vault.
     ///
     /// # Errors

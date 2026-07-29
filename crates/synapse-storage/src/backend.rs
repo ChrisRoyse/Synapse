@@ -26,8 +26,11 @@ use synapse_calyx::{
     SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
     SynapseCalyxDriftReport, SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxFindParams,
     SynapseCalyxFindReport, SynapseCalyxGroundedObservationReadback,
-    SynapseCalyxGroundingGapReport, SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport,
-    SynapseCalyxKernelParams, SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback,
+    SynapseCalyxGroundingGapReport, SynapseCalyxGuardCalibrateParams,
+    SynapseCalyxGuardCalibrateReport, SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport,
+    SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport,
+    SynapseCalyxKernelParams, SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport,
+    SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback,
     SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
     SynapseCalyxObservationPutReadback, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
     SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
@@ -750,6 +753,24 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: &SynapseCalyxPanelDriftParams,
     ) -> StorageResult<SynapseCalyxPanelDriftReport>;
+    fn rebuild_domain_kernels_intelligence(
+        &self,
+        params: &SynapseCalyxKernelRebuildParams,
+    ) -> StorageResult<SynapseCalyxKernelRebuildReport>;
+    fn domain_kernel_health_intelligence(
+        &self,
+        panel_version: u32,
+        content_slot: u16,
+        anchor_kind: Option<&str>,
+    ) -> StorageResult<SynapseCalyxKernelHealthReport>;
+    fn guard_calibrate_intelligence(
+        &self,
+        params: &SynapseCalyxGuardCalibrateParams,
+    ) -> StorageResult<SynapseCalyxGuardCalibrateReport>;
+    fn guard_verify_intelligence(
+        &self,
+        params: &SynapseCalyxGuardVerifyParams,
+    ) -> StorageResult<SynapseCalyxGuardVerifyReport>;
 }
 
 pub struct CalyxBackend {
@@ -2524,6 +2545,90 @@ impl StorageBackend for CalyxBackend {
                     calyx_write_failed(
                         "calyx_assay",
                         "measure native Calyx panel MMD drift",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn rebuild_domain_kernels_intelligence(
+        &self,
+        params: &SynapseCalyxKernelRebuildParams,
+    ) -> StorageResult<SynapseCalyxKernelRebuildReport> {
+        self.with_vault(
+            "calyx_lodestar",
+            "rebuild native Calyx per-domain grounding kernels",
+            true,
+            |vault| {
+                vault.rebuild_domain_kernels(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_lodestar",
+                        "rebuild native Calyx per-domain grounding kernels",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn domain_kernel_health_intelligence(
+        &self,
+        panel_version: u32,
+        content_slot: u16,
+        anchor_kind: Option<&str>,
+    ) -> StorageResult<SynapseCalyxKernelHealthReport> {
+        self.with_vault(
+            "calyx_lodestar",
+            "report native Calyx kernel health",
+            false,
+            |vault| {
+                vault
+                    .domain_kernel_health(panel_version, content_slot, anchor_kind)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_lodestar",
+                            "report native Calyx kernel health",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn guard_calibrate_intelligence(
+        &self,
+        params: &SynapseCalyxGuardCalibrateParams,
+    ) -> StorageResult<SynapseCalyxGuardCalibrateReport> {
+        self.with_vault(
+            "calyx_ward",
+            "calibrate the native Calyx Ward guard profile",
+            true,
+            |vault| {
+                vault.guard_calibrate(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_ward",
+                        "calibrate the native Calyx Ward guard profile",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn guard_verify_intelligence(
+        &self,
+        params: &SynapseCalyxGuardVerifyParams,
+    ) -> StorageResult<SynapseCalyxGuardVerifyReport> {
+        self.with_vault(
+            "calyx_ward",
+            "verify a record against the native Calyx Ward guard profile",
+            false,
+            |vault| {
+                vault.guard_verify(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_ward",
+                        "verify a record against the native Calyx Ward guard profile",
                         &source,
                     )
                 })

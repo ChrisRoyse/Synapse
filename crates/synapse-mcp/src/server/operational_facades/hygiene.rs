@@ -375,5 +375,241 @@ pub(super) async fn handle(
                 |out| out.vault_verify = Some(response),
             )))
         }
+        HygieneOperation::Kernel => {
+            let spec = params
+                .0
+                .kernel
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "kernel"))?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_kernel(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_lodestar",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene kernel operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            // Health READS the persisted Kernel artifact (a CF read plus a JSON
+            // decode of the full kernel), so it is blocking IO and must not
+            // occupy a runtime worker serving MCP.
+            let response =
+                tokio::task::spawn_blocking(move || crate::m3::hygiene::run_kernel(&db, &spec))
+                    .await
+                    .map_err(|error| {
+                        facade_delegate_error(
+                            HYGIENE_TOOL,
+                            operation.as_str(),
+                            &source_id,
+                            HYGIENE_SOT,
+                            crate::m1::mcp_error(
+                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                format!("kernel health blocking task failed to join: {error}"),
+                            ),
+                            "inspect daemon logs; the kernel-health task terminated abnormally",
+                        )
+                    })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "kernel_id={} trust={} size={} recall_ratio={:.4} min_recall_ratio={:.4} pass_mode={} grounded_fraction={:.4} artifact_bytes={}",
+                    response.kernel_id,
+                    response.trust,
+                    response.size,
+                    response.recall_ratio,
+                    response.min_recall_ratio,
+                    response.recall_pass_mode,
+                    response.grounded_fraction,
+                    response.artifact_bytes
+                ),
+                |out| out.kernel = Some(response),
+            )))
+        }
+        HygieneOperation::KernelRebuild => {
+            let spec = params
+                .0
+                .kernel_rebuild
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "kernel_rebuild"))?;
+            // The rebuild persists Kernel artifacts: maintenance-gated exactly
+            // like the other mutating hygiene operations. This gate is also what
+            // keeps kernel selection off any latency-critical caller — the pass
+            // is minutes of MFVS + recall measurement per domain and the Calyx
+            // layer asserts a cold context (#1686) underneath it.
+            require_maintenance_profile(
+                service,
+                &request_context,
+                HYGIENE_TOOL,
+                operation.as_str(),
+                &format!("panel_{}", spec.panel_version),
+                HYGIENE_SOT,
+            )?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_kernel_rebuild(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_lodestar",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene kernel_rebuild operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::hygiene::run_kernel_rebuild(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("kernel rebuild blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the kernel-rebuild task terminated abnormally",
+                )
+            })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "domains_discovered={} domains_built={} domains_refused={} all_domains_grounded={} artifacts_persisted={} kernel_cf_rows_after={}",
+                    response.domains_discovered,
+                    response.domains_built,
+                    response.domains_refused,
+                    response.all_domains_grounded,
+                    response.artifacts_persisted,
+                    response.kernel_cf_rows_after
+                ),
+                |out| out.kernel_rebuild = Some(response),
+            )))
+        }
+        HygieneOperation::GuardCalibrate => {
+            let spec = params
+                .0
+                .guard_calibrate
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "guard_calibrate"))?;
+            if spec.persist.unwrap_or(true) {
+                // A persisted profile changes what every profile-backed guarded
+                // search will admit from then on: maintenance-gated.
+                require_maintenance_profile(
+                    service,
+                    &request_context,
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &format!("panel_{}", spec.panel_version),
+                    HYGIENE_SOT,
+                )?;
+            }
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_guard_calibrate(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_ward",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene guard_calibrate operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::hygiene::run_guard_calibrate(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("guard calibration blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the guard-calibration task terminated abnormally",
+                )
+            })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "guard_id={} adjudicated_good={} adjudicated_bad={} unadjudicated={} slots={} persisted={} readback_calibrated={} guard_cf_profile_bytes={}",
+                    response.guard_id,
+                    response.adjudicated_good,
+                    response.adjudicated_bad,
+                    response.unadjudicated,
+                    response.slots.len(),
+                    response.persisted,
+                    response.readback_calibrated,
+                    response.guard_cf_profile_bytes
+                ),
+                |out| out.guard_calibrate = Some(response),
+            )))
+        }
+        HygieneOperation::GuardVerify => {
+            let spec = params
+                .0
+                .guard_verify
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "guard_verify"))?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_guard_verify(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_ward",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the hygiene guard_verify operation",
+                )
+            })?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::hygiene::run_guard_verify(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("guard verification blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the guard-verification task terminated abnormally",
+                )
+            })??;
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "guard_id={} overall_pass={} provisional={} policy={} required_slots={} failing_slots={} trusted_exemplars={}",
+                    response.guard_id,
+                    response.overall_pass,
+                    response.provisional,
+                    response.policy,
+                    response.required_slots.len(),
+                    response.failing_slots.len(),
+                    response.trusted_exemplars
+                ),
+                |out| out.guard_verify = Some(response),
+            )))
+        }
     }
 }

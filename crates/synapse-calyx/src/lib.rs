@@ -9,10 +9,12 @@ pub use error_bridge::SYNAPSE_CALYX_BACKPRESSURE;
 mod find;
 mod grounding;
 mod intelligence;
+pub mod kernel_maintenance;
 pub mod lineage;
 pub mod lowering;
 mod math;
 pub mod vault_runtime;
+pub mod ward;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -65,8 +67,19 @@ use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
 };
 use fs2::FileExt as _;
+pub use kernel_maintenance::{
+    SYNAPSE_KERNEL_MAX_DOMAINS, SynapseCalyxKernelDomainOutcome, SynapseCalyxKernelHealthReport,
+    SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport, VaultKernelArtifactStore,
+};
 pub use lineage::{
     ACKNOWLEDGE_RESET_ENV, SynapseCalyxVaultLineage, VaultLineageGeneration, lineage_path,
+};
+pub use ward::{
+    SYNAPSE_GUARD_DEFAULT_ALPHA, SYNAPSE_GUARD_DEFAULT_PROFILE_KEY, SYNAPSE_GUARD_MIN_GOOD_SCORES,
+    SynapseCalyxGuardAspect, SynapseCalyxGuardCalibrateParams, SynapseCalyxGuardCalibrateReport,
+    SynapseCalyxGuardSlotCalibration, SynapseCalyxGuardSlotSpec, SynapseCalyxGuardSlotVerdict,
+    SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport, clopper_pearson_tail,
+    min_certifiable_bad_scores,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};

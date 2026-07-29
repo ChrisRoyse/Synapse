@@ -69,6 +69,10 @@ pub(super) fn hygiene_response(
         blind_spot: None,
         drift: None,
         vault_verify: None,
+        kernel: None,
+        kernel_rebuild: None,
+        guard_calibrate: None,
+        guard_verify: None,
     };
     fill(&mut response);
     response
