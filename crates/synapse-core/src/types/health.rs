@@ -412,9 +412,32 @@ pub struct CalyxHotPathBoundaryHealth {
     /// Wall-clock time of the most recent violation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_violation_unix_ms: Option<u64>,
-    /// Structured code emitted on violation.
+    /// Structured code carried by the most recent violation.
+    ///
+    /// Present **only** when `violations_total > 0`. It names an observation
+    /// that happened, not a label this subsystem always wears: emitting a
+    /// violation code alongside `violations_total = 0` reads to any operator or
+    /// scraper as "a violation occurred", which is the same constant-that-looks-
+    /// like-a-measurement defect as #1883/#1884/#1886.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub violation_code: Option<String>,
+    /// Whether the reflex scheduler (and therefore the tick thread) exists.
+    ///
+    /// This is what makes `tick_thread_tagged = false` interpretable: `false`
+    /// here means there is nothing to tag, not that the tagging is broken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_started: Option<bool>,
+    /// Structured code naming why the `artifact_*` / `refresher_*` group could
+    /// not be computed. Present exactly when that group is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_unavailable_code: Option<String>,
+    /// Why the `artifact_*` / `refresher_*` group could not be computed, with
+    /// the remediation that would make it computable.
+    ///
+    /// An absent field and a field that cannot be computed are different facts,
+    /// so the second one is stated rather than left to inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_unavailable_reason: Option<String>,
     /// Absolute path of the lowered guard-threshold artifact the tick consumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,

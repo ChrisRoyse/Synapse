@@ -122,6 +122,88 @@ fn runtime_lock_unavailable_health<T>(
     }
 }
 
+/// Why the reflex tick's lowered-artifact feed can or cannot be described
+/// (#1686).
+///
+/// The `artifact_*` / `refresher_*` group in `calyx_hot_path` is only
+/// computable once a reflex scheduler exists, because the feed is owned by the
+/// scheduler that reads it. Health must not silently omit that group: an absent
+/// field and a field that cannot be computed are different facts, and only the
+/// second one can be distinguished from "the mechanism is broken".
+enum LoweredFeedReadback {
+    Ready(Box<synapse_reflex::LoweredFeedSnapshot>),
+    RuntimeAbsent,
+    RuntimeLockBusy,
+    SchedulerNotStarted,
+}
+
+impl LoweredFeedReadback {
+    fn snapshot(&self) -> Option<&synapse_reflex::LoweredFeedSnapshot> {
+        match self {
+            Self::Ready(snapshot) => Some(snapshot),
+            Self::RuntimeAbsent | Self::RuntimeLockBusy | Self::SchedulerNotStarted => None,
+        }
+    }
+
+    const fn unavailable_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Ready(_) => None,
+            Self::RuntimeAbsent => Some("REFLEX_RUNTIME_NOT_INITIALIZED"),
+            Self::RuntimeLockBusy => Some("REFLEX_RUNTIME_LOCK_BUSY"),
+            Self::SchedulerNotStarted => Some("REFLEX_SCHEDULER_NOT_STARTED"),
+        }
+    }
+
+    fn unavailable_reason(&self) -> Option<String> {
+        let reason = match self {
+            Self::Ready(_) => return None,
+            Self::RuntimeAbsent => {
+                "the reflex runtime has not been created, so there is no tick thread and no \
+                 lowered-artifact feed to describe; the runtime initializes on the first reflex \
+                 tool call"
+            }
+            Self::RuntimeLockBusy => {
+                "the reflex runtime lock is busy and health is fail-closed rather than waiting \
+                 behind in-flight work; retry health to read the lowered-artifact feed"
+            }
+            Self::SchedulerNotStarted => {
+                "no reflex is registered, so the scheduler thread does not exist: \
+                 tick_thread_tagged=false and hot_ticks_total=0 mean there is nothing to tag, not \
+                 that tagging is broken. Register one through the public facade \
+                 `routine operation=reflex_register` (requires a WRITE_REFLEX grant) to start the \
+                 tick and populate the artifact_* fields"
+            }
+        };
+        Some(reason.to_owned())
+    }
+}
+
+/// The violation code to report, derived from whether one was actually
+/// recorded.
+///
+/// Deliberately a function rather than an inline `Some(CONST)`: the code is a
+/// property of an observed violation, and routing it through one place makes
+/// "emit the label unconditionally" a change someone has to make on purpose.
+fn violation_code_for(last_violation: Option<&synapse_reflex::HotPathViolation>) -> Option<String> {
+    last_violation.map(|_observed| synapse_reflex::HOT_PATH_BOUNDARY_VIOLATION_CODE.to_owned())
+}
+
+fn lowered_feed_readback(
+    reflex_runtime: Option<&std::sync::Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>>,
+) -> LoweredFeedReadback {
+    let Some(runtime) = reflex_runtime else {
+        return LoweredFeedReadback::RuntimeAbsent;
+    };
+    let Ok(runtime) = runtime.try_lock() else {
+        return LoweredFeedReadback::RuntimeLockBusy;
+    };
+    runtime
+        .lowered_guard_thresholds_snapshot()
+        .map_or(LoweredFeedReadback::SchedulerNotStarted, |snapshot| {
+            LoweredFeedReadback::Ready(Box::new(snapshot))
+        })
+}
+
 fn storage_pressure_status(level: synapse_storage::DiskPressureLevel) -> String {
     match level {
         synapse_storage::DiskPressureLevel::Normal => "ok",
@@ -592,27 +674,29 @@ impl SynapseService {
         let violations_total = synapse_reflex::hot_path::violations_total();
         let last_violation = synapse_reflex::hot_path::last_violation();
         let publish = synapse_storage::maintenance::lowering_publish_readback();
-        let feed = match self.m3_state.try_lock() {
-            Ok(state) => state.reflex_runtime.as_ref().and_then(|runtime| {
-                runtime
-                    .try_lock()
-                    .ok()
-                    .and_then(|runtime| runtime.lowered_guard_thresholds_snapshot())
-            }),
+        let readback = match self.m3_state.try_lock() {
+            Ok(state) => lowered_feed_readback(state.reflex_runtime.as_ref()),
             Err(error) => return state_lock_unavailable_health("M3", error),
         };
+        let feed = readback.snapshot();
 
         let mut boundary = synapse_core::CalyxHotPathBoundaryHealth {
             tick_thread_tagged: Some(synapse_reflex::hot_path::tick_thread_tagged()),
             hot_ticks_total: Some(synapse_reflex::hot_path::hot_ticks_total()),
             violations_total: Some(violations_total),
-            violation_code: Some(synapse_reflex::HOT_PATH_BOUNDARY_VIOLATION_CODE.to_owned()),
+            // Only an observed violation gets a violation code. A constant label
+            // beside `violations_total = 0` would announce an event that never
+            // happened.
+            violation_code: violation_code_for(last_violation.as_ref()),
             last_violation_operation: last_violation
                 .as_ref()
                 .map(|violation| violation.operation.clone()),
             last_violation_unix_ms: last_violation
                 .as_ref()
                 .map(|violation| violation.at_unix_ms),
+            scheduler_started: Some(feed.is_some()),
+            feed_unavailable_code: readback.unavailable_code().map(str::to_owned),
+            feed_unavailable_reason: readback.unavailable_reason(),
             publish_attempts_total: Some(publish.attempts_total),
             publish_success_total: Some(publish.success_total),
             publish_failure_total: Some(publish.failure_total),
@@ -623,7 +707,7 @@ impl SynapseService {
             publish_last_error: publish.last_error.clone(),
             ..synapse_core::CalyxHotPathBoundaryHealth::default()
         };
-        if let Some(feed) = &feed {
+        if let Some(feed) = feed {
             boundary.artifact_state = Some(feed.state.to_owned());
             boundary.artifact_safe_default_code = feed.safe_default_code.clone();
             boundary.artifact_safe_default_detail = feed.safe_default_detail.clone();
@@ -649,7 +733,6 @@ impl SynapseService {
         // The published file is hashed here, in health, so `Get-FileHash` on the
         // same path is a direct comparison an operator can make by hand.
         let artifact_path = feed
-            .as_ref()
             .and_then(|feed| feed.artifact_path.clone())
             .or_else(|| publish.last_path.clone());
         if let Some(path) = artifact_path.as_ref() {
@@ -695,8 +778,8 @@ impl SynapseService {
         // defaults, and calling that an error would cry wolf on every fresh
         // start for a whole maintenance cadence.
         let pending_first_publish =
-            feed.as_ref().is_some_and(|feed| feed.state != "fresh") && publish.success_total == 0;
-        if let Some(feed) = &feed
+            feed.is_some_and(|feed| feed.state != "fresh") && publish.success_total == 0;
+        if let Some(feed) = feed
             && feed.state != "fresh"
             && publish.success_total > 0
         {
@@ -707,21 +790,24 @@ impl SynapseService {
                 feed.safe_default_detail.as_deref().unwrap_or("unknown")
             ));
         }
-        let status = if !reasons.is_empty() {
-            "error"
-        } else if feed.is_none() {
-            "initializing"
-        } else if pending_first_publish {
-            "pending_lowering"
-        } else {
-            "ok"
+        // `no_tick_thread` is deliberately not `initializing`: nothing resolves
+        // it on its own. There is no tick until a reflex is registered, and an
+        // operator reading "initializing" would wait for a state that never
+        // arrives.
+        let status = match () {
+            () if !reasons.is_empty() => "error",
+            () if matches!(readback, LoweredFeedReadback::SchedulerNotStarted) => "no_tick_thread",
+            () if feed.is_none() => "initializing",
+            () if pending_first_publish => "pending_lowering",
+            () => "ok",
         };
         let detail = if reasons.is_empty() {
-            feed.as_ref().map_or_else(
+            feed.map_or_else(
                 || {
-                    "reflex runtime has not started; the hot-path boundary reports once a tick \
-                     thread exists"
-                        .to_owned()
+                    readback.unavailable_reason().unwrap_or_else(|| {
+                        "the lowered-artifact feed is unavailable for an unrecorded reason"
+                            .to_owned()
+                    })
                 },
                 |feed| {
                     format!(
@@ -1717,5 +1803,87 @@ const fn backend_config_name(backend: Backend) -> &'static str {
         Backend::Vigem => "vigem",
         Backend::Hardware => "hardware",
         Backend::Auto => "auto",
+    }
+}
+
+#[cfg(test)]
+mod calyx_hot_path_tests {
+    use super::LoweredFeedReadback;
+
+    /// A violation code must describe an observation, never decorate a clean
+    /// reading.
+    ///
+    /// Health previously emitted `violations_total = 0` and
+    /// `violation_code = "SYNAPSE_CALYX_HOT_PATH_BOUNDARY_VIOLATION"` together,
+    /// which reads to an operator or a scraper as "a boundary violation
+    /// occurred". This pins the rule that produced that bug so it cannot come
+    /// back: the code is derived from the recorded violation, not from a
+    /// constant.
+    #[test]
+    fn a_violation_code_is_only_emitted_for_an_observed_violation() {
+        assert_eq!(
+            super::violation_code_for(None),
+            None,
+            "no recorded violation must yield no violation code"
+        );
+
+        let observed = synapse_reflex::HotPathViolation {
+            operation: "reflex_write_audit".to_owned(),
+            at_unix_ms: 1,
+        };
+        assert_eq!(
+            super::violation_code_for(Some(&observed)),
+            Some(synapse_reflex::HOT_PATH_BOUNDARY_VIOLATION_CODE.to_owned())
+        );
+    }
+
+    /// Every state in which the artifact group cannot be computed must name
+    /// itself.
+    ///
+    /// An omitted field and a field that cannot be computed are different
+    /// facts. Only the second one lets an operator tell "there is nothing to
+    /// measure yet" apart from "the measurement is broken", which is exactly
+    /// the distinction a `tick_thread_tagged = false` reading turns on.
+    #[test]
+    fn every_unavailable_feed_state_names_its_condition() {
+        for readback in [
+            LoweredFeedReadback::RuntimeAbsent,
+            LoweredFeedReadback::RuntimeLockBusy,
+            LoweredFeedReadback::SchedulerNotStarted,
+        ] {
+            assert!(readback.snapshot().is_none());
+            let code = readback
+                .unavailable_code()
+                .expect("an unavailable feed must carry a structured code");
+            let reason = readback
+                .unavailable_reason()
+                .expect("an unavailable feed must carry a human reason");
+            assert!(!code.is_empty(), "{code} must not be blank");
+            assert!(
+                reason.len() > 40,
+                "{code} reason must state the condition and its remediation, got {reason:?}"
+            );
+        }
+    }
+
+    /// The scheduler-not-started reason must point at the supported surface.
+    ///
+    /// `reflex_register` is an implementation tool with no MCP surface at any
+    /// profile; the only reachable path is the `routine` public facade. Health
+    /// has to say so, or an operator hunting for a way to start the tick
+    /// concludes there is none.
+    #[test]
+    fn the_scheduler_not_started_reason_names_the_reachable_trigger() {
+        let reason = LoweredFeedReadback::SchedulerNotStarted
+            .unavailable_reason()
+            .expect("scheduler-not-started must carry a reason");
+        assert!(
+            reason.contains("routine operation=reflex_register"),
+            "reason must name the public facade that starts a tick, got {reason:?}"
+        );
+        assert!(
+            reason.contains("nothing to tag"),
+            "reason must separate 'nothing to tag' from 'tagging is broken', got {reason:?}"
+        );
     }
 }
