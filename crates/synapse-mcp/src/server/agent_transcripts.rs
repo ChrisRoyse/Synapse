@@ -884,6 +884,10 @@ pub(crate) struct SpawnIngestOutcome {
     pub deferred_for_pressure: bool,
     pub skipped: bool,
     pub cancelled: bool,
+    /// The spawn was parked on a *terminal* condition: no operator action can
+    /// make it ingestible, so it is reported once and never counted as a
+    /// retryable ingest error (#1879).
+    pub terminally_parked: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1263,6 +1267,44 @@ struct SpawnManifestSeed {
     created_unix_ms: Option<u64>,
 }
 
+/// Unix-ms instant at which `act_spawn_agent` began writing a spawn manifest
+/// into every spawn directory (commit `a0bde113`, 2026-06-13, issue #949).
+///
+/// A spawn directory whose UUIDv7 identity was minted before this instant was
+/// created by a daemon that never wrote a manifest at all. Its launch-time
+/// facts — the pinned model, the approval-gate contract, the template
+/// provenance — were never recorded anywhere and cannot be reconstructed by
+/// any operator action. Such a spawn is terminally un-ingestible, and saying so
+/// once is honest; raising a retryable ERROR whose remediation is "restore the
+/// launch-time spawn manifest" is not (#1879).
+const AGENT_SPAWN_MANIFEST_CONTRACT_EPOCH_UNIX_MS: u64 = 1_781_344_075_000;
+
+/// Distinct terminal code for a spawn that predates the manifest contract.
+const TRANSCRIPT_SPAWN_PRE_MANIFEST_UNINGESTIBLE: &str =
+    "TRANSCRIPT_SPAWN_PRE_MANIFEST_UNINGESTIBLE";
+
+/// Decodes the launch instant embedded in a spawn id's UUIDv7 identity.
+///
+/// `act_spawn_agent` mints `agent-spawn-<uuidv7>`, and RFC 9562 §5.7 puts a
+/// big-endian 48-bit Unix-millisecond timestamp in the first six octets. That
+/// makes the directory name itself physical evidence of when the spawn was
+/// launched, independent of any file inside it (whose mtimes were rewritten by
+/// later orphan-recovery sweeps).
+fn spawn_id_launch_unix_ms(spawn_id: &str) -> Option<u64> {
+    let uuid = spawn_id.strip_prefix("agent-spawn-")?;
+    let hex: String = uuid.chars().filter(|ch| *ch != '-').take(12).collect();
+    if hex.len() != 12 {
+        return None;
+    }
+    u64::from_str_radix(&hex, 16).ok()
+}
+
+/// True when this spawn directory provably predates the manifest contract.
+fn spawn_predates_manifest_contract(spawn_id: &str) -> bool {
+    spawn_id_launch_unix_ms(spawn_id)
+        .is_some_and(|launched| launched < AGENT_SPAWN_MANIFEST_CONTRACT_EPOCH_UNIX_MS)
+}
+
 /// Reads stable spawn metadata recorded at launch.
 ///
 /// `model` is the authoritative model seed for Codex spawns, whose stream may
@@ -1271,13 +1313,20 @@ struct SpawnManifestSeed {
 /// Missing, unreadable, or malformed launch metadata is fatal and parked on
 /// the cursor. Ingestion must not silently substitute guessed identity/time
 /// seeds when the spawn owner promised an authoritative manifest.
-fn read_spawn_manifest_seed(log_dir: &Path) -> Result<SpawnManifestSeed, String> {
+fn read_spawn_manifest_seed(log_dir: &Path, spawn_id: &str) -> Result<SpawnManifestSeed, String> {
     let path = log_dir.join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if spawn_predates_manifest_contract(spawn_id) {
+                return Err(format!(
+                    "{TRANSCRIPT_SPAWN_PRE_MANIFEST_UNINGESTIBLE}: path={} spawn_launched_unix_ms={} manifest_contract_epoch_unix_ms={AGENT_SPAWN_MANIFEST_CONTRACT_EPOCH_UNIX_MS}; this spawn was launched before act_spawn_agent wrote spawn manifests, so its launch-time model/approval-gate/template facts were never recorded anywhere and no operator action can restore them; remediation=none — the transcript is permanently un-ingestible and the spawn directory may be deleted once its stdout.jsonl is no longer wanted as a raw artifact",
+                    path.display(),
+                    spawn_id_launch_unix_ms(spawn_id).unwrap_or(0)
+                ));
+            }
             return Err(format!(
-                "TRANSCRIPT_SPAWN_MANIFEST_MISSING: path={}; remediation=restore the launch-time spawn manifest before ingesting the transcript",
+                "TRANSCRIPT_SPAWN_MANIFEST_MISSING: path={}; the spawn directory and its manifest are published as one atomic rename, so a published directory without a manifest means the manifest was deleted after launch; remediation=restore the exact launch-time spawn manifest from backup, or delete the spawn directory if the transcript is not wanted",
                 path.display()
             ));
         }
@@ -1300,22 +1349,33 @@ fn read_spawn_manifest_seed(log_dir: &Path) -> Result<SpawnManifestSeed, String>
             path.display()
         )
     })?;
-    let model = manifest
-        .get("model")
-        .and_then(Value::as_str)
+    // An explicit JSON `null` is the identical statement to omitting the key:
+    // "the operator pinned no model". `act_spawn_agent` omits absent optionals
+    // today, but until commit `0ffcf54d` (2026-07-23) it serialized them as
+    // `null`, and rejecting those manifests made every unpinned spawn from
+    // before that date permanently un-ingestible — 75 of the 106 transcript
+    // ingest failures measured on this host (#1879). Reading `null` as absent
+    // loses no information and guesses nothing; a present-but-wrong-typed or
+    // empty-string value is still rejected, because that IS corruption.
+    let model_field = object.get("model").filter(|value| !value.is_null());
+    let model = model_field
+        .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned);
-    let created_unix_ms = manifest.get("created_unix_ms").and_then(Value::as_u64);
-    if object.contains_key("model") && model.is_none() {
+    let created_field = object
+        .get("created_unix_ms")
+        .filter(|value| !value.is_null());
+    let created_unix_ms = created_field.and_then(|value| value.as_u64());
+    if model_field.is_some() && model.is_none() {
         return Err(format!(
-            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} model must be a non-empty string when present; remediation=repair the manifest from the spawn launch SoT",
+            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} model must be a non-empty string or null when present; remediation=repair the manifest from the spawn launch SoT",
             path.display()
         ));
     }
-    if object.contains_key("created_unix_ms") && created_unix_ms.is_none() {
+    if created_field.is_some() && created_unix_ms.is_none() {
         return Err(format!(
-            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} created_unix_ms must be an unsigned integer when present; remediation=repair the manifest from the spawn launch SoT",
+            "TRANSCRIPT_SPAWN_MANIFEST_INVALID: path={} created_unix_ms must be an unsigned integer or null when present; remediation=repair the manifest from the spawn launch SoT",
             path.display()
         ));
     }
@@ -1478,6 +1538,41 @@ fn stick_cursor_error(
     detail
 }
 
+/// Parks a spawn on a condition that is terminal rather than faulty: the
+/// transcript can never be ingested and no remediation exists.
+///
+/// Deliberately not an ERROR and deliberately not counted in
+/// `INGEST_ERRORS_TOTAL`. A permanently un-ingestible historical artifact that
+/// re-raises an ERROR on every fresh cursor teaches operators to filter the
+/// whole ingest subsystem out of their logs, which is exactly how a real
+/// ingest fault would then be missed (#1879).
+fn park_cursor_terminal(
+    db: &Db,
+    cursor: &mut TranscriptCursor,
+    cursor_revision_sha256: &mut Option<[u8; 32]>,
+    code: &'static str,
+    detail: String,
+) {
+    tracing::warn!(
+        code,
+        spawn_id = %cursor.spawn_id,
+        source_path = %cursor.source_path,
+        detail = %detail,
+        terminal = true,
+        "transcript ingestion parked a spawn permanently; this is terminal, not a retryable failure"
+    );
+    cursor.error = Some(detail);
+    cursor.updated_ts_ns = unix_time_ns_now();
+    if let Err(store_error) = store_cursor(db, cursor, cursor_revision_sha256) {
+        tracing::error!(
+            code = "TRANSCRIPT_INGEST_ERROR",
+            spawn_id = %cursor.spawn_id,
+            detail = %store_error,
+            "failed to persist the terminal cursor park itself"
+        );
+    }
+}
+
 /// True when `completion-status.json` exists with a terminal status.
 fn completion_is_terminal(log_dir: &Path) -> Result<bool, String> {
     let path = log_dir.join("completion-status.json");
@@ -1540,9 +1635,10 @@ fn ingest_spawn_dir_once_with_cancel(
     let mut cursor = match loaded.cursor {
         Some(cursor) => cursor,
         None => {
-            let manifest_seed = match read_spawn_manifest_seed(log_dir) {
+            let manifest_seed = match read_spawn_manifest_seed(log_dir, spawn_id) {
                 Ok(seed) => seed,
                 Err(detail) => {
+                    let terminal = detail.starts_with(TRANSCRIPT_SPAWN_PRE_MANIFEST_UNINGESTIBLE);
                     let mut cursor = TranscriptCursor {
                         record_version: TRANSCRIPT_CURSOR_VERSION,
                         spawn_id: spawn_id.to_owned(),
@@ -1569,6 +1665,20 @@ fn ingest_spawn_dir_once_with_cancel(
                         error: None,
                         updated_ts_ns: unix_time_ns_now(),
                     };
+                    if terminal {
+                        park_cursor_terminal(
+                            db,
+                            &mut cursor,
+                            &mut cursor_revision_sha256,
+                            TRANSCRIPT_SPAWN_PRE_MANIFEST_UNINGESTIBLE,
+                            detail,
+                        );
+                        return Ok(SpawnIngestOutcome {
+                            skipped: true,
+                            terminally_parked: true,
+                            ..SpawnIngestOutcome::default()
+                        });
+                    }
                     return Err(stick_cursor_error(
                         db,
                         &mut cursor,
@@ -2352,6 +2462,7 @@ fn ingest_all_spawn_dirs_once_with_cancel(
     let mut new_rows = 0_u64;
     let mut completed = 0_u64;
     let mut errors = 0_u64;
+    let mut terminally_parked = 0_u64;
     let mut deferred = 0_u64;
     let mut cancelled = false;
     let entries = match std::fs::read_dir(root) {
@@ -2460,6 +2571,9 @@ fn ingest_all_spawn_dirs_once_with_cancel(
                 if outcome.source_complete && !outcome.skipped {
                     completed += 1;
                 }
+                if outcome.terminally_parked {
+                    terminally_parked += 1;
+                }
                 if outcome.deferred_for_pressure {
                     deferred += 1;
                 }
@@ -2486,6 +2600,7 @@ fn ingest_all_spawn_dirs_once_with_cancel(
         "new_rows": new_rows,
         "sources_completed": completed,
         "errors": errors,
+        "terminally_parked": terminally_parked,
         "pressure_deferred": deferred,
         "cancelled": cancelled,
     });
@@ -2501,13 +2616,14 @@ fn ingest_all_spawn_dirs_once_with_cancel(
         );
         return summary;
     }
-    if new_rows > 0 || completed > 0 || errors > 0 || deferred > 0 {
+    if new_rows > 0 || completed > 0 || errors > 0 || deferred > 0 || terminally_parked > 0 {
         tracing::info!(
             code = "TRANSCRIPT_INGEST_CYCLE_OK",
             dirs_seen,
             new_rows,
             sources_completed = completed,
             errors,
+            terminally_parked,
             pressure_deferred = deferred,
             "transcript ingest cycle finished"
         );

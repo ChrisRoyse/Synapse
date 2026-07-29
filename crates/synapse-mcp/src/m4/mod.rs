@@ -90,6 +90,11 @@ const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const SHELL_ENV_DAEMON_STALE: &str = "SYNAPSE_SHELL_ENV_DAEMON_STALE";
 const SHELL_ENV_DURABLE_MISSING: &str = "SYNAPSE_SHELL_ENV_DURABLE_MISSING";
 const SHELL_ENV_DURABLE_INVALID: &str = "SYNAPSE_SHELL_ENV_DURABLE_INVALID";
+/// `CUDA_PATH` is absent from durable Windows environment *and* NVML proved
+/// this host has no CUDA device, so the absence is the correct state rather
+/// than a broken install (#1881). Reported at INFO with the device evidence.
+const SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE: &str =
+    "SYNAPSE_SHELL_ENV_CUDA_PATH_ABSENT_NO_CUDA_DEVICE";
 const WINDOWS_DURABLE_ENV_OVERRIDE_KEYS: [&str; 6] = [
     "CUDA_PATH",
     "CUDA_PATH_V13_3",
@@ -11986,16 +11991,26 @@ fn configured_host_environment_diagnostics(
             .as_ref()
             .is_none_or(|durable| durable.value.trim().is_empty());
         if durable_missing && (key.eq_ignore_ascii_case("CUDA_PATH") || process_value.is_some()) {
+            // #1881: a missing CUDA_PATH is only a broken install when this
+            // host can actually run CUDA. Gate the severity on the same NVML
+            // device probe the Calyx math backend uses to justify selecting
+            // the CPU runtime, so both subsystems classify the host from one
+            // piece of physical evidence instead of two guesses.
+            let (diagnostic_code, severity) = if key.eq_ignore_ascii_case("CUDA_PATH") {
+                if synapse_calyx::host_cuda_device_probe().device_absent_proven {
+                    (SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE, "info")
+                } else {
+                    (SHELL_ENV_DURABLE_MISSING, "error")
+                }
+            } else {
+                (SHELL_ENV_DURABLE_MISSING, "warning")
+            };
             diagnostics.push(configured_host_environment_diagnostic(
                 key,
                 env,
                 requested_env,
-                SHELL_ENV_DURABLE_MISSING,
-                if key.eq_ignore_ascii_case("CUDA_PATH") {
-                    "error"
-                } else {
-                    "warning"
-                },
+                diagnostic_code,
+                severity,
             ));
             continue;
         }
@@ -12090,6 +12105,10 @@ fn shell_environment_diagnostic_remediation(diagnostic_code: &str, key: &str) ->
         SHELL_ENV_DURABLE_MISSING => format!(
             "{key} is absent from durable Windows environment. Run scripts\\synapse-setup.ps1 or set the real HKCU/HKLM environment value, then verify the registry Source of Truth before retrying CUDA-relevant shell work."
         ),
+        SHELL_ENV_DURABLE_ABSENT_NO_CUDA_DEVICE => format!(
+            "{key} is absent from durable Windows environment BECAUSE this host has no CUDA device, which is the correct state and needs no action. NVML evidence: {}. Installing the CUDA toolkit here would not make CUDA usable; the Calyx math backend independently selects the CPU runtime on this same probe (SYNAPSE_CALYX_MATH_AUTO_CPU_NO_CUDA_DEVICE). If an NVIDIA GPU is later installed, this diagnostic returns to {SHELL_ENV_DURABLE_MISSING} at error severity on its own.",
+            synapse_calyx::host_cuda_device_probe().basis
+        ),
         SHELL_ENV_DURABLE_INVALID => format!(
             "{key} does not resolve to a CUDA root containing bin\\nvcc.exe. Set the durable HKCU/HKLM value to the installed CUDA root, then verify that bin\\nvcc.exe exists before retrying CUDA-relevant shell work."
         ),
@@ -12108,6 +12127,24 @@ fn log_shell_environment_diagnostics(diagnostics: &[ActRunShellEnvironmentDiagno
                 durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
                 effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
                 source_of_truth = %diagnostic.source_of_truth,
+                remediation = %diagnostic.remediation,
+                "act_run_shell configured-host environment diagnostic"
+            );
+        } else if diagnostic.severity == "info" {
+            // #1881: the observation is real and still reported, but it is not
+            // a fault. It carries the NVML verdict that makes it correct.
+            let probe = synapse_calyx::host_cuda_device_probe();
+            tracing::info!(
+                code = %diagnostic.diagnostic_code,
+                variable = %diagnostic.variable,
+                daemon_pid = diagnostic.daemon_pid,
+                process_value = diagnostic.process_value.as_deref().unwrap_or("<missing>"),
+                durable_value = diagnostic.durable_value.as_deref().unwrap_or("<missing>"),
+                effective_value = diagnostic.effective_value.as_deref().unwrap_or("<missing>"),
+                source_of_truth = %diagnostic.source_of_truth,
+                host_cuda_probe_code = probe.code,
+                host_cuda_device_absent_proven = probe.device_absent_proven,
+                host_cuda_probe_basis = %probe.basis,
                 remediation = %diagnostic.remediation,
                 "act_run_shell configured-host environment diagnostic"
             );

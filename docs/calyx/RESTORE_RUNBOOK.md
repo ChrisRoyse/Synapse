@@ -337,12 +337,26 @@ chain is intact, but the journal attests nothing before this open, so the vault
 cannot claim its full history.
 
 Practical note: `covers_full_history` is `true` only for
-`chain_origin="vault-genesis"`, and **no code path currently writes that
-origin** — a generation is created either by seeding (`lineage-seeded`) or by an
-acknowledged reset (`reset-acknowledged` → `post-reset`). So on any vault alive
-today `covers_full_history=false` is the expected steady state, not a symptom.
-Do not treat it as an alarm; `hygiene operation=vault_verify` deliberately
-excludes it from its green predicate for exactly this reason (§8).
+`chain_origin="vault-genesis"`. Since #1884 that origin is reachable and is
+recorded at the vault's own creation: when a vault open both mints
+`vault-identity.json` (nothing existed before it) **and** finds `latest_seq=0`,
+the journal is written with `started_reason="vault-genesis"` and
+`SYNAPSE_CALYX_VAULT_LINEAGE_GENESIS_RECORDED` is logged at info. A vault
+created that way reports `covers_full_history=true` for its whole life, until an
+acknowledged reset flips it to `post-reset`/`false`.
+
+`chain_origin="lineage-seeded"` now means what it says: the journal was attached
+to a vault that already existed — a restored copy, or any vault predating the
+journal — so an unattested prefix genuinely precedes it and
+`covers_full_history=false` is a true statement about that vault, not a
+placeholder. Every vault created before #1884 is permanently `lineage-seeded`;
+that is correct, because the daemon never witnessed its genesis.
+
+(Before #1884 no code path wrote `vault-genesis` at all, so the field was a
+constant `false` on every vault — including brand-new ones whose chain genuinely
+did cover their whole history. `hygiene operation=vault_verify` excludes it from
+its green predicate as a workaround for that bug; with the field now reporting a
+real property, that exclusion can be removed — see §8.)
 
 If you want the restored vault to be recognised as a *continuation* rather than a
 new lineage, copy `vault_lineage.json` from the backup target to

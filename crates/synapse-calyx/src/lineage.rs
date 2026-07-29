@@ -63,6 +63,28 @@ const LINEAGE_IO_REMEDIATION: &str = "the vault lineage journal is the only reco
      vault directory; repair or restore the exact file named in this error rather than deleting \
      it";
 
+/// Whether the caller is *creating* the vault on this open, or adopting one
+/// that already existed.
+///
+/// This is deliberately supplied by the caller rather than inferred inside the
+/// journal, because only the caller can know it. `PostgreSQL` follows the same
+/// rule: the cluster's `system_identifier` is *produced by `initdb`* — at the
+/// moment the cluster is created — and never reconstructed afterwards from the
+/// data directory's contents. A vault whose identity was minted by this very
+/// open, and which carries no durable sequences yet, has nothing before it that
+/// the journal could have missed; a vault the journal is merely being attached
+/// to does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultOpenGenesis {
+    /// This open minted `vault-identity.json` for a vault that did not exist
+    /// before. Combined with `latest_seq == 0`, the journal witnesses the
+    /// vault's entire life.
+    CreatedThisOpen,
+    /// The vault directory already carried an identity before this open. The
+    /// journal cannot attest anything that happened before it.
+    PreExisting,
+}
+
 /// One contiguous life of a vault directory: opened, written to, and (if it was
 /// replaced) superseded by the next generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,9 +127,11 @@ pub struct SynapseCalyxVaultLineage {
     pub generation: u64,
     /// Number of recorded replacements before this generation.
     pub reset_count: u64,
-    /// `lineage-seeded` (nothing is attested before this point),
-    /// `vault-genesis` (this journal saw the vault from its first open), or
-    /// `post-reset` (this chain begins after a recorded replacement).
+    /// `vault-genesis` (this journal was created together with the vault, at
+    /// `latest_seq == 0`, so it saw every sequence the vault ever held),
+    /// `lineage-seeded` (the journal was attached to a vault that already
+    /// existed, so an unattested prefix precedes it), or `post-reset` (this
+    /// chain begins after a recorded replacement).
     pub chain_origin: String,
     /// Durable sequence at which lineage tracking for this generation began.
     pub generation_origin_seq: u64,
@@ -121,8 +145,15 @@ pub struct SynapseCalyxVaultLineage {
 }
 
 impl SynapseCalyxVaultLineage {
-    /// True when the verified chain cannot be claimed to cover the vault's
-    /// whole history, because a replacement or an unattested prefix precedes it.
+    /// True when the verified chain can be claimed to cover the vault's whole
+    /// history: the journal was written at the vault's own genesis and no
+    /// replacement has been recorded since.
+    ///
+    /// Before #1884 this was a constant `false`: no code path ever wrote
+    /// `vault-genesis`, so the only reachable origins were `lineage-seeded`
+    /// and `post-reset`. A permanently-negative provenance field trains
+    /// operators to ignore it exactly when it starts telling the truth, which
+    /// is the failure mode #1875 exists to prevent.
     #[must_use]
     pub fn chain_covers_full_history(&self) -> bool {
         self.chain_origin == "vault-genesis"
@@ -158,6 +189,11 @@ fn canonical_dir_key(vault_dir: &Path) -> String {
 /// `now_unix_ms` is supplied by the caller so the vault's configured clock — not
 /// an ambient wall clock — stamps the journal.
 ///
+/// `genesis` records whether this open *created* the vault. It decides, once
+/// and permanently, whether the journal may later claim to cover the vault's
+/// full history; nothing observable after the fact can recover that answer,
+/// which is why it is recorded at creation rather than inferred (#1884).
+///
 /// # Errors
 ///
 /// Fails closed when the journal cannot be read/written/parsed, when it belongs
@@ -170,13 +206,24 @@ pub fn evaluate_and_record(
     latest_seq: u64,
     now_unix_ms: u64,
     acknowledgement: Option<&str>,
+    genesis: VaultOpenGenesis,
 ) -> Result<SynapseCalyxVaultLineage, SynapseCalyxError> {
     let path = lineage_path(vault_dir);
     let Some(mut disk) = read_lineage(&path)? else {
+        // Genesis is claimed only on the conjunction of two physical facts:
+        // this open minted the vault identity, AND the vault holds no durable
+        // sequences. Either alone is insufficient — an identity file restored
+        // beside populated column families would mint an id over real history.
+        let genesis_proven = genesis == VaultOpenGenesis::CreatedThisOpen && latest_seq == 0;
+        let started_reason = if genesis_proven {
+            "vault-genesis"
+        } else {
+            "lineage-seeded"
+        };
         let generation = VaultLineageGeneration {
             generation: 1,
             vault_id: vault_id.to_owned(),
-            started_reason: "lineage-seeded".to_owned(),
+            started_reason: started_reason.to_owned(),
             first_observed_unix_ms: now_unix_ms,
             last_observed_unix_ms: now_unix_ms,
             high_water_seq: latest_seq,
@@ -190,19 +237,33 @@ pub fn evaluate_and_record(
             generations: vec![generation],
         };
         write_lineage(&path, &disk)?;
-        tracing::warn!(
-            code = "SYNAPSE_CALYX_VAULT_LINEAGE_SEEDED",
-            vault_dir = %vault_dir.display(),
-            lineage_path = %path.display(),
-            vault_id,
-            latest_seq,
-            "seeded the vault lineage journal; nothing before this open is attested by it"
-        );
+        if genesis_proven {
+            tracing::info!(
+                code = "SYNAPSE_CALYX_VAULT_LINEAGE_GENESIS_RECORDED",
+                vault_dir = %vault_dir.display(),
+                lineage_path = %path.display(),
+                vault_id,
+                latest_seq,
+                "recorded the vault lineage journal at this vault's own genesis; the journal \
+                 attests every sequence this vault will ever hold"
+            );
+        } else {
+            tracing::warn!(
+                code = "SYNAPSE_CALYX_VAULT_LINEAGE_SEEDED",
+                vault_dir = %vault_dir.display(),
+                lineage_path = %path.display(),
+                vault_id,
+                latest_seq,
+                identity_created_this_open = genesis == VaultOpenGenesis::CreatedThisOpen,
+                "seeded the vault lineage journal over a pre-existing vault; nothing before this \
+                 open is attested by it"
+            );
+        }
         return Ok(SynapseCalyxVaultLineage {
             lineage_path: path,
             generation: 1,
             reset_count: 0,
-            chain_origin: "lineage-seeded".to_owned(),
+            chain_origin: started_reason.to_owned(),
             generation_origin_seq: latest_seq,
             predecessor_vault_id: None,
             predecessor_high_water_seq: None,

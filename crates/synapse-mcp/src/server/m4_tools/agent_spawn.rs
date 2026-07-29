@@ -1062,6 +1062,132 @@ pub(super) fn read_synapse_bearer_token() -> Result<String, ErrorData> {
     Ok(token)
 }
 
+/// Staging-name prefix for a spawn directory that has not been published yet.
+///
+/// Every spawn-root consumer (`recover_orphaned_agent_spawn_terminal_artifacts`
+/// here, and the transcript ingest scan in `server::agent_transcripts`) skips
+/// entries that do not start with `agent-spawn-`, so a staging directory is
+/// invisible to all of them until it is renamed into place.
+const AGENT_SPAWN_STAGING_PREFIX: &str = ".staging-";
+
+/// Creates the spawn directory and the manifest describing it as a single
+/// publish, and returns the published directory.
+///
+/// The directory is built under a staging name, the manifest is written and
+/// fsynced inside it, and only then is it renamed to `agent-spawn-<id>` within
+/// the same parent directory. Microsoft documents `MoveFileEx` as moving a
+/// directory together with its children, and a rename within one directory on
+/// NTFS is a single metadata operation — so the published name either appears
+/// with its manifest already inside or does not appear at all.
+///
+/// If anything fails before the rename, the staging directory is removed, so an
+/// interrupted spawn leaves neither a directory nor a manifest (#1879).
+fn publish_agent_spawn_dir_with_manifest(
+    root: &Path,
+    spawn_id: &str,
+    params: &ActSpawnAgentParams,
+    working_dir: &Path,
+) -> Result<PathBuf, ErrorData> {
+    let log_dir = root.join(spawn_id);
+    if log_dir.exists() {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent refuses to reuse the existing spawn directory {}: spawn ids are minted per launch, so an existing directory means a colliding or replayed spawn id",
+                log_dir.display()
+            ),
+        ));
+    }
+    // Encode the manifest before creating anything on disk: an encoding fault
+    // must not be able to leave a directory behind.
+    let manifest = build_spawn_manifest(spawn_id, params, working_dir)?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_spawn_agent failed to encode spawn manifest: {error}"),
+        )
+    })?;
+
+    fs::create_dir_all(root).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to create agent spawn root {}: {error}",
+                root.display()
+            ),
+        )
+    })?;
+    let staging_dir = root.join(format!("{AGENT_SPAWN_STAGING_PREFIX}{spawn_id}"));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "act_spawn_agent failed to clear the leftover spawn staging directory {}: {error}",
+                    staging_dir.display()
+                ),
+            )
+        })?;
+    }
+    fs::create_dir_all(&staging_dir).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to create the spawn staging directory {}: {error}",
+                staging_dir.display()
+            ),
+        )
+    })?;
+
+    let staged_manifest_path = staging_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
+    if let Err(error) = write_and_sync_file(&staged_manifest_path, &manifest_bytes) {
+        discard_agent_spawn_staging_dir(&staging_dir);
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to write the spawn manifest {}: {error}",
+                staged_manifest_path.display()
+            ),
+        ));
+    }
+    if let Err(error) = fs::rename(&staging_dir, &log_dir) {
+        discard_agent_spawn_staging_dir(&staging_dir);
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to publish the spawn directory {} from {}: {error}",
+                log_dir.display(),
+                staging_dir.display()
+            ),
+        ));
+    }
+    Ok(log_dir)
+}
+
+/// Writes `bytes` to `path` and flushes them to the device before returning, so
+/// a published spawn directory cannot contain a zero-length manifest.
+fn write_and_sync_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Removes an unpublished staging directory. Failure to clean up is logged
+/// rather than raised: the caller is already returning the real error, and a
+/// leftover `.staging-*` entry is invisible to every spawn-root consumer.
+fn discard_agent_spawn_staging_dir(staging_dir: &Path) {
+    if let Err(error) = fs::remove_dir_all(staging_dir) {
+        tracing::warn!(
+            code = "AGENT_SPAWN_STAGING_DISCARD_FAILED",
+            staging_dir = %staging_dir.display(),
+            detail = %error,
+            remediation = "remove the leftover .staging-* entry under the agent spawn root; it is skipped by orphan recovery and transcript ingest but occupies disk",
+            "act_spawn_agent could not remove an unpublished spawn staging directory"
+        );
+    }
+}
+
 pub(super) fn prepare_agent_spawn_files(
     spawn_id: &str,
     params: &ActSpawnAgentParams,
@@ -1069,16 +1195,11 @@ pub(super) fn prepare_agent_spawn_files(
 ) -> Result<AgentSpawnFiles, ErrorData> {
     let agent_kind = params.effective_cli()?;
     let root = agent_spawn_root_dir()?;
-    let log_dir = root.join(spawn_id);
-    fs::create_dir_all(&log_dir).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to create log directory {}: {error}",
-                log_dir.display()
-            ),
-        )
-    })?;
+    // The spawn directory and the manifest describing it are published as one
+    // step (#1879). Before this, the directory was created first and the
+    // manifest written tenth; any failure in between left a transcript
+    // directory that nothing described and that could never be ingested.
+    let log_dir = publish_agent_spawn_dir_with_manifest(&root, spawn_id, params, working_dir)?;
     let prompt_path = log_dir.join("prompt.txt");
     let stdout_path = log_dir.join("stdout.jsonl");
     let stderr_path = log_dir.join("stderr.log");
@@ -1206,28 +1327,6 @@ pub(super) fn prepare_agent_spawn_files(
             )
         })?;
     }
-
-    // Spawn manifest: the authoritative record of which CLI and (when the
-    // operator pinned one) which model this spawn was launched with. The
-    // transcript ingester reads it to attribute cost — indispensable for Codex,
-    // whose `exec --json` stream carries no model id (#949).
-    let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
-    let manifest = build_spawn_manifest(spawn_id, params, working_dir)?;
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_spawn_agent failed to encode spawn manifest: {error}"),
-        )
-    })?;
-    fs::write(&manifest_path, manifest_bytes).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to write spawn manifest {}: {error}",
-                manifest_path.display()
-            ),
-        )
-    })?;
 
     Ok(AgentSpawnFiles {
         log_dir,

@@ -8,6 +8,7 @@ mod error_bridge;
 pub use error_bridge::SYNAPSE_CALYX_BACKPRESSURE;
 mod find;
 mod grounding;
+pub mod host_cuda;
 mod intelligence;
 pub mod kernel_maintenance;
 pub mod lineage;
@@ -67,13 +68,18 @@ use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
 };
 use fs2::FileExt as _;
+pub use host_cuda::{SynapseCalyxHostCudaProbe, host_cuda_device_probe};
 pub use kernel_maintenance::{
     SYNAPSE_KERNEL_MAX_DOMAINS, SynapseCalyxKernelDomainOutcome, SynapseCalyxKernelHealthReport,
     SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport, VaultKernelArtifactStore,
 };
 pub use lineage::{
-    ACKNOWLEDGE_RESET_ENV, SynapseCalyxVaultLineage, VaultLineageGeneration, lineage_path,
+    ACKNOWLEDGE_RESET_ENV, SynapseCalyxVaultLineage, VaultLineageGeneration, VaultOpenGenesis,
+    lineage_path,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use ulid::Ulid;
 pub use ward::{
     SYNAPSE_GUARD_DEFAULT_ALPHA, SYNAPSE_GUARD_DEFAULT_PROFILE_KEY, SYNAPSE_GUARD_MIN_GOOD_SCORES,
     SynapseCalyxGuardAspect, SynapseCalyxGuardCalibrateParams, SynapseCalyxGuardCalibrateReport,
@@ -81,9 +87,6 @@ pub use ward::{
     SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport, clopper_pearson_tail,
     min_certifiable_bad_scores,
 };
-use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
-use ulid::Ulid;
 
 pub use async_vault::{
     SynapseCalyxAsyncConfig, SynapseCalyxAsyncVault, SynapseCalyxAsyncVaultHandle,
@@ -2410,6 +2413,11 @@ impl SynapseCalyxVault {
                 vault.latest_seq(),
                 now_unix_ms,
                 lineage::acknowledgement_from_env().as_deref(),
+                if identity.created_this_open {
+                    lineage::VaultOpenGenesis::CreatedThisOpen
+                } else {
+                    lineage::VaultOpenGenesis::PreExisting
+                },
             ) {
                 Ok(lineage) => lineage,
                 Err(error) => {
@@ -4348,6 +4356,9 @@ impl SynapseCalyxVault {
             latest_seq,
             SynapseCalyxClock::from_tuning(&config.tuning)?.now(),
             None,
+            // Close cannot be a genesis: the journal was already written at
+            // open, so this call always takes the existing-generation path.
+            lineage::VaultOpenGenesis::PreExisting,
         )?;
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_LINEAGE_CLOSE_RECORDED",
@@ -4413,6 +4424,10 @@ struct VaultIdentityDisk {
 struct VaultIdentity {
     vault_id: String,
     machine_salt: Vec<u8>,
+    /// True when this call minted `vault-identity.json` because none existed.
+    /// This is the vault's `initdb` moment and the only point at which genesis
+    /// is knowable (#1884); nothing later can recover it.
+    created_this_open: bool,
 }
 
 impl VaultIdentity {
@@ -4636,7 +4651,8 @@ fn load_or_create_identity(
     config: &SynapseCalyxConfig,
 ) -> Result<VaultIdentity, SynapseCalyxError> {
     let identity_path = identity_path(&config.vault_dir);
-    if !identity_path.exists() {
+    let created_this_open = !identity_path.exists();
+    if created_this_open {
         let disk = VaultIdentityDisk {
             schema_version: IDENTITY_SCHEMA_VERSION,
             vault_id: VaultId::from_ulid(Ulid::new()).to_string(),
@@ -4648,6 +4664,7 @@ fn load_or_create_identity(
     Ok(VaultIdentity {
         vault_id,
         machine_salt,
+        created_this_open,
     })
 }
 
