@@ -641,6 +641,8 @@ fn verify_chain_response(
         raw_commitment_failure: verify.raw_commitment_failure.clone(),
         covers_full_history: verify.covers_full_history,
         chain_origin: verify.chain_origin.clone(),
+        history_coverage: verify.history_coverage.clone(),
+        attested_from_seq: verify.attested_from_seq,
         vault_generation: verify.vault_generation,
         vault_reset_count: verify.vault_reset_count,
         predecessor_vault_id: verify.predecessor_vault_id.clone(),

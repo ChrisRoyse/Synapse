@@ -367,6 +367,11 @@ pub struct AuditVerifyChainResponse {
     pub covers_full_history: bool,
     /// `vault-genesis` | `lineage-seeded` | `post-reset`.
     pub chain_origin: String,
+    /// Why coverage is what it is (#1884). A `partial-*` verdict describes where
+    /// the attested chain *starts*; `intact` is the separate integrity answer.
+    pub history_coverage: String,
+    /// Durable sequence from which the lineage journal attests this chain.
+    pub attested_from_seq: u64,
     pub vault_generation: u64,
     pub vault_reset_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]

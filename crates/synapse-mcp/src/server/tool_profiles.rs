@@ -5235,13 +5235,20 @@ fn inspect_facade_schema_parity(
         }
     }
 
-    let blocking_tool_count = mismatched + unresolved;
+    // #1886: a contract naming a tool the router does not register is the
+    // tool-granularity form of the same drift, and it is the direction that
+    // leaves the contract describing operations no caller can ever reach. It
+    // blocks startup for the same reason an operation-level mismatch does:
+    // there is no CI, so service construction is the only surface that cannot
+    // be skipped. `verified` and `blocking_tool_count` therefore agree, instead
+    // of health reporting `error` for a condition the daemon started through.
+    let blocking_tool_count = mismatched + unresolved + not_registered;
     FacadeSchemaParitySnapshot {
         operation: FACADE_SCHEMA_PARITY_OPERATION,
         source_of_truth: FACADE_SCHEMA_PARITY_SOURCE_OF_TRUTH,
         error_code: FACADE_SCHEMA_PARITY_ERROR_CODE,
         remediation: FACADE_SCHEMA_PARITY_REMEDIATION,
-        verified: blocking_tool_count == 0 && not_registered == 0,
+        verified: blocking_tool_count == 0,
         compared_tool_count: contracts.len(),
         matched_tool_count: matched,
         mismatched_tool_count: mismatched,
@@ -5263,7 +5270,6 @@ impl FacadeSchemaParitySnapshot {
         let detail = self
             .divergent
             .iter()
-            .filter(|row| row.status != "tool_not_registered")
             .map(|row| {
                 format!(
                     "{} [{}] declared_enum={} live_schema={} declared_but_absent_from_schema_enum={:?} live_but_undeclared_in_contract={:?}{}",

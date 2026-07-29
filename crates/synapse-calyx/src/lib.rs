@@ -919,6 +919,15 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub covers_full_history: bool,
     /// `vault-genesis` | `lineage-seeded` | `post-reset`.
     pub chain_origin: String,
+    /// Why coverage is what it is (#1884): `full-from-genesis`,
+    /// `partial-journal-seeded-over-pre-existing-vault`,
+    /// `partial-begins-after-acknowledged-vault-replacement`. A partial verdict
+    /// is a statement about the chain's *start*, not about its integrity —
+    /// `intact` is the integrity answer and they are reported separately.
+    pub history_coverage: String,
+    /// Durable sequence from which this generation's chain is attested by the
+    /// lineage journal. Equals 0 exactly when `covers_full_history` is true.
+    pub attested_from_seq: u64,
     /// 1-based lineage generation of the vault this chain lives in.
     pub vault_generation: u64,
     /// Recorded vault replacements preceding this generation.
@@ -955,11 +964,18 @@ pub struct SynapseCalyxVaultVerifyReport {
 }
 
 impl SynapseCalyxVaultVerifyReport {
-    /// True only when every checked surface verified. `covers_full_history` is
-    /// deliberately **not** part of this predicate: after an acknowledged reset
-    /// or a seeded journal it is permanently false, so folding it in would make
-    /// every scheduled run red forever and train the operator to ignore the
-    /// alarm. It is reported, not alarmed on.
+    /// True only when every checked surface verified.
+    ///
+    /// `covers_full_history` is deliberately **not** part of this predicate, and
+    /// after #1884 that exclusion is a real distinction rather than a
+    /// workaround for a constant. Integrity ("every hash in the verified range
+    /// links") and coverage ("where the attested range starts") are different
+    /// questions. A vault whose journal was seeded over pre-existing data, or
+    /// one continuing after an acknowledged replacement, has a chain that is
+    /// genuinely intact and genuinely starts later than sequence 0; folding the
+    /// second fact into a red verdict would report an intact chain as broken
+    /// forever. Coverage is reported instead as `history_coverage` plus
+    /// `attested_from_seq`, which name the start and the reason for it.
     #[must_use]
     pub const fn green(&self) -> bool {
         self.restore.success
@@ -1047,6 +1063,8 @@ impl SynapseCalyxLedgerVerifyReport {
             raw_commitment_failure: raw_commitments.failure.clone(),
             covers_full_history: lineage.chain_covers_full_history(),
             chain_origin: lineage.chain_origin.clone(),
+            history_coverage: lineage.history_coverage().to_owned(),
+            attested_from_seq: lineage.generation_origin_seq,
             vault_generation: lineage.generation,
             vault_reset_count: lineage.reset_count,
             predecessor_vault_id: lineage.predecessor_vault_id.clone(),

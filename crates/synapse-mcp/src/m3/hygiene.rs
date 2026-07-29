@@ -4273,9 +4273,12 @@ pub struct HygieneVaultVerifyResponse {
     pub vault_generation: u64,
     pub vault_reset_count: u64,
     pub chain_origin: String,
-    /// Reported, never alarmed on: permanently false after a seeded journal or
-    /// an acknowledged reset.
+    /// Reported, never alarmed on: an intact chain that begins after a seeded
+    /// journal or an acknowledged reset is intact and partial at once (#1884).
+    /// `history_coverage` names which, and `attested_from_seq` names where.
     pub covers_full_history: bool,
+    pub history_coverage: String,
+    pub attested_from_seq: u64,
     pub constellation_count: u64,
     pub anchor_count: u64,
     pub ledger_entry_count: u64,
@@ -4341,6 +4344,8 @@ pub fn run_vault_verify(
         vault_reset_count: report.chain.vault_reset_count,
         chain_origin: report.chain.chain_origin.clone(),
         covers_full_history: report.chain.covers_full_history,
+        history_coverage: report.chain.history_coverage.clone(),
+        attested_from_seq: report.chain.attested_from_seq,
         constellation_count: report.restore.constellation_count,
         anchor_count: report.restore.anchor_count,
         ledger_entry_count: report.restore.ledger_entry_count,

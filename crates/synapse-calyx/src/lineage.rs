@@ -158,6 +158,25 @@ impl SynapseCalyxVaultLineage {
     pub fn chain_covers_full_history(&self) -> bool {
         self.chain_origin == "vault-genesis"
     }
+
+    /// Names *why* coverage is what it is, so `covers_full_history=false` is a
+    /// statement an operator can act on rather than a bare negative.
+    ///
+    /// Integrity and coverage are different questions about a chain (#1884). A
+    /// vault seeded over pre-existing data, or one continuing after an
+    /// acknowledged replacement, can have a perfectly intact chain that simply
+    /// begins later than sequence 0. Reporting that as an unnamed `false` is
+    /// what made the field read as "history is missing" — the #1875 alarm —
+    /// on healthy vaults.
+    #[must_use]
+    pub fn history_coverage(&self) -> &'static str {
+        match self.chain_origin.as_str() {
+            "vault-genesis" => "full-from-genesis",
+            "lineage-seeded" => "partial-journal-seeded-over-pre-existing-vault",
+            "post-reset" => "partial-begins-after-acknowledged-vault-replacement",
+            _ => "partial-unrecognized-chain-origin",
+        }
+    }
 }
 
 /// Path of the lineage journal for `vault_dir`: a sibling file, so deleting the

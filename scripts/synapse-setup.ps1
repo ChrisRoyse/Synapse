@@ -7812,14 +7812,41 @@ function Get-SynapseCandidateReplacementReservationId {
         Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_UNREADABLE bind=$Bind live_pid=$($listener.OwningProcess) error=$($healthRead.Error) remediation=repair authenticated health for the exact live daemon before candidate validation"
     }
     $health = $healthRead.Health
-    if (-not $health.ok -or [int]$health.pid -ne [int]$listener.OwningProcess) {
-        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_IDENTITY_MISMATCH bind=$Bind listener_pid=$($listener.OwningProcess) health_ok=$($health.ok) health_pid=$($health.pid) remediation=repair the exact daemon process/socket/health identity before candidate validation"
+    # #1890: identity and fitness are two different questions about the outgoing daemon and must
+    # not share one gate. Identity (does the process answering /health hold the listen socket?) is
+    # the real replacement hazard -- a leaked socket or a second daemon -- and still refuses.
+    # Fitness (health.ok) is NOT a precondition for replacing the outgoing daemon: an unhealthy
+    # daemon is the strongest reason to replace it, and gating on it deadlocks every deploy whose
+    # whole purpose is to fix why health is false. The candidate's fitness is decided separately
+    # in Test-SynapseCandidateDaemon, which is the process whose fitness is actually in question.
+    $liveHealthPid = if ($null -eq $health.pid) { 0 } else { [int]$health.pid }
+    if ($liveHealthPid -ne [int]$listener.OwningProcess) {
+        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_IDENTITY_MISMATCH bind=$Bind listener_pid=$($listener.OwningProcess) health_pid=$(if ($null -eq $health.pid) { '<absent>' } else { $liveHealthPid }) failing_term=health_pid_ne_listener_pid remediation=the process answering authenticated /health is not the process holding the listen socket; repair the exact daemon process/socket identity (leaked listen socket or a second daemon) before candidate validation"
+    }
+    if ($health.ok -ne $true) {
+        $liveSubsystemStatuses = @()
+        if ($health.subsystems) {
+            foreach ($prop in @($health.subsystems.PSObject.Properties | Sort-Object Name)) {
+                $status = [string]$prop.Value.status
+                if ($status -and $status -ne 'ok') { $liveSubsystemStatuses += ("{0}={1}" -f $prop.Name, $status) }
+            }
+        }
+        $liveStatusText = if ($liveSubsystemStatuses.Count -gt 0) { $liveSubsystemStatuses -join ',' } else { '<none-not-ok>' }
+        Info "SYNAPSE_GPU_REPLACEMENT_OUTGOING_DAEMON_UNHEALTHY bind=$Bind live_pid=$($listener.OwningProcess) health_ok=false identity_verified=true not_ok_subsystems=$liveStatusText note=replacement proceeds; process/socket/health identity is consistent and replacing an unhealthy daemon is the remedy, not a reason to refuse"
     }
     $calyxHealth = $health.subsystems.calyx_vault
     $selectedBackend = [string]$calyxHealth.calyx_math_backend
     $healthReservationId = [string]$calyxHealth.calyx_gpu_reservation_id
-    if ([string]$calyxHealth.status -ne 'ok' -or [string]::IsNullOrWhiteSpace($selectedBackend)) {
-        Die "SYNAPSE_GPU_REPLACEMENT_CALYX_HEALTH_INVALID bind=$Bind live_pid=$($listener.OwningProcess) calyx_status=$($calyxHealth.status) selected_backend=$selectedBackend remediation=repair the live Calyx health state before candidate validation"
+    # Same split for the Calyx subsystem: the datum this function needs from it is the selected math
+    # backend (which decides whether a GPU reservation has to be handed off at all). That datum being
+    # readable is the precondition; the subsystem's aggregate verdict is not. Every exactness check
+    # the handoff actually depends on -- ledger row, reservation id shape, lease file -- still runs
+    # below and still refuses under its own precise code.
+    if ([string]::IsNullOrWhiteSpace($selectedBackend)) {
+        Die "SYNAPSE_GPU_REPLACEMENT_CALYX_BACKEND_UNREADABLE bind=$Bind live_pid=$($listener.OwningProcess) calyx_status=$(if ([string]$calyxHealth.status) { [string]$calyxHealth.status } else { '<absent>' }) selected_backend=<absent> failing_term=calyx_math_backend_absent remediation=authenticated health must name the live daemon's Calyx math backend so the GPU reservation handoff can be decided; repair the live Calyx vault subsystem before candidate validation"
+    }
+    if ([string]$calyxHealth.status -ne 'ok') {
+        Info "SYNAPSE_GPU_REPLACEMENT_OUTGOING_CALYX_NOT_OK bind=$Bind live_pid=$($listener.OwningProcess) calyx_status=$([string]$calyxHealth.status) selected_backend=$selectedBackend note=replacement proceeds; the backend needed for the reservation decision is readable and every reservation exactness check below still refuses under its own code"
     }
 
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)

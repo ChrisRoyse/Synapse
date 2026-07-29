@@ -159,6 +159,9 @@ pub struct SynapseCalyxBackupLineage {
     /// the journal existed: the backup attests the surviving chain, not the
     /// vault's whole history.
     pub covers_full_history: bool,
+    /// Why coverage is what it is (#1884), so a restored backup states where its
+    /// attested history begins instead of only that it is not the whole vault.
+    pub history_coverage: String,
 }
 
 /// Structured, self-verifying backup result.
@@ -415,6 +418,7 @@ pub(crate) fn capture_lineage(
         reset_count: lineage.reset_count,
         chain_origin: lineage.chain_origin.clone(),
         covers_full_history: lineage.chain_covers_full_history(),
+        history_coverage: lineage.history_coverage().to_owned(),
     })
 }
 
