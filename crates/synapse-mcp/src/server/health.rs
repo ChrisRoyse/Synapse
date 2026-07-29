@@ -6,7 +6,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
-use synapse_core::{Backend, CalyxMathProbeTopKEntry, ChromeBridgeDetail};
+use synapse_core::{
+    Backend, CalyxMathProbeTopKEntry, CalyxTuningKnobEnforcement, CalyxTuningKnobStatus,
+    ChromeBridgeDetail,
+};
 
 /// Verbosity control for the `health` tool response.
 ///
@@ -281,6 +284,142 @@ fn calyx_health_cf_sizes_skipped_reason() -> String {
     "calyx backend health skips scan-bound CF size estimates; use storage summary/inspect for explicit storage readback".to_owned()
 }
 
+/// Where a Calyx tuning knob's effective value is actually decided, and what
+/// tuning the configured knob does today (#1883).
+///
+/// Every entry here was traced to a real consumer or proved to have none. The
+/// table lives beside the health reporter on purpose: the value and the verdict
+/// are emitted together so a bare number can never be reported again. Each
+/// `declared_at` is a `file:symbol` an operator can open; when it names a
+/// constant other than the knob, THAT constant is what the daemon obeys.
+struct CalyxTuningKnobFacts {
+    knob: &'static str,
+    enforcement: CalyxTuningKnobEnforcement,
+    declared_at: &'static str,
+    blocked_by_issue: &'static str,
+    effect_of_tuning: &'static str,
+}
+
+const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
+    CalyxTuningKnobFacts {
+        knob: "bit_floor_bits",
+        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
+        declared_at: "crates/synapse-storage/src/constellations.rs PANEL_ADMISSION_BIT_FLOOR",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: lens admission compares signal_bits against the hardcoded PANEL_ADMISSION_BIT_FLOOR, not this value",
+    },
+    CalyxTuningKnobFacts {
+        knob: "correlation_ceiling",
+        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
+        declared_at: "crates/synapse-storage/src/constellations.rs PANEL_ADMISSION_CORRELATION_CEILING",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: lens redundancy compares max_redundancy_nmi against the hardcoded PANEL_ADMISSION_CORRELATION_CEILING, not this value",
+    },
+    CalyxTuningKnobFacts {
+        knob: "guard_far_identity",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "crates/synapse-calyx/src/ward.rs SynapseCalyxVault::configured_guard_target_far",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets the default target false-accept rate hygiene operation=guard_calibrate certifies for identity slots; an explicit per-request target_far still wins, and a value above calyx-ward's per-aspect ceiling is refused loudly rather than ignored",
+    },
+    CalyxTuningKnobFacts {
+        knob: "guard_far_content",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "crates/synapse-calyx/src/ward.rs SynapseCalyxVault::configured_guard_target_far",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets the default target false-accept rate hygiene operation=guard_calibrate certifies for content slots; an explicit per-request target_far still wins, and a value above calyx-ward's per-aspect ceiling is refused loudly rather than ignored",
+    },
+    CalyxTuningKnobFacts {
+        knob: "guard_far_stylistic",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "crates/synapse-calyx/src/ward.rs SynapseCalyxVault::configured_guard_target_far",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets the default target false-accept rate hygiene operation=guard_calibrate certifies for stylistic slots; an explicit per-request target_far still wins, and a value above calyx-ward's per-aspect ceiling is refused loudly rather than ignored",
+    },
+    CalyxTuningKnobFacts {
+        knob: "guard_cold_start_tau",
+        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
+        declared_at: "calyx/crates/calyx-ward/src/guard.rs cold-start tau constant",
+        blocked_by_issue: "1677",
+        effect_of_tuning: "none: the cold-start tau the guard applies is a Ward constant; this value only travels into the lowered artifact",
+    },
+    CalyxTuningKnobFacts {
+        knob: "kernel_fraction",
+        enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
+        declared_at: "none: no code anywhere reads kernel_fraction",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: validated, lowered into the guard-threshold artifact, and read by nothing",
+    },
+    CalyxTuningKnobFacts {
+        knob: "kernel_recall_gate",
+        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
+        declared_at: "crates/synapse-calyx/src/intelligence.rs SYNAPSE_KERNEL_DEFAULT_MIN_RECALL",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: the kernel recall gate enforced on the intelligence path is the hardcoded SYNAPSE_KERNEL_DEFAULT_MIN_RECALL",
+    },
+    CalyxTuningKnobFacts {
+        knob: "fusion_k",
+        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
+        declared_at: "calyx/crates/calyx-sextant/src/fusion/rrf.rs RRF_K (also calyx-ledger/src/reproduce/fusion.rs RRF_K and crates/synapse-calyx/src/find.rs SYNAPSE_FIND_RRF_K)",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: every fused query scores with the substrate's hardcoded RRF_K=60; threading this value requires an rrf_k on calyx_sextant::FusionContext plus a parameter through calyx-search into synapse-calyx find.rs",
+    },
+    CalyxTuningKnobFacts {
+        knob: "temporal_boost_min",
+        enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
+        declared_at: "none: no code anywhere reads temporal_boost_min",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: validated at startup and reported here; the temporal rerank bounds come from the registered temporal policy, not from this knob",
+    },
+    CalyxTuningKnobFacts {
+        knob: "temporal_boost_max",
+        enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
+        declared_at: "none: no code anywhere reads temporal_boost_max",
+        blocked_by_issue: "1883",
+        effect_of_tuning: "none: validated at startup and reported here; the temporal rerank bounds come from the registered temporal policy, not from this knob",
+    },
+];
+
+/// Renders every tuning knob as `value + enforcement verdict + the code that
+/// actually decides`.
+fn calyx_tuning_knob_report(
+    tuning: &synapse_calyx::SynapseCalyxTuningConfig,
+) -> Vec<CalyxTuningKnobStatus> {
+    CALYX_TUNING_KNOB_FACTS
+        .iter()
+        .map(|facts| CalyxTuningKnobStatus {
+            knob: facts.knob.to_owned(),
+            configured_value: calyx_tuning_knob_value(tuning, facts.knob),
+            enforcement: facts.enforcement,
+            effective_value_declared_at: facts.declared_at.to_owned(),
+            blocked_by_issue: facts.blocked_by_issue.to_owned(),
+            effect_of_tuning: facts.effect_of_tuning.to_owned(),
+        })
+        .collect()
+}
+
+/// Reads one knob out of the live tuning config by name.
+///
+/// An unknown name is reported as such rather than silently rendered as a
+/// default, so a knob added to the config without a traced verdict in
+/// `CALYX_TUNING_KNOB_FACTS` shows up as unreported instead of disappearing.
+fn calyx_tuning_knob_value(tuning: &synapse_calyx::SynapseCalyxTuningConfig, knob: &str) -> String {
+    match knob {
+        "bit_floor_bits" => tuning.bit_floor_bits.to_string(),
+        "correlation_ceiling" => tuning.correlation_ceiling.to_string(),
+        "guard_far_identity" => tuning.guard_far_identity.to_string(),
+        "guard_far_content" => tuning.guard_far_content.to_string(),
+        "guard_far_stylistic" => tuning.guard_far_stylistic.to_string(),
+        "guard_cold_start_tau" => tuning.guard_cold_start_tau.to_string(),
+        "kernel_fraction" => tuning.kernel_fraction.to_string(),
+        "kernel_recall_gate" => tuning.kernel_recall_gate.to_string(),
+        "fusion_k" => tuning.fusion_k.to_string(),
+        "temporal_boost_min" => tuning.temporal_boost_min.to_string(),
+        "temporal_boost_max" => tuning.temporal_boost_max.to_string(),
+        other => format!("<unmapped tuning knob {other}>"),
+    }
+}
+
 fn apply_storage_maintenance_fields(
     health: &mut SubsystemHealth,
     readback: &crate::m3::StorageMaintenanceReadback,
@@ -456,10 +595,30 @@ impl SynapseService {
                 .iter()
                 .find(|row| row.reservation_id == reservation_id)
         });
+        let tuning_knobs = tuning
+            .as_ref()
+            .map_or_else(Vec::new, calyx_tuning_knob_report);
+        let inert_tuning_knob_count = tuning_knobs
+            .iter()
+            .filter(|knob| !knob.enforcement.is_load_bearing())
+            .count();
+        let inert_tuning_knob_names = tuning_knobs
+            .iter()
+            .filter(|knob| !knob.enforcement.is_load_bearing())
+            .map(|knob| {
+                format!(
+                    "{}={}[{}]",
+                    knob.knob,
+                    knob.configured_value,
+                    knob.enforcement.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} math={} remediation={}",
+                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} math={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
@@ -479,6 +638,9 @@ impl SynapseService {
                 math_backend
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), |math| math.detail()),
+                tuning_knobs.len(),
+                inert_tuning_knob_count,
+                inert_tuning_knob_names,
                 status.remediation.as_deref().unwrap_or("none")
             )),
             calyx_vault_open: Some(status.open),
@@ -500,15 +662,8 @@ impl SynapseService {
             calyx_vault_remediation: status.remediation,
             calyx_bit_floor_bits: tuning.map(|config| config.bit_floor_bits),
             calyx_correlation_ceiling: tuning.map(|config| config.correlation_ceiling),
-            calyx_guard_far_identity: tuning.map(|config| config.guard_far_identity),
-            calyx_guard_far_content: tuning.map(|config| config.guard_far_content),
-            calyx_guard_far_stylistic: tuning.map(|config| config.guard_far_stylistic),
-            calyx_guard_cold_start_tau: tuning.map(|config| config.guard_cold_start_tau),
-            calyx_kernel_fraction: tuning.map(|config| config.kernel_fraction),
-            calyx_kernel_recall_gate: tuning.map(|config| config.kernel_recall_gate),
-            calyx_fusion_k: tuning.map(|config| config.fusion_k),
-            calyx_temporal_boost_min: tuning.map(|config| config.temporal_boost_min),
-            calyx_temporal_boost_max: tuning.map(|config| config.temporal_boost_max),
+            calyx_tuning_knobs: tuning_knobs,
+            calyx_inert_tuning_knob_count: Some(inert_tuning_knob_count),
             calyx_vram_budget_bytes: tuning.map(|config| config.vram_budget_bytes),
             calyx_vram_budget_enforced: math_backend
                 .as_ref()
@@ -908,26 +1063,37 @@ impl SynapseService {
         }
     }
 
+    /// #1886: the facade contract is a hand-maintained list. Reporting a hash of
+    /// it as a passing check is exactly the defect this subsystem used to have,
+    /// so `ok` now requires the live-schema parity gate to have compared every
+    /// facade against its served `operation` enum and agreed in both
+    /// directions. Anything less reports `error` and names the divergence.
     fn facade_contract_health(&self) -> SubsystemHealth {
-        match Self::facade_contract_snapshot() {
+        match self.facade_contract_snapshot() {
             Ok(snapshot) => {
                 let invalid_count = snapshot.missing_contract_tool_names.len()
                     + snapshot.unknown_contract_tool_names.len()
                     + snapshot.duplicate_contract_tool_names.len()
                     + snapshot.duplicate_operation_names.len()
                     + snapshot.invalid_contract_reasons.len();
-                let status = if invalid_count == 0 { "ok" } else { "error" };
+                let parity = &snapshot.schema_parity;
+                let status = if invalid_count == 0 && parity.verified {
+                    "ok"
+                } else {
+                    "error"
+                };
                 SubsystemHealth {
                     status: status.to_owned(),
                     detail: Some(format!(
-                        "source_of_truth={} public_tool_count={} contract_tool_count={} operation_count={} mutating_operation_count={} invalid_count={} contract_sha256={}",
+                        "source_of_truth={} public_tool_count={} contract_tool_count={} operation_count={} mutating_operation_count={} invalid_count={} contract_sha256={} schema_parity: {}",
                         snapshot.source_of_truth,
                         snapshot.public_tool_count,
                         snapshot.contract_tool_count,
                         snapshot.operation_count,
                         snapshot.mutating_operation_count,
                         invalid_count,
-                        snapshot.facade_contract_sha256
+                        snapshot.facade_contract_sha256,
+                        parity.health_detail()
                     )),
                     ..SubsystemHealth::default()
                 }

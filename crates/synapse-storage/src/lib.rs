@@ -969,6 +969,29 @@ impl Db {
         self.backend.calyx_vault_status()
     }
 
+    /// Publishes the lowered guard-threshold hot-path artifact (#1686) through
+    /// the vault's own producer.
+    ///
+    /// This exists so there is exactly ONE producer of the fingerprinted
+    /// envelope (#1885). The off-tick maintenance publisher previously rebuilt
+    /// the same payload, fingerprint and atomic-publish sequence by hand purely
+    /// because the `Arc<SynapseCalyxVault>` is private to the backend; two
+    /// independent producers of one on-disk format drift silently. Callers must
+    /// admit this off the async runtime workers — it is blocking file I/O and
+    /// asserts a cold Calyx context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the vault handle is closed or
+    /// poisoned, the frozen payload cannot be encoded, or the atomic publish
+    /// fails.
+    pub fn lower_guard_thresholds(
+        &self,
+        params: &synapse_calyx::LoweringParams,
+    ) -> StorageResult<synapse_calyx::LoweredPublishReport> {
+        self.backend.lower_guard_thresholds(params)
+    }
+
     /// Rebuilds and independently reopens the persisted Calyx search
     /// generation for the exact durable active panel.
     ///

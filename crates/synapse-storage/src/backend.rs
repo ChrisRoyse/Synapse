@@ -30,10 +30,10 @@ use synapse_calyx::{
     SynapseCalyxGuardCalibrateReport, SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport,
     SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport,
     SynapseCalyxKernelParams, SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport,
-    SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback,
-    SynapseCalyxLedgerVerifyReport, SynapseCalyxMultiConditionalWriteOutcome,
-    SynapseCalyxObservationPutReadback, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
-    SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
+    SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
+    SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPeriodicityReport,
+    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
@@ -456,6 +456,18 @@ pub trait StorageBackend: Send + Sync {
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus>;
+    /// Publishes the lowered guard-threshold artifact through the vault's own
+    /// single producer (#1885).
+    ///
+    /// The maintenance publisher used to rebuild the fingerprinted envelope by
+    /// hand because the sole `Arc<SynapseCalyxVault>` lives behind a private
+    /// `with_vault`. Two independent producers of one on-disk format is one
+    /// too many, so the vault's producer is exposed here instead and the
+    /// reconstruction is gone.
+    fn lower_guard_thresholds(
+        &self,
+        params: &synapse_calyx::LoweringParams,
+    ) -> StorageResult<synapse_calyx::LoweredPublishReport>;
     fn rebuild_calyx_search_indexes(
         &self,
         expected_panel_version: u32,
@@ -1925,6 +1937,26 @@ impl StorageBackend for CalyxBackend {
 
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus> {
         self.vault.status()
+    }
+
+    fn lower_guard_thresholds(
+        &self,
+        params: &synapse_calyx::LoweringParams,
+    ) -> StorageResult<synapse_calyx::LoweredPublishReport> {
+        self.with_vault(
+            "<calyx-vault>",
+            "lower Calyx guard thresholds to the frozen hot-path artifact",
+            false,
+            |vault| {
+                vault.lower_guard_thresholds(params).map_err(|source| {
+                    calyx_write_failed(
+                        "<calyx-vault>",
+                        "lower Calyx guard thresholds to the frozen hot-path artifact",
+                        &source,
+                    )
+                })
+            },
+        )
     }
 
     fn rebuild_calyx_search_indexes(

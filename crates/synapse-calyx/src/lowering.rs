@@ -269,6 +269,16 @@ impl SynapseCalyxVault {
     /// Lowers the current guard-threshold hot set into a frozen, fingerprinted
     /// artifact published atomically under `<vault_dir>/lowered/`.
     ///
+    /// **This is the only producer of the artifact (#1885).** The storage
+    /// maintenance publisher used to rebuild the same payload, content
+    /// fingerprint, clock stamp and atomic publish by hand, purely because the
+    /// sole `Arc<SynapseCalyxVault>` sat behind a private `with_vault`; two
+    /// independent producers of one on-disk format drift with nothing to catch
+    /// it. That path is gone: maintenance now calls
+    /// `Db::lower_guard_thresholds`, which delegates here. Anything that needs
+    /// to publish this artifact must reach this function — do not reconstruct
+    /// [`LoweredArtifactEnvelope`] anywhere else.
+    ///
     /// Runs on the async storage/maintenance path and asserts a cold context
     /// (it must never be called from a tick). The payload is the exact, frozen
     /// tuning thresholds; the fingerprint binds the content hash plus the

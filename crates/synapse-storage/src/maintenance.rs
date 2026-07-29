@@ -21,13 +21,11 @@ use std::sync::{
     Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use synapse_calyx::{
-    LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
-    LoweredArtifactEnvelope, LoweredArtifactHandle, LoweredArtifactKind, LoweredFingerprint,
-    LoweredGuardThresholds, SynapseCalyxClockMode, SynapseCalyxTuningConfig,
-    SynapseCalyxVaultStatus, hot_context,
+    LoweredArtifactHandle, LoweredArtifactKind, LoweringParams, SynapseCalyxVaultStatus,
+    hot_context,
 };
 use tokio::sync::Semaphore;
 
@@ -291,12 +289,20 @@ pub(crate) fn publish_lowered_guard_thresholds() {
             return;
         }
     };
-    if let Err((code, detail)) = publish_from_status(&status) {
+    if let Err((code, detail)) = publish_through_vault(&db, &status) {
         record_lowering_failure(code, &detail);
     }
 }
 
-fn publish_from_status(status: &SynapseCalyxVaultStatus) -> Result<(), (&'static str, String)> {
+/// Decides whether this vault state permits a publish, and where the artifact
+/// belongs.
+///
+/// `Ok(None)` is a recorded skip (a closed or disabled vault has nothing to
+/// lower and must not be treated as a failure); `Err` is an open vault that
+/// cannot describe itself, which is a real fault.
+fn lowering_target_dir(
+    status: &SynapseCalyxVaultStatus,
+) -> Result<Option<PathBuf>, (&'static str, String)> {
     if !status.open {
         record_lowering_skip(
             "STORAGE_LOWERING_VAULT_NOT_OPEN",
@@ -305,38 +311,51 @@ fn publish_from_status(status: &SynapseCalyxVaultStatus) -> Result<(), (&'static
                 status.enabled, status.phase
             ),
         );
-        return Ok(());
+        return Ok(None);
     }
-    let (Some(vault_dir), Some(tuning), Some(vault_id)) = (
-        status.vault_dir.as_ref(),
-        status.tuning.as_ref(),
-        status.vault_id.as_ref(),
-    ) else {
+    let Some(vault_dir) = status.vault_dir.as_ref() else {
         return Err((
             "STORAGE_LOWERING_VAULT_STATE_INCOMPLETE",
-            format!(
-                "open Calyx vault reported an incomplete state for lowering (vault_dir={} \
-                 tuning={} vault_id={})",
-                status.vault_dir.is_some(),
-                status.tuning.is_some(),
-                status.vault_id.is_some()
-            ),
+            "open Calyx vault reported no vault_dir, so the lowered artifact has no home"
+                .to_owned(),
         ));
     };
-    let envelope = freeze_guard_threshold_envelope(status, tuning, vault_id)?;
-    let content_sha256 = envelope.fingerprint.content_sha256.clone();
-    let produced_at_unix_ms = envelope.fingerprint.produced_at_unix_ms;
-    let generation = envelope.fingerprint.generation;
-    let bytes = serde_json::to_vec_pretty(&envelope).map_err(|error| {
+    Ok(Some(vault_dir.clone()))
+}
+
+/// Publishes through the vault's own producer and then re-reads the bytes
+/// through the consumer.
+///
+/// #1885: this function does not construct an envelope. `SynapseCalyxVault::
+/// lower_guard_thresholds` is the single producer of the frozen payload, its
+/// content fingerprint, the vault clock stamp and the atomic publish; this
+/// caller only supplies the off-runtime lowering inputs and proves the result
+/// through the reader that will actually trust the file.
+fn publish_through_vault(
+    db: &Db,
+    status: &SynapseCalyxVaultStatus,
+) -> Result<(), (&'static str, String)> {
+    let Some(vault_dir) = lowering_target_dir(status)? else {
+        return Ok(());
+    };
+    let params = LoweringParams {
+        generation: LOWERING_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1),
+        // The guard-threshold hot set is read straight off the vault tuning
+        // config; no panel generation or lens produces it, so claiming
+        // producing versions here would fabricate provenance.
+        producing_panel_versions: Vec::new(),
+        producing_lens_ids: Vec::new(),
+        staleness_bound_ms: LOWERED_GUARD_THRESHOLDS_STALENESS_BOUND_MS,
+    };
+    let report = db.lower_guard_thresholds(&params).map_err(|error| {
         (
-            "STORAGE_LOWERING_ENCODE_FAILED",
-            format!("encode lowered guard-threshold envelope: {error}"),
+            "STORAGE_LOWERING_PUBLISH_FAILED",
+            format!("lower Calyx guard thresholds through the vault producer: {error}"),
         )
     })?;
-    let dir = vault_dir.join(LOWERED_DIR_NAME);
-    let path = dir.join(LoweredArtifactKind::GuardThresholds.file_name());
-    atomic_publish(&dir, &path, &bytes)?;
-    verify_published_artifact(vault_dir, &path, produced_at_unix_ms)?;
+    verify_published_artifact(&vault_dir, &report.path, report.produced_at_unix_ms)?;
 
     LOWERING_PUBLISH_SUCCESS.fetch_add(1, Ordering::Relaxed);
     {
@@ -344,85 +363,25 @@ fn publish_from_status(status: &SynapseCalyxVaultStatus) -> Result<(), (&'static
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.last_success_unix_ms = Some(produced_at_unix_ms);
-        guard.last_content_sha256 = Some(content_sha256.clone());
-        guard.last_path = Some(path.clone());
-        guard.last_generation = Some(generation);
-        guard.last_source_ledger_seq = Some(envelope.fingerprint.source_ledger_seq);
+        guard.last_success_unix_ms = Some(report.produced_at_unix_ms);
+        guard.last_content_sha256 = Some(report.content_sha256.clone());
+        guard.last_path = Some(report.path.clone());
+        guard.last_generation = Some(report.generation);
+        guard.last_source_ledger_seq = Some(report.source_ledger_seq);
         guard.last_error_code = None;
         guard.last_error = None;
     }
     tracing::info!(
         code = "STORAGE_LOWERED_ARTIFACT_PUBLISHED",
-        kind = %LoweredArtifactKind::GuardThresholds,
-        path = %path.display(),
-        content_sha256 = %content_sha256,
-        generation,
-        source_ledger_seq = envelope.fingerprint.source_ledger_seq,
-        bytes_len = bytes.len(),
-        "published and re-verified the lowered guard-threshold artifact off-tick"
+        kind = %report.kind,
+        path = %report.path.display(),
+        content_sha256 = %report.content_sha256,
+        generation = report.generation,
+        source_ledger_seq = report.source_ledger_seq,
+        bytes_len = report.bytes_len,
+        "re-verified the lowered guard-threshold artifact published by the vault producer"
     );
     Ok(())
-}
-
-/// Freezes the vault's current guard-threshold hot set into a fingerprinted
-/// envelope.
-///
-/// The fingerprint is a SHA-256 over the canonical payload bytes, produced with
-/// the same encoder the reader uses to re-derive them. `produced_at_unix_ms`
-/// comes from the vault's own clock mode, not from wall-clock time, so a vault
-/// pinned to a fixed clock does not get an artifact stamped with a time it does
-/// not believe in.
-fn freeze_guard_threshold_envelope(
-    status: &SynapseCalyxVaultStatus,
-    tuning: &SynapseCalyxTuningConfig,
-    vault_id: &str,
-) -> Result<LoweredArtifactEnvelope, (&'static str, String)> {
-    let payload = LoweredGuardThresholds {
-        bit_floor_bits: tuning.bit_floor_bits,
-        correlation_ceiling: tuning.correlation_ceiling,
-        guard_far_identity: tuning.guard_far_identity,
-        guard_far_content: tuning.guard_far_content,
-        guard_far_stylistic: tuning.guard_far_stylistic,
-        guard_cold_start_tau: tuning.guard_cold_start_tau,
-        kernel_fraction: tuning.kernel_fraction,
-        kernel_recall_gate: tuning.kernel_recall_gate,
-    };
-    let canonical = serde_json::to_vec(&payload).map_err(|error| {
-        (
-            "STORAGE_LOWERING_ENCODE_FAILED",
-            format!("encode frozen guard-threshold payload: {error}"),
-        )
-    })?;
-    let produced_at_unix_ms = match tuning.clock_mode {
-        SynapseCalyxClockMode::System => unix_time_ms_now(),
-        SynapseCalyxClockMode::Fixed => tuning.fixed_clock_unix_ms.ok_or_else(|| {
-            (
-                "STORAGE_LOWERING_CLOCK_INVALID",
-                "clock_mode=fixed is missing fixed_clock_unix_ms; refusing to stamp a lowered \
-                 artifact with a clock the vault does not have"
-                    .to_owned(),
-            )
-        })?,
-    };
-    Ok(LoweredArtifactEnvelope {
-        magic: LOWERED_ARTIFACT_MAGIC.to_owned(),
-        kind: LoweredArtifactKind::GuardThresholds,
-        fingerprint: LoweredFingerprint {
-            schema_version: LOWERED_ARTIFACT_SCHEMA_VERSION,
-            content_sha256: sha256_hex(&canonical),
-            generation: LOWERING_GENERATION
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1),
-            producing_panel_versions: Vec::new(),
-            producing_lens_ids: Vec::new(),
-            source_ledger_seq: status.latest_seq.unwrap_or_default(),
-            produced_at_unix_ms,
-            vault_id: vault_id.to_owned(),
-        },
-        staleness_bound_ms: LOWERED_GUARD_THRESHOLDS_STALENESS_BOUND_MS,
-        payload,
-    })
 }
 
 /// Proves the just-written bytes through the consumer that will actually read
@@ -457,84 +416,20 @@ fn verify_published_artifact(
     ))
 }
 
-/// Writes `bytes` to `path` atomically: sibling temp file, `sync_all`, rename.
-/// A concurrent reader sees either the previous artifact or the new one, never a
-/// partial write.
-fn atomic_publish(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), (&'static str, String)> {
-    use std::io::Write as _;
-
-    std::fs::create_dir_all(dir).map_err(|error| {
-        (
-            "STORAGE_LOWERING_DIR_FAILED",
-            format!(
-                "create lowered artifact directory {}: {error}",
-                dir.display()
-            ),
-        )
-    })?;
-    let tmp_path = path.with_extension("json.tmp");
-    let mut file = std::fs::File::create(&tmp_path).map_err(|error| {
-        (
-            "STORAGE_LOWERING_WRITE_FAILED",
-            format!(
-                "create lowered artifact temp file {}: {error}",
-                tmp_path.display()
-            ),
-        )
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| {
-            (
-                "STORAGE_LOWERING_WRITE_FAILED",
-                format!(
-                    "write and flush lowered artifact temp file {}: {error}",
-                    tmp_path.display()
-                ),
-            )
-        })?;
-    drop(file);
-    std::fs::rename(&tmp_path, path).map_err(|error| {
-        let _ = std::fs::remove_file(&tmp_path);
-        (
-            "STORAGE_LOWERING_PUBLISH_FAILED",
-            format!(
-                "atomically rename lowered artifact into {}: {error}",
-                path.display()
-            ),
-        )
-    })?;
-    Ok(())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-fn unix_time_ms_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
-    use synapse_calyx::{
-        LOWERED_DIR_NAME as DIR, LoweredArtifactState, SynapseCalyxTuningConfig,
-        SynapseCalyxVaultStatus,
-    };
+    use synapse_calyx::{LOWERED_DIR_NAME as DIR, SynapseCalyxTuningConfig};
+
+    fn unix_time_ms_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .unwrap_or_default()
+    }
 
     fn scratch_vault_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -559,54 +454,34 @@ mod tests {
         }
     }
 
-    /// The producer's fingerprint must be exactly what the consumer recomputes.
-    ///
-    /// This is the contract the whole hot-path boundary rests on: the tick trusts
-    /// a frozen file only because the reader re-derives its content hash. If the
-    /// two encoders ever drift the artifact degrades to the fail-closed default
-    /// and the tick silently stops consuming lowered intelligence, so the round
-    /// trip is asserted here rather than assumed.
+    /// An open vault must resolve to exactly its own directory, because that is
+    /// the only thing this module still decides: #1885 moved every byte of the
+    /// artifact — payload, fingerprint, clock stamp, atomic publish — behind the
+    /// vault's single producer, so there is no second envelope to assert here.
     #[test]
-    fn published_artifact_round_trips_through_the_consumer() {
-        let vault_dir = scratch_vault_dir("roundtrip");
+    fn an_open_vault_lowers_into_its_own_vault_dir() {
+        let vault_dir = scratch_vault_dir("target");
         let status = open_status(&vault_dir);
 
-        publish_from_status(&status).expect("publish lowered guard thresholds");
+        let resolved = lowering_target_dir(&status).expect("an open vault is a publishable target");
 
-        let path = vault_dir
-            .join(DIR)
-            .join(LoweredArtifactKind::GuardThresholds.file_name());
-        assert!(path.is_file(), "artifact was not published at {path:?}");
-
-        let handle =
-            LoweredArtifactHandle::unloaded(&vault_dir, LoweredArtifactKind::GuardThresholds);
-        let outcome = handle.refresh(unix_time_ms_now());
-        assert!(
-            outcome.became_fresh,
-            "consumer refused the published artifact: {:?}",
-            outcome.safe_default
-        );
-
-        let state = handle.load();
-        let LoweredArtifactState::Fresh(artifact) = state.as_ref() else {
-            panic!("expected a fresh artifact, got {state:?}");
-        };
-        let tuning = SynapseCalyxTuningConfig::default();
-        // Bit-exact, not approximately equal: the frozen payload must survive the
-        // JSON round trip unchanged or its content hash would not match.
-        assert_eq!(
-            artifact.guard_thresholds.bit_floor_bits.to_bits(),
-            tuning.bit_floor_bits.to_bits()
-        );
-        assert_eq!(artifact.fingerprint.source_ledger_seq, 1234);
-        assert_eq!(artifact.fingerprint.vault_id, "test-vault");
-        // The fingerprint must be the hash of the canonical payload bytes, not
-        // of the envelope, so an operator comparing the two knows which is which.
-        let canonical =
-            serde_json::to_vec(&artifact.guard_thresholds).expect("re-encode frozen payload");
-        assert_eq!(artifact.fingerprint.content_sha256, sha256_hex(&canonical));
-
+        assert_eq!(resolved.as_deref(), Some(vault_dir.as_path()));
         std::fs::remove_dir_all(&vault_dir).expect("clean scratch vault dir");
+    }
+
+    /// An open vault that cannot name its own directory is a fault, not a skip.
+    /// Classification matters: reporting it as "nothing to lower" would leave a
+    /// hot path on fail-closed defaults with a clean-looking publisher.
+    #[test]
+    fn an_open_vault_without_a_directory_is_a_failure() {
+        let status = SynapseCalyxVaultStatus {
+            vault_dir: None,
+            ..open_status(Path::new("unused"))
+        };
+
+        let error = lowering_target_dir(&status).expect_err("an incomplete open vault must fail");
+
+        assert_eq!(error.0, "STORAGE_LOWERING_VAULT_STATE_INCOMPLETE");
     }
 
     /// A closed vault must be reported as a skip, never published from.
@@ -620,8 +495,10 @@ mod tests {
         };
         let before = LOWERING_PUBLISH_SKIPPED.load(Ordering::Relaxed);
 
-        publish_from_status(&status).expect("a closed vault is a skip, not an error");
+        let resolved =
+            lowering_target_dir(&status).expect("a closed vault is a skip, not an error");
 
+        assert!(resolved.is_none());
         assert_eq!(LOWERING_PUBLISH_SKIPPED.load(Ordering::Relaxed), before + 1);
         assert!(!vault_dir.join(DIR).exists());
         std::fs::remove_dir_all(&vault_dir).expect("clean scratch vault dir");

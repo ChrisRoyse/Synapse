@@ -27,6 +27,70 @@ pub struct Health {
     pub subsystems: BTreeMap<String, SubsystemHealth>,
 }
 
+/// How a Calyx tuning knob's configured value relates to the value the daemon
+/// actually behaves according to (#1883).
+///
+/// A knob is only `LoadBearing` when the configured number is the one the code
+/// reads. Anything else is named for what it is, because an operator who tunes
+/// an inert knob and restarts observes no change and has no way to tell that
+/// from "the change had no effect on this workload".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CalyxTuningKnobEnforcement {
+    /// The configured value is read on the path it names. Tuning it changes
+    /// behaviour.
+    LoadBearing,
+    /// The effective value is a hardcoded constant somewhere else. Tuning this
+    /// knob changes nothing; `effective_value_declared_at` names the code that
+    /// actually decides.
+    #[default]
+    InertHardcodedElsewhere,
+    /// Nothing anywhere reads this knob, not even a hardcoded twin. It is
+    /// validated, carried and reported, and that is all.
+    InertNoConsumer,
+}
+
+impl CalyxTuningKnobEnforcement {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadBearing => "load_bearing",
+            Self::InertHardcodedElsewhere => "inert_hardcoded_elsewhere",
+            Self::InertNoConsumer => "inert_no_consumer",
+        }
+    }
+
+    /// Whether the configured value reaches any consumer.
+    #[must_use]
+    pub const fn is_load_bearing(self) -> bool {
+        matches!(self, Self::LoadBearing)
+    }
+}
+
+/// One Calyx tuning knob reported as a measurement rather than a decoration
+/// (#1883).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxTuningKnobStatus {
+    /// Config field name as it appears in `SynapseCalyxTuningConfig`, e.g.
+    /// `fusion_k`.
+    pub knob: String,
+    /// The configured value, rendered exactly as the daemon holds it.
+    pub configured_value: String,
+    pub enforcement: CalyxTuningKnobEnforcement,
+    /// The exact code location that decides this quantity today. For a
+    /// load-bearing knob that is the consumer; for an inert one it is the
+    /// hardcoded constant that wins instead, `none` when there is no consumer
+    /// at all.
+    pub effective_value_declared_at: String,
+    /// The issue that must land before an inert knob becomes load bearing.
+    /// Empty for a load-bearing knob.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub blocked_by_issue: String,
+    /// Plain statement of what tuning this knob does today.
+    pub effect_of_tuning: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubsystemHealth {
@@ -162,24 +226,19 @@ pub struct SubsystemHealth {
     pub calyx_bit_floor_bits: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_correlation_ceiling: Option<f32>,
+    /// #1883: every configurable Calyx tuning knob, each reported WITH whether
+    /// anything actually reads it. The nine `calyx_*` knobs that used to be
+    /// printed here as bare numbers were validated, lowered and echoed, and read
+    /// by nothing — the values that took effect were hardcoded elsewhere. A
+    /// number with no enforcement state attached misrepresents an inert config
+    /// field as a measured one, so the value never travels without its verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calyx_tuning_knobs: Vec<CalyxTuningKnobStatus>,
+    /// Count of knobs in `calyx_tuning_knobs` whose configured value does not
+    /// reach any consumer. Non-zero means the tuning surface is partly
+    /// decorative and the subsystem must not report a clean `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_guard_far_identity: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_guard_far_content: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_guard_far_stylistic: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_guard_cold_start_tau: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_kernel_fraction: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_kernel_recall_gate: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_fusion_k: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_temporal_boost_min: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_temporal_boost_max: Option<f32>,
+    pub calyx_inert_tuning_knob_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vram_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
