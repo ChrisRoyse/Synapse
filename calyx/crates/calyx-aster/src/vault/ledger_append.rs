@@ -349,11 +349,17 @@ where
                     &commitments,
                     seal_count,
                     cursor,
+                    // Issue #1876: how many rows vanished is not where they
+                    // vanished. Pin the position against the sealed ladder.
                     format!(
-                        "raw commitment Ledger seal {} claims {} rows but only {} remain in the physical commitment CF",
+                        "raw commitment Ledger seal {} claims {} rows but only {} remain in the physical commitment CF: {}",
                         entry.seq,
                         seal.commitment_count,
-                        commitments.len().saturating_sub(cursor)
+                        commitments.len().saturating_sub(cursor),
+                        raw_commitment::describe_truncated_cohort(
+                            &seal,
+                            commitments.get(cursor..).unwrap_or(&[])
+                        )
                     ),
                 ));
             };
@@ -362,9 +368,17 @@ where
                     &commitments,
                     seal_count,
                     cursor,
+                    // Issue #1876: the cohort range alone gave the operator a
+                    // span to hand-search. Decompose the divergence and name the
+                    // offending sequence(s). Failure path only, so the extra
+                    // hashing costs nothing on an intact vault.
                     format!(
-                        "raw commitment Ledger seal {} does not match physical commitment rows {}..={} count={}",
-                        entry.seq, seal.first_seq, seal.last_seq, seal.commitment_count
+                        "raw commitment Ledger seal {} does not match physical commitment rows {}..={} count={}: {}",
+                        entry.seq,
+                        seal.first_seq,
+                        seal.last_seq,
+                        seal.commitment_count,
+                        raw_commitment::describe_mismatch(&seal, cohort)
                     ),
                 ));
             }
