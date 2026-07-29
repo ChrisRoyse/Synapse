@@ -110,7 +110,7 @@ pub use intelligence::{
     SynapseCalyxNeffEstimate, SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak,
     SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport, SynapseCalyxSlotBits,
     SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams,
-    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    SynapseCalyxWeaveBlindSpotPair, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
