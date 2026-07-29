@@ -31,6 +31,17 @@ const REFLEX_TICK_JITTER_METRIC: &str = "reflex_tick_jitter_us";
 const REFLEX_STARVED_METRIC: &str = "reflex_starved_total";
 
 pub(super) fn tick(runtime: &mut RuntimeState, elapsed: Duration, degraded: bool) {
+    // Hot-path boundary (#1686). The tick's Calyx-derived guard thresholds are
+    // pinned here, at tick start, from the frozen lowered artifact: one
+    // lock-free `ArcSwap` load, no filesystem access, no live Calyx call. The
+    // pinned value is the authoritative threshold set for the whole tick, so
+    // nothing further down may go looking for a fresher one. When no verified
+    // artifact is published the value is the documented fail-closed default —
+    // never a live lookup.
+    let _frozen_guard_thresholds = runtime
+        .lowered_guard_thresholds
+        .load_for_tick(crate::hot_path::unix_time_ms_now());
+    crate::hot_path::record_hot_tick();
     let events = runtime.subscription.drain();
     expire_action_until_event_lifetimes(runtime, &events);
     let mut dispatched_actions = 0_usize;

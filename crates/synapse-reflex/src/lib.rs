@@ -7,9 +7,11 @@ pub mod bus;
 pub mod conflict;
 mod dispatch;
 pub mod error;
+pub mod hot_path;
 pub mod kinds;
 mod lifecycle;
 mod listing;
+pub mod lowered;
 mod runtime;
 pub mod scheduler;
 mod storage;
@@ -30,6 +32,10 @@ pub use dispatch::{
     ReflexActionGateHandle, ReflexActionPermissionDenied,
 };
 pub use error::{ReflexError, ReflexResult};
+pub use hot_path::{
+    HOT_PATH_BOUNDARY_VIOLATION_CODE, HotPathViolation, HotTickThreadScope, enter_hot_tick_thread,
+    run_hot_tick_thread,
+};
 pub use kinds::aim_track::{
     AimTrackContext, AimTrackController, AimTrackOutput, AimTrackParams, AimTrackTarget,
     AimTrackTargetSnapshot, AimTrackTargetSource, AimTrackTargetSourceHandle, DEFAULT_EMA_ALPHA,
@@ -55,6 +61,10 @@ pub use kinds::path_follow::{
     MAX_PATH_FOLLOW_SAMPLES, PathFollowContext, PathFollowController, PathFollowOutput,
     PathFollowParams, PathFollowPhase, REFLEX_PATH_FOLLOW_COMPLETED_KIND,
     REFLEX_PATH_FOLLOW_TICK_KIND,
+};
+pub use lowered::{
+    LOWERED_REFRESH_INTERVAL, LoweredFeedSnapshot, LoweredGuardThresholdFeed, LoweredRefresher,
+    REFLEX_LOWERED_ARTIFACT_NO_VAULT, REFLEX_LOWERED_REFRESHER_SPAWN_FAILED,
 };
 pub use runtime::ReflexRuntime;
 pub use scheduler::{

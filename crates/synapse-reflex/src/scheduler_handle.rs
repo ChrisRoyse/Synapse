@@ -23,9 +23,20 @@ pub struct SchedulerHandle {
     pub(super) samples: Arc<Mutex<VecDeque<TickSample>>>,
     pub(super) controls: Arc<Mutex<Vec<ReflexControl>>>,
     pub(super) statuses: Arc<Mutex<Vec<ReflexStatus>>>,
+    /// Owns the off-tick refresher for the tick's lowered artifact (#1686).
+    /// Held here so it is torn down with the scheduler it feeds.
+    pub(super) lowered_refresher: crate::lowered::LoweredRefresher,
 }
 
 impl SchedulerHandle {
+    /// The frozen guard-threshold feed the tick reads at tick start (#1686).
+    #[must_use]
+    pub const fn lowered_guard_thresholds(
+        &self,
+    ) -> &Arc<crate::lowered::LoweredGuardThresholdFeed> {
+        self.lowered_refresher.feed()
+    }
+
     #[must_use]
     pub fn samples(&self) -> Vec<TickSample> {
         lock_samples(&self.samples).iter().copied().collect()
@@ -139,6 +150,7 @@ impl SchedulerHandle {
     /// Returns an error if the scheduler thread panicked before joining.
     pub fn stop(&mut self) -> ReflexResult<()> {
         self.stop.store(true, Ordering::Release);
+        self.lowered_refresher.stop();
         if let Some(join) = self.join.take() {
             join.join().map_err(|error| ReflexError::ParamsInvalid {
                 detail: format!("scheduler thread panicked: {error:?}"),

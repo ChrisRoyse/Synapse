@@ -817,6 +817,11 @@ impl M3State {
         &mut self,
     ) -> std::result::Result<(), synapse_storage::StorageError> {
         let db = self.ensure_storage()?;
+        // Hot-path boundary (#1686). The admitted maintenance pass also lowers
+        // the guard-threshold hot set into the frozen artifact the reflex tick
+        // consumes, and it reads the vault through this handle. Register before
+        // the first pass can run so no pass is skipped for want of a source.
+        synapse_storage::maintenance::register_lowering_source(&db);
         self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample

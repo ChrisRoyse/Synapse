@@ -16,6 +16,14 @@ use synapse_storage::{Db, StorageResult, cf, encode_json};
     )
 )]
 pub fn write_audit(db: &Db, audit: &StoredReflexAudit) -> StorageResult<()> {
+    // Hot-path boundary (#1686 / #1802). This function performs a batched vault
+    // put *and* a native Calyx constellation measurement — real I/O plus lens
+    // math. It is the single most expensive thing the reflex crate can do, and
+    // it must never run on the tagged scheduler thread. Detection is always-on:
+    // in release the guard counts the violation and emits
+    // `SYNAPSE_CALYX_HOT_PATH_BOUNDARY_VIOLATION`, which `health` surfaces; in
+    // debug it also trips the hard assertion.
+    crate::hot_path::guard_cold("reflex_write_audit");
     let key = audit_key(audit).into_bytes();
     let value = encode_json(audit)?;
     db.put_batch(cf::CF_REFLEX_AUDIT, [(key.clone(), value.clone())])?;

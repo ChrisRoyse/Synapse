@@ -258,6 +258,19 @@ impl ReflexRuntime {
     pub fn audit_context(&self) -> Option<StoredAuditContext> {
         self.audit_context.clone()
     }
+
+    /// Externally readable state of the tick's lowered guard-threshold feed
+    /// (#1686).
+    ///
+    /// `None` before the scheduler has been started; there is no tick and
+    /// therefore no hot path to describe.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn lowered_guard_thresholds_snapshot(&self) -> Option<crate::LoweredFeedSnapshot> {
+        self.scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.lowered_guard_thresholds().snapshot())
+    }
 }
 
 fn duration_us(duration: Duration) -> u64 {

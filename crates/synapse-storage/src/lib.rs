@@ -7,7 +7,7 @@ pub mod constellations;
 pub mod episodes;
 pub mod error;
 mod gc;
-mod maintenance;
+pub mod maintenance;
 mod pressure;
 pub mod routines;
 pub mod timeline;

@@ -499,6 +499,8 @@ impl ReflexScheduler {
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
+        let lowered_refresher = start_lowered_feed(audit_db.as_ref())?;
+        let lowered_feed = Arc::clone(lowered_refresher.feed());
         // The scheduler thread is a hard-real-time 1 ms loop; it must never
         // perform a vault write. Build the off-thread audit sink before the
         // scheduler exists and refuse to start if its writer thread cannot be
@@ -581,6 +583,7 @@ impl ReflexScheduler {
             audit_sink,
             audit_context,
             action_gate,
+            lowered_guard_thresholds: Arc::clone(&lowered_feed),
             tick_index: 0,
             deadline_miss_streak: 0,
             last_tick_late_signal: None,
@@ -599,8 +602,25 @@ impl ReflexScheduler {
             samples,
             controls,
             statuses,
+            lowered_refresher,
         })
     }
+}
+
+/// Builds the tick's frozen guard-threshold feed and starts its off-tick
+/// refresher (#1686).
+///
+/// Done on the cold construction path, before the tick thread exists, so the
+/// artifact's first read never happens under the hot-context tag. The lowered
+/// artifact lives under the vault directory, which is the storage handle's path;
+/// without a storage handle there is no vault and the feed says so rather than
+/// inventing one.
+fn start_lowered_feed(
+    audit_db: Option<&Arc<Db>>,
+) -> ReflexResult<crate::lowered::LoweredRefresher> {
+    let vault_dir = audit_db.map(|db| db.path.clone());
+    let feed = crate::lowered::LoweredGuardThresholdFeed::new(vault_dir.as_deref());
+    crate::lowered::LoweredRefresher::start(feed)
 }
 
 pub(crate) fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()> {

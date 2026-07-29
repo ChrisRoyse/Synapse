@@ -74,6 +74,13 @@ pub(super) struct RuntimeState {
     pub(super) audit_sink: Option<Arc<ReflexAuditSink>>,
     pub(super) audit_context: Option<StoredAuditContext>,
     pub(super) action_gate: Option<ReflexActionGateHandle>,
+    /// Frozen guard-threshold intelligence for the tick (#1686).
+    ///
+    /// Read once per tick with a single lock-free atomic load. This is the
+    /// scheduler's *only* source of Calyx-derived tuning: the tick may not call
+    /// Calyx, and this artifact is what makes that possible rather than merely
+    /// asserted.
+    pub(super) lowered_guard_thresholds: Arc<crate::lowered::LoweredGuardThresholdFeed>,
     pub(super) tick_index: u64,
     pub(super) deadline_miss_streak: u32,
     pub(super) last_tick_late_signal: Option<TickLateSignal>,
@@ -180,8 +187,22 @@ pub(super) fn path_follow_states(
         .collect()
 }
 
+/// Scheduler thread entry point.
+///
+/// This frame exists only to hold the hot-context tag for the *entire* thread
+/// body (#1686). `enter_hot_tick_thread` returns a `#[must_use]` RAII scope, and
+/// a scope bound inside the body would be dropped by any early `return` — from
+/// the timer-start failure path, from `run_degraded`, or from a future `?` —
+/// silently un-tagging the thread and disabling every downstream
+/// `assert_cold_calyx`. Keeping the binding in a wrapper whose only statement is
+/// the call makes that structurally impossible instead of a convention someone
+/// has to remember.
+pub(super) fn run_scheduler_thread(runtime: RuntimeState) {
+    crate::hot_path::run_hot_tick_thread(move || run_tagged_scheduler_thread(runtime));
+}
+
 #[cfg(windows)]
-pub(super) fn run_scheduler_thread(mut runtime: RuntimeState) {
+fn run_tagged_scheduler_thread(mut runtime: RuntimeState) {
     if runtime.config.force_degraded {
         run_degraded(runtime, "forced_degraded_config");
         return;
@@ -207,7 +228,7 @@ pub(super) fn run_scheduler_thread(mut runtime: RuntimeState) {
 }
 
 #[cfg(not(windows))]
-pub(super) fn run_scheduler_thread(runtime: RuntimeState) {
+fn run_tagged_scheduler_thread(runtime: RuntimeState) {
     run_degraded(
         runtime,
         "high-resolution waitable timer is only available on Windows",

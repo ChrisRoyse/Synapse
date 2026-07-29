@@ -296,6 +296,7 @@ impl SynapseService {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
         subsystems.insert("calyx_vault".to_owned(), self.calyx_vault_health());
+        subsystems.insert("calyx_hot_path".to_owned(), self.calyx_hot_path_health());
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("perception".to_owned(), self.perception_health());
@@ -563,6 +564,185 @@ impl SynapseService {
             calyx_clock_mode: tuning.map(|config| config.clock_mode.as_str().to_owned()),
             calyx_fixed_clock_unix_ms: tuning.and_then(|config| config.fixed_clock_unix_ms),
             calyx_rng_seed: tuning.map(|config| config.rng_seed),
+            ..SubsystemHealth::default()
+        }
+    }
+
+    /// Makes the Calyx hot-path boundary externally observable (#1686).
+    ///
+    /// The doctrine is that latency-critical loops consume only frozen, lowered
+    /// artifacts and never issue a live Calyx call. Everything an operator needs
+    /// to *check* that claim — without attaching a debugger — is here:
+    ///
+    /// * `violations_total` must read `0`. It is an always-on counter, not a
+    ///   `debug_assert!`, precisely because `debug_assert!` is compiled out of
+    ///   optimized builds by default, so a release acceptance run would
+    ///   otherwise be measuring nothing.
+    /// * `artifact_file_sha256` is the SHA-256 of the whole published file and
+    ///   is directly comparable with `Get-FileHash`;
+    ///   `artifact_content_sha256` is the payload fingerprint the envelope
+    ///   records and that the consumer re-verifies on every refresh.
+    /// * `artifact_hot_reads_total` proves the tick is reading the artifact, and
+    ///   `publish_*` proves the maintenance pass is producing it.
+    ///
+    /// The subsystem reports `error` on any violation, on a failing publisher,
+    /// or on a tick pinned to the fail-closed defaults while a vault is open —
+    /// each of those means the boundary is not delivering what it claims.
+    fn calyx_hot_path_health(&self) -> SubsystemHealth {
+        let violations_total = synapse_reflex::hot_path::violations_total();
+        let last_violation = synapse_reflex::hot_path::last_violation();
+        let publish = synapse_storage::maintenance::lowering_publish_readback();
+        let feed = match self.m3_state.try_lock() {
+            Ok(state) => state.reflex_runtime.as_ref().and_then(|runtime| {
+                runtime
+                    .try_lock()
+                    .ok()
+                    .and_then(|runtime| runtime.lowered_guard_thresholds_snapshot())
+            }),
+            Err(error) => return state_lock_unavailable_health("M3", error),
+        };
+
+        let mut boundary = synapse_core::CalyxHotPathBoundaryHealth {
+            tick_thread_tagged: Some(synapse_reflex::hot_path::tick_thread_tagged()),
+            hot_ticks_total: Some(synapse_reflex::hot_path::hot_ticks_total()),
+            violations_total: Some(violations_total),
+            violation_code: Some(synapse_reflex::HOT_PATH_BOUNDARY_VIOLATION_CODE.to_owned()),
+            last_violation_operation: last_violation
+                .as_ref()
+                .map(|violation| violation.operation.clone()),
+            last_violation_unix_ms: last_violation
+                .as_ref()
+                .map(|violation| violation.at_unix_ms),
+            publish_attempts_total: Some(publish.attempts_total),
+            publish_success_total: Some(publish.success_total),
+            publish_failure_total: Some(publish.failure_total),
+            publish_skipped_total: Some(publish.skipped_total),
+            publish_last_success_unix_ms: publish.last_success_unix_ms,
+            publish_last_content_sha256: publish.last_content_sha256.clone(),
+            publish_last_error_code: publish.last_error_code.clone(),
+            publish_last_error: publish.last_error.clone(),
+            ..synapse_core::CalyxHotPathBoundaryHealth::default()
+        };
+        if let Some(feed) = &feed {
+            boundary.artifact_state = Some(feed.state.to_owned());
+            boundary.artifact_safe_default_code = feed.safe_default_code.clone();
+            boundary.artifact_safe_default_detail = feed.safe_default_detail.clone();
+            boundary.artifact_safe_default_remediation = feed.safe_default_remediation.clone();
+            boundary.artifact_content_sha256 = feed.content_sha256.clone();
+            boundary.artifact_generation = feed.generation;
+            boundary.artifact_source_ledger_seq = feed.source_ledger_seq;
+            boundary.artifact_vault_id = feed.vault_id.clone();
+            boundary.artifact_produced_at_unix_ms = feed.produced_at_unix_ms;
+            boundary.artifact_staleness_bound_ms = feed.staleness_bound_ms;
+            boundary.artifact_hot_reads_total = Some(feed.hot_reads_total);
+            boundary.artifact_refreshes_total = Some(feed.refreshes_total);
+            boundary.artifact_fresh_refreshes_total = Some(feed.fresh_refreshes_total);
+            boundary.artifact_safe_default_refreshes_total =
+                Some(feed.safe_default_refreshes_total);
+            boundary.refresher_running = Some(feed.refresher_running);
+            boundary.refresher_interval_ms = Some(feed.refresher_interval_ms);
+            boundary.artifact_path = feed
+                .artifact_path
+                .as_ref()
+                .map(|path| path.display().to_string());
+        }
+        // The published file is hashed here, in health, so `Get-FileHash` on the
+        // same path is a direct comparison an operator can make by hand.
+        let artifact_path = feed
+            .as_ref()
+            .and_then(|feed| feed.artifact_path.clone())
+            .or_else(|| publish.last_path.clone());
+        if let Some(path) = artifact_path.as_ref() {
+            boundary.artifact_path = Some(path.display().to_string());
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    boundary.artifact_file_bytes = u64::try_from(bytes.len()).ok();
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    boundary.artifact_file_sha256 = Some(hex_lower(&hasher.finalize()));
+                }
+                Err(error) => {
+                    boundary.artifact_file_read_error = Some(format!(
+                        "read published lowered artifact {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        let mut reasons = Vec::new();
+        if violations_total > 0 {
+            reasons.push(format!(
+                "{} live-Calyx-from-hot-path violations ({violations_total} total, last={})",
+                synapse_reflex::HOT_PATH_BOUNDARY_VIOLATION_CODE,
+                last_violation
+                    .as_ref()
+                    .map_or("unknown", |violation| violation.operation.as_str())
+            ));
+        }
+        if publish.failure_total > 0 {
+            reasons.push(format!(
+                "guard-threshold lowering publisher has {} failures (last {}: {})",
+                publish.failure_total,
+                publish.last_error_code.as_deref().unwrap_or("unknown"),
+                publish.last_error.as_deref().unwrap_or("unknown")
+            ));
+        }
+        // A tick on the fail-closed defaults is only a *defect* once a publish
+        // has actually succeeded: that combination means the producer wrote an
+        // artifact the consumer refuses, which is real drift. Before the first
+        // successful publish the tick is legitimately on the documented safe
+        // defaults, and calling that an error would cry wolf on every fresh
+        // start for a whole maintenance cadence.
+        let pending_first_publish =
+            feed.as_ref().is_some_and(|feed| feed.state != "fresh") && publish.success_total == 0;
+        if let Some(feed) = &feed
+            && feed.state != "fresh"
+            && publish.success_total > 0
+        {
+            reasons.push(format!(
+                "a lowered guard-threshold artifact has been published but the reflex tick \
+                 refuses it and runs on the fail-closed defaults ({}: {})",
+                feed.safe_default_code.as_deref().unwrap_or("unknown"),
+                feed.safe_default_detail.as_deref().unwrap_or("unknown")
+            ));
+        }
+        let status = if !reasons.is_empty() {
+            "error"
+        } else if feed.is_none() {
+            "initializing"
+        } else if pending_first_publish {
+            "pending_lowering"
+        } else {
+            "ok"
+        };
+        let detail = if reasons.is_empty() {
+            feed.as_ref().map_or_else(
+                || {
+                    "reflex runtime has not started; the hot-path boundary reports once a tick \
+                     thread exists"
+                        .to_owned()
+                },
+                |feed| {
+                    format!(
+                        "violations_total={violations_total} artifact_state={} \
+                         content_sha256={} hot_reads_total={} publish_success_total={} \
+                         publish_last_error_code={}",
+                        feed.state,
+                        feed.content_sha256.as_deref().unwrap_or("none"),
+                        feed.hot_reads_total,
+                        publish.success_total,
+                        publish.last_error_code.as_deref().unwrap_or("none")
+                    )
+                },
+            )
+        } else {
+            reasons.join("; ")
+        };
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail: Some(detail),
+            calyx_hot_path: Some(boundary),
             ..SubsystemHealth::default()
         }
     }

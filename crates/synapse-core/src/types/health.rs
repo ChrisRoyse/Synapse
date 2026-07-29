@@ -365,6 +365,10 @@ pub struct SubsystemHealth {
     /// fields are retained; full responses populate every parsed field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_bridge: Option<ChromeBridgeDetail>,
+    /// Structured `calyx_hot_path` verdict (#1686). `None` for every subsystem
+    /// except `calyx_hot_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_hot_path: Option<CalyxHotPathBoundaryHealth>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -372,6 +376,129 @@ pub struct SubsystemHealth {
 pub struct CalyxMathProbeTopKEntry {
     pub index: usize,
     pub score: f32,
+}
+
+/// Externally readable state of the Calyx hot-path boundary (#1686).
+///
+/// The boundary doctrine is that latency-critical loops consume only *lowered*,
+/// frozen, fingerprinted artifacts and never issue a live Calyx call. This
+/// struct is the evidence surface for that claim, and every field is designed to
+/// be checkable from `health` alone, without a debugger:
+///
+/// * `violations_total` is an **always-on** counter — it is maintained
+///   identically in debug and release, because the in-crate `debug_assert!`
+///   boundary check is compiled out of optimized builds by default
+///   (see `std::debug_assert!`), which would make a release acceptance run
+///   worthless on its own.
+/// * `artifact_file_sha256` is the SHA-256 of the *whole published file*, so an
+///   operator can compare it directly against `Get-FileHash`.
+/// * `artifact_content_sha256` is the fingerprint the envelope records over its
+///   frozen payload, re-verified at read time by the artifact consumer.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxHotPathBoundaryHealth {
+    /// Whether the reflex scheduler thread is currently tagged as a hot context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_thread_tagged: Option<bool>,
+    /// Ticks executed under the hot-context tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_ticks_total: Option<u64>,
+    /// Always-on count of live-Calyx-from-hot-context violations. Must be `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violations_total: Option<u64>,
+    /// Operation named by the most recent violation, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_violation_operation: Option<String>,
+    /// Wall-clock time of the most recent violation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_violation_unix_ms: Option<u64>,
+    /// Structured code emitted on violation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation_code: Option<String>,
+    /// Absolute path of the lowered guard-threshold artifact the tick consumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    /// `fresh` or `safe_default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_state: Option<String>,
+    /// Fail-closed code in force while `artifact_state` is `safe_default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_safe_default_code: Option<String>,
+    /// Detail for the fail-closed safe default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_safe_default_detail: Option<String>,
+    /// Remediation for the fail-closed safe default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_safe_default_remediation: Option<String>,
+    /// Payload fingerprint recorded in the envelope and re-verified on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_content_sha256: Option<String>,
+    /// SHA-256 over the entire published file; compare with `Get-FileHash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_file_sha256: Option<String>,
+    /// Size of the published file in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_file_bytes: Option<u64>,
+    /// Error encountered while hashing the published file for readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_file_read_error: Option<String>,
+    /// Monotonic artifact generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_generation: Option<u64>,
+    /// Vault ledger sequence the artifact was lowered from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_source_ledger_seq: Option<u64>,
+    /// Vault id the artifact was lowered from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_vault_id: Option<String>,
+    /// When the artifact was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_produced_at_unix_ms: Option<u64>,
+    /// Reader-side staleness bound in force (`0` disables the wall-clock bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_staleness_bound_ms: Option<u64>,
+    /// Hot-path `load()` calls served from the frozen in-memory pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_hot_reads_total: Option<u64>,
+    /// Off-tick refresh passes performed by the reflex refresher thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_refreshes_total: Option<u64>,
+    /// Refreshes that landed on a verified fresh artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_fresh_refreshes_total: Option<u64>,
+    /// Refreshes that degraded to the documented safe default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_safe_default_refreshes_total: Option<u64>,
+    /// Whether the off-tick refresher thread is alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresher_running: Option<bool>,
+    /// Off-tick refresher cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresher_interval_ms: Option<u64>,
+    /// Publish attempts made by the storage maintenance pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_attempts_total: Option<u64>,
+    /// Publishes that wrote and re-verified an artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_success_total: Option<u64>,
+    /// Publishes that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_failure_total: Option<u64>,
+    /// Publishes skipped because no open Calyx vault was registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_skipped_total: Option<u64>,
+    /// When the last successful publish completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_last_success_unix_ms: Option<u64>,
+    /// Fingerprint written by the last successful publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_last_content_sha256: Option<String>,
+    /// Structured code of the last publish failure or skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_last_error_code: Option<String>,
+    /// Detail of the last publish failure or skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_last_error: Option<String>,
 }
 
 /// Structured replacement for the `chrome_bridge` subsystem's concatenated
