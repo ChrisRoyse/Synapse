@@ -2,7 +2,8 @@
 
 use crate::cf::{ColumnFamily, base_key, recurrence_key, recurrence_prefix_range};
 use crate::dedup::{EpochSecs, OccurrenceId};
-use crate::vault::{AsterVault, encode};
+use crate::vault::AsterVault;
+use crate::vault::base_rewrite::BaseRowRewrite;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, VaultStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -151,7 +152,15 @@ pub enum StoredRecurrenceRow {
 
 #[derive(Clone, Debug)]
 pub struct RecurrenceAppend {
-    pub updated_base: Constellation,
+    /// The subject's Base row, rewritten in place.
+    ///
+    /// A `Constellation` here would be wrong: every occurrence append rewrites
+    /// this row, and re-encoding a decoded constellation replaces its real slot
+    /// hashes with hashes of the `Absent` placeholders the decode produced
+    /// (issue #1888). This is the panel that lazily backfills its slots, so
+    /// that clobber landed on the one panel it could actually damage — and it
+    /// did, silently, on every occurrence.
+    pub updated_base: BaseRowRewrite,
     pub recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
     pub occurrence_id: OccurrenceId,
 }
@@ -236,7 +245,7 @@ where
 
 pub(crate) fn build_append<C>(
     vault: &AsterVault<C>,
-    mut base: Constellation,
+    mut base: BaseRowRewrite,
     t_k: EpochSecs,
     context: OccurrenceContext,
     observed_at: EpochSecs,
@@ -249,8 +258,9 @@ where
     retention.validate()?;
     t_k.to_u64()?;
     observed_at.to_u64()?;
-    let existing = read_rows(vault, base.cx_id)?;
-    let frequency = frequency_from_base(&base)?
+    let cx_id = base.constellation().cx_id;
+    let existing = read_rows(vault, cx_id)?;
+    let frequency = frequency_from_base(base.constellation())?
         .unwrap_or(0)
         .max(existing.total_count());
     let next_frequency = frequency
@@ -271,12 +281,12 @@ where
     let summary = merge_summary(existing.rollup_summary, &rolled);
 
     let mut recurrence_rows = vec![(
-        recurrence_key(base.cx_id, occurrence_id.0),
+        recurrence_key(cx_id, occurrence_id.0),
         encode_recurrence_row(&StoredRecurrenceRow::Occurrence(new_occurrence))?,
     )];
     for occurrence in &rolled {
         recurrence_rows.push((
-            recurrence_key(base.cx_id, occurrence.id.0),
+            recurrence_key(cx_id, occurrence.id.0),
             encode_recurrence_row(&StoredRecurrenceRow::RolledOccurrence {
                 id: occurrence.id,
                 dedup_key_sha256: occurrence.dedup_key_sha256,
@@ -287,12 +297,13 @@ where
     }
     if let Some(summary) = &summary {
         recurrence_rows.push((
-            recurrence_summary_key(base.cx_id),
+            recurrence_summary_key(cx_id),
             encode_recurrence_row(&StoredRecurrenceRow::RollupSummary(summary.clone()))?,
         ));
     }
 
-    base.scalars
+    base.constellation_mut()
+        .scalars
         .insert(FREQUENCY_SCALAR.to_string(), next_frequency as f64);
     Ok(RecurrenceAppend {
         updated_base: base,
@@ -348,7 +359,8 @@ fn base_frequency<C: Clock>(vault: &AsterVault<C>, cx_id: CxId) -> Result<u64> {
     let Some(base) = read_base(vault, cx_id)? else {
         return Ok(0);
     };
-    Ok(frequency_from_base(&base)?.unwrap_or(0))
+    let base = base.constellation();
+    Ok(frequency_from_base(base)?.unwrap_or(0))
 }
 
 pub fn recurrence_summary_key(cx_id: CxId) -> Vec<u8> {
@@ -365,10 +377,10 @@ pub fn decode_recurrence_row(bytes: &[u8]) -> Result<StoredRecurrenceRow> {
         .map_err(|error| CalyxError::aster_corrupt_shard(format!("decode recurrence row: {error}")))
 }
 
-fn read_base<C: Clock>(vault: &AsterVault<C>, cx_id: CxId) -> Result<Option<Constellation>> {
+fn read_base<C: Clock>(vault: &AsterVault<C>, cx_id: CxId) -> Result<Option<BaseRowRewrite>> {
     vault
         .read_cf_at(vault.snapshot(), ColumnFamily::Base, &base_key(cx_id))?
-        .map(|bytes| encode::decode_constellation_base(&bytes))
+        .map(|bytes| BaseRowRewrite::decode(&bytes))
         .transpose()
 }
 

@@ -20,6 +20,7 @@ use super::{
 use crate::cf::ColumnFamily;
 use crate::recurrence::{OccurrenceContext, RetentionPolicy, build_append};
 use crate::vault::AsterVault;
+use crate::vault::base_rewrite::BaseRowRewrite;
 
 pub fn ingest_at<C>(
     vault: &AsterVault<C>,
@@ -222,9 +223,11 @@ where
     );
     let mut recurrence_rows = Vec::new();
     if is_recurrence_series {
+        // A brand-new constellation genuinely holds its slot vectors, so its
+        // hashes are computed from them rather than carried (#1888).
         let append = build_append(
             vault,
-            new_cx,
+            BaseRowRewrite::from_measured(&new_cx)?,
             at,
             OccurrenceContext::new(Vec::new())?,
             at,
@@ -232,7 +235,7 @@ where
             None,
         )?;
         let occurrence = append.occurrence_id;
-        new_cx = append.updated_base;
+        new_cx = append.updated_base.constellation().clone();
         recurrence_rows = append.recurrence_rows;
         online_rows.push(online_event_row(
             DedupOnlineKind::Occurrence,
@@ -304,11 +307,13 @@ where
     let mut before_base = None;
     let mut recurrence_tombstones = Vec::new();
     let occurrence = if matched.action == DedupAction::RecurrenceSeries {
+        // `get` hydrates the real slot vectors from the slot CFs, so this is a
+        // measured constellation, not a decoded Base row (#1888).
         let base = vault.get(matched.existing, vault.snapshot())?;
         before_base = Some(base.clone());
         let append = build_append(
             vault,
-            base,
+            BaseRowRewrite::from_measured(&base)?,
             matched.at,
             OccurrenceContext::new(Vec::new())?,
             matched.at,

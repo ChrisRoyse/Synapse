@@ -1,3 +1,4 @@
+use super::base_rewrite::BaseRowRewrite;
 use super::{AsterVault, encode, ledger_hook};
 use crate::cf::{ColumnFamily, base_key};
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq};
@@ -9,10 +10,11 @@ where
     pub(crate) fn commit_recurrence_batch_locked(
         &self,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
-        updated_base: Option<Constellation>,
+        updated_base: Option<BaseRowRewrite>,
     ) -> Result<Seq> {
         let mut rows = Vec::new();
-        if let Some(cx) = updated_base.as_ref() {
+        if let Some(rewrite) = updated_base.as_ref() {
+            let cx = rewrite.constellation();
             if cx.vault_id != self.vault_id {
                 return Err(CalyxError::vault_access_denied(
                     "recurrence base update belongs to another vault",
@@ -21,7 +23,9 @@ where
             rows.push(encode::WriteRow {
                 cf: ColumnFamily::Base,
                 key: base_key(cx.cx_id),
-                value: encode::encode_constellation_base(cx)?,
+                // Carries the stored slot hashes; re-encoding from the decoded
+                // constellation clobbered them on every occurrence (#1888).
+                value: rewrite.encode()?,
             });
         }
         rows.extend(
@@ -54,7 +58,7 @@ where
     pub(crate) fn commit_dedup_ingest_locked(
         &self,
         mut constellation: Option<Constellation>,
-        updated_base: Option<Constellation>,
+        updated_base: Option<BaseRowRewrite>,
         online_rows: Vec<(Vec<u8>, Vec<u8>)>,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
         subject: CxId,
@@ -86,7 +90,8 @@ where
         if let Some(cx) = constellation.as_ref() {
             self.stage_constellation_rows(&mut rows, cx)?;
         }
-        if let Some(cx) = updated_base.as_ref() {
+        if let Some(rewrite) = updated_base.as_ref() {
+            let cx = rewrite.constellation();
             if cx.vault_id != self.vault_id {
                 return Err(CalyxError::vault_access_denied(
                     "dedup recurrence base update belongs to another vault",
@@ -95,7 +100,7 @@ where
             rows.push(encode::WriteRow {
                 cf: ColumnFamily::Base,
                 key: base_key(cx.cx_id),
-                value: encode::encode_constellation_base(cx)?,
+                value: rewrite.encode()?,
             });
         }
         for (key, value) in online_rows {

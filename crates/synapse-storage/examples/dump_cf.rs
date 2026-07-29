@@ -2089,8 +2089,8 @@ fn audit_slot_hashes(db_path: PathBuf, repair: bool) -> Result<(), Box<dyn Error
         (None, None) => unreachable!("exactly one vault handle is opened"),
     };
     let vault_id = match (writable.as_ref(), read_only.as_ref()) {
-        (Some(vault), _) => vault.vault_id().to_string(),
-        (None, Some(vault)) => vault.vault_id().to_string(),
+        (Some(vault), _) => vault.vault_id(),
+        (None, Some(vault)) => vault.vault_id(),
         (None, None) => unreachable!("exactly one vault handle is opened"),
     };
     write_stdout_line(
@@ -2141,8 +2141,8 @@ fn audit_slot_hashes(db_path: PathBuf, repair: bool) -> Result<(), Box<dyn Error
         let entry = tally.entry(panel.clone()).or_default();
         entry.0 = entry.0.saturating_add(1);
 
-        let mut rewrite = BaseRowRewrite::decode(&value)?;
-        let mut row_bad = false;
+        let mut restated = BaseRowRewrite::decode(&value)?;
+        let mut row_has_defect = false;
         let mut row_repairable = true;
         for (slot, recorded) in &slot_hashes {
             slots_checked = slots_checked.saturating_add(1);
@@ -2183,7 +2183,7 @@ fn audit_slot_hashes(db_path: PathBuf, repair: bool) -> Result<(), Box<dyn Error
                     row_repairable = false;
                 }
             }
-            row_bad = true;
+            row_has_defect = true;
             write_stdout_line(
                 &mut stdout,
                 format_args!(
@@ -2201,10 +2201,10 @@ fn audit_slot_hashes(db_path: PathBuf, repair: bool) -> Result<(), Box<dyn Error
             if verdict == SlotHashVerdict::Mismatched
                 && let Some(bytes) = stored.as_deref()
             {
-                rewrite.set_slot_hash(*slot, bytes)?;
+                restated.set_slot_hash(*slot, bytes)?;
             }
         }
-        if !row_bad {
+        if !row_has_defect {
             continue;
         }
         rows_bad = rows_bad.saturating_add(1);
@@ -2222,7 +2222,7 @@ fn audit_slot_hashes(db_path: PathBuf, repair: bool) -> Result<(), Box<dyn Error
             repairs.push(SynapseCalyxCfWrite::new(
                 ColumnFamily::Base,
                 key.clone(),
-                rewrite.encode()?,
+                restated.encode()?,
             ));
             repaired_rows = repaired_rows.saturating_add(1);
         }

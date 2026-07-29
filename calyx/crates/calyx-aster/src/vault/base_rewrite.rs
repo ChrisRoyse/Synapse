@@ -33,6 +33,33 @@ pub struct BaseRowRewrite {
 }
 
 impl BaseRowRewrite {
+    /// Builds a rewrite from a constellation whose slot vectors are genuinely
+    /// present, computing each slot hash from the vector itself.
+    ///
+    /// This is the other legitimate origin of authoritative slot hashes: a
+    /// freshly measured constellation, or one hydrated from the slot CFs by
+    /// `AsterVault::get`. Having both origins produce the *same* type is what
+    /// removes the ambiguity that caused #1888 — a caller can no longer hand a
+    /// decoded, placeholder-slotted constellation to a rewrite path that
+    /// assumes measured vectors, because the rewrite path takes this type and
+    /// only these two constructors can produce one.
+    pub fn from_measured(constellation: &Constellation) -> Result<Self> {
+        let slot_hashes = constellation
+            .slots
+            .iter()
+            .map(|(slot, vector)| {
+                Ok((
+                    *slot,
+                    encode::hash_slot_bytes(&encode::encode_slot_vector(vector)?),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            constellation: constellation.clone(),
+            slot_hashes,
+        })
+    }
+
     /// Decodes a stored Base row for in-place mutation.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let (constellation, slot_hashes) =
