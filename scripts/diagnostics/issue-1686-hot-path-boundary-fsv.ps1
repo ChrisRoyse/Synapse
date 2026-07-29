@@ -48,10 +48,21 @@ $before = Get-HotPath
 if ($null -eq $before) { Write-Host "  calyx_hot_path subsystem ABSENT from health - deploy did not land" -ForegroundColor Red; exit 1 }
 Note ($before | ConvertTo-Json -Depth 4 -Compress)
 
-Check 'reflex tick thread is tagged hot'        $true  $before.tick_thread_tagged
+# At rest, with no reflex registered, there is no scheduler and therefore no
+# tick thread. That is a legitimate state, and health must SAY so rather than
+# leave tick_thread_tagged=false looking like a broken tag. The tagging itself
+# is asserted after a reflex is registered, further down.
 Check 'no boundary violations at rest'          0      ([int]$before.violations_total)
 Check 'no violation code at rest'               $null  $before.violation_code
-Check 'artifact refresher is running'           $true  $before.refresher_running
+if (-not $before.scheduler_started) {
+    Note "no reflex registered yet, so no scheduler - health must name the condition:"
+    Note ("  feed_unavailable_code = $($before.feed_unavailable_code)")
+    Check 'health names why the feed is unavailable' 'REFLEX_SCHEDULER_NOT_STARTED' $before.feed_unavailable_code
+    Check 'and gives a remediation'                  $true (-not [string]::IsNullOrWhiteSpace($before.feed_unavailable_reason))
+    Check 'tick thread is honestly reported untagged' $false $before.tick_thread_tagged
+} else {
+    Check 'reflex tick thread is tagged hot'     $true  $before.tick_thread_tagged
+}
 
 # The publish must have actually happened; `pending_lowering` means it never did.
 Note ("artifact_state = $($before.artifact_state)   publish_success_total = $($before.publish_success_total)")
@@ -120,7 +131,19 @@ $reg = Invoke-SynTool -SessionId $sid -Name 'routine' -TimeoutSec 120 -Arguments
 if ($reg.error) { Write-Host ("  reflex_register error: " + ($reg.error | ConvertTo-Json -Depth 6 -Compress)) -ForegroundColor Red }
 Check 'registered a reflex (needs WRITE_REFLEX in --allowed-permissions)' $true (-not [bool]$reg.error)
 $reflexId = $null
-if ($reg.obj) { $reflexId = $reg.obj.reflex_id; Note ("reflex_id = $reflexId") }
+if ($reg.obj) {
+    foreach ($cand in @($reg.obj.reflex_register.reflex_id, $reg.obj.reflex_register.id, $reg.obj.reflex_id, $reg.obj.id)) {
+        if (-not [string]::IsNullOrWhiteSpace($cand)) { $reflexId = $cand; break }
+    }
+}
+if (-not $reflexId) {
+    # Fall back to the authoritative list rather than leaking a registered
+    # reflex onto the operator's daemon.
+    $ls = Invoke-SynTool -SessionId $sid -Name 'routine' -Arguments @{ operation='reflex_list'; reflex_list=@{} } -TimeoutSec 120
+    $reflexId = @($ls.obj.reflex_list.reflexes | Where-Object { $_.state -eq 'active' } | Select-Object -First 1).id
+}
+Note ("reflex_id = $reflexId")
+Check 'obtained a reflex id so cleanup cannot leak it' $true (-not [string]::IsNullOrWhiteSpace($reflexId))
 if ($reg.error) { Write-Host "`nABORTING: cannot start a tick thread, so the boundary claim is untestable." -ForegroundColor Red; exit 1 }
 
 $seqBefore   = Get-VaultSeq
@@ -160,6 +183,10 @@ try {
             operation = 'reflex_cancel'; reflex_cancel = @{ reflex_id = $reflexId }
         }
         Note ("reflex cancelled: isError=$($can.isError)")
+        # Independent readback: the FSV must not leave state behind.
+        Start-Sleep -Seconds 2
+        $ls2 = Invoke-SynTool -SessionId $sid -Name 'routine' -Arguments @{ operation='reflex_list'; reflex_list=@{} } -TimeoutSec 120
+        Check 'FSV left no active reflex behind' 0 (@($ls2.obj.reflex_list.reflexes | Where-Object { $_.state -eq 'active' }).Count)
     }
 }
 

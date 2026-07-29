@@ -94,28 +94,65 @@ $vaultCopy = Join-Path $backup 'vault'
 Check 'vault/ copy exists' $true (Test-Path -LiteralPath $vaultCopy)
 
 # 1. Every hash in the manifest must be independently reproducible.
+#    `relative_path` is relative to the vault/ copy, not the backup root.
 $files = @($manifest.files)
 Note ("manifest records $($files.Count) files; re-hashing every one independently")
-$mismatch = 0; $missing = 0
+$mismatch = 0; $missing = 0; $hashed = 0
 foreach ($entry in $files) {
-    $rel = if ($entry.path) { $entry.path } else { $entry.relative_path }
-    $abs = Join-Path $backup $rel
-    if (-not (Test-Path -LiteralPath $abs)) { $missing++; continue }
-    $want = if ($entry.sha256) { $entry.sha256 } else { $entry.hash }
-    $got  = (Get-FileHash -LiteralPath $abs -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($got -ne $want.ToLowerInvariant()) { $mismatch++ ; Write-Host "    HASH MISMATCH $rel" -ForegroundColor Red }
+    $abs = Join-Path $vaultCopy $entry.relative_path
+    if (-not (Test-Path -LiteralPath $abs)) {
+        $missing++
+        if ($missing -le 5) { Write-Host "    MISSING $($entry.relative_path)" -ForegroundColor Red }
+        continue
+    }
+    $got = (Get-FileHash -LiteralPath $abs -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hashed++
+    if ($got -ne "$($entry.sha256)".ToLowerInvariant()) {
+        $mismatch++
+        Write-Host "    HASH MISMATCH $($entry.relative_path)" -ForegroundColor Red
+    }
 }
 Check 'every manifest file present on disk' 0 $missing
 Check 'every manifest SHA-256 independently reproduces' 0 $mismatch
+# Guard against the vacuous pass: a `continue` on every entry would leave zero
+# mismatches while having verified nothing at all.
+Check 'the hash check was not vacuous (all entries actually hashed)' $files.Count $hashed
+Check 'manifest file_count agrees with its own files array' ([int]$manifest.file_count) $files.Count
 
 # 2. The runtime locks must be excluded DELIBERATELY and said so, not dropped.
-$copied = @(Get-ChildItem $vaultCopy -Recurse -File | ForEach-Object { $_.FullName.Substring($vaultCopy.Length).TrimStart('\') })
+$copied     = @(Get-ChildItem $vaultCopy -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($vaultCopy.Length).TrimStart('\') })
+$manifested = @($files | ForEach-Object { $_.relative_path -replace '/', '\' })
+$excluded   = @($manifest.excluded_runtime)
 foreach ($runtime in @('daemon.lock','daemon-lifecycle.lock','vault.lock','vault.pid','daemon.pid')) {
-    Check "runtime lock excluded from the copy: $runtime" $false ($copied -contains $runtime)
+    Check "runtime lock not copied: $runtime" $false ($copied -contains $runtime)
+    Check "runtime lock not manifested: $runtime" $false ($manifested -contains $runtime)
 }
-Check 'wal\.append.lock excluded' $false ([bool]($copied | Where-Object { $_ -like '*.append.lock' }))
-Check 'exclusions are recorded, not silent' $true ($null -ne $manifest.excluded_runtime -and @($manifest.excluded_runtime).Count -gt 0)
-Note ("excluded_runtime: " + ((@($manifest.excluded_runtime) | ForEach-Object { $_.path }) -join ', '))
+# A 0-byte .append.lock can legitimately reappear in the copy, because opening
+# the backup vault read-only during restore_verify recreates the lock token.
+# The property that matters is that the backup never CLAIMS it as vault data.
+Check 'wal/.append.lock is not manifested as data' $false ([bool]($manifested | Where-Object { $_ -like '*.append.lock' }))
+Check 'exclusions are recorded, not silent' $true ($excluded.Count -gt 0)
+Check 'wal/.append.lock exclusion is recorded with a reason' $true `
+    ([bool]($excluded | Where-Object { $_.relative_path -like '*append.lock*' -and $_.reason }))
+Note ("excluded_runtime (" + $excluded.Count + "): " + ((@($excluded) | ForEach-Object { "$($_.relative_path)" }) -join ', '))
+
+# 2b. The pinned-manifest snapshot is the fix for the rotation race. Assert it.
+$pin = $manifest.pinned_manifest
+Check 'a manifest generation was pinned' $true ($null -ne $pin -and -not [string]::IsNullOrWhiteSpace($pin.pointer))
+Note ("pinned pointer=$($pin.pointer) manifest_seq=$($pin.manifest_seq) durable_seq=$($pin.durable_seq) retained=$($pin.generations_retained)")
+Check 'retention window matches the measured 32' 32 ([int]$pin.generations_retained)
+Check 'the pinned manifest itself is in the copy' $true (Test-Path -LiteralPath (Join-Path $vaultCopy $pin.pointer))
+Check 'CURRENT in the copy names the pinned generation' $pin.pointer ((Get-Content -LiteralPath (Join-Path $vaultCopy 'CURRENT') -Raw).Trim())
+$refMissing = 0
+foreach ($ref in @($pin.referenced_paths)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $vaultCopy ($ref -replace '/', '\')))) { $refMissing++; Write-Host "    REFERENCED-BUT-MISSING $ref" -ForegroundColor Red }
+}
+Note ("pinned manifest references $(@($pin.referenced_paths).Count) paths")
+Check 'every referenced path was copied (mandatory, never tolerated)' 0 $refMissing
+Note ("tolerated_absences = $(@($manifest.tolerated_absences).Count) (superseded generations reclaimed mid-copy; each must carry a justification)")
+foreach ($ta in @($manifest.tolerated_absences)) {
+    Check "tolerated absence carries a justification: $($ta.relative_path)" $true (-not [string]::IsNullOrWhiteSpace($ta.reason))
+}
 
 # 3. Vault identity must be captured (the #1875 lesson).
 Check 'lineage journal captured' $true (Test-Path -LiteralPath (Join-Path $backup 'vault_lineage.json'))
@@ -134,9 +171,17 @@ $rv = Invoke-SynTool -SessionId $sid2 -Name 'storage' -Arguments @{ operation='r
 if ($rv.error) { Write-Host ("  restore_verify error: " + ($rv.error | ConvertTo-Json -Depth 6 -Compress)) -ForegroundColor Red }
 Check 'restore_verify succeeded' $true (-not [bool]$rv.error)
 if ($rv.obj) {
-    Note ($rv.obj | ConvertTo-Json -Depth 5 -Compress)
-    Check 'restored chain verifies intact' $true ([bool]$rv.obj.chain_intact)
-    Check 'restored vault id matches the source' $liveVaultId $rv.obj.vault_id
+    $v = $rv.obj.restore_verify.verify
+    Note ("success=$($v.success) chain_intact=$($v.chain_intact) constellations=$($v.constellation_count) anchors=$($v.anchor_count) ledger_entries=$($v.ledger_entry_count)")
+    Note ("ledger_tip_hash=$($v.ledger_tip_hash)")
+    Check 'restore_verify reports success'        $true ([bool]$v.success)
+    Check 'restored chain verifies intact'        $true ([bool]$v.chain_intact)
+    Check 'no failure reasons'                    0     (@($v.failure_reasons).Count)
+    Check 'restored vault holds constellations'   $true ([int]$v.constellation_count -gt 0)
+    Check 'restored vault holds ledger entries'   $true ([int]$v.ledger_entry_count -gt 0)
+    Check 'verify ran against the backup copy'    $vaultCopy $v.vault_path
+    # The manifest recorded the vault identity independently of this verify.
+    Check 'backup manifest records the source vault id' $liveVaultId $manifest.vault_id
 }
 
 # ------------------------------------------------------ EDGE: CONTAINMENT ---
