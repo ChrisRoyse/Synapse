@@ -25,7 +25,8 @@ use super::support::{
     vault_base_count_at,
 };
 use super::{
-    FusionChoice, FusionTuning, GuardChoice, SearchBudget, SearchFreshness, SearchOutcome,
+    FusionChoice, FusionResolution, FusionTuning, GuardChoice, SearchBudget, SearchFreshness,
+    SearchOutcome,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -196,7 +197,18 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         trace.emit("search_slots.empty", None, Some(0));
         return Ok(SearchOutcome::empty_with_generation(generation));
     }
-    let strategy = fusion.to_strategy(&slots)?;
+    // Resolved against three sets, not one: which slots scored, which the query
+    // could measure into at all, and which the generation holds (#1913).
+    let strategy = match fusion.to_strategy(&slots, &query_slots, &generation)? {
+        FusionResolution::Ready(strategy) => strategy,
+        FusionResolution::NoMatch => {
+            // The requested lens exists and this query probed it; it simply
+            // matched nothing. Same verdict as the all-slots-empty branch above,
+            // for the same reason.
+            trace.emit("fusion.single_lens.empty", None, Some(0));
+            return Ok(SearchOutcome::empty_with_generation(generation));
+        }
+    };
     let context = FusionContext {
         panel_version: panel.version,
         k: k.max(64),

@@ -36,7 +36,9 @@ mod types;
 pub use budget::SearchBudget;
 pub use delta::{MAX_RECONCILED_DELTA_KEYS, PanelDeltaComposition, measure_panel_delta};
 use search::search_outcome_with_measured_slots;
-pub use types::{FusionChoice, FusionTuning, GuardChoice, SearchFreshness, SearchOutcome};
+pub use types::{
+    FusionChoice, FusionResolution, FusionTuning, GuardChoice, SearchFreshness, SearchOutcome,
+};
 
 /// Historical flat in-region cosine threshold. Since #1094 this is NEVER
 /// applied implicitly: `--guard in-region` without an operator tau loads the

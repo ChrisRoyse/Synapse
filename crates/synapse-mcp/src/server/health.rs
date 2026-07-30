@@ -660,11 +660,40 @@ impl SynapseService {
             ),
             _ => (status.state.clone(), status.remediation.clone()),
         };
-        // `built` is the only healthy state. Every other value means recall
-        // either cannot serve, is expected to fail closed, or is unverified —
-        // each of which is an error rather than a warning, because the surface
-        // presents as available otherwise.
-        let health_status = if state == "built" { "ok" } else { "error" };
+        // `built` is the only healthy state: every other value means recall
+        // cannot serve, is expected to fail closed, or is unverified, and
+        // reporting any of those as `ok` is the lying surface #1891/#1907 were
+        // about.
+        //
+        // But `error` is not the only alternative to `ok`, and collapsing them
+        // was its own lying surface (#1914). Before the derived-state maintainer's
+        // first tick there is no measurement to fold in, so the state is still
+        // `built_delta_unmeasured` — not because anything is wrong, but because
+        // nothing has been measured yet. Calling that `error` made `health.ok`
+        // false for the first ~5.5 minutes of EVERY daemon start, which is
+        // exactly when a gate or operator is most likely to be watching, and
+        // trains them to discount the flag.
+        //
+        // The distinction is load bearing:
+        //   error    — measured, and recall cannot serve. Act now.
+        //   starting — not measured yet. Nothing is known to be wrong. Wait a tick.
+        //
+        // `starting` matches what `calyx_derived_state` and `calyx_lens_coverage`
+        // already report for their own pre-first-tick state, so the three agree
+        // instead of one of them flipping the global flag.
+        //
+        // Deliberately narrow: this is ONLY the never-measured case. A stale
+        // measurement, a missing manifest, an unreadable panel state and a
+        // `lagging` generation are all measured facts about a generation that
+        // cannot serve, and every one of them stays `error`.
+        let never_measured = measured_delta.is_none() && state == "built_delta_unmeasured";
+        let health_status = if state == "built" {
+            "ok"
+        } else if never_measured {
+            "starting"
+        } else {
+            "error"
+        };
         let remediation_for_field = remediation.clone();
         let slot_summary = if status.slots.is_empty() {
             "none".to_owned()
