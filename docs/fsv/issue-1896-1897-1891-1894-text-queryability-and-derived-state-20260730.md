@@ -489,3 +489,61 @@ maintainer's measurement, the remediation still came from the cheap-path
 classifier. Two adjacent fields contradicting each other is the same
 lying-surface shape in miniature. Fixed in `8eacd5ad`: both now come from the
 same match.
+
+---
+
+## Final state (`6379d316` + `8eacd5ad`, daemon pid 19404)
+
+exe sha256 `72CD37B5EA51A5B02D713166F56920AA99865D3901D69515180EB00B7D1A883D`.
+Read from an independent MCP session.
+
+```
+health.ok = True
+
+calyx_search_generation : ok
+  state=built  delta_changed_keys=176  seq_lag=783  rows_covered=339
+  remediation="none; the derived-state maintainer measured 176 changed keys
+               against the limit 8192"
+
+calyx_derived_state : ok
+  last_search_action=none_needed
+  last_search_reason=delta_changed_keys 176 is inside the refresh threshold 4096
+                     (seq_lag 726)
+  last_search_elapsed_ms=10
+  refresh_delta_keys_threshold=4096  min_rebuild_interval_ms=600000
+
+calyx_lens_coverage : ok
+  panels_measured=3  deficient_panels=[]  blind_spot_ceiling=0.5
+  1664001: n_lenses=5 measured=256/344   blind_spot_records=0
+  1665001: n_lenses=6 measured=256/2250  blind_spot_records=0
+  1665002: n_lenses=9 measured=256/14500 blind_spot_records=0
+
+find by_text "issue844-notepad-demo-20260624-091816.txt"
+  rank=1 cx=fc571cacaaa3ddc7885a7a3960892dcf raw_score=0.25
+  rank=2 cx=7edf0b55881102c53db0859e4d1e0843 raw_score=0.125
+  rank=3 cx=92cb0065e157a95b71f4e2998ac77ea7 raw_score=0.125
+  consulted_slots=[3]
+
+find by_text "zzzqqqxxnonexistenttoken"  -> OK hits=0
+find by_text "!!! ??? ..."               -> OK hits=0
+```
+
+```
+PASS  the remediation now travels with the state: a built generation reports the
+      measured key count against the limit, instead of the "delta unmeasured"
+      text a built/ok payload was still carrying (fixed in 8eacd5ad)
+PASS  none_needed names both quantities, so the decision is auditable
+PASS  the delta measurement costs 10 ms; the whole derived-state pass, including
+      the three-panel lens-coverage sample, costs 2,185 ms off the runtime
+PASS  the known-answer record is rank 1 with clean score separation
+PASS  no-match queries return an empty result set, not a stale-index error
+```
+
+### One more confirmation of the unit argument
+
+`seq_lag=783` carried **176** changed keys here, where `seq_lag=1634` carried
+**18,000** twenty minutes earlier. The ratio varies by two orders of magnitude
+between two readings of the same vault, because it is dominated by whatever
+other panels happened to be ingesting. That is the whole case for measuring the
+trigger in changed keys, and the whole case for #1901.
+
