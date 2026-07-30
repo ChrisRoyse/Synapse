@@ -264,6 +264,12 @@ fn syn_encoder_from_kind(kind: &str, shape: SlotShape) -> Result<Option<Algorith
         ["syn_sparse_text", dim] => AlgorithmicEncoder::SynSparseText {
             dim: parse_u32_value(kind, dim)?,
         },
+        ["syn_sparse_text_tf"] => AlgorithmicEncoder::SynSparseTextTf {
+            dim: sparse_shape_dim(kind, shape)?,
+        },
+        ["syn_sparse_text_tf", dim] => AlgorithmicEncoder::SynSparseTextTf {
+            dim: parse_u32_value(kind, dim)?,
+        },
         ["syn_token_slots"] => AlgorithmicEncoder::SynTokenSlots {
             token_dim: multi_shape_dim(kind, shape)?,
         },
