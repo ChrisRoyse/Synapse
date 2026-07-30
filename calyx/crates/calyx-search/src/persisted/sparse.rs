@@ -148,7 +148,7 @@ pub(super) fn search(
         ))
     })?;
     let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
-    validate_sparse_weights(entries, index.scoring, "query")?;
+    validate_sparse_query_weights(entries, index.scoring, "query")?;
     if index.dim != *query_dim {
         return Err(stale(format!(
             "persistent sparse slot {slot} index dim {} != query dim {query_dim}; reingest/backfill the vault",
@@ -198,7 +198,7 @@ pub(super) fn search_reconciled(
             index.dim
         )));
     }
-    validate_sparse_weights(query_entries, index.scoring, "delta query")?;
+    validate_sparse_query_weights(query_entries, index.scoring, "delta query")?;
     let replacement_rows = sparse_replacement_rows(slot, *query_dim, index.scoring, replacements)?;
     let scored = match index.scoring {
         SparseScoring::DotProduct => score_dot_reconciled(
@@ -724,13 +724,71 @@ fn score_dot_product(
     Ok(scores.into_iter().collect())
 }
 
+/// Whether this call is validating a stored document row or a query vector.
+///
+/// The distinction matters for BM25 and only for BM25. `tf_td` — the document
+/// side — is *defined* as a raw occurrence count, and the whole `b`/`avgdl`
+/// length correction is a statement about counts summing to a document length.
+/// `qtf_t` — the query side — is a weight, and a non-integral query weight is a
+/// legitimate boost rather than a broken measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SparseWeightRole {
+    /// A stored row's measured vector. BM25 requires raw counts here.
+    Document,
+    /// A query vector. Weights are boosts and need not be counts.
+    Query,
+}
+
 fn validate_sparse_weights(
     entries: &[SparseEntry],
     scoring: SparseScoring,
     context: &str,
 ) -> CliResult<f32> {
+    validate_sparse_weights_for(entries, scoring, SparseWeightRole::Document, context)
+}
+
+fn validate_sparse_query_weights(
+    entries: &[SparseEntry],
+    scoring: SparseScoring,
+    context: &str,
+) -> CliResult<f32> {
+    validate_sparse_weights_for(entries, scoring, SparseWeightRole::Query, context)
+}
+
+fn validate_sparse_weights_for(
+    entries: &[SparseEntry],
+    scoring: SparseScoring,
+    role: SparseWeightRole,
+    context: &str,
+) -> CliResult<f32> {
     let mut total = 0.0_f32;
     for entry in entries {
+        // A BM25 document weight must be a raw term-frequency COUNT.
+        //
+        // This is not stylistic strictness. BM25's document-length saturation
+        // reads `doc_len` as the sum of a row's weights and compares it against
+        // the corpus average. An encoder that L1-normalizes its output makes
+        // every row sum to exactly 1.0, so `len_norm` is 1.0 for every
+        // document, `b` and `avgdl` are computed and persisted and validated
+        // and cannot move a single score, and the `b=0.75` the manifest implies
+        // is operationally `b=0` (#1902). The identical defect one lane over
+        // was #1900.
+        //
+        // "Every weight is a positive integer" is the checkable form of
+        // "these are counts", and it cannot false-positive on a genuine count
+        // lane. A normalized lane fails it on the first row carrying two
+        // distinct terms.
+        if scoring == SparseScoring::Bm25
+            && role == SparseWeightRole::Document
+            && entry.val.is_finite()
+            && entry.val > 0.0
+            && entry.val.fract() != 0.0
+        {
+            return Err(stale(format!(
+                "persistent sparse BM25 {context} weight {} at index {} is not a whole term-frequency count; BM25 scores a raw count and derives the document length from the weight sum, so a normalized or otherwise fractional lane has a length correction that cannot act (b/avgdl become inert). Score this lens as sparse_dot, or measure it with a raw-count encoder (for example syn_sparse_text_tf / sparse_keywords_tf) and rebuild the vault search indexes",
+                entry.val, entry.idx
+            )));
+        }
         match scoring {
             SparseScoring::Bm25 if !entry.val.is_finite() || entry.val <= 0.0 => {
                 return Err(stale(format!(

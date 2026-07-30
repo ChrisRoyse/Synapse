@@ -187,16 +187,29 @@ fn sparse_scoring_for_runtime(runtime: &LensRuntime) -> sparse::SparseScoring {
 /// exact precondition for scoring its lane with BM25.
 ///
 /// BM25 needs an unnormalized `tf` and a real document length. A lane whose
-/// encoder L1-normalizes (`syn_sparse_text`) has neither: every stored vector
-/// sums to 1.0, so `doc_len` is 1.0 for every row and `b`/avgdl saturation is
-/// inert. Scoring such a lane as BM25 would silently apply a length correction
-/// that corrects nothing, so it stays a dot product and only genuinely
-/// term-frequency lanes are admitted here (#1900).
+/// encoder L1-normalizes has neither: every stored vector sums to 1.0, so
+/// `doc_len` is 1.0 for every row and `b`/avgdl saturation is inert. Scoring
+/// such a lane as BM25 silently applies a length correction that corrects
+/// nothing, so it stays a dot product and only genuinely term-frequency lanes
+/// are admitted here (#1900).
+///
+/// `sparse` and `sparse_keywords` were admitted here by #1900 and are **not**
+/// term-frequency kinds — both resolve to `AlgorithmicEncoder::SparseKeywords`,
+/// whose CPU encoder divides every count by the row's total. They were the same
+/// defect one layer over: a lane that *is* scored as BM25 by a scorer whose
+/// length parameters cannot act (#1902). The raw-count sibling
+/// `sparse_keywords_tf` replaces them for ranking; the normalized lanes remain
+/// perfectly good similarity features scored by dot product.
+///
+/// This list is the *intent* half of the guard. The enforcement half is in
+/// `calyx-search/src/persisted/sparse.rs`, which refuses a fractional weight on
+/// any BM25 document row at build and read time, so a lane that reaches BM25 by
+/// some other route than this list still cannot persist an inert `b`.
 fn is_lexical_term_frequency_kind(kind: &str) -> bool {
     let normalized = kind.replace('-', "_");
     matches!(
         normalized.split(':').next(),
-        Some("sparse" | "sparse_keywords" | "syn_sparse_text_tf")
+        Some("sparse_keywords_tf" | "syn_sparse_text_tf")
     )
 }
 

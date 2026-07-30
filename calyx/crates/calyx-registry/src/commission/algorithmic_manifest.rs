@@ -43,16 +43,20 @@ pub(super) fn output_shape(runtime: &str, dim: u32) -> Result<SlotShape> {
         | "gdelt-source-event"
         | "gdelt_source_event" => SlotShape::Sparse(checked_positive(kind, dim)?),
         "scalar" => checked_dense(kind, dim, 1)?,
-        "sparse" | "sparse-keywords" | "sparse_keywords" => {
-            SlotShape::Sparse(checked_positive(kind, dim)?)
-        }
+        "sparse" | "sparse-keywords" | "sparse_keywords" | "sparse-keywords-tf"
+        | "sparse_keywords_tf" => SlotShape::Sparse(checked_positive(kind, dim)?),
         "token-hash" | "token_hash" | "multi-hash" | "multi_hash" => SlotShape::Multi {
             token_dim: checked_positive(kind, dim)?,
         },
         value if value.starts_with("one-hot:") || value.starts_with("one_hot:") => {
             checked_dense(kind, dim, parse_dim(value)?)?
         }
-        value if value.starts_with("sparse-keywords:") || value.starts_with("sparse_keywords:") => {
+        value
+            if value.starts_with("sparse-keywords:")
+                || value.starts_with("sparse_keywords:")
+                || value.starts_with("sparse-keywords-tf:")
+                || value.starts_with("sparse_keywords_tf:") =>
+        {
             let parsed = parse_dim(value)?;
             checked_match(kind, dim, parsed)?;
             SlotShape::Sparse(parsed)
@@ -126,6 +130,9 @@ fn encoder_from_kind(kind: &str, shape: SlotShape) -> Result<AlgorithmicEncoder>
         "sparse" | "sparse-keywords" | "sparse_keywords" => AlgorithmicEncoder::SparseKeywords {
             dim: sparse_shape_dim(kind, shape)?,
         },
+        "sparse-keywords-tf" | "sparse_keywords_tf" => AlgorithmicEncoder::SparseKeywordsTf {
+            dim: sparse_shape_dim(kind, shape)?,
+        },
         "token-hash" | "token_hash" | "multi-hash" | "multi_hash" => {
             AlgorithmicEncoder::TokenHash {
                 token_dim: multi_shape_dim(kind, shape)?,
@@ -134,6 +141,14 @@ fn encoder_from_kind(kind: &str, shape: SlotShape) -> Result<AlgorithmicEncoder>
         value if value.starts_with("one-hot:") || value.starts_with("one_hot:") => {
             AlgorithmicEncoder::OneHot {
                 buckets: dense_shape_dim(kind, shape)?,
+            }
+        }
+        value
+            if value.starts_with("sparse-keywords-tf:")
+                || value.starts_with("sparse_keywords_tf:") =>
+        {
+            AlgorithmicEncoder::SparseKeywordsTf {
+                dim: sparse_shape_dim(kind, shape)?,
             }
         }
         value if value.starts_with("sparse-keywords:") || value.starts_with("sparse_keywords:") => {

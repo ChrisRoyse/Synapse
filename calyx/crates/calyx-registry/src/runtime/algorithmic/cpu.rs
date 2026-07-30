@@ -94,40 +94,76 @@ pub(super) fn ast_style_features(bytes: &[u8]) -> Vec<f32> {
 }
 
 pub(super) fn sparse_keywords(bytes: &[u8], dim: u32) -> Result<SlotVector> {
-    let terms = String::from_utf8_lossy(bytes)
+    sparse_keywords_from_hashes(&keyword_hashes(bytes), dim)
+}
+
+/// The whitespace-term hashing shared by the normalized and raw-count lanes, so
+/// the two encoders differ only in normalization and never in bucketing.
+fn keyword_hashes(bytes: &[u8]) -> Vec<u32> {
+    String::from_utf8_lossy(bytes)
         .split_whitespace()
-        .map(str::as_bytes)
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    sparse_keywords_from_hashes(
-        &terms
-            .iter()
-            .map(|term| {
-                let digest = content_address([term.as_slice()]);
-                u32::from_be_bytes(digest[..4].try_into().expect("content hash has bytes"))
-            })
-            .collect::<Vec<_>>(),
-        dim,
-    )
+        .map(|term| {
+            let digest = content_address([term.as_bytes()]);
+            u32::from_be_bytes(digest[..4].try_into().expect("content hash has bytes"))
+        })
+        .collect()
 }
 
 pub(super) fn sparse_keywords_from_hashes(hashes: &[u32], dim: u32) -> Result<SlotVector> {
     let dim = dim.max(1);
+    Ok(SlotVector::Sparse {
+        dim,
+        entries: normalized_entries(&keyword_counts(hashes, dim)),
+    })
+}
+
+/// Raw hashed term frequencies over whitespace terms: unsigned, unnormalized.
+///
+/// The BM25-scorable sibling of `sparse_keywords`, which L1-normalizes. That
+/// normalization is correct for a similarity lane and fatal for a ranking one:
+/// it makes every stored vector sum to exactly 1.0, so the document length
+/// BM25 derives from the weight sum is 1.0 for *every* row in the corpus, and
+/// `b`/`avgdl` are computed, persisted and validated while being unable to move
+/// a single score (#1902). `tf` also stops being a count and becomes a relative
+/// frequency, so a one-token document scores 1.0 on its only term while a
+/// hundred-token document scores 0.01 on each of its -- the exact
+/// short-document dominance `b` exists to bound.
+///
+/// The hashing is byte-identical to `sparse_keywords`; only the normalization
+/// is dropped. Both encoders stay data-oblivious, and the corpus statistics
+/// stay in the index where they belong.
+pub(super) fn sparse_keywords_tf(bytes: &[u8], dim: u32) -> Result<SlotVector> {
+    sparse_keywords_tf_from_hashes(&keyword_hashes(bytes), dim)
+}
+
+pub(super) fn sparse_keywords_tf_from_hashes(hashes: &[u32], dim: u32) -> Result<SlotVector> {
+    let dim = dim.max(1);
+    Ok(SlotVector::Sparse {
+        dim,
+        entries: keyword_counts(hashes, dim)
+            .into_iter()
+            .map(|(idx, val)| SparseEntry { idx, val })
+            .collect(),
+    })
+}
+
+fn keyword_counts(hashes: &[u32], dim: u32) -> BTreeMap<u32, f32> {
     let mut counts = BTreeMap::<u32, f32>::new();
     for &hash in hashes {
         *counts.entry(hash % dim).or_default() += 1.0;
     }
+    counts
+}
+
+fn normalized_entries(counts: &BTreeMap<u32, f32>) -> Vec<SparseEntry> {
     let total = counts.values().sum::<f32>().max(1.0);
-    Ok(SlotVector::Sparse {
-        dim,
-        entries: counts
-            .into_iter()
-            .map(|(idx, val)| SparseEntry {
-                idx,
-                val: val / total,
-            })
-            .collect(),
-    })
+    counts
+        .iter()
+        .map(|(idx, val)| SparseEntry {
+            idx: *idx,
+            val: val / total,
+        })
+        .collect()
 }
 
 pub(super) fn token_hash(bytes: &[u8], token_dim: u32) -> Result<SlotVector> {

@@ -147,12 +147,16 @@ fn algorithmic_cuda_capable(runtime: &LensRuntime) -> bool {
             | "sparse"
             | "sparse-keywords"
             | "sparse_keywords"
+            | "sparse-keywords-tf"
+            | "sparse_keywords_tf"
             | "token-hash"
             | "token_hash"
             | "multi-hash"
             | "multi_hash"
     ) || kind.starts_with("sparse-keywords:")
         || kind.starts_with("sparse_keywords:")
+        || kind.starts_with("sparse-keywords-tf:")
+        || kind.starts_with("sparse_keywords_tf:")
         || kind.starts_with("token-hash:")
         || kind.starts_with("token_hash:")
 }

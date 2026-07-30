@@ -103,6 +103,13 @@ pub(super) fn measure_batch(lens: &AlgorithmicLens, inputs: &[Input]) -> Result<
         AlgorithmicEncoder::ByteFeatures => byte_batch(lens, inputs),
         AlgorithmicEncoder::SparseKeywords { dim } => sparse_batch(lens, inputs, dim),
         AlgorithmicEncoder::TokenHash { token_dim } => token_batch(lens, inputs, token_dim),
+        // `SparseKeywordsTf` deliberately falls through to the CPU encoder
+        // rather than reusing `sparse_batch`: that path calls
+        // `sparse_keywords_from_hashes`, which L1-normalizes, and routing the
+        // raw-count lane through it would reintroduce #1902 on exactly the
+        // corpora large enough to cross the CUDA threshold. Giving it its own
+        // GPU path is possible but cannot be verified on a host without an
+        // NVIDIA device, so it stays CPU-native until it can be.
         _ => cpu_batch(lens, inputs, inputs.len(), "encoder is CPU-native"),
     }
 }

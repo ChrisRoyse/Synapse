@@ -137,6 +137,12 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
         ["sparse_keywords", dim] => AlgorithmicEncoder::SparseKeywords {
             dim: parse_u32(dim)?,
         },
+        ["sparse_keywords_tf"] => AlgorithmicEncoder::SparseKeywordsTf {
+            dim: sparse_dim(spec.output)?,
+        },
+        ["sparse_keywords_tf", dim] => AlgorithmicEncoder::SparseKeywordsTf {
+            dim: parse_u32(dim)?,
+        },
         ["token_hash"] | ["multi_hash"] => AlgorithmicEncoder::TokenHash {
             token_dim: token_dim(spec.output)?,
         },

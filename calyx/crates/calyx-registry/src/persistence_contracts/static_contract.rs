@@ -163,6 +163,12 @@ fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncode
         ["sparse_keywords", dim] => Some(AlgorithmicEncoder::SparseKeywords {
             dim: parse_u32(dim)?,
         }),
+        ["sparse_keywords_tf"] => Some(AlgorithmicEncoder::SparseKeywordsTf {
+            dim: sparse_dim(shape)?,
+        }),
+        ["sparse_keywords_tf", dim] => Some(AlgorithmicEncoder::SparseKeywordsTf {
+            dim: parse_u32(dim)?,
+        }),
         ["token_hash"] | ["multi_hash"] => Some(AlgorithmicEncoder::TokenHash {
             token_dim: token_dim(shape)?,
         }),

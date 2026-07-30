@@ -16,7 +16,7 @@ pub use batch::{
 };
 use cpu::{
     ast_style_features, byte_features, hash_part, one_hot_features, scalar_features,
-    sparse_keywords, token_hash,
+    sparse_keywords, sparse_keywords_tf, token_hash,
 };
 
 const BYTE_FEATURE_DIM: u32 = 16;
@@ -32,8 +32,21 @@ pub enum AlgorithmicEncoder {
     OneHot { buckets: u32 },
     /// Small AST/code-style feature vector.
     AstStyle,
-    /// Hashed whitespace terms in a sparse ambient space.
+    /// Hashed whitespace terms in a sparse ambient space, L1-normalized.
+    ///
+    /// The normalization makes this a *similarity* lane, not a ranking lane:
+    /// every stored vector sums to 1.0, so a BM25 document length is 1.0 for
+    /// every row and the `b`/avgdl correction cannot act (#1902). Use
+    /// [`AlgorithmicEncoder::SparseKeywordsTf`] for a lexically-rankable lane.
     SparseKeywords { dim: u32 },
+    /// Hashed whitespace terms as raw, unnormalized term-frequency counts.
+    ///
+    /// The BM25-scorable sibling of [`AlgorithmicEncoder::SparseKeywords`]:
+    /// identical hashing, no normalization, so `tf` is a genuine count and the
+    /// document length is a genuine length. This is the HashingTF-then-IDF
+    /// split -- the encoder stays data-oblivious (a count depends only on the
+    /// input bytes) and the corpus statistics stay in the index (#1902).
+    SparseKeywordsTf { dim: u32 },
     /// Hashed whitespace terms as per-token vectors for MaxSim.
     TokenHash { token_dim: u32 },
     /// Dense CAMEO/event-code features from GDELT text rows.
@@ -139,6 +152,7 @@ impl AlgorithmicEncoder {
             Self::SynOneHot { buckets } | Self::SynBin { buckets, .. } => buckets,
             Self::AstStyle => 8,
             Self::SparseKeywords { dim }
+            | Self::SparseKeywordsTf { dim }
             | Self::SynHash { dim }
             | Self::SynSparseText { dim }
             | Self::SynSparseTextTf { dim }
@@ -218,6 +232,7 @@ impl AlgorithmicEncoder {
             // Word-token lanes: the query is tokenized and hashed by exactly the
             // same code that tokenized and hashed the stored text.
             Self::SparseKeywords { .. }
+            | Self::SparseKeywordsTf { .. }
             | Self::TokenHash { .. }
             | Self::SynSparseTextTf { .. }
             | Self::SynTokenSlots { .. }
@@ -292,6 +307,7 @@ impl AlgorithmicEncoder {
     pub const fn shape(self) -> SlotShape {
         match self {
             Self::SparseKeywords { dim }
+            | Self::SparseKeywordsTf { dim }
             | Self::SynHash { dim }
             | Self::SynSparseText { dim }
             | Self::SynSparseTextTf { dim }
@@ -349,6 +365,11 @@ impl AlgorithmicLens {
 
     pub fn sparse_keywords(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::SparseKeywords { dim })
+    }
+
+    /// The BM25-scorable, raw-count sibling of [`Self::sparse_keywords`].
+    pub fn sparse_keywords_tf(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
+        Self::new(name, modality, AlgorithmicEncoder::SparseKeywordsTf { dim })
     }
 
     pub fn token_hash(name: impl Into<String>, modality: Modality, token_dim: u32) -> Self {
@@ -622,6 +643,7 @@ impl AlgorithmicLens {
                 data: ast_style_features(&input.bytes),
             },
             AlgorithmicEncoder::SparseKeywords { dim } => sparse_keywords(&input.bytes, dim)?,
+            AlgorithmicEncoder::SparseKeywordsTf { dim } => sparse_keywords_tf(&input.bytes, dim)?,
             AlgorithmicEncoder::TokenHash { token_dim } => token_hash(&input.bytes, token_dim)?,
             AlgorithmicEncoder::GdeltCameo => SlotVector::Dense {
                 dim: self.encoder.dim(),
