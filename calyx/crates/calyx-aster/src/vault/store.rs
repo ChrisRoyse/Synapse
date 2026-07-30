@@ -255,10 +255,54 @@ where
 
     /// Reads the Base CF row only, preserving metadata, anchors, and stored
     /// provenance without hydrating slot vectors.
+    ///
+    /// # The returned `slots` map is EMPTY, not the row's slot membership
+    ///
+    /// `slots` is cleared deliberately: this accessor promises "no slot vectors
+    /// were read", and leaving the decoded `Absent` placeholders in place would
+    /// present a hash-only integrity record as if it were a measurement (#1894).
+    ///
+    /// The cost is that the returned value cannot answer **"does this row
+    /// declare slot N"** — `slots.is_empty()` is true for every row, including
+    /// rows that declare every slot on the panel. A caller that asks it anyway
+    /// gets a uniformly negative answer with no error, which is how #1907
+    /// silently emptied delta reconciliation for two releases. Use
+    /// [`Self::declared_slot_ids_at_snapshot`] for membership, and
+    /// `get_selected_slots_at_snapshot` for vectors.
     pub fn get_base_at_snapshot(&self, id: CxId, snapshot: Snapshot) -> Result<Constellation> {
         let mut constellation = self.read_base_at_snapshot(id, snapshot)?;
         constellation.slots.clear();
         Ok(constellation)
+    }
+
+    /// The slot ids one row's `Base` row **declares**, without reading a single
+    /// slot vector.
+    ///
+    /// Slot membership is a property of the `Base` row: it is fixed when the row
+    /// is created and is immutable thereafter (#1903), and a qualified slot
+    /// write extends it only by rewriting `Base` in the same atomic batch
+    /// (#1888). So the membership is fully answerable from `Base` alone, and
+    /// answering it is exactly what [`Self::get_base_at_snapshot`] cannot do.
+    ///
+    /// This exists so the one legitimate question about an unhydrated row —
+    /// *which of my query slots is it even worth selecting?* — has a direct
+    /// answer, instead of being inferred from a map that was cleared on purpose.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the row is absent at `snapshot` or its
+    /// `Base` bytes do not decode.
+    pub fn declared_slot_ids_at_snapshot(
+        &self,
+        id: CxId,
+        snapshot: Snapshot,
+    ) -> Result<BTreeSet<SlotId>> {
+        Ok(self
+            .read_base_at_snapshot(id, snapshot)?
+            .slots
+            .keys()
+            .copied()
+            .collect())
     }
 
     fn read_base_at_snapshot(&self, id: CxId, snapshot: Snapshot) -> Result<Constellation> {

@@ -18,6 +18,13 @@ use super::support::SearchReadSnapshot;
 pub const MAX_RECONCILED_DELTA_KEYS: usize = 8_192;
 const DELTA_REBASE_CODE: &str = "CALYX_SEARCH_DELTA_REBASE_REQUIRED";
 
+/// A reconciled query masked rows out of its own index and hydrated nothing to
+/// replace them (#1907). Distinct from a genuine miss on purpose: #1896 traded
+/// "empty result" for "stale index" for the *matching* case, and this is the
+/// case that trade left unguarded.
+pub const RECONCILED_REPLACEMENTS_MISSING_CODE: &str =
+    "CALYX_SEARCH_RECONCILED_REPLACEMENTS_MISSING";
+
 /// The exact panel-scoped changed-key delta a query is judged against, with the
 /// composition that produced the count (#1901).
 ///
@@ -218,6 +225,29 @@ pub(super) struct SearchDelta {
     changed: BTreeSet<CxId>,
     docs: BTreeMap<CxId, Constellation>,
     vectors: BTreeMap<SlotId, BTreeMap<CxId, SlotVector>>,
+    /// Per query slot, how many live changed rows **declare** that slot.
+    ///
+    /// Together with [`Self::absent`] this is the expectation `vectors` is
+    /// judged against (#1907), as a conservation law rather than a heuristic:
+    /// every declared slot on a live row hydrates to exactly one vector, and
+    /// that vector is either usable (counted in `vectors`) or explicitly
+    /// [`SlotVector::Absent`] (counted in `absent`). So
+    ///
+    /// ```text
+    ///     declared[slot] == vectors[slot].len() + absent[slot]
+    /// ```
+    ///
+    /// must hold for every query slot. Any shortfall is a row the delta masked
+    /// out of the index and then failed to account for.
+    declared: BTreeMap<SlotId, usize>,
+    /// Per query slot, how many declared vectors hydrated to `Absent`.
+    ///
+    /// `Absent` is an explicit absence, not a zero vector: an inactive lens, a
+    /// modality that does not apply, or an unavailable lens all produce it
+    /// legitimately, and such a row genuinely contributes no recall. Counting
+    /// it separately is what lets the conservation law above stay exact instead
+    /// of firing on a healthy parked lane.
+    absent: BTreeMap<SlotId, usize>,
     covered_to_seq: Option<u64>,
 }
 
@@ -227,6 +257,8 @@ impl SearchDelta {
             changed: BTreeSet::new(),
             docs: BTreeMap::new(),
             vectors: BTreeMap::new(),
+            declared: BTreeMap::new(),
+            absent: BTreeMap::new(),
             covered_to_seq: None,
         }
     }
@@ -284,6 +316,14 @@ impl SearchDelta {
             .iter()
             .map(|slot| (*slot, BTreeMap::new()))
             .collect::<BTreeMap<_, _>>();
+        let mut declared = query_slots
+            .iter()
+            .map(|slot| (*slot, 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut absent = query_slots
+            .iter()
+            .map(|slot| (*slot, 0_usize))
+            .collect::<BTreeMap<_, _>>();
         for cx_id in &changed_keys {
             let base =
                 vault.read_cf_snapshot(read.snapshot(), ColumnFamily::Base, cx_id.as_bytes())?;
@@ -294,26 +334,36 @@ impl SearchDelta {
             if base.panel_version != indexes.panel_version() {
                 continue;
             }
+            // Slot membership must come from the row's declared slot set, NOT
+            // from `base.slots` (#1907): `get_base_at_snapshot` clears that map
+            // by design, so filtering through it selected nothing for every row
+            // ever — the delta masked the whole index and replaced none of it.
+            let row_slots = vault.declared_slot_ids_at_snapshot(*cx_id, read.snapshot())?;
             let available_query_slots = query_slots
                 .iter()
-                .filter(|slot| base.slots.contains_key(slot))
+                .filter(|slot| row_slots.contains(slot))
                 .copied()
                 .collect::<BTreeSet<_>>();
+            for slot in &available_query_slots {
+                *declared.get_mut(slot).expect("query slot initialized") += 1;
+            }
             let cx = vault.get_selected_slots_at_snapshot(
                 *cx_id,
                 read.snapshot(),
                 available_query_slots.iter().copied(),
             )?;
             for slot in query_slots {
-                if let Some(vector) = cx
-                    .slots
-                    .get(slot)
-                    .filter(|vector| !matches!(vector, SlotVector::Absent { .. }))
-                {
-                    vectors
-                        .get_mut(slot)
-                        .expect("query slot initialized")
-                        .insert(*cx_id, vector.clone());
+                match cx.slots.get(slot) {
+                    Some(SlotVector::Absent { .. }) => {
+                        *absent.get_mut(slot).expect("query slot initialized") += 1;
+                    }
+                    Some(vector) => {
+                        vectors
+                            .get_mut(slot)
+                            .expect("query slot initialized")
+                            .insert(*cx_id, vector.clone());
+                    }
+                    None => {}
                 }
             }
             docs.insert(*cx_id, cx);
@@ -323,16 +373,25 @@ impl SearchDelta {
             None,
             Some(changed_keys.len()),
             Some(format!(
-                "live_replacements={} tombstoned_or_moved={} covered_to_seq={}",
+                "live_replacements={} tombstoned_or_moved={} covered_to_seq={} declared={} measured={}",
                 docs.len(),
                 changed_keys.len().saturating_sub(docs.len()),
-                read.seq()
+                read.seq(),
+                summarize_per_slot(&declared),
+                summarize_per_slot(
+                    &vectors
+                        .iter()
+                        .map(|(slot, rows)| (*slot, rows.len()))
+                        .collect()
+                ),
             )),
         );
         Ok(Self {
             changed: changed_keys,
             docs,
             vectors,
+            declared,
+            absent,
             covered_to_seq: Some(read.seq()),
         })
     }
@@ -356,6 +415,24 @@ impl SearchDelta {
     fn vectors_for(&self, slot: SlotId) -> &BTreeMap<CxId, SlotVector> {
         self.vectors.get(&slot).unwrap_or_else(|| empty_vectors())
     }
+
+    fn declared_for(&self, slot: SlotId) -> usize {
+        self.declared.get(&slot).copied().unwrap_or_default()
+    }
+
+    fn absent_for(&self, slot: SlotId) -> usize {
+        self.absent.get(&slot).copied().unwrap_or_default()
+    }
+}
+
+/// `slot_<id>=<count>` for every query slot, so a delta detail line names the
+/// per-slot numbers rather than a total that hides which lane is short.
+fn summarize_per_slot(counts: &BTreeMap<SlotId, usize>) -> String {
+    counts
+        .iter()
+        .map(|(slot, count)| format!("slot_{}={count}", slot.get()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,16 +446,55 @@ pub(super) fn search_slots_reconciled(
 ) -> CliResult<BTreeMap<SlotId, Vec<IndexSearchHit>>> {
     let mut out = BTreeMap::new();
     for (slot, query) in query_vectors {
+        let declared = delta.declared_for(*slot);
+        let absent = delta.absent_for(*slot);
+        let replacements = delta.vectors_for(*slot).len();
         trace.emit_detail(
             "search_slot.delta.start",
             Some(*slot),
             Some(k),
             Some(format!(
-                "changed={} replacements={}",
+                "changed={} declared={declared} replacements={replacements} absent={absent}",
                 delta.changed.len(),
-                delta.vectors_for(*slot).len()
             )),
         );
+        // Conservation check — the guard #1907 needed and did not have.
+        //
+        // `changed` masks its rows out of the persisted index unconditionally,
+        // whether or not a replacement exists. So a row that is masked but not
+        // accounted for is not a ranking nuance: that part of the corpus is
+        // *deleted* from the answer, and the caller is handed a short result (or
+        // `Ok(vec![])`) that reads as "nothing matched". #1907 was exactly that
+        // — `base.slots` is cleared by `get_base_at_snapshot`, so the slot
+        // filter selected nothing for every row ever, every replacement set was
+        // empty, and whole-index recall silently went to zero after a backfill.
+        //
+        // Every declared slot on a live row hydrates to exactly one vector, and
+        // that vector is either usable or explicitly `Absent`. So the identity
+        // below is exact, not a threshold, and it holds for the healthy states
+        // that a cruder "replacements is empty" test would false-close on:
+        //
+        // - purely tombstoned changed rows never reach `declared` at all;
+        // - a changed row that does not carry this slot is not declared;
+        // - a parked/inapplicable lens declares its slot and hydrates `Absent`,
+        //   which is counted, so an all-absent lane reconciles quietly.
+        if declared != replacements.saturating_add(absent) {
+            return Err(CalyxError {
+                code: RECONCILED_REPLACEMENTS_MISSING_CODE,
+                message: format!(
+                    "reconciled search for slot {slot} masked {} changed constellation(s) out of the persisted index, but could not \
+                     account for what it masked: {declared} live row(s) of this panel declare the slot, yet only {replacements} \
+                     hydrated a usable vector and {absent} an explicit Absent ({} unaccounted). Every declared slot on a live row \
+                     hydrates to exactly one vector, so the shortfall means those rows were removed from the index and nothing took \
+                     their place — the result would silently omit them rather than rank them",
+                    delta.changed.len(),
+                    declared.saturating_sub(replacements.saturating_add(absent)),
+                ),
+                remediation: "rebuild the exact panel search generation to serve recall from a current index, then repair the delta \
+                              hydration path; do not read this as an empty result — the index holds rows this query was entitled to see",
+            }
+            .into());
+        }
         let hits = indexes.search_reconciled(
             *slot,
             query,

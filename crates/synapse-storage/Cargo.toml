@@ -30,6 +30,10 @@ tracing.workspace = true
 # rewrite an SST with correct record/body CRCs so the storage layer accepts the
 # bytes and the provenance verifier is the thing under test (issue #1874).
 crc32fast = "1"
+# Used only by the reconciled_recall_fsv manual-FSV instrument, which drives the
+# search engine's delta-reconciliation path directly so an empty result can be
+# attributed to a named stage of its own trace rather than inferred (issue #1907).
+calyx-search = { path = "../../calyx/crates/calyx-search" }
 
 [lints]
 workspace = true

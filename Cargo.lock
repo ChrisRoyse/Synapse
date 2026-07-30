@@ -5344,6 +5344,7 @@ dependencies = [
  "calyx-core",
  "calyx-lenses",
  "calyx-registry",
+ "calyx-search",
  "crc32fast",
  "fs2",
  "serde",
