@@ -41,8 +41,15 @@ pub struct PanelDeltaComposition {
     pub base_keys_other_panels: usize,
     /// Changed `Base` keys whose visible history is entirely tombstoned.
     pub base_keys_unattributed: usize,
-    /// Changed keys contributed by each indexed slot CF, which is already
-    /// panel-scoped because a slot id belongs to exactly one panel.
+    /// Changed keys contributed by each indexed slot CF.
+    ///
+    /// A slot id belongs to exactly one panel *name* (#1776), which is why these
+    /// scans need no `Base`-style attribution — but **not** to one panel
+    /// *version*: a new generation of the same panel reuses its slot ids, so two
+    /// live generations of one panel would count each other here. Latent while a
+    /// superseded generation is inert; tracked in #1905, which is also where the
+    /// stronger observation lives (every slot write also writes its Base row, so
+    /// these scans may be redundant once that is established for every writer).
     pub slot_keys: BTreeMap<SlotId, usize>,
     /// Distinct constellations to reconcile: the union of the scoped `Base`
     /// keys and every slot CF's keys.
@@ -83,9 +90,11 @@ impl PanelDeltaComposition {
 
 /// Measures one panel generation's changed-key delta against a pinned snapshot.
 ///
-/// The `Base` scan is scoped to `panel_version`; the slot scans are inherently
-/// scoped because slot ids are globally unique per panel. This is the single
-/// definition of "how far behind is this generation" in the workspace.
+/// The `Base` scan is scoped to `panel_version`; the slot scans rely on slot ids
+/// being globally unique per panel *name* (see `slot_keys` for the residual this
+/// leaves, tracked in #1905). This is the single definition of "how far behind is
+/// this generation" in the workspace: both the query path's bounded
+/// reconciliation check and the maintainer's refresh trigger call it.
 ///
 /// # Errors
 ///
