@@ -403,3 +403,89 @@ will probe. On the dim-1024 timeline lane that is a ~1-in-1024 chance per query
 of injecting an entire spurious lane into the rank fusion at full weight, with
 nothing in the result distinguishing a collision from a real exact match. It is
 excluded, and the capability it removes is filed as #1899.
+
+---
+
+## Re-verification on the corrected trigger (`82f2d1de`)
+
+Daemon pid **896**, exe sha256 `B40614C8BF2B6BB037D59994B9AE660E6B0BE7E8D472E95DC53CB7A6DD7AE146`.
+The first tick after restart is itself the counterexample the old threshold
+would have missed:
+
+```
+STARTED   action=refresh_over_existing destructive=true already_unusable=true
+          reason=delta_changed_keys 18000 exceeds the refresh threshold 4096
+                 (half the query-time reconciliation limit 8192);
+                 seq_lag is 1634, which is why the lag alone is not the trigger
+          before_state=lagging built_at_seq=76112 vault_latest_seq=77746
+COMMITTED after_state=built after_built_at_seq=77746 after_seq_lag=0
+          after_delta_changed_keys=0 after_rows_covered=339 elapsed_ms=605
+```
+
+```
+PASS  seq_lag 1634 is INSIDE the old 4096 threshold, while delta_changed_keys
+      18000 is 2.2x the 8192 limit: the old code would have reported
+      none_needed / built on a generation whose queries were already failing
+PASS  already_unusable=true exempted the refresh from the naptime bound
+PASS  after: delta_changed_keys=0, seq_lag=0, state=built, rows_covered=339
+PASS  the log line names both quantities, so the discrepancy is visible in the
+      record that made the decision
+```
+
+### Health, after
+
+```
+health.ok = True
+
+calyx_search_generation : ok
+  state=built built_at_seq=77746 vault_latest_seq=77789 seq_lag=43
+  delta_changed_keys=0 delta_measured_at_unix_ms=1785402496877
+  max_reconciled_delta_keys=8192 rows_covered=339 dense_lanes=5 sparse_lanes=2
+
+calyx_derived_state : ok
+  attempts=1 success=1 failure=0
+  last_search_action=refresh_over_existing
+  last_search_reason=delta_changed_keys 18000 exceeds the refresh threshold 4096
+                     ...; seq_lag is 1634, which is why the lag alone is not the trigger
+  refresh_delta_keys_threshold=4096 min_rebuild_interval_ms=600000
+```
+
+### The known-answer test, re-run
+
+```
+find by_text "issue844-notepad-demo-20260624-091816.txt"
+  rank=1  cx=fc571cacaaa3ddc7885a7a3960892dcf  raw_score=0.25
+  rank=2  cx=7edf0b55881102c53db0859e4d1e0843  raw_score=0.125
+  rank=3  cx=92cb0065e157a95b71f4e2998ac77ea7  raw_score=0.125
+  consulted_slots=[3]  base_seq=77746
+```
+
+```
+PASS  the cx_id derived from CF_TIMELINE bytes on disk is rank 1
+PASS  clean score separation (0.25 vs 0.125) on a discriminative single token
+PASS  consulted_slots is still exactly [3]
+```
+
+### The empty-result fix, verified
+
+```
+by_text "zzzqqqxxnonexistenttoken"  -> OK  hits=0  base_seq=77746
+by_text "!!! ??? ..."               -> OK  hits=0  base_seq=77746
+```
+
+```
+PASS  both previously returned SYNAPSE_CALYX_FIND_INDEX_STALE with a
+      "reingest or backfill stale slot rows" remediation against a healthy index
+PASS  the empty outcome carries the generation, so the caller still sees which
+      index answered and at which sequence
+```
+
+### One further self-contradiction, found and fixed
+
+The payload above initially reported `state=built status=ok` while carrying the
+remediation "this read did not measure the changed-key delta, so whether a query
+can reconcile the generation is unknown" — the state override folded in the
+maintainer's measurement, the remediation still came from the cheap-path
+classifier. Two adjacent fields contradicting each other is the same
+lying-surface shape in miniature. Fixed in `8eacd5ad`: both now come from the
+same match.
