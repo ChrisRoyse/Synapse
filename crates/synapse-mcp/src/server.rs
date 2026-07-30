@@ -1842,6 +1842,31 @@ pub(crate) fn explicit_action_target(
     }
 }
 
+/// What `process_qos::assert_interactive_qos` observed and asserted at startup.
+///
+/// Process-global because it describes the process, not a session: the priority
+/// class and power-throttling mask are properties of the whole daemon, asserted
+/// once before any subsystem starts. Written exactly once from `main`, read by
+/// `health` on every call.
+static PROCESS_QOS_REPORT: std::sync::OnceLock<crate::process_qos::ProcessQosReport> =
+    std::sync::OnceLock::new();
+
+/// Records the startup QoS assertion so `health` can report it (#1910).
+///
+/// A second call is ignored rather than panicking: the report is diagnostic and
+/// losing the daemon over a duplicate write would be a strictly worse outcome
+/// than reporting the first observation.
+pub(crate) fn set_process_qos_report(report: crate::process_qos::ProcessQosReport) {
+    let _ = PROCESS_QOS_REPORT.set(report);
+}
+
+/// The startup QoS assertion, or `None` when `main` has not run it — which is
+/// the case for in-process constructions of the service that never went through
+/// daemon startup.
+pub(crate) fn process_qos_report() -> Option<&'static crate::process_qos::ProcessQosReport> {
+    PROCESS_QOS_REPORT.get()
+}
+
 /// Whether test-only/debug MCP tools should be exposed on the surface.
 fn debug_tools_enabled() -> bool {
     std::env::var("SYNAPSE_DEBUG_TOOLS")

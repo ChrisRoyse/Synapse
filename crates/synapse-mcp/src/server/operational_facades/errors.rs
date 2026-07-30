@@ -92,6 +92,19 @@ pub(super) fn facade_conflict_error(
     )
 }
 
+/// Wraps a delegated failure in this facade's envelope.
+///
+/// The delegate's **own** remediation wins when it has one (#1911). This
+/// function already read the delegate's `code` off its data and fell back only
+/// when absent; `remediation` is the adjacent field of the same
+/// `{code, message, remediation}` contract and was being overwritten
+/// unconditionally, so every delegated failure across the 40-tool surface
+/// reported its facade's generic sentence regardless of what actually broke.
+///
+/// The facade's own string is not discarded — it answers a different question
+/// ("what does this tool need from you") than the substrate's ("what is
+/// broken"), so it is reported alongside as `facade_remediation` and remains the
+/// fallback for delegates that carry no remediation of their own.
 pub(super) fn facade_delegate_error(
     tool: &'static str,
     operation: &'static str,
@@ -100,6 +113,7 @@ pub(super) fn facade_delegate_error(
     error: ErrorData,
     remediation: &'static str,
 ) -> ErrorData {
+    let delegate_remediation = remediation_from(&error);
     ErrorData::new(
         ErrorCode(-32099),
         format!(
@@ -112,7 +126,8 @@ pub(super) fn facade_delegate_error(
             "operation": operation,
             "source_id": source_id,
             "source_of_truth": source_of_truth,
-            "remediation": remediation,
+            "remediation": delegate_remediation.as_deref().unwrap_or(remediation),
+            "facade_remediation": remediation,
             "cause": {
                 "message": error.message.to_string(),
                 "data": error.data,
@@ -129,4 +144,21 @@ fn error_code_from(error: &ErrorData) -> String {
         .and_then(Value::as_str)
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned()
+}
+
+/// The delegate's own remediation, when it carried one.
+///
+/// An empty or whitespace-only string is treated as absent: it would satisfy
+/// the contract's shape while telling the operator nothing, and silently
+/// preferring it over the facade's real guidance would be a regression dressed
+/// as a fix.
+fn remediation_from(error: &ErrorData) -> Option<String> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("remediation"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }

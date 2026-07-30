@@ -543,6 +543,7 @@ impl SynapseService {
             "http".to_owned(),
             self.http_health(active_sessions, http_session_read_error),
         );
+        subsystems.insert("process_qos".to_owned(), Self::process_qos_health());
         subsystems.insert("daemon_drain".to_owned(), self.daemon_drain_health());
         subsystems.insert(
             "daemon_lifecycle".to_owned(),
@@ -1412,6 +1413,66 @@ impl SynapseService {
                 detail: Some(format!("{error:?}")),
                 ..SubsystemHealth::default()
             },
+        }
+    }
+
+    /// Reports how the OS is scheduling this daemon, and whether the daemon's
+    /// own QoS assertion landed (#1910).
+    ///
+    /// `status` is `degraded`, not `error`, when the assertion failed: a daemon
+    /// running at the wrong priority answers every request correctly, just more
+    /// slowly at the tail. Calling that `error` would make `health.ok` false and
+    /// fail deploy gates over a performance property, which overstates it. What
+    /// matters is that it stops being *invisible*.
+    fn process_qos_health() -> SubsystemHealth {
+        let Some(report) = crate::server::process_qos_report() else {
+            return SubsystemHealth {
+                status: "unmeasured".to_owned(),
+                detail: Some(
+                    "the startup QoS assertion did not run in this process, so the daemon's priority class \
+                     and power-throttling state are unknown; this is expected only for an in-process service \
+                     that never went through daemon startup"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        };
+
+        let status = if report.failure_code.is_some() {
+            "degraded"
+        } else {
+            "ok"
+        };
+        // Say the thing that is actionable, not just the state. A daemon that had
+        // to raise itself is working, but its launcher is still wrong at the
+        // source and that is worth repairing.
+        let detail = report.failure_detail.clone().or_else(|| {
+            report.priority_raised.then(|| {
+                format!(
+                    "the daemon was launched at {} and raised itself to {}; the launch path is still handing \
+                     down a background priority class, which the daemon can only correct after startup — \
+                     rerun scripts/synapse-setup.ps1 to converge the scheduled task onto Priority 5 \
+                     (NORMAL_PRIORITY_CLASS) so the whole chain starts correctly",
+                    report.priority_class_before, report.priority_class_after
+                )
+            })
+        });
+
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail,
+            process_qos: Some(synapse_core::ProcessQosHealth {
+                priority_class_before: Some(report.priority_class_before.to_owned()),
+                priority_class_after: Some(report.priority_class_after.to_owned()),
+                priority_raised: Some(report.priority_raised),
+                power_throttling_control_mask: Some(report.power_throttling_control_mask),
+                power_throttling_state_mask: Some(report.power_throttling_state_mask),
+                execution_speed_throttling_disabled: Some(
+                    report.execution_speed_throttling_disabled,
+                ),
+                failure_code: report.failure_code.map(str::to_owned),
+            }),
+            ..SubsystemHealth::default()
         }
     }
 

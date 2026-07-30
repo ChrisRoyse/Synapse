@@ -4800,6 +4800,31 @@ pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
     )
 }
 
+/// Builds an MCP error that carries a structured failure's **own** remediation
+/// as a field (#1911).
+///
+/// [`mcp_error`] emits `{"code": ...}` only, so converting a substrate error
+/// through it left the remediation reachable solely as text inside the message.
+/// Anything downstream mapping that error onto its own envelope therefore had
+/// nothing to forward and substituted a generic sentence — which is how a
+/// failure came to advise a fix for a different fault.
+///
+/// Use this wherever a typed error with a catalog remediation crosses into the
+/// MCP surface; use [`mcp_error`] for failures raised here, whose remediation
+/// belongs to the reporting surface rather than to a substrate.
+pub fn mcp_error_with_remediation(
+    code: &str,
+    message: impl Into<String>,
+    remediation: &str,
+) -> ErrorData {
+    let message = message.into();
+    ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        message,
+        Some(json!({ "code": code, "remediation": remediation })),
+    )
+}
+
 /// Rejects malformed native window handles before target resolution or any
 /// hidden-desktop worker dispatch. This deliberately validates only the handle
 /// shape: a canonical HWND owned by another Windows desktop must be checked for

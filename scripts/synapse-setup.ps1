@@ -10909,6 +10909,75 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
     }
 }
 
+# Task Scheduler's default Priority is 7, which Windows maps to
+# BELOW_NORMAL_PRIORITY_CLASS + THREAD_PRIORITY_BELOW_NORMAL, and priority class
+# is inherited all the way down the launch chain (task -> wscript wrapper ->
+# supervisor -> synapse-mcp.exe). The daemon serves interactive MCP tool calls,
+# so it belongs in the band Microsoft designates for interactive tasks:
+#
+#   4, 5, 6 -> NORMAL_PRIORITY_CLASS      "used for interactive tasks"
+#   7, 8    -> BELOW_NORMAL_PRIORITY_CLASS "used for background tasks"
+#   https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-priority
+#
+# 5 (the middle of the NORMAL band), not 1/2/3: AboveNormal or High would let the
+# daemon contend with the user's own foreground application, which is the
+# opposite failure. Normal makes it an equal, not a winner.
+#
+# Measured on this host (i7-1355U, 6 competing Normal-priority CPU burners on 12
+# logical CPUs, identical query and corpus, A/B/A on the same process):
+#   BelowNormal  p95 = 965 / 319 / 463 / 428 ms
+#   Normal       p95 = 227 / 255 ms
+# The median moves little; the TAIL is where a deprioritized daemon is felt,
+# which is the signature of priority inversion rather than of slow work (#1910).
+$script:SynapseDaemonTaskPriority = 5
+
+function Assert-SynapseDaemonTaskPriority {
+    <#
+    .SYNOPSIS
+    Converges the daemon task's Priority onto the interactive band, on the
+    adoption path as well as the registration path.
+
+    .DESCRIPTION
+    Setting the value only at Register-ScheduledTask is not enough: setup adopts
+    an already-running task whenever one is healthy, and never re-registers it.
+    A host installed before this invariant existed would therefore keep
+    BELOW_NORMAL forever across every redeploy -- which is exactly how #1910 was
+    found. This reads the live value, repairs it when wrong, and re-reads to
+    prove the repair landed rather than trusting Set-ScheduledTask's return.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$Phase
+    )
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        Die "SYNAPSE_DAEMON_TASK_PRIORITY_TASK_MISSING task=$TaskName phase=$Phase remediation=register the daemon task before asserting its priority"
+    }
+
+    $observed = [int]$task.Settings.Priority
+    if ($observed -eq $script:SynapseDaemonTaskPriority) {
+        Info "SYNAPSE_DAEMON_TASK_PRIORITY_OK task=$TaskName phase=$Phase priority=$observed priority_class=NORMAL remediation=none"
+        return
+    }
+
+    Info "SYNAPSE_DAEMON_TASK_PRIORITY_REPAIRING task=$TaskName phase=$Phase observed=$observed expected=$($script:SynapseDaemonTaskPriority) reason=the daemon serves interactive MCP calls and must not run in the background priority band"
+    try {
+        $task.Settings.Priority = $script:SynapseDaemonTaskPriority
+        Set-ScheduledTask -TaskName $TaskName -Settings $task.Settings -ErrorAction Stop | Out-Null
+    } catch {
+        Die "SYNAPSE_DAEMON_TASK_PRIORITY_REPAIR_FAILED task=$TaskName phase=$Phase observed=$observed expected=$($script:SynapseDaemonTaskPriority) error=$($_.Exception.Message) remediation=grant Task Scheduler write access for this task and rerun setup"
+    }
+
+    # Read back from Task Scheduler, not from the object we just mutated.
+    $after = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $readback = if ($after) { [int]$after.Settings.Priority } else { -1 }
+    if ($readback -ne $script:SynapseDaemonTaskPriority) {
+        Die "SYNAPSE_DAEMON_TASK_PRIORITY_REPAIR_NOT_DURABLE task=$TaskName phase=$Phase expected=$($script:SynapseDaemonTaskPriority) readback=$readback remediation=Task Scheduler accepted the write but did not persist it; inspect the task definition and rerun setup"
+    }
+    Info "SYNAPSE_DAEMON_TASK_PRIORITY_REPAIRED task=$TaskName phase=$Phase priority=$readback priority_class=NORMAL remediation=none; the repair takes effect on the next daemon start"
+}
+
 function Remove-SynapseDaemonTaskRestartAuthority {
     param(
         [Parameter(Mandatory=$true)][string]$TaskName,
@@ -12134,6 +12203,9 @@ if (-not $liveDaemonHandoffRequired) {
         $liveAdoption.DaemonPid,
         $liveAdoption.SupervisorState,
         $liveAdoption.DaemonArgumentText)
+    # Adoption keeps the task exactly as it was, so a host installed before the
+    # priority invariant existed would never converge without this (#1910).
+    Assert-SynapseDaemonTaskPriority -TaskName $TaskName -Phase 'adoption'
 } else {
     Step "Registering auto-start daemon task '$TaskName'"
     Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 300
@@ -12157,13 +12229,18 @@ if (-not $liveDaemonHandoffRequired) {
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 `
-                -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+                -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                -Priority $SynapseDaemonTaskPriority
     $set.Hidden = $true
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $princ `
         -Settings $set -Description "Synapse MCP HTTP daemon (loopback) - the single body controlling Windows + WSL programs." | Out-Null
+    # Prove the registered value rather than trusting the settings object: this
+    # is the field whose silent default cost the daemon its interactive priority
+    # on every install to date (#1910).
+    Assert-SynapseDaemonTaskPriority -TaskName $TaskName -Phase 'post_register'
     Start-ScheduledTask -TaskName $TaskName
     Info "Task registered and started."
     [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'post_register')

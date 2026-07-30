@@ -65,6 +65,7 @@ mod m1;
 mod m2;
 mod m3;
 mod m4;
+mod process_qos;
 mod safety;
 mod secret_crypto;
 mod server;
@@ -467,6 +468,12 @@ async fn run() -> anyhow::Result<ExitCode> {
         drop(telemetry_guard);
         return result;
     }
+
+    // Declare the daemon's scheduling QoS before any subsystem starts, so every
+    // thread this process later spawns inherits the asserted priority class
+    // rather than the one the launcher happened to hand down (#1910).
+    let process_qos = process_qos::assert_interactive_qos();
+    crate::server::set_process_qos_report(process_qos);
 
     let dpi_awareness = synapse_capture::init_process_dpi_awareness()
         .context("initialize per-monitor DPI awareness")?;

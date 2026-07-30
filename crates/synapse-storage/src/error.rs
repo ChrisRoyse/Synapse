@@ -48,6 +48,15 @@ pub enum StorageError {
         cf_name: String,
         code: &'static str,
         detail: String,
+        /// The substrate error's own remediation, kept as a field rather than
+        /// only as text inside `detail` (#1911).
+        ///
+        /// `{code, message, remediation}` is the wire contract and `code`
+        /// already travels here; folding the remediation into a formatted
+        /// string meant every caller mapping this onto its own surface had
+        /// nothing to forward, so each one substituted a generic sentence about
+        /// a different fault.
+        remediation: &'static str,
         /// Exact applied sequence when Calyx proved the failure happened after
         /// its irreversible commit boundary. `None` means no applied sequence
         /// was proven and callers must not infer one from the global tip.
@@ -68,6 +77,9 @@ pub enum StorageError {
         cf_name: String,
         code: &'static str,
         detail: String,
+        /// The substrate error's own remediation (#1911). See
+        /// [`StorageError::CalyxWriteFailed`] for why this is a field.
+        remediation: &'static str,
     },
     #[error("storage schema mismatch: expected {expected}, actual {actual}")]
     SchemaMismatch { expected: u32, actual: u32 },
@@ -90,6 +102,22 @@ impl StorageError {
             Self::UnsafeGcEvictionRefused { .. } => error_codes::STORAGE_GC_UNSAFE_EVICTION_REFUSED,
             Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,
+        }
+    }
+
+    /// Returns the substrate error's own remediation, when this failure carries
+    /// one (#1911).
+    ///
+    /// `None` for the variants raised by this crate, whose remediation belongs
+    /// to whatever surface is reporting them — a caller can then tell "this
+    /// failure has no specific fix to forward" apart from "the fix is empty"
+    /// and fall back deliberately instead of by accident.
+    #[must_use]
+    pub const fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::CalyxWriteFailed { remediation, .. }
+            | Self::CalyxReadFailed { remediation, .. } => Some(*remediation),
+            _ => None,
         }
     }
 

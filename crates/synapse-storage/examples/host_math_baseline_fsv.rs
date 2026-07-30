@@ -259,6 +259,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     ] {
         println!("  {name:<10} {}", if enabled { "enabled" } else { "-" });
     }
+    // The compile-time list above says what LLVM was allowed to emit. It does
+    // NOT say what this CPU can execute, and the two answers diverge for every
+    // kernel that dispatches at runtime — which is the whole point of runtime
+    // dispatch. Reporting only the compile-time set made a real question
+    // ("does this host have SHA-NI, so is `sha2` picking its hardware backend?")
+    // unanswerable from the instrument's own output, so both are printed now.
+    println!("--- runtime instruction set THIS CPU actually supports ---");
+    for (name, detected) in [
+        ("avx", is_x86_feature_detected!("avx")),
+        ("avx2", is_x86_feature_detected!("avx2")),
+        ("fma", is_x86_feature_detected!("fma")),
+        ("bmi2", is_x86_feature_detected!("bmi2")),
+        ("sha", is_x86_feature_detected!("sha")),
+        ("aes", is_x86_feature_detected!("aes")),
+        ("avx512f", is_x86_feature_detected!("avx512f")),
+    ] {
+        println!("  {name:<10} {}", if detected { "present" } else { "-" });
+    }
+    // `sha2` 0.11 selects its `x86-sha` backend when sha + sse2 + ssse3 + sse4.1
+    // are all detected at runtime, and falls back to `soft` otherwise. That is
+    // the exact predicate, so state the conclusion rather than leaving it to be
+    // inferred from the feature list.
+    let shani = is_x86_feature_detected!("sha")
+        && is_x86_feature_detected!("sse2")
+        && is_x86_feature_detected!("ssse3")
+        && is_x86_feature_detected!("sse4.1");
+    println!(
+        "  sha2 backend = {}  (runtime-selected; no compile flag governs this)",
+        if shani { "x86-sha (SHA-NI)" } else { "soft" }
+    );
+
     let backend = CpuBackend::new();
     println!(
         "  forge simd_path = {}  (runtime avx512={})",

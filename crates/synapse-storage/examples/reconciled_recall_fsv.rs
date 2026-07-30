@@ -138,13 +138,19 @@ fn report_sidecar(vault_dir: &Path, query_cells: &[u32]) -> Result<(), Box<dyn E
     let mut sidecar = None;
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.starts_with(&format!("slot_{TEXT_SLOT:05}_")) && name.ends_with(".sparse.json") {
             sidecar = Some(path);
         }
     }
     let Some(path) = sidecar else {
-        println!("  SIDECAR none found for slot {TEXT_SLOT} under {}", dir.display());
+        println!(
+            "  SIDECAR none found for slot {TEXT_SLOT} under {}",
+            dir.display()
+        );
         return Ok(());
     };
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
@@ -152,7 +158,9 @@ fn report_sidecar(vault_dir: &Path, query_cells: &[u32]) -> Result<(), Box<dyn E
     let postings = &value["postings"];
     println!(
         "  SIDECAR {} rows={rows} scoring={} dim={}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
         value["scoring"],
         value["dim"]
     );
@@ -196,7 +204,8 @@ fn run_query(
 ) -> Result<Vec<(CxId, f32)>, Box<dyn Error>> {
     println!("\n--- phase {phase}: by_text \"{text}\" ---");
     let allowed = BTreeSet::from([SlotId::new(TEXT_SLOT)]);
-    let query_vectors = calyx_search::measure_query_vectors_with_slots(state, text, Some(&allowed))?;
+    let query_vectors =
+        calyx_search::measure_query_vectors_with_slots(state, text, Some(&allowed))?;
     let cells = query_vectors
         .iter()
         .flat_map(|(_, vector)| match vector {
@@ -204,7 +213,10 @@ fn run_query(
             _ => Vec::new(),
         })
         .collect::<Vec<_>>();
-    println!("  measured query slots={} cells={cells:?}", query_vectors.len());
+    println!(
+        "  measured query slots={} cells={cells:?}",
+        query_vectors.len()
+    );
     report_sidecar(vault_dir, &cells)?;
 
     let mut trace = Vec::new();
@@ -294,7 +306,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let base_present = vault
         .read_cf_at(vault.latest_seq(), ColumnFamily::Base, &base_key(marked))?
         .is_some();
-    let stored_vector = vault.read_slot_vector_at(vault.latest_seq(), marked, SlotId::new(TEXT_SLOT))?;
+    let stored_vector =
+        vault.read_slot_vector_at(vault.latest_seq(), marked, SlotId::new(TEXT_SLOT))?;
     println!(
         "SoT base_present={base_present} slot_{TEXT_SLOT}_vector={}",
         match &stored_vector {
@@ -368,7 +381,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if phase_a && phase_c && !phase_b {
         println!("  #1907 REPRODUCED: reconciled recall drops the hit the index provably holds");
     } else if phase_a && phase_b && phase_c && edges_ok {
-        println!("  #1907 FIXED: reconciled recall is correct on the happy path and all edge cases");
+        println!(
+            "  #1907 FIXED: reconciled recall is correct on the happy path and all edge cases"
+        );
     } else {
         println!("  INCONCLUSIVE / REGRESSED: see the failing line above");
     }
@@ -403,11 +418,25 @@ fn edge_cases(
         .ok_or("marked row lost its lexical vector")?;
     println!("\n[D] BEFORE latest_seq={}", vault.latest_seq());
     vault.put_slot_vector(marked, panel_slot, &vector)?;
-    println!("[D] AFTER  latest_seq={} (generation is now stale)", vault.latest_seq());
+    println!(
+        "[D] AFTER  latest_seq={} (generation is now stale)",
+        vault.latest_seq()
+    );
     let absent_term = "synfsv1907noSuchTermAnywhere";
-    let hits = run_query(vault, vault_dir, state, "D (genuine miss, stale generation)", absent_term, false)?;
+    let hits = run_query(
+        vault,
+        vault_dir,
+        state,
+        "D (genuine miss, stale generation)",
+        absent_term,
+        false,
+    )?;
     let d_ok = hits.is_empty();
-    println!("  EXPECTED hits=0 and NO error (a miss is a miss, #1896)\n  OBSERVED hits={} {}", hits.len(), if d_ok { "OK" } else { "WRONG" });
+    println!(
+        "  EXPECTED hits=0 and NO error (a miss is a miss, #1896)\n  OBSERVED hits={} {}",
+        hits.len(),
+        if d_ok { "OK" } else { "WRONG" }
+    );
     results.push(("D genuine miss returns empty, no error".to_owned(), d_ok));
 
     // --- E: a row ingested AFTER the generation must be findable ------------
@@ -438,11 +467,32 @@ fn edge_cases(
         )?
     };
     let new_id = new_row.cx_id;
-    let before = run_query(vault, vault_dir, state, "E-before (row not yet written)", new_marker, false)?;
-    println!("[E] BEFORE hits={} latest_seq={}", before.len(), vault.latest_seq());
+    let before = run_query(
+        vault,
+        vault_dir,
+        state,
+        "E-before (row not yet written)",
+        new_marker,
+        false,
+    )?;
+    println!(
+        "[E] BEFORE hits={} latest_seq={}",
+        before.len(),
+        vault.latest_seq()
+    );
     vault.put(new_row)?;
-    println!("[E] AFTER  wrote cx_id={new_id} latest_seq={}", vault.latest_seq());
-    let after = run_query(vault, vault_dir, state, "E (new row, stale generation)", new_marker, false)?;
+    println!(
+        "[E] AFTER  wrote cx_id={new_id} latest_seq={}",
+        vault.latest_seq()
+    );
+    let after = run_query(
+        vault,
+        vault_dir,
+        state,
+        "E (new row, stale generation)",
+        new_marker,
+        false,
+    )?;
     let e_ok = before.is_empty() && after.len() == 1 && after[0].0 == new_id;
     println!(
         "  EXPECTED before=0 after=1 cx_id={new_id}\n  OBSERVED before={} after={} {}",
@@ -457,11 +507,21 @@ fn edge_cases(
     // design. `declared` never counts it (the collector skips a row with no
     // visible Base), so the conservation check must stay silent and the correct
     // answer here is an empty result, not an error.
-    let before = run_query(vault, vault_dir, state, "F-before (row still live)", MARKER, false)?;
+    let before = run_query(
+        vault,
+        vault_dir,
+        state,
+        "F-before (row still live)",
+        MARKER,
+        false,
+    )?;
     let base_before = vault
         .read_cf_at(vault.latest_seq(), ColumnFamily::Base, &base_key(marked))?
         .is_some();
-    println!("[F] BEFORE base_row_present={base_before} hits={}", before.len());
+    println!(
+        "[F] BEFORE base_row_present={base_before} hits={}",
+        before.len()
+    );
     let erased = vault.erase_scope_ledger_stamped(
         calyx_aster::erase::EraseScope::Cx(marked),
         &calyx_aster::erase::EraseRegistry::new(),
@@ -474,7 +534,14 @@ fn edge_cases(
         erased.records_deleted,
         vault.latest_seq()
     );
-    let after = run_query(vault, vault_dir, state, "F (erased row, stale generation)", MARKER, false)?;
+    let after = run_query(
+        vault,
+        vault_dir,
+        state,
+        "F (erased row, stale generation)",
+        MARKER,
+        false,
+    )?;
     let f_ok = before.len() == 1 && !base_before.eq(&false) && !base_after && after.is_empty();
     println!(
         "  EXPECTED before=1 after=0, base row gone, NO error\n  OBSERVED before={} after={} base_after={base_after} {}",

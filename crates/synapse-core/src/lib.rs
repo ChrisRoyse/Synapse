@@ -31,7 +31,7 @@ pub use types::{
     ObservationCaptureConfig, ObservationCaptureTarget, ObservationDiagnostics,
     ObservationElementsPage, OcrBackend, OcrCapturedTarget, OcrConfidenceSource, OcrResult,
     OcrWord, PERCEIVED_TEXT_UNTRUSTED_NOTICE, PROFILE_SCHEMA_VERSION, PadButton, PadId, PathPoint,
-    PathSpec, PerceptionMode, Point, Profile, ProfileBackends, ProfileCapture,
+    PathSpec, PerceptionMode, Point, ProcessQosHealth, Profile, ProfileBackends, ProfileCapture,
     ProfileCaptureTarget, ProfileDetection, ProfileId, ProfileMatch, ProfileOcr, ProfileUseScope,
     RealityAudit, RealityBaseline, RealityBaselineStatus, RealityDelta, RealityDeltaConflict,
     RealityDeltaValidationError, RealityDriftItem, RealityDriftStatus, RealitySourceSurface,

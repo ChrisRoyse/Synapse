@@ -17,7 +17,23 @@ use synapse_storage::{
     STORAGE_METADATA_ONLY_REDACTION_POLICY, cf,
 };
 
-use crate::m1::mcp_error;
+use crate::m1::{mcp_error, mcp_error_with_remediation};
+
+/// Maps a `StorageError` onto the MCP surface **with** its own remediation
+/// (#1911).
+///
+/// `StorageError::code()` was already being forwarded here while the adjacent
+/// remediation was left to survive only as text inside the message, so anything
+/// downstream that re-wrapped this error had nothing to forward and substituted
+/// a generic sentence describing a different fault. Errors this crate raises
+/// itself carry no substrate remediation, and those still go through
+/// [`mcp_error`] so the reporting surface supplies the fix.
+fn storage_mcp_error(error: &synapse_storage::StorageError) -> ErrorData {
+    error.remediation().map_or_else(
+        || mcp_error(error.code(), error.to_string()),
+        |remediation| mcp_error_with_remediation(error.code(), error.to_string(), remediation),
+    )
+}
 
 use super::{
     M3ToolStub,
@@ -1558,7 +1574,7 @@ pub fn run_find_similar(
     };
     let report = db
         .find_similar(&find_params)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        .map_err(|error| storage_mcp_error(&error))?;
     // An exact-value probe returns bucket candidates, not exact matches: inside
     // the index a collision is byte-identical to a true match. Confirm every
     // candidate against its authoritative source field here, drop the ones that

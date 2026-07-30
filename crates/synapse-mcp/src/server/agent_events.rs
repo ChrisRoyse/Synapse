@@ -280,6 +280,10 @@ fn latch_agent_event_commit_reconciliation(
     agent_event_commit_reconciliation_error(stage, detail)
 }
 
+/// The one statement of what to do about a latched agent-event commit
+/// fail-stop, so the message text and the structured field cannot drift apart.
+const AGENT_EVENT_COMMIT_RECONCILIATION_REMEDIATION: &str = "stop this daemon, reopen the Calyx vault from durable WAL truth, inspect the exact journal/projection rows named by the preceding error, and do not retry the logical operation in this process";
+
 fn agent_event_commit_reconciliation_error(
     stage: &'static str,
     detail: impl Into<String>,
@@ -288,9 +292,13 @@ fn agent_event_commit_reconciliation_error(
         cf_name: "<agent-event-journal-and-projection>".to_owned(),
         code: CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED,
         detail: format!(
-            "AGENT_EVENT_COMMIT_FAIL_STOP_LATCHED: stage={stage}; {}; remediation=stop this daemon, reopen the Calyx vault from durable WAL truth, inspect the exact journal/projection rows named by the preceding error, and do not retry the logical operation in this process",
+            "AGENT_EVENT_COMMIT_FAIL_STOP_LATCHED: stage={stage}; {}; remediation={AGENT_EVENT_COMMIT_RECONCILIATION_REMEDIATION}",
             detail.into()
         ),
+        // Also a field, not only text inside `detail`, so the facade that
+        // reports this failure forwards the real fix instead of substituting a
+        // generic one (#1911).
+        remediation: AGENT_EVENT_COMMIT_RECONCILIATION_REMEDIATION,
         committed_seq: None,
     }
 }

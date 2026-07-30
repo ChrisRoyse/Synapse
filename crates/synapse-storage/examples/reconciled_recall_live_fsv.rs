@@ -105,7 +105,10 @@ fn report_sidecar(vault_dir: &Path, panel_version: u32) -> Result<Vec<CxId>, Box
     let mut sidecar = None;
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.starts_with(&format!("slot_{TEXT_SLOT:05}_")) && name.ends_with(".sparse.json") {
             sidecar = Some(path);
         }
@@ -113,10 +116,14 @@ fn report_sidecar(vault_dir: &Path, panel_version: u32) -> Result<Vec<CxId>, Box
     let path = sidecar.ok_or("no persisted sparse sidecar for the lexical slot")?;
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     let rows = value["rows"].as_array().cloned().unwrap_or_default();
-    let cells = value["postings"].as_object().map_or(0, serde_json::Map::len);
+    let cells = value["postings"]
+        .as_object()
+        .map_or(0, serde_json::Map::len);
     println!(
         "SIDECAR {} rows={} distinct_posted_cells={cells} scoring={} dim={}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
         rows.len(),
         value["scoring"],
         value["dim"]
@@ -140,9 +147,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let vault_id: VaultId = args.next().ok_or("missing <vault-id>")?.parse()?;
     let probe_text = args.next().unwrap_or_else(|| DEFAULT_PROBE.to_owned());
 
-    println!("reconciled_recall_live_fsv: vault_dir={}", vault_dir.display());
+    println!(
+        "reconciled_recall_live_fsv: vault_dir={}",
+        vault_dir.display()
+    );
     let salt = std::fs::read(&salt_path)?;
-    println!("salt={} ({} bytes) vault_id={vault_id}", salt_path.display(), salt.len());
+    println!(
+        "salt={} ({} bytes) vault_id={vault_id}",
+        salt_path.display(),
+        salt.len()
+    );
 
     let vault = AsterVault::open(&vault_dir, vault_id, salt, VaultOptions::default())?;
     let state = load_vault_panel_state(&vault_dir)?;
@@ -154,11 +168,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- step 1+2: current index, static search = the ground truth ----------
     calyx_search::rebuild_for_vault_with_panel_state(&vault_dir, &vault, &state)?;
-    println!("\n=== step 1: generation rebuilt at seq={} ===", vault.latest_seq());
+    println!(
+        "\n=== step 1: generation rebuilt at seq={} ===",
+        vault.latest_seq()
+    );
     let indexed = report_sidecar(&vault_dir, panel_version)?;
     println!("indexed rows in the lexical lane: {}", indexed.len());
 
-    let truth = run_query(&vault, &vault_dir, &state, "step 2 GROUND TRUTH (static, current index)", &probe_text)?;
+    let truth = run_query(
+        &vault,
+        &vault_dir,
+        &state,
+        "step 2 GROUND TRUTH (static, current index)",
+        &probe_text,
+    )?;
     if truth.is_empty() {
         return Err(format!(
             "probe \"{probe_text}\" matches nothing even on a current index; pick a term that occurs in this corpus"
@@ -203,11 +226,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("delta now: {}", composition.composition());
 
     // --- step 4: the identical probe, now reconciled ------------------------
-    let reconciled = run_query(&vault, &vault_dir, &state, "step 4 RECONCILED (stale generation)", &probe_text)?;
+    let reconciled = run_query(
+        &vault,
+        &vault_dir,
+        &state,
+        "step 4 RECONCILED (stale generation)",
+        &probe_text,
+    )?;
 
     // A genuine miss must still be an empty result on the same stale generation.
     let miss_term = "synfsv1907termthatcannotoccur";
-    let miss = run_query(&vault, &vault_dir, &state, "edge: genuine miss on the stale generation", miss_term)?;
+    let miss = run_query(
+        &vault,
+        &vault_dir,
+        &state,
+        "edge: genuine miss on the stale generation",
+        miss_term,
+    )?;
 
     println!("\n================= VERDICT =================");
     let truth_ids: Vec<String> = truth.iter().map(|(id, _)| id.to_string()).collect();
@@ -231,9 +266,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !score_delta.is_empty() {
         println!("  score differences        = {score_delta:?}");
     }
-    println!("  genuine miss still empty = {} (hits={})", miss.is_empty(), miss.len());
+    println!(
+        "  genuine miss still empty = {} (hits={})",
+        miss.is_empty(),
+        miss.len()
+    );
     if same_order && same_scores && miss.is_empty() {
-        println!("  PASS: reconciled recall over the live corpus reproduces the current index exactly");
+        println!(
+            "  PASS: reconciled recall over the live corpus reproduces the current index exactly"
+        );
     } else {
         println!("  FAIL: reconciled recall diverges from the current index on real data");
     }

@@ -8968,6 +8968,10 @@ fn calyx_read_failed(
         cf_name: cf_name.to_owned(),
         code: source.code,
         detail: format!("{action}: {source}"),
+        // The value was already in hand here — it was being logged and then
+        // dropped, so the specific fix reached the operator's log and never the
+        // error envelope they actually read (#1911).
+        remediation: source.remediation,
     }
 }
 
@@ -8985,6 +8989,7 @@ fn calyx_write_failed(cf_name: &str, action: &str, source: &SynapseCalyxError) -
         cf_name: cf_name.to_owned(),
         code: source.code,
         detail: format!("{action}: {source}"),
+        remediation: source.remediation,
         committed_seq: None,
     }
 }
@@ -9008,6 +9013,7 @@ fn calyx_conditional_write_failed(
         cf_name: cf_name.to_owned(),
         code: source.source.code,
         detail: format!("{action}: {}", source.source),
+        remediation: source.source.remediation,
         committed_seq: source.committed_seq,
     }
 }

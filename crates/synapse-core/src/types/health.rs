@@ -550,6 +550,54 @@ pub struct SubsystemHealth {
     /// except `calyx_hot_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_hot_path: Option<CalyxHotPathBoundaryHealth>,
+    /// Structured `process_qos` verdict (#1910). `None` for every subsystem
+    /// except `process_qos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_qos: Option<ProcessQosHealth>,
+}
+
+/// How the OS is scheduling this daemon process, and whether the daemon
+/// successfully said what it wanted (#1910).
+///
+/// This exists because the defect it reports was invisible on every surface the
+/// system is normally verified through: the daemon ran at
+/// `BELOW_NORMAL_PRIORITY_CLASS` on every install, and the only way to see that
+/// was an out-of-band `Get-Process`. Scheduling `QoS` is part of whether the
+/// daemon is healthy, so it is reported where the rest of health is.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessQosHealth {
+    /// Priority class the process was launched with, before it asserted its own.
+    /// `BelowNormal` here with `Normal` after means the launcher handed down the
+    /// background default and the daemon corrected it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_class_before: Option<String>,
+    /// Priority class read back from the OS after the assertion. This is the
+    /// value that governs scheduling, and it is a readback rather than the value
+    /// that was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_class_after: Option<String>,
+    /// Whether the daemon actually had to raise itself. `true` means the launch
+    /// path is still handing down a background priority — worth repairing at the
+    /// source even though the daemon compensated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_raised: Option<bool>,
+    /// `ControlMask` from `GetProcessInformation(ProcessPowerThrottling)`. Zero
+    /// means the process made no explicit choice and Windows is inferring a `QoS`
+    /// level heuristically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_throttling_control_mask: Option<u32>,
+    /// `StateMask` from the same readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_throttling_state_mask: Option<u32>,
+    /// Proven by readback: execution-speed throttling is explicitly controlled
+    /// and off, so the process is not classified `EcoQoS` and not biased onto
+    /// efficiency cores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_speed_throttling_disabled: Option<bool>,
+    /// Structured code for an assertion that did not reach its intended state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
