@@ -41,18 +41,33 @@ pub struct PanelDeltaComposition {
     pub base_keys_other_panels: usize,
     /// Changed `Base` keys whose visible history is entirely tombstoned.
     pub base_keys_unattributed: usize,
-    /// Changed keys contributed by each indexed slot CF.
+    /// Changed keys observed in each indexed slot CF.
     ///
-    /// A slot id belongs to exactly one panel *name* (#1776), which is why these
-    /// scans need no `Base`-style attribution — but **not** to one panel
-    /// *version*: a new generation of the same panel reuses its slot ids, so two
-    /// live generations of one panel would count each other here. Latent while a
-    /// superseded generation is inert; tracked in #1905, which is also where the
-    /// stronger observation lives (every slot write also writes its Base row, so
-    /// these scans may be redundant once that is established for every writer).
+    /// A slot id belongs to exactly one panel *name* (#1776) — but **not** to one
+    /// panel *version*: a new generation of the same panel reuses its slot ids,
+    /// so `cf/slot_03` holds rows from every generation of that panel. These
+    /// counts are therefore **reported, not counted** (#1905): they no longer
+    /// contribute to `changed`, so an inflated slot contribution stays visible
+    /// here without charging this generation's budget for another generation's
+    /// ingest.
     pub slot_keys: BTreeMap<SlotId, usize>,
-    /// Distinct constellations to reconcile: the union of the scoped `Base`
-    /// keys and every slot CF's keys.
+    /// Changed slot keys belonging to a different generation, excluded.
+    pub slot_keys_other_generation: usize,
+    /// Changed slot keys with no visible `Base` row, excluded.
+    ///
+    /// Orphan slot rows awaiting GC. They were never reconcilable — the
+    /// reconciliation skips a key whose `Base` row is absent — so counting them
+    /// only ever inflated the budget.
+    pub slot_keys_orphaned: usize,
+    /// Distinct constellations to reconcile: exactly the panel-scoped `Base`
+    /// changed keys.
+    ///
+    /// Slot keys are deliberately **not** unioned in. Every live slot write is
+    /// staged in the same atomic batch as its own `Base` row — see
+    /// `measure_panel_delta` for the enumeration and the commit-time guard that
+    /// holds it — so a slot key that this panel generation must reconcile is
+    /// already here, and one that is not here belongs to another generation or
+    /// to no live row at all.
     pub changed: BTreeSet<CxId>,
 }
 
@@ -74,7 +89,7 @@ impl PanelDeltaComposition {
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "panel_version={} base_seq={} pinned_seq={} distinct_changed={} base_scanned={} base_panel={} base_other_panels={} base_unattributed={}{}{slots}",
+            "panel_version={} base_seq={} pinned_seq={} distinct_changed={} base_scanned={} base_panel={} base_other_panels={} base_unattributed={} slot_other_generation={} slot_orphaned={}{}{slots}",
             self.panel_version,
             self.base_seq,
             self.pinned_seq,
@@ -83,6 +98,8 @@ impl PanelDeltaComposition {
             self.base_keys_panel,
             self.base_keys_other_panels,
             self.base_keys_unattributed,
+            self.slot_keys_other_generation,
+            self.slot_keys_orphaned,
             if self.slot_keys.is_empty() { "" } else { " " },
         )
     }
@@ -90,16 +107,53 @@ impl PanelDeltaComposition {
 
 /// Measures one panel generation's changed-key delta against a pinned snapshot.
 ///
-/// The `Base` scan is scoped to `panel_version`; the slot scans rely on slot ids
-/// being globally unique per panel *name* (see `slot_keys` for the residual this
-/// leaves, tracked in #1905). This is the single definition of "how far behind is
-/// this generation" in the workspace: both the query path's bounded
-/// reconciliation check and the maintainer's refresh trigger call it.
+/// This is the single definition of "how far behind is this generation" in the
+/// workspace: both the query path's bounded reconciliation check and the
+/// maintainer's refresh trigger call it.
+///
+/// # Why the delta is the panel-scoped `Base` set, and nothing else (#1905)
+///
+/// #1901 scoped the `Base` half. The slot half was left unscoped on the grounds
+/// that a slot id belongs to exactly one panel (#1776) — true of a panel *name*
+/// and false of a panel *version*. A new generation reuses its predecessor's
+/// slot ids, so `cf/slot_03` holds rows from every generation of that panel and
+/// an unscoped scan charges one generation for another's ingest.
+///
+/// Rather than attribute each slot key, the scans stop contributing at all,
+/// because the panel-scoped `Base` set is already complete. Every writer that
+/// can stage a row into a quantized slot CF:
+///
+/// - **ingest** (`prepared::stage_validated_constellation_rows`, single and
+///   batch) stages `Base` and every slot row in one atomic batch;
+/// - **`put_slot_vector`** — the only qualified slot write — stages the slot row
+///   *and* the rewritten `Base` row in one atomic batch, because the `Base` slot
+///   hash **is** the vector's integrity record (#1888);
+/// - **erase** (`erase::targets`) reaches `collect_slot_targets` only alongside
+///   pushing the row's own `Base` key, so `Base` is tombstoned with it — and a
+///   fully-tombstoned chain is returned in the panel's keys as `unattributed`,
+///   precisely so a deleted row is still masked;
+/// - **orphan-slot GC** deletes slot rows that have *no visible `Base` row*,
+///   which the reconciliation skips anyway (`base.is_none()` → `continue`);
+/// - **compaction/tiering** moves SSTs, not commit-domain rows.
+///
+/// This is not only an audit of today's call sites. `mvcc::store` refuses, at
+/// commit, any batch carrying a live quantized-slot write with neither a
+/// same-batch nor a visible `Base` row (`"live quantized slot write has no
+/// visible or same-batch Base row … refusing unscoped search-index mutation"`).
+///
+/// The scans still run, as a **cross-check rather than a contribution**: a
+/// changed slot key that is absent from the panel's `Base` set must be
+/// explicable, and each one is classified as another generation's or as an
+/// orphan. A key that is neither — a live row of *this* generation whose slot
+/// changed without its `Base` — would mean a writer has broken the invariant
+/// this scoping rests on, and that fails closed rather than silently
+/// under-reconciling.
 ///
 /// # Errors
 ///
 /// Fails closed when the MVCC changed-key history cannot prove the requested
-/// range, or when a changed key is not a well-formed `CxId`.
+/// range, when a changed key is not a well-formed `CxId`, or when a changed slot
+/// key belongs to this generation but its `Base` row did not change with it.
 pub fn measure_panel_delta<C: Clock>(
     vault: &AsterVault<C>,
     snapshot: calyx_aster::mvcc::Snapshot,
@@ -114,12 +168,35 @@ pub fn measure_panel_delta<C: Clock>(
         changed.insert(cx_id_from_key(key, ColumnFamily::Base)?);
     }
     let mut slot_keys = BTreeMap::new();
+    let mut slot_keys_other_generation = 0_usize;
+    let mut slot_keys_orphaned = 0_usize;
     for slot in query_slots {
         let cf = ColumnFamily::slot(slot);
         let keys = vault.changed_cf_keys_after_snapshot(snapshot, cf, base_seq)?;
         slot_keys.insert(slot, keys.len());
         for key in keys {
-            changed.insert(cx_id_from_key(&key, cf)?);
+            let cx_id = cx_id_from_key(&key, cf)?;
+            if changed.contains(&cx_id) {
+                continue;
+            }
+            if vault
+                .read_cf_snapshot(snapshot, ColumnFamily::Base, cx_id.as_bytes())?
+                .is_none()
+            {
+                slot_keys_orphaned += 1;
+                continue;
+            }
+            let base = vault.get_base_at_snapshot(cx_id, snapshot)?;
+            if base.panel_version == panel_version {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "constellation {cx_id} changed in {} after seq {base_seq} but its Base row did not, while both belong to panel {panel_version}; \
+                     every live slot write is staged in the same atomic batch as its own Base row, so this means a writer bypassed that contract and the \
+                     panel-scoped reconciliation delta is no longer complete. Repair the writer rather than widening the delta",
+                    cf.name()
+                ))
+                .into());
+            }
+            slot_keys_other_generation += 1;
         }
     }
     Ok(PanelDeltaComposition {
@@ -131,6 +208,8 @@ pub fn measure_panel_delta<C: Clock>(
         base_keys_other_panels: scoped.other_panels,
         base_keys_unattributed: scoped.unattributed,
         slot_keys,
+        slot_keys_other_generation,
+        slot_keys_orphaned,
         changed,
     })
 }
