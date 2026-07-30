@@ -199,15 +199,25 @@ impl AlgorithmicEncoder {
             | Self::SynSparseText { .. }
             | Self::SynTokenSlots { .. }
             | Self::SynMultiHot { .. }
-            // Whole-string lanes: the query hashes to the same cell as an
-            // identical stored string, which is exact-match recall.
-            | Self::SynHash { .. }
             // Character/byte-shape lanes over arbitrary text.
             | Self::ByteFeatures
             | Self::AstStyle => true,
+            // Whole-string hashes are excluded, and this is the one call in the
+            // table that could have gone either way. A hash lane looks
+            // attractive — a query identical to a stored app name lands in the
+            // same cell, which is exact-match recall. But it hashes *any* query
+            // to exactly one cell, so it always returns a full ranked list: for
+            // an unrelated phrase, whatever happens to share that bucket. On a
+            // dim-1024 lane that is a roughly 1-in-1024 chance, per query, of
+            // injecting an entire spurious lane into the rank fusion at full
+            // weight, with nothing in the result to distinguish a real exact
+            // match from a collision. Free-text recall must not be occasionally
+            // and invisibly wrong, so exact-match-by-hash needs its own explicit
+            // query mode rather than silent participation in every text query.
+            Self::SynHash { .. }
             // Closed vocabularies: an out-of-vocabulary phrase still lands in a
             // bucket, so a match here would be fabricated, not measured.
-            Self::OneHot { .. }
+            | Self::OneHot { .. }
             | Self::SynOneHot { .. }
             // Numeric, temporal and derived-statistic encoders: a phrase is not
             // one of their inputs.
