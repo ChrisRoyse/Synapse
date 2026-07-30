@@ -47,11 +47,28 @@ pub const SYN_TIMELINE_PANEL_VERSION: u32 = 1_900_001;
 /// rows written before the BM25 lane existed rather than guess at a number.
 pub const SYN_TIMELINE_PANEL_VERSION_PRE_1900: u32 = 1_664_001;
 pub const SYN_EPISODE_PANEL_NAME: &str = "syn-episode-v1";
-pub const SYN_EPISODE_PANEL_VERSION: u32 = 1_664_002;
+/// Current episode slot layout.
+///
+/// #1904 added `EP_SLOT_TITLE_BM25`. Same reasoning as the timeline bump above:
+/// a `panel_version` identifies a slot layout and Base slot membership is
+/// immutable once written, so a new lens is a new generation re-measured from
+/// the authoritative `CF_EPISODES` rows. Adding the slot without bumping this
+/// now fails closed with `CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE` (#1903) rather
+/// than being dropped.
+pub const SYN_EPISODE_PANEL_VERSION: u32 = 1_904_002;
+/// The episode layout #1904 superseded.
+pub const SYN_EPISODE_PANEL_VERSION_PRE_1904: u32 = 1_664_002;
 pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
 pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_665_001;
 pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
-pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_665_002;
+/// Current agent-transcript slot layout.
+///
+/// #1904 added `AT_SLOT_TEXT_BM25`, giving the largest text corpus on the vault
+/// its first lexically-rankable lane. See the episode constant above for why a
+/// new lens is a new generation.
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_904_003;
+/// The agent-transcript layout #1904 superseded.
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904: u32 = 1_665_002;
 // #1776 moved these panels off their old panel-local slot ids onto exclusive
 // GLOBAL blocks. A panel_version identifies a slot layout, so the new layout
 // gets a new version: reusing the old one would make a single panel_version
@@ -123,7 +140,7 @@ const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100
 /// `u16` and `cf/slot_<id>` directories are named from it, so there is ample
 /// headroom. Raise it when a new panel block needs room; the compile-time
 /// assertion on `PANEL_SLOT_BLOCKS` keeps the two in agreement.
-const CALYX_DURABLE_SLOT_ID_MAX: u16 = 106;
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 108;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -168,6 +185,21 @@ const EP_SLOT_STARTED_BOUNDARY_ONEHOT: SlotId = SlotId::new(19);
 const EP_SLOT_ENDED_BOUNDARY_ONEHOT: SlotId = SlotId::new(20);
 const EP_SLOT_INTERRUPTION_RATIO: SlotId = SlotId::new(21);
 const EP_SLOT_RECORD_VECTOR: SlotId = SlotId::new(22);
+/// Raw term-frequency lexical lane over the same title text
+/// `EP_SLOT_TITLE_SPARSE` hashes (#1904). The episode panel's `8..=22` is boxed
+/// in by the agent-event panel at 23, so this is a second block.
+const EP_SLOT_TITLE_BM25: SlotId = SlotId::new(108);
+
+/// Sparse dimension for the episode lexical lane.
+///
+/// An episode title is a window/document title, the same shape of text the
+/// timeline panel measures, so this is sized against the same kind of small
+/// repetitive vocabulary rather than against transcript prose: the live
+/// timeline BM25 sidecar occupies **51 distinct cells** across 113
+/// title-bearing rows, so 4,096 leaves two orders of magnitude of headroom.
+/// Recorded as its own constant so the two lanes can diverge without one
+/// silently inheriting the other's sizing.
+const EP_TITLE_BM25_DIM: u32 = 4_096;
 
 const AE_SLOT_KIND_ONEHOT: SlotId = SlotId::new(23);
 const AE_SLOT_OPERATION_ONEHOT: SlotId = SlotId::new(24);
@@ -195,6 +227,54 @@ const AT_SLOT_OUTPUT_TOKENS_LOG1P: SlotId = SlotId::new(44);
 const AT_SLOT_CACHE_READ_LOG1P: SlotId = SlotId::new(45);
 const AT_SLOT_CACHE_CREATION_LOG1P: SlotId = SlotId::new(46);
 const AT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(47);
+/// Raw term-frequency lexical lane over the same transcript text
+/// `AT_SLOT_TEXT_SPARSE` hashes (#1904).
+///
+/// The agent-transcript panel's original block `35..=47` is boxed in by the
+/// action panel at 48, and a block is contiguous by construction, so this panel
+/// gets a **second** block. Note that `104..=106` — which #1904 originally
+/// proposed — are *not* free: they are unused headroom inside the **timeline**
+/// panel's `103..=106`, and taking them would put a transcript vector into a
+/// column family another panel exclusively owns, which is the #1776 collision.
+const AT_SLOT_TEXT_BM25: SlotId = SlotId::new(107);
+
+/// Sparse dimension for the agent-transcript lexical lane.
+///
+/// Chosen from the corpus's measured vocabulary, not copied from the timeline
+/// panel's 2048. `syn_sparse_text_tf` is a hashing-trick encoder, so the
+/// quantity that matters is how many *distinct* terms compete for cells, not
+/// how long a document is: document length is what BM25's `b` already corrects
+/// for, while a hash collision is uncorrectable and makes a query for one term
+/// score documents that only ever contained another.
+///
+/// Measured by `crates/synapse-calyx/examples/lexical_dimension_sizing_fsv.rs`
+/// over the real provider session corpus these rows are derived from (46 files,
+/// 2,487 text-bearing documents, 117,972 tokens, **8,702 distinct terms**):
+///
+/// | dim | load factor | colliding terms | collision rate |
+/// |---|---|---|---|
+/// | 2,048 | 4.25 | 8,584 | **0.9864** |
+/// | 4,096 | 2.12 | 7,657 | 0.8799 |
+/// | 8,192 | 1.06 | 5,664 | 0.6509 |
+/// | 16,384 | 0.53 | 3,573 | 0.4106 |
+/// | 32,768 | 0.27 | 1,971 | 0.2265 |
+/// | 65,536 | 0.13 | 1,063 | 0.1222 |
+///
+/// Copying the timeline's 2048 would have put **98.6%** of terms in a shared
+/// cell. The measured rates track `1 - exp(-V/dim)` closely (at 65,536 that
+/// predicts 0.124 against 0.1222 observed), so the model can be trusted to
+/// project past the sample.
+///
+/// The sample is 2,487 documents; the live panel holds 14,030 rows, of which a
+/// substantial share are non-text control lines. Projecting the text-bearing
+/// vocabulary at 15k-20k distinct terms, 65,536 would give ~26% and 262,144
+/// gives ~7%. A larger dimension is close to free here — a sparse vector stores
+/// only occupied cells, and the persisted postings map is keyed by occupied
+/// cells too, so the cost is O(tokens), not O(dim) — which makes headroom the
+/// cheap side of this trade.
+///
+/// Re-run the instrument before changing this; do not adjust it by intuition.
+const AT_TEXT_BM25_DIM: u32 = 262_144;
 
 // Slot ids are GLOBAL, not panel-local (#1776).
 //
@@ -323,6 +403,12 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         first: 8,
         last: 22,
     },
+    // The episode panel's second block (#1904). Holds `EP_SLOT_TITLE_BM25`.
+    PanelSlotBlock {
+        panel: SYN_EPISODE_PANEL_NAME,
+        first: 108,
+        last: 108,
+    },
     PanelSlotBlock {
         panel: SYN_AGENT_EVENT_PANEL_NAME,
         first: 23,
@@ -332,6 +418,13 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
         first: 35,
         last: 47,
+    },
+    // The agent-transcript panel's second block (#1904). Holds
+    // `AT_SLOT_TEXT_BM25`.
+    PanelSlotBlock {
+        panel: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+        first: 107,
+        last: 107,
     },
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
@@ -1580,6 +1673,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (EP_SLOT_DOCUMENT_HASH, "syn.episode.document_hash.v1"),
     (EP_SLOT_URL_HOST_HASH, "syn.episode.url_host_hash.v1"),
     (EP_SLOT_TITLE_SPARSE, "syn.episode.title_sparse.v1"),
+    (EP_SLOT_TITLE_BM25, "syn.episode.title_bm25.v1"),
     (
         EP_SLOT_START_HOUR_CYCLIC,
         "syn.episode.start_hour_cyclic.v1",
@@ -1648,6 +1742,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     ),
     (AT_SLOT_MODEL_HASH, "syn.agent_transcript.model_hash.v1"),
     (AT_SLOT_TEXT_SPARSE, "syn.agent_transcript.text_sparse.v1"),
+    (AT_SLOT_TEXT_BM25, "syn.agent_transcript.text_bm25.v1"),
     (AT_SLOT_TOOL_HASH, "syn.agent_transcript.tool_hash.v1"),
     (AT_SLOT_LINE_RANK, "syn.agent_transcript.line_rank.v1"),
     (
@@ -2007,6 +2102,18 @@ pub fn build_episode_constellation(
                 "syn.episode.title_sparse.v1",
                 Modality::Structured,
                 4096,
+            ),
+            episode_title_text(record).as_str(),
+        )?,
+    );
+    slots.insert(
+        EP_SLOT_TITLE_BM25,
+        measure_text(
+            SYN_EPISODE_PANEL_NAME,
+            AlgorithmicLens::syn_sparse_text_tf(
+                "syn.episode.title_bm25.v1",
+                Modality::Structured,
+                EP_TITLE_BM25_DIM,
             ),
             episode_title_text(record).as_str(),
         )?,
@@ -2485,6 +2592,17 @@ fn episode_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRe
             registry,
         )?,
         syn_content_slot(
+            EP_SLOT_TITLE_BM25,
+            "syn.episode.title_bm25.v1",
+            RegistryAlgorithmicLens::syn_sparse_text_tf(
+                "syn.episode.title_bm25.v1",
+                Modality::Structured,
+                EP_TITLE_BM25_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
             EP_SLOT_START_HOUR_CYCLIC,
             "syn.episode.start_hour_cyclic.v1",
             RegistryAlgorithmicLens::syn_cyclic_time(
@@ -2832,6 +2950,7 @@ pub fn build_agent_transcript_constellation(
             1024,
         )?,
     );
+    let transcript_text_value = transcript_text(record);
     slots.insert(
         AT_SLOT_TEXT_SPARSE,
         measure_text(
@@ -2841,7 +2960,19 @@ pub fn build_agent_transcript_constellation(
                 Modality::Structured,
                 4096,
             ),
-            &transcript_text(record),
+            &transcript_text_value,
+        )?,
+    );
+    slots.insert(
+        AT_SLOT_TEXT_BM25,
+        measure_text(
+            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            AlgorithmicLens::syn_sparse_text_tf(
+                "syn.agent_transcript.text_bm25.v1",
+                Modality::Structured,
+                AT_TEXT_BM25_DIM,
+            ),
+            &transcript_text_value,
         )?,
     );
     let transcript_tool_names = transcript_tool_names(record);

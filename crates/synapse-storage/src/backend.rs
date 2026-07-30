@@ -2921,10 +2921,15 @@ impl StorageBackend for CalyxBackend {
         after_physical: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<constellations::TemporalMetadataBackfillReport> {
-        if !matches!(source_cf, cf::CF_TIMELINE | cf::CF_EPISODES) {
+        if !matches!(
+            source_cf,
+            cf::CF_TIMELINE | cf::CF_EPISODES | cf::CF_AGENT_TRANSCRIPTS
+        ) {
             return Err(StorageError::BackendInvalidConfig {
                 value: source_cf.to_owned(),
-                detail: "temporal metadata backfill accepts only timeline or episodes".to_owned(),
+                detail:
+                    "temporal metadata backfill accepts only CF_TIMELINE, CF_EPISODES, or CF_AGENT_TRANSCRIPTS"
+                        .to_owned(),
             });
         }
         if source_key.is_some() && after_physical.is_some() {
@@ -2962,39 +2967,49 @@ impl StorageBackend for CalyxBackend {
                         vault_id: vault.vault_id_value(),
                         cx_id: vault.cx_id_for_input(
                             &raw,
-                            if source_cf == cf::CF_TIMELINE {
-                                SYN_TIMELINE_PANEL_VERSION
-                            } else {
-                                SYN_EPISODE_PANEL_VERSION
+                            match source_cf {
+                                cf::CF_TIMELINE => SYN_TIMELINE_PANEL_VERSION,
+                                cf::CF_EPISODES => SYN_EPISODE_PANEL_VERSION,
+                                _ => SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
                             },
                         ),
                         created_at_ms: calyx_clock_now_for_write(vault, source_cf)?,
                         next_ledger_seq: vault.latest_seq().saturating_add(1),
                     };
-                    let expected = if source_cf == cf::CF_TIMELINE {
-                        let record: TimelineRecord =
-                            serde_json::from_slice(&raw).map_err(|error| {
-                                StorageError::ReadFailed {
-                                    cf_name: source_cf.to_owned(),
-                                    detail: format!(
-                                        "decode authoritative timeline row key_hex={}: {error}",
-                                        constellations::hex_encode(&key)
-                                    ),
-                                }
-                            })?;
-                        constellations::build_timeline_constellation(context, &key, &raw, &record)?
-                    } else {
-                        let record: EpisodeRecord =
-                            serde_json::from_slice(&raw).map_err(|error| {
-                                StorageError::ReadFailed {
-                                    cf_name: source_cf.to_owned(),
-                                    detail: format!(
-                                        "decode authoritative episode row key_hex={}: {error}",
-                                        constellations::hex_encode(&key)
-                                    ),
-                                }
-                            })?;
-                        constellations::build_episode_constellation(context, &key, &raw, &record)?
+                    let decode_failed = |error: &serde_json::Error, label: &str| {
+                        StorageError::ReadFailed {
+                            cf_name: source_cf.to_owned(),
+                            detail: format!(
+                                "decode authoritative {label} row key_hex={}: {error}",
+                                constellations::hex_encode(&key)
+                            ),
+                        }
+                    };
+                    let expected = match source_cf {
+                        cf::CF_TIMELINE => {
+                            let record: TimelineRecord = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "timeline"))?;
+                            constellations::build_timeline_constellation(
+                                context, &key, &raw, &record,
+                            )?
+                        }
+                        cf::CF_EPISODES => {
+                            let record: EpisodeRecord = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "episode"))?;
+                            constellations::build_episode_constellation(context, &key, &raw, &record)?
+                        }
+                        // #1904 gave the agent-transcript panel its first
+                        // lexical lane, which needs the same re-measure path the
+                        // timeline panel used. The panel is spawn-keyed and by
+                        // far the largest on the vault, so it is only ever
+                        // reached through the paginated cursor.
+                        _ => {
+                            let record: AgentTranscriptRecord = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "agent transcript"))?;
+                            constellations::build_agent_transcript_constellation(
+                                context, &key, &raw, &record,
+                            )?
+                        }
                     };
                     let put = vault
                         .put_observation_constellation(expected.clone())
