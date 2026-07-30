@@ -181,11 +181,13 @@ fn syn_output_shape(kind: &str, dim: u32) -> Result<Option<SlotShape>> {
         }
         ["syn_hash"]
         | ["syn_sparse_text"]
+        | ["syn_sparse_text_tf"]
         | ["syn_multi_hot"]
         | ["syn_multihot"]
         | ["syn_cross"] => SlotShape::Sparse(checked_power_of_two(kind, dim)?),
         ["syn_hash", parsed]
         | ["syn_sparse_text", parsed]
+        | ["syn_sparse_text_tf", parsed]
         | ["syn_multi_hot", parsed]
         | ["syn_multihot", parsed]
         | ["syn_cross", parsed] => {
