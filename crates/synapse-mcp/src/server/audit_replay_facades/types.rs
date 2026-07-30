@@ -370,7 +370,9 @@ pub struct AuditVerifyChainResponse {
     /// Why coverage is what it is (#1884). A `partial-*` verdict describes where
     /// the attested chain *starts*; `intact` is the separate integrity answer.
     pub history_coverage: String,
-    /// Durable sequence from which the lineage journal attests this chain.
+    /// `latest_seq` when this generation was recorded, in its own numbering — 0
+    /// for both a genesis vault and an emptied replacement, so it is not a
+    /// coverage proxy. Read `history_coverage` for coverage.
     pub attested_from_seq: u64,
     pub vault_generation: u64,
     pub vault_reset_count: u64,

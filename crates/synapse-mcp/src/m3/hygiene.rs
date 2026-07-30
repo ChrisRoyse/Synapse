@@ -4278,6 +4278,9 @@ pub struct HygieneVaultVerifyResponse {
     /// `history_coverage` names which, and `attested_from_seq` names where.
     pub covers_full_history: bool,
     pub history_coverage: String,
+    /// `latest_seq` when this generation was recorded, in its own numbering — 0
+    /// for both a genesis vault and an emptied replacement, so it is not a
+    /// coverage proxy. See `history_coverage`.
     pub attested_from_seq: u64,
     pub constellation_count: u64,
     pub anchor_count: u64,

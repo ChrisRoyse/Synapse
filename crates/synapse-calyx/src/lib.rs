@@ -925,8 +925,15 @@ pub struct SynapseCalyxLedgerVerifyReport {
     /// is a statement about the chain's *start*, not about its integrity —
     /// `intact` is the integrity answer and they are reported separately.
     pub history_coverage: String,
-    /// Durable sequence from which this generation's chain is attested by the
-    /// lineage journal. Equals 0 exactly when `covers_full_history` is true.
+    /// Durable sequence, **in this generation's own numbering**, from which the
+    /// lineage journal attests the chain — the `latest_seq` observed when this
+    /// generation was recorded.
+    ///
+    /// It is 0 for a genesis vault and also 0 for a replacement vault whose
+    /// bytes were recreated empty, so it is not a proxy for coverage: read
+    /// `history_coverage` for that. What a `post-reset` generation does *not*
+    /// attest is the predecessor's history, whose extent is
+    /// `predecessor_high_water_seq`, not this field.
     pub attested_from_seq: u64,
     /// 1-based lineage generation of the vault this chain lives in.
     pub vault_generation: u64,
