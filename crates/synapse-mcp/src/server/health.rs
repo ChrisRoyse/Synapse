@@ -632,21 +632,34 @@ impl SynapseService {
             .filter(|after| after.panel_version == status.panel_version);
         let measured_delta = measured.and_then(|after| after.delta_changed_keys);
         let measured_at = measured.and_then(|after| after.delta_measured_at_unix_ms);
-        let state = match (status.state.as_str(), measured_delta) {
-            ("built_delta_unmeasured", Some(keys)) => {
-                if keys > status.max_reconciled_delta_keys {
-                    "lagging".to_owned()
-                } else {
-                    "built".to_owned()
-                }
-            }
-            _ => status.state.clone(),
+        // The remediation travels with the state it explains. Overriding one
+        // without the other left `state=built status=ok` carrying "this read did
+        // not measure the changed-key delta, so whether a query can reconcile
+        // the generation is unknown" — a payload contradicting itself, which is
+        // the same lying-surface shape in miniature.
+        let (state, remediation) = match (status.state.as_str(), measured_delta) {
+            ("built_delta_unmeasured", Some(keys)) if keys > status.max_reconciled_delta_keys => (
+                "lagging".to_owned(),
+                format!(
+                    "the derived-state maintainer measured {keys} changed keys against the bounded                      delta-reconciliation limit {}, so queries fail closed with                      CALYX_SEARCH_DELTA_REBASE_REQUIRED until the generation is rebuilt.",
+                    status.max_reconciled_delta_keys
+                ),
+            ),
+            ("built_delta_unmeasured", Some(keys)) => (
+                "built".to_owned(),
+                format!(
+                    "none; the derived-state maintainer measured {keys} changed keys against the                      limit {}",
+                    status.max_reconciled_delta_keys
+                ),
+            ),
+            _ => (status.state.clone(), status.remediation.clone()),
         };
         // `built` is the only healthy state. Every other value means recall
         // either cannot serve, is expected to fail closed, or is unverified —
         // each of which is an error rather than a warning, because the surface
         // presents as available otherwise.
         let health_status = if state == "built" { "ok" } else { "error" };
+        let remediation_for_field = remediation.clone();
         let slot_summary = if status.slots.is_empty() {
             "none".to_owned()
         } else {
@@ -683,7 +696,7 @@ impl SynapseService {
                 slot_summary,
                 status.manifest_path.as_deref().unwrap_or("none"),
                 status.panel_state_error.as_deref().unwrap_or("none"),
-                status.remediation,
+                remediation,
             )),
             calyx_search_generation_state: Some(state),
             calyx_search_generation_delta_changed_keys: measured_delta,
@@ -701,7 +714,7 @@ impl SynapseService {
             calyx_search_generation_sparse_slot_count: Some(status.sparse_slot_count),
             calyx_search_generation_age_ms: status.age_ms,
             calyx_search_generation_rebuild_required: status.rebuild_required,
-            calyx_search_generation_remediation: Some(status.remediation),
+            calyx_search_generation_remediation: Some(remediation_for_field),
             ..SubsystemHealth::default()
         }
     }
