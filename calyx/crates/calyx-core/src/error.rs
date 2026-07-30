@@ -247,4 +247,16 @@ error_catalog! {
     AsterVaultSchemaAhead, aster_vault_schema_ahead, "CALYX_ASTER_VAULT_SCHEMA_AHEAD",
     "vault contains a durable column family this build does not know about",
     "the vault is intact and newer than this build: do NOT delete, purge, or clear it. Run the build that created the named column family, or upgrade this build to one that registers it";
+
+    // Re-measuring an already-stored CxId with a different slot set is the
+    // normal shape of "a lens was added to a panel builder". Nothing is
+    // corrupt, so CALYX_ASTER_CORRUPT_SHARD ("restore from restic/snapshot")
+    // pointed the operator at a repair that cannot help and at a subsystem
+    // that is not involved (issue #1903, same misclassification class as
+    // #1875). It is a schema-evolution refusal, and it carries the same
+    // remediation the qualified slot-write path already names.
+    AsterPanelSlotSetImmutable, aster_panel_slot_set_immutable,
+    "CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE",
+    "a re-measured constellation declares a different slot set, or different slot vectors, than the stored row of the same CxId",
+    "the stored row's Base slot membership and slot hashes are part of what the row IS, and are immutable once committed. Retrying cannot succeed. Allocate a NEW panel version (which yields new CxIds), give the added slot an id inside a block that panel owns, and re-measure the authoritative source rows into that generation";
 }

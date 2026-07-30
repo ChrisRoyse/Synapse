@@ -53,7 +53,15 @@ where
     /// Inserts a content-addressed observation or reports its locked duplicate
     /// outcome. On duplicates, the first-write metadata/scalars/input pointer
     /// remain authoritative while compatible anchors are merged. Content hash,
-    /// panel, modality, redaction, and slot differences still fail closed.
+    /// panel, modality, and redaction differences fail closed.
+    ///
+    /// A re-measurement that declares a different **slot set** — or the same
+    /// slots carrying different vectors — is refused with
+    /// `CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE`, which names the exact
+    /// added/removed/re-measured slot ids (#1903). `ExistingIdentical` is
+    /// therefore only ever returned for a row that really is identical: adding
+    /// a lens to a live panel is a new panel generation, never an in-place
+    /// rewrite, and the refusal writes nothing.
     pub fn put_observation_with_outcome(&self, constellation: Constellation) -> Result<PutOutcome> {
         self.put_with_outcome_policy(constellation, DuplicatePutPolicy::ContentObservation)
     }

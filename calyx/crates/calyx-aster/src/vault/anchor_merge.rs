@@ -4,12 +4,69 @@ use super::encode::{self, WriteRow};
 use crate::cf::{ColumnFamily, anchor_key, base_key};
 use crate::dedup::{AnchorConflictResult, check_anchor_conflict};
 use crate::recurrence::FREQUENCY_SCALAR;
-use calyx_core::{Anchor, CalyxError, Constellation, CxId, LedgerRef, Result};
+use calyx_core::{Anchor, CalyxError, Constellation, CxId, LedgerRef, Result, SlotId};
+
+/// Names exactly how a re-measured constellation's slot set differs from the
+/// stored row's, or `None` when the two declare the same slots carrying the
+/// same vectors.
+///
+/// This is separated from the generic identity diff because "slots" on its own
+/// is not actionable: the caller needs to know *which* slot it added before it
+/// can allocate that slot an id and a new panel generation (#1903).
+fn slot_set_difference(existing: &Constellation, incoming: &Constellation) -> Option<String> {
+    let stored: BTreeSet<SlotId> = existing.slots.keys().copied().collect();
+    let proposed: BTreeSet<SlotId> = incoming.slots.keys().copied().collect();
+    let added = proposed.difference(&stored).copied().collect::<Vec<_>>();
+    let removed = stored.difference(&proposed).copied().collect::<Vec<_>>();
+    let remeasured = stored
+        .intersection(&proposed)
+        .copied()
+        .filter(|slot| existing.slots.get(slot) != incoming.slots.get(slot))
+        .collect::<Vec<_>>();
+    if added.is_empty() && removed.is_empty() && remeasured.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "slots_added=[{}] slots_removed=[{}] slots_remeasured=[{}] stored_slots=[{}] proposed_slots=[{}]",
+        join_slots(&added),
+        join_slots(&removed),
+        join_slots(&remeasured),
+        join_slots(&stored.iter().copied().collect::<Vec<_>>()),
+        join_slots(&proposed.iter().copied().collect::<Vec<_>>()),
+    ))
+}
+
+fn join_slots(slots: &[SlotId]) -> String {
+    slots
+        .iter()
+        .map(SlotId::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Refuses a re-measurement that would change what the stored row declares.
+///
+/// The stored row's Base slot membership and per-slot integrity hashes are the
+/// row's identity, and the qualified slot-write path (`slot_backfill.rs`)
+/// already refuses to attach a slot a Base row never declared. Before #1903
+/// the ingest path refused the same thing but reported it as
+/// `CALYX_ASTER_CORRUPT_SHARD` naming only the word "slots", which sends the
+/// operator to shard restore for what is a panel-generation migration.
+fn ensure_slot_set_immutable(existing: &Constellation, incoming: &Constellation) -> Result<()> {
+    let Some(difference) = slot_set_difference(existing, incoming) else {
+        return Ok(());
+    };
+    Err(CalyxError::aster_panel_slot_set_immutable(format!(
+        "re-measured constellation {} (panel_version={}) declares a different slot set than the stored row: {difference}",
+        incoming.cx_id, incoming.panel_version
+    )))
+}
 
 pub(super) fn merge_duplicate_anchors(
     existing: &mut Constellation,
     incoming: &Constellation,
 ) -> Result<Vec<Anchor>> {
+    ensure_slot_set_immutable(existing, incoming)?;
     let identity_differences = anchor_merge_identity_differences(existing, incoming);
     if !identity_differences.is_empty() {
         return Err(CalyxError::aster_corrupt_shard(format!(
@@ -53,6 +110,7 @@ pub(super) fn merge_observation_anchors(
     existing: &mut Constellation,
     incoming: &Constellation,
 ) -> Result<Vec<Anchor>> {
+    ensure_slot_set_immutable(existing, incoming)?;
     let mut differences = Vec::new();
     if existing.cx_id != incoming.cx_id {
         differences.push("cx_id");
@@ -72,9 +130,10 @@ pub(super) fn merge_observation_anchors(
     if existing.modality != incoming.modality {
         differences.push("modality");
     }
-    if existing.slots != incoming.slots {
-        differences.push("slots");
-    }
+    // Slots are checked by `ensure_slot_set_immutable` above, which names the
+    // exact per-slot difference and the migration that resolves it. Repeating
+    // the bare "slots" difference here could only shadow that with a less
+    // actionable message.
     if !differences.is_empty() {
         return Err(CalyxError::aster_corrupt_shard(format!(
             "content-addressed observation collision; differing identity fields: {}",
@@ -143,9 +202,8 @@ fn anchor_merge_identity_differences(left: &Constellation, right: &Constellation
     if left.modality != right.modality {
         differences.push("modality".to_string());
     }
-    if left.slots != right.slots {
-        differences.push("slots".to_string());
-    }
+    // See `merge_duplicate_anchors`: slot differences are refused earlier by
+    // `ensure_slot_set_immutable` with the exact added/removed/re-measured ids.
     if left.scalars != right.scalars {
         differences.push("scalars".to_string());
     }
