@@ -283,10 +283,48 @@ PASS  the reason names the measured lag and the threshold it was compared agains
 PASS  health.ok stayed True across all four
 ```
 
-At the vault's live rate (~33 seq/min) the generation takes roughly two hours to
-reach the refresh threshold again, which is the intended amortisation: the
-maintainer is cheap when there is nothing to do and only pays the rebuild cost
-once per ~4096 sequences of drift.
+### The trigger was in the wrong unit — found by this FSV, fixed in `82f2d1de`
+
+The four-tick reading above says `seq_lag 478 is inside the refresh threshold
+4096`, and `health` reported `state=built`. **Both were wrong**, and the next
+`find` call proved it — 51 seconds after a successful rebuild:
+
+```
+health: calyx_search_generation  state=built  built_at_seq=76112  seq_lag=739
+find  : CALYX_SEARCH_DELTA_REBASE_REQUIRED
+        search delta contains 17785 changed keys between manifest base seq 76112
+        and pinned seq 76851, exceeding the bounded reconciliation limit 8192
+```
+
+Health said `built` while every query failed closed — the exact lying-surface
+shape this batch exists to remove, reintroduced by the fix for it.
+
+**Root cause.** The threshold and the classifier were expressed in
+`vault_latest_seq - built_at_seq`, on the assumption that a bounded sequence lag
+bounds the reconciliation work. It does not: `SearchDelta::collect` counts
+distinct changed `CxId`s, and **739 sequences carried 17,785 changed keys**. A
+maintenance trigger measured in a different unit from the failure it prevents is
+a proxy that silently stops tracking.
+
+The trigger, the classifier and the health surface now use the changed-key count
+itself, measured against a single pinned snapshot that mirrors the query path's
+collector. The cheap health path reports `built_delta_unmeasured` rather than
+asserting `built` from a lag, an unmeasured delta counts as unbounded rather
+than zero, and the naptime no longer holds an already-unusable generation dead.
+
+### And why the two numbers diverge so far — filed as #1901
+
+739 sequences cannot change 17,785 keys of a **329-row** generation. They did not:
+`SearchDelta::collect` scopes its per-slot scans correctly but scans
+`ColumnFamily::Base` **unfiltered by panel**, and Base holds every panel's
+constellations. This vault carries 14,030 agent-transcript rows against
+timeline's 329, so ordinary transcript ingest — unrelated to timeline recall —
+exhausts the timeline generation's delta budget about every twelve minutes.
+
+A panel's recall availability therefore depends on unrelated panels' write
+volume. Filed as **#1901** rather than fixed here: it changes delta semantics for
+every consumer and deserves its own FSV, and the unit fix above is correct and
+necessary independently of it.
 
 ---
 
