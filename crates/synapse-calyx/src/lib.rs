@@ -247,7 +247,10 @@ pub struct SynapseCalyxSearchRebuildReport {
 ///
 /// Reading it is cheap and side-effect free — the manifest, the rebuild marker
 /// and the vault sequence, no CF scans — so `health` can report it every call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// `Eq` is deliberately absent: `delta_coverage_ratio` is an `f64` (#1908), and a
+// float has no total equality. `PartialEq` is what callers actually compare
+// these with, and nothing uses this type as a key.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SynapseCalyxSearchGenerationStatus {
     /// Active durable panel version, when one is published.
     pub panel_version: Option<u32>,
@@ -295,6 +298,22 @@ pub struct SynapseCalyxSearchGenerationStatus {
     pub max_reconciled_delta_keys: u64,
     /// Largest per-slot row count in the generation — the rows recall can reach.
     pub rows_covered: Option<u64>,
+    /// `delta_changed_keys / rows_covered` — how much of *this* generation has
+    /// been superseded (#1908).
+    ///
+    /// The absolute key count cannot answer that on its own: 461 changed keys is
+    /// negligible against the 8192 query-time limit and is **total** churn for a
+    /// 461-row generation. Recall stops being served by the index and starts
+    /// being served entirely by delta reconciliation at `1.0`, and every query
+    /// then rebuilds the corpus statistics from the delta.
+    ///
+    /// This is the tombstone ratio that segment-based engines schedule
+    /// consolidation on, and reporting it makes "this generation is fully
+    /// superseded" readable rather than something a caller has to derive by
+    /// dividing two fields. `None` when either input was not measured; values
+    /// above `1.0` are possible and meaningful (rows changed more than once, or
+    /// changed rows the generation never indexed).
+    pub delta_coverage_ratio: Option<f64>,
     /// Per-slot index presence: dense and sparse lanes are reported separately
     /// because they fail independently.
     pub slots: Vec<SynapseCalyxSearchGenerationSlot>,
@@ -434,6 +453,7 @@ fn search_generation_status_without_panel(
         delta_measured_at_unix_ms: None,
         max_reconciled_delta_keys,
         rows_covered: None,
+        delta_coverage_ratio: None,
         slots: Vec::new(),
         dense_slot_count: 0,
         sparse_slot_count: 0,
@@ -540,6 +560,49 @@ const SEARCH_DELTA_SCAN_LEASE_MS: u64 = 30_000;
 
 pub const SEARCH_GENERATION_REFRESH_DELTA_KEYS: u64 =
     (calyx_search::MAX_RECONCILED_DELTA_KEYS as u64) / 2;
+
+/// Fraction of a generation's own rows that may be superseded before the
+/// unattended maintainer refreshes it (issue #1908).
+///
+/// [`SEARCH_GENERATION_REFRESH_DELTA_KEYS`] is a fraction of the **query-time
+/// reconciliation limit**, which is a property of the query path, not of the
+/// generation being maintained. For any generation smaller than that limit the
+/// absolute trigger cannot fire before the generation is *entirely* superseded:
+/// the live timeline generation is 461 rows, so 100% churn is still 9x below
+/// 4096 and the maintainer reported `none_needed` against a delta covering
+/// every row it had indexed. That is the missing denominator this supplies —
+/// the same lesson as #1891 (measure the trigger in the quantity of the failure
+/// it prevents) applied one level up.
+///
+/// The unit is the ratio the doc above already reaches for when it says
+/// FreshDiskANN-style engines "consolidate at a pending fraction of the base".
+/// Segment engines schedule on exactly this quantity: Lucene records superseded
+/// documents in a per-segment bitset and reclaims them at merge, and
+/// Elasticsearch's tiered policy targets segments past ~10% deletions
+/// (`only_expunge_deletes` uses the same default).
+///
+/// 0.25 rather than Lucene's 0.10 because a Synapse rebuild replaces the whole
+/// generation rather than merging two segments, so each refresh costs more than
+/// a tiered merge does; a quarter of the rows superseded is still ~18x earlier
+/// than the absolute trigger on the live panel. Thrash is bounded independently
+/// by the minimum gap between unattended builds.
+pub const SEARCH_GENERATION_REFRESH_COVERAGE_RATIO: f64 = 0.25;
+
+/// Superseded fraction of a generation, or `None` when either input is
+/// unmeasured or the generation covers no rows.
+///
+/// A `None` must never read as zero: an unmeasured delta is unknown, and a
+/// zero-row generation has no denominator to divide by.
+// Both inputs are row/key counts for one panel generation, bounded by the vault's
+// row count and orders of magnitude below f64's 2^53 exact-integer range, so the
+// conversion is lossless in every reachable state.
+#[allow(clippy::cast_precision_loss)]
+fn delta_coverage_ratio(delta_changed_keys: Option<u64>, rows_covered: Option<u64>) -> Option<f64> {
+    match (delta_changed_keys, rows_covered) {
+        (Some(changed), Some(rows)) if rows > 0 => Some(changed as f64 / rows as f64),
+        _ => None,
+    }
+}
 
 /// Minimum wall-clock gap between two unattended generation builds.
 ///
@@ -3179,6 +3242,7 @@ impl SynapseCalyxVault {
             delta_measured_at_unix_ms,
             max_reconciled_delta_keys,
             rows_covered,
+            delta_coverage_ratio: delta_coverage_ratio(delta_changed_keys, rows_covered),
             slots,
             dense_slot_count,
             sparse_slot_count,
@@ -3284,11 +3348,33 @@ impl SynapseCalyxVault {
                     before.max_reconciled_delta_keys
                 ),
             )
+        } else if before
+            .delta_coverage_ratio
+            .is_some_and(|ratio| ratio > SEARCH_GENERATION_REFRESH_COVERAGE_RATIO)
+        {
+            // The absolute threshold is a fraction of the *query* limit, so it
+            // cannot fire for a generation smaller than that limit however
+            // completely it has been superseded (#1908). This is the missing
+            // denominator: refresh once this generation's own rows are stale
+            // past the ratio, whatever the key count.
+            (
+                SearchGenerationMaintenanceAction::RefreshOverExisting,
+                format!(
+                    "delta_coverage_ratio {:.3} exceeds the refresh coverage ratio {SEARCH_GENERATION_REFRESH_COVERAGE_RATIO} \
+                     ({delta_keys} changed keys against {} rows covered); the absolute threshold {SEARCH_GENERATION_REFRESH_DELTA_KEYS} \
+                     could not fire here because it is a fraction of the query-time limit, not of this generation (seq_lag {seq_lag})",
+                    before.delta_coverage_ratio.unwrap_or_default(),
+                    before.rows_covered.unwrap_or_default(),
+                ),
+            )
         } else {
             (
                 SearchGenerationMaintenanceAction::NoneNeeded,
                 format!(
-                    "delta_changed_keys {delta_keys} is inside the refresh threshold {SEARCH_GENERATION_REFRESH_DELTA_KEYS} (seq_lag {seq_lag})"
+                    "delta_changed_keys {delta_keys} is inside the refresh threshold {SEARCH_GENERATION_REFRESH_DELTA_KEYS} and coverage {} is inside the ratio {SEARCH_GENERATION_REFRESH_COVERAGE_RATIO} (seq_lag {seq_lag})",
+                    before
+                        .delta_coverage_ratio
+                        .map_or_else(|| "unmeasured".to_owned(), |ratio| format!("{ratio:.3}")),
                 ),
             )
         };

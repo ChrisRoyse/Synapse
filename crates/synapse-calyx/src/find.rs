@@ -824,9 +824,20 @@ fn no_indexable_query_error(
 /// Maps a substrate search error onto a Synapse error, naming the rebuild
 /// remediation for stale/missing derived indexes so a query over a
 /// missing/stale index always fails closed with the exact fix.
+///
+/// A structured substrate error's **own** remediation travels with it (#1909).
+/// It used to be replaced by the generic sentence below, so every code but one
+/// reported the same fix regardless of what failed — which is how
+/// `CALYX_SEARCH_DELTA_REBASE_REQUIRED` came to advise inspecting the manifest,
+/// and how `CALYX_SEARCH_RECONCILED_REPLACEMENTS_MISSING` (#1907) would have.
+/// The generic string is now the fallback for the `Io`/`Usage` variants that
+/// genuinely carry no catalog remediation, not the default for everything.
 fn find_index_error(action: &str, error: &SearchError) -> SynapseCalyxError {
     let code = error.code();
     let message = format!("{action}: {}", error.message());
+    // A deliberate re-code, not a pass-through: a stale derived index is
+    // reported on the Synapse surface as a find-specific state with the rebuild
+    // remediation, because that is the action the operator has to take.
     if code == "CALYX_STALE_DERIVED" {
         return SynapseCalyxError::new(
             "SYNAPSE_CALYX_FIND_INDEX_STALE",
@@ -837,7 +848,9 @@ fn find_index_error(action: &str, error: &SearchError) -> SynapseCalyxError {
     SynapseCalyxError::new(
         code,
         message,
-        "inspect the durable panel state and the named persisted search generation; rebuild the panel search indexes if the manifest is missing or corrupt",
+        error.remediation().unwrap_or(
+            "inspect the durable panel state and the named persisted search generation; rebuild the panel search indexes if the manifest is missing or corrupt",
+        ),
     )
 }
 

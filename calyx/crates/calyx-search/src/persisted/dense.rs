@@ -361,16 +361,40 @@ fn want(k: usize, len: usize) -> usize {
     k.max(1).min(len)
 }
 
+/// Similarity for the persisted dense lanes, scored through Sextant's
+/// runtime-dispatched kernel rather than a private scalar loop.
+///
+/// # Why this is not hand-written here any more
+///
+/// This was a plain `for` loop accumulating `dot`/`left_l2`/`right_l2`. A float
+/// reduction carries a serial dependency, and Rust does not enable fast-math, so
+/// LLVM may not reassociate it — the loop therefore stays scalar no matter what
+/// `target-cpu` the binary is built at. It was the only dense scoring path in
+/// the workspace without SIMD dispatch: `index/distance.rs` has selected an AVX2
+/// kernel by `is_x86_feature_detected!` since it was written, and DiskANN has
+/// always scored through it.
+///
+/// Measured on this workspace's default `target-cpu=x86-64-v2` baseline
+/// (`synapse-storage --example host_math_baseline_fsv`), 20k rows per pass:
+///
+/// ```text
+///   dim=32    private scalar loop  29.0M rows/s   ->  dispatched  59.3M rows/s
+///   dim=384   private scalar loop   2.76M rows/s  ->  dispatched   6.54M rows/s
+/// ```
+///
+/// The dispatch is a runtime feature check, so this is not a portability trade:
+/// a host without AVX2 gets the scalar kernel and the previous throughput, and a
+/// host with it gets roughly double without the binary having to be rebuilt for
+/// that host. Raising the compile baseline was measured as the alternative and
+/// moved this same path only ~7-12% — within run-to-run variance on a laptop —
+/// because of the reassociation limit above.
+///
+/// `cosine_distance` returns `1 - cos`, so similarity is `1 - distance`. It
+/// clamps the distance at 0, which bounds similarity at 1.0 and removes the
+/// slightly-above-1.0 values float error used to allow here; a zero-norm vector
+/// yields distance 1.0, i.e. similarity 0.0, exactly as before. Scores differ
+/// from the old loop only in the last few significant digits, from AVX2's
+/// different summation order.
 fn cosine(left: &[f32], right: &[f32]) -> f32 {
-    let (mut dot, mut left_l2, mut right_l2) = (0.0, 0.0, 0.0);
-    for (left, right) in left.iter().zip(right) {
-        dot += left * right;
-        left_l2 += left * left;
-        right_l2 += right * right;
-    }
-    if left_l2 == 0.0 || right_l2 == 0.0 {
-        0.0
-    } else {
-        dot / (left_l2.sqrt() * right_l2.sqrt())
-    }
+    1.0 - calyx_sextant::index::distance::cosine_distance(left, right)
 }

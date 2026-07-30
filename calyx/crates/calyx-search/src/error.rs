@@ -43,6 +43,25 @@ impl SearchError {
             Self::Io(message) | Self::Usage(message) => message,
         }
     }
+
+    /// The catalog error's own remediation, when this failure has one.
+    ///
+    /// `{code, message, remediation}` is the whole wire contract, and the
+    /// remediation is the part that says what to *do*. Without this accessor a
+    /// caller mapping a `SearchError` onto its own surface had nothing to
+    /// forward, so it substituted a generic sentence and the specific fix was
+    /// silently lost (#1909) — a fail-closed error that no longer explains how
+    /// to close it.
+    ///
+    /// `None` for the two local variants that have no catalog entry, so a
+    /// caller can tell "this failure carries no remediation" apart from "the
+    /// remediation is empty" and fall back deliberately.
+    pub fn remediation(&self) -> Option<&'static str> {
+        match self {
+            Self::Calyx(error) => Some(error.remediation),
+            Self::Io(_) | Self::Usage(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for SearchError {

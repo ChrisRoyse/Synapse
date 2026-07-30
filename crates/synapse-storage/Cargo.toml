@@ -34,6 +34,10 @@ crc32fast = "1"
 # search engine's delta-reconciliation path directly so an empty result can be
 # attributed to a named stage of its own trace rather than inferred (issue #1907).
 calyx-search = { path = "../../calyx/crates/calyx-search" }
+# Used only by host_math_baseline_fsv, which times the production CPU math
+# kernels so the host's instruction baseline is chosen from a measurement.
+calyx-forge = { path = "../../calyx/crates/calyx-forge" }
+calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }
 
 [lints]
 workspace = true

@@ -5342,9 +5342,11 @@ version = "0.1.0"
 dependencies = [
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-lenses",
  "calyx-registry",
  "calyx-search",
+ "calyx-sextant",
  "crc32fast",
  "fs2",
  "serde",
