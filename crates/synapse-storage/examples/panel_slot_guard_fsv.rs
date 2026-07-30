@@ -22,10 +22,11 @@ use std::str::FromStr as _;
 
 use calyx_core::{CxId, VaultId};
 use serde_json::json;
+use synapse_core::types::{TimelineActor, TimelineKind, TimelineRecord};
 use synapse_storage::constellations::{
     NativeConstellationContext, SYN_ACTION_PANEL_NAME, SYN_MCP_USAGE_PANEL_NAME,
     SYN_OUTCOME_PANEL_NAME, SYN_PROCESS_PANEL_NAME, SYN_TIMELINE_PANEL_NAME,
-    build_action_constellation, build_process_constellation,
+    build_action_constellation, build_process_constellation, build_timeline_constellation,
 };
 
 fn context() -> Result<NativeConstellationContext, Box<dyn Error>> {
@@ -53,13 +54,47 @@ fn report(label: &str, panel: &str, slots: &[u16]) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("panel_slot_guard_fsv: observed slot ids per real public builder");
-    println!("declared blocks: timeline 1..=7, episode 8..=22, agent-event 23..=34,");
+    println!("declared blocks: timeline 1..=7 AND 103..=106, episode 8..=22, agent-event 23..=34,");
     println!("  agent-transcript 35..=47, action 48..=52, reflex 53..=59, process 60..=66,");
     println!("  observation 67..=74, outcome 75..=81, mcp-usage 82..=93,");
     println!("  recurrence-subject 94..=95, graphpos-app 96..=97, graphpos-process 98..=99,");
     println!("  path-hierarchy 100..=102");
     println!(
+        "  (a panel may own more than one block: a block is contiguous, so the timeline panel's"
+    );
+    println!(
+        "   1..=7 could not grow past the episode panel at 8 when #1900 added its BM25 lane at 103)"
+    );
+    println!(
         "(reference: {SYN_TIMELINE_PANEL_NAME}, {SYN_ACTION_PANEL_NAME}, {SYN_PROCESS_PANEL_NAME}, {SYN_OUTCOME_PANEL_NAME}, {SYN_MCP_USAGE_PANEL_NAME})"
+    );
+
+    // The timeline panel is the one that gained a second block (#1900); build a
+    // real row through the real public builder so the observed ids are measured
+    // rather than asserted.
+    let timeline_record = TimelineRecord {
+        record_version: 1,
+        ts_ns: 1_785_000_000_000_000_000,
+        kind: TimelineKind::TitleChange,
+        actor: TimelineActor::Human,
+        app: Some("Notepad.exe".to_owned()),
+        payload: json!({ "title": "fsv-1776-1900 title - Notepad" }),
+    };
+    let timeline_raw = serde_json::to_vec(&timeline_record)?;
+    let timeline = build_timeline_constellation(
+        context()?,
+        b"fsv-1776/timeline-key",
+        &timeline_raw,
+        &timeline_record,
+    )?;
+    report(
+        "build_timeline_constellation",
+        SYN_TIMELINE_PANEL_NAME,
+        &timeline
+            .slots
+            .keys()
+            .map(|slot| slot.get())
+            .collect::<Vec<_>>(),
     );
 
     let action_record = json!({

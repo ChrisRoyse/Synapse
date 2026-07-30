@@ -123,7 +123,7 @@ const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100
 /// `u16` and `cf/slot_<id>` directories are named from it, so there is ample
 /// headroom. Raise it when a new panel block needs room; the compile-time
 /// assertion on `PANEL_SLOT_BLOCKS` keeps the two in agreement.
-const CALYX_DURABLE_SLOT_ID_MAX: u16 = 102;
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 106;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -143,8 +143,14 @@ const TL_SLOT_DOW_CYCLIC: SlotId = SlotId::new(5);
 const TL_SLOT_ACTOR_ONEHOT: SlotId = SlotId::new(6);
 const TL_SLOT_RECENCY_RANK: SlotId = SlotId::new(7);
 /// Raw term-frequency lexical lane over the same title text `TL_SLOT_TITLE_SPARSE`
-/// hashes (#1900). Slot ids are allocated vault-globally (#1776), so this takes
-/// the next free id rather than reusing a timeline-local one.
+/// hashes (#1900).
+///
+/// Slot ids are allocated vault-globally in exclusive per-panel blocks (#1776),
+/// and the timeline panel's original block `1..=7` is boxed in by the episode
+/// panel at 8. A block is contiguous by construction, so a new timeline lens
+/// cannot extend it — the timeline panel gets a **second** block, `103..=106`,
+/// declared in `PANEL_SLOT_BLOCKS`. The write-time guard rejected this exact id
+/// on a fresh vault before any row was written, which is what the guard is for.
 const TL_SLOT_TITLE_BM25: SlotId = SlotId::new(103);
 
 const EP_SLOT_APP_HASH: SlotId = SlotId::new(8);
@@ -278,7 +284,13 @@ const PH_SLOT_SIGNATURE: SlotId = SlotId::new(100);
 const PH_SLOT_ANCESTORS: SlotId = SlotId::new(101);
 const PH_SLOT_PATH_HASH: SlotId = SlotId::new(102);
 
-/// One panel's exclusive, contiguous block of global slot ids.
+/// One exclusive, contiguous block of global slot ids owned by one panel.
+///
+/// A panel may own **more than one** block. It has to: a block is contiguous, so
+/// once a panel's neighbours are allocated its original block cannot grow, and a
+/// panel that gains a lens later (#1900 added a BM25 lexical lane to the timeline
+/// panel, whose `1..=7` is boxed in by the episode panel at 8) needs a second
+/// range rather than an id belonging to someone else.
 struct PanelSlotBlock {
     panel: &'static str,
     first: u16,
@@ -296,6 +308,15 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_TIMELINE_PANEL_NAME,
         first: 1,
         last: 7,
+    },
+    // The timeline panel's second block (#1900). Holds `TL_SLOT_TITLE_BM25`
+    // (103); 104..=106 are unallocated headroom in this panel's own range, so
+    // the next timeline lens needs no third block. Unused ids inside a block
+    // have no physical `cf/slot_<id>` and cost nothing.
+    PanelSlotBlock {
+        panel: SYN_TIMELINE_PANEL_NAME,
+        first: 103,
+        last: 106,
     },
     PanelSlotBlock {
         panel: SYN_EPISODE_PANEL_NAME,
@@ -3650,10 +3671,16 @@ fn validate_panel_slot_allocation(
             ),
         });
     };
-    let Some(block) = PANEL_SLOT_BLOCKS
+    // Every block this panel owns, not only the first. A block is contiguous, so
+    // a panel whose neighbours are already allocated cannot extend its original
+    // range and must own a second one (#1900 added a BM25 lexical lane at 103 to
+    // a timeline panel boxed in at 7). Matching only the first block would reject
+    // a correctly allocated id in a later block.
+    let blocks = PANEL_SLOT_BLOCKS
         .iter()
-        .find(|block| block.panel == panel.as_str())
-    else {
+        .filter(|block| block.panel == panel.as_str())
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
         return Err(StorageError::WriteFailed {
             cf_name: "calyx_constellation".to_owned(),
             detail: format!(
@@ -3663,20 +3690,27 @@ fn validate_panel_slot_allocation(
                  (issue #1776)"
             ),
         });
-    };
+    }
     for slot in slots.keys() {
         let id = slot.get();
-        if id < block.first || id > block.last {
+        if !blocks
+            .iter()
+            .any(|block| id >= block.first && id <= block.last)
+        {
+            let owned = blocks
+                .iter()
+                .map(|block| format!("{}..={}", block.first, block.last))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(StorageError::WriteFailed {
                 cf_name: "calyx_constellation".to_owned(),
                 detail: format!(
                     "SYNAPSE_PANEL_SLOT_OUT_OF_BLOCK: panel_version={panel_version} \
-                     pointer={pointer} panel={panel} declared slot id {id}, which is outside its \
-                     exclusive block {}..={}. Calyx stores every slot in a global cf/slot_{id:02} \
+                     pointer={pointer} panel={panel} declared slot id {id}, which is outside every \
+                     block it owns ({owned}). Calyx stores every slot in a global cf/slot_{id:02} \
                      column family keyed by CxId alone, so writing it here would mix this panel's \
                      vectors into another panel's physical column family (issue #1776). Use an id \
-                     from this panel's block, or allocate a new block in PANEL_SLOT_BLOCKS",
-                    block.first, block.last
+                     from one of this panel's blocks, or allocate a new block in PANEL_SLOT_BLOCKS"
                 ),
             });
         }

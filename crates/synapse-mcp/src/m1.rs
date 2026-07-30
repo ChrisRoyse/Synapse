@@ -255,12 +255,21 @@ pub struct FindParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
-    /// Fused **memory** recall instead of perception (#1676): per-slot DiskANN
-    /// and BM25 recall over the persisted Calyx search generation, fused at the
-    /// rank level by Reciprocal Rank Fusion (`k = 60`, 1-based ranks). Answers
-    /// "which stored records are like this one / like this text", not "what is
-    /// on screen". Every hit carries its per-lens rank contributions, the lenses
-    /// that agreed and dissented, and verified ledger provenance.
+    /// Fused **memory** recall instead of perception (#1676): per-slot dense
+    /// (cosine) and sparse lexical (BM25) recall over the persisted Calyx search
+    /// generation, fused at the rank level by Reciprocal Rank Fusion (`k = 60`,
+    /// 1-based ranks). Answers "which stored records are like this one / like
+    /// this text / carry exactly this field value", not "what is on screen".
+    /// Every hit carries its per-lens rank contributions, the lenses that agreed
+    /// and dissented, verified ledger provenance, and each consulted lane's
+    /// exact scoring law.
+    ///
+    /// `query_mode=by_text` is **lexical**: it matches records sharing literal
+    /// word tokens with the query and cannot match a paraphrase, because no
+    /// Synapse lens is a semantic text embedding (#1898). `query_mode=by_exact`
+    /// takes `exact_slot` + `exact_value` and confirms every hash-bucket
+    /// candidate against its authoritative source field, so collisions are
+    /// dropped and counted rather than returned (#1899).
     ///
     /// Mutually exclusive with every perception filter above: the two read
     /// different sources of truth and are never merged. Fails closed (naming

@@ -56,6 +56,23 @@ struct SparseIndex {
     postings: BTreeMap<u32, Vec<SparsePosting>>,
     doc_lengths: BTreeMap<CxId, f32>,
     avg_doc_len: f32,
+    /// Rows that carry at least one term in this lane.
+    ///
+    /// **Not persisted**, and deliberately so: it is derivable from `rows` in one
+    /// pass at load time, and a stored copy could disagree with the payload it
+    /// summarizes. Populated by `build_index` and by `read` after
+    /// deserialization; `SparseIndex` is constructed nowhere else.
+    ///
+    /// This is BM25's `N` (and the denominator of `avg_doc_len`), which must
+    /// count documents that *have the field* rather than every row in the panel.
+    /// On the live timeline panel 238 of 339 rows carry no title at all, so
+    /// averaging over all rows put `avg_doc_len` at 0.2956 instead of 0.992 —
+    /// making every title-bearing document look 3x longer than average and
+    /// re-introducing, through the `b` term, exactly the short-document bias `b`
+    /// exists to remove. Lucene scopes both to the field's `docCount` for the
+    /// same reason (#1900).
+    #[serde(skip)]
+    field_docs: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -290,11 +307,18 @@ fn score_bm25_reconciled(
         .iter()
         .filter(|row| changed.contains(&row.cx_id))
         .collect::<Vec<_>>();
+    // Field-bearing counts on both sides of the delta, for the same reason the
+    // static path uses `field_docs`: a removed or replacing row that carries no
+    // term in this lane is not a document of this field.
+    let removed_field_docs = removed.iter().filter(|row| !row.entries.is_empty()).count();
+    let replacement_field_docs = replacements
+        .values()
+        .filter(|row| !row.entries.is_empty())
+        .count();
     let total_docs = index
-        .rows
-        .len()
-        .saturating_sub(removed.len())
-        .saturating_add(replacements.len());
+        .field_docs
+        .saturating_sub(removed_field_docs)
+        .saturating_add(replacement_field_docs);
     let old_total = index.doc_lengths.values().copied().sum::<f32>();
     let removed_total = removed.iter().map(|row| row.doc_len).sum::<f32>();
     let replacement_total = replacements.values().map(|row| row.doc_len).sum::<f32>();
@@ -428,6 +452,7 @@ fn build_index(
         .collect::<CliResult<Vec<_>>>()?;
     let postings = postings_from_rows(&rows);
     let (doc_lengths, avg_doc_len) = sparse_stats(&rows)?;
+    let field_docs = field_doc_count(&rows);
     Ok(SparseIndex {
         format: SPARSE_FORMAT_V3.to_string(),
         scoring,
@@ -438,6 +463,7 @@ fn build_index(
         postings,
         doc_lengths,
         avg_doc_len,
+        field_docs,
     })
 }
 
@@ -463,12 +489,15 @@ fn read(
             "persistent sparse sidecar sha256 {actual} != manifest {expected}; rebuild the vault search indexes"
         )));
     }
-    let index: SparseIndex = serde_json::from_slice(&bytes).map_err(|err| {
+    let mut index: SparseIndex = serde_json::from_slice(&bytes).map_err(|err| {
         stale(format!(
             "persistent sparse sidecar {} is not valid JSON: {err}; rebuild the vault search indexes",
             path.display()
         ))
     })?;
+    // Derived from the payload, not read from it: `field_docs` is `#[serde(skip)]`
+    // precisely so a persisted copy cannot disagree with the rows it counts.
+    index.field_docs = field_doc_count(&index.rows);
     validate(&index, entry, manifest_base_seq, slot)?;
     Ok(index)
 }
@@ -595,6 +624,15 @@ fn postings_from_rows(rows: &[SparseRow]) -> BTreeMap<u32, Vec<SparsePosting>> {
     out
 }
 
+/// Rows carrying at least one term in this lane — BM25's `N`.
+///
+/// A row whose vector is empty is a document that does not have this field at
+/// all. It is retained in `rows` (the lane must know the row exists so a delta
+/// can mask it) but it is not a document the field's statistics describe.
+fn field_doc_count(rows: &[SparseRow]) -> usize {
+    rows.iter().filter(|row| !row.entries.is_empty()).count()
+}
+
 fn sparse_stats(rows: &[SparseRow]) -> CliResult<(BTreeMap<CxId, f32>, f32)> {
     let doc_lengths = rows
         .iter()
@@ -607,10 +645,13 @@ fn sparse_stats(rows: &[SparseRow]) -> CliResult<(BTreeMap<CxId, f32>, f32)> {
             return Err(stale("persistent sparse corpus length overflowed"));
         }
     }
-    let avg_doc_len = if rows.is_empty() {
+    // Averaged over the documents that carry the field, never over every row in
+    // the panel: see `SparseIndex::field_docs`.
+    let field_docs = field_doc_count(rows);
+    let avg_doc_len = if field_docs == 0 {
         0.0
     } else {
-        total_doc_len / rows.len() as f32
+        total_doc_len / field_docs as f32
     };
     Ok((doc_lengths, avg_doc_len))
 }
@@ -623,7 +664,10 @@ fn score(
     if index.scoring == SparseScoring::DotProduct {
         return score_dot_product(index, query, candidates);
     }
-    let total_docs = index.rows.len();
+    // BM25's N is the number of documents that carry this field, matching the
+    // `avg_doc_len` denominator. Using every panel row would deflate IDF for
+    // every term on a panel where most rows have no text at all.
+    let total_docs = index.field_docs;
     let scorer = Bm25::default();
     let mut scores = BTreeMap::<CxId, f32>::new();
     for query_entry in query {
