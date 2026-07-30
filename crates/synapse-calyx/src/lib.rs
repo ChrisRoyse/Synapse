@@ -265,7 +265,21 @@ pub struct SynapseCalyxSearchGenerationStatus {
     /// generation is.
     pub vault_latest_seq: u64,
     /// `latest_seq - built_at_seq`, saturating.
+    ///
+    /// Informational only. It is **not** the quantity the query-time limit is
+    /// measured in, and it is not a proxy for it: 739 sequences carried 17,785
+    /// changed keys on the production vault. Read `delta_changed_keys`.
     pub seq_lag: Option<u64>,
+    /// Distinct changed keys between the generation's `base_seq` and the current
+    /// snapshot — the exact quantity `MAX_RECONCILED_DELTA_KEYS` bounds, and so
+    /// the only measurement that answers "can a query reconcile this generation".
+    ///
+    /// `None` when this status was read on the cheap path that does not scan for
+    /// it; a `None` here is "not measured", never "zero".
+    pub delta_changed_keys: Option<u64>,
+    /// When `delta_changed_keys` was measured, so a caller can tell a live
+    /// measurement from a stale one.
+    pub delta_measured_at_unix_ms: Option<u64>,
     /// Bounded delta-reconciliation limit. Once the changed-key count between
     /// `built_at_seq` and the pinned snapshot exceeds this, every query fails
     /// with `CALYX_SEARCH_DELTA_REBASE_REQUIRED` — so a `seq_lag` far above it
@@ -407,6 +421,8 @@ fn search_generation_status_without_panel(
         built_at_seq: None,
         vault_latest_seq,
         seq_lag: None,
+        delta_changed_keys: None,
+        delta_measured_at_unix_ms: None,
         max_reconciled_delta_keys,
         rows_covered: None,
         slots: Vec::new(),
@@ -430,11 +446,11 @@ fn search_generation_status_without_panel(
 /// cannot serve at all or is expected to fail closed, so the caller reports it as
 /// an error rather than a warning — a search surface that presents as available
 /// while being inert is the defect family this exists to close.
-fn classify_search_generation(
+const fn classify_search_generation(
     rebuild_marker_staked: bool,
     manifest_present: bool,
     built_at_seq: Option<u64>,
-    seq_lag: Option<u64>,
+    delta_changed_keys: Option<u64>,
     max_reconciled_delta_keys: u64,
 ) -> (&'static str, &'static str) {
     if rebuild_marker_staked {
@@ -459,20 +475,33 @@ fn classify_search_generation(
              operation=search_rebuild.",
         );
     }
-    if seq_lag.is_some_and(|lag| lag > max_reconciled_delta_keys) {
-        return (
+    // Classified on the measured changed-key count, because that is the exact
+    // quantity `MAX_RECONCILED_DELTA_KEYS` bounds. Classifying on the sequence
+    // lag instead reported `built` on a generation whose delta was 17,785 keys
+    // — more than twice the limit — while every query failed closed (#1891).
+    match delta_changed_keys {
+        Some(keys) if keys > max_reconciled_delta_keys => (
             "lagging",
-            "the generation is further behind the vault than the bounded delta-reconciliation \
-             limit, so queries are expected to fail closed with \
+            "the generation's measured changed-key delta exceeds the bounded \
+             delta-reconciliation limit, so queries fail closed with \
              CALYX_SEARCH_DELTA_REBASE_REQUIRED. Rebuild it with storage \
              operation=search_rebuild.",
-        );
+        ),
+        Some(_) => ("built", "none"),
+        // Not measured is not the same as measured-and-fine. Reporting `built`
+        // here would be the assertion that broke this surface once already.
+        None => (
+            "built_delta_unmeasured",
+            "the manifest is present and parseable, but this read did not measure the \
+             changed-key delta, so whether a query can reconcile the generation is \
+             unknown. The derived-state maintainer measures it on every tick; read its \
+             last measurement, or use the delta-measuring status path.",
+        ),
     }
-    ("built", "none")
 }
 
-/// How far the persisted search generation is allowed to fall behind the vault
-/// before the unattended maintainer refreshes it (issue #1891, ask 2).
+/// How many **changed keys** the persisted search generation is allowed to fall
+/// behind by before the unattended maintainer refreshes it (issue #1891, ask 2).
 ///
 /// This is deliberately **below** [`calyx_search::MAX_RECONCILED_DELTA_KEYS`],
 /// which is the point at which a query *dies* with
@@ -485,10 +514,22 @@ fn classify_search_generation(
 /// FreshDiskANN-style engines consolidate at a pending fraction of the base
 /// rather than at the point of failure.
 ///
-/// Half the limit gives the maintainer a full budget's worth of headroom: even
-/// if a refresh fails and the next tick is a whole cadence away, the generation
-/// is still inside the range where queries can reconcile.
-pub const SEARCH_GENERATION_REFRESH_SEQ_LAG: u64 =
+/// **The unit matters, and it is not the sequence lag.** This threshold was
+/// first written against `vault_latest_seq - built_at_seq`, on the assumption
+/// that a bounded sequence lag bounds the reconciliation work. It does not: one
+/// vault sequence can change many keys. Measured on the production vault
+/// immediately after a successful rebuild, a lag of **739 sequences** carried
+/// **17,785 changed keys** — more than twice the query-time limit — so `health`
+/// reported `state=built` while every query failed closed. A maintenance
+/// trigger has to be measured in the same quantity as the failure it prevents,
+/// or it is a proxy that silently stops tracking.
+/// Reader-lease lifetime for the changed-key delta scan.
+///
+/// Bounded and short: the scan is a bulk read on a maintenance tick, and a
+/// reader lease held longer than it needs pins the GC frontier.
+const SEARCH_DELTA_SCAN_LEASE_MS: u64 = 30_000;
+
+pub const SEARCH_GENERATION_REFRESH_DELTA_KEYS: u64 =
     (calyx_search::MAX_RECONCILED_DELTA_KEYS as u64) / 2;
 
 /// Minimum wall-clock gap between two unattended generation builds.
@@ -2867,6 +2908,93 @@ impl SynapseCalyxVault {
     pub fn search_generation_status(
         &self,
     ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
+        self.search_generation_status_inner(false)
+    }
+
+    /// The same report, with the generation's changed-key delta actually
+    /// measured (issue #1891).
+    ///
+    /// This is the expensive path: it scans the `Base` CF and every indexed
+    /// slot CF for keys committed after the generation's `base_seq`, exactly as
+    /// the query path's delta collector does, so the number it reports is the
+    /// number a query will be judged against rather than a proxy for it.
+    ///
+    /// It exists as a separate entry point because that scan is far too heavy to
+    /// run on every `health` request. The unattended maintainer calls it on its
+    /// tick and publishes the result; `health` reports that published
+    /// measurement with its age.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the generation state cannot be read or
+    /// the changed-key scan fails.
+    pub fn search_generation_status_with_delta(
+        &self,
+    ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
+        self.search_generation_status_inner(true)
+    }
+
+    /// Counts the distinct constellations changed since `base_seq` across the
+    /// `Base` CF and the generation's own slot CFs.
+    ///
+    /// This mirrors `calyx_search::engine::delta::SearchDelta::collect` on
+    /// purpose: it must count the same keys the query path counts, or the
+    /// maintenance trigger and the query-time limit drift apart. It is a
+    /// distinct-key count, not a sum, because the same constellation changing in
+    /// the Base CF and in three slot CFs is one key to reconcile, not four.
+    fn measure_search_delta_changed_keys(
+        &self,
+        base_seq: u64,
+        slots: &[SynapseCalyxSearchGenerationSlot],
+    ) -> Result<u64, SynapseCalyxError> {
+        use std::collections::BTreeSet;
+        // One pinned snapshot for the whole count, so every column family is
+        // read against the same view and the number cannot mix sequences.
+        let snapshot = self
+            .vault
+            .pin_reader(Freshness::FreshDerived, SEARCH_DELTA_SCAN_LEASE_MS);
+        let mut changed: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut families = vec![ColumnFamily::Base];
+        families.extend(
+            slots
+                .iter()
+                .map(|slot| ColumnFamily::slot(calyx_core::SlotId::new(slot.slot))),
+        );
+        let mut scan_error = None;
+        for cf in families {
+            match self
+                .vault
+                .changed_cf_keys_after_snapshot(snapshot, cf, base_seq)
+            {
+                Ok(keys) => changed.extend(keys),
+                Err(error) => {
+                    scan_error = Some(SynapseCalyxError::from_calyx(
+                        &format!(
+                            "scan changed {cf:?} keys after seq {base_seq} for the search generation delta"
+                        ),
+                        &error,
+                    ));
+                    break;
+                }
+            }
+        }
+        // Release the lease on every path: a leaked reader lease pins the GC
+        // frontier, which is a far worse outcome than a failed measurement.
+        let _released = self.vault.release_reader(snapshot.lease().id());
+        if let Some(error) = scan_error {
+            return Err(error);
+        }
+        Ok(changed.len() as u64)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one status read over one pinned view; splitting it would let the manifest facts and the delta measurement come from different snapshots, which is the class of drift this surface exists to report"
+    )]
+    fn search_generation_status_inner(
+        &self,
+        measure_delta: bool,
+    ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
         let vault_dir = self.config.vault_dir.as_path();
         let vault_latest_seq = self.vault.latest_seq();
         let max_reconciled_delta_keys = calyx_search::MAX_RECONCILED_DELTA_KEYS as u64;
@@ -2940,12 +3068,19 @@ impl SynapseCalyxVault {
             _ => None,
         };
         let seq_lag = built_at_seq.map(|seq| vault_latest_seq.saturating_sub(seq));
+        let (delta_changed_keys, delta_measured_at_unix_ms) = match (measure_delta, built_at_seq) {
+            (true, Some(base_seq)) => (
+                Some(self.measure_search_delta_changed_keys(base_seq, &slots)?),
+                now_unix_ms,
+            ),
+            _ => (None, None),
+        };
 
         let (state, remediation) = classify_search_generation(
             rebuild_required.is_some(),
             manifest_present,
             built_at_seq,
-            seq_lag,
+            delta_changed_keys,
             max_reconciled_delta_keys,
         );
 
@@ -2958,6 +3093,8 @@ impl SynapseCalyxVault {
             built_at_seq,
             vault_latest_seq,
             seq_lag,
+            delta_changed_keys,
+            delta_measured_at_unix_ms,
             max_reconciled_delta_keys,
             rows_covered,
             slots,
@@ -3017,7 +3154,9 @@ impl SynapseCalyxVault {
         &self,
     ) -> Result<SearchGenerationMaintenanceReport, SynapseCalyxError> {
         let started = std::time::Instant::now();
-        let before = self.search_generation_status()?;
+        // The delta-measuring path: the decision must be made on the same
+        // quantity the query-time limit is enforced on (#1891).
+        let before = self.search_generation_status_with_delta()?;
         let elapsed = |started: std::time::Instant| {
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
         };
@@ -3035,6 +3174,9 @@ impl SynapseCalyxVault {
             });
         };
 
+        // Treat an unmeasured delta as unbounded rather than as zero: a missing
+        // measurement must never read as "nothing to do".
+        let delta_keys = before.delta_changed_keys.unwrap_or(u64::MAX);
         let seq_lag = before.seq_lag.unwrap_or(u64::MAX);
         let (action, reason) = if !before.manifest_present || before.built_at_seq.is_none() {
             (
@@ -3052,11 +3194,11 @@ impl SynapseCalyxVault {
                     before.rebuild_required.as_deref().unwrap_or("unknown")
                 ),
             )
-        } else if seq_lag > SEARCH_GENERATION_REFRESH_SEQ_LAG {
+        } else if delta_keys > SEARCH_GENERATION_REFRESH_DELTA_KEYS {
             (
                 SearchGenerationMaintenanceAction::RefreshOverExisting,
                 format!(
-                    "seq_lag {seq_lag} exceeds the refresh threshold {SEARCH_GENERATION_REFRESH_SEQ_LAG} (half the query-time reconciliation limit {})",
+                    "delta_changed_keys {delta_keys} exceeds the refresh threshold {SEARCH_GENERATION_REFRESH_DELTA_KEYS} (half the query-time reconciliation limit {}); seq_lag is {seq_lag}, which is why the lag alone is not the trigger",
                     before.max_reconciled_delta_keys
                 ),
             )
@@ -3064,7 +3206,7 @@ impl SynapseCalyxVault {
             (
                 SearchGenerationMaintenanceAction::NoneNeeded,
                 format!(
-                    "seq_lag {seq_lag} is inside the refresh threshold {SEARCH_GENERATION_REFRESH_SEQ_LAG}"
+                    "delta_changed_keys {delta_keys} is inside the refresh threshold {SEARCH_GENERATION_REFRESH_DELTA_KEYS} (seq_lag {seq_lag})"
                 ),
             )
         };
@@ -3079,10 +3221,15 @@ impl SynapseCalyxVault {
             });
         }
 
-        // The naptime bound. An absent generation is exempt: there is no live
-        // artifact to protect, and holding recall off for ten minutes to
-        // rate-limit a build that replaces nothing would be the wrong trade.
+        // The naptime bound exists to stop a hot write stream from spending the
+        // maintenance budget on back-to-back rebuilds. It must never hold a
+        // *dead* generation dead: once the delta is past the query-time limit,
+        // every query is already failing closed, so waiting protects nothing and
+        // costs recall. Two exemptions therefore apply — an absent generation
+        // (no live artifact to protect) and an already-unusable one.
+        let already_unusable = delta_keys > before.max_reconciled_delta_keys;
         if action == SearchGenerationMaintenanceAction::RefreshOverExisting
+            && !already_unusable
             && before
                 .age_ms
                 .is_some_and(|age| age < SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS)
@@ -3109,14 +3256,17 @@ impl SynapseCalyxVault {
             before_built_at_seq = ?before.built_at_seq,
             vault_latest_seq = before.vault_latest_seq,
             seq_lag = ?before.seq_lag,
-            refresh_threshold = SEARCH_GENERATION_REFRESH_SEQ_LAG,
+            delta_changed_keys = ?before.delta_changed_keys,
+            refresh_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS,
+            max_reconciled_delta_keys = before.max_reconciled_delta_keys,
+            already_unusable,
             "building the persisted search generation unattended"
         );
         self.rebuild_search_indexes(panel_version)?;
 
         // Source of truth is the manifest on disk, re-read independently of the
         // build that just claimed to write it.
-        let after = self.search_generation_status()?;
+        let after = self.search_generation_status_with_delta()?;
         tracing::info!(
             code = "SYNAPSE_CALYX_SEARCH_GENERATION_MAINTENANCE_COMMITTED",
             panel_version,
@@ -3125,6 +3275,7 @@ impl SynapseCalyxVault {
             after_state = %after.state,
             after_built_at_seq = ?after.built_at_seq,
             after_seq_lag = ?after.seq_lag,
+            after_delta_changed_keys = ?after.delta_changed_keys,
             after_rows_covered = ?after.rows_covered,
             after_dense_lanes = after.dense_slot_count,
             after_sparse_lanes = after.sparse_slot_count,

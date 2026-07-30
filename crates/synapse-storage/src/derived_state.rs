@@ -35,7 +35,7 @@ use std::sync::{
 };
 
 use synapse_calyx::{
-    SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS, SEARCH_GENERATION_REFRESH_SEQ_LAG,
+    SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS, SEARCH_GENERATION_REFRESH_DELTA_KEYS,
     SynapseCalyxLensCoverageStatus, SynapseCalyxSearchGenerationStatus, hot_context,
 };
 
@@ -44,10 +44,10 @@ use crate::Db;
 /// How often the derived-state maintainer runs.
 ///
 /// Chosen against the freshness budget it defends, not for its own sake: the
-/// generation is refreshed once it is [`SEARCH_GENERATION_REFRESH_SEQ_LAG`]
-/// sequences behind, which is half the limit at which queries fail, so the tick
-/// only has to be frequent enough that a burst of writes cannot cross the whole
-/// remaining half budget between two ticks. Five minutes matches the storage GC
+/// generation is refreshed once its changed-key delta passes
+/// [`SEARCH_GENERATION_REFRESH_DELTA_KEYS`], which is half the limit at which
+/// queries fail, so the tick only has to be frequent enough that a burst of
+/// writes cannot cross the whole remaining half budget between two ticks. Five minutes matches the storage GC
 /// cadence and keeps the two heavy periodic passes on the same rhythm.
 pub const DERIVED_STATE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 
@@ -104,7 +104,7 @@ pub struct DerivedStateReadback {
     pub last_skip_detail: Option<String>,
     /// Thresholds this maintainer runs under, published so an operator reading
     /// health never has to guess which budget produced the decision.
-    pub refresh_seq_lag_threshold: u64,
+    pub refresh_delta_keys_threshold: u64,
     pub min_rebuild_interval_ms: u64,
 }
 
@@ -118,7 +118,7 @@ pub fn register_derived_state_source(db: &Arc<Db>) {
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_SOURCE_REGISTERED",
         db_path = %db.path.display(),
-        refresh_seq_lag_threshold = SEARCH_GENERATION_REFRESH_SEQ_LAG,
+        refresh_delta_keys_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS,
         min_rebuild_interval_ms = SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS,
         "registered the storage handle the unattended derived-state maintainer reads"
     );
@@ -135,7 +135,7 @@ pub fn derived_state_readback() -> DerivedStateReadback {
     readback.success_total = DERIVED_STATE_SUCCESS.load(Ordering::Relaxed);
     readback.failure_total = DERIVED_STATE_FAILURE.load(Ordering::Relaxed);
     readback.skipped_total = DERIVED_STATE_SKIPPED.load(Ordering::Relaxed);
-    readback.refresh_seq_lag_threshold = SEARCH_GENERATION_REFRESH_SEQ_LAG;
+    readback.refresh_delta_keys_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS;
     readback.min_rebuild_interval_ms = SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS;
     readback
 }

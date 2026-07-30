@@ -616,14 +616,37 @@ impl SynapseService {
                 };
             }
         };
-        // `built` is the only healthy state. Every other value means recall
-        // either cannot serve or is expected to fail closed, which is an error
-        // rather than a warning: the surface presents as available otherwise.
-        let health_status = if status.state == "built" {
-            "ok"
-        } else {
-            "error"
+        // The live status is read on the cheap path, which does not scan for the
+        // changed-key delta — so on its own it can only report
+        // `built_delta_unmeasured`. The derived-state maintainer measures the
+        // delta on every tick, so its last measurement is folded in here.
+        //
+        // This matters because the delta, not the sequence lag, is the quantity
+        // the query-time limit is enforced on. Classifying on the lag reported
+        // `built` on a generation whose delta was 17,785 keys against a limit of
+        // 8,192, while every query failed closed (#1891).
+        let derived_state = synapse_storage::derived_state::derived_state_readback();
+        let measured = derived_state
+            .last_search_state_after
+            .as_ref()
+            .filter(|after| after.panel_version == status.panel_version);
+        let measured_delta = measured.and_then(|after| after.delta_changed_keys);
+        let measured_at = measured.and_then(|after| after.delta_measured_at_unix_ms);
+        let state = match (status.state.as_str(), measured_delta) {
+            ("built_delta_unmeasured", Some(keys)) => {
+                if keys > status.max_reconciled_delta_keys {
+                    "lagging".to_owned()
+                } else {
+                    "built".to_owned()
+                }
+            }
+            _ => status.state.clone(),
         };
+        // `built` is the only healthy state. Every other value means recall
+        // either cannot serve, is expected to fail closed, or is unverified —
+        // each of which is an error rather than a warning, because the surface
+        // presents as available otherwise.
+        let health_status = if state == "built" { "ok" } else { "error" };
         let slot_summary = if status.slots.is_empty() {
             "none".to_owned()
         } else {
@@ -642,13 +665,15 @@ impl SynapseService {
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
-                status.state,
+                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} delta_changed_keys={:?} delta_measured_at_unix_ms={:?}                  max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
+                state,
                 status.panel_version,
                 status.manifest_present,
                 status.built_at_seq,
                 status.vault_latest_seq,
                 status.seq_lag,
+                measured_delta,
+                measured_at,
                 status.max_reconciled_delta_keys,
                 status.rows_covered,
                 status.dense_slot_count,
@@ -660,7 +685,9 @@ impl SynapseService {
                 status.panel_state_error.as_deref().unwrap_or("none"),
                 status.remediation,
             )),
-            calyx_search_generation_state: Some(status.state),
+            calyx_search_generation_state: Some(state),
+            calyx_search_generation_delta_changed_keys: measured_delta,
+            calyx_search_generation_delta_measured_at_unix_ms: measured_at,
             calyx_search_generation_panel_version: status.panel_version,
             calyx_search_generation_manifest_path: status.manifest_path,
             calyx_search_generation_manifest_present: Some(status.manifest_present),
@@ -713,7 +740,7 @@ impl SynapseService {
             detail: Some(format!(
                 "attempts={} success={} failure={} skipped={} last_run_unix_ms={:?} \
                  last_success_unix_ms={:?} last_search_action={} last_search_reason={} \
-                 last_search_elapsed_ms={:?} refresh_seq_lag_threshold={} \
+                 last_search_elapsed_ms={:?} refresh_delta_keys_threshold={} \
                  min_rebuild_interval_ms={} last_failure_code={} last_failure_detail={} \
                  last_skip={}",
                 readback.attempts_total,
@@ -725,7 +752,7 @@ impl SynapseService {
                 readback.last_search_action.as_deref().unwrap_or("none"),
                 readback.last_search_reason.as_deref().unwrap_or("none"),
                 readback.last_search_elapsed_ms,
-                readback.refresh_seq_lag_threshold,
+                readback.refresh_delta_keys_threshold,
                 readback.min_rebuild_interval_ms,
                 readback.last_failure_code.as_deref().unwrap_or("none"),
                 readback.last_failure_detail.as_deref().unwrap_or("none"),
@@ -739,9 +766,13 @@ impl SynapseService {
             calyx_derived_state_failure_total: Some(readback.failure_total),
             calyx_derived_state_last_failure_code: readback.last_failure_code,
             calyx_derived_state_last_failure_detail: readback.last_failure_detail,
-            calyx_derived_state_refresh_seq_lag_threshold: Some(
-                readback.refresh_seq_lag_threshold,
+            calyx_derived_state_refresh_delta_keys_threshold: Some(
+                readback.refresh_delta_keys_threshold,
             ),
+            calyx_derived_state_last_delta_changed_keys: readback
+                .last_search_state_after
+                .as_ref()
+                .and_then(|status| status.delta_changed_keys),
             ..SubsystemHealth::default()
         }
     }

@@ -261,8 +261,22 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_built_at_seq: Option<u64>,
     /// How far the generation is behind the vault, in sequences.
+    ///
+    /// Informational. It is NOT the quantity the limit below is enforced on and
+    /// is not a proxy for it — 739 sequences carried 17,785 changed keys on the
+    /// production vault. Read `calyx_search_generation_delta_changed_keys`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_seq_lag: Option<u64>,
+    /// Distinct changed keys between the generation and the current snapshot —
+    /// the exact quantity `max_reconciled_delta_keys` bounds, and therefore the
+    /// only number that answers whether a query can reconcile the generation.
+    /// Measured by the derived-state maintainer on its tick, not on this
+    /// request; `None` means not measured, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_delta_changed_keys: Option<u64>,
+    /// When that delta was measured, so a stale measurement is visible as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_delta_measured_at_unix_ms: Option<u64>,
     /// Bounded delta-reconciliation budget; past it every query fails closed
     /// with `CALYX_SEARCH_DELTA_REBASE_REQUIRED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,11 +325,14 @@ pub struct SubsystemHealth {
     pub calyx_derived_state_last_failure_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_failure_detail: Option<String>,
-    /// Seq lag at which the maintainer refreshes — deliberately below the
-    /// query-time reconciliation limit, so the index is repaired before recall
-    /// dies rather than after.
+    /// Changed-key delta at which the maintainer refreshes — deliberately below
+    /// the query-time reconciliation limit, so the index is repaired before
+    /// recall dies rather than after.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_derived_state_refresh_seq_lag_threshold: Option<u64>,
+    pub calyx_derived_state_refresh_delta_keys_threshold: Option<u64>,
+    /// The changed-key delta the maintainer measured on its last tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_delta_changed_keys: Option<u64>,
 
     // --- panel lens coverage (issue #1894, ask 2) ---
     // `abundance` computed `blind_spot_records = 1740` on a panel of 1,745
