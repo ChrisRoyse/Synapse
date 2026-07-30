@@ -14,18 +14,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use calyx_assay::{
     AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, Direction,
     EstimatorKind, InterEventHazardReport, MiEstimate, MmdConfig, PeriodogramConfig, RateShift,
-    SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport, TEResult, TeEstimator, TrustTag,
-    autocorrelation, bin_event_counts, bits_report_with_anchor, entropy_bits,
-    inter_event_hazard_with_alpha, ksg_mi_continuous_discrete, lomb_scargle_with_config,
-    mmd_change_point, panel_sufficiency_with_anchor, partitioned_histogram_nmi,
-    per_sensor_attribution, recurrence_rate_cusum, stable_rank, synergy_pair, synergy_report,
-    transfer_entropy_sweep, unmeasured_synergy_pair,
+    SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport, TEResult, TeEstimator,
+    TiedOccurrenceCollapse, TrustTag, autocorrelation, bin_event_counts, bits_report_with_anchor,
+    collapse_tied_occurrences, entropy_bits, inter_event_hazard_with_alpha,
+    ksg_mi_continuous_discrete, lomb_scargle_with_config, mmd_change_point,
+    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution,
+    recurrence_rate_cusum, stable_rank, synergy_pair, synergy_report, transfer_entropy_sweep,
+    unmeasured_synergy_pair,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
-    Anchor, AnchorKind, AnchorValue, Constellation, CxId, PanelSlotId, SlotId, SlotVector,
-    SystemClock, Ts,
+    Anchor, AnchorKind, AnchorValue, Constellation, CxId, METADATA_SOURCE_EVENT_TIME_RAW,
+    PanelSlotId, SlotId, SlotVector, SystemClock, Ts,
 };
 use calyx_forge::{Backend, KnnMetric};
 use calyx_lodestar::{
@@ -564,10 +565,11 @@ impl SynapseCalyxVault {
 
     /// Scans the `Base` CF once and returns the dense-slot corpus for a panel.
     ///
-    /// `panel_dense_slots` records every dense lens the panel carries across all
-    /// scanned rows — including rows outside the window — so a lens that is dark
-    /// inside the window is reportable as a blind spot instead of silently
-    /// vanishing from the lens count.
+    /// `panel_dense_slots` records every dense lens the corpus carries, so a lens
+    /// that is dark on some records is reportable as a blind spot instead of
+    /// silently vanishing from the lens count. It is collected from the hydrated
+    /// records, because a Base row alone cannot say which of its slots are dense
+    /// — it stores only slot ids and hashes (issue #1894).
     fn load_panel_dense_corpus_in_window(
         &self,
         panel_version: u32,
@@ -575,23 +577,26 @@ impl SynapseCalyxVault {
         window: TimeWindowNs,
     ) -> Result<DenseCorpus, SynapseCalyxError> {
         let rows = self.scan_cf_latest(ColumnFamily::Base)?;
+        // A Base row carries only `(slot_id, slot_hash)` pairs: every slot it
+        // decodes to is `SlotVector::Absent`, by design, because the vectors live
+        // in the per-slot CFs. Building the corpus straight from the decoded Base
+        // row therefore produced records with zero usable slots on EVERY panel,
+        // so `n_lenses` was structurally always 0 and weave/abundance/bits/
+        // redundancy/kernel were all vacuously zero — reported honestly, but
+        // measuring nothing (issue #1894). Hydrate the slots from their CFs.
+        let snapshot = self.read_snapshot();
         let mut records = Vec::new();
         let mut records_scanned = 0usize;
         let mut records_outside_window = 0usize;
         let mut panel_dense_slots: BTreeSet<SlotId> = BTreeSet::new();
         for (_, value) in rows {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
+            let base = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
             })?;
-            if constellation.panel_version != panel_version {
+            if base.panel_version != panel_version {
                 continue;
             }
-            for (slot, vector) in &constellation.slots {
-                if matches!(vector, SlotVector::Dense { .. }) {
-                    panel_dense_slots.insert(*slot);
-                }
-            }
-            if !window.contains_created_at_ms(constellation.created_at) {
+            if !window.contains_created_at_ms(base.created_at) {
                 records_outside_window += 1;
                 continue;
             }
@@ -599,7 +604,13 @@ impl SynapseCalyxVault {
             if records.len() >= max_records {
                 continue;
             }
-            records.push(DenseRecord::from_constellation(&constellation));
+            let hydrated = self.hydrated_constellation(base.cx_id, snapshot)?;
+            for (slot, vector) in &hydrated.slots {
+                if matches!(vector, SlotVector::Dense { .. }) {
+                    panel_dense_slots.insert(*slot);
+                }
+            }
+            records.push(DenseRecord::from_constellation(&hydrated));
         }
         Ok(DenseCorpus {
             records,
@@ -1940,6 +1951,14 @@ pub struct SynapseCalyxPeriodicityReport {
 pub struct SynapseCalyxDriftReport {
     pub panel_version: u32,
     pub filter_value: Option<String>,
+    /// Occurrences read from the panel before the tie collapse (#1893).
+    pub n_occurrences: usize,
+    /// Distinct instants the CUSUM gap series was built over.
+    pub n_distinct_instants: usize,
+    /// Occurrences absorbed into an earlier simultaneous instant.
+    pub ties_collapsed: usize,
+    /// Largest number of occurrences sharing one instant.
+    pub max_multiplicity: usize,
     pub n_gaps: usize,
     pub baseline_mean_gap: f64,
     pub baseline_sigma: f64,
@@ -1960,6 +1979,14 @@ pub struct SynapseCalyxDriftReport {
 pub struct SynapseCalyxHazardReport {
     pub panel_version: u32,
     pub filter_value: Option<String>,
+    /// Occurrences read from the panel before the tie collapse (#1893).
+    pub n_occurrences: usize,
+    /// Distinct instants the renewal gap series was built over.
+    pub n_distinct_instants: usize,
+    /// Occurrences absorbed into an earlier simultaneous instant.
+    pub ties_collapsed: usize,
+    /// Largest number of occurrences sharing one instant.
+    pub max_multiplicity: usize,
     pub n_gaps: usize,
     pub mean_gap_seconds: f64,
     pub coefficient_of_variation: f64,
@@ -1979,6 +2006,91 @@ pub struct SynapseCalyxHazardReport {
 struct EventRecord {
     secs: f64,
     group: Option<String>,
+}
+
+/// Nanoseconds per second, for reconstructing sub-second event times.
+const NS_PER_SEC: u64 = 1_000_000_000;
+/// `NS_PER_SEC` as an exactly-representable `f64` divisor.
+const NS_PER_SEC_F64: f64 = 1.0e9;
+
+/// Recovers the full-precision source event time in **fractional seconds** from
+/// a Base row's nanosecond stamp, cross-checked against its whole-second stamp.
+///
+/// `activate_temporal_lane` writes `source_event_time_raw` (integer nanoseconds)
+/// and `source_event_time_secs` (`raw / 1e9`) in the same call, so on any row
+/// this daemon wrote the two agree by construction. Reading only the truncated
+/// seconds quantised the occurrence series onto a 1-second grid, manufacturing
+/// ties that the source does not contain (issue #1893).
+///
+/// The integer and fractional parts are summed in the *seconds* domain rather
+/// than dividing `ns as f64`, so the magnitude fed to `f64` stays inside the
+/// exactly-representable integer range that
+/// `SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE` already guards. The resulting
+/// resolution near 2026 epochs is ~2.4e-7 s — three orders of magnitude finer
+/// than the millisecond stamps Calyx records, so distinct milliseconds stay
+/// distinguishable.
+///
+/// A row whose temporal lane is active but whose raw stamp is absent,
+/// unparseable, or inconsistent with its own seconds stamp is an integrity
+/// defect. It is reported, not worked around: silently using the lossy stamp
+/// would reintroduce exactly the manufactured ties this exists to remove.
+fn sub_second_event_secs(
+    constellation: &Constellation,
+    whole_secs_i64: i64,
+    whole_secs: f64,
+) -> Result<f64, SynapseCalyxError> {
+    let raw = constellation.metadata_value(METADATA_SOURCE_EVENT_TIME_RAW);
+    let Some(raw) = raw else {
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_RAW_TIMESTAMP_ABSENT",
+            "a Base row has an active temporal lane and a source_event_time_secs stamp but no \
+             source_event_time_raw nanosecond stamp; activate_temporal_lane writes both together, \
+             so one without the other means the row was written by an unknown path or was mutated",
+            "inspect the Base row (storage operation=anchors with its source cf_name/key_hex) and \
+             repair or re-derive its temporal metadata; do not infer nanoseconds from the seconds \
+             stamp, which would restore the 1-second quantisation that issue #1893 removed",
+        ));
+    };
+    let Ok(nanos) = raw.parse::<u64>() else {
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_RAW_TIMESTAMP_NOT_NANOS",
+            "a Base row's source_event_time_raw is not an integer nanosecond count, so the \
+             full-precision occurrence time cannot be recovered from it",
+            "re-derive the row's temporal metadata through activate_temporal_lane, which writes \
+             source_event_time_raw as integer nanoseconds alongside its whole-second truncation",
+        ));
+    };
+    let raw_secs = i64::try_from(nanos / NS_PER_SEC).map_err(|_| {
+        temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE",
+            "a source event nanosecond stamp exceeds the representable second range",
+            "repair the source timestamp to a valid Unix-nanosecond value",
+        )
+    })?;
+    if raw_secs != whole_secs_i64 {
+        return Err(temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_STAMPS_DISAGREE",
+            "a Base row's source_event_time_raw nanosecond stamp does not truncate to its own \
+             source_event_time_secs stamp; the two are written together and must agree, so one of \
+             them has been corrupted or rewritten",
+            "inspect the Base row (storage operation=anchors with its source cf_name/key_hex), \
+             establish which stamp matches the source row, and re-derive its temporal metadata",
+        ));
+    }
+    // The remainder is strictly below one second, so it fits `u32` and converts
+    // to `f64` exactly; the divisor is a literal power of ten. Neither step loses
+    // a bit — which is the whole point of summing in the seconds domain instead
+    // of dividing `nanos as f64`, where a 2026 epoch already exceeds the
+    // exactly-representable integer range.
+    let sub_second_nanos = u32::try_from(nanos % NS_PER_SEC).map_err(|_| {
+        temporal_error(
+            "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
+            "a nanosecond remainder modulo one second did not fit u32, which is arithmetically \
+             impossible; the timestamp arithmetic itself is wrong",
+            "inspect the persisted Base row's source_event_time_raw value",
+        )
+    })?;
+    Ok(whole_secs + f64::from(sub_second_nanos) / NS_PER_SEC_F64)
 }
 
 impl SynapseCalyxVault {
@@ -2169,12 +2281,17 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxTemporalParams,
     ) -> Result<SynapseCalyxDriftReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("temporal_drift");
-        let times = self.filtered_event_times(params)?;
-        let cusum: CusumReport = recurrence_rate_cusum(&times)
+        // The CUSUM runs over gaps between distinct instants; the MMD runs over
+        // binned counts, where multiplicity is signal, so it keeps every
+        // occurrence (issue #1893).
+        let collapse = self.distinct_event_instants(params)?;
+        let times = &collapse.instants;
+        let cusum: CusumReport = recurrence_rate_cusum(times)
             .map_err(|error| loom_math_error("CUSUM rate change-point", &error))?;
 
         let bin = validated_bin_seconds(params.bin_seconds)?;
-        let mmd = match bin_event_counts(&times, bin) {
+        let all_times = self.filtered_event_times(params)?;
+        let mmd = match bin_event_counts(&all_times, bin) {
             Ok((_, counts)) => temporal_mmd_change_point(&counts),
             Err(_) => None,
         };
@@ -2183,6 +2300,10 @@ impl SynapseCalyxVault {
         let out = serde_json::json!({
             "panel_version": params.panel_version,
             "filter_value": params.filter_value,
+            "n_occurrences": collapse.n_occurrences,
+            "n_distinct_instants": collapse.n_distinct_instants,
+            "ties_collapsed": collapse.ties_collapsed,
+            "max_multiplicity": collapse.max_multiplicity,
             "n_gaps": cusum.n_gaps,
             "baseline_mean_gap": cusum.baseline_mean_gap,
             "baseline_sigma": cusum.baseline_sigma,
@@ -2202,6 +2323,10 @@ impl SynapseCalyxVault {
         Ok(SynapseCalyxDriftReport {
             panel_version: params.panel_version,
             filter_value: params.filter_value.clone(),
+            n_occurrences: collapse.n_occurrences,
+            n_distinct_instants: collapse.n_distinct_instants,
+            ties_collapsed: collapse.ties_collapsed,
+            max_multiplicity: collapse.max_multiplicity,
             n_gaps: cusum.n_gaps,
             baseline_mean_gap: cusum.baseline_mean_gap,
             baseline_sigma: cusum.baseline_sigma,
@@ -2230,7 +2355,10 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxTemporalParams,
     ) -> Result<SynapseCalyxHazardReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("temporal_hazard");
-        let times = self.filtered_event_times(params)?;
+        // The Gamma renewal fit is over gaps between distinct instants; tied
+        // occurrences carry no gap and would make the fit undefined (#1893).
+        let collapse = self.distinct_event_instants(params)?;
+        let times = &collapse.instants;
         let last = *times.last().ok_or_else(|| {
             temporal_error(
                 "SYNAPSE_CALYX_TEMPORAL_INSUFFICIENT_EVENTS",
@@ -2240,12 +2368,16 @@ impl SynapseCalyxVault {
         })?;
         let now = resolve_now_secs(params.now_secs, self.clock_now_ms().ok(), last);
         let report: InterEventHazardReport =
-            inter_event_hazard_with_alpha(&times, now, params.overdue_alpha)
+            inter_event_hazard_with_alpha(times, now, params.overdue_alpha)
                 .map_err(|error| loom_math_error("inter-event overdue hazard", &error))?;
 
         let out = serde_json::json!({
             "panel_version": params.panel_version,
             "filter_value": params.filter_value,
+            "n_occurrences": collapse.n_occurrences,
+            "n_distinct_instants": collapse.n_distinct_instants,
+            "ties_collapsed": collapse.ties_collapsed,
+            "max_multiplicity": collapse.max_multiplicity,
             "n_gaps": report.n_gaps,
             "mean_gap_seconds": report.mean_gap,
             "coefficient_of_variation": report.coefficient_of_variation,
@@ -2266,6 +2398,10 @@ impl SynapseCalyxVault {
         Ok(SynapseCalyxHazardReport {
             panel_version: params.panel_version,
             filter_value: params.filter_value.clone(),
+            n_occurrences: collapse.n_occurrences,
+            n_distinct_instants: collapse.n_distinct_instants,
+            ties_collapsed: collapse.ties_collapsed,
+            max_multiplicity: collapse.max_multiplicity,
             n_gaps: report.n_gaps,
             mean_gap_seconds: report.mean_gap,
             coefficient_of_variation: report.coefficient_of_variation,
@@ -2312,13 +2448,21 @@ impl SynapseCalyxVault {
                     "repair the source timestamp to a valid Unix-second value within +/- 2^53",
                 ));
             }
-            let secs = secs.to_f64().ok_or_else(|| {
+            let whole_secs = secs.to_f64().ok_or_else(|| {
                 temporal_error(
                     "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
                     "a validated source event timestamp could not be converted to f64",
                     "inspect the persisted Base row and repair its source event timestamp",
                 )
             })?;
+            // `activate_temporal_lane` writes the nanosecond stamp and its
+            // whole-second truncation together, so the sub-second part is
+            // already on this row. Reading only the truncation quantised every
+            // occurrence to a 1-second grid and manufactured ties that do not
+            // exist in the source (issue #1893). Prefer the full-precision
+            // stamp, and fail loudly rather than silently using the lossy one
+            // when the two disagree — that is a Base-row integrity defect.
+            let secs = sub_second_event_secs(&constellation, secs, whole_secs)?;
             let group =
                 group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
             records.push(EventRecord { secs, group });
@@ -2358,6 +2502,37 @@ impl SynapseCalyxVault {
             ));
         }
         Ok(times)
+    }
+
+    /// Ascending series of **distinct** occurrence instants for the renewal and
+    /// CUSUM estimators, with the tie collapse that produced it.
+    ///
+    /// `periodicity` and `causality` bin their occurrences, so multiplicity is
+    /// signal there and they keep the full series. `drift` and `hazard` model
+    /// inter-occurrence gaps, which are only defined between distinct instants —
+    /// an orderly point process admits no tied times. Synapse genuinely writes
+    /// several agent events at one identical nanosecond (they share a commit,
+    /// which is why the `CF_AGENT_EVENTS` key carries a `seq` disambiguator), so
+    /// the collapse is the normal path, not an exceptional one (issue #1893).
+    fn distinct_event_instants(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+    ) -> Result<TiedOccurrenceCollapse, SynapseCalyxError> {
+        let times = self.filtered_event_times(params)?;
+        let collapse = collapse_tied_occurrences(&times)
+            .map_err(|error| loom_math_error("collapse tied occurrence instants", &error))?;
+        if collapse.n_distinct_instants < SYNAPSE_TEMPORAL_MIN_EVENTS {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_INSUFFICIENT_DISTINCT_INSTANTS",
+                "the occurrence series has enough occurrences but too few DISTINCT instants for a \
+                 gap-based estimate: inter-occurrence gaps exist only between distinct instants, \
+                 and after collapsing simultaneous occurrences fewer than the minimum remain",
+                "this is not a total-count shortfall — the occurrences are concentrated at a few \
+                 instants. Widen the record window, drop the filter, or capture occurrences spread \
+                 over more distinct instants (>= 8) for this stream",
+            ));
+        }
+        Ok(collapse)
     }
 
     /// Persists one JSON temporal report row to a native CF and flushes it.
@@ -3043,14 +3218,24 @@ impl SynapseCalyxVault {
         let mut rows: Vec<RecallQuery> = Vec::new();
         let mut anchors: Vec<CxId> = Vec::new();
         let mut vault_corpus_size = 0usize;
+        let snapshot = self.read_snapshot();
         for (_, value) in self.scan_cf_latest(ColumnFamily::Base)? {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
+            let base = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
             })?;
-            if constellation.panel_version != params.panel_version {
+            if base.panel_version != params.panel_version {
                 continue;
             }
             vault_corpus_size += 1;
+            // The Base row says whether the content slot exists on this record;
+            // it cannot supply the vector, which lives in the slot CF. Reading
+            // the vector straight off the Base row yielded `Absent` for every
+            // record, so every concept was excluded and the kernel reported
+            // `0 embedded concept(s)` over a panel full of measurements (#1894).
+            if !base.slots.contains_key(&content_slot.slot_id()) {
+                continue;
+            }
+            let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
             let Some(vector) = constellation
                 .slots
                 .get(&content_slot.slot_id())

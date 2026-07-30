@@ -577,7 +577,13 @@ fn legacy_manifest_path(vault_dir: &Path) -> PathBuf {
     vault_dir.join(INDEX_ROOT).join(MANIFEST_NAME)
 }
 
-fn manifest_path(vault_dir: &Path, panel_version: u32) -> PathBuf {
+/// Manifest path for one panel's persisted search generation.
+///
+/// Public so an operational surface can name the exact expected location even
+/// when the file is absent (issue #1891) — an absent index must be reported with
+/// the path an operator can go look at, not as silence.
+#[must_use]
+pub fn manifest_path(vault_dir: &Path, panel_version: u32) -> PathBuf {
     panel_index_root(vault_dir, panel_version).join(MANIFEST_NAME)
 }
 

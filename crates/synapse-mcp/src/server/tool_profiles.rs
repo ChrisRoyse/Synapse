@@ -446,7 +446,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                     "per-hit per-lens RRF contributions (score = SUM over consulted slots of w_s/(60 + rank_s), rank_s 1-based) + agree/disagree lenses + verified ledger seq/hash per hit + generation manifest sha256/base_seq + an explicit guard readback proving the Ward in-region guard (#1677) was NOT applied",
                 ),
                 "SYNAPSE_CALYX_FIND_REBUILD_REQUIRED",
-                "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; note the live vault's index_inverted CF is empty, so the BM25 sparse lane stays unbuilt until a rebuild materializes it; pass the `similar` block alone, never mixed with the perception filters",
+                "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; a generation lagging further behind the vault than the bounded delta-reconciliation limit fails every query with CALYX_SEARCH_DELTA_REBASE_REQUIRED, and `health` subsystem calyx_search_generation reports which of those states the vault is in; pass the `similar` block alone, never mixed with the perception filters",
             ),
         ],
     ),
@@ -2037,7 +2037,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                     "per-hit per-lens RRF contributions (score = SUM over consulted slots of w_s/(60 + rank_s), rank_s 1-based) + agree/disagree lenses + verified ledger seq/hash per hit + generation manifest sha256/base_seq + an explicit guard readback proving the Ward in-region guard (#1677) was NOT applied",
                 ),
                 "SYNAPSE_CALYX_FIND_REBUILD_REQUIRED",
-                "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; the live vault's index_inverted CF is empty, so the BM25 sparse lane stays unbuilt until a rebuild materializes it",
+                "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; a generation lagging further behind the vault than the bounded delta-reconciliation limit fails every query with CALYX_SEARCH_DELTA_REBASE_REQUIRED, and `health` subsystem calyx_search_generation reports which of those states the vault is in",
             ),
             op(
                 "retire_orphan_slot_cfs",

@@ -87,6 +87,27 @@ impl Constellation {
             .and_then(|value| value.parse::<i64>().ok())
     }
 
+    /// Returns the preserved source event timestamp at full **nanosecond**
+    /// precision, when the writer recorded one as an integer nanosecond count.
+    ///
+    /// [`METADATA_SOURCE_EVENT_TIME_RAW`] is documented as verbatim source text
+    /// *or* an integer, so a non-integer value yields `None` rather than an
+    /// error: it means this writer did not record nanoseconds, which callers
+    /// must distinguish from a corrupt one. Callers that require nanoseconds
+    /// should cross-check against [`Self::source_event_time_secs`] and fail
+    /// loudly on disagreement — the two stamps are written together
+    /// (`activate_temporal_lane`) and must agree by construction (issue #1893).
+    ///
+    /// Like [`Self::source_event_time_secs`], an explicitly inactive temporal
+    /// lane is suppressed rather than substituted with storage time.
+    pub fn source_event_time_nanos(&self) -> Option<u64> {
+        if self.metadata_value(METADATA_TEMPORAL_LANE_STATE) == Some(TEMPORAL_LANE_INACTIVE) {
+            return None;
+        }
+        self.metadata_value(METADATA_SOURCE_EVENT_TIME_RAW)
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
     /// Validates this record at storage/API boundaries.
     pub fn validate_schema(&self) -> Result<()> {
         if self.panel_version == 0 {

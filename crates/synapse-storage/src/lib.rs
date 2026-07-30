@@ -969,6 +969,23 @@ impl Db {
         self.backend.calyx_vault_status()
     }
 
+    /// Read-only state of the persisted search generation for the active panel.
+    ///
+    /// Recall depends entirely on this generation and nothing reported its state
+    /// before, so an absent or badly-lagged index was first observed by whoever
+    /// called `find` and read the failure (issue #1891).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the vault handle is closed, or
+    /// when the reported state itself would have to be guessed (an unparseable
+    /// rebuild marker, an unhashable manifest).
+    pub fn calyx_search_generation_status(
+        &self,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus> {
+        self.backend.calyx_search_generation_status()
+    }
+
     /// Publishes the lowered guard-threshold hot-path artifact (#1686) through
     /// the vault's own producer.
     ///

@@ -384,13 +384,141 @@ fn validate_gaps(event_times: &[f64], min_gaps: usize) -> Result<Vec<f64>> {
     for (index, pair) in event_times.windows(2).enumerate() {
         let gap = pair[1] - pair[0];
         if gap <= 0.0 {
-            return Err(insufficient(format!(
-                "occurrence times must be strictly increasing; violation at index {index}"
-            )));
+            // An ordering violation is not a sample-count shortfall: no amount
+            // of additional data changes it, so it carries its own code and
+            // names the offending instants instead of telling the operator to
+            // anchor more outcomes (issue #1893).
+            return Err(not_monotonic(event_times, index));
         }
         gaps.push(gap);
     }
     Ok(gaps)
+}
+
+/// Builds `CALYX_ASSAY_OCCURRENCES_NOT_MONOTONIC` naming the offending instants.
+///
+/// `first_violation` is the index `i` where `t[i+1] - t[i] <= 0`. The message
+/// distinguishes a tie from a descending step, quotes up to
+/// [`NOT_MONOTONIC_REPORTED_VIOLATIONS`] offending `(index, t[i], t[i+1])`
+/// triples, and states the total violation count, so the diagnosis needs no
+/// code read.
+fn not_monotonic(event_times: &[f64], first_violation: usize) -> CalyxError {
+    let violations: Vec<(usize, f64, f64)> = event_times
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| pair[1] - pair[0] <= 0.0)
+        .map(|(index, pair)| (index, pair[0], pair[1]))
+        .collect();
+    let tied = violations.iter().filter(|(_, a, b)| a == b).count();
+    let descending = violations.len() - tied;
+    let quoted = violations
+        .iter()
+        .take(NOT_MONOTONIC_REPORTED_VIOLATIONS)
+        .map(|(index, a, b)| {
+            let kind = if a == b { "tied" } else { "descending" };
+            format!("[{index}]={a} -> [{}]={b} ({kind})", index + 1)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    CalyxError::assay_occurrences_not_monotonic(format!(
+        "occurrence times must be strictly increasing; {} of {} adjacent pairs violate that \
+         ({tied} tied, {descending} descending), first at index {first_violation}; first {} \
+         violation(s): {quoted}",
+        violations.len(),
+        event_times.len().saturating_sub(1),
+        violations.len().min(NOT_MONOTONIC_REPORTED_VIOLATIONS),
+    ))
+}
+
+/// How many offending adjacent pairs an ordering error quotes verbatim.
+pub const NOT_MONOTONIC_REPORTED_VIOLATIONS: usize = 3;
+
+/// Deterministic collapse of tied occurrence instants (issue #1893).
+///
+/// The renewal and CUSUM estimators model the times **at which** a recurrence
+/// occurred, so their gap series is only defined over *distinct* instants — an
+/// orderly point process admits no tied event times (Meyer 2010, §"Breaking up
+/// tied event times"). Real corpora tie anyway: Synapse writes several agent
+/// events at one identical nanosecond (they share a commit), which is why the
+/// `CF_AGENT_EVENTS` key codec carries a `seq` disambiguator.
+///
+/// The survival/point-process literature offers two accepted responses —
+/// jitter the ties, or collapse them and treat time as discrete. **Jitter is
+/// rejected here**: these primitives are contractually bit-deterministic, and a
+/// random tie-break makes the same corpus yield different change-points across
+/// runs. So tied instants collapse to one occurrence carrying its multiplicity.
+///
+/// Nothing is dropped silently: the returned report carries the input count, the
+/// distinct-instant count, how many occurrences were absorbed, and the largest
+/// multiplicity seen, for the caller to surface in its readback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TiedOccurrenceCollapse {
+    /// Distinct occurrence instants, strictly increasing.
+    pub instants: Vec<f64>,
+    /// Multiplicity of each entry in `instants` (parallel, ≥ 1).
+    pub multiplicities: Vec<usize>,
+    /// Occurrences supplied by the caller.
+    pub n_occurrences: usize,
+    /// Distinct instants after the collapse (`instants.len()`).
+    pub n_distinct_instants: usize,
+    /// Occurrences absorbed into an earlier instant
+    /// (`n_occurrences - n_distinct_instants`).
+    pub ties_collapsed: usize,
+    /// Largest number of occurrences sharing one instant (1 when none tied).
+    pub max_multiplicity: usize,
+}
+
+/// Collapses tied instants in an ascending occurrence series.
+///
+/// # Errors
+///
+/// Returns `CALYX_ASSAY_OCCURRENCES_NOT_MONOTONIC` when `times` is not sorted
+/// ascending (a descending step is a caller defect that collapsing must not
+/// mask), and `CALYX_ASSAY_INSUFFICIENT_SAMPLES` when a value is not finite or
+/// the series is empty.
+pub fn collapse_tied_occurrences(times: &[f64]) -> Result<TiedOccurrenceCollapse> {
+    if times.is_empty() {
+        return Err(insufficient(
+            "the occurrence series is empty; nothing to collapse",
+        ));
+    }
+    for (index, &time) in times.iter().enumerate() {
+        if !time.is_finite() {
+            return Err(insufficient(format!(
+                "occurrence {index} is NaN or infinite"
+            )));
+        }
+    }
+    let mut instants: Vec<f64> = Vec::with_capacity(times.len());
+    let mut multiplicities: Vec<usize> = Vec::with_capacity(times.len());
+    for (index, &time) in times.iter().enumerate() {
+        match instants.last().copied() {
+            Some(previous) if time == previous => {
+                *multiplicities
+                    .last_mut()
+                    .expect("instants and multiplicities stay parallel") += 1;
+            }
+            Some(previous) if time < previous => {
+                // Collapsing must never hide unsortedness; that is a distinct
+                // defect with a distinct cause.
+                return Err(not_monotonic(times, index.saturating_sub(1)));
+            }
+            _ => {
+                instants.push(time);
+                multiplicities.push(1);
+            }
+        }
+    }
+    let n_distinct_instants = instants.len();
+    let max_multiplicity = multiplicities.iter().copied().max().unwrap_or(1);
+    Ok(TiedOccurrenceCollapse {
+        instants,
+        multiplicities,
+        n_occurrences: times.len(),
+        n_distinct_instants,
+        ties_collapsed: times.len() - n_distinct_instants,
+        max_multiplicity,
+    })
 }
 
 /// Gamma pdf `f(x; k, θ) = x^{k-1} e^{-x/θ} / (θ^k Γ(k))`.

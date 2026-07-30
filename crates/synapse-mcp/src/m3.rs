@@ -978,6 +978,22 @@ impl M3State {
             .unwrap_or_else(|| self.calyx_vault_status.clone())
     }
 
+    /// Read-only persisted-search-generation state, or the storage error that
+    /// prevented reading it (issue #1891).
+    ///
+    /// `None` means no storage handle is open at all — distinct from "the vault
+    /// is open and the generation is absent", which is a real reported state.
+    #[must_use]
+    pub fn calyx_search_generation_status(
+        &self,
+    ) -> Option<Result<synapse_calyx::SynapseCalyxSearchGenerationStatus, String>> {
+        let db = self.db.as_ref()?;
+        Some(
+            db.calyx_search_generation_status()
+                .map_err(|error| error.to_string()),
+        )
+    }
+
     #[must_use]
     pub fn storage_maintenance_readback(&self) -> StorageMaintenanceReadback {
         let gc_task = self

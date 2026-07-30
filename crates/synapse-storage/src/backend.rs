@@ -461,6 +461,11 @@ pub trait StorageBackend: Send + Sync {
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus>;
+    /// Read-only state of the persisted search generation for the active panel
+    /// (issue #1891). Side-effect free, so `health` can report it every call.
+    fn calyx_search_generation_status(
+        &self,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus>;
     /// Publishes the lowered guard-threshold artifact through the vault's own
     /// single producer (#1885).
     ///
@@ -1942,6 +1947,25 @@ impl StorageBackend for CalyxBackend {
 
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus> {
         self.vault.status()
+    }
+
+    fn calyx_search_generation_status(
+        &self,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus> {
+        self.with_vault(
+            "<calyx-vault>",
+            "read Calyx persisted search generation status",
+            false,
+            |vault| {
+                vault.search_generation_status().map_err(|source| {
+                    calyx_write_failed(
+                        "<calyx-vault>",
+                        "read Calyx persisted search generation status",
+                        &source,
+                    )
+                })
+            },
+        )
     }
 
     fn lower_guard_thresholds(

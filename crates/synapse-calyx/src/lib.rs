@@ -236,6 +236,74 @@ pub struct SynapseCalyxSearchRebuildReport {
     pub raw_sidecars: Vec<SynapseCalyxSearchRawSidecar>,
 }
 
+/// Read-only state of the persisted search generation for the active panel.
+///
+/// Recall depends entirely on this generation, and nothing announced its state
+/// before: an absent or badly-lagged generation was first observed by whoever
+/// called `find` and read the error (issue #1891). This is the owning surface
+/// that answers "is the search layer built, over how many rows, and when".
+///
+/// Reading it is cheap and side-effect free — the manifest, the rebuild marker
+/// and the vault sequence, no CF scans — so `health` can report it every call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxSearchGenerationStatus {
+    /// Active durable panel version, when one is published.
+    pub panel_version: Option<u32>,
+    /// Why no panel version is reported, when `panel_version` is `None`.
+    pub panel_state_error: Option<String>,
+    /// Expected manifest path for the active panel (reported even when absent,
+    /// so the operator can look at the exact location).
+    pub manifest_path: Option<String>,
+    /// Whether the manifest file exists on disk.
+    pub manifest_present: bool,
+    pub manifest_sha256: Option<String>,
+    /// Vault sequence the generation was built at.
+    pub built_at_seq: Option<u64>,
+    /// Current vault sequence. `latest_seq - built_at_seq` is how far behind the
+    /// generation is.
+    pub vault_latest_seq: u64,
+    /// `latest_seq - built_at_seq`, saturating.
+    pub seq_lag: Option<u64>,
+    /// Bounded delta-reconciliation limit. Once the changed-key count between
+    /// `built_at_seq` and the pinned snapshot exceeds this, every query fails
+    /// with `CALYX_SEARCH_DELTA_REBASE_REQUIRED` — so a `seq_lag` far above it
+    /// is a strong predictor that recall is already dead.
+    pub max_reconciled_delta_keys: u64,
+    /// Largest per-slot row count in the generation — the rows recall can reach.
+    pub rows_covered: Option<u64>,
+    /// Per-slot index presence: dense and sparse lanes are reported separately
+    /// because they fail independently.
+    pub slots: Vec<SynapseCalyxSearchGenerationSlot>,
+    pub dense_slot_count: u64,
+    pub sparse_slot_count: u64,
+    /// Manifest file modification time, as the build timestamp.
+    pub built_at_unix_ms: Option<u64>,
+    /// Age of the build in milliseconds, at read time.
+    pub age_ms: Option<u64>,
+    /// A staked rebuild-required intent, when one is present.
+    pub rebuild_required: Option<String>,
+    /// `absent` | `rebuild_required` | `lagging` | `built`. `absent` and
+    /// `rebuild_required` mean recall cannot serve at all; `lagging` means the
+    /// seq lag exceeds the bounded reconciliation limit, so it very likely
+    /// cannot either.
+    pub state: String,
+    /// What to do about the reported state, or `none` when it is healthy.
+    pub remediation: String,
+}
+
+/// One persisted-index slot's presence in the generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxSearchGenerationSlot {
+    pub slot: u16,
+    /// Index kind, e.g. `flat_dense`, `diskann`, `sparse_dot`.
+    pub kind: String,
+    /// `dense` or `sparse` — the retrieval lane this slot serves.
+    pub lane: String,
+    /// Rows indexed for this slot.
+    pub len: u64,
+    pub built_at_seq: u64,
+}
+
 /// Outcome of publishing an active durable `Panel` snapshot to the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SynapseCalyxPanelPublishReport {
@@ -316,6 +384,115 @@ fn search_rebuild_error(action: &str, error: calyx_search::SearchError) -> Synap
             "inspect the rebuild marker, durable panel state, and named physical search artifact before retrying",
         ),
     }
+}
+
+/// The generation status for a vault with no active durable panel published.
+///
+/// Without an active panel there is nothing a generation could be built *for*, so
+/// the state is `absent` and the repair is to publish the panel first — not to run
+/// a rebuild that would fail with `SYNAPSE_CALYX_NO_ACTIVE_PANEL`.
+fn search_generation_status_without_panel(
+    panel_state_error: Option<String>,
+    vault_latest_seq: u64,
+    max_reconciled_delta_keys: u64,
+) -> SynapseCalyxSearchGenerationStatus {
+    SynapseCalyxSearchGenerationStatus {
+        panel_version: None,
+        panel_state_error,
+        manifest_path: None,
+        manifest_present: false,
+        manifest_sha256: None,
+        built_at_seq: None,
+        vault_latest_seq,
+        seq_lag: None,
+        max_reconciled_delta_keys,
+        rows_covered: None,
+        slots: Vec::new(),
+        dense_slot_count: 0,
+        sparse_slot_count: 0,
+        built_at_unix_ms: None,
+        age_ms: None,
+        rebuild_required: None,
+        state: "absent".to_owned(),
+        remediation:
+            "publish the active panel (publish_active_panel / boot panel publication), then build \
+             the search generation; until then no recall path can serve a query"
+                .to_owned(),
+    }
+}
+
+/// Decides the reported state of a persisted search generation and what to do
+/// about it (issue #1891).
+///
+/// `built` is the only healthy verdict. Everything else means recall either
+/// cannot serve at all or is expected to fail closed, so the caller reports it as
+/// an error rather than a warning — a search surface that presents as available
+/// while being inert is the defect family this exists to close.
+fn classify_search_generation(
+    rebuild_marker_staked: bool,
+    manifest_present: bool,
+    built_at_seq: Option<u64>,
+    seq_lag: Option<u64>,
+    max_reconciled_delta_keys: u64,
+) -> (&'static str, &'static str) {
+    if rebuild_marker_staked {
+        return (
+            "rebuild_required",
+            "a mutation staked a rebuild-required intent; the generation is stale until a rebuild \
+             republishes the manifest. Run storage operation=search_rebuild.",
+        );
+    }
+    if !manifest_present {
+        return (
+            "absent",
+            "no search generation exists for the active panel, so no recall path can serve a \
+             query. Build it with storage operation=search_rebuild.",
+        );
+    }
+    if built_at_seq.is_none() {
+        return (
+            "rebuild_required",
+            "the manifest exists but does not describe a usable generation for this panel \
+             (format, panel, or slot shape mismatch). Rebuild it with storage \
+             operation=search_rebuild.",
+        );
+    }
+    if seq_lag.is_some_and(|lag| lag > max_reconciled_delta_keys) {
+        return (
+            "lagging",
+            "the generation is further behind the vault than the bounded delta-reconciliation \
+             limit, so queries are expected to fail closed with \
+             CALYX_SEARCH_DELTA_REBASE_REQUIRED. Rebuild it with storage \
+             operation=search_rebuild.",
+        );
+    }
+    ("built", "none")
+}
+
+/// Classifies a persisted-index kind into the retrieval lane it serves.
+///
+/// Dense and sparse lanes fail independently — a vault can carry a built dense
+/// ANN index and no BM25 lane at all — so an operational surface must report
+/// them separately rather than as one "index present" bit (issue #1891).
+fn search_slot_lane(kind: &str) -> &'static str {
+    if kind.contains("sparse") {
+        "sparse"
+    } else if kind.contains("dense") || kind.contains("diskann") || kind.contains("multi") {
+        "dense"
+    } else {
+        "unknown"
+    }
+}
+
+/// File modification time in Unix milliseconds, or `None` when unavailable.
+fn file_modified_unix_ms(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
 fn read_optional_sha256(path: &Path) -> Result<Option<String>, SynapseCalyxError> {
@@ -2270,6 +2447,47 @@ impl SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxVault {
+    /// Pins one read snapshot sequence for a whole intelligence pass.
+    ///
+    /// Every record in one pass must be hydrated against the same snapshot, or
+    /// the corpus mixes sequences and the derived result describes no single
+    /// state of the vault.
+    pub(crate) fn read_snapshot(&self) -> u64 {
+        self.vault.snapshot()
+    }
+
+    /// Reads one constellation with its slot vectors hydrated from the per-slot
+    /// CFs (issue #1894).
+    ///
+    /// **A `Base` row does not contain slot vectors.** It stores
+    /// `(slot_id, slot_hash)` pairs, and `decode_constellation_base` therefore
+    /// yields `SlotVector::Absent { NotApplicable }` for *every* slot. Treating a
+    /// Base-decoded constellation as if it carried measurements silently produces
+    /// an empty lens set: it is not an error, no row is missing, and every
+    /// downstream count is a truthful zero over nothing. That is what made
+    /// `weave`/`abundance`/`bits`/`redundancy` report `n_lenses=0` and `kernel`
+    /// report `0 embedded concepts` on a panel whose records carry twelve
+    /// measured content lenses.
+    ///
+    /// Any caller that needs vectors — as opposed to anchors, scalars, metadata
+    /// or slot *ids* — must go through this, not through the Base row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the row or one of its slot
+    /// CF rows cannot be read at `snapshot`.
+    pub(crate) fn hydrated_constellation(
+        &self,
+        cx_id: CxId,
+        snapshot: u64,
+    ) -> Result<Constellation, SynapseCalyxError> {
+        self.vault.get(cx_id, snapshot).map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                &format!("hydrate slot vectors for constellation {cx_id}"),
+                &error,
+            )
+        })
+    }
     /// Atomically replaces only the temporal metadata fields on one legacy
     /// Base row after exact panel and source-identity verification.
     ///
@@ -2540,6 +2758,132 @@ impl SynapseCalyxVault {
     #[must_use]
     pub fn latest_seq(&self) -> Seq {
         self.vault.latest_seq()
+    }
+
+    /// Reads the persisted search generation's state for the active panel,
+    /// without building or mutating anything (issue #1891).
+    ///
+    /// Every recall path depends on this generation, and before this nothing
+    /// announced its state: an absent generation, a staked rebuild marker, or a
+    /// generation lagging past the bounded reconciliation limit were all silent
+    /// until an operator called `find` and read the failure. This reports the
+    /// facts — which lanes are built, over how many rows, at which sequence, how
+    /// long ago — so `health` can raise it as a named deficiency instead.
+    ///
+    /// It never fails on an *absent* generation: absence is the state being
+    /// reported, not an error in reporting it. It does fail when the vault's own
+    /// panel state or a staked marker cannot be read, because those mean the
+    /// reported state itself would be a guess.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the rebuild-required marker exists but
+    /// cannot be parsed, or when the manifest exists but cannot be hashed.
+    pub fn search_generation_status(
+        &self,
+    ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
+        let vault_dir = self.config.vault_dir.as_path();
+        let vault_latest_seq = self.vault.latest_seq();
+        let max_reconciled_delta_keys = calyx_search::MAX_RECONCILED_DELTA_KEYS as u64;
+
+        let (panel_version, panel_state_error) = match load_vault_panel_state(vault_dir) {
+            Ok(state) => (Some(state.panel.version), None),
+            Err(error) if error.code == CALYX_NO_ACTIVE_PANEL => (
+                None,
+                Some(format!(
+                    "no active durable panel is published, so no search generation can exist: {}",
+                    error.message
+                )),
+            ),
+            Err(error) => (None, Some(format!("{}: {}", error.code, error.message))),
+        };
+
+        let Some(panel_version) = panel_version else {
+            return Ok(search_generation_status_without_panel(
+                panel_state_error,
+                vault_latest_seq,
+                max_reconciled_delta_keys,
+            ));
+        };
+
+        let manifest = calyx_search::manifest_path(vault_dir, panel_version);
+        let manifest_present = manifest.is_file();
+        let manifest_sha256 = read_optional_sha256(&manifest)?;
+        let rebuild_required = calyx_search::read_rebuild_required_marker(vault_dir, panel_version)
+            .map_err(|error| {
+                search_rebuild_error("read rebuild-required marker for generation status", error)
+            })?
+            .map(|marker| format!("source={} detail={}", marker.source, marker.detail));
+
+        let (built_at_seq, rows_covered, slots) = if manifest_present {
+            match calyx_search::PersistedSearchIndexes::open(vault_dir, panel_version)
+                .and_then(|indexes| indexes.generation())
+            {
+                Ok(generation) => {
+                    let slots: Vec<SynapseCalyxSearchGenerationSlot> = generation
+                        .slots
+                        .iter()
+                        .map(|slot| SynapseCalyxSearchGenerationSlot {
+                            slot: slot.panel_slot.slot_id().get(),
+                            kind: slot.kind.clone(),
+                            lane: search_slot_lane(&slot.kind).to_owned(),
+                            len: slot.len as u64,
+                            built_at_seq: slot.built_at_seq,
+                        })
+                        .collect();
+                    let rows = slots.iter().map(|slot| slot.len).max();
+                    (Some(generation.base_seq), rows, slots)
+                }
+                // The manifest exists but does not describe a usable generation
+                // (wrong format, wrong panel, malformed slot shape). That is a
+                // reportable state, not a reason to fail the health read.
+                Err(_) => (None, None, Vec::new()),
+            }
+        } else {
+            (None, None, Vec::new())
+        };
+
+        let dense_slot_count = slots.iter().filter(|slot| slot.lane == "dense").count() as u64;
+        let sparse_slot_count = slots.iter().filter(|slot| slot.lane == "sparse").count() as u64;
+        let built_at_unix_ms = file_modified_unix_ms(&manifest);
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        let age_ms = match (built_at_unix_ms, now_unix_ms) {
+            (Some(built), Some(now)) => Some(now.saturating_sub(built)),
+            _ => None,
+        };
+        let seq_lag = built_at_seq.map(|seq| vault_latest_seq.saturating_sub(seq));
+
+        let (state, remediation) = classify_search_generation(
+            rebuild_required.is_some(),
+            manifest_present,
+            built_at_seq,
+            seq_lag,
+            max_reconciled_delta_keys,
+        );
+
+        Ok(SynapseCalyxSearchGenerationStatus {
+            panel_version: Some(panel_version),
+            panel_state_error,
+            manifest_path: Some(manifest.display().to_string()),
+            manifest_present,
+            manifest_sha256,
+            built_at_seq,
+            vault_latest_seq,
+            seq_lag,
+            max_reconciled_delta_keys,
+            rows_covered,
+            slots,
+            dense_slot_count,
+            sparse_slot_count,
+            built_at_unix_ms,
+            age_ms,
+            rebuild_required,
+            state: state.to_owned(),
+            remediation: remediation.to_owned(),
+        })
     }
 
     /// Rebuilds the immutable persisted-search generation for the exact active

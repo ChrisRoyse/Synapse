@@ -2,7 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const CUDA_PATH_DEFAULT: &str = "/usr/local/cuda-13.3";
+/// CUDA toolkit release this crate's kernels are compiled against.
+const CUDA_VERSION: &str = "13.3";
 const CUDA_ARCH: &str = "sm_120";
 const CUDA_CCBIN_ENV: &str = "FORGE_CUDA_CCBIN";
 
@@ -102,18 +103,68 @@ fn cuda_feature_enabled() -> bool {
 }
 
 fn locate_nvcc() -> PathBuf {
-    let cuda_path = env::var_os("CUDA_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(CUDA_PATH_DEFAULT));
-    let nvcc = cuda_path.join("bin").join(nvcc_exe_name());
+    // Every candidate is built with `Path::join`, never a hand-written
+    // separator, and the default roots follow the host platform's own
+    // convention. Mixing the two produced `/usr/local/cuda-13.3\bin\nvcc.exe` —
+    // a path that cannot exist anywhere, which sent the reader looking for a
+    // broken toolchain layout instead of reading the actionable half of the
+    // message (issue #1892).
+    let explicit = env::var_os("CUDA_PATH").map(PathBuf::from);
+    let roots: Vec<PathBuf> = match &explicit {
+        Some(root) => vec![root.clone()],
+        None => default_cuda_roots(),
+    };
 
-    if !nvcc.is_file() {
-        panic!(
-            "nvcc not found at {}; set CUDA_PATH to CUDA 13.3 root",
-            nvcc.display()
-        );
+    let mut probed = Vec::new();
+    for root in &roots {
+        let nvcc = root.join("bin").join(nvcc_exe_name());
+        if nvcc.is_file() {
+            return nvcc;
+        }
+        probed.push(nvcc);
     }
-    nvcc
+
+    let probed_list = probed
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = if explicit.is_some() {
+        format!("CUDA_PATH is set, so only it was probed ({CUDA_VERSION} kernels)")
+    } else {
+        format!(
+            "CUDA_PATH is unset, so the platform default {CUDA_VERSION} root(s) were probed; set \
+             CUDA_PATH to a CUDA {CUDA_VERSION} root to override"
+        )
+    };
+    panic!(
+        "CALYX_FORGE_NVCC_NOT_FOUND: the `cuda` feature needs the CUDA {CUDA_VERSION} toolkit, and \
+         no nvcc was found.\nprobed:\n{probed_list}\n{source}\nA host with no NVIDIA toolkit \
+         cannot build this feature; build without `--features cuda` (scripts\\synapse-setup.ps1 \
+         detects this and reports `Calyx CUDA kernels DISABLED` rather than failing)."
+    );
+}
+
+/// Platform-conventional CUDA roots probed when `CUDA_PATH` is unset.
+///
+/// Windows: the NVIDIA installer's location under `%ProgramFiles%`, which is
+/// also where it points `CUDA_PATH`. Unix: the `/usr/local` convention, both the
+/// versioned directory and the `cuda` symlink the toolkit maintains.
+fn default_cuda_roots() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        let program_files = env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\Program Files"));
+        let toolkit = program_files
+            .join("NVIDIA GPU Computing Toolkit")
+            .join("CUDA");
+        vec![toolkit.join(format!("v{CUDA_VERSION}"))]
+    } else {
+        vec![
+            PathBuf::from("/usr/local").join(format!("cuda-{CUDA_VERSION}")),
+            PathBuf::from("/usr/local").join("cuda"),
+        ]
+    }
 }
 
 fn nvcc_exe_name() -> &'static str {

@@ -518,6 +518,10 @@ impl SynapseService {
         subsystems.insert("storage".to_owned(), self.storage_health());
         subsystems.insert("calyx_vault".to_owned(), self.calyx_vault_health());
         subsystems.insert("calyx_hot_path".to_owned(), self.calyx_hot_path_health());
+        subsystems.insert(
+            "calyx_search_generation".to_owned(),
+            self.calyx_search_generation_health(),
+        );
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("perception".to_owned(), self.perception_health());
@@ -565,6 +569,105 @@ impl SynapseService {
             tool_surface_sha256: tool_surface.sha256,
             tool_names: tool_surface.names,
             subsystems,
+        }
+    }
+
+    /// Reports the persisted search generation as a named deficiency rather than
+    /// as silence (issue #1891).
+    ///
+    /// Recall depends entirely on this generation. Before this subsystem existed,
+    /// `health` said nothing about it: an absent index, a staked rebuild marker,
+    /// or a generation lagging so far behind the vault that every query fails
+    /// closed were all invisible until an operator called `find` and read the
+    /// error. An absent or unusable generation is an `error` here, because the
+    /// capability every recall path needs is unavailable.
+    fn calyx_search_generation_health(&self) -> SubsystemHealth {
+        let status = match self.m3_state.try_lock() {
+            Ok(state) => state.calyx_search_generation_status(),
+            Err(error) => return state_lock_unavailable_health("M3", error),
+        };
+        let Some(status) = status else {
+            return SubsystemHealth {
+                status: "disabled".to_owned(),
+                detail: Some(
+                    "no storage handle is open, so no vault search generation exists to report"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                return SubsystemHealth {
+                    status: "error".to_owned(),
+                    detail: Some(format!(
+                        "reading the persisted search generation state failed, so whether recall                          can serve is unknown: {error}"
+                    )),
+                    ..SubsystemHealth::default()
+                };
+            }
+        };
+        // `built` is the only healthy state. Every other value means recall
+        // either cannot serve or is expected to fail closed, which is an error
+        // rather than a warning: the surface presents as available otherwise.
+        let health_status = if status.state == "built" {
+            "ok"
+        } else {
+            "error"
+        };
+        let slot_summary = if status.slots.is_empty() {
+            "none".to_owned()
+        } else {
+            status
+                .slots
+                .iter()
+                .map(|slot| {
+                    format!(
+                        "{}:{}/{}/rows={}",
+                        slot.slot, slot.lane, slot.kind, slot.len
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        SubsystemHealth {
+            status: health_status.to_owned(),
+            detail: Some(format!(
+                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
+                status.state,
+                status.panel_version,
+                status.manifest_present,
+                status.built_at_seq,
+                status.vault_latest_seq,
+                status.seq_lag,
+                status.max_reconciled_delta_keys,
+                status.rows_covered,
+                status.dense_slot_count,
+                status.sparse_slot_count,
+                status.age_ms,
+                status.rebuild_required.as_deref().unwrap_or("none"),
+                slot_summary,
+                status.manifest_path.as_deref().unwrap_or("none"),
+                status.panel_state_error.as_deref().unwrap_or("none"),
+                status.remediation,
+            )),
+            calyx_search_generation_state: Some(status.state),
+            calyx_search_generation_panel_version: status.panel_version,
+            calyx_search_generation_manifest_path: status.manifest_path,
+            calyx_search_generation_manifest_present: Some(status.manifest_present),
+            calyx_search_generation_built_at_seq: status.built_at_seq,
+            calyx_search_generation_seq_lag: status.seq_lag,
+            calyx_search_generation_max_reconciled_delta_keys: Some(
+                status.max_reconciled_delta_keys,
+            ),
+            calyx_search_generation_rows_covered: status.rows_covered,
+            calyx_search_generation_dense_slot_count: Some(status.dense_slot_count),
+            calyx_search_generation_sparse_slot_count: Some(status.sparse_slot_count),
+            calyx_search_generation_age_ms: status.age_ms,
+            calyx_search_generation_rebuild_required: status.rebuild_required,
+            calyx_search_generation_remediation: Some(status.remediation),
+            ..SubsystemHealth::default()
         }
     }
 

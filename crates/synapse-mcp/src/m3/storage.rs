@@ -1129,6 +1129,18 @@ pub struct StorageIntelligenceDriftReport {
     pub panel_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_value: Option<String>,
+    /// Occurrences read from the panel before simultaneous instants were
+    /// collapsed. `n_occurrences - n_distinct_instants == ties_collapsed`
+    /// (issue #1893).
+    pub n_occurrences: u64,
+    /// Distinct instants the gap series was actually built over. Inter-event
+    /// gaps exist only between distinct instants.
+    pub n_distinct_instants: u64,
+    /// Occurrences absorbed into an earlier simultaneous instant. Non-zero is
+    /// normal for agent events, which are written several per commit.
+    pub ties_collapsed: u64,
+    /// Largest number of occurrences sharing one instant (1 when none tied).
+    pub max_multiplicity: u64,
     pub n_gaps: u64,
     pub baseline_mean_gap: f64,
     pub baseline_sigma: f64,
@@ -1157,6 +1169,18 @@ pub struct StorageIntelligenceHazardReport {
     pub panel_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_value: Option<String>,
+    /// Occurrences read from the panel before simultaneous instants were
+    /// collapsed. `n_occurrences - n_distinct_instants == ties_collapsed`
+    /// (issue #1893).
+    pub n_occurrences: u64,
+    /// Distinct instants the gap series was actually built over. Inter-event
+    /// gaps exist only between distinct instants.
+    pub n_distinct_instants: u64,
+    /// Occurrences absorbed into an earlier simultaneous instant. Non-zero is
+    /// normal for agent events, which are written several per commit.
+    pub ties_collapsed: u64,
+    /// Largest number of occurrences sharing one instant (1 when none tied).
+    pub max_multiplicity: u64,
     pub n_gaps: u64,
     pub mean_gap_seconds: f64,
     pub coefficient_of_variation: f64,
@@ -2095,6 +2119,10 @@ pub fn run_intelligence_drift(
         source_of_truth: "Calyx TemporalXTerm CF rows",
         panel_version: report.panel_version,
         filter_value: report.filter_value,
+        n_occurrences: report.n_occurrences as u64,
+        n_distinct_instants: report.n_distinct_instants as u64,
+        ties_collapsed: report.ties_collapsed as u64,
+        max_multiplicity: report.max_multiplicity as u64,
         n_gaps: report.n_gaps as u64,
         baseline_mean_gap: report.baseline_mean_gap,
         baseline_sigma: report.baseline_sigma,
@@ -2123,6 +2151,10 @@ pub fn run_intelligence_hazard(
         source_of_truth: "Calyx TemporalXTerm CF rows",
         panel_version: report.panel_version,
         filter_value: report.filter_value,
+        n_occurrences: report.n_occurrences as u64,
+        n_distinct_instants: report.n_distinct_instants as u64,
+        ties_collapsed: report.ties_collapsed as u64,
+        max_multiplicity: report.max_multiplicity as u64,
         n_gaps: report.n_gaps as u64,
         mean_gap_seconds: report.mean_gap_seconds,
         coefficient_of_variation: report.coefficient_of_variation,

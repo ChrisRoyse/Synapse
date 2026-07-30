@@ -11,7 +11,11 @@ use crate::persisted::PersistedSearchIndexes;
 
 use super::support::SearchReadSnapshot;
 
-const MAX_RECONCILED_DELTA_KEYS: usize = 8_192;
+/// Bounded changed-key budget for reconciling a lagging generation against the
+/// current snapshot. Beyond this the query fails closed with
+/// `CALYX_SEARCH_DELTA_REBASE_REQUIRED` rather than doing unbounded work, so
+/// operational surfaces need to be able to report the limit (issue #1891).
+pub const MAX_RECONCILED_DELTA_KEYS: usize = 8_192;
 const DELTA_REBASE_CODE: &str = "CALYX_SEARCH_DELTA_REBASE_REQUIRED";
 
 pub(super) struct SearchDelta {

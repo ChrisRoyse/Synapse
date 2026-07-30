@@ -135,11 +135,12 @@ impl SynapseCalyxVault {
         let mut kind_records: BTreeMap<String, usize> = BTreeMap::new();
         let mut slots: BTreeMap<u16, SlotAccumulator> = BTreeMap::new();
 
+        let snapshot = self.read_snapshot();
         for (_, value) in rows {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
+            let base = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
             })?;
-            if constellation.panel_version != panel_version {
+            if base.panel_version != panel_version {
                 continue;
             }
             records_scanned += 1;
@@ -147,6 +148,11 @@ impl SynapseCalyxVault {
                 continue;
             }
             records_measured += 1;
+            // Per-slot presence is measured from hydrated vectors: a Base row
+            // decodes every slot to `Absent`, so the `is_absent` skip below
+            // discarded every slot on every record and the grounding report
+            // described zero lenses (issue #1894).
+            let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
 
             let grounded_kinds = grounded_anchor_kinds(&constellation.anchors);
             let record_is_grounded = !grounded_kinds.is_empty();

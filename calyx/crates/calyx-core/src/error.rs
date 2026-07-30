@@ -144,6 +144,11 @@ error_catalog! {
     AssayDegenerateInput, assay_degenerate_input, "CALYX_ASSAY_DEGENERATE_INPUT",
     "zero-variance / all-tied estimator input", "supply a non-constant paired series (correlation is undefined on a constant column)";
 
+    AssayOccurrencesNotMonotonic, assay_occurrences_not_monotonic,
+    "CALYX_ASSAY_OCCURRENCES_NOT_MONOTONIC",
+    "occurrence series is descending or carries tied instants where the estimator requires strictly increasing times",
+    "sort the occurrence series ascending and collapse tied instants (calyx_assay::collapse_tied_occurrences) before calling; this is an ordering defect in the caller's input preparation, not a sample-count shortfall, so collecting more occurrences cannot fix it";
+
     KernelUngrounded, kernel_ungrounded, "CALYX_KERNEL_UNGROUNDED",
     "kernel over ungrounded graph", "add anchors (grounding_gaps)";
 

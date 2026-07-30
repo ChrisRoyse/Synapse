@@ -974,8 +974,12 @@ pub(super) async fn handle(
                 )
             } else if let Some(drift) = &response.drift {
                 format!(
-                    "intelligence drift panel={} n_gaps={} cusum_change_detected={} direction={:?} mmd_p_value={:?} temporal_xterm_rows={}",
+                    "intelligence drift panel={} n_occurrences={} n_distinct_instants={} ties_collapsed={} max_multiplicity={} n_gaps={} cusum_change_detected={} direction={:?} mmd_p_value={:?} temporal_xterm_rows={}",
                     drift.panel_version,
+                    drift.n_occurrences,
+                    drift.n_distinct_instants,
+                    drift.ties_collapsed,
+                    drift.max_multiplicity,
                     drift.n_gaps,
                     drift.cusum_change_detected,
                     drift.cusum_direction,
@@ -984,8 +988,12 @@ pub(super) async fn handle(
                 )
             } else if let Some(hazard) = &response.hazard {
                 format!(
-                    "intelligence hazard panel={} n_gaps={} survival={:.4} overdue={} expected_next_seconds={:.1} temporal_xterm_rows={}",
+                    "intelligence hazard panel={} n_occurrences={} n_distinct_instants={} ties_collapsed={} max_multiplicity={} n_gaps={} survival={:.4} overdue={} expected_next_seconds={:.1} temporal_xterm_rows={}",
                     hazard.panel_version,
+                    hazard.n_occurrences,
+                    hazard.n_distinct_instants,
+                    hazard.ties_collapsed,
+                    hazard.max_multiplicity,
                     hazard.n_gaps,
                     hazard.survival,
                     hazard.overdue,

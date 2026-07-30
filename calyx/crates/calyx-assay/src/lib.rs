@@ -216,7 +216,8 @@ pub use recurrence_anchor::{
 pub use recurrence_hazard::{
     CV_DETERMINISTIC, CusumChangePoint, CusumConfig, CusumReport, DEFAULT_CUSUM_SLACK_K,
     DEFAULT_CUSUM_THRESHOLD_H, DEFAULT_MIN_SIGMA_FRAC, DEFAULT_OVERDUE_ALPHA,
-    InterEventHazardReport, MIN_CUSUM_GAPS, MIN_HAZARD_GAPS, RateShift, inter_event_hazard,
+    InterEventHazardReport, MIN_CUSUM_GAPS, MIN_HAZARD_GAPS, NOT_MONOTONIC_REPORTED_VIOLATIONS,
+    RateShift, TiedOccurrenceCollapse, collapse_tied_occurrences, inter_event_hazard,
     inter_event_hazard_from_series, inter_event_hazard_with_alpha, recurrence_rate_cusum,
     recurrence_rate_cusum_from_series, recurrence_rate_cusum_with_config,
 };

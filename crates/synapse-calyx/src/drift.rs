@@ -492,19 +492,24 @@ impl SynapseCalyxVault {
         max_records: usize,
     ) -> Result<DriftCorpus, SynapseCalyxError> {
         let rows = self.scan_cf_latest(ColumnFamily::Base)?;
+        let snapshot = self.read_snapshot();
         let mut records = Vec::new();
         let mut records_scanned = 0usize;
         for (_, value) in rows {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
+            let base = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
             })?;
-            if constellation.panel_version != panel_version {
+            if base.panel_version != panel_version {
                 continue;
             }
             records_scanned += 1;
             if records.len() >= max_records {
                 continue;
             }
+            // Slot vectors live in the per-slot CFs; a Base row decodes to
+            // `Absent` for every slot, so reading them from it produced an empty
+            // drift corpus that measured nothing (issue #1894).
+            let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
             let slots = constellation
                 .slots
                 .iter()

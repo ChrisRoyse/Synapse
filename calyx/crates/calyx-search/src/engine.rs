@@ -20,7 +20,7 @@ use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
 
 mod budget;
-mod delta;
+pub mod delta;
 mod guard;
 mod hydration;
 mod hydration_cache;
@@ -28,6 +28,7 @@ mod search;
 mod support;
 mod types;
 pub use budget::SearchBudget;
+pub use delta::MAX_RECONCILED_DELTA_KEYS;
 use search::search_outcome_with_measured_slots;
 pub use types::{FusionChoice, FusionTuning, GuardChoice, SearchFreshness, SearchOutcome};
 

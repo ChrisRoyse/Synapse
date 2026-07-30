@@ -239,6 +239,52 @@ pub struct SubsystemHealth {
     /// decorative and the subsystem must not report a clean `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_inert_tuning_knob_count: Option<usize>,
+
+    // --- persisted search generation (issue #1891) ---
+    // Every recall path depends on this generation. Before these fields, an
+    // absent or badly-lagged index was announced by nothing: the first observer
+    // was whoever called `find` and read the error. An absent generation on a
+    // vault that holds derived rows is an `error`, not silence.
+    /// `absent` | `rebuild_required` | `lagging` | `built`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_state: Option<String>,
+    /// Active durable panel the generation belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_panel_version: Option<u32>,
+    /// Expected manifest path, reported even when the file is absent so the
+    /// operator can go look at the exact location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_manifest_present: Option<bool>,
+    /// Vault sequence the generation was built at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_built_at_seq: Option<u64>,
+    /// How far the generation is behind the vault, in sequences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_seq_lag: Option<u64>,
+    /// Bounded delta-reconciliation budget; past it every query fails closed
+    /// with `CALYX_SEARCH_DELTA_REBASE_REQUIRED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_max_reconciled_delta_keys: Option<u64>,
+    /// Rows recall can actually reach — the largest per-slot index length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_rows_covered: Option<u64>,
+    /// Dense (ANN) lanes built. Reported separately from sparse because the two
+    /// fail independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_dense_slot_count: Option<u64>,
+    /// Sparse (BM25) lanes built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_sparse_slot_count: Option<u64>,
+    /// Age of the last build in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_age_ms: Option<u64>,
+    /// A staked rebuild-required intent, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_rebuild_required: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_remediation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vram_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

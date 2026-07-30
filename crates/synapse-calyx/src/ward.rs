@@ -806,12 +806,16 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxGuardCalibrateParams,
     ) -> Result<BTreeMap<u16, Vec<f32>>, SynapseCalyxError> {
         for (_, value) in self.scan_cf_latest(ColumnFamily::Base)? {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
+            let base = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
             })?;
-            if constellation.panel_version != panel_version || constellation.cx_id != cx_id {
+            if base.panel_version != panel_version || base.cx_id != cx_id {
                 continue;
             }
+            // The guard scores real slot vectors, which live in the per-slot CFs.
+            // A Base row decodes every slot to `Absent`, so reading them from it
+            // returned an empty slot map and the guard scored nothing (#1894).
+            let constellation = self.hydrated_constellation(base.cx_id, self.read_snapshot())?;
             let mut slots = BTreeMap::new();
             for spec in &params.slots {
                 if let Some(vector) = constellation
