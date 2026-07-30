@@ -260,6 +260,34 @@ health.ok = True        (was False)
 killed it, and the threshold that repairs it is deliberately half the threshold
 at which queries fail, so it is repaired **before** recall dies rather than after.
 
+### Edge case: it does not rebuild every tick
+
+Read 21 minutes after daemon start, i.e. after four ticks:
+
+```
+calyx_derived_state:
+  attempts=4 success=4 failure=0 skipped=0
+  last_search_action=none_needed
+  last_search_reason=seq_lag 478 is inside the refresh threshold 4096
+  last_search_elapsed_ms=11
+
+calyx_search_generation:
+  state=built built_at_seq=76112 vault_latest_seq=76644 seq_lag=532 age_ms=986867
+```
+
+```
+PASS  only the first of four ticks rebuilt; the manifest mtime and base_seq are
+      unchanged since 08:08:01Z / 76112
+PASS  a no-op tick costs 11 ms against 448 ms for the one that rebuilt
+PASS  the reason names the measured lag and the threshold it was compared against
+PASS  health.ok stayed True across all four
+```
+
+At the vault's live rate (~33 seq/min) the generation takes roughly two hours to
+reach the refresh threshold again, which is the intended amortisation: the
+maintainer is cheap when there is nothing to do and only pays the rebuild cost
+once per ~4096 sequences of drift.
+
 ---
 
 ## #1894 ask 2 — lens coverage is a named health deficiency
