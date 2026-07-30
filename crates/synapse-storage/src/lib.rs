@@ -4,6 +4,7 @@ mod backend;
 pub mod cf;
 pub mod codecs;
 pub mod constellations;
+pub mod derived_state;
 pub mod episodes;
 pub mod error;
 mod gc;
@@ -675,6 +676,42 @@ impl Db {
     #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
     pub fn spawn_checkpoint_task(&self) -> StorageResult<GcTask> {
         self.backend.spawn_checkpoint_task()
+    }
+
+    /// Spawns the unattended derived-state maintainer (#1891, #1894): keeps the
+    /// persisted search generation inside its freshness budget and republishes a
+    /// measured lens-coverage readback for `health` to raise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the selected backend cannot spawn the task.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn spawn_derived_state_task(&self) -> StorageResult<GcTask> {
+        self.backend.spawn_derived_state_task()
+    }
+
+    /// Runs one unattended search-generation maintenance decision and build.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the generation state cannot be read or a
+    /// build it decided to run fails.
+    pub fn maintain_calyx_search_generation(
+        &self,
+    ) -> StorageResult<synapse_calyx::SearchGenerationMaintenanceReport> {
+        self.backend.maintain_calyx_search_generation()
+    }
+
+    /// Measures how many lenses each registered panel's records actually carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when a panel corpus cannot be scanned.
+    pub fn measure_calyx_lens_coverage(
+        &self,
+        max_records: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxLensCoverageStatus> {
+        self.backend.measure_calyx_lens_coverage(max_records)
     }
 
     /// Returns the current DB-volume disk-pressure level.

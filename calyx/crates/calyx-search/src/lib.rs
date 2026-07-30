@@ -16,9 +16,12 @@ mod provenance;
 
 pub use engine::{
     DEFAULT_IN_REGION_GUARD_TAU, FusionChoice, FusionTuning, GuardChoice,
-    MAX_RECONCILED_DELTA_KEYS, SearchBudget, SearchFreshness, SearchOutcome, SearchSlotCache,
-    SearchSlotCacheDiagnostic, SearchTraceEvent, measure_query_vectors,
-    measure_query_vectors_with_slots, search_outcome, search_outcome_with_freshness,
+    MAX_RECONCILED_DELTA_KEYS, QUERY_SKIP_LENS_NOT_REGISTERED,
+    QUERY_SKIP_LENS_NOT_TEXT_QUERYABLE, QUERY_SKIP_NOT_SELECTED, QUERY_SKIP_SLOT_NOT_ACTIVE,
+    QUERY_SKIP_VECTOR_NOT_INDEXABLE, QueryMeasurement, QuerySlotSkip, SearchBudget,
+    SearchFreshness, SearchOutcome, SearchSlotCache, SearchSlotCacheDiagnostic, SearchTraceEvent,
+    measure_query, measure_query_vectors, measure_query_vectors_with_slots, search_outcome,
+    search_outcome_with_freshness,
     search_outcome_with_query_vectors, search_outcome_with_query_vectors_freshness,
     search_outcome_with_query_vectors_freshness_cached, search_outcome_with_slots,
     search_outcome_with_slots_traced,

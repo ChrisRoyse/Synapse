@@ -151,6 +151,19 @@ impl Registry {
         self.lenses.contains_key(&id)
     }
 
+    /// Whether a registered lens can answer a free-text query (issue #1896).
+    ///
+    /// Returns `None` when the lens id is not registered, so a caller can tell
+    /// "this lens says no" apart from "this panel references a lens this
+    /// registry does not hold" — two conditions that both produced an empty
+    /// query and one indistinguishable error before.
+    #[must_use]
+    pub fn text_queryable(&self, id: LensId) -> Option<bool> {
+        self.lenses
+            .get(&id)
+            .map(|entry| entry.lens.text_queryable())
+    }
+
     /// Finds a registered lens by its stable frozen/spec name.
     pub fn find_lens_by_name(&self, name: &str) -> Option<LensId> {
         self.lenses

@@ -415,6 +415,89 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Measures how many lenses the records of each named panel actually carry,
+    /// so an absent lens layer is reportable as a named deficiency rather than
+    /// only as a zero inside a report an operator must know to ask for
+    /// (issue #1894, ask 2).
+    ///
+    /// `abundance` already computed the alarm — `blind_spot_records = 1740` on a
+    /// panel with 1,745 constellations — and nothing raised it. The number only
+    /// appeared to whoever ran an intelligence pass by hand, which is precisely
+    /// the class of surface #1891 established should be reported by `health`
+    /// instead. This is that measurement, bounded so it can run on a periodic
+    /// maintenance tick.
+    ///
+    /// A record carrying fewer than two co-present dense lenses contributes no
+    /// within-record cross-term at all, so it is blind for every association-
+    /// derived surface: weave, abundance, bits, redundancy and kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when a panel corpus cannot be scanned or a
+    /// constellation cannot be decoded or hydrated.
+    pub fn lens_coverage_status(
+        &self,
+        panel_versions: &[u32],
+        max_records: usize,
+    ) -> Result<SynapseCalyxLensCoverageStatus, SynapseCalyxError> {
+        let max_records = max_records.clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+        let mut panels = Vec::new();
+        for panel_version in panel_versions {
+            let corpus = self.load_panel_dense_corpus(*panel_version, max_records)?;
+            // A panel with no rows at all is not a lens deficiency; it is an
+            // empty panel, and reporting it as a blind spot would raise a false
+            // alarm on every panel Synapse has registered but not yet filled.
+            if corpus.records_scanned == 0 {
+                continue;
+            }
+            let records_measured = corpus.records.len();
+            let blind_spot_records = corpus
+                .records
+                .iter()
+                .filter(|record| record.slots.len() < 2)
+                .count();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "record counts are bounded by SYNAPSE_INTELLIGENCE_MAX_RECORDS"
+            )]
+            let blind_spot_fraction = if records_measured == 0 {
+                0.0
+            } else {
+                blind_spot_records as f32 / records_measured as f32
+            };
+            panels.push(SynapseCalyxPanelLensCoverage {
+                panel_version: *panel_version,
+                records_scanned: corpus.records_scanned,
+                records_measured,
+                n_lenses: corpus.panel_dense_slots.len(),
+                dense_slots: corpus
+                    .panel_dense_slots
+                    .iter()
+                    .map(|slot| slot.get())
+                    .collect(),
+                blind_spot_records,
+                blind_spot_fraction,
+            });
+        }
+        let deficient_panels = panels
+            .iter()
+            .filter(|panel| {
+                panel.n_lenses < 2 || panel.blind_spot_fraction > SYNAPSE_LENS_BLIND_SPOT_CEILING
+            })
+            .map(|panel| panel.panel_version)
+            .collect();
+        Ok(SynapseCalyxLensCoverageStatus {
+            panels,
+            max_records_per_panel: max_records,
+            deficient_panels,
+            blind_spot_ceiling: SYNAPSE_LENS_BLIND_SPOT_CEILING,
+            measured_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+        })
+    }
+
     /// Reads back the derived-data abundance report for one panel from the
     /// physical `Base`, `XTerm`, and `Graph` CFs without re-weaving.
     ///
@@ -938,6 +1021,17 @@ pub struct SynapseCalyxAssayParams {
     pub anchor_kind: String,
     pub max_records: usize,
     pub ksg_k: usize,
+    /// Declared lens name per physical slot id, supplied by the layer that owns
+    /// the panel declarations (issue #1897).
+    ///
+    /// This crate sits below the crate that declares the Synapse panels, so it
+    /// cannot resolve "slot 29" to `syn.agent_event.error_onehot.v1` on its own,
+    /// and the vault's published panel state only covers the single *active*
+    /// panel — not the panel a redundancy pass is usually asked about. Without
+    /// this the reports could only name bare slot numbers, which is exactly the
+    /// localisation failure #1897 was filed about. An empty map is honest: every
+    /// slot is then reported as unnamed rather than guessed at.
+    pub lens_names: BTreeMap<u16, String>,
 }
 
 impl SynapseCalyxAssayParams {
@@ -948,7 +1042,24 @@ impl SynapseCalyxAssayParams {
             anchor_kind,
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             ksg_k: SYNAPSE_KSG_DEFAULT_K,
+            lens_names: BTreeMap::new(),
         }
+    }
+
+    /// Attaches the declared slot-to-lens-name catalog used to localise every
+    /// per-lens finding in the resulting report.
+    #[must_use]
+    pub fn with_lens_names(mut self, lens_names: BTreeMap<u16, String>) -> Self {
+        self.lens_names = lens_names;
+        self
+    }
+
+    /// The declared lens name for one slot, or an explicit unnamed marker.
+    fn lens_name(&self, slot: u16) -> String {
+        self.lens_names
+            .get(&slot)
+            .cloned()
+            .unwrap_or_else(|| format!("<unnamed slot {slot}>"))
     }
 }
 
@@ -972,6 +1083,16 @@ pub struct SynapseCalyxBitsReport {
     pub anchored_records: usize,
     pub distinct_outcomes: usize,
     pub total_bits: f32,
+    /// Whether the corpus could support a bits measurement at all (#1897).
+    ///
+    /// `false` means the zeros in this report are the absence of a measurement,
+    /// not a measured zero — a distinction a caller previously had to infer by
+    /// cross-reading `anchored_records`, `distinct_outcomes` and an empty
+    /// `slots` list.
+    pub measurable: bool,
+    /// Why the corpus could not support a measurement, when `measurable` is
+    /// false. Always `None` when it is true.
+    pub unmeasurable_reason: Option<String>,
     /// Assay trust tag: whether *this measurement* had enough paired samples.
     /// Distinct from `domain_provisional`, which is about anchor coverage.
     pub grounded: bool,
@@ -1015,6 +1136,45 @@ pub struct SynapseCalyxSufficiencyReport {
     pub assay_cf_rows_after: usize,
 }
 
+/// Fraction of a panel's measured records that may carry fewer than two
+/// co-present dense lenses before the panel is reported as deficient.
+///
+/// A record with fewer than two lenses contributes no within-record cross-term,
+/// so every association-derived surface is blind to it. A small tail of such
+/// records is normal — optional fields are legitimately absent on some rows —
+/// but a majority means the panel is not carrying the lens layer the
+/// intelligence stack is built on, which is the condition #1894 found reported
+/// as a silent zero.
+pub const SYNAPSE_LENS_BLIND_SPOT_CEILING: f32 = 0.5;
+
+/// Lens coverage measured over one panel's records.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxPanelLensCoverage {
+    pub panel_version: u32,
+    /// Panel rows seen in the Base scan.
+    pub records_scanned: usize,
+    /// Rows actually hydrated and measured, bounded by the pass budget.
+    pub records_measured: usize,
+    /// Distinct dense lenses the measured records carry between them.
+    pub n_lenses: usize,
+    pub dense_slots: Vec<u16>,
+    /// Measured records carrying fewer than two co-present dense lenses.
+    pub blind_spot_records: usize,
+    pub blind_spot_fraction: f32,
+}
+
+/// Lens coverage across the panels a vault carries (issue #1894, ask 2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxLensCoverageStatus {
+    pub panels: Vec<SynapseCalyxPanelLensCoverage>,
+    pub max_records_per_panel: usize,
+    /// Panels carrying fewer than two lenses, or whose blind-spot fraction is
+    /// above [`SYNAPSE_LENS_BLIND_SPOT_CEILING`].
+    pub deficient_panels: Vec<u32>,
+    pub blind_spot_ceiling: f32,
+    pub measured_at_unix_ms: Option<u64>,
+}
+
 /// One pairwise redundancy measurement between two lenses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxRedundancyPair {
@@ -1026,6 +1186,40 @@ pub struct SynapseCalyxRedundancyPair {
     pub redundant: bool,
 }
 
+/// One lens pair that could not be measured, named with the reason.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxRedundancySkip {
+    pub slot_a: u16,
+    pub slot_b: u16,
+    pub lens_a: String,
+    pub lens_b: String,
+    /// Stable reason code: `constant_column` or `insufficient_paired_samples`.
+    pub reason: String,
+    /// Which of the two slots caused it, when the reason is slot-specific.
+    pub offending_slot: Option<u16>,
+    pub detail: String,
+    pub n_paired: usize,
+}
+
+/// A lens carrying no information at all over the measured corpus.
+///
+/// A column with zero entropy cannot correlate with anything, which is why it
+/// makes every pair it participates in unmeasurable — but it is a finding in its
+/// own right, not merely the reason another report failed. Calyx's catalog
+/// already has the code for it (`CALYX_ASSAY_LOW_SIGNAL`), and the honest
+/// remediation is to park or retire the lens (issue #1897).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxLowSignalLens {
+    pub slot: u16,
+    pub lens: String,
+    pub code: String,
+    /// The single value every record projected to.
+    pub constant_value: f32,
+    pub records_observed: usize,
+    pub distinct_values: usize,
+    pub remediation: String,
+}
+
 /// Result of one Assay redundancy / effective-rank pass with Assay readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxRedundancyReport {
@@ -1033,7 +1227,19 @@ pub struct SynapseCalyxRedundancyReport {
     pub n_lenses: usize,
     pub records_scanned: usize,
     pub effective_rank: f32,
+    /// `C(n_lenses, 2)` — every pair the panel could in principle offer.
+    pub pairs_possible: usize,
     pub pairs_evaluated: usize,
+    pub pairs_skipped: usize,
+    /// Every skipped pair, named with its offending slot and reason (#1897).
+    pub skipped_details: Vec<SynapseCalyxRedundancySkip>,
+    /// The lenses the reported `effective_rank` is actually computed over, so
+    /// the number is never silently taken over a smaller set than the caller
+    /// believes it covers.
+    pub effective_rank_slots: Vec<u16>,
+    pub effective_rank_lenses: Vec<String>,
+    /// Zero-entropy lenses found while measuring, recommended for parking.
+    pub low_signal_lenses: Vec<SynapseCalyxLowSignalLens>,
     /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
     pub domain_provisional: bool,
     /// Fraction of the domain's measured records carrying a grounded anchor.
@@ -1122,11 +1328,32 @@ impl SynapseCalyxVault {
                 TrustTag::Trusted
             )
         });
-        let total_bits = slot_bits.iter().map(|(_, bits)| *bits).sum();
+        // Summing an empty set of estimates yields `-0.0` on this path, which
+        // renders as a negative zero and reads as a measurement rather than the
+        // absence of one (#1897). Normalize the sign; the magnitude is untouched.
+        let total_bits: f32 = slot_bits.iter().map(|(_, bits)| *bits).sum();
+        let total_bits = if total_bits == 0.0 { 0.0 } else { total_bits };
         // #1670: a result over an under-anchored domain may only advise. This is
         // a different property from `grounded` above, which is the assay's own
         // sample-count trust tag.
         let verdict = self.domain_grounding_verdict(params.panel_version, max_records)?;
+
+        // A zeroed report over zero anchored records is a different statement
+        // from a measured zero, and the caller should not have to infer which
+        // one it is holding by cross-reading three other fields (#1897).
+        let unmeasurable_reason = if gathered.anchored_records == 0 {
+            Some(format!(
+                "no record in the {} scanned panel row(s) carries an anchor of kind '{}', so there is nothing to measure bits about; the panel's domain grounded fraction is {:.4}",
+                corpus.records_scanned, params.anchor_kind, verdict.grounded_fraction
+            ))
+        } else if gathered.distinct_outcomes < 2 {
+            Some(format!(
+                "the {} anchored record(s) carry {} distinct outcome(s); mutual information about an outcome requires at least 2",
+                gathered.anchored_records, gathered.distinct_outcomes
+            ))
+        } else {
+            None
+        };
 
         let assay_cf_rows_after = self.persist_assay_store(&store)?;
         Ok(SynapseCalyxBitsReport {
@@ -1135,6 +1362,8 @@ impl SynapseCalyxVault {
             anchored_records: gathered.anchored_records,
             distinct_outcomes: gathered.distinct_outcomes,
             total_bits,
+            measurable: unmeasurable_reason.is_none(),
+            unmeasurable_reason,
             grounded,
             domain_provisional: verdict.provisional,
             domain_grounded_fraction: verdict.grounded_fraction,
@@ -1304,11 +1533,47 @@ impl SynapseCalyxVault {
     /// the redundancy matrix), persists redundant pairs to the Assay CF, and
     /// reads the CF back.
     ///
+    /// # Fail-closed granularity (issue #1897)
+    ///
+    /// Redundancy over `N` lenses is `C(N,2)` **independent** measurements. NMI
+    /// genuinely is undefined against a zero-entropy column, so refusing to
+    /// fabricate one is correct — but refusing at the granularity of the whole
+    /// pass discards every pair that *is* defined. On the production agent-event
+    /// panel that meant one constant lens out of seven destroyed all 21 pairs,
+    /// 15 of which were perfectly measurable.
+    ///
+    /// The boundary is therefore per pair, not per pass:
+    ///
+    /// * every pair whose two columns are non-constant and sufficiently sampled
+    ///   is measured;
+    /// * every skipped pair is reported with its reason and the exact offending
+    ///   slot and lens name, rather than vanishing;
+    /// * `effective_rank` is computed over the measurable submatrix and the
+    ///   lenses it covers are named, so the rank is never silently over a
+    ///   smaller set than the caller thinks;
+    /// * the whole pass still fails closed when pairs were possible and **none**
+    ///   was measurable — a panel of entirely dead lenses is still an error.
+    ///
+    /// This mirrors how mature statistical libraries treat degenerate columns
+    /// (pandas returns a per-pair `NaN` rather than aborting the matrix) while
+    /// improving on it: a skipped pair here carries a stated reason instead of a
+    /// silent `NaN` a caller must interpret.
+    ///
+    /// A zero-entropy lens is additionally surfaced as a named
+    /// `CALYX_ASSAY_LOW_SIGNAL` finding recommended for parking, because a lens
+    /// that carries no information about anything is a defect in the panel — not
+    /// merely the reason an unrelated report died.
+    ///
     /// # Errors
     ///
     /// Returns a structured Calyx-backed error when the corpus cannot be read,
-    /// the NMI/effective-rank math fails closed, or the Assay write/readback
-    /// fails.
+    /// the effective-rank math fails closed, no pair of a multi-lens panel is
+    /// measurable, an NMI estimate fails for a reason the pre-checks did not
+    /// classify, or the Assay write/readback fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the per-pair classification, the per-lens low-signal finding and the covered-submatrix rank are one measurement pass over one corpus; splitting them would hand each part a separately-pinned view of the sketches"
+    )]
     pub fn assay_redundancy(
         &self,
         params: &SynapseCalyxAssayParams,
@@ -1333,6 +1598,28 @@ impl SynapseCalyxVault {
         let slot_ids: Vec<SlotId> = sketches.keys().copied().collect();
         let n_lenses = slot_ids.len();
 
+        // Per-lens degeneracy is a property of the lens over the whole corpus,
+        // so it is measured once here and reported as its own finding, instead
+        // of being rediscovered inside every pair it poisons.
+        let low_signal_lenses: Vec<SynapseCalyxLowSignalLens> = slot_ids
+            .iter()
+            .filter_map(|slot| {
+                let column = &sketches[slot];
+                let stats = constant_column_stats(column)?;
+                Some(SynapseCalyxLowSignalLens {
+                    slot: slot.get(),
+                    lens: params.lens_name(slot.get()),
+                    code: "CALYX_ASSAY_LOW_SIGNAL".to_owned(),
+                    constant_value: stats.value,
+                    records_observed: stats.n,
+                    distinct_values: 1,
+                    remediation:
+                        "park or retire this lens: a zero-entropy column over the measured corpus carries no information about any outcome and cannot correlate with any other lens"
+                            .to_owned(),
+                })
+            })
+            .collect();
+
         let mut matrix = vec![vec![0.0_f32; n_lenses]; n_lenses];
         for (index, row) in matrix.iter_mut().enumerate() {
             row[index] = 1.0;
@@ -1341,20 +1628,85 @@ impl SynapseCalyxVault {
         let vault_id = self.vault_id_value();
         let seq = self.latest_seq();
         let mut redundant_pairs = Vec::new();
+        let mut skipped_details: Vec<SynapseCalyxRedundancySkip> = Vec::new();
+        let mut measured_slots: BTreeSet<SlotId> = BTreeSet::new();
         let mut pairs_evaluated = 0usize;
+        let pairs_possible = n_lenses.saturating_mul(n_lenses.saturating_sub(1)) / 2;
         for i in 0..n_lenses {
             for j in (i + 1)..n_lenses {
-                let (paired_a, paired_b) =
-                    paired_sketches(&sketches[&slot_ids[i]], &sketches[&slot_ids[j]]);
+                let (slot_a, slot_b) = (slot_ids[i], slot_ids[j]);
+                let (paired_a, paired_b) = paired_sketches(&sketches[&slot_a], &sketches[&slot_b]);
+                let mut skip = |reason: &str, offending: Option<SlotId>, detail: String| {
+                    skipped_details.push(SynapseCalyxRedundancySkip {
+                        slot_a: slot_a.get(),
+                        slot_b: slot_b.get(),
+                        lens_a: params.lens_name(slot_a.get()),
+                        lens_b: params.lens_name(slot_b.get()),
+                        reason: reason.to_owned(),
+                        offending_slot: offending.map(SlotId::get),
+                        detail,
+                        n_paired: paired_a.len(),
+                    });
+                };
                 if paired_a.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
+                    skip(
+                        "insufficient_paired_samples",
+                        None,
+                        format!(
+                            "{} record(s) carry both lenses; the estimator requires {SYNAPSE_ASSAY_MIN_SAMPLES}",
+                            paired_a.len()
+                        ),
+                        );
                     continue;
                 }
+                // Classified here rather than left to the estimator, so the
+                // failure names the offending slot and only this pair is lost.
+                if let Some(stats) = constant_slice_stats(&paired_a) {
+                    skip(
+                        "constant_column",
+                        Some(slot_a),
+                        format!(
+                            "slot {} projects to the constant value {} across all {} paired record(s), so NMI is undefined for this pair",
+                            slot_a.get(),
+                            stats.value,
+                            stats.n
+                        ),
+                    );
+                    continue;
+                }
+                if let Some(stats) = constant_slice_stats(&paired_b) {
+                    skip(
+                        "constant_column",
+                        Some(slot_b),
+                        format!(
+                            "slot {} projects to the constant value {} across all {} paired record(s), so NMI is undefined for this pair",
+                            slot_b.get(),
+                            stats.value,
+                            stats.n
+                        ),
+                    );
+                    continue;
+                }
+                // Any error surviving the pre-checks above is not an expected
+                // data property; it fails the whole pass, naming the pair.
                 let report =
                     partitioned_histogram_nmi(&paired_a, &paired_b, SYNAPSE_REDUNDANCY_NMI_BINS)
                         .map_err(|error| {
-                            loom_math_error("estimate pairwise redundancy NMI", &error)
+                            loom_math_error(
+                                &format!(
+                                    "estimate pairwise redundancy NMI for slot {} ({}) x slot {} ({}) over {} paired record(s)",
+                                    slot_a.get(),
+                                    params.lens_name(slot_a.get()),
+                                    slot_b.get(),
+                                    params.lens_name(slot_b.get()),
+                                    paired_a.len()
+                                ),
+                                &error,
+                            )
                         })?;
                 pairs_evaluated += 1;
+                measured_slots.insert(slot_a);
+                measured_slots.insert(slot_b);
                 let nmi = report.nmi.clamp(0.0, 1.0);
                 matrix[i][j] = nmi;
                 matrix[j][i] = nmi;
@@ -1368,8 +1720,8 @@ impl SynapseCalyxVault {
                             AnchorKind::Reward,
                         ),
                         AssaySubject::Pair {
-                            a: slot_ids[i],
-                            b: slot_ids[j],
+                            a: slot_a,
+                            b: slot_b,
                         },
                         MiEstimate::point(
                             report.mi_bits,
@@ -1381,8 +1733,8 @@ impl SynapseCalyxVault {
                         seq,
                     );
                     redundant_pairs.push(SynapseCalyxRedundancyPair {
-                        slot_a: slot_ids[i].get(),
-                        slot_b: slot_ids[j].get(),
+                        slot_a: slot_a.get(),
+                        slot_b: slot_b.get(),
                         nmi: report.nmi,
                         mi_bits: report.mi_bits,
                         n_samples: paired_a.len(),
@@ -1391,18 +1743,85 @@ impl SynapseCalyxVault {
                 }
             }
         }
-        let effective_rank = stable_rank(&matrix)
-            .map_err(|error| loom_math_error("compute effective rank", &error))?
-            .n_eff;
+
+        // The one place the pass is still allowed to fail wholesale: pairs were
+        // available and not one of them could be measured.
+        if pairs_possible > 0 && pairs_evaluated == 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REDUNDANCY_NO_MEASURABLE_PAIR",
+                format!(
+                    "panel {} offers {pairs_possible} lens pair(s) over {n_lenses} lens(es) and {} record(s), and none is measurable: {}",
+                    params.panel_version,
+                    corpus.records_scanned,
+                    format_redundancy_skips(&skipped_details)
+                ),
+                "park or retire the named zero-entropy lens(es), or widen the record window so enough records carry both lenses of at least one pair",
+            ));
+        }
+
+        // The rank is reported over exactly the lenses that contributed a
+        // measurement. Including a lens whose every pair was skipped would
+        // inflate the rank with a row of zeros the pass never measured.
+        let (rank_indices, effective_rank_slots): (Vec<usize>, Vec<u16>) = if pairs_possible == 0 {
+            (
+                (0..n_lenses).collect(),
+                slot_ids.iter().map(|slot| slot.get()).collect(),
+            )
+        } else {
+            slot_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| measured_slots.contains(slot))
+                .map(|(index, slot)| (index, slot.get()))
+                .unzip()
+        };
+        let submatrix: Vec<Vec<f32>> = rank_indices
+            .iter()
+            .map(|row| rank_indices.iter().map(|col| matrix[*row][*col]).collect())
+            .collect();
+        let effective_rank = if submatrix.is_empty() {
+            0.0
+        } else {
+            stable_rank(&submatrix)
+                .map_err(|error| loom_math_error("compute effective rank", &error))?
+                .n_eff
+        };
+        let effective_rank_lenses = effective_rank_slots
+            .iter()
+            .map(|slot| params.lens_name(*slot))
+            .collect();
         // #1670 control-doctrine marker for the domain this rank was read over.
         let verdict = self.domain_grounding_verdict(params.panel_version, max_records)?;
         let assay_cf_rows_after = self.persist_assay_store(&store)?;
+        if !skipped_details.is_empty() || !low_signal_lenses.is_empty() {
+            tracing::warn!(
+                code = "SYNAPSE_CALYX_REDUNDANCY_PARTIAL",
+                panel_version = params.panel_version,
+                pairs_possible,
+                pairs_evaluated,
+                pairs_skipped = skipped_details.len(),
+                low_signal_lens_count = low_signal_lenses.len(),
+                low_signal_lenses = %low_signal_lenses
+                    .iter()
+                    .map(|lens| format!("slot {} ({})", lens.slot, lens.lens))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                skipped = %format_redundancy_skips(&skipped_details),
+                "redundancy measured the defined pairs and reported the rest by name"
+            );
+        }
         Ok(SynapseCalyxRedundancyReport {
             panel_version: params.panel_version,
             n_lenses,
             records_scanned: corpus.records_scanned,
             effective_rank,
+            pairs_possible,
             pairs_evaluated,
+            pairs_skipped: skipped_details.len(),
+            skipped_details,
+            effective_rank_slots,
+            effective_rank_lenses,
+            low_signal_lenses,
             domain_provisional: verdict.provisional,
             domain_grounded_fraction: verdict.grounded_fraction,
             redundant_pairs,
@@ -1695,6 +2114,76 @@ fn mark_sole_carriers(slots: &mut [SynapseCalyxSlotBits], attributions: &[SlotAt
             entry.sole_carrier = attribution.sole_carrier;
         }
     }
+}
+
+/// The observed constant value of a degenerate column, and how many records it
+/// was observed over.
+struct ConstantColumn {
+    value: f32,
+    n: usize,
+}
+
+/// Classifies a whole lens column as constant, for the per-lens low-signal
+/// finding (#1897). An empty column is not "constant" — it is unobserved.
+#[allow(
+    clippy::float_cmp,
+    reason = "zero entropy is exact equality, not approximate: a column whose values differ by any representable amount carries information, and an epsilon here would discard a real, measurable lens as degenerate"
+)]
+fn constant_column_stats(column: &BTreeMap<usize, f32>) -> Option<ConstantColumn> {
+    let mut values = column.values();
+    let first = *values.next()?;
+    values
+        .all(|value| *value == first)
+        .then_some(ConstantColumn {
+            value: first,
+            n: column.len(),
+        })
+}
+
+/// Classifies one side of an already-paired sample as constant.
+///
+/// This is checked on the *paired* slice rather than the full column because a
+/// lens can be non-constant panel-wide yet constant across the exact records it
+/// shares with the other lens — and it is that intersection the estimator sees.
+#[allow(
+    clippy::float_cmp,
+    reason = "zero entropy is exact equality; see constant_column_stats"
+)]
+fn constant_slice_stats(values: &[f32]) -> Option<ConstantColumn> {
+    let first = *values.first()?;
+    values
+        .iter()
+        .all(|value| *value == first)
+        .then_some(ConstantColumn {
+            value: first,
+            n: values.len(),
+        })
+}
+
+/// Renders skipped pairs into one operator-readable line that always names the
+/// offending slot and its lens.
+fn format_redundancy_skips(skips: &[SynapseCalyxRedundancySkip]) -> String {
+    if skips.is_empty() {
+        return "none".to_owned();
+    }
+    skips
+        .iter()
+        .map(|skip| {
+            format!(
+                "[{}({}) x {}({}) reason={} offending_slot={} n_paired={} {}]",
+                skip.slot_a,
+                skip.lens_a,
+                skip.slot_b,
+                skip.lens_b,
+                skip.reason,
+                skip.offending_slot
+                    .map_or_else(|| "none".to_owned(), |slot| slot.to_string()),
+                skip.n_paired,
+                skip.detail
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn paired_sketches(a: &BTreeMap<usize, f32>, b: &BTreeMap<usize, f32>) -> (Vec<f32>, Vec<f32>) {

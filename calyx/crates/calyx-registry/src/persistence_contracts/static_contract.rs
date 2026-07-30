@@ -75,6 +75,30 @@ pub fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensCo
     }
 }
 
+/// Whether a persisted lens can answer a free-text query, decided from its
+/// persisted [`LensSpec`] alone — without constructing a runtime (issue #1896).
+///
+/// The search query gate runs against a registry rebuilt lazily from the vault's
+/// persisted registry snapshot, so the lens objects it holds are thin
+/// placeholders that have not loaded (and must not be forced to load) their
+/// runtime just to answer "could this lens answer text?". The spec's runtime
+/// declaration already names the exact encoder, so the answer is derivable from
+/// bytes that are already on disk.
+///
+/// Non-algorithmic runtimes fall back to the historical modality gate, so this
+/// preserves the previous behaviour for every model-backed text lens.
+#[must_use]
+pub fn spec_text_queryable(spec: &LensSpec) -> bool {
+    if spec.modality == Modality::Text {
+        return true;
+    }
+    match &spec.runtime {
+        LensRuntime::Algorithmic { kind } => algorithmic_encoder(kind, spec.output)
+            .is_some_and(AlgorithmicEncoder::accepts_free_text),
+        _ => false,
+    }
+}
+
 fn algorithmic_contract(spec: &LensSpec, kind: &str) -> Result<FrozenLensContract> {
     let encoder = algorithmic_encoder(kind, spec.output).ok_or_else(|| {
         lens_config_invalid(format!(

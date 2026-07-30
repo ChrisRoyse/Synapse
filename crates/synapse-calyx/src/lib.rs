@@ -119,15 +119,17 @@ pub use intelligence::{
     SYNAPSE_KERNEL_DEFAULT_MAX_HOPS, SYNAPSE_KERNEL_DEFAULT_MIN_RECALL,
     SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
     SYNAPSE_KSG_DEFAULT_K, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS, SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG,
-    SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS, SynapseCalyxAbundanceReport,
-    SynapseCalyxAgreementEdge, SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge,
-    SynapseCalyxBitsReport, SynapseCalyxCausalityLag, SynapseCalyxCausalityReport,
-    SynapseCalyxDriftReport, SynapseCalyxHazardReport, SynapseCalyxKernelAnswerHop,
-    SynapseCalyxKernelAnswerReport, SynapseCalyxKernelParams, SynapseCalyxKernelReport,
-    SynapseCalyxNeffEstimate, SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak,
-    SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport, SynapseCalyxSlotBits,
-    SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams,
-    SynapseCalyxWeaveBlindSpotPair, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    SYNAPSE_LENS_BLIND_SPOT_CEILING, SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS,
+    SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxAssayParams,
+    SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport, SynapseCalyxCausalityLag,
+    SynapseCalyxCausalityReport, SynapseCalyxDriftReport, SynapseCalyxHazardReport,
+    SynapseCalyxKernelAnswerHop, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelParams,
+    SynapseCalyxKernelReport, SynapseCalyxLensCoverageStatus, SynapseCalyxLowSignalLens,
+    SynapseCalyxNeffEstimate, SynapseCalyxPanelLensCoverage, SynapseCalyxPeriodicityReport,
+    SynapseCalyxPeriodogramPeak, SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport,
+    SynapseCalyxRedundancySkip, SynapseCalyxSlotBits, SynapseCalyxSufficiencyDeficit,
+    SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams, SynapseCalyxWeaveBlindSpotPair,
+    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
@@ -467,6 +469,89 @@ fn classify_search_generation(
         );
     }
     ("built", "none")
+}
+
+/// How far the persisted search generation is allowed to fall behind the vault
+/// before the unattended maintainer refreshes it (issue #1891, ask 2).
+///
+/// This is deliberately **below** [`calyx_search::MAX_RECONCILED_DELTA_KEYS`],
+/// which is the point at which a query *dies* with
+/// `CALYX_SEARCH_DELTA_REBASE_REQUIRED`. Reusing the query-tolerance limit as
+/// the maintenance trigger would mean the generation is only ever repaired
+/// after recall has already failed. Keeping the consolidation threshold
+/// separate from, and stricter than, the query-time limit is the standard shape
+/// for incrementally-maintained retrieval indexes — Postgres BM25 extensions
+/// separate `auto_rebuild_threshold` from their query overlay budget, and
+/// FreshDiskANN-style engines consolidate at a pending fraction of the base
+/// rather than at the point of failure.
+///
+/// Half the limit gives the maintainer a full budget's worth of headroom: even
+/// if a refresh fails and the next tick is a whole cadence away, the generation
+/// is still inside the range where queries can reconcile.
+pub const SEARCH_GENERATION_REFRESH_SEQ_LAG: u64 =
+    (calyx_search::MAX_RECONCILED_DELTA_KEYS as u64) / 2;
+
+/// Minimum wall-clock gap between two unattended generation builds.
+///
+/// A rebuild republishes the whole generation, so a busy write stream could
+/// otherwise drive back-to-back rebuilds and spend the maintenance budget on
+/// nothing else. This is the same "background naptime" bound managed vector
+/// stores expose for automatic index maintenance. It does not weaken the
+/// freshness guarantee: the seq-lag threshold above leaves a full budget of
+/// headroom, so one skipped cadence cannot push the generation past the point
+/// where queries fail.
+pub const SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+/// What the unattended maintainer decided to do about the search generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchGenerationMaintenanceAction {
+    /// No generation existed. Building one replaces nothing, so it is not a
+    /// destructive maintenance mutation (issue #1891, ask 3).
+    InitialBuild,
+    /// A generation existed and was republished because it had drifted past
+    /// [`SEARCH_GENERATION_REFRESH_SEQ_LAG`] or carried a staked
+    /// rebuild-required marker. This one *does* replace a live artifact.
+    RefreshOverExisting,
+    /// The generation is inside its freshness budget; nothing was written.
+    NoneNeeded,
+    /// A build was due but was held back by
+    /// [`SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS`].
+    DeferredByInterval,
+    /// No active durable panel is published, so no generation can exist yet.
+    NoActivePanel,
+}
+
+impl SearchGenerationMaintenanceAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialBuild => "initial_build",
+            Self::RefreshOverExisting => "refresh_over_existing",
+            Self::NoneNeeded => "none_needed",
+            Self::DeferredByInterval => "deferred_by_interval",
+            Self::NoActivePanel => "no_active_panel",
+        }
+    }
+
+    /// Whether this action replaced a live artifact rather than creating a
+    /// first one. The two are gated differently on purpose (#1891 ask 3).
+    #[must_use]
+    pub const fn is_destructive(self) -> bool {
+        matches!(self, Self::RefreshOverExisting)
+    }
+}
+
+/// One unattended search-generation maintenance pass, with the state read back
+/// from disk after the work rather than assumed from the return of the build.
+#[derive(Clone, Debug)]
+pub struct SearchGenerationMaintenanceReport {
+    pub action: SearchGenerationMaintenanceAction,
+    pub reason: String,
+    /// Generation state observed before the pass decided anything.
+    pub before: SynapseCalyxSearchGenerationStatus,
+    /// Generation state re-read from disk after the pass, when it built.
+    pub after: Option<SynapseCalyxSearchGenerationStatus>,
+    pub elapsed_ms: u64,
 }
 
 /// Classifies a persisted-index kind into the retrieval lane it serves.
@@ -2883,6 +2968,175 @@ impl SynapseCalyxVault {
             rebuild_required,
             state: state.to_owned(),
             remediation: remediation.to_owned(),
+        })
+    }
+
+    /// Keeps the persisted search generation inside its freshness budget,
+    /// unattended (issue #1891, ask 2).
+    ///
+    /// Before this, the generation could only ever be created or repaired by a
+    /// human-driven break-glass ceremony. On the production vault that ceremony
+    /// had run exactly once: the generation was built at seq 55908 and then
+    /// silently allowed to expire, drifting 13,685 sequences past the bounded
+    /// reconciliation limit of 8,192 — so every recall query failed closed and
+    /// nothing brought it back. An always-on capability whose only repair is a
+    /// manual ceremony is off by default, forever.
+    ///
+    /// The two builds are classified separately, because they are not the same
+    /// operation (ask 3): an **initial build** over an absent generation
+    /// replaces nothing and is non-destructive, whereas a **refresh over an
+    /// existing generation** republishes a live artifact. Both are admitted
+    /// here, but they are reported and logged distinctly so the destructive one
+    /// is never mistaken for the harmless one in an audit.
+    ///
+    /// The pass is triple-bounded so it can run on a periodic tick without
+    /// becoming the thing that starves the vault:
+    ///
+    /// * it does nothing at all while the seq lag is inside
+    ///   [`SEARCH_GENERATION_REFRESH_SEQ_LAG`],
+    ///   which is half the query-time reconciliation limit, so the generation is
+    ///   refreshed *before* recall dies rather than after;
+    /// * it refuses to build twice inside
+    ///   [`SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS`];
+    /// * it never builds when no active durable panel is published, because
+    ///   there is nothing to build against.
+    ///
+    /// The result is verified by re-reading the generation state off disk after
+    /// the build, not by trusting the build's own return value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the generation state cannot be read, or
+    /// when a build it decided to run fails. It does not error merely because
+    /// no build was needed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the decision and its five named outcomes are one policy; splitting them would separate a branch from the state it was decided against, which is exactly how the generation was allowed to expire unobserved"
+    )]
+    pub fn maintain_search_generation(
+        &self,
+    ) -> Result<SearchGenerationMaintenanceReport, SynapseCalyxError> {
+        let started = std::time::Instant::now();
+        let before = self.search_generation_status()?;
+        let elapsed = |started: std::time::Instant| {
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        };
+
+        let Some(panel_version) = before.panel_version else {
+            return Ok(SearchGenerationMaintenanceReport {
+                action: SearchGenerationMaintenanceAction::NoActivePanel,
+                reason: before
+                    .panel_state_error
+                    .clone()
+                    .unwrap_or_else(|| "no active durable panel is published".to_owned()),
+                before,
+                after: None,
+                elapsed_ms: elapsed(started),
+            });
+        };
+
+        let seq_lag = before.seq_lag.unwrap_or(u64::MAX);
+        let (action, reason) = if !before.manifest_present || before.built_at_seq.is_none() {
+            (
+                SearchGenerationMaintenanceAction::InitialBuild,
+                format!(
+                    "no usable generation exists for panel {panel_version} (manifest_present={}), and building a first one replaces nothing",
+                    before.manifest_present
+                ),
+            )
+        } else if before.rebuild_required.is_some() {
+            (
+                SearchGenerationMaintenanceAction::RefreshOverExisting,
+                format!(
+                    "a mutation staked a rebuild-required intent: {}",
+                    before.rebuild_required.as_deref().unwrap_or("unknown")
+                ),
+            )
+        } else if seq_lag > SEARCH_GENERATION_REFRESH_SEQ_LAG {
+            (
+                SearchGenerationMaintenanceAction::RefreshOverExisting,
+                format!(
+                    "seq_lag {seq_lag} exceeds the refresh threshold {SEARCH_GENERATION_REFRESH_SEQ_LAG} (half the query-time reconciliation limit {})",
+                    before.max_reconciled_delta_keys
+                ),
+            )
+        } else {
+            (
+                SearchGenerationMaintenanceAction::NoneNeeded,
+                format!(
+                    "seq_lag {seq_lag} is inside the refresh threshold {SEARCH_GENERATION_REFRESH_SEQ_LAG}"
+                ),
+            )
+        };
+
+        if action == SearchGenerationMaintenanceAction::NoneNeeded {
+            return Ok(SearchGenerationMaintenanceReport {
+                action,
+                reason,
+                before,
+                after: None,
+                elapsed_ms: elapsed(started),
+            });
+        }
+
+        // The naptime bound. An absent generation is exempt: there is no live
+        // artifact to protect, and holding recall off for ten minutes to
+        // rate-limit a build that replaces nothing would be the wrong trade.
+        if action == SearchGenerationMaintenanceAction::RefreshOverExisting
+            && before
+                .age_ms
+                .is_some_and(|age| age < SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS)
+        {
+            return Ok(SearchGenerationMaintenanceReport {
+                action: SearchGenerationMaintenanceAction::DeferredByInterval,
+                reason: format!(
+                    "{reason}, but the current generation is only {}ms old and the minimum unattended rebuild interval is {SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS}ms",
+                    before.age_ms.unwrap_or_default()
+                ),
+                before,
+                after: None,
+                elapsed_ms: elapsed(started),
+            });
+        }
+
+        tracing::info!(
+            code = "SYNAPSE_CALYX_SEARCH_GENERATION_MAINTENANCE_STARTED",
+            panel_version,
+            action = action.as_str(),
+            destructive = action.is_destructive(),
+            reason = %reason,
+            before_state = %before.state,
+            before_built_at_seq = ?before.built_at_seq,
+            vault_latest_seq = before.vault_latest_seq,
+            seq_lag = ?before.seq_lag,
+            refresh_threshold = SEARCH_GENERATION_REFRESH_SEQ_LAG,
+            "building the persisted search generation unattended"
+        );
+        self.rebuild_search_indexes(panel_version)?;
+
+        // Source of truth is the manifest on disk, re-read independently of the
+        // build that just claimed to write it.
+        let after = self.search_generation_status()?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_SEARCH_GENERATION_MAINTENANCE_COMMITTED",
+            panel_version,
+            action = action.as_str(),
+            destructive = action.is_destructive(),
+            after_state = %after.state,
+            after_built_at_seq = ?after.built_at_seq,
+            after_seq_lag = ?after.seq_lag,
+            after_rows_covered = ?after.rows_covered,
+            after_dense_lanes = after.dense_slot_count,
+            after_sparse_lanes = after.sparse_slot_count,
+            elapsed_ms = elapsed(started),
+            "persisted search generation rebuilt unattended and re-read from disk"
+        );
+        Ok(SearchGenerationMaintenanceReport {
+            action,
+            reason,
+            before,
+            after: Some(after),
+            elapsed_ms: elapsed(started),
         })
     }
 

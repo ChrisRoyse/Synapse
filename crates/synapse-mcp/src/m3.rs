@@ -310,6 +310,10 @@ pub struct M3State {
     /// Checkpoint-only maintenance task (2026-07-23 cold-start fix): bounds
     /// the crash-stranded WAL tail to ~30s of commits.
     pub storage_checkpoint_task: Option<GcTask>,
+    /// Unattended derived-state maintainer (#1891, #1894): keeps the persisted
+    /// search generation inside its freshness budget and republishes the
+    /// measured lens-coverage readback that `health` raises.
+    pub storage_derived_state_task: Option<GcTask>,
     pub storage_pressure_task: Option<PressureTask>,
     pub storage_last_error: Option<String>,
     pub storage_maintenance_unsupported: Option<String>,
@@ -351,6 +355,7 @@ pub struct StorageMaintenanceShutdownReadback {
     pub gc_owner_present: bool,
     pub checkpoint_owner_present: bool,
     pub pressure_owner_present: bool,
+    pub derived_state_owner_present: bool,
     pub owners_quiescent: bool,
     pub failures: Vec<String>,
 }
@@ -366,6 +371,7 @@ impl StorageMaintenanceShutdownReadback {
         usize::from(self.gc_owner_present)
             + usize::from(self.checkpoint_owner_present)
             + usize::from(self.pressure_owner_present)
+            + usize::from(self.derived_state_owner_present)
     }
 
     pub fn verdict(&self) -> Result<()> {
@@ -393,11 +399,12 @@ pub async fn shutdown_storage_maintenance_tasks(
     state: &SharedM3State,
     reason: &'static str,
 ) -> StorageMaintenanceShutdownReadback {
-    let (gc_task, checkpoint_task, pressure_task) = match state.lock() {
+    let (gc_task, checkpoint_task, pressure_task, derived_state_task) = match state.lock() {
         Ok(mut state) => (
             state.storage_gc_task.take(),
             state.storage_checkpoint_task.take(),
             state.storage_pressure_task.take(),
+            state.storage_derived_state_task.take(),
         ),
         Err(poisoned) => {
             let detail = format!(
@@ -409,6 +416,7 @@ pub async fn shutdown_storage_maintenance_tasks(
                 gc_owner_present: false,
                 checkpoint_owner_present: false,
                 pressure_owner_present: false,
+                derived_state_owner_present: false,
                 owners_quiescent: false,
                 failures: vec![detail],
             };
@@ -424,6 +432,7 @@ pub async fn shutdown_storage_maintenance_tasks(
     let gc_owner_present = gc_task.is_some();
     let checkpoint_owner_present = checkpoint_task.is_some();
     let pressure_owner_present = pressure_task.is_some();
+    let derived_state_owner_present = derived_state_task.is_some();
     let gc_shutdown = async move {
         match gc_task {
             Some(task) => task.shutdown("garbage_collection").await.err(),
@@ -442,12 +451,26 @@ pub async fn shutdown_storage_maintenance_tasks(
             None => None,
         }
     };
-    let (gc_error, checkpoint_error, pressure_error) =
-        tokio::join!(gc_shutdown, checkpoint_shutdown, pressure_shutdown);
+    // The derived-state maintainer holds the vault through the same admitted
+    // blocking pass as GC, so it must be quiesced before the vault closes for
+    // exactly the same reason (#1891).
+    let derived_state_shutdown = async move {
+        match derived_state_task {
+            Some(task) => task.shutdown("derived_state").await.err(),
+            None => None,
+        }
+    };
+    let (gc_error, checkpoint_error, pressure_error, derived_state_error) = tokio::join!(
+        gc_shutdown,
+        checkpoint_shutdown,
+        pressure_shutdown,
+        derived_state_shutdown
+    );
     let failures = [
         gc_error.map(|error| format!("garbage_collection: {error}")),
         checkpoint_error.map(|error| format!("checkpoint: {error}")),
         pressure_error.map(|error| format!("disk_pressure: {error}")),
+        derived_state_error.map(|error| format!("derived_state: {error}")),
     ]
     .into_iter()
     .flatten()
@@ -459,6 +482,7 @@ pub async fn shutdown_storage_maintenance_tasks(
         gc_owner_present,
         checkpoint_owner_present,
         pressure_owner_present,
+        derived_state_owner_present,
         owners_quiescent: true,
         failures,
     };
@@ -665,6 +689,7 @@ impl M3State {
             db: None,
             storage_gc_task: None,
             storage_checkpoint_task: None,
+            storage_derived_state_task: None,
             storage_pressure_task: None,
             storage_last_error: None,
             storage_maintenance_unsupported: None,
@@ -822,6 +847,11 @@ impl M3State {
         // consumes, and it reads the vault through this handle. Register before
         // the first pass can run so no pass is skipped for want of a source.
         synapse_storage::maintenance::register_lowering_source(&db);
+        // Same discipline for the derived-state maintainer (#1891, #1894): the
+        // pass reads the vault through this handle, so registering it before the
+        // first tick is what keeps the search generation and the lens-coverage
+        // readback from being skipped for want of a source.
+        synapse_storage::derived_state::register_derived_state_source(&db);
         self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
@@ -863,6 +893,18 @@ impl M3State {
                 Err(error) => {
                     self.storage_last_error =
                         Some(format!("storage checkpoint task start: {error}"));
+                    return Err(error);
+                }
+            }
+        }
+        if self.storage_derived_state_task.is_none() {
+            match db.spawn_derived_state_task() {
+                Ok(task) => {
+                    self.storage_derived_state_task = Some(task);
+                }
+                Err(error) => {
+                    self.storage_last_error =
+                        Some(format!("storage derived-state task start: {error}"));
                     return Err(error);
                 }
             }

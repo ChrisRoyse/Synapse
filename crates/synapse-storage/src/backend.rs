@@ -452,6 +452,14 @@ pub trait StorageBackend: Send + Sync {
     ) -> StorageResult<gc::GcReport>;
     fn spawn_gc_task(&self) -> StorageResult<gc::GcTask>;
     fn spawn_checkpoint_task(&self) -> StorageResult<gc::GcTask>;
+    fn spawn_derived_state_task(&self) -> StorageResult<gc::GcTask>;
+    fn maintain_calyx_search_generation(
+        &self,
+    ) -> StorageResult<synapse_calyx::SearchGenerationMaintenanceReport>;
+    fn measure_calyx_lens_coverage(
+        &self,
+        max_records: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxLensCoverageStatus>;
     fn pressure_level(&self) -> pressure::DiskPressureLevel;
     fn pressure_permits_write(&self, cf_name: &str) -> bool;
     fn pressure_transition_codes(&self) -> StorageResult<Vec<&'static str>>;
@@ -1500,6 +1508,21 @@ impl pressure::PressureMaintenance for CalyxPressureMaintenance {
 /// interval (~20k sequences observed, replaying for minutes on every boot).
 /// Checkpointing writes only the batches staged since the previous flush plus
 /// one manifest publish — it never scans catalogs or compacts.
+/// Drives the unattended derived-state maintainer on its own cadence.
+///
+/// It carries no vault handle of its own: the pass reads the registered process
+/// storage handle through a `Weak`, exactly like the guard-threshold lowering
+/// publisher, so a closed vault is observed as a recorded skip rather than kept
+/// alive by the scheduler.
+struct CalyxDerivedStateRunner;
+
+impl gc::GcRunner for CalyxDerivedStateRunner {
+    fn run_once(&self) -> StorageResult<gc::GcReport> {
+        crate::derived_state::run_derived_state_maintenance();
+        Ok(gc::GcReport::default())
+    }
+}
+
 struct CalyxCheckpointRunner {
     vault: Arc<CalyxVaultRuntime>,
 }
@@ -1891,6 +1914,64 @@ impl StorageBackend for CalyxBackend {
             Arc::new(CalyxCheckpointRunner::new(Arc::clone(&self.vault))),
             CALYX_CHECKPOINT_INTERVAL,
             gc::MaintenanceTaskKind::Checkpoint,
+        )
+    }
+
+    fn spawn_derived_state_task(&self) -> StorageResult<gc::GcTask> {
+        gc::spawn_runner(
+            Arc::new(CalyxDerivedStateRunner),
+            crate::derived_state::DERIVED_STATE_INTERVAL,
+            gc::MaintenanceTaskKind::DerivedState,
+        )
+    }
+
+    fn maintain_calyx_search_generation(
+        &self,
+    ) -> StorageResult<synapse_calyx::SearchGenerationMaintenanceReport> {
+        self.vault.with_vault(
+            "calyx_search_generation",
+            "maintain the persisted Calyx search generation",
+            true,
+            |vault| {
+                vault.maintain_search_generation().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_search_generation",
+                        "maintain the persisted Calyx search generation",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn measure_calyx_lens_coverage(
+        &self,
+        max_records: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxLensCoverageStatus> {
+        // The panels Synapse registers and writes rows to. Measured together so
+        // one panel losing its lens layer is visible next to the panels that
+        // still carry theirs (#1894).
+        const PANELS: [u32; 4] = [
+            SYN_TIMELINE_PANEL_VERSION,
+            SYN_EPISODE_PANEL_VERSION,
+            SYN_AGENT_EVENT_PANEL_VERSION,
+            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        ];
+        self.vault.with_vault(
+            "calyx_lens_coverage",
+            "measure Calyx panel lens coverage",
+            true,
+            |vault| {
+                vault
+                    .lens_coverage_status(&PANELS, max_records)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_lens_coverage",
+                            "measure Calyx panel lens coverage",
+                            &source,
+                        )
+                    })
+            },
         )
     }
 

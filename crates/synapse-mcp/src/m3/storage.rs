@@ -940,6 +940,12 @@ pub struct StorageIntelligenceBitsReport {
     pub anchored_records: u64,
     pub distinct_outcomes: u64,
     pub total_bits: f32,
+    /// False when the zeros in this report are the absence of a measurement
+    /// rather than a measured zero (#1897).
+    pub measurable: bool,
+    /// Why nothing could be measured, when `measurable` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmeasurable_reason: Option<String>,
     /// Assay sample-count trust tag for this measurement.
     pub grounded: bool,
     /// #1670 control-doctrine marker: the domain's grounded anchor coverage is
@@ -992,6 +998,35 @@ pub struct StorageIntelligenceRedundancyPair {
     pub redundant: bool,
 }
 
+/// One lens pair the redundancy pass could not measure, named with its reason
+/// and the exact offending slot (#1897).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceRedundancySkip {
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub lens_a: String,
+    pub lens_b: String,
+    pub reason: String,
+    pub offending_slot: Option<u32>,
+    pub detail: String,
+    pub n_paired: u64,
+}
+
+/// A zero-entropy lens found while measuring redundancy: it carries no
+/// information about anything and is recommended for parking (#1897).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceLowSignalLens {
+    pub slot: u32,
+    pub lens: String,
+    pub code: String,
+    pub constant_value: f32,
+    pub records_observed: u64,
+    pub distinct_values: u64,
+    pub remediation: String,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceRedundancyReport {
@@ -1000,7 +1035,16 @@ pub struct StorageIntelligenceRedundancyReport {
     pub n_lenses: u64,
     pub records_scanned: u64,
     pub effective_rank: f32,
+    /// `C(n_lenses, 2)`: every pair the panel could in principle offer.
+    pub pairs_possible: u64,
     pub pairs_evaluated: u64,
+    pub pairs_skipped: u64,
+    pub skipped_details: Vec<StorageIntelligenceRedundancySkip>,
+    /// The lenses `effective_rank` was actually computed over, named, so the
+    /// rank is never read as covering more lenses than it measured.
+    pub effective_rank_slots: Vec<u32>,
+    pub effective_rank_lenses: Vec<String>,
+    pub low_signal_lenses: Vec<StorageIntelligenceLowSignalLens>,
     /// #1670 control-doctrine marker: domain anchor coverage below the floor.
     pub domain_provisional: bool,
     pub domain_grounded_fraction: f32,
@@ -1845,7 +1889,8 @@ fn assay_params(
             )
         })?;
     let mut assay =
-        synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, anchor_kind.to_owned());
+        synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, anchor_kind.to_owned())
+            .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
     assay.max_records = clamp_intelligence_records(params.max_records);
     if let Some(ksg_k) = params.ksg_k {
         assay.ksg_k = ksg_k as usize;
@@ -1869,6 +1914,8 @@ pub fn run_intelligence_bits(
         anchored_records: report.anchored_records as u64,
         distinct_outcomes: report.distinct_outcomes as u64,
         total_bits: report.total_bits,
+        measurable: report.measurable,
+        unmeasurable_reason: report.unmeasurable_reason,
         grounded: report.grounded,
         domain_provisional: report.domain_provisional,
         domain_grounded_fraction: report.domain_grounded_fraction,
@@ -1930,8 +1977,8 @@ pub fn run_intelligence_redundancy(
     db: &synapse_storage::Db,
     params: &StorageIntelligenceParams,
 ) -> Result<StorageIntelligenceRedundancyReport, ErrorData> {
-    let mut assay =
-        synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, String::new());
+    let mut assay = synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, String::new())
+        .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
     assay.max_records = clamp_intelligence_records(params.max_records);
     let report = db
         .assay_redundancy_intelligence(&assay)
@@ -1942,7 +1989,42 @@ pub fn run_intelligence_redundancy(
         n_lenses: report.n_lenses as u64,
         records_scanned: report.records_scanned as u64,
         effective_rank: report.effective_rank,
+        pairs_possible: report.pairs_possible as u64,
         pairs_evaluated: report.pairs_evaluated as u64,
+        pairs_skipped: report.pairs_skipped as u64,
+        skipped_details: report
+            .skipped_details
+            .into_iter()
+            .map(|skip| StorageIntelligenceRedundancySkip {
+                slot_a: u32::from(skip.slot_a),
+                slot_b: u32::from(skip.slot_b),
+                lens_a: skip.lens_a,
+                lens_b: skip.lens_b,
+                reason: skip.reason,
+                offending_slot: skip.offending_slot.map(u32::from),
+                detail: skip.detail,
+                n_paired: skip.n_paired as u64,
+            })
+            .collect(),
+        effective_rank_slots: report
+            .effective_rank_slots
+            .into_iter()
+            .map(u32::from)
+            .collect(),
+        effective_rank_lenses: report.effective_rank_lenses,
+        low_signal_lenses: report
+            .low_signal_lenses
+            .into_iter()
+            .map(|lens| StorageIntelligenceLowSignalLens {
+                slot: u32::from(lens.slot),
+                lens: lens.lens,
+                code: lens.code,
+                constant_value: lens.constant_value,
+                records_observed: lens.records_observed as u64,
+                distinct_values: lens.distinct_values as u64,
+                remediation: lens.remediation,
+            })
+            .collect(),
         domain_provisional: report.domain_provisional,
         domain_grounded_fraction: report.domain_grounded_fraction,
         redundant_pairs: report

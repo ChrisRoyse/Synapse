@@ -172,6 +172,77 @@ impl AlgorithmicEncoder {
         }
     }
 
+    /// Whether measuring a free-text query string through this encoder produces
+    /// a vector comparable to the vectors it produced at ingest (issue #1896).
+    ///
+    /// This is the declared, per-encoder answer to "is this lens text-queryable?"
+    /// that the coarse [`Modality`] tag cannot give. It is true exactly for the
+    /// encoders whose input *is* a string of words or an opaque byte string —
+    /// the lexical lanes a text query is meant to probe — and false for every
+    /// encoder whose input is a number, a timestamp, or a value drawn from a
+    /// closed vocabulary, because measuring a phrase through those either fails
+    /// outright (the numeric encoders reject non-numeric bytes) or silently
+    /// hashes the phrase into a bucket and reports a confident false match (the
+    /// one-hot encoders).
+    ///
+    /// The GDELT encoders are `false` here: they parse a fixed GDELT row layout,
+    /// not a phrase. They are declared `Modality::Text` and stay reachable
+    /// through the modality arm of [`AlgorithmicLens::text_queryable`], so this
+    /// classification cannot narrow existing recall — it only widens it to the
+    /// structured-tagged text encoders that were previously unreachable.
+    pub const fn accepts_free_text(self) -> bool {
+        match self {
+            // Word-token lanes: the query is tokenized and hashed by exactly the
+            // same code that tokenized and hashed the stored text.
+            Self::SparseKeywords { .. }
+            | Self::TokenHash { .. }
+            | Self::SynSparseText { .. }
+            | Self::SynTokenSlots { .. }
+            | Self::SynMultiHot { .. }
+            // Whole-string lanes: the query hashes to the same cell as an
+            // identical stored string, which is exact-match recall.
+            | Self::SynHash { .. }
+            // Character/byte-shape lanes over arbitrary text.
+            | Self::ByteFeatures
+            | Self::AstStyle => true,
+            // Closed vocabularies: an out-of-vocabulary phrase still lands in a
+            // bucket, so a match here would be fabricated, not measured.
+            Self::OneHot { .. }
+            | Self::SynOneHot { .. }
+            // Numeric, temporal and derived-statistic encoders: a phrase is not
+            // one of their inputs.
+            | Self::Scalar
+            | Self::SynCyclicTime { .. }
+            | Self::SynScalarRaw
+            | Self::SynScalarLog1p
+            | Self::SynScalarZScore { .. }
+            | Self::SynScalarRank { .. }
+            | Self::SynRecordVector { .. }
+            | Self::SynBin { .. }
+            | Self::SynOrdinal { .. }
+            | Self::SynFrequency { .. }
+            | Self::SynTargetMean { .. }
+            | Self::SynDelta { .. }
+            | Self::SynRate { .. }
+            | Self::SynCross { .. }
+            | Self::SynAggregation { .. }
+            // Fixed-layout GDELT row parsers, reachable via their Text modality.
+            | Self::GdeltCameo
+            | Self::GdeltActorGeo { .. }
+            | Self::GdeltSourceDomain { .. }
+            | Self::GdeltEventGeo { .. }
+            | Self::GdeltActorPair { .. }
+            | Self::GdeltEventActor { .. }
+            | Self::GdeltToneSignal { .. }
+            | Self::GdeltSourceEvent { .. }
+            | Self::GdeltActionGeo { .. }
+            | Self::GdeltActorCountry { .. }
+            | Self::GdeltSourceHost { .. }
+            | Self::GdeltSqlDate { .. }
+            | Self::GdeltEventCode { .. } => false,
+        }
+    }
+
     pub const fn shape(self) -> SlotShape {
         match self {
             Self::SparseKeywords { dim }
@@ -569,6 +640,13 @@ impl Lens for AlgorithmicLens {
 
     fn modality(&self) -> Modality {
         self.modality
+    }
+
+    fn text_queryable(&self) -> bool {
+        // Additive by construction (#1896): anything the modality gate already
+        // admitted stays admitted, and the encoder declaration only adds the
+        // text lanes that a coarse `Modality::Structured` tag was hiding.
+        self.modality == Modality::Text || self.encoder.accepts_free_text()
     }
 
     fn measure(&self, input: &Input) -> Result<SlotVector> {

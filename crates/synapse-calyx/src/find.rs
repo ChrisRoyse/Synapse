@@ -63,8 +63,8 @@ use calyx_core::{Constellation, CxId, SlotId, VaultStore};
 use calyx_registry::load_vault_panel_state;
 use calyx_search::{
     FusionChoice, FusionTuning, GuardChoice, PersistedSearchGeneration, PersistedSearchIndexes,
-    REBUILD_REQUIRED_REMEDIATION, SearchBudget, SearchError, SearchFreshness, SearchOutcome,
-    measure_query_vectors, read_rebuild_required_marker,
+    QueryMeasurement, REBUILD_REQUIRED_REMEDIATION, SearchBudget, SearchError, SearchFreshness,
+    SearchOutcome, measure_query, read_rebuild_required_marker,
     search_outcome_with_query_vectors_freshness,
 };
 use calyx_sextant::TemporalScores;
@@ -355,7 +355,7 @@ impl SynapseCalyxVault {
 
         // Build the multi-slot query, restricted to slots that carry a
         // persisted index (non-indexed slots cannot contribute recall).
-        let (query_vectors, query_kind, self_cx) = match &params.query {
+        let (query_vectors, query_kind, self_cx, measurement) = match &params.query {
             SynapseCalyxFindQuery::ByExample { cx_id } => {
                 let example = parse_cx_id(cx_id)?;
                 let constellation = self.read_example_constellation(example, panel_version)?;
@@ -365,26 +365,30 @@ impl SynapseCalyxVault {
                     .filter(|(slot, _)| indexed_slots.contains(slot))
                     .map(|(slot, vector)| (*slot, vector.clone()))
                     .collect::<Vec<_>>();
-                (vectors, format!("by_example:{example}"), Some(example))
+                (vectors, format!("by_example:{example}"), Some(example), None)
             }
             SynapseCalyxFindQuery::ByText { text } => {
-                let measured = measure_query_vectors(&state, text)
+                // Measured over the panel's own slot set, not pre-restricted to
+                // the indexed set, so an empty result can distinguish "no lens
+                // is text-queryable" from "the text-queryable lens carries no
+                // persisted index" (#1896). The restriction is applied after.
+                let measured = measure_query(&state, text, None)
                     .map_err(|error| find_index_error("measure fused-find text query", &error))?;
                 let vectors = measured
-                    .into_iter()
+                    .vectors
+                    .iter()
                     .filter(|(slot, _)| indexed_slots.contains(slot))
+                    .map(|(slot, vector)| (*slot, vector.clone()))
                     .collect::<Vec<_>>();
-                (vectors, "by_text".to_owned(), None)
+                (vectors, "by_text".to_owned(), None, Some(measured))
             }
         };
 
         if query_vectors.is_empty() {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_FIND_NO_INDEXABLE_QUERY",
-                format!(
-                    "fused find over panel {panel_version} produced no query vector on any persisted-index slot"
-                ),
-                "supply a record/text that measures at least one lens present in the rebuilt search generation, or rebuild the panel search indexes",
+            return Err(no_indexable_query_error(
+                panel_version,
+                &indexed_slots,
+                measurement.as_ref(),
             ));
         }
 
@@ -654,6 +658,77 @@ fn find_guard_readback(
             .map(|line| (*line).to_owned())
             .collect(),
     })
+}
+
+/// Builds the empty-query failure so it names **why** no slot qualified.
+///
+/// Three unrelated conditions used to collapse into one message that said only
+/// that no vector was produced (#1896): no lens on the panel is declared
+/// text-queryable at all; a text-queryable lens exists but measured nothing
+/// indexable from this particular query; or it measured fine but carries no
+/// persisted index. Each has a different repair — declare the lens, change the
+/// query, rebuild the generation — so the error reports the three counts that
+/// separate them plus the per-slot skip reasons behind them.
+fn no_indexable_query_error(
+    panel_version: u32,
+    indexed_slots: &BTreeSet<SlotId>,
+    measurement: Option<&QueryMeasurement>,
+) -> SynapseCalyxError {
+    let Some(measurement) = measurement else {
+        // by_example: the example's own stored slots never intersected the
+        // persisted index, which is an index-coverage fact, not a query one.
+        return SynapseCalyxError::new(
+            "SYNAPSE_CALYX_FIND_NO_INDEXABLE_QUERY",
+            format!(
+                "fused find over panel {panel_version} produced no query vector on any persisted-index slot: the example record carries no slot that the persisted generation indexes (indexed_slots={})",
+                indexed_slots.len()
+            ),
+            "supply an example record measured on a lens present in the rebuilt search generation, or run storage operation=search_rebuild so the generation covers the example's slots",
+        );
+    };
+
+    let measured_but_unindexed: Vec<u16> = measurement
+        .vectors
+        .iter()
+        .map(|(slot, _)| slot.get())
+        .filter(|slot| !indexed_slots.contains(&SlotId::new(*slot)))
+        .collect();
+    let (message_tail, remediation) = if measurement.text_queryable_slots == 0 {
+        (
+            "no active lens on this panel declares itself text-queryable, so a text query can never produce a vector here regardless of index state".to_owned(),
+            "declare a text-queryable lens on this panel (a sparse-text or hash encoder); a one-hot, cyclic-time or numeric lens cannot answer free text by construction",
+        )
+    } else if measurement.indexable_slots == 0 {
+        (
+            "every text-queryable lens measured this query to a non-indexable vector (an empty query, or text that tokenizes to nothing)".to_owned(),
+            "supply query text that produces at least one token for the panel's text-queryable lens",
+        )
+    } else if measured_but_unindexed.is_empty() {
+        (
+            "the measured query slots were all excluded before scoring".to_owned(),
+            "run storage operation=search_rebuild so the persisted generation covers the panel's text-queryable slots",
+        )
+    } else {
+        (
+            format!(
+                "the query measured on slot(s) {measured_but_unindexed:?}, but the persisted generation indexes slot(s) {:?}, so no measured slot can be probed",
+                indexed_slots
+                    .iter()
+                    .map(|slot| slot.get())
+                    .collect::<Vec<_>>()
+            ),
+            "run storage operation=search_rebuild so the persisted generation covers the panel's text-queryable slots",
+        )
+    };
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_FIND_NO_INDEXABLE_QUERY",
+        format!(
+            "fused find over panel {panel_version} produced no query vector on any persisted-index slot: {message_tail}. {} indexed_slots={}",
+            measurement.diagnostic(),
+            indexed_slots.len()
+        ),
+        remediation,
+    )
 }
 
 /// Maps a substrate search error onto a Synapse error, naming the rebuild

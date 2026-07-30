@@ -285,6 +285,57 @@ pub struct SubsystemHealth {
     pub calyx_search_generation_rebuild_required: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_remediation: Option<String>,
+
+    // --- unattended derived-state maintenance (issues #1891, #1894) ---
+    // The generation above is only ever `built` because something keeps it that
+    // way. These fields report whether that something is running and what it
+    // last decided, so a maintainer that has silently stopped is visible before
+    // the generation it maintains expires.
+    /// `initial_build` | `refresh_over_existing` | `none_needed` |
+    /// `deferred_by_interval` | `no_active_panel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_search_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_search_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_run_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_success_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_attempts_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_failure_total: Option<u64>,
+    /// The last failure, retained across later successes so a lifetime failure
+    /// counter never outlives its own evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_failure_detail: Option<String>,
+    /// Seq lag at which the maintainer refreshes — deliberately below the
+    /// query-time reconciliation limit, so the index is repaired before recall
+    /// dies rather than after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_refresh_seq_lag_threshold: Option<u64>,
+
+    // --- panel lens coverage (issue #1894, ask 2) ---
+    // `abundance` computed `blind_spot_records = 1740` on a panel of 1,745
+    // constellations and nothing raised it. These fields are that alarm.
+    /// Panels measured in the last coverage pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_coverage_panels_measured: Option<u64>,
+    /// Panels carrying fewer than two lenses, or whose blind-spot fraction
+    /// exceeds the ceiling. Non-zero is an `error`: every association-derived
+    /// surface on such a panel can only report a vacuous zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_coverage_deficient_panels: Option<u64>,
+    /// Records measured across all panels that carry fewer than two co-present
+    /// dense lenses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_coverage_blind_spot_records: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_coverage_records_measured: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_coverage_measured_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vram_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

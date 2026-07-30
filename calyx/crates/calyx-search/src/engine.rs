@@ -13,7 +13,11 @@ use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, SlotId, SlotVector};
 
 use crate::engine_measure::measure_query_vectors_with_slots_traced;
-pub use crate::engine_measure::{measure_query_vectors, measure_query_vectors_with_slots};
+pub use crate::engine_measure::{
+    QUERY_SKIP_LENS_NOT_REGISTERED, QUERY_SKIP_LENS_NOT_TEXT_QUERYABLE, QUERY_SKIP_NOT_SELECTED,
+    QUERY_SKIP_SLOT_NOT_ACTIVE, QUERY_SKIP_VECTOR_NOT_INDEXABLE, QueryMeasurement, QuerySlotSkip,
+    measure_query, measure_query_vectors, measure_query_vectors_with_slots,
+};
 pub use crate::engine_slot_cache::{SearchSlotCache, SearchSlotCacheDiagnostic};
 pub use crate::engine_trace::SearchTraceEvent;
 use crate::engine_trace::SearchTracer;

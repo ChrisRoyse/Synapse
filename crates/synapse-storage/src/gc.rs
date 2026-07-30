@@ -179,6 +179,9 @@ pub trait GcRunner: Send + Sync + 'static {
 pub enum MaintenanceTaskKind {
     GarbageCollection,
     Checkpoint,
+    /// Keeps the vault's derived layers — the persisted search generation and
+    /// the measured lens coverage — from silently expiring (#1891, #1894).
+    DerivedState,
 }
 
 impl MaintenanceTaskKind {
@@ -186,6 +189,7 @@ impl MaintenanceTaskKind {
         match self {
             Self::GarbageCollection => "storage_gc",
             Self::Checkpoint => "storage_checkpoint",
+            Self::DerivedState => "storage_derived_state",
         }
     }
 
@@ -193,6 +197,7 @@ impl MaintenanceTaskKind {
         match self {
             Self::GarbageCollection => "garbage_collection",
             Self::Checkpoint => "checkpoint",
+            Self::DerivedState => "derived_state",
         }
     }
 }

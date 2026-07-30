@@ -896,10 +896,13 @@ pub(super) async fn handle(
                 )
             } else if let Some(bits) = &response.bits {
                 format!(
-                    "intelligence bits panel={} anchor={} anchored_records={} total_bits={:.4} grounded={} domain_provisional={} domain_grounded_fraction={:.4} slots={} assay_rows={}",
+                    "intelligence bits panel={} anchor={} anchored_records={} distinct_outcomes={} measurable={} unmeasurable_reason={} total_bits={:.4} grounded={} domain_provisional={} domain_grounded_fraction={:.4} slots={} assay_rows={}",
                     bits.panel_version,
                     bits.anchor_kind,
                     bits.anchored_records,
+                    bits.distinct_outcomes,
+                    bits.measurable,
+                    bits.unmeasurable_reason.as_deref().unwrap_or("none"),
                     bits.total_bits,
                     bits.grounded,
                     bits.domain_provisional,
@@ -923,11 +926,45 @@ pub(super) async fn handle(
                 )
             } else if let Some(redundancy) = &response.redundancy {
                 format!(
-                    "intelligence redundancy panel={} n_lenses={} effective_rank={:.4} pairs_evaluated={} redundant_pairs={} domain_provisional={} domain_grounded_fraction={:.4} assay_rows={}",
+                    "intelligence redundancy panel={} n_lenses={} effective_rank={:.4} over_lenses=[{}] pairs_possible={} pairs_evaluated={} pairs_skipped={} skipped=[{}] low_signal_lenses=[{}] redundant_pairs={} domain_provisional={} domain_grounded_fraction={:.4} assay_rows={}",
                     redundancy.panel_version,
                     redundancy.n_lenses,
                     redundancy.effective_rank,
+                    redundancy
+                        .effective_rank_slots
+                        .iter()
+                        .zip(&redundancy.effective_rank_lenses)
+                        .map(|(slot, lens)| format!("{slot}:{lens}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    redundancy.pairs_possible,
                     redundancy.pairs_evaluated,
+                    redundancy.pairs_skipped,
+                    redundancy
+                        .skipped_details
+                        .iter()
+                        .map(|skip| format!(
+                            "{}({}) x {}({}) reason={} offending_slot={} n_paired={}",
+                            skip.slot_a,
+                            skip.lens_a,
+                            skip.slot_b,
+                            skip.lens_b,
+                            skip.reason,
+                            skip.offending_slot
+                                .map_or_else(|| "none".to_owned(), |slot| slot.to_string()),
+                            skip.n_paired
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    redundancy
+                        .low_signal_lenses
+                        .iter()
+                        .map(|lens| format!(
+                            "{}({}) {} constant_value={} records={}",
+                            lens.slot, lens.lens, lens.code, lens.constant_value, lens.records_observed
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
                     redundancy.redundant_pairs.len(),
                     redundancy.domain_provisional,
                     redundancy.domain_grounded_fraction,

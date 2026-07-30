@@ -69,6 +69,31 @@ pub trait Lens: Send + Sync {
     /// Modality this lens accepts.
     fn modality(&self) -> Modality;
 
+    /// Whether a free-text query string can be measured through this lens and
+    /// produce a vector comparable to the vectors this lens produced at ingest.
+    ///
+    /// This is deliberately **not** an inference from [`Self::modality`]. The
+    /// modality tag is coarse — one-hot encoders, cyclic-time encoders, numeric
+    /// scalars and sparse text encoders can all share a single tag — so gating
+    /// text recall on it either admits lenses that cannot answer a text query
+    /// (a timestamp encoder handed the word "focus_change") or, when a whole
+    /// panel declares itself structured, excludes every lens including the
+    /// sparse text lane the recall path is built on. The latter is what shipped:
+    /// `Modality::Text` appeared zero times across the 78 Synapse lens
+    /// declarations, so `by_text` could never produce a query vector on any
+    /// Synapse panel regardless of index state (issue #1896).
+    ///
+    /// Text-queryability is a property of the *encoder*: it is true exactly when
+    /// measuring the query bytes through this lens is the same operation that
+    /// measured the stored bytes, which is the symmetry a lexical or dense
+    /// retrieval lane requires to compare a query against a document at all.
+    ///
+    /// The default preserves the historical gate for every runtime that has not
+    /// declared otherwise, so this can only widen recall, never narrow it.
+    fn text_queryable(&self) -> bool {
+        self.modality() == Modality::Text
+    }
+
     /// Deterministically measures one input.
     fn measure(&self, input: &Input) -> Result<SlotVector>;
 

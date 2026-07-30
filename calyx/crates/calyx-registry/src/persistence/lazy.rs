@@ -103,6 +103,16 @@ impl Lens for LazyPersistedLens {
         self.snapshot.contract.modality()
     }
 
+    fn text_queryable(&self) -> bool {
+        // Answered from the persisted spec, never by loading the runtime: this
+        // is called once per slot on every text query, and a lens whose runtime
+        // cannot load in this process must still be classifiable (#1896).
+        self.snapshot.spec.as_ref().map_or_else(
+            || self.snapshot.contract.modality() == Modality::Text,
+            crate::persistence_contracts::spec_text_queryable,
+        )
+    }
+
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         self.runtime()?.measure(input)
     }

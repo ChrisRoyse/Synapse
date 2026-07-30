@@ -522,6 +522,14 @@ impl SynapseService {
             "calyx_search_generation".to_owned(),
             self.calyx_search_generation_health(),
         );
+        subsystems.insert(
+            "calyx_derived_state".to_owned(),
+            Self::calyx_derived_state_health(),
+        );
+        subsystems.insert(
+            "calyx_lens_coverage".to_owned(),
+            Self::calyx_lens_coverage_health(),
+        );
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("perception".to_owned(), self.perception_health());
@@ -667,6 +675,144 @@ impl SynapseService {
             calyx_search_generation_age_ms: status.age_ms,
             calyx_search_generation_rebuild_required: status.rebuild_required,
             calyx_search_generation_remediation: Some(status.remediation),
+            ..SubsystemHealth::default()
+        }
+    }
+
+    /// Reports whether the unattended derived-state maintainer is running and
+    /// what it last decided (issues #1891, #1894).
+    ///
+    /// This reads a published readback, never the vault: the measurement itself
+    /// happens on the maintenance tick, off the request path, so `health` stays
+    /// a cheap read no matter how large the corpus grows.
+    ///
+    /// A maintainer that has silently stopped is exactly as dangerous as the
+    /// expired generation #1891 found — the generation looks `built` right up
+    /// until it does not — so a pass that has never run, or whose last run
+    /// failed, reports `error` rather than staying quiet.
+    fn calyx_derived_state_health() -> SubsystemHealth {
+        let readback = synapse_storage::derived_state::derived_state_readback();
+        let never_ran = readback.last_run_unix_ms.is_none();
+        let last_failed = readback
+            .last_failure_unix_ms
+            .zip(readback.last_success_unix_ms)
+            .is_some_and(|(failure, success)| failure > success)
+            || (readback.failure_total > 0 && readback.last_success_unix_ms.is_none());
+        let status = if never_ran {
+            // Not yet an error at boot: the first tick is a cadence away. It is
+            // reported as `starting` so a maintainer that never arrives is still
+            // distinguishable from one that is merely young.
+            "starting"
+        } else if last_failed {
+            "error"
+        } else {
+            "ok"
+        };
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail: Some(format!(
+                "attempts={} success={} failure={} skipped={} last_run_unix_ms={:?} \
+                 last_success_unix_ms={:?} last_search_action={} last_search_reason={} \
+                 last_search_elapsed_ms={:?} refresh_seq_lag_threshold={} \
+                 min_rebuild_interval_ms={} last_failure_code={} last_failure_detail={} \
+                 last_skip={}",
+                readback.attempts_total,
+                readback.success_total,
+                readback.failure_total,
+                readback.skipped_total,
+                readback.last_run_unix_ms,
+                readback.last_success_unix_ms,
+                readback.last_search_action.as_deref().unwrap_or("none"),
+                readback.last_search_reason.as_deref().unwrap_or("none"),
+                readback.last_search_elapsed_ms,
+                readback.refresh_seq_lag_threshold,
+                readback.min_rebuild_interval_ms,
+                readback.last_failure_code.as_deref().unwrap_or("none"),
+                readback.last_failure_detail.as_deref().unwrap_or("none"),
+                readback.last_skip_code.as_deref().unwrap_or("none"),
+            )),
+            calyx_derived_state_last_search_action: readback.last_search_action,
+            calyx_derived_state_last_search_reason: readback.last_search_reason,
+            calyx_derived_state_last_run_unix_ms: readback.last_run_unix_ms,
+            calyx_derived_state_last_success_unix_ms: readback.last_success_unix_ms,
+            calyx_derived_state_attempts_total: Some(readback.attempts_total),
+            calyx_derived_state_failure_total: Some(readback.failure_total),
+            calyx_derived_state_last_failure_code: readback.last_failure_code,
+            calyx_derived_state_last_failure_detail: readback.last_failure_detail,
+            calyx_derived_state_refresh_seq_lag_threshold: Some(
+                readback.refresh_seq_lag_threshold,
+            ),
+            ..SubsystemHealth::default()
+        }
+    }
+
+    /// Raises panel lens coverage as a named deficiency (issue #1894, ask 2).
+    ///
+    /// `abundance` already computed the alarm — `blind_spot_records = 1740` out
+    /// of 1,745 constellations — and no surface raised it, so the condition was
+    /// visible only to whoever ran an intelligence pass by hand and knew what
+    /// the zero meant. A panel carrying fewer than two co-present lenses makes
+    /// weave, bits, redundancy and kernel all vacuously zero, which is a
+    /// capability outage reported as a clean-looking number.
+    fn calyx_lens_coverage_health() -> SubsystemHealth {
+        let readback = synapse_storage::derived_state::derived_state_readback();
+        let Some(coverage) = readback.last_lens_coverage else {
+            return SubsystemHealth {
+                status: "starting".to_owned(),
+                detail: Some(
+                    "the derived-state maintainer has not completed a lens-coverage pass yet; \
+                     coverage is measured on its periodic tick, not on this request"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        };
+        let records_measured: usize = coverage
+            .panels
+            .iter()
+            .map(|panel| panel.records_measured)
+            .sum();
+        let blind_spot_records: usize = coverage
+            .panels
+            .iter()
+            .map(|panel| panel.blind_spot_records)
+            .sum();
+        let status = if coverage.deficient_panels.is_empty() {
+            "ok"
+        } else {
+            "error"
+        };
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail: Some(format!(
+                "panels_measured={} deficient_panels={:?} blind_spot_ceiling={} \
+                 sample_records_per_panel={} measured_at_unix_ms={:?} panels=[{}]",
+                coverage.panels.len(),
+                coverage.deficient_panels,
+                coverage.blind_spot_ceiling,
+                coverage.max_records_per_panel,
+                coverage.measured_at_unix_ms,
+                coverage
+                    .panels
+                    .iter()
+                    .map(|panel| format!(
+                        "{}:n_lenses={} slots={:?} measured={}/{} blind_spot_records={} ({:.4})",
+                        panel.panel_version,
+                        panel.n_lenses,
+                        panel.dense_slots,
+                        panel.records_measured,
+                        panel.records_scanned,
+                        panel.blind_spot_records,
+                        panel.blind_spot_fraction
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )),
+            calyx_lens_coverage_panels_measured: Some(coverage.panels.len() as u64),
+            calyx_lens_coverage_deficient_panels: Some(coverage.deficient_panels.len() as u64),
+            calyx_lens_coverage_blind_spot_records: Some(blind_spot_records as u64),
+            calyx_lens_coverage_records_measured: Some(records_measured as u64),
+            calyx_lens_coverage_measured_at_unix_ms: coverage.measured_at_unix_ms,
             ..SubsystemHealth::default()
         }
     }
