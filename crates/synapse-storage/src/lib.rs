@@ -978,6 +978,26 @@ impl Db {
             .temporal_rerank(candidates, query_time_secs, tz_offset_secs)
     }
 
+    /// Confirms exact-match-by-hash candidates against their authoritative
+    /// source fields, so a bucket collision is dropped rather than returned as
+    /// an exact match (#1899).
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the panel slot has no declared exact-match lane, a
+    /// candidate id is not a `CxId`, a Base row cannot be read, or a source row
+    /// cannot be decoded.
+    pub fn confirm_exact_matches(
+        &self,
+        panel_version: u32,
+        slot: u16,
+        value: &str,
+        cx_ids: &[String],
+    ) -> StorageResult<Vec<constellations::ExactMatchConfirmation>> {
+        self.backend
+            .confirm_exact_matches(panel_version, slot, value, cx_ids)
+    }
+
     /// Reconstructs temporal metadata from authoritative timeline or episode
     /// source rows and atomically journals each changed Base row.
     ///

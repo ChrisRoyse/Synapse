@@ -277,3 +277,126 @@ pub(crate) fn slot_vector_shape(vector: &SlotVector) -> String {
         SlotVector::Absent { reason } => format!("absent reason={reason:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Exact whole-value query measurement (#1899)
+// ---------------------------------------------------------------------------
+
+/// Structured error code: the addressed slot is not declared on the panel.
+pub const EXACT_QUERY_SLOT_NOT_ON_PANEL: &str = "CALYX_SEARCH_EXACT_SLOT_NOT_ON_PANEL";
+/// Structured error code: the slot exists but its lens does not content-address
+/// a whole value, so an exact-match assertion against it has no meaning.
+pub const EXACT_QUERY_LENS_NOT_EXACT_VALUE_QUERYABLE: &str =
+    "CALYX_SEARCH_EXACT_LENS_NOT_EXACT_VALUE_QUERYABLE";
+
+/// One slot's measurement of an exact whole-value query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExactValueMeasurement {
+    pub slot: SlotId,
+    pub lens_id: calyx_core::LensId,
+    pub lens_name: String,
+    pub vector: SlotVector,
+    /// The cell the value hashed into, stated so a caller can see that an exact
+    /// query is a single-bucket probe rather than a ranked lexical match.
+    pub probe_cells: Vec<u32>,
+}
+
+/// Measures one exact whole-value query against exactly one panel slot (#1899).
+///
+/// Deliberately not a variant of the free-text path. Free text is measured
+/// across every text-queryable lens and fused; an exact-value query is an
+/// assertion about one field, so it addresses one slot and fails closed when
+/// that slot's lens cannot make the assertion — rather than quietly measuring
+/// the value through a tokenizing lane and returning a lexical near-match under
+/// the name "exact".
+///
+/// # Errors
+///
+/// Fails closed when the slot is not declared on the panel, is not `Active`, its
+/// lens is not held by the registry, its lens does not declare
+/// [`calyx_core::Lens::exact_value_queryable`], or the measured vector is not
+/// something an index can probe with.
+pub fn measure_exact_value(
+    state: &calyx_registry::VaultPanelState,
+    slot: SlotId,
+    value: &str,
+) -> CliResult<ExactValueMeasurement> {
+    use calyx_core::{Input, SlotState};
+    let declared = state
+        .panel
+        .slots
+        .iter()
+        .find(|candidate| candidate.slot_id == slot)
+        .ok_or_else(|| CalyxError {
+            code: EXACT_QUERY_SLOT_NOT_ON_PANEL,
+            message: format!(
+                "slot {slot} is not declared on panel {}; declared slots are {:?}",
+                state.panel.version,
+                state
+                    .panel
+                    .slots
+                    .iter()
+                    .map(|candidate| candidate.slot_id.get())
+                    .collect::<Vec<_>>()
+            ),
+            remediation: "address an exact-value query at a slot the active panel declares",
+        })?;
+    if declared.state != SlotState::Active {
+        return Err(CalyxError {
+            code: EXACT_QUERY_SLOT_NOT_ON_PANEL,
+            message: format!(
+                "slot {slot} on panel {} is {:?}, not Active",
+                state.panel.version, declared.state
+            ),
+            remediation: "address an exact-value query at an active slot",
+        }
+        .into());
+    }
+    let exact_queryable = state
+        .registry
+        .exact_value_queryable(declared.lens_id)
+        .ok_or_else(|| CalyxError {
+            code: QUERY_SKIP_LENS_NOT_REGISTERED,
+            message: format!(
+                "panel {} slot {slot} references lens {} which this registry does not hold",
+                state.panel.version, declared.lens_id
+            ),
+            remediation: "repair the persisted registry snapshot for the active panel",
+        })?;
+    if !exact_queryable {
+        return Err(CalyxError {
+            code: EXACT_QUERY_LENS_NOT_EXACT_VALUE_QUERYABLE,
+            message: format!(
+                "panel {} slot {slot} lens {} does not content-address a whole value, so it cannot answer an exact-match query; only a whole-string hash lane can",
+                state.panel.version, declared.lens_id
+            ),
+            remediation: "address the exact-value query at a hash-lane slot, or use query_mode=by_text for a lexical query",
+        }
+        .into());
+    }
+    let input = Input::new(declared.modality, value.as_bytes().to_vec());
+    let vector = state.registry.measure(declared.lens_id, &input)?;
+    if !vector.is_indexable() {
+        return Err(CalyxError {
+            code: QUERY_SKIP_VECTOR_NOT_INDEXABLE,
+            message: format!(
+                "panel {} slot {slot} measured the exact value into {}, which no index can probe with",
+                state.panel.version,
+                slot_vector_shape(&vector)
+            ),
+            remediation: "supply a non-empty value the slot's lens can measure",
+        }
+        .into());
+    }
+    let probe_cells = match &vector {
+        SlotVector::Sparse { entries, .. } => entries.iter().map(|entry| entry.idx).collect(),
+        _ => Vec::new(),
+    };
+    Ok(ExactValueMeasurement {
+        slot,
+        lens_id: declared.lens_id,
+        lens_name: declared.slot_key.key().to_string(),
+        vector,
+        probe_cells,
+    })
+}

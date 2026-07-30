@@ -972,6 +972,28 @@ where
             .changed_keys_after_at(snapshot, cf, after_exclusive, &self.clock)
     }
 
+    /// Returns the `Base` changed-key delta scoped to one exact panel version,
+    /// with the composition that produced it (#1901).
+    ///
+    /// Every caller that bounds or reports a panel-scoped reconciliation delta
+    /// must use this rather than the whole-`Base`
+    /// [`Self::changed_cf_keys_after_snapshot`]: `Base` is shared by every
+    /// panel, so an unscoped count charges one panel's budget for another
+    /// panel's ingest.
+    pub fn changed_base_keys_after_snapshot_for_panel(
+        &self,
+        snapshot: Snapshot,
+        after_exclusive: Seq,
+        panel_version: u32,
+    ) -> Result<crate::mvcc::PanelScopedChangedKeys> {
+        self.rows.changed_base_keys_after_at_for_panel(
+            snapshot,
+            after_exclusive,
+            panel_version,
+            &self.clock,
+        )
+    }
+
     /// Scans visible raw CF rows from one atomic latest committed view.
     pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.rows.scan_cf_latest(cf)

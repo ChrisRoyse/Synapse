@@ -18,6 +18,114 @@ use super::support::SearchReadSnapshot;
 pub const MAX_RECONCILED_DELTA_KEYS: usize = 8_192;
 const DELTA_REBASE_CODE: &str = "CALYX_SEARCH_DELTA_REBASE_REQUIRED";
 
+/// The exact panel-scoped changed-key delta a query is judged against, with the
+/// composition that produced the count (#1901).
+///
+/// One measurement, one definition: both the query path's bounded
+/// reconciliation check and the unattended maintainer's refresh trigger read
+/// this, so the number that decides a rebuild and the number that fails a query
+/// closed cannot drift apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PanelDeltaComposition {
+    /// Panel version the delta was scoped to.
+    pub panel_version: u32,
+    /// Generation base sequence the delta starts after (exclusive).
+    pub base_seq: u64,
+    /// Pinned snapshot sequence the delta ends at (inclusive).
+    pub pinned_seq: u64,
+    /// Changed `Base` keys across every panel, before scoping.
+    pub base_keys_scanned: usize,
+    /// Changed `Base` keys attributed to this panel.
+    pub base_keys_panel: usize,
+    /// Changed `Base` keys attributed to some other panel and excluded.
+    pub base_keys_other_panels: usize,
+    /// Changed `Base` keys whose visible history is entirely tombstoned.
+    pub base_keys_unattributed: usize,
+    /// Changed keys contributed by each indexed slot CF, which is already
+    /// panel-scoped because a slot id belongs to exactly one panel.
+    pub slot_keys: BTreeMap<SlotId, usize>,
+    /// Distinct constellations to reconcile: the union of the scoped `Base`
+    /// keys and every slot CF's keys.
+    pub changed: BTreeSet<CxId>,
+}
+
+impl PanelDeltaComposition {
+    /// Distinct constellations this delta must reconcile.
+    #[must_use]
+    pub fn changed_len(&self) -> usize {
+        self.changed.len()
+    }
+
+    /// One-line composition, so an error names where its count came from rather
+    /// than only how large it is.
+    #[must_use]
+    pub fn composition(&self) -> String {
+        let slots = self
+            .slot_keys
+            .iter()
+            .map(|(slot, count)| format!("slot_{}={count}", slot.get()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "panel_version={} base_seq={} pinned_seq={} distinct_changed={} base_scanned={} base_panel={} base_other_panels={} base_unattributed={}{}{slots}",
+            self.panel_version,
+            self.base_seq,
+            self.pinned_seq,
+            self.changed.len(),
+            self.base_keys_scanned,
+            self.base_keys_panel,
+            self.base_keys_other_panels,
+            self.base_keys_unattributed,
+            if self.slot_keys.is_empty() { "" } else { " " },
+        )
+    }
+}
+
+/// Measures one panel generation's changed-key delta against a pinned snapshot.
+///
+/// The `Base` scan is scoped to `panel_version`; the slot scans are inherently
+/// scoped because slot ids are globally unique per panel. This is the single
+/// definition of "how far behind is this generation" in the workspace.
+///
+/// # Errors
+///
+/// Fails closed when the MVCC changed-key history cannot prove the requested
+/// range, or when a changed key is not a well-formed `CxId`.
+pub fn measure_panel_delta<C: Clock>(
+    vault: &AsterVault<C>,
+    snapshot: calyx_aster::mvcc::Snapshot,
+    panel_version: u32,
+    base_seq: u64,
+    query_slots: impl IntoIterator<Item = SlotId>,
+) -> CliResult<PanelDeltaComposition> {
+    let scoped =
+        vault.changed_base_keys_after_snapshot_for_panel(snapshot, base_seq, panel_version)?;
+    let mut changed = BTreeSet::new();
+    for key in &scoped.keys {
+        changed.insert(cx_id_from_key(key, ColumnFamily::Base)?);
+    }
+    let mut slot_keys = BTreeMap::new();
+    for slot in query_slots {
+        let cf = ColumnFamily::slot(slot);
+        let keys = vault.changed_cf_keys_after_snapshot(snapshot, cf, base_seq)?;
+        slot_keys.insert(slot, keys.len());
+        for key in keys {
+            changed.insert(cx_id_from_key(&key, cf)?);
+        }
+    }
+    Ok(PanelDeltaComposition {
+        panel_version,
+        base_seq,
+        pinned_seq: snapshot.seq(),
+        base_keys_scanned: scoped.scanned,
+        base_keys_panel: scoped.panel,
+        base_keys_other_panels: scoped.other_panels,
+        base_keys_unattributed: scoped.unattributed,
+        slot_keys,
+        changed,
+    })
+}
+
 pub(super) struct SearchDelta {
     changed: BTreeSet<CxId>,
     docs: BTreeMap<CxId, Constellation>,
@@ -56,25 +164,28 @@ impl SearchDelta {
                 read.derived_content_seq()
             )),
         );
-        let mut changed_keys = BTreeSet::new();
-        for key in
-            vault.changed_cf_keys_after_snapshot(read.snapshot(), ColumnFamily::Base, base_seq)?
-        {
-            changed_keys.insert(cx_id_from_key(&key, ColumnFamily::Base)?);
-        }
-        for slot in query_slots {
-            let cf = ColumnFamily::slot(*slot);
-            for key in vault.changed_cf_keys_after_snapshot(read.snapshot(), cf, base_seq)? {
-                changed_keys.insert(cx_id_from_key(&key, cf)?);
-            }
-        }
+        let composition = measure_panel_delta(
+            vault,
+            read.snapshot(),
+            indexes.panel_version(),
+            base_seq,
+            query_slots.iter().copied(),
+        )?;
+        let changed_keys = composition.changed.clone();
+        trace.emit_detail(
+            "delta.scan.scoped",
+            None,
+            Some(changed_keys.len()),
+            Some(composition.composition()),
+        );
         if changed_keys.len() > MAX_RECONCILED_DELTA_KEYS {
             return Err(CalyxError {
                 code: DELTA_REBASE_CODE,
                 message: format!(
-                    "search delta contains {} changed keys between manifest base seq {base_seq} and pinned seq {}, exceeding the bounded reconciliation limit {MAX_RECONCILED_DELTA_KEYS}",
+                    "search delta contains {} changed keys between manifest base seq {base_seq} and pinned seq {}, exceeding the bounded reconciliation limit {MAX_RECONCILED_DELTA_KEYS} ({})",
                     changed_keys.len(),
-                    read.seq()
+                    read.seq(),
+                    composition.composition()
                 ),
                 remediation: "rebuild the exact panel search generation, then retry; the immutable generation is too far behind for bounded current-snapshot reconciliation",
             }

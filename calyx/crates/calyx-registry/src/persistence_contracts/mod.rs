@@ -1,7 +1,9 @@
 mod repair_all;
 mod runtime;
 mod static_contract;
-pub use static_contract::{derive_runtime_contract_from_spec, spec_text_queryable};
+pub use static_contract::{
+    derive_runtime_contract_from_spec, spec_exact_value_queryable, spec_text_queryable,
+};
 
 use std::path::Path;
 

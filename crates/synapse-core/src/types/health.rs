@@ -274,6 +274,12 @@ pub struct SubsystemHealth {
     /// request; `None` means not measured, never zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_delta_changed_keys: Option<u64>,
+    /// Composition of the measured delta: `Base` keys scanned across all panels,
+    /// how many belong to this panel, how many were another panel's churn, and
+    /// each slot CF's contribution (#1901). A count without this could not say
+    /// whether the generation is stale or a bystander.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_delta_composition: Option<String>,
     /// When that delta was measured, so a stale measurement is visible as one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_delta_measured_at_unix_ms: Option<u64>,
@@ -288,7 +294,9 @@ pub struct SubsystemHealth {
     /// fail independently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_dense_slot_count: Option<u64>,
-    /// Sparse (BM25) lanes built.
+    /// Sparse lexical lanes built. The lane's actual law is per-slot: a
+    /// `sparse_bm25` lane ranks by BM25, a `sparse_dot` lane by a plain dot
+    /// product with no IDF and no length saturation (#1900).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_sparse_slot_count: Option<u64>,
     /// Age of the last build in milliseconds.

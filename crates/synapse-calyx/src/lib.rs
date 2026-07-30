@@ -118,8 +118,8 @@ pub use intelligence::{
     SYNAPSE_INTELLIGENCE_MAX_RECORDS, SYNAPSE_KERNEL_DEFAULT_EDGE_COS, SYNAPSE_KERNEL_DEFAULT_KNN,
     SYNAPSE_KERNEL_DEFAULT_MAX_HOPS, SYNAPSE_KERNEL_DEFAULT_MIN_RECALL,
     SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS, SYNAPSE_KNN_DEFAULT_K, SYNAPSE_KNN_MAX_EDGES,
-    SYNAPSE_KSG_DEFAULT_K, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS, SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG,
-    SYNAPSE_LENS_BLIND_SPOT_CEILING, SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS,
+    SYNAPSE_KSG_DEFAULT_K, SYNAPSE_LENS_BLIND_SPOT_CEILING, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS,
+    SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG, SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS,
     SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxAssayParams,
     SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport, SynapseCalyxCausalityLag,
     SynapseCalyxCausalityReport, SynapseCalyxDriftReport, SynapseCalyxHazardReport,
@@ -277,6 +277,14 @@ pub struct SynapseCalyxSearchGenerationStatus {
     /// `None` when this status was read on the cheap path that does not scan for
     /// it; a `None` here is "not measured", never "zero".
     pub delta_changed_keys: Option<u64>,
+    /// Where the measured delta came from: how many `Base` keys were scanned
+    /// across all panels, how many belong to this panel, how many were excluded
+    /// as another panel's churn, and each slot CF's contribution (#1901).
+    ///
+    /// Before the `Base` scan was panel-scoped, this generation's budget was
+    /// charged for every other panel's ingest, so the count alone could not tell
+    /// a genuinely stale generation from a bystander.
+    pub delta_composition: Option<String>,
     /// When `delta_changed_keys` was measured, so a caller can tell a live
     /// measurement from a stale one.
     pub delta_measured_at_unix_ms: Option<u64>,
@@ -422,6 +430,7 @@ fn search_generation_status_without_panel(
         vault_latest_seq,
         seq_lag: None,
         delta_changed_keys: None,
+        delta_composition: None,
         delta_measured_at_unix_ms: None,
         max_reconciled_delta_keys,
         rows_covered: None,
@@ -2572,7 +2581,83 @@ impl SynapseCalyxReadOnlyVault {
     }
 }
 
+/// Metadata key naming the authoritative source column family of a Base row.
+///
+/// Declared here as the literal the writer uses, because `synapse-storage`
+/// depends on this crate and not the other way round.
+const SYNAPSE_META_SOURCE_CF: &str = "synapse_source_cf";
+/// Metadata key naming the hex-encoded authoritative source key of a Base row.
+const SYNAPSE_META_SOURCE_KEY_HEX: &str = "synapse_source_key_hex";
+
+/// Panel identity and authoritative source pointer read back from one Base row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxBaseSourcePointer {
+    pub cx_id: String,
+    pub panel_version: u32,
+    /// `None` when the row records no source CF, which means it was not written
+    /// by a Synapse source-row projection.
+    pub source_cf: Option<String>,
+    pub source_key_hex: Option<String>,
+    /// Slot ids the Base row declares membership for.
+    pub declared_slots: Vec<u16>,
+}
+
 impl SynapseCalyxVault {
+    /// Reads the panel identity and source-row pointer recorded on one Base row.
+    ///
+    /// This is the exact evidence an exact-match confirmation needs (#1899): a
+    /// hash-lane hit names a `cx_id`, and only the authoritative source field can
+    /// distinguish a true whole-value match from a bucket collision. Reads the
+    /// Base row alone — no slot hydration — because the confirmation compares
+    /// source bytes, not vectors.
+    ///
+    /// `Ok(None)` means no Base row is visible for the id at the pinned snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the Base row cannot be read
+    /// or decoded, or when the decoded row's identity differs from the requested
+    /// `cx_id`.
+    pub fn read_base_source_pointer(
+        &self,
+        cx_id: CxId,
+    ) -> Result<Option<SynapseCalyxBaseSourcePointer>, SynapseCalyxError> {
+        let snapshot = self.vault.snapshot();
+        let Some(bytes) = self
+            .vault
+            .read_cf_at(snapshot, ColumnFamily::Base, cx_id.as_bytes())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(&format!("read Base row {cx_id}"), &error)
+            })?
+        else {
+            return Ok(None);
+        };
+        let constellation =
+            calyx_aster::vault::encode::decode_constellation_base(&bytes).map_err(|error| {
+                SynapseCalyxError::from_calyx(&format!("decode Base row {cx_id}"), &error)
+            })?;
+        if constellation.cx_id != cx_id {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BASE_ROW_IDENTITY_MISMATCH",
+                format!(
+                    "Base row keyed {cx_id} decodes to constellation {}",
+                    constellation.cx_id
+                ),
+                "the Base keyspace is corrupt for this id; reconcile the physical shard before trusting any read of it",
+            ));
+        }
+        Ok(Some(SynapseCalyxBaseSourcePointer {
+            cx_id: cx_id.to_string(),
+            panel_version: constellation.panel_version,
+            source_cf: constellation.metadata.get(SYNAPSE_META_SOURCE_CF).cloned(),
+            source_key_hex: constellation
+                .metadata
+                .get(SYNAPSE_META_SOURCE_KEY_HEX)
+                .cloned(),
+            declared_slots: constellation.slots.keys().map(|slot| slot.get()).collect(),
+        }))
+    }
+
     /// Pins one read snapshot sequence for a whole intelligence pass.
     ///
     /// Every record in one pass must be hydrated against the same snapshot, or
@@ -2934,57 +3019,47 @@ impl SynapseCalyxVault {
         self.search_generation_status_inner(true)
     }
 
-    /// Counts the distinct constellations changed since `base_seq` across the
-    /// `Base` CF and the generation's own slot CFs.
+    /// Counts the distinct constellations changed since `base_seq` for exactly
+    /// one panel, across the `Base` CF and the generation's own slot CFs.
     ///
-    /// This mirrors `calyx_search::engine::delta::SearchDelta::collect` on
-    /// purpose: it must count the same keys the query path counts, or the
-    /// maintenance trigger and the query-time limit drift apart. It is a
-    /// distinct-key count, not a sum, because the same constellation changing in
-    /// the Base CF and in three slot CFs is one key to reconcile, not four.
+    /// This calls the *same* `calyx_search::measure_panel_delta` the query
+    /// path's delta collector calls, rather than mirroring it: it must count the
+    /// same keys the query path counts, or the maintenance trigger and the
+    /// query-time limit drift apart. It is a distinct-key count, not a sum,
+    /// because the same constellation changing in the Base CF and in three slot
+    /// CFs is one key to reconcile, not four. The `Base` share is scoped to
+    /// `panel_version` (#1901): `Base` is shared by every panel, and counting
+    /// all of it charged a 329-row timeline generation for 17,785 keys of
+    /// unrelated agent-transcript ingest.
     fn measure_search_delta_changed_keys(
         &self,
+        panel_version: u32,
         base_seq: u64,
         slots: &[SynapseCalyxSearchGenerationSlot],
-    ) -> Result<u64, SynapseCalyxError> {
-        use std::collections::BTreeSet;
+    ) -> Result<calyx_search::PanelDeltaComposition, SynapseCalyxError> {
         // One pinned snapshot for the whole count, so every column family is
         // read against the same view and the number cannot mix sequences.
         let snapshot = self
             .vault
             .pin_reader(Freshness::FreshDerived, SEARCH_DELTA_SCAN_LEASE_MS);
-        let mut changed: BTreeSet<Vec<u8>> = BTreeSet::new();
-        let mut families = vec![ColumnFamily::Base];
-        families.extend(
-            slots
-                .iter()
-                .map(|slot| ColumnFamily::slot(calyx_core::SlotId::new(slot.slot))),
+        let measured = calyx_search::measure_panel_delta(
+            &self.vault,
+            snapshot,
+            panel_version,
+            base_seq,
+            slots.iter().map(|slot| calyx_core::SlotId::new(slot.slot)),
         );
-        let mut scan_error = None;
-        for cf in families {
-            match self
-                .vault
-                .changed_cf_keys_after_snapshot(snapshot, cf, base_seq)
-            {
-                Ok(keys) => changed.extend(keys),
-                Err(error) => {
-                    scan_error = Some(SynapseCalyxError::from_calyx(
-                        &format!(
-                            "scan changed {cf:?} keys after seq {base_seq} for the search generation delta"
-                        ),
-                        &error,
-                    ));
-                    break;
-                }
-            }
-        }
         // Release the lease on every path: a leaked reader lease pins the GC
         // frontier, which is a far worse outcome than a failed measurement.
         let _released = self.vault.release_reader(snapshot.lease().id());
-        if let Some(error) = scan_error {
-            return Err(error);
-        }
-        Ok(changed.len() as u64)
+        measured.map_err(|error| {
+            search_rebuild_error(
+                &format!(
+                    "measure the panel {panel_version} search-generation delta after seq {base_seq}"
+                ),
+                error,
+            )
+        })
     }
 
     #[allow(
@@ -3068,13 +3143,19 @@ impl SynapseCalyxVault {
             _ => None,
         };
         let seq_lag = built_at_seq.map(|seq| vault_latest_seq.saturating_sub(seq));
-        let (delta_changed_keys, delta_measured_at_unix_ms) = match (measure_delta, built_at_seq) {
-            (true, Some(base_seq)) => (
-                Some(self.measure_search_delta_changed_keys(base_seq, &slots)?),
-                now_unix_ms,
-            ),
-            _ => (None, None),
-        };
+        let (delta_changed_keys, delta_composition, delta_measured_at_unix_ms) =
+            match (measure_delta, built_at_seq) {
+                (true, Some(base_seq)) => {
+                    let measured =
+                        self.measure_search_delta_changed_keys(panel_version, base_seq, &slots)?;
+                    (
+                        Some(measured.changed_len() as u64),
+                        Some(measured.composition()),
+                        now_unix_ms,
+                    )
+                }
+                _ => (None, None, None),
+            };
 
         let (state, remediation) = classify_search_generation(
             rebuild_required.is_some(),
@@ -3094,6 +3175,7 @@ impl SynapseCalyxVault {
             vault_latest_seq,
             seq_lag,
             delta_changed_keys,
+            delta_composition,
             delta_measured_at_unix_ms,
             max_reconciled_delta_keys,
             rows_covered,

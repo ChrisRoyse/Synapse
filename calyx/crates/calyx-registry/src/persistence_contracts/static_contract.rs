@@ -99,6 +99,23 @@ pub fn spec_text_queryable(spec: &LensSpec) -> bool {
     }
 }
 
+/// Whether a persisted lens can answer an exact whole-value query, decided from
+/// its persisted [`LensSpec`] alone (#1899).
+///
+/// Answered without constructing a runtime, for the same reason
+/// [`spec_text_queryable`] is: the gate runs against a registry rebuilt lazily
+/// from the vault's persisted snapshot. Unlike text-queryability there is no
+/// modality fallback — a modality tag says nothing about whether an encoder
+/// content-addresses the whole value, so an undeclarable runtime is `false`.
+#[must_use]
+pub fn spec_exact_value_queryable(spec: &LensSpec) -> bool {
+    match &spec.runtime {
+        LensRuntime::Algorithmic { kind } => algorithmic_encoder(kind, spec.output)
+            .is_some_and(AlgorithmicEncoder::accepts_exact_value),
+        _ => false,
+    }
+}
+
 fn algorithmic_contract(spec: &LensSpec, kind: &str) -> Result<FrozenLensContract> {
     let encoder = algorithmic_encoder(kind, spec.output).ok_or_else(|| {
         lens_config_invalid(format!(
@@ -193,6 +210,12 @@ fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncode
             dim: sparse_dim(shape)?,
         }),
         ["syn_sparse_text", dim] => Some(AlgorithmicEncoder::SynSparseText {
+            dim: parse_u32(dim)?,
+        }),
+        ["syn_sparse_text_tf"] => Some(AlgorithmicEncoder::SynSparseTextTf {
+            dim: sparse_dim(shape)?,
+        }),
+        ["syn_sparse_text_tf", dim] => Some(AlgorithmicEncoder::SynSparseTextTf {
             dim: parse_u32(dim)?,
         }),
         ["syn_token_slots"] => Some(AlgorithmicEncoder::SynTokenSlots {

@@ -113,6 +113,16 @@ impl Lens for LazyPersistedLens {
         )
     }
 
+    fn exact_value_queryable(&self) -> bool {
+        // Answered from the persisted spec for the same reason
+        // `text_queryable` is: this runs per slot on a query path, and a lens
+        // whose runtime cannot load must still be classifiable (#1899).
+        self.snapshot
+            .spec
+            .as_ref()
+            .is_some_and(crate::persistence_contracts::spec_exact_value_queryable)
+    }
+
     fn measure(&self, input: &Input) -> Result<SlotVector> {
         self.runtime()?.measure(input)
     }

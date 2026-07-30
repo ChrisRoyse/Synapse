@@ -183,11 +183,20 @@ fn sparse_scoring_for_runtime(runtime: &LensRuntime) -> sparse::SparseScoring {
     }
 }
 
+/// Whether an algorithmic lens kind emits raw term frequencies, which is the
+/// exact precondition for scoring its lane with BM25.
+///
+/// BM25 needs an unnormalized `tf` and a real document length. A lane whose
+/// encoder L1-normalizes (`syn_sparse_text`) has neither: every stored vector
+/// sums to 1.0, so `doc_len` is 1.0 for every row and `b`/avgdl saturation is
+/// inert. Scoring such a lane as BM25 would silently apply a length correction
+/// that corrects nothing, so it stays a dot product and only genuinely
+/// term-frequency lanes are admitted here (#1900).
 fn is_lexical_term_frequency_kind(kind: &str) -> bool {
     let normalized = kind.replace('-', "_");
     matches!(
         normalized.split(':').next(),
-        Some("sparse" | "sparse_keywords")
+        Some("sparse" | "sparse_keywords" | "syn_sparse_text_tf")
     )
 }
 

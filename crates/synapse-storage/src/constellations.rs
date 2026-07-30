@@ -33,7 +33,19 @@ use synapse_telemetry::metrics::{
 use crate::{StorageError, StorageResult, cf};
 
 pub const SYN_TIMELINE_PANEL_NAME: &str = "syn-timeline-v1";
-pub const SYN_TIMELINE_PANEL_VERSION: u32 = 1_664_001;
+/// Current timeline slot layout.
+///
+/// #1900 added `TL_SLOT_TITLE_BM25`, a raw term-frequency lexical lane, because
+/// the normalized signed lane it sits beside cannot carry the term frequency or
+/// the document length BM25 ranks on. A `panel_version` identifies a slot
+/// layout, and the Base row's slot membership is immutable once written — a
+/// qualified slot write into a row that never declared the slot is refused by
+/// design — so a new lens on this panel is a new generation, re-measured from
+/// the authoritative `CF_TIMELINE` rows, exactly as #1776 did.
+pub const SYN_TIMELINE_PANEL_VERSION: u32 = 1_900_001;
+/// The timeline layout #1900 superseded, kept named so an audit can identify
+/// rows written before the BM25 lane existed rather than guess at a number.
+pub const SYN_TIMELINE_PANEL_VERSION_PRE_1900: u32 = 1_664_001;
 pub const SYN_EPISODE_PANEL_NAME: &str = "syn-episode-v1";
 pub const SYN_EPISODE_PANEL_VERSION: u32 = 1_664_002;
 pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
@@ -130,6 +142,10 @@ const TL_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(4);
 const TL_SLOT_DOW_CYCLIC: SlotId = SlotId::new(5);
 const TL_SLOT_ACTOR_ONEHOT: SlotId = SlotId::new(6);
 const TL_SLOT_RECENCY_RANK: SlotId = SlotId::new(7);
+/// Raw term-frequency lexical lane over the same title text `TL_SLOT_TITLE_SPARSE`
+/// hashes (#1900). Slot ids are allocated vault-globally (#1776), so this takes
+/// the next free id rather than reusing a timeline-local one.
+const TL_SLOT_TITLE_BM25: SlotId = SlotId::new(103);
 
 const EP_SLOT_APP_HASH: SlotId = SlotId::new(8);
 const EP_SLOT_DOCUMENT_HASH: SlotId = SlotId::new(9);
@@ -423,6 +439,163 @@ pub struct TemporalMetadataBackfillReport {
     pub latest_seq: u64,
     pub resume_after_physical: Option<Vec<u8>>,
     pub more: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Exact-match-by-hash lanes (#1899)
+// ---------------------------------------------------------------------------
+
+/// One whole-value hash lane and the authoritative source field it measures.
+///
+/// A `syn_hash` slot content-addresses an entire field value into one sparse
+/// cell, which makes exact-match recall possible and makes a bucket collision
+/// indistinguishable from a true match *inside the index*. The only thing that
+/// can tell them apart is the source field itself, so a lane is only usable for
+/// exact matching if the field it measured can be named and re-read. This table
+/// is that naming, and a slot absent from it is refused rather than confirmed
+/// against a guess.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SynExactMatchLane {
+    pub panel_version: u32,
+    pub slot: u16,
+    /// Authoritative source column family the value is re-read from.
+    pub source_cf: &'static str,
+    /// Dot-separated JSON path into the source row, matching the measurement
+    /// site's field exactly.
+    pub field_path: &'static str,
+}
+
+/// Every declared exact-match lane, keyed by (`panel_version`, slot).
+///
+/// Mirrors the measurement sites: each entry names the same field the
+/// corresponding `syn_hash` lens is handed at ingest. A field path that drifts
+/// from its measurement site makes confirmation reject true matches, which is a
+/// loud failure (`candidates_confirmed=0`) rather than a silent one.
+pub const SYN_EXACT_MATCH_LANES: &[SynExactMatchLane] = &[
+    SynExactMatchLane {
+        panel_version: SYN_TIMELINE_PANEL_VERSION,
+        slot: 2,
+        source_cf: cf::CF_TIMELINE,
+        field_path: "app",
+    },
+    SynExactMatchLane {
+        panel_version: SYN_EPISODE_PANEL_VERSION,
+        slot: 8,
+        source_cf: cf::CF_EPISODES,
+        field_path: "app",
+    },
+    SynExactMatchLane {
+        panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
+        slot: 25,
+        source_cf: cf::CF_AGENT_EVENTS,
+        field_path: "provider",
+    },
+    SynExactMatchLane {
+        panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
+        slot: 28,
+        source_cf: cf::CF_AGENT_EVENTS,
+        field_path: "tool_name",
+    },
+];
+
+/// One exact-match candidate's confirmation against its authoritative source
+/// field (#1899).
+///
+/// A hash-lane probe returns bucket candidates, and a collision is
+/// byte-identical to a true match inside the index. This is the readback of the
+/// only check that can separate them: re-read the source field and compare.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactMatchConfirmation {
+    pub cx_id: String,
+    /// True only when the source field was read and equals the queried value.
+    pub confirmed: bool,
+    pub source_cf: Option<String>,
+    pub source_key_hex: Option<String>,
+    /// The value actually found on the source row, when one was readable.
+    pub observed_value: Option<String>,
+    /// Machine-readable verdict: `confirmed`, `bucket_collision`,
+    /// `source_field_absent`, `base_row_absent`, `source_row_absent`,
+    /// `panel_mismatch`, or `source_cf_mismatch`.
+    pub verdict: &'static str,
+}
+
+/// Verdict for a candidate whose source field equals the queried value.
+pub const EXACT_MATCH_CONFIRMED: &str = "confirmed";
+/// Verdict for a candidate that shares the bucket but not the value.
+pub const EXACT_MATCH_BUCKET_COLLISION: &str = "bucket_collision";
+
+/// Looks up the declared exact-match lane for one panel slot.
+#[must_use]
+pub fn syn_exact_match_lane(panel_version: u32, slot: u16) -> Option<&'static SynExactMatchLane> {
+    SYN_EXACT_MATCH_LANES
+        .iter()
+        .find(|lane| lane.panel_version == panel_version && lane.slot == slot)
+}
+
+/// Reads one dot-separated field out of an authoritative source row as the exact
+/// string the lens measured.
+///
+/// `Ok(None)` means the field is absent or null on this row, which is a real
+/// answer: the lens measured `Absent` for it, so the row cannot be a true match.
+/// A non-string field is an error rather than a stringified guess, because the
+/// hash was taken over the bytes the measurement site passed and a coerced
+/// number would compare against different bytes.
+///
+/// # Errors
+///
+/// Returns a read-scoped storage error when the row is not valid JSON, when a
+/// path segment traverses a non-object, or when the addressed field is neither
+/// null nor a string.
+pub fn syn_exact_field_value(
+    source_cf: &str,
+    field_path: &str,
+    raw: &[u8],
+) -> StorageResult<Option<String>> {
+    let row: Value = serde_json::from_slice(raw).map_err(|error| StorageError::ReadFailed {
+        cf_name: source_cf.to_owned(),
+        detail: format!("decode authoritative row for exact-match confirmation: {error}"),
+    })?;
+    let mut cursor = &row;
+    for segment in field_path.split('.') {
+        match cursor {
+            Value::Object(map) => match map.get(segment) {
+                Some(next) => cursor = next,
+                None => return Ok(None),
+            },
+            Value::Null => return Ok(None),
+            other => {
+                return Err(StorageError::ReadFailed {
+                    cf_name: source_cf.to_owned(),
+                    detail: format!(
+                        "exact-match field path {field_path} traverses a non-object at segment {segment}: found {}",
+                        value_kind(other)
+                    ),
+                });
+            }
+        }
+    }
+    match cursor {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(value.clone())),
+        other => Err(StorageError::ReadFailed {
+            cf_name: source_cf.to_owned(),
+            detail: format!(
+                "exact-match field path {field_path} addresses a {}, but the hash lane measured string bytes",
+                value_kind(other)
+            ),
+        }),
+    }
+}
+
+const fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 #[must_use]
@@ -1381,49 +1554,107 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (TL_SLOT_DOW_CYCLIC, "syn.timeline.dow_cyclic.v1"),
     (TL_SLOT_ACTOR_ONEHOT, "syn.timeline.actor_onehot.v1"),
     (TL_SLOT_RECENCY_RANK, "syn.timeline.event_time_rank.v1"),
+    (TL_SLOT_TITLE_BM25, "syn.timeline.title_bm25.v1"),
     (EP_SLOT_APP_HASH, "syn.episode.app_hash.v1"),
     (EP_SLOT_DOCUMENT_HASH, "syn.episode.document_hash.v1"),
     (EP_SLOT_URL_HOST_HASH, "syn.episode.url_host_hash.v1"),
     (EP_SLOT_TITLE_SPARSE, "syn.episode.title_sparse.v1"),
-    (EP_SLOT_START_HOUR_CYCLIC, "syn.episode.start_hour_cyclic.v1"),
+    (
+        EP_SLOT_START_HOUR_CYCLIC,
+        "syn.episode.start_hour_cyclic.v1",
+    ),
     (EP_SLOT_START_DOW_CYCLIC, "syn.episode.start_dow_cyclic.v1"),
     (EP_SLOT_DURATION_LOG1P, "syn.episode.duration_log1p.v1"),
     (EP_SLOT_DURATION_RANK, "syn.episode.duration_rank.v1"),
-    (EP_SLOT_KEYSTROKES_ZSCORE, "syn.episode.keystrokes_zscore.v1"),
+    (
+        EP_SLOT_KEYSTROKES_ZSCORE,
+        "syn.episode.keystrokes_zscore.v1",
+    ),
     (EP_SLOT_CLICKS_ZSCORE, "syn.episode.clicks_zscore.v1"),
     (EP_SLOT_ROW_COUNT_ZSCORE, "syn.episode.row_count_zscore.v1"),
-    (EP_SLOT_STARTED_BOUNDARY_ONEHOT, "syn.episode.started_boundary_onehot.v1"),
-    (EP_SLOT_ENDED_BOUNDARY_ONEHOT, "syn.episode.ended_boundary_onehot.v1"),
-    (EP_SLOT_INTERRUPTION_RATIO, "syn.episode.interruption_ratio_raw.v1"),
+    (
+        EP_SLOT_STARTED_BOUNDARY_ONEHOT,
+        "syn.episode.started_boundary_onehot.v1",
+    ),
+    (
+        EP_SLOT_ENDED_BOUNDARY_ONEHOT,
+        "syn.episode.ended_boundary_onehot.v1",
+    ),
+    (
+        EP_SLOT_INTERRUPTION_RATIO,
+        "syn.episode.interruption_ratio_raw.v1",
+    ),
     (EP_SLOT_RECORD_VECTOR, "syn.episode.record_vector.v1"),
     (AE_SLOT_KIND_ONEHOT, "syn.agent_event.kind_onehot.v1"),
-    (AE_SLOT_OPERATION_ONEHOT, "syn.agent_event.operation_onehot.v1"),
+    (
+        AE_SLOT_OPERATION_ONEHOT,
+        "syn.agent_event.operation_onehot.v1",
+    ),
     (AE_SLOT_PROVIDER_HASH, "syn.agent_event.provider_hash.v1"),
-    (AE_SLOT_REQUEST_MODEL_HASH, "syn.agent_event.request_model_hash.v1"),
-    (AE_SLOT_RESPONSE_MODEL_HASH, "syn.agent_event.response_model_hash.v1"),
+    (
+        AE_SLOT_REQUEST_MODEL_HASH,
+        "syn.agent_event.request_model_hash.v1",
+    ),
+    (
+        AE_SLOT_RESPONSE_MODEL_HASH,
+        "syn.agent_event.response_model_hash.v1",
+    ),
     (AE_SLOT_TOOL_HASH, "syn.agent_event.tool_hash.v1"),
     (AE_SLOT_ERROR_ONEHOT, "syn.agent_event.error_onehot.v1"),
-    (AE_SLOT_END_STATE_ONEHOT, "syn.agent_event.end_state_onehot.v1"),
+    (
+        AE_SLOT_END_STATE_ONEHOT,
+        "syn.agent_event.end_state_onehot.v1",
+    ),
     (AE_SLOT_HOUR_CYCLIC, "syn.agent_event.hour_cyclic.v1"),
     (AE_SLOT_DOW_CYCLIC, "syn.agent_event.dow_cyclic.v1"),
-    (AE_SLOT_USAGE_TOTAL_LOG1P, "syn.agent_event.usage_total_log1p.v1"),
+    (
+        AE_SLOT_USAGE_TOTAL_LOG1P,
+        "syn.agent_event.usage_total_log1p.v1",
+    ),
     (AE_SLOT_RECORD_VECTOR, "syn.agent_event.record_vector.v1"),
     (AT_SLOT_ROLE_ONEHOT, "syn.agent_transcript.role_onehot.v1"),
-    (AT_SLOT_STATUS_ONEHOT, "syn.agent_transcript.status_onehot.v1"),
-    (AT_SLOT_SOURCE_ONEHOT, "syn.agent_transcript.source_onehot.v1"),
-    (AT_SLOT_EVENT_KIND_HASH, "syn.agent_transcript.event_kind_hash.v1"),
+    (
+        AT_SLOT_STATUS_ONEHOT,
+        "syn.agent_transcript.status_onehot.v1",
+    ),
+    (
+        AT_SLOT_SOURCE_ONEHOT,
+        "syn.agent_transcript.source_onehot.v1",
+    ),
+    (
+        AT_SLOT_EVENT_KIND_HASH,
+        "syn.agent_transcript.event_kind_hash.v1",
+    ),
     (AT_SLOT_MODEL_HASH, "syn.agent_transcript.model_hash.v1"),
     (AT_SLOT_TEXT_SPARSE, "syn.agent_transcript.text_sparse.v1"),
     (AT_SLOT_TOOL_HASH, "syn.agent_transcript.tool_hash.v1"),
     (AT_SLOT_LINE_RANK, "syn.agent_transcript.line_rank.v1"),
-    (AT_SLOT_INPUT_TOKENS_LOG1P, "syn.agent_transcript.input_tokens_log1p.v1"),
-    (AT_SLOT_OUTPUT_TOKENS_LOG1P, "syn.agent_transcript.output_tokens_log1p.v1"),
-    (AT_SLOT_CACHE_READ_LOG1P, "syn.agent_transcript.cache_read_log1p.v1"),
-    (AT_SLOT_CACHE_CREATION_LOG1P, "syn.agent_transcript.cache_creation_log1p.v1"),
-    (AT_SLOT_RECORD_VECTOR, "syn.agent_transcript.record_vector.v1"),
+    (
+        AT_SLOT_INPUT_TOKENS_LOG1P,
+        "syn.agent_transcript.input_tokens_log1p.v1",
+    ),
+    (
+        AT_SLOT_OUTPUT_TOKENS_LOG1P,
+        "syn.agent_transcript.output_tokens_log1p.v1",
+    ),
+    (
+        AT_SLOT_CACHE_READ_LOG1P,
+        "syn.agent_transcript.cache_read_log1p.v1",
+    ),
+    (
+        AT_SLOT_CACHE_CREATION_LOG1P,
+        "syn.agent_transcript.cache_creation_log1p.v1",
+    ),
+    (
+        AT_SLOT_RECORD_VECTOR,
+        "syn.agent_transcript.record_vector.v1",
+    ),
     (ACT_SLOT_KIND_ONEHOT, "syn.action.kind_onehot.v1"),
     (ACT_SLOT_TARGET_HASH, "syn.action.target_hash.v1"),
-    (ACT_SLOT_PARAMS_RECORD_VECTOR, "syn.action.params_record_vector.v1"),
+    (
+        ACT_SLOT_PARAMS_RECORD_VECTOR,
+        "syn.action.params_record_vector.v1",
+    ),
     (ACT_SLOT_HOUR_CYCLIC, "syn.action.hour_cyclic.v1"),
     (ACT_SLOT_DOW_CYCLIC, "syn.action.dow_cyclic.v1"),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
@@ -1442,9 +1673,15 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (PR_SLOT_RECORD_VECTOR, "syn.process.record_vector.v1"),
     (OB_SLOT_APP_HASH, "syn.observation.app_hash.v1"),
     (OB_SLOT_ROLE_HISTOGRAM, "syn.observation.role_histogram.v1"),
-    (OB_SLOT_ENTITY_MULTI_HOT, "syn.observation.entity_multi_hot.v1"),
+    (
+        OB_SLOT_ENTITY_MULTI_HOT,
+        "syn.observation.entity_multi_hot.v1",
+    ),
     (OB_SLOT_HUD_RECORD_VECTOR, "syn.observation.hud_scalars.v1"),
-    (OB_SLOT_FLAGS_MULTI_HOT, "syn.observation.flags_multi_hot.v1"),
+    (
+        OB_SLOT_FLAGS_MULTI_HOT,
+        "syn.observation.flags_multi_hot.v1",
+    ),
     (OB_SLOT_HOUR_CYCLIC, "syn.observation.hour_cyclic.v1"),
     (OB_SLOT_DOW_CYCLIC, "syn.observation.dow_cyclic.v1"),
     (OB_SLOT_RECORD_VECTOR, "syn.observation.record_vector.v1"),
@@ -1456,23 +1693,38 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (OUT_SLOT_DOW_CYCLIC, "syn.outcome.dow_cyclic.v1"),
     (OUT_SLOT_RECORD_VECTOR, "syn.outcome.record_vector.v1"),
     (MU_SLOT_TOOL_ONEHOT, "syn.mcp_usage.tool_onehot.v1"),
-    (MU_SLOT_OPERATION_ONEHOT, "syn.mcp_usage.operation_onehot.v1"),
+    (
+        MU_SLOT_OPERATION_ONEHOT,
+        "syn.mcp_usage.operation_onehot.v1",
+    ),
     (MU_SLOT_ROUTE_HASH, "syn.mcp_usage.route_hash.v1"),
-    (MU_SLOT_PARAM_SHAPE_HASH, "syn.mcp_usage.param_shape_hash.v1"),
+    (
+        MU_SLOT_PARAM_SHAPE_HASH,
+        "syn.mcp_usage.param_shape_hash.v1",
+    ),
     (MU_SLOT_STATUS_ONEHOT, "syn.mcp_usage.status_onehot.v1"),
     (MU_SLOT_ERROR_ONEHOT, "syn.mcp_usage.error_onehot.v1"),
     (MU_SLOT_PROFILE_HASH, "syn.mcp_usage.profile_hash.v1"),
     (MU_SLOT_SURFACE_HASH, "syn.mcp_usage.tool_surface_hash.v1"),
-    (MU_SLOT_SESSION_SEQUENCE_RANK, "syn.mcp_usage.session_sequence_rank.v1"),
+    (
+        MU_SLOT_SESSION_SEQUENCE_RANK,
+        "syn.mcp_usage.session_sequence_rank.v1",
+    ),
     (MU_SLOT_HOUR_CYCLIC, "syn.mcp_usage.hour_cyclic.v1"),
     (MU_SLOT_DOW_CYCLIC, "syn.mcp_usage.dow_cyclic.v1"),
     (MU_SLOT_RECORD_VECTOR, "syn.mcp_usage.record_vector.v1"),
     (RS_SLOT_KIND_ONEHOT, "syn.recurrence_subject.kind_onehot.v1"),
-    (RS_SLOT_SUBJECT_HASH, "syn.recurrence_subject.identity_hash.v1"),
+    (
+        RS_SLOT_SUBJECT_HASH,
+        "syn.recurrence_subject.identity_hash.v1",
+    ),
     (GP_APP_SLOT_SIGNATURE, "syn.graphpos.signature.v1"),
     (GP_APP_SLOT_NEIGHBORS, "syn.graphpos.neighbor_histogram.v1"),
     (GP_PROCESS_SLOT_SIGNATURE, "syn.graphpos.signature.v1"),
-    (GP_PROCESS_SLOT_NEIGHBORS, "syn.graphpos.neighbor_histogram.v1"),
+    (
+        GP_PROCESS_SLOT_NEIGHBORS,
+        "syn.graphpos.neighbor_histogram.v1",
+    ),
     (PH_SLOT_SIGNATURE, "syn.path_hierarchy.signature.v1"),
     (PH_SLOT_ANCESTORS, "syn.path_hierarchy.ancestor_set.v1"),
     (PH_SLOT_PATH_HASH, "syn.path_hierarchy.path_hash.v1"),
@@ -1652,6 +1904,19 @@ pub fn build_timeline_constellation(
                 RECENCY_RANK_MAX_UNIX_MS_MICROS,
             ),
             record.ts_ns / NS_PER_MS,
+        )?,
+    );
+
+    slots.insert(
+        TL_SLOT_TITLE_BM25,
+        measure_text(
+            SYN_TIMELINE_PANEL_NAME,
+            AlgorithmicLens::syn_sparse_text_tf(
+                "syn.timeline.title_bm25.v1",
+                Modality::Structured,
+                2048,
+            ),
+            timeline_title(record).as_deref().unwrap_or(""),
         )?,
     );
 
@@ -2009,6 +2274,9 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
         RegistryAlgorithmicEncoder::SynSparseText { dim } => {
             format!("syn_sparse_text:{dim}")
         }
+        RegistryAlgorithmicEncoder::SynSparseTextTf { dim } => {
+            format!("syn_sparse_text_tf:{dim}")
+        }
         RegistryAlgorithmicEncoder::SynTokenSlots { token_dim } => {
             format!("syn_token_slots:{token_dim}")
         }
@@ -2127,6 +2395,17 @@ fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageR
                 Modality::Structured,
                 0,
                 RECENCY_RANK_MAX_UNIX_MS_MICROS,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            TL_SLOT_TITLE_BM25,
+            "syn.timeline.title_bm25.v1",
+            RegistryAlgorithmicLens::syn_sparse_text_tf(
+                "syn.timeline.title_bm25.v1",
+                Modality::Structured,
+                2048,
             ),
             panel_version,
             registry,

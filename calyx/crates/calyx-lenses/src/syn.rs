@@ -100,6 +100,55 @@ pub(super) fn sparse_text(bytes: &[u8], dim: u32) -> Result<SlotVector> {
     )
 }
 
+/// Raw hashed term frequencies over free text, unsigned and unnormalized.
+///
+/// This is the payload a BM25 lane requires and `sparse_text` cannot provide.
+/// `sparse_text` L1-normalizes signed hashes, so every stored vector sums to
+/// 1.0: the term frequency becomes a *relative* frequency and the document
+/// length disappears, which is exactly why a one-word title tied an exact
+/// full-title match (#1900). BM25's `tf` must be a raw count and its `b`/avgdl
+/// saturation must compare a real document length against a real corpus
+/// average, so this encoder emits the count and lets the index supply the
+/// corpus statistics — the standard HashingTF-then-IDF split, and the only
+/// arrangement that keeps the lens data-oblivious while the ranking is
+/// corpus-aware.
+///
+/// Signed hashing is deliberately dropped here. Signed feature hashing exists
+/// to make a *dot product* an unbiased estimator; on a lexical ranking lane a
+/// negative term frequency is meaningless, and sign cancellation inside a
+/// bucket would silently destroy the count BM25 saturates over.
+pub(super) fn sparse_text_tf(bytes: &[u8], dim: u32) -> Result<SlotVector> {
+    let dim = ensure_power_of_two("syn sparse text tf dim", dim)?;
+    let tokens = lexical_tokens(bytes, MAX_TEXT_TOKENS, "syn sparse text tf")?;
+    let mut counts = BTreeMap::<u32, f32>::new();
+    for token in &tokens {
+        let digest = content_address([b"syn-sparse-text-tf-v1".as_slice(), token.as_bytes()]);
+        let idx = hash_prefix(&digest) & (dim - 1);
+        *counts.entry(idx).or_default() += 1.0;
+    }
+    let entries = counts
+        .into_iter()
+        .map(|(idx, val)| SparseEntry { idx, val })
+        .collect();
+    Ok(SlotVector::Sparse { dim, entries })
+}
+
+/// `text_tokens`, minus tokens that carry no alphanumeric character.
+///
+/// `text_tokens` keeps `-` and `_` as word characters so intra-word hyphens
+/// survive, which also makes the standalone `-` in `"a.txt - Notepad"` its own
+/// token. On a normalized lane that token consumed normalization mass; on a
+/// term-frequency lane it would inflate the document length and earn its own
+/// IDF weight. It carries no lexical content either way, so it is dropped here
+/// (#1900 ask 4). The frozen `text_tokens` behaviour is left untouched: every
+/// already-measured lens depends on it byte for byte.
+fn lexical_tokens(bytes: &[u8], max_tokens: usize, label: &str) -> Result<Vec<String>> {
+    Ok(text_tokens(bytes, max_tokens, label)?
+        .into_iter()
+        .filter(|token| token.chars().any(char::is_alphanumeric))
+        .collect())
+}
+
 pub(super) fn token_slots(bytes: &[u8], token_dim: u32) -> Result<SlotVector> {
     let token_dim = ensure_power_of_two("syn token slots token_dim", token_dim)?;
     let tokens = text_tokens(bytes, MAX_TOKEN_SLOTS, "syn token slots")?;

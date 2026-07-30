@@ -102,6 +102,9 @@ pub struct StorageSearchRebuildSlot {
     pub shape: String,
     pub len: usize,
     pub built_at_seq: u64,
+    /// The exact within-lane scoring law this index ranks by (#1900), reported
+    /// so a caller never has to infer a ranking law from an index kind.
+    pub scoring_law: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -134,8 +137,9 @@ pub struct StorageSearchRebuildResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageFindSimilarParams {
-    /// `by_example` (a record key -> its own stored slot vectors) or `by_text`
-    /// (measured through the active panel's text lenses).
+    /// `by_example` (a record key -> its own stored slot vectors), `by_text`
+    /// (measured through the active panel's text lenses), or `by_exact` (one
+    /// hash-lane slot + the whole field value, confirmed against the source row).
     pub query_mode: String,
     /// Content-addressed example record id; required when `query_mode=by_example`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,12 +147,24 @@ pub struct StorageFindSimilarParams {
     /// Query text; required when `query_mode=by_text`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Panel slot to address; required when `query_mode=by_exact`. Must be a
+    /// whole-value hash lane (#1899).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 65535))]
+    pub exact_slot: Option<u32>,
+    /// The whole field value being asserted; required when
+    /// `query_mode=by_exact`. Compared byte-for-byte against the source field of
+    /// every bucket candidate, so a collision is dropped rather than returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_value: Option<String>,
     /// Maximum fused hits to return.
     #[schemars(range(min = 1, max = 1000))]
     pub k: u32,
     /// Rank-level fusion: `rrf`, `weighted_rrf`, or `single_slot`.
     pub fusion: String,
-    /// Slot id to isolate when `fusion=single_slot` (pure vector or pure BM25).
+    /// Slot id to isolate when `fusion=single_slot` (pure vector recall, or the
+    /// term-frequency lane for pure BM25 recall). Each lane's actual scoring law
+    /// is reported on `generation.slots[].scoring_law`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 65535))]
     pub single_slot: Option<u32>,
@@ -252,7 +268,43 @@ pub struct StorageFindSimilarResponse {
     pub maxsim_note: String,
     pub grounding_note: String,
     pub generation: StorageFindGeneration,
+    /// Present only for `query_mode=by_exact`: what the hash lane probed and what
+    /// the source-field confirmation did to its candidates (#1899).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<StorageFindExact>,
     pub hits: Vec<StorageFindHit>,
+}
+
+/// The exact-match probe and its confirmation pass (#1899).
+///
+/// `candidates_probed` is what the hash bucket returned; `candidates_confirmed`
+/// is what survived re-reading each candidate's authoritative source field.
+/// A gap between them is a visible collision, not a silent filter.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindExact {
+    pub slot: u32,
+    pub lens: String,
+    pub value: String,
+    pub probe_cells: Vec<u32>,
+    pub source_cf: String,
+    pub source_field: String,
+    pub candidates_probed: u64,
+    pub candidates_confirmed: u64,
+    pub candidates_dropped: u64,
+    pub confirmation_law: String,
+    pub candidates: Vec<StorageFindExactCandidate>,
+}
+
+/// One candidate's confirmation verdict against its source field.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageFindExactCandidate {
+    pub cx_id: String,
+    pub confirmed: bool,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_value: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,11 +1475,39 @@ pub fn run_find_similar(
                 })?;
             synapse_calyx::SynapseCalyxFindQuery::ByText { text }
         }
+        "by_exact" => {
+            let slot = params.exact_slot.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "storage operation=find_similar query_mode=by_exact requires exact_slot"
+                        .to_owned(),
+                )
+            })?;
+            let slot = u16::try_from(slot).map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "storage operation=find_similar exact_slot {slot} exceeds the u16 slot id range"
+                    ),
+                )
+            })?;
+            let value = params
+                .exact_value
+                .clone()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "storage operation=find_similar query_mode=by_exact requires a non-empty exact_value".to_owned(),
+                    )
+                })?;
+            synapse_calyx::SynapseCalyxFindQuery::ByExact { slot, value }
+        }
         other => {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
-                    "storage operation=find_similar query_mode {other:?} must be by_example or by_text"
+                    "storage operation=find_similar query_mode {other:?} must be by_example, by_text, or by_exact"
                 ),
             ));
         }
@@ -1479,7 +1559,91 @@ pub fn run_find_similar(
     let report = db
         .find_similar(&find_params)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    Ok(storage_find_similar_response(report))
+    // An exact-value probe returns bucket candidates, not exact matches: inside
+    // the index a collision is byte-identical to a true match. Confirm every
+    // candidate against its authoritative source field here, drop the ones that
+    // fail, and report probed-vs-confirmed so a collision-heavy bucket is
+    // visible rather than silently filtered (#1899).
+    let exact = confirm_find_exact(db, &report)?;
+    let mut response = storage_find_similar_response(report);
+    if let Some(exact) = exact {
+        let confirmed = exact
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.confirmed)
+            .map(|candidate| candidate.cx_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        response.hits.retain(|hit| confirmed.contains(&hit.cx_id));
+        for (rank, hit) in response.hits.iter_mut().enumerate() {
+            hit.rank = rank as u64 + 1;
+        }
+        response.exact = Some(exact);
+    }
+    Ok(response)
+}
+
+/// Confirms an exact-value probe's candidates against their source fields.
+///
+/// Returns `None` for any query mode other than `by_exact`, so no other mode
+/// pays for the read.
+fn confirm_find_exact(
+    db: &synapse_storage::Db,
+    report: &synapse_calyx::SynapseCalyxFindReport,
+) -> Result<Option<StorageFindExact>, ErrorData> {
+    let Some(probe) = report.exact.as_ref() else {
+        return Ok(None);
+    };
+    let lane = synapse_storage::constellations::syn_exact_match_lane(
+        report.panel_version,
+        probe.slot,
+    )
+    .ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=find_similar query_mode=by_exact addressed panel {} slot {}, which measures a whole value but declares no source field to confirm against; an unconfirmable hash hit cannot be reported as an exact match",
+                report.panel_version, probe.slot
+            ),
+        )
+    })?;
+    let cx_ids = report
+        .hits
+        .iter()
+        .map(|hit| hit.cx_id.clone())
+        .collect::<Vec<_>>();
+    let confirmations = db
+        .confirm_exact_matches(report.panel_version, probe.slot, &probe.value, &cx_ids)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let confirmed = confirmations
+        .iter()
+        .filter(|confirmation| confirmation.confirmed)
+        .count() as u64;
+    let probed = confirmations.len() as u64;
+    Ok(Some(StorageFindExact {
+        slot: u32::from(probe.slot),
+        lens: probe.lens.clone(),
+        value: probe.value.clone(),
+        probe_cells: probe.probe_cells.clone(),
+        source_cf: lane.source_cf.to_owned(),
+        source_field: lane.field_path.to_owned(),
+        candidates_probed: probed,
+        candidates_confirmed: confirmed,
+        candidates_dropped: probed.saturating_sub(confirmed),
+        confirmation_law: format!(
+            "a candidate is an exact match only when {}.{} on its authoritative source row equals the queried value byte for byte; every other bucket candidate is dropped",
+            lane.source_cf, lane.field_path
+        ),
+        candidates: confirmations
+            .into_iter()
+            .map(|confirmation| StorageFindExactCandidate {
+                cx_id: confirmation.cx_id,
+                confirmed: confirmation.confirmed,
+                verdict: confirmation.verdict.to_owned(),
+                source_key_hex: confirmation.source_key_hex,
+                observed_value: confirmation.observed_value,
+            })
+            .collect(),
+    }))
 }
 
 fn storage_find_similar_response(
@@ -1501,6 +1665,7 @@ fn storage_find_similar_response(
                 shape: format!("{:?}", slot.shape),
                 len: slot.len,
                 built_at_seq: slot.built_at_seq,
+                scoring_law: slot.scoring_law,
             })
             .collect(),
     };
@@ -1560,6 +1725,7 @@ fn storage_find_similar_response(
         maxsim_note: report.maxsim_note,
         grounding_note: report.grounding_note,
         generation,
+        exact: None,
         hits,
     }
 }
@@ -1977,8 +2143,9 @@ pub fn run_intelligence_redundancy(
     db: &synapse_storage::Db,
     params: &StorageIntelligenceParams,
 ) -> Result<StorageIntelligenceRedundancyReport, ErrorData> {
-    let mut assay = synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, String::new())
-        .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
+    let mut assay =
+        synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, String::new())
+            .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
     assay.max_records = clamp_intelligence_records(params.max_records);
     let report = db
         .assay_redundancy_intelligence(&assay)

@@ -94,6 +94,29 @@ pub trait Lens: Send + Sync {
         self.modality() == Modality::Text
     }
 
+    /// Whether this lens can answer an **exact whole-value** query (#1899).
+    ///
+    /// This is a different question from [`Self::text_queryable`] and the two are
+    /// close to mutually exclusive. A free-text lane tokenizes: it must match a
+    /// document that shares *some* words with the query. A whole-string
+    /// content-address lane does the opposite — it hashes the entire byte string
+    /// into one cell, so it can only answer "which records carry exactly this
+    /// value", and it answers that better than any tokenizing lane could.
+    ///
+    /// Such a lane must not join free-text fusion, because it produces a
+    /// one-nonzero vector for *any* phrase and a bucket collision then returns
+    /// an entire unrelated record set at full lane weight with nothing in the
+    /// result to distinguish it from a true match. Declared separately, the
+    /// caller states "this value is the whole field", the collision ambiguity
+    /// becomes the caller's stated intent, and the query mode can confirm each
+    /// candidate against its source field before returning it.
+    ///
+    /// Defaults to false: a lane earns this by being a whole-value hash, never
+    /// by omission.
+    fn exact_value_queryable(&self) -> bool {
+        false
+    }
+
     /// Deterministically measures one input.
     fn measure(&self, input: &Input) -> Result<SlotVector>;
 

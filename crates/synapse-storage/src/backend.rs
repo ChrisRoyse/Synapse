@@ -548,6 +548,15 @@ pub trait StorageBackend: Send + Sync {
         query_time_secs: i64,
         tz_offset_secs: i32,
     ) -> StorageResult<SynapseCalyxTemporalRerankReadback>;
+    /// Confirms exact-match-by-hash candidates against their authoritative
+    /// source fields, dropping bucket collisions (#1899).
+    fn confirm_exact_matches(
+        &self,
+        panel_version: u32,
+        slot: u16,
+        value: &str,
+        cx_ids: &[String],
+    ) -> StorageResult<Vec<constellations::ExactMatchConfirmation>>;
     #[allow(clippy::too_many_lines)]
     fn backfill_temporal_metadata(
         &self,
@@ -2319,6 +2328,132 @@ impl StorageBackend for CalyxBackend {
                 })
             },
         )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one confirmation loop with an explicit verdict per failure mode; collapsing the arms would replace named verdicts with a generic `unconfirmed`, which is the exact ambiguity #1899 exists to remove"
+    )]
+    fn confirm_exact_matches(
+        &self,
+        panel_version: u32,
+        slot: u16,
+        value: &str,
+        cx_ids: &[String],
+    ) -> StorageResult<Vec<constellations::ExactMatchConfirmation>> {
+        use constellations::{
+            EXACT_MATCH_BUCKET_COLLISION, EXACT_MATCH_CONFIRMED, ExactMatchConfirmation,
+        };
+        let lane = constellations::syn_exact_match_lane(panel_version, slot).ok_or_else(|| {
+            StorageError::BackendInvalidConfig {
+                value: format!("panel={panel_version} slot={slot}"),
+                detail: "no exact-match lane is declared for this panel slot, so a hash-lane candidate cannot be confirmed against a source field; declare it in SYN_EXACT_MATCH_LANES beside its measurement site".to_owned(),
+            }
+        })?;
+        let mut out = Vec::with_capacity(cx_ids.len());
+        for cx_id in cx_ids {
+            let parsed = cx_id.trim().parse::<calyx_core::CxId>().map_err(|error| {
+                StorageError::ReadFailed {
+                    cf_name: "base".to_owned(),
+                    detail: format!("exact-match candidate {cx_id:?} is not a CxId: {error}"),
+                }
+            })?;
+            let pointer = self.with_vault(
+                "calyx_base",
+                "read Base source pointer for exact-match confirmation",
+                false,
+                |vault| {
+                    vault.read_base_source_pointer(parsed).map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_base",
+                            "read Base source pointer for exact-match confirmation",
+                            &source,
+                        )
+                    })
+                },
+            )?;
+            let Some(pointer) = pointer else {
+                out.push(ExactMatchConfirmation {
+                    cx_id: cx_id.clone(),
+                    confirmed: false,
+                    source_cf: None,
+                    source_key_hex: None,
+                    observed_value: None,
+                    verdict: "base_row_absent",
+                });
+                continue;
+            };
+            if pointer.panel_version != panel_version {
+                out.push(ExactMatchConfirmation {
+                    cx_id: cx_id.clone(),
+                    confirmed: false,
+                    source_cf: pointer.source_cf,
+                    source_key_hex: pointer.source_key_hex,
+                    observed_value: None,
+                    verdict: "panel_mismatch",
+                });
+                continue;
+            }
+            let (Some(source_cf), Some(source_key_hex)) =
+                (pointer.source_cf.clone(), pointer.source_key_hex.clone())
+            else {
+                out.push(ExactMatchConfirmation {
+                    cx_id: cx_id.clone(),
+                    confirmed: false,
+                    source_cf: pointer.source_cf,
+                    source_key_hex: pointer.source_key_hex,
+                    observed_value: None,
+                    verdict: "source_row_absent",
+                });
+                continue;
+            };
+            if source_cf != lane.source_cf {
+                out.push(ExactMatchConfirmation {
+                    cx_id: cx_id.clone(),
+                    confirmed: false,
+                    source_cf: Some(source_cf),
+                    source_key_hex: Some(source_key_hex),
+                    observed_value: None,
+                    verdict: "source_cf_mismatch",
+                });
+                continue;
+            }
+            let key = decode_source_key_hex(&source_key_hex).map_err(|detail| {
+                StorageError::ReadFailed {
+                    cf_name: source_cf.clone(),
+                    detail: format!(
+                        "exact-match candidate {cx_id} records an undecodable source key: {detail}"
+                    ),
+                }
+            })?;
+            let Some(raw) = self.get_cf(&source_cf, &key)? else {
+                out.push(ExactMatchConfirmation {
+                    cx_id: cx_id.clone(),
+                    confirmed: false,
+                    source_cf: Some(source_cf),
+                    source_key_hex: Some(source_key_hex),
+                    observed_value: None,
+                    verdict: "source_row_absent",
+                });
+                continue;
+            };
+            let observed =
+                constellations::syn_exact_field_value(&source_cf, lane.field_path, &raw)?;
+            let verdict = match observed.as_deref() {
+                Some(found) if found == value => EXACT_MATCH_CONFIRMED,
+                Some(_) => EXACT_MATCH_BUCKET_COLLISION,
+                None => "source_field_absent",
+            };
+            out.push(ExactMatchConfirmation {
+                cx_id: cx_id.clone(),
+                confirmed: verdict == EXACT_MATCH_CONFIRMED,
+                source_cf: Some(source_cf),
+                source_key_hex: Some(source_key_hex),
+                observed_value: observed,
+                verdict,
+            });
+        }
+        Ok(out)
     }
 
     fn temporal_rerank(

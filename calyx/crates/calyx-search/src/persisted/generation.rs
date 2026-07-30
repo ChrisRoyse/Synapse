@@ -24,6 +24,38 @@ pub struct PersistedSearchSlot {
     pub shape: SlotShape,
     pub len: usize,
     pub built_at_seq: u64,
+    /// The exact within-lane scoring law this index ranks by (#1900).
+    ///
+    /// Reported rather than inferred. `sparse_dot` and `sparse_bm25` are both
+    /// "the sparse lane" and rank by entirely different laws — one of them with
+    /// no IDF and no length saturation at all — so a caller reading a rank has
+    /// to be told which one produced it.
+    pub scoring_law: String,
+}
+
+/// The within-lane scoring law for one persisted index kind.
+///
+/// Single source of truth: the strings are derived from the scorers themselves
+/// (`Bm25::law`) or state the operation the lane physically performs, so they
+/// cannot drift from the code that ranks.
+#[must_use]
+pub fn slot_scoring_law(kind: &str) -> String {
+    match kind {
+        "flat_dense" => {
+            "cosine: score(d) = <q,d> / (||q||*||d||) over the exhaustive dense lane".to_owned()
+        }
+        "diskann" => {
+            "cosine: score(d) = <q,d> / (||q||*||d||) over a Vamana graph, approximate by construction".to_owned()
+        }
+        "sparse_bm25" | "sparse_inverted" => calyx_sextant::index::bm25::Bm25::default().law(),
+        "sparse_dot" => {
+            "dot: score(d) = SUM_t q_t * d_t over stored sparse weights; NO idf and NO document-length saturation, so a term shared with a short document can outscore a full exact match (#1900)".to_owned()
+        }
+        "multi_maxsim" | "multi_maxsim_segments" => {
+            "maxsim: score(d) = SUM_i max_j <q_i, d_j> late interaction over token vectors".to_owned()
+        }
+        other => format!("unknown index kind {other}: no declared scoring law"),
+    }
 }
 
 impl PersistedSearchIndexes {
@@ -71,6 +103,7 @@ impl PersistedSearchSlot {
         };
         Ok(Self {
             panel_slot: PanelSlotId::new(panel_version, SlotId::new(entry.slot)),
+            scoring_law: slot_scoring_law(&entry.kind),
             kind: entry.kind.clone(),
             shape,
             len: entry.len,

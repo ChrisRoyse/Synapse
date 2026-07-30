@@ -69,8 +69,7 @@ static DERIVED_STATE_SKIPPED: AtomicU64 = AtomicU64::new(0);
 ///
 /// A `Weak` for the same reason the lowering source is: this registry must not
 /// be the reason a closed vault's handle stays alive.
-static DERIVED_STATE_SOURCE: LazyLock<Mutex<Option<Weak<Db>>>> =
-    LazyLock::new(|| Mutex::new(None));
+static DERIVED_STATE_SOURCE: LazyLock<Mutex<Option<Weak<Db>>>> = LazyLock::new(|| Mutex::new(None));
 
 static DERIVED_STATE_LAST: LazyLock<Mutex<DerivedStateReadback>> =
     LazyLock::new(|| Mutex::new(DerivedStateReadback::default()));
@@ -214,8 +213,12 @@ pub(crate) fn run_derived_state_maintenance() {
             guard.last_search_action = Some(report.action.as_str().to_owned());
             guard.last_search_reason = Some(report.reason.clone());
             guard.last_search_elapsed_ms = Some(report.elapsed_ms);
-            guard.last_search_state_after =
-                Some(report.after.clone().unwrap_or_else(|| report.before.clone()));
+            guard.last_search_state_after = Some(
+                report
+                    .after
+                    .clone()
+                    .unwrap_or_else(|| report.before.clone()),
+            );
         }
         Err(error) => {
             any_failed = true;

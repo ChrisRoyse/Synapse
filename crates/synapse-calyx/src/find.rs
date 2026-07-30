@@ -6,8 +6,17 @@
 //!
 //! * **Query-by-example** — a record key (`cx_id`); its own stored slot vectors
 //!   become the multi-slot query. "Find episodes like this one."
-//! * **Query-by-text** — a text string measured through the active panel's text
-//!   lenses (the BM25-able sparse slots).
+//! * **Query-by-text** — a text string measured through the active panel's
+//!   free-text lenses. On the Synapse panels that is the raw term-frequency
+//!   lexical lane (`syn_sparse_text_tf`), which the index ranks with real BM25.
+//!   The normalized signed lane beside it (`syn_sparse_text`) is deliberately
+//!   *not* free-text queryable: L1 normalization leaves no term frequency to
+//!   saturate and no document length to compare, so it could not rank by
+//!   discriminativeness and a one-word title tied a record's own verbatim title
+//!   (#1900). It remains a similarity feature for `by_example`.
+//! * **Query-by-exact-value** — one whole-value hash-lane slot plus the field
+//!   value, confirmed against the authoritative source row so a bucket collision
+//!   is dropped instead of returned (#1899).
 //!
 //! Doctrine honored here:
 //! * **No-flatten.** Slots stay typed and separate; recall runs per slot and the
@@ -31,10 +40,13 @@
 //! where `rank_s` is 1-based within slot `s`'s recall list and `w_s` is the
 //! slot weight (`1.0` for plain `Rrf`; the panel's declared profile weights for
 //! `WeightedRrf`). `SingleSlot(s)` isolates one lens (`w = 1.0` on `s`,
-//! `0` elsewhere) so a caller can compare pure vector recall vs. pure BM25 recall
-//! against fusion. `k = 60` is Cormack et al.'s validated default and matches
-//! the Sextant substrate; BM25's `k1`/`b` live in the frozen sparse-inverted
-//! index built at rebuild time and are not re-parameterized per query.
+//! `0` elsewhere) so a caller can compare pure vector recall vs. pure lexical
+//! recall against fusion. `k = 60` is Cormack et al.'s validated default and
+//! matches the Sextant substrate; BM25's `k1`/`b` live in the built sparse index
+//! and are not re-parameterized per query. Each consulted lane reports the exact
+//! within-lane law it ranked by on
+//! `generation.slots[].scoring_law`, because `sparse_dot` and `sparse_bm25` are
+//! both "the sparse lane" and rank by entirely different laws (#1900).
 //!
 //! ## Seams
 //! * **Ward guarded search (#1677)** — always `GuardChoice::Off` here. The
@@ -133,6 +145,18 @@ pub enum SynapseCalyxFindQuery {
     ByExample { cx_id: String },
     /// Query-by-text: measured through the active panel's text lenses.
     ByText { text: String },
+    /// Query-by-exact-value: the caller asserts `value` is the **whole** field a
+    /// specific hash-lane slot measures, and the lane answers which records
+    /// carry exactly that value (#1899).
+    ///
+    /// A whole-string hash lane is excluded from free-text fusion on purpose —
+    /// it produces a one-cell vector for any phrase, so a bucket collision would
+    /// inject an entire unrelated record set into every text query with nothing
+    /// in the result to distinguish it from a true match. Stating the assertion
+    /// explicitly makes the collision the caller's declared intent, which is
+    /// what allows each candidate to be confirmed against its source field
+    /// before it is returned.
+    ByExact { slot: u16, value: String },
 }
 
 /// Rank-level fusion strategy for the find pass.
@@ -144,7 +168,7 @@ pub enum SynapseCalyxFindFusion {
     /// Reciprocal Rank Fusion using the panel's declared profile weights.
     WeightedRrf,
     /// Isolate a single lens (e.g. the record-vector slot for pure vector
-    /// recall, or a sparse title/text slot for pure BM25 recall).
+    /// recall, or the sparse term-frequency slot for pure BM25 recall).
     SingleSlot { slot: u16 },
 }
 
@@ -258,6 +282,30 @@ pub struct SynapseCalyxFindGuard {
     pub enable_requirements: Vec<String>,
 }
 
+/// What an exact-value probe physically asked the hash lane (#1899).
+///
+/// Carried on the report so a caller can see that the hit set is a
+/// single-bucket probe and *not yet* an exact-match answer: a bucket collision
+/// is byte-identical to a true match inside the index, so the returned
+/// candidates are unconfirmed until each one's source field is re-read and
+/// compared. `confirmation_required` states that obligation in the payload
+/// rather than leaving it to documentation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxFindExactProbe {
+    pub slot: u16,
+    /// Slot key of the lens that measured the value.
+    pub lens: String,
+    /// The whole-field value the caller asserted.
+    pub value: String,
+    /// Sparse cells the value hashed into. A whole-string hash lights exactly
+    /// one, so more than one cell here means the lane is not what it claims.
+    pub probe_cells: Vec<u32>,
+    pub confirmation_required: String,
+}
+
+/// The confirmation obligation an exact-value probe carries.
+const EXACT_CONFIRMATION_REQUIRED: &str = "these hits are unconfirmed bucket candidates: a hash collision is indistinguishable from a true match inside the index, so each candidate's source field must be re-read and compared to the queried value before it is treated as an exact match; storage operation=find_similar query_mode=by_exact performs that confirmation and reports candidates_probed vs candidates_confirmed";
+
 /// Result of one fused find-similar pass, with the physical generation readback.
 ///
 /// Serialize-only: it embeds the immutable [`PersistedSearchGeneration`] manifest
@@ -266,8 +314,12 @@ pub struct SynapseCalyxFindGuard {
 pub struct SynapseCalyxFindReport {
     pub panel_version: u32,
     pub fusion: String,
-    /// `by_example:<cx_id>` or `by_text`.
+    /// `by_example:<cx_id>`, `by_text`, or `by_exact:slot=<n>`.
     pub query_kind: String,
+    /// Present only for `by_exact`: what the probe physically asked, and the
+    /// confirmation still owed on its candidates (#1899).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact: Option<SynapseCalyxFindExactProbe>,
     pub k: usize,
     pub rrf_k: u32,
     /// The rank-level fusion law, so a caller can recompute every score from the
@@ -355,6 +407,7 @@ impl SynapseCalyxVault {
 
         // Build the multi-slot query, restricted to slots that carry a
         // persisted index (non-indexed slots cannot contribute recall).
+        let mut exact: Option<SynapseCalyxFindExactProbe> = None;
         let (query_vectors, query_kind, self_cx, measurement) = match &params.query {
             SynapseCalyxFindQuery::ByExample { cx_id } => {
                 let example = parse_cx_id(cx_id)?;
@@ -365,7 +418,43 @@ impl SynapseCalyxVault {
                     .filter(|(slot, _)| indexed_slots.contains(slot))
                     .map(|(slot, vector)| (*slot, vector.clone()))
                     .collect::<Vec<_>>();
-                (vectors, format!("by_example:{example}"), Some(example), None)
+                (
+                    vectors,
+                    format!("by_example:{example}"),
+                    Some(example),
+                    None,
+                )
+            }
+            SynapseCalyxFindQuery::ByExact { slot, value } => {
+                let slot = SlotId::new(*slot);
+                let measured = calyx_search::measure_exact_value(&state, slot, value)
+                    .map_err(|error| find_index_error("measure exact-value find query", &error))?;
+                if !indexed_slots.contains(&slot) {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_FIND_EXACT_SLOT_NOT_INDEXED",
+                        format!(
+                            "panel {panel_version} slot {slot} can measure the exact value, but the persisted generation carries no index for it; indexed slots are {:?}",
+                            indexed_slots
+                                .iter()
+                                .map(|slot| slot.get())
+                                .collect::<Vec<_>>()
+                        ),
+                        "rebuild the panel search generation so the hash lane is indexed, then retry",
+                    ));
+                }
+                exact = Some(SynapseCalyxFindExactProbe {
+                    slot: slot.get(),
+                    lens: measured.lens_name.clone(),
+                    value: value.clone(),
+                    probe_cells: measured.probe_cells.clone(),
+                    confirmation_required: EXACT_CONFIRMATION_REQUIRED.to_owned(),
+                });
+                (
+                    vec![(slot, measured.vector)],
+                    format!("by_exact:slot={}", slot.get()),
+                    None,
+                    None,
+                )
             }
             SynapseCalyxFindQuery::ByText { text } => {
                 // Measured over the panel's own slot set, not pre-restricted to
@@ -469,6 +558,7 @@ impl SynapseCalyxVault {
             panel_version,
             fusion: params.fusion.name().to_owned(),
             query_kind,
+            exact,
             k,
             rrf_k,
             rrf_formula: synapse_find_rrf_formula(rrf_k),

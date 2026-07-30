@@ -632,6 +632,11 @@ impl SynapseService {
             .filter(|after| after.panel_version == status.panel_version);
         let measured_delta = measured.and_then(|after| after.delta_changed_keys);
         let measured_at = measured.and_then(|after| after.delta_measured_at_unix_ms);
+        // Where the count came from, not only how large it is (#1901). A delta
+        // measured over every panel's `Base` churn could not distinguish a
+        // genuinely stale generation from a bystander charged for another
+        // panel's ingest, so the composition travels with the number.
+        let measured_composition = measured.and_then(|after| after.delta_composition.clone());
         // The remediation travels with the state it explains. Overriding one
         // without the other left `state=built status=ok` carrying "this read did
         // not measure the changed-key delta, so whether a query can reconcile
@@ -678,7 +683,7 @@ impl SynapseService {
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} delta_changed_keys={:?} delta_measured_at_unix_ms={:?}                  max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
+                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} delta_changed_keys={:?} delta_measured_at_unix_ms={:?}                  delta_composition={} max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
                 state,
                 status.panel_version,
                 status.manifest_present,
@@ -687,6 +692,7 @@ impl SynapseService {
                 status.seq_lag,
                 measured_delta,
                 measured_at,
+                measured_composition.as_deref().unwrap_or("not_measured"),
                 status.max_reconciled_delta_keys,
                 status.rows_covered,
                 status.dense_slot_count,
@@ -700,6 +706,7 @@ impl SynapseService {
             )),
             calyx_search_generation_state: Some(state),
             calyx_search_generation_delta_changed_keys: measured_delta,
+            calyx_search_generation_delta_composition: measured_composition,
             calyx_search_generation_delta_measured_at_unix_ms: measured_at,
             calyx_search_generation_panel_version: status.panel_version,
             calyx_search_generation_manifest_path: status.manifest_path,

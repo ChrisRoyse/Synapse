@@ -1656,7 +1656,7 @@ impl SynapseCalyxVault {
                             "{} record(s) carry both lenses; the estimator requires {SYNAPSE_ASSAY_MIN_SAMPLES}",
                             paired_a.len()
                         ),
-                        );
+                    );
                     continue;
                 }
                 // Classified here rather than left to the estimator, so the

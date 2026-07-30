@@ -266,6 +266,67 @@ impl VersionedCfStore {
         Ok(keys)
     }
 
+    /// The same MVCC changed-key delta as [`Self::changed_keys_after_at`], but
+    /// over `Base` only and attributed to one exact panel version (#1901).
+    ///
+    /// `ColumnFamily::Base` holds the constellations of *every* panel, while a
+    /// persisted search generation is panel-scoped. Counting the whole `Base`
+    /// delta therefore charged one panel's reconciliation budget for every other
+    /// panel's ingest: on the live vault a 329-row timeline generation measured
+    /// 17,785 changed keys after 739 sequences, all of it agent-transcript
+    /// churn, and every timeline query failed closed minutes after a full
+    /// rebuild. Slot CFs need no equivalent scope because a slot id is allocated
+    /// globally and belongs to exactly one panel.
+    ///
+    /// Attribution reads the row's own value bytes, never a separate disk read:
+    /// a key that changed in the range has a version in this overlay table, and
+    /// `decode_header` recovers `panel_version` from it. The whole visible chain
+    /// is examined, not only its newest version, because a delete or a
+    /// cross-panel move must still be charged to the panel that indexed the row.
+    ///
+    /// A key whose entire visible history is tombstoned — the live version it
+    /// replaced has already been compacted out of the overlay — cannot be
+    /// attributed. Those keys are returned *with* the panel's keys and counted
+    /// separately: the changed set is used only to mask rows out of an immutable
+    /// generation, so masking a key that generation never held is a no-op, while
+    /// dropping a key it did hold would serve a deleted row.
+    pub fn changed_base_keys_after_at_for_panel(
+        &self,
+        snapshot: Snapshot,
+        after_exclusive: Seq,
+        panel_version: u32,
+        clock: &dyn Clock,
+    ) -> Result<PanelScopedChangedKeys> {
+        let keys =
+            self.changed_keys_after_at(snapshot, ColumnFamily::Base, after_exclusive, clock)?;
+        let scanned = keys.len();
+        let table = self.rows.read().expect("mvcc row table poisoned");
+        let mut scoped = Vec::new();
+        let mut other_panels = 0_usize;
+        let mut unattributed = 0_usize;
+        for key in keys {
+            match visible_base_panels_in_chain(&table, &key, snapshot.seq())? {
+                ChainPanels::Panels(panels) if panels.contains(&panel_version) => {
+                    scoped.push(key);
+                }
+                ChainPanels::Panels(_) => other_panels += 1,
+                ChainPanels::Unattributable => {
+                    unattributed += 1;
+                    scoped.push(key);
+                }
+            }
+        }
+        drop(table);
+        Ok(PanelScopedChangedKeys {
+            panel_version,
+            scanned,
+            panel: scoped.len() - unattributed,
+            other_panels,
+            unattributed,
+            keys: scoped,
+        })
+    }
+
     /// Scans visible rows for one CF and key range at the pinned sequence.
     pub fn scan_cf_range_at(
         &self,

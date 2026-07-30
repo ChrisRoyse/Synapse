@@ -387,6 +387,7 @@ pub(super) async fn handle(
                         shape: format!("{:?}", slot.shape),
                         len: slot.len,
                         built_at_seq: slot.built_at_seq,
+                        scoring_law: slot.scoring_law,
                     })
                     .collect(),
                 raw_sidecars: report
@@ -961,7 +962,11 @@ pub(super) async fn handle(
                         .iter()
                         .map(|lens| format!(
                             "{}({}) {} constant_value={} records={}",
-                            lens.slot, lens.lens, lens.code, lens.constant_value, lens.records_observed
+                            lens.slot,
+                            lens.lens,
+                            lens.code,
+                            lens.constant_value,
+                            lens.records_observed
                         ))
                         .collect::<Vec<_>>()
                         .join(" | "),

@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, CliResult};
-pub use generation::{PersistedSearchGeneration, PersistedSearchSlot};
+pub use generation::{PersistedSearchGeneration, PersistedSearchSlot, slot_scoring_law};
 pub use marker::{
     MarkerClearOutcome, REBUILD_REQUIRED_REMEDIATION, REBUILD_REQUIRED_SCHEMA,
     RebuildRequiredMarker, clear_rebuild_required_marker, clear_rebuild_required_marker_if_owned,

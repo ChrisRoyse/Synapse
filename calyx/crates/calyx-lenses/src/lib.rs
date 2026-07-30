@@ -30,6 +30,9 @@ pub enum AlgorithmicEncoder {
     SynHash { dim: u32 },
     /// Signed sparse text hash in a power-of-two sparse space.
     SynSparseText { dim: u32 },
+    /// Raw hashed term frequencies over free text: unsigned, unnormalized, and
+    /// therefore the only Syn* text lane a real BM25 scorer can rank (#1900).
+    SynSparseTextTf { dim: u32 },
     /// Hashed text token slots for multi-vector retrieval.
     SynTokenSlots { token_dim: u32 },
     /// Signed multi-hot flag hash in a power-of-two sparse space.
@@ -90,6 +93,7 @@ impl AlgorithmicEncoder {
             Self::SynOneHot { buckets } | Self::SynBin { buckets, .. } => buckets,
             Self::SynHash { dim }
             | Self::SynSparseText { dim }
+            | Self::SynSparseTextTf { dim }
             | Self::SynMultiHot { dim }
             | Self::SynRecordVector { dim }
             | Self::SynCross { dim }
@@ -110,6 +114,7 @@ impl AlgorithmicEncoder {
         match self {
             Self::SynHash { dim }
             | Self::SynSparseText { dim }
+            | Self::SynSparseTextTf { dim }
             | Self::SynMultiHot { dim }
             | Self::SynCross { dim } => SlotShape::Sparse(if dim == 0 { 1 } else { dim }),
             Self::SynTokenSlots { token_dim } => SlotShape::Multi { token_dim },
@@ -182,6 +187,11 @@ impl AlgorithmicLens {
 
     pub fn syn_sparse_text(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::SynSparseText { dim })
+    }
+
+    /// A raw term-frequency lexical lane (#1900).
+    pub fn syn_sparse_text_tf(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
+        Self::new(name, modality, AlgorithmicEncoder::SynSparseTextTf { dim })
     }
 
     pub fn syn_token_slots(name: impl Into<String>, modality: Modality, token_dim: u32) -> Self {
@@ -316,6 +326,7 @@ impl AlgorithmicLens {
             AlgorithmicEncoder::SynOneHot { buckets } => syn::one_hot(&input.bytes, buckets)?,
             AlgorithmicEncoder::SynHash { dim } => syn::hash(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseText { dim } => syn::sparse_text(&input.bytes, dim)?,
+            AlgorithmicEncoder::SynSparseTextTf { dim } => syn::sparse_text_tf(&input.bytes, dim)?,
             AlgorithmicEncoder::SynTokenSlots { token_dim } => {
                 syn::token_slots(&input.bytes, token_dim)?
             }

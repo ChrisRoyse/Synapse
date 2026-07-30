@@ -78,6 +78,9 @@ pub enum AlgorithmicEncoder {
     SynHash { dim: u32 },
     /// Signed sparse text hash in a power-of-two sparse space.
     SynSparseText { dim: u32 },
+    /// Raw hashed term frequencies over free text: unsigned, unnormalized, and
+    /// therefore the only Syn* text lane a real BM25 scorer can rank (#1900).
+    SynSparseTextTf { dim: u32 },
     /// Hashed text token slots for multi-vector retrieval.
     SynTokenSlots { token_dim: u32 },
     /// Signed multi-hot flag hash in a power-of-two sparse space.
@@ -138,6 +141,7 @@ impl AlgorithmicEncoder {
             Self::SparseKeywords { dim }
             | Self::SynHash { dim }
             | Self::SynSparseText { dim }
+            | Self::SynSparseTextTf { dim }
             | Self::SynMultiHot { dim }
             | Self::SynRecordVector { dim }
             | Self::SynCross { dim }
@@ -190,13 +194,32 @@ impl AlgorithmicEncoder {
     /// through the modality arm of [`AlgorithmicLens::text_queryable`], so this
     /// classification cannot narrow existing recall — it only widens it to the
     /// structured-tagged text encoders that were previously unreachable.
+    /// Whether this encoder content-addresses the **whole** input value into one
+    /// cell, which is what makes an exact-match query mode possible (#1899).
+    ///
+    /// True only for `syn_hash`: `syn::hash` digests the entire byte string and
+    /// lights exactly one bucket, so a query equal to a stored value lands in
+    /// that same bucket and every record carrying that value is returned. That
+    /// is genuine exact-match recall, and it is the capability excluded from
+    /// free-text fusion by [`Self::accepts_free_text`] rather than made
+    /// unreachable.
+    ///
+    /// One-hot encoders are excluded even though they also light one cell: their
+    /// vocabulary is closed, so an out-of-vocabulary value still produces a
+    /// bucket, and the "exact match" would be against a value the encoder never
+    /// saw. Tokenizing lanes are excluded because a multi-token vector is not an
+    /// assertion about the whole field.
+    pub const fn accepts_exact_value(self) -> bool {
+        matches!(self, Self::SynHash { .. })
+    }
+
     pub const fn accepts_free_text(self) -> bool {
         match self {
             // Word-token lanes: the query is tokenized and hashed by exactly the
             // same code that tokenized and hashed the stored text.
             Self::SparseKeywords { .. }
             | Self::TokenHash { .. }
-            | Self::SynSparseText { .. }
+            | Self::SynSparseTextTf { .. }
             | Self::SynTokenSlots { .. }
             | Self::SynMultiHot { .. }
             // Character/byte-shape lanes over arbitrary text.
@@ -215,6 +238,19 @@ impl AlgorithmicEncoder {
             // and invisibly wrong, so exact-match-by-hash needs its own explicit
             // query mode rather than silent participation in every text query.
             Self::SynHash { .. }
+            // A normalized signed hash measures the right tokens and cannot
+            // *rank* them. `signed_sparse` L1-normalizes, so every stored vector
+            // sums to 1.0 and each token's weight is 1/n_tokens: there is no
+            // term frequency left to saturate and no document length left to
+            // compare against a corpus average, and no IDF can be applied to a
+            // weight that already absorbed the normalization. Measured on the
+            // live index, that made a one-word title `Notepad` score exactly as
+            // high on a record's own verbatim title as the record itself, and
+            // the arbitrary tie decided recall (#1900). It stays a real
+            // similarity feature — signed hashing is what makes a dot product
+            // unbiased, which is what `by_example` wants — but free-text ranking
+            // belongs to `SynSparseTextTf`, whose raw counts BM25 can rank.
+            | Self::SynSparseText { .. }
             // Closed vocabularies: an out-of-vocabulary phrase still lands in a
             // bucket, so a match here would be fabricated, not measured.
             | Self::OneHot { .. }
@@ -258,6 +294,7 @@ impl AlgorithmicEncoder {
             Self::SparseKeywords { dim }
             | Self::SynHash { dim }
             | Self::SynSparseText { dim }
+            | Self::SynSparseTextTf { dim }
             | Self::SynMultiHot { dim }
             | Self::SynCross { dim }
             | Self::GdeltActorGeo { dim }
@@ -432,6 +469,16 @@ impl AlgorithmicLens {
 
     pub fn syn_sparse_text(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::SynSparseText { dim })
+    }
+
+    /// A raw term-frequency lexical lane (#1900).
+    ///
+    /// Use this, not [`Self::syn_sparse_text`], wherever the lane is meant to be
+    /// ranked by BM25: the normalized signed lane cannot carry a term frequency
+    /// or a document length, so IDF and length saturation have nothing to work
+    /// with there.
+    pub fn syn_sparse_text_tf(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
+        Self::new(name, modality, AlgorithmicEncoder::SynSparseTextTf { dim })
     }
 
     pub fn syn_token_slots(name: impl Into<String>, modality: Modality, token_dim: u32) -> Self {
@@ -612,6 +659,7 @@ impl AlgorithmicLens {
             AlgorithmicEncoder::SynOneHot { buckets } => syn::one_hot(&input.bytes, buckets)?,
             AlgorithmicEncoder::SynHash { dim } => syn::hash(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseText { dim } => syn::sparse_text(&input.bytes, dim)?,
+            AlgorithmicEncoder::SynSparseTextTf { dim } => syn::sparse_text_tf(&input.bytes, dim)?,
             AlgorithmicEncoder::SynTokenSlots { token_dim } => {
                 syn::token_slots(&input.bytes, token_dim)?
             }

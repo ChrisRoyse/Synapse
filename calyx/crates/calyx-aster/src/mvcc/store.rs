@@ -1193,6 +1193,81 @@ fn visible_base_panel(
     panel_from_base_value(key, &value).map(Some)
 }
 
+/// One panel's own share of a `Base` changed-key delta, with the composition
+/// that produced it (#1901).
+///
+/// `scanned` is every key that changed in the range across all panels;
+/// `panel + other_panels + unattributed == scanned`. `keys` carries the
+/// panel's keys plus the unattributable ones, which is exactly the set a
+/// panel-scoped reconciliation must mask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelScopedChangedKeys {
+    /// Panel version the delta was scoped to.
+    pub panel_version: u32,
+    /// Changed `Base` keys in the range, before scoping.
+    pub scanned: usize,
+    /// Keys attributed to `panel_version`.
+    pub panel: usize,
+    /// Keys attributed to some other panel and excluded.
+    pub other_panels: usize,
+    /// Keys whose visible history is entirely tombstoned, so no panel can be
+    /// proven; included in `keys` conservatively.
+    pub unattributed: usize,
+    /// `panel` + `unattributed` keys, in key order.
+    pub keys: Vec<Vec<u8>>,
+}
+
+impl PanelScopedChangedKeys {
+    /// Keys this delta must reconcile.
+    #[must_use]
+    pub fn reconcile_len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// One-line composition, for an error or trace that must say where the
+    /// count came from rather than only how large it is.
+    #[must_use]
+    pub fn composition(&self) -> String {
+        format!(
+            "panel_version={} scanned_base_keys={} panel_keys={} other_panel_keys={} unattributed_keys={}",
+            self.panel_version, self.scanned, self.panel, self.other_panels, self.unattributed
+        )
+    }
+}
+
+/// Panels a single `Base` key's visible version chain can be attributed to.
+enum ChainPanels {
+    /// Every panel version the chain's live versions declared. Never empty.
+    Panels(BTreeSet<u32>),
+    /// Every visible version is a tombstone, so the row's panel is unprovable
+    /// from the overlay alone.
+    Unattributable,
+}
+
+/// Attributes one `Base` key to every panel its visible chain ever declared.
+///
+/// Walks the whole chain rather than only the newest visible version: a row
+/// deleted after the generation was built, or moved between panels, still
+/// belongs to the delta of the panel that indexed it.
+fn visible_base_panels_in_chain(table: &RowTable, key: &[u8], seq: Seq) -> Result<ChainPanels> {
+    let mut panels = BTreeSet::new();
+    let versions = table
+        .get(&ColumnFamily::Base)
+        .and_then(|base| base.get(key))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for version in versions.iter().filter(|version| version.seq <= seq) {
+        if is_tombstone_value(&version.value) {
+            continue;
+        }
+        panels.insert(panel_from_base_value(key, &version.value)?);
+    }
+    if panels.is_empty() {
+        return Ok(ChainPanels::Unattributable);
+    }
+    Ok(ChainPanels::Panels(panels))
+}
+
 fn panel_from_base_value(key: &[u8], value: &[u8]) -> Result<u32> {
     let header = crate::vault::encode::decode_header(value)?;
     if header.cx_id.as_bytes() != key {

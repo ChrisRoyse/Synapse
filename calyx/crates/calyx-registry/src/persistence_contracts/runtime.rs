@@ -182,6 +182,12 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
         ["syn_sparse_text", dim] => AlgorithmicEncoder::SynSparseText {
             dim: parse_u32(dim)?,
         },
+        ["syn_sparse_text_tf"] => AlgorithmicEncoder::SynSparseTextTf {
+            dim: sparse_dim(spec.output)?,
+        },
+        ["syn_sparse_text_tf", dim] => AlgorithmicEncoder::SynSparseTextTf {
+            dim: parse_u32(dim)?,
+        },
         ["syn_token_slots"] => AlgorithmicEncoder::SynTokenSlots {
             token_dim: token_dim(spec.output)?,
         },

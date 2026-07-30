@@ -164,6 +164,17 @@ impl Registry {
             .map(|entry| entry.lens.text_queryable())
     }
 
+    /// Whether a registered lens can answer an exact whole-value query (#1899).
+    ///
+    /// `None` when the lens id is not registered, for the same reason
+    /// [`Self::text_queryable`] distinguishes that case.
+    #[must_use]
+    pub fn exact_value_queryable(&self, id: LensId) -> Option<bool> {
+        self.lenses
+            .get(&id)
+            .map(|entry| entry.lens.exact_value_queryable())
+    }
+
     /// Finds a registered lens by its stable frozen/spec name.
     pub fn find_lens_by_name(&self, name: &str) -> Option<LensId> {
         self.lenses
