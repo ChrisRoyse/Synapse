@@ -506,7 +506,7 @@ pub fn run_grounding_gap(
         .grounding_gap_intelligence(params.panel_version, max_records)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneGroundingGapResponse {
-        source_of_truth: "Calyx Base CF anchors",
+        source_of_truth: "Calyx Base CF anchors + hydrated per-slot CF lens vectors",
         panel_version: report.panel_version,
         records_scanned: report.records_scanned as u64,
         records_measured: report.records_measured as u64,
@@ -1152,7 +1152,7 @@ pub fn run_blind_spot(
         .blind_spot_intelligence(&spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneBlindSpotResponse {
-        source_of_truth: "Calyx Base CF lens vectors",
+        source_of_truth: "Calyx per-slot CF lens vectors (hydrated; the Base CF row carries only slot ids and hashes)",
         panel_version: report.panel_version,
         records_scanned: report.records_scanned as u64,
         records_measured: report.records_measured as u64,
