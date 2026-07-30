@@ -7,7 +7,7 @@ use calyx_sextant::FusionContext;
 use calyx_sextant::{apply_in_region_guard_to_hits, fusion};
 
 use crate::engine_fusion::{stage1_slots, weights_for};
-use crate::engine_measure::{no_indexable_query_vectors, no_indexable_stored_vectors};
+use crate::engine_measure::no_indexable_query_vectors;
 use crate::engine_slot_cache::{SearchSlotCache, search_slots_with_cache};
 use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
@@ -176,8 +176,25 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
     trace.emit("search_slots.done", None, Some(per_slot.len()));
     let slots = per_slot.keys().copied().collect::<Vec<_>>();
     if slots.is_empty() {
-        trace.emit("search_slots.empty", None, None);
-        return Err(no_indexable_stored_vectors().into());
+        // A query that matches no document is the correct answer, not a fault.
+        //
+        // This used to return `CALYX_STALE_DERIVED` ("no indexable stored slot
+        // vectors ... reingest or backfill stale slot rows"), which is a claim
+        // about the *index*. It cannot be true here: the empty-index case is
+        // already handled above, where `indexed_max_len == 0 && delta.is_empty()`
+        // returns an empty outcome, so reaching this point means the indexes do
+        // hold documents and every probed slot simply returned no candidate.
+        //
+        // Saying otherwise sent an operator to rebuild a healthy generation over
+        // a query whose terms merely do not occur in the corpus — a surface
+        // presenting a normal outcome as corruption. It was unreachable while
+        // `by_text` could never produce a query vector at all (#1896); opening
+        // that gate made it the ordinary response to any non-matching phrase.
+        //
+        // The empty outcome carries the generation, so a caller can still see
+        // exactly which index answered and at which sequence.
+        trace.emit("search_slots.empty", None, Some(0));
+        return Ok(SearchOutcome::empty_with_generation(generation));
     }
     let strategy = fusion.to_strategy(&slots)?;
     let context = FusionContext {

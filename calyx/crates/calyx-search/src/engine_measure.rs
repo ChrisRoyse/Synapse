@@ -267,12 +267,6 @@ pub(crate) fn no_indexable_query_vectors() -> CalyxError {
     )
 }
 
-pub(crate) fn no_indexable_stored_vectors() -> CalyxError {
-    CalyxError::stale_derived(
-        "search has no indexable stored slot vectors matching active query lenses; reingest or backfill stale slot rows",
-    )
-}
-
 pub(crate) fn slot_vector_shape(vector: &SlotVector) -> String {
     match vector {
         SlotVector::Dense { dim, data } => format!("dense dim={dim} len={}", data.len()),
