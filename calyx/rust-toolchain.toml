@@ -1,4 +1,19 @@
 [toolchain]
-channel = "1.95.0"
+# MUST match the repository-root `rust-toolchain.toml` channel. `scripts/lint.ps1`
+# gate 2 fails closed on any divergence.
+#
+# Why (issue #1928): `rust-toolchain.toml` is resolved from the CURRENT
+# DIRECTORY, not from the manifest. This file was pinned to 1.95.0 while the root
+# pinned 1.97.1, so `cd calyx; cargo clippy` linted these crates with clippy
+# 0.1.95 while the compiler that actually builds them into `synapse-mcp.exe` was
+# 0.1.97 — two different lint sets over one tree, with every lint added in 1.96
+# and 1.97 silently never firing here. rustfmt diverged the same way, so a
+# `cargo fmt` run from the root and one from `calyx/` could disagree about the
+# same file forever.
+#
+# Aligned to 1.97.1 on 2026-07-31 after measuring that the whole calyx workspace
+# already lints clean under it: `cargo +1.97.1 clippy --workspace --all-targets`
+# from `calyx/` exits 0.
+channel = "1.97.1"
 profile = "minimal"
 components = ["clippy", "rustfmt"]

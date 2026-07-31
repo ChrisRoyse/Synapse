@@ -272,7 +272,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("usage: ward_declared_enum_adjudication_fsv <empty-scratch-dir>")?;
     std::fs::create_dir_all(&root)?;
 
-    println!("ward_declared_enum_adjudication_fsv: root={}", root.display());
+    println!(
+        "ward_declared_enum_adjudication_fsv: root={}",
+        root.display()
+    );
     println!(
         "CONSTRUCTED CORPUS: {TOTAL_ROWS} rows = {GOOD_ROWS} good + {BAD_ROWS} bad, \
          guard slot {GUARD_SLOT} (syn.timeline.hour_cyclic.v1)"
@@ -301,7 +304,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Ok(_) => {
             ok = false;
-            println!("  FAIL — calibrated against an undeclared enum kind. This is the fabrication the guard exists to refuse.");
+            println!(
+                "  FAIL — calibrated against an undeclared enum kind. This is the fabrication the guard exists to refuse."
+            );
         }
     }
 
@@ -356,7 +361,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Err(message) => {
             ok = false;
-            println!("  FAIL — refused the declared corpus: {}", first_line(message));
+            println!(
+                "  FAIL — refused the declared corpus: {}",
+                first_line(message)
+            );
         }
     }
 
@@ -371,7 +379,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             ok &= refused && all_counted_good;
             println!(
                 "  refused={refused} counted_all_{TOTAL_ROWS}_as_good={all_counted_good} {}",
-                if refused && all_counted_good { "OK" } else { "FAIL" }
+                if refused && all_counted_good {
+                    "OK"
+                } else {
+                    "FAIL"
+                }
             );
             println!("  {}", first_line(message));
         }
@@ -397,7 +409,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 bools.bad,
                 bools.unadjudicated,
                 calibrated.readback_calibrated,
-                if same && calibrated.readback_calibrated { "OK" } else { "FAIL" }
+                if same && calibrated.readback_calibrated {
+                    "OK"
+                } else {
+                    "FAIL"
+                }
             );
         }
         Err(message) => {

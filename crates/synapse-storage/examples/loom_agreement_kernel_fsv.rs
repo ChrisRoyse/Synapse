@@ -250,7 +250,9 @@ fn claim_2_and_3_delta_and_determinism() -> bool {
                 Ok(value) => value,
                 Err(error) => {
                     ok = false;
-                    println!("  dim={dim} FAIL — production kernel refused a pair the old loop accepted: {error}");
+                    println!(
+                        "  dim={dim} FAIL — production kernel refused a pair the old loop accepted: {error}"
+                    );
                     break;
                 }
             };
@@ -366,7 +368,9 @@ fn claim_4_and_5_refusals() -> bool {
         overflowing.iter().all(|v| v.is_finite())
     );
     match agreement_scalar_pre_1917(&overflowing, &partner) {
-        Some(value) => println!("  BEFORE (pre-#1917 loop): returned {value} — a wrong answer, silently"),
+        Some(value) => {
+            println!("  BEFORE (pre-#1917 loop): returned {value} — a wrong answer, silently")
+        }
         None => println!("  BEFORE (pre-#1917 loop): refused"),
     }
     match agreement_scalar(&overflowing, &partner) {

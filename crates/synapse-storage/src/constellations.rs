@@ -4,11 +4,10 @@ use std::time::Duration;
 
 use calyx_core::{
     AbsentReason, Asymmetry, CalyxErrorCode, Constellation, CxFlags, CxId, Input, InputRef,
-    LedgerRef, Lens,
-    METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS, METADATA_SOURCE_SEQUENCE,
-    METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE, Modality, Panel, QuantPolicy,
-    Slot, SlotId, SlotKey, SlotResource, SlotState, SlotVector, TEMPORAL_LANE_ACTIVE,
-    TEMPORAL_LANE_INACTIVE, TEMPORAL_MISSING_CREATED_AT, VaultId,
+    LedgerRef, Lens, METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS,
+    METADATA_SOURCE_SEQUENCE, METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE,
+    Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey, SlotResource, SlotState, SlotVector,
+    TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE, TEMPORAL_MISSING_CREATED_AT, VaultId,
 };
 use calyx_lenses::AlgorithmicLens;
 use calyx_lenses::measure::{absent, input_hash};
@@ -5948,9 +5947,7 @@ impl AgentTranscriptToolAdjudication {
 /// carries a distinct label through `corpus_histogram`'s `tool_outcome`
 /// dimension, so the gap is counted from the vault rather than inferred.
 #[must_use]
-pub fn agent_transcript_tool_outcome(
-    record: &AgentTranscriptRecord,
-) -> AgentTranscriptToolOutcome {
+pub fn agent_transcript_tool_outcome(record: &AgentTranscriptRecord) -> AgentTranscriptToolOutcome {
     if record.event_kind.as_deref() != Some(AGENT_TRANSCRIPT_TOOL_RESULT_EVENT_KIND)
         || record.status != TranscriptParseStatus::Parsed
     {
@@ -5968,9 +5965,9 @@ pub fn agent_transcript_tool_outcome(
         Some(TRANSCRIPT_TOOL_STATUS_OK) => {
             AgentTranscriptToolOutcome::Adjudicated(AgentTranscriptToolAdjudication::DeclaredOk)
         }
-        None => AgentTranscriptToolOutcome::Adjudicated(
-            AgentTranscriptToolAdjudication::OmittedIsError,
-        ),
+        None => {
+            AgentTranscriptToolOutcome::Adjudicated(AgentTranscriptToolAdjudication::OmittedIsError)
+        }
         Some(_) => AgentTranscriptToolOutcome::Unadjudicable(
             AgentTranscriptUnadjudicable::UndeclaredStatus,
         ),
@@ -6030,9 +6027,7 @@ fn grounding_anchor_value_payload(value: &GroundingAnchorValue) -> Value {
 /// see [`agent_transcript_tool_outcome`] for why refusing to guess must never
 /// cost the evidence row.
 #[must_use]
-pub fn agent_transcript_outcome_anchor(
-    record: &AgentTranscriptRecord,
-) -> Option<GroundingAnchor> {
+pub fn agent_transcript_outcome_anchor(record: &AgentTranscriptRecord) -> Option<GroundingAnchor> {
     let adjudication = match agent_transcript_tool_outcome(record) {
         AgentTranscriptToolOutcome::NotAToolResult => return None,
         AgentTranscriptToolOutcome::Adjudicated(adjudication) => adjudication,

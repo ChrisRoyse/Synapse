@@ -2075,10 +2075,11 @@ fn transcript_text_presence(record: &synapse_core::AgentTranscriptRecord) -> &'s
 /// Hex-encodes a row key so a decode failure names the exact physical row.
 fn corpus_key_hex(key: &[u8]) -> String {
     use std::fmt::Write as _;
-    key.iter().fold(String::with_capacity(key.len() * 2), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    key.iter()
+        .fold(String::with_capacity(key.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn optional_label(value: Option<&str>) -> String {
@@ -2178,10 +2179,10 @@ pub fn inspect_corpus_histogram(
                             rows_decoded += 1;
                             for name in &wanted {
                                 let label = match name.as_str() {
-                                    "role" => record.role.as_ref().map_or_else(
-                                        || "<absent>".to_owned(),
-                                        json_label,
-                                    ),
+                                    "role" => record
+                                        .role
+                                        .as_ref()
+                                        .map_or_else(|| "<absent>".to_owned(), json_label),
                                     "event_kind" => optional_label(record.event_kind.as_deref()),
                                     "status" => json_label(&record.status),
                                     "source" => json_label(&record.source),
@@ -2194,10 +2195,8 @@ pub fn inspect_corpus_histogram(
                         Err(error) => {
                             decode_failures += 1;
                             if first_decode_failure.is_none() {
-                                first_decode_failure = Some(format!(
-                                    "key_hex={} error={error}",
-                                    corpus_key_hex(key)
-                                ));
+                                first_decode_failure =
+                                    Some(format!("key_hex={} error={error}", corpus_key_hex(key)));
                             }
                         }
                     }

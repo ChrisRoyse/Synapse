@@ -40,8 +40,7 @@ use synapse_core::types::{
     AgentTranscriptRecord, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::constellations::{
-    NativeConstellationContext, SLOT_REFUSED_ABSENT_PREFIX,
-    build_agent_transcript_constellation,
+    NativeConstellationContext, SLOT_REFUSED_ABSENT_PREFIX, build_agent_transcript_constellation,
 };
 
 /// The lens bound this instrument straddles, mirrored from
@@ -95,8 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
              MAX_TEXT_TOKENS={MAX_TEXT_TOKENS} and this run proved nothing; widen the row"
         ));
     }
-    for slot in over_refused.iter().copied() {
-        if !TEXT_SLOTS.contains(&slot) {
+    for slot in &over_refused {
+        if !TEXT_SLOTS.contains(slot) {
             failures.push(format!(
                 "slot {slot} refused, but only the three unbounded text lanes {TEXT_SLOTS:?} \
                  should ever degrade"
@@ -182,7 +181,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         Err(error) => {
-            println!("  refused as required: {}", truncate(&error.to_string(), 120));
+            println!(
+                "  refused as required: {}",
+                truncate(&error.to_string(), 120)
+            );
         }
     }
 

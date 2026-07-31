@@ -121,7 +121,9 @@ use std::collections::BTreeMap;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
-use calyx_core::{AnchorKind, AnchorValue, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine};
+use calyx_core::{
+    AnchorKind, AnchorValue, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine,
+};
 use calyx_registry::load_vault_panel_state;
 use calyx_ward::{
     CalibrationInput, GuardId, GuardPolicy, GuardProfile, MIN_BAD_SCORES, NoveltyAction, SlotKind,

@@ -3144,7 +3144,6 @@ impl StorageBackend for CalyxBackend {
         })
     }
 
-
     #[allow(clippy::too_many_lines)]
     fn put_timeline_constellation(
         &self,

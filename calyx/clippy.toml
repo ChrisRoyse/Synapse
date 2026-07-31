@@ -2,9 +2,24 @@
 #
 # `calyx/Cargo.toml` declares its own `[workspace]`, so Clippy resolves this
 # file rather than the repository-root `clippy.toml` when linting a calyx
-# crate. The cosine guard below must therefore exist in BOTH files: a rule that
-# lives only at the root silently does not apply to the crates that own every
-# cosine implementation, which is precisely the failure mode it guards against.
+# crate. Rules that must hold across both trees therefore have to exist in BOTH
+# files: a rule that lives only at the root silently does not apply to the
+# crates that own every cosine implementation, which is precisely the failure
+# mode it guards against (issue #1928).
+#
+# The shared block below is duplicated byte-for-byte from the root
+# `clippy.toml`. `scripts/lint.ps1` extracts both blocks and fails closed if
+# they differ, so the duplication cannot drift silently.
+#
+# NOTE: this workspace does NOT set `allow-unwrap-in-tests` /
+# `allow-expect-in-tests`, because it does not deny `unwrap_used`/`expect_used`
+# in the first place (see [workspace.lints.clippy] in calyx/Cargo.toml). That is
+# a real policy divergence from the root workspace and `scripts/lint.ps1`
+# reports it, so "I ran lint" never implies the two trees are held to one
+# standard.
+
+# >>> SHARED-LINT-CONTRACT — byte-identical in ./clippy.toml and ./calyx/clippy.toml >>>
+# Edit BOTH files together; scripts/lint.ps1 fails closed on any divergence.
 #
 # #1922 ask 3: make a fifth undispatched cosine impossible to add by accident.
 #
@@ -25,3 +40,4 @@
 disallowed-methods = [
     { path = "calyx_forge::cpu::simd::dot_and_pair_norms", reason = "use calyx_forge::cpu::distance::cosine, the single cosine entry point (#1922); it owns shape validation, dispatched reduction, per-side finiteness attribution, the zero-norm threshold and the [-1,1] range contract, and returns a typed CosineFailure you map to your own error codes" },
 ]
+# <<< SHARED-LINT-CONTRACT <<<

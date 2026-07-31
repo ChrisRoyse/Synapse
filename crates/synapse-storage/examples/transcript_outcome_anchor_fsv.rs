@@ -133,9 +133,7 @@ fn sample_real_tool_results() -> Result<Vec<SampledRow>, Box<dyn Error>> {
             let (expected_adjudication, expected_success) = match block.get("is_error") {
                 Some(Value::Bool(true)) => (AgentTranscriptToolAdjudication::DeclaredError, false),
                 Some(Value::Bool(false)) => (AgentTranscriptToolAdjudication::DeclaredOk, true),
-                None | Some(Value::Null) => {
-                    (AgentTranscriptToolAdjudication::OmittedIsError, true)
-                }
+                None | Some(Value::Null) => (AgentTranscriptToolAdjudication::OmittedIsError, true),
                 Some(_) => continue,
             };
             let bucket = buckets.entry(expected_adjudication.label()).or_default();
@@ -147,9 +145,10 @@ fn sample_real_tool_results() -> Result<Vec<SampledRow>, Box<dyn Error>> {
                 record: transcript_row_from_block(line, block, line_no),
                 expected_success,
                 expected_adjudication,
-                source_file: path
-                    .file_name()
-                    .map_or_else(|| "?".to_owned(), |name| name.to_string_lossy().into_owned()),
+                source_file: path.file_name().map_or_else(
+                    || "?".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
                 source_line: index as u64 + 1,
             });
         }
@@ -373,9 +372,8 @@ fn boundary_audit(db: &Db, failures: &mut Vec<String>) -> Result<(), Box<dyn Err
         verdict(held)
     );
     if !held {
-        failures.push(
-            "an assistant row was anchored, or left anchors on the physical CF".to_owned(),
-        );
+        failures
+            .push("an assistant row was anchored, or left anchors on the physical CF".to_owned());
     }
 
     // (2) A tool_result row carrying two blocks. Constructed, because the real

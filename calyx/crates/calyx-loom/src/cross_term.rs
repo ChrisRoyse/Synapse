@@ -109,7 +109,10 @@ fn agreement_failure_error(failure: CosineFailure) -> calyx_core::CalyxError {
         CosineFailure::Empty => loom_error(CALYX_LOOM_DIM_MISMATCH, "xterm dims 0 and 0"),
         CosineFailure::NonFinite { side, index } => loom_error(
             CALYX_LOOM_NON_FINITE_VECTOR,
-            format!("xterm {} vector element {index} is non-finite", side.label()),
+            format!(
+                "xterm {} vector element {index} is non-finite",
+                side.label()
+            ),
         ),
         CosineFailure::NormOverflow { side } => loom_error(
             CALYX_LOOM_NON_FINITE_VECTOR,
