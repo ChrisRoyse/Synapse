@@ -13,10 +13,10 @@ cuda = ["dep:calyx-forge", "calyx-forge/cuda"]
 
 [dependencies]
 blake3.workspace = true
-calyx-aster = { path = "../calyx-aster" }
-calyx-core = { path = "../calyx-core" }
-calyx-forge = { path = "../calyx-forge", optional = true }
-calyx-loom = { path = "../calyx-loom" }
+calyx-aster = { workspace = true }
+calyx-core = { workspace = true }
+calyx-forge = { workspace = true, optional = true }
+calyx-loom = { workspace = true }
 rand.workspace = true
 rand_chacha.workspace = true
 serde.workspace = true

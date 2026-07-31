@@ -9,13 +9,13 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
-calyx-aster = { path = "../calyx-aster" }
-calyx-core = { path = "../calyx-core" }
-calyx-ledger = { path = "../calyx-ledger" }
-calyx-loom = { path = "../calyx-loom" }
-calyx-mincut = { path = "../calyx-mincut" }
-calyx-paths = { path = "../calyx-paths" }
-calyx-sextant = { path = "../calyx-sextant" }
+calyx-aster = { workspace = true }
+calyx-core = { workspace = true }
+calyx-ledger = { workspace = true }
+calyx-loom = { workspace = true }
+calyx-mincut = { workspace = true }
+calyx-paths = { workspace = true }
+calyx-sextant = { workspace = true }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

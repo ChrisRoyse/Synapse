@@ -28,8 +28,33 @@ rust-version = "1.95"
 license-file = "LICENSE.md"
 authors = ["Synapse contributors"]
 repository = "https://github.com/ChrisRoyse/Synapse"
+# LICENSE.md is PolyForm-Noncommercial-1.0.0 — source-available, NOT open source,
+# and commercial use requires a separate paid licence. These crates must therefore
+# never reach crates.io, and `cargo publish` is the only thing that could put them
+# there by accident. Declaring it here also makes the crates *private* in
+# cargo-deny's sense, which is what `[licenses] private.ignore = true` in deny.toml
+# keys off: the licence gate exists to audit third-party licences, and our own
+# licence is a policy decision rather than a compliance finding. (#1930)
+publish = false
 
 [workspace.dependencies]
+# Vendored calyx crates reached by path (the calyx workspace is `exclude`d).
+# Same reason as calyx/Cargo.toml: a bare `{ path = ... }` is a `*` requirement
+# and `deny.toml` bans wildcards (#1930).
+calyx-assay = { version = "0.1.0", path = "calyx/crates/calyx-assay" }
+calyx-aster = { version = "0.1.0", path = "calyx/crates/calyx-aster" }
+calyx-core = { version = "0.1.0", path = "calyx/crates/calyx-core" }
+calyx-forge = { version = "0.1.0", path = "calyx/crates/calyx-forge" }
+calyx-ledger = { version = "0.1.0", path = "calyx/crates/calyx-ledger" }
+calyx-lenses = { version = "0.1.0", path = "calyx/crates/calyx-lenses" }
+calyx-lodestar = { version = "0.1.0", path = "calyx/crates/calyx-lodestar" }
+calyx-loom = { version = "0.1.0", path = "calyx/crates/calyx-loom" }
+calyx-paths = { version = "0.1.0", path = "calyx/crates/calyx-paths" }
+calyx-registry = { version = "0.1.0", path = "calyx/crates/calyx-registry" }
+calyx-search = { version = "0.1.0", path = "calyx/crates/calyx-search" }
+calyx-sextant = { version = "0.1.0", path = "calyx/crates/calyx-sextant" }
+calyx-ward = { version = "0.1.0", path = "calyx/crates/calyx-ward" }
+
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
 tokio-tungstenite = "0.29.0"
@@ -39,7 +64,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1.1.2"
 thiserror = "2.0.18"
-anyhow = "1.0.102"
+# >= 1.0.103: RUSTSEC-2026-0190 (unsoundness in `Error::downcast_mut()`).
+# Held here rather than only in Cargo.lock so a fresh resolve cannot go back.
+anyhow = "1.0.103"
 async-trait = "0.1.89"
 arboard = { version = "3.6.1", default-features = false }
 base64 = "0.22.1"

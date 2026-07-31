@@ -8,15 +8,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-calyx-assay = { path = "../calyx-assay" }
-calyx-anneal = { path = "../calyx-anneal" }
-calyx-aster = { path = "../calyx-aster" }
-calyx-core = { path = "../calyx-core" }
-calyx-forge = { path = "../calyx-forge" }
-calyx-ledger = { path = "../calyx-ledger" }
-calyx-lodestar = { path = "../calyx-lodestar" }
-calyx-paths = { path = "../calyx-paths" }
-calyx-ward = { path = "../calyx-ward" }
+calyx-assay = { workspace = true }
+calyx-anneal = { workspace = true }
+calyx-aster = { workspace = true }
+calyx-core = { workspace = true }
+calyx-forge = { workspace = true }
+calyx-ledger = { workspace = true }
+calyx-lodestar = { workspace = true }
+calyx-paths = { workspace = true }
+calyx-ward = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 

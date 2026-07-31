@@ -5,15 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
+# PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
+# makes this crate `private` for `cargo deny check licenses` (#1930).
+publish.workspace = true
 
 [features]
 default = []
 
 [dependencies]
-calyx-aster = { path = "../../calyx/crates/calyx-aster" }
-calyx-core = { path = "../../calyx/crates/calyx-core" }
-calyx-lenses = { path = "../../calyx/crates/calyx-lenses" }
-calyx-registry = { path = "../../calyx/crates/calyx-registry" }
+calyx-aster = { workspace = true }
+calyx-core = { workspace = true }
+calyx-lenses = { workspace = true }
+calyx-registry = { workspace = true }
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,15 +36,15 @@ crc32fast = "1"
 # Used only by the reconciled_recall_fsv manual-FSV instrument, which drives the
 # search engine's delta-reconciliation path directly so an empty result can be
 # attributed to a named stage of its own trace rather than inferred (issue #1907).
-calyx-search = { path = "../../calyx/crates/calyx-search" }
+calyx-search = { workspace = true }
 # Used only by host_math_baseline_fsv, which times the production CPU math
 # kernels so the host's instruction baseline is chosen from a measurement.
-calyx-forge = { path = "../../calyx/crates/calyx-forge" }
-calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }
+calyx-forge = { workspace = true }
+calyx-sextant = { workspace = true }
 # Used only by loom_agreement_kernel_fsv, which measures the weave cosine
 # against the scalar loop it replaced so the persisted-value delta is a
 # measurement rather than an assertion (issue #1917).
-calyx-loom = { path = "../../calyx/crates/calyx-loom" }
+calyx-loom = { workspace = true }
 
 [lints]
 workspace = true

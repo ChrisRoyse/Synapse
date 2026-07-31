@@ -58,7 +58,9 @@ Default `--mode` is `Stdio` (env `SYNAPSE_MODE`). See [15_mcp_server_architectur
 | Concurrency | crossbeam, arc-swap | 0.8.4 / 1.9.1 |
 | Clipboard | arboard | 3.6.1 |
 
-Lint posture: `clippy::unwrap_used` / `clippy::expect_used` are **denied workspace-wide** in production paths, allowed only in test code (`clippy.toml`, `[workspace.lints.clippy]`). Dependency/license gating via `cargo-deny` (`deny.toml`).
+Lint posture: `clippy::unwrap_used` / `clippy::expect_used` are **denied workspace-wide** in production paths, allowed only in test code (`clippy.toml`, `[workspace.lints.clippy]`).
+
+Dependency/advisory/license gating via `cargo-deny` (`deny.toml`), run as **gate 5 of `scripts/lint.ps1`** over both workspaces. Requires `cargo-deny >= 0.20.2`; install with `pwsh -File scripts/install-cargo-deny.ps1`. The gate **fails closed when the binary is absent** rather than skipping — until #1930 (2026-07-31) `cargo-deny` was not installed and no script invoked it, so this sentence described a gate that had never run once. Its first real run failed all three checks with 45 findings.
 
 ---
 

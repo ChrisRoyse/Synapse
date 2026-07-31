@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-calyx-core = { path = "../calyx-core" }
-calyx-paths = { path = "../calyx-paths" }
+calyx-core = { workspace = true }
+calyx-paths = { workspace = true }
 rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true

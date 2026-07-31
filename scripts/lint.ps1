@@ -33,8 +33,19 @@
        *current directory*, so `cd calyx; cargo clippy` used to run clippy 0.1.95
        while the root — the compiler that actually builds calyx into the shipped
        binary — ran 0.1.97. Two lint universes over one tree. The pins must match.
-    3. `cargo fmt --all --check`, per workspace.
-    4. `cargo clippy --workspace --all-targets`, per workspace.
+    3. Lock-graph agreement (#1929). Gates 1 and 2 make the two workspaces lint
+       under one config and one compiler; this one makes them lint the same
+       DEPENDENCY GRAPH. `calyx/Cargo.lock` used to resolve independently, and 46
+       package versions reachable from calyx's own crates were absent from the
+       root graph — so a green calyx gate was not evidence about the shipped
+       binary. Delegated to scripts/calyx-lock.ps1, which reads both lock files
+       and invokes no cargo.
+    4. `cargo fmt --all --check`, per workspace.
+    5. `cargo deny check`, per workspace (#1930). Advisories, licenses, bans and
+       sources. FAILS CLOSED when the binary is absent rather than skipping — a
+       gate that reports success while checking nothing is the exact failure mode
+       this script exists to end.
+    6. `cargo clippy --workspace --all-targets`, per workspace.
 
   It also REPORTS (does not fail on) the `[workspace.lints]` policy divergence
   between the two workspaces, so "I ran lint" never implies the two trees are
@@ -45,7 +56,9 @@
   gates. Formatting is the one gate whose repair is unambiguous.
 
 .PARAMETER SkipClippy
-  Run only the cheap config gates and `fmt`. For a fast pre-commit pass.
+  Skip gate 6 only. The config gates, `fmt` and `cargo deny` still run, so a
+  `-SkipClippy` pass is still a real statement about dependency policy and lock
+  agreement — just not about lint cleanliness. For a fast pre-commit pass.
 
 .EXAMPLE
   pwsh -File scripts/lint.ps1
@@ -118,7 +131,7 @@ function Get-SharedContract {
     return $lines[($begin + 1)..($end - 1)]
 }
 
-Write-Gate 'Gate 1/4  shared clippy.toml contract agreement (#1928)'
+Write-Gate 'Gate 1/6  shared clippy.toml contract agreement (#1928)'
 $rootClippy = Join-Path $RepoRoot 'clippy.toml'
 $calyxClippy = Join-Path $CalyxRoot 'clippy.toml'
 try {
@@ -166,7 +179,7 @@ function Get-ToolchainChannel {
     return $match.Matches[0].Groups[1].Value
 }
 
-Write-Gate 'Gate 2/4  rust-toolchain pin agreement (#1928)'
+Write-Gate 'Gate 2/6  rust-toolchain pin agreement (#1928)'
 try {
     $rootChannel = Get-ToolchainChannel -Path (Join-Path $RepoRoot 'rust-toolchain.toml')
     $calyxChannel = Get-ToolchainChannel -Path (Join-Path $CalyxRoot 'rust-toolchain.toml')
@@ -231,7 +244,30 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# Gates 3 and 4 — fmt and clippy, per workspace
+# Gate 3 — the two lock graphs must agree (#1929)
+# ---------------------------------------------------------------------------
+
+Write-Gate 'Gate 3/6  Cargo.lock graph agreement, root vs calyx (#1929)'
+$lockScript = Join-Path $PSScriptRoot 'calyx-lock.ps1'
+if (-not (Test-Path -LiteralPath $lockScript)) {
+    Add-Failure 'SYNAPSE_LINT_LOCK_GATE_MISSING' `
+        "$lockScript does not exist, so the calyx lock graph cannot be checked against the root's" `
+        'restore scripts/calyx-lock.ps1 (issue #1929)'
+}
+else {
+    # Run in-process rather than as a nested pwsh: the child would not share
+    # $script:Failures, and a non-zero exit there must land in THIS script's
+    # verdict rather than being printed and forgotten.
+    & $lockScript -Check
+    if ($LASTEXITCODE -ne 0) {
+        Add-Failure 'SYNAPSE_LINT_CALYX_LOCK_DRIFTED' `
+            "calyx/Cargo.lock resolves package versions that the root graph does not contain and that calyx crates actually reach; the calyx clippy gate below would not be linting what ships" `
+            'pwsh -File scripts/calyx-lock.ps1 -Sync, then re-run this script and commit both lock files together'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Gates 4, 5 and 6 — fmt, cargo-deny and clippy, per workspace
 # ---------------------------------------------------------------------------
 
 function Invoke-CargoGate {
@@ -263,14 +299,72 @@ function Invoke-CargoGate {
 
 $fmtArgs = if ($Fix) { @('fmt', '--all') } else { @('fmt', '--all', '--check') }
 
-Write-Gate 'Gate 3/4  cargo fmt, both workspaces'
+Write-Gate 'Gate 4/6  cargo fmt, both workspaces'
 [void](Invoke-CargoGate -WorkspaceLabel 'root' -WorkingDirectory $RepoRoot -CargoArgs $fmtArgs `
         -Code 'SYNAPSE_LINT_FMT_ROOT_FAILED' -Remediation 'run scripts/lint.ps1 -Fix, then review the diff')
 [void](Invoke-CargoGate -WorkspaceLabel 'calyx' -WorkingDirectory $CalyxRoot -CargoArgs $fmtArgs `
         -Code 'SYNAPSE_LINT_FMT_CALYX_FAILED' -Remediation 'run scripts/lint.ps1 -Fix, then review the diff')
 
+# ---------------------------------------------------------------------------
+# Gate 5 — cargo-deny, both workspaces (#1930)
+# ---------------------------------------------------------------------------
+#
+# `deny.toml` sat in this repository from initial scaffolding and NOTHING ever
+# ran it, while two docs listed it as an active gate. The first real run
+# (2026-07-31) failed all three checks with 45 findings. So the one thing this
+# gate must never do is report success without having run: an absent binary is a
+# HARD FAILURE, not a skip.
+#
+# It runs over BOTH workspaces for the reason gate 3 exists. The root and calyx
+# graphs are not identical even after the lock sync — calyx resolves 13 packages
+# root never sees — and RUSTSEC-2026-0186 (memmap2) was found only in the calyx
+# run before `unsound = "all"` was set in deny.toml.
+
+$DenyMinVersion = [version]'0.20.2'
+
+Write-Gate 'Gate 5/6  cargo deny check, both workspaces (#1930)'
+$denyCmd = Get-Command 'cargo-deny' -ErrorAction SilentlyContinue
+if ($null -eq $denyCmd) {
+    Add-Failure 'SYNAPSE_LINT_CARGO_DENY_ABSENT' `
+        'cargo-deny is not installed on this host, so the advisory/license/ban policy in deny.toml is enforced by nothing (#1930)' `
+        'pwsh -File scripts/install-cargo-deny.ps1'
+}
+else {
+    $denyVersionRaw = (& cargo deny --version 2>&1 | Out-String).Trim()
+    $parsed = $null
+    if ($denyVersionRaw -match 'cargo-deny\s+(\d+\.\d+\.\d+)') { $parsed = [version]$Matches[1] }
+
+    if ($null -eq $parsed) {
+        Add-Failure 'SYNAPSE_LINT_CARGO_DENY_VERSION_UNPARSEABLE' `
+            "'cargo deny --version' returned '$denyVersionRaw', which does not match 'cargo-deny X.Y.Z'" `
+            'pwsh -File scripts/install-cargo-deny.ps1 -Force'
+    }
+    elseif ($parsed -lt $DenyMinVersion) {
+        # deny.toml uses `unsound`/`unmaintained = "all"` and
+        # `unused-ignored-advisory`, which older cargo-deny does not understand.
+        # Catch it by version rather than by a confusing unknown-field error.
+        Add-Failure 'SYNAPSE_LINT_CARGO_DENY_TOO_OLD' `
+            "found cargo-deny $parsed but deny.toml requires >= $DenyMinVersion (it uses the advisories fields unsound/unmaintained = 'all' and unused-ignored-advisory, which older releases reject as unknown)" `
+            "pwsh -File scripts/install-cargo-deny.ps1 -Version $DenyMinVersion -Force"
+    }
+    else {
+        Write-Host "   using $denyVersionRaw" -ForegroundColor Green
+        [void](Invoke-CargoGate -WorkspaceLabel 'root' -WorkingDirectory $RepoRoot `
+                -CargoArgs @('deny', 'check') `
+                -Code 'SYNAPSE_LINT_CARGO_DENY_ROOT_FAILED' `
+                -Remediation 'read the reported RUSTSEC ids / licenses / bans. Fix at the source (cargo update, a manifest floor, a removed wildcard). Only add a deny.toml ignore with a written reason and a removal condition.')
+        # calyx/ has no deny.toml of its own by design — one policy governs the
+        # whole tree, so the root config is passed in explicitly. A second file
+        # would be a second policy that could silently disagree with this one.
+        [void](Invoke-CargoGate -WorkspaceLabel 'calyx' -WorkingDirectory $CalyxRoot `
+                -CargoArgs @('deny', '--config', (Join-Path $RepoRoot 'deny.toml'), 'check') `
+                -Code 'SYNAPSE_LINT_CARGO_DENY_CALYX_FAILED' `
+                -Remediation 'same as root. Note the calyx graph holds 13 packages the root never resolves, so a finding here can be genuinely calyx-only.')
+    }
+}
+
 if (-not $SkipClippy) {
-    Write-Gate 'Gate 4/4  cargo clippy, both workspaces'
+    Write-Gate 'Gate 6/6  cargo clippy, both workspaces'
     $clippyArgs = @('clippy', '--workspace', '--all-targets')
     [void](Invoke-CargoGate -WorkspaceLabel 'root' -WorkingDirectory $RepoRoot -CargoArgs $clippyArgs `
             -Code 'SYNAPSE_LINT_CLIPPY_ROOT_FAILED' -Remediation 'fix the reported lints; the root workspace denies clippy::all')
@@ -281,7 +375,7 @@ if (-not $SkipClippy) {
             -Code 'SYNAPSE_LINT_CLIPPY_CALYX_FAILED' -Remediation 'fix the reported lints; the calyx workspace denies clippy::all')
 }
 else {
-    Write-Gate 'Gate 4/4  cargo clippy — SKIPPED by -SkipClippy'
+    Write-Gate 'Gate 6/6  cargo clippy — SKIPPED by -SkipClippy'
     Write-Host '   NOTE this run proves nothing about lint cleanliness in either workspace.' -ForegroundColor Yellow
 }
 

@@ -21,12 +21,12 @@ cuda = ["dep:cudarc", "dep:cuvs-sys"]
 [dependencies]
 bincode.workspace = true
 blake3.workspace = true
-calyx-anneal = { path = "../calyx-anneal" }
-calyx-aster = { path = "../calyx-aster" }
-calyx-core = { path = "../calyx-core" }
-calyx-forge = { path = "../calyx-forge" }
-calyx-paths = { path = "../calyx-paths" }
-calyx-ward = { path = "../calyx-ward" }
+calyx-anneal = { workspace = true }
+calyx-aster = { workspace = true }
+calyx-core = { workspace = true }
+calyx-forge = { workspace = true }
+calyx-paths = { workspace = true }
+calyx-ward = { workspace = true }
 memmap2.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

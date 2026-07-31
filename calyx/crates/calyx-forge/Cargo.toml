@@ -12,8 +12,8 @@ default = []
 cuda = ["dep:cudarc"]
 
 [dependencies]
-calyx-core = { path = "../calyx-core" }
-calyx-ledger = { path = "../calyx-ledger" }
+calyx-core = { workspace = true }
+calyx-ledger = { workspace = true }
 cudarc = { workspace = true, optional = true, features = ["std", "driver", "cublas", "nvrtc", "dynamic-linking", "cuda-13030"] }
 nvml-wrapper.workspace = true
 rand.workspace = true

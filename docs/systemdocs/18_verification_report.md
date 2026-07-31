@@ -67,7 +67,8 @@
 | Clippy | `clippy::unwrap_used` / `clippy::expect_used` **denied** workspace-wide. |
 | Pre-push gate | `.githooks/pre-push` runs root fmt/clippy for root Rust/Cargo changes and separate Calyx fmt/clippy with `--manifest-path calyx/Cargo.toml` for `calyx/` Rust/Cargo changes. |
 | Calyx CUDA build env | `scripts/synapse-setup.ps1` publishes `NVCC_CCBIN` and appends `-Xcompiler=/Zc:preprocessor` to `NVCC_APPEND_FLAGS` when CUDA is installed so Windows CUDA 13.x dependency kernels fail loudly only on real compiler/config errors. |
-| Dependency/license gate | `cargo-deny` (`deny.toml`): targets x86_64 linux-gnu + windows-msvc; allowed licenses MIT, Apache-2.0 (+LLVM-exception), BSD-2/3-Clause, MPL-2.0; advisories version 2. |
+| Dependency/license gate | `cargo-deny` (`deny.toml`), run as gate 5 of `scripts/lint.ps1` over **both** workspaces (root config passed to calyx via `--config`). Targets x86_64 linux-gnu + windows-msvc; allowed licenses MIT, Apache-2.0 (+LLVM-exception), BSD-2/3-Clause, MPL-2.0, ISC, Zlib, Unicode-3.0, BSL-1.0, CC0-1.0, CDLA-Permissive-2.0; advisories version 2 with `unsound`/`unmaintained = "all"`, `yanked = "deny"` and `unused-ignored-advisory = "deny"`. First-party crates are `publish = false` and exempted via `licenses.private.ignore`. Requires `cargo-deny >= 0.20.2` (`scripts/install-cargo-deny.ps1`); an absent binary is a hard failure, not a skip (#1930). |
+| Lock-graph gate | `scripts/calyx-lock.ps1 -Check`, run as gate 3 of `scripts/lint.ps1`. Asserts that every package version reachable from calyx's own crates in `calyx/Cargo.lock` is also present in the root `Cargo.lock`, so the calyx lint workspace compiles the graph that ships. `-Sync` regenerates `calyx/Cargo.lock` from the root lock (#1929). |
 | CI | None (no `.github/` workflows, Makefile, justfile, or nextest config). |
 | Lint status at snapshot | Not executed in this pass (`cargo clippy` not run here) — "Not determined from source". |
 

@@ -19,12 +19,12 @@ default = []
 cuda = ["calyx-sextant/cuda"]
 
 [dependencies]
-calyx-core = { path = "../calyx-core" }
-calyx-aster = { path = "../calyx-aster" }
-calyx-ledger = { path = "../calyx-ledger" }
-calyx-sextant = { path = "../calyx-sextant" }
-calyx-registry = { path = "../calyx-registry" }
-calyx-ward = { path = "../calyx-ward" }
+calyx-core = { workspace = true }
+calyx-aster = { workspace = true }
+calyx-ledger = { workspace = true }
+calyx-sextant = { workspace = true }
+calyx-registry = { workspace = true }
+calyx-ward = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true

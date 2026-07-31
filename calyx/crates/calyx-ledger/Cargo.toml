@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 bincode.workspace = true
 blake3.workspace = true
-calyx-core = { path = "../calyx-core" }
+calyx-core = { workspace = true }
 ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true

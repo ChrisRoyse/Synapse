@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
+# PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
+# makes this crate `private` for `cargo deny check licenses` (#1930).
+publish.workspace = true
 
 [[bin]]
 name = "synapse-mcp"

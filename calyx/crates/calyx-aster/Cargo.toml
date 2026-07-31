@@ -11,10 +11,10 @@ publish.workspace = true
 aes-gcm.workspace = true
 bincode.workspace = true
 blake3.workspace = true
-calyx-core = { path = "../calyx-core" }
-calyx-forge = { path = "../calyx-forge" }
-calyx-ledger = { path = "../calyx-ledger" }
-calyx-paths = { path = "../calyx-paths" }
+calyx-core = { workspace = true }
+calyx-forge = { workspace = true }
+calyx-ledger = { workspace = true }
+calyx-paths = { workspace = true }
 crc32fast.workspace = true
 hkdf.workspace = true
 memmap2.workspace = true

@@ -13,11 +13,11 @@ cuda = ["candle-cuda", "calyx-forge/cuda"]
 candle-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "fastembed/cuda"]
 
 [dependencies]
-calyx-assay = { path = "../calyx-assay" }
-calyx-aster = { path = "../calyx-aster" }
-calyx-core = { path = "../calyx-core" }
-calyx-forge = { path = "../calyx-forge" }
-calyx-ledger = { path = "../calyx-ledger" }
+calyx-assay = { workspace = true }
+calyx-aster = { workspace = true }
+calyx-core = { workspace = true }
+calyx-forge = { workspace = true }
+calyx-ledger = { workspace = true }
 blake3.workspace = true
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
