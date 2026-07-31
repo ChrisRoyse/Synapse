@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use calyx_core::{Constellation, CxId, SlotId, VaultStore};
+use calyx_core::{Constellation, CxId, SlotId, SlotVector, VaultStore};
 use calyx_registry::{VaultPanelState, load_vault_panel_state};
 use calyx_search::{
     FusionChoice, FusionTuning, GuardChoice, PersistedSearchGeneration, PersistedSearchIndexes,
@@ -517,10 +517,30 @@ impl SynapseCalyxVault {
             SynapseCalyxFindQuery::ByExample { cx_id } => {
                 let example = parse_cx_id(cx_id)?;
                 let constellation = self.read_example_constellation(example, panel_version)?;
+                // Two independent reasons a stored slot cannot carry a query,
+                // and both must be applied.
+                //
+                // `indexed_slots` drops lenses the generation does not index —
+                // they cannot contribute recall.
+                //
+                // `Absent` drops lenses that never measured THIS record. An
+                // absent slot is an explicit "this lens did not measure this
+                // input", not a zero vector, so it is not a query: forwarding
+                // one made the persisted search refuse the whole pass with
+                // SYNAPSE_CALYX_FIND_INDEX_STALE ("slot N received an absent
+                // query vector"), which names a stale index and sends the
+                // operator to rebuild — when nothing is stale and the rebuild
+                // cannot help. Measured on syn-mcp-usage-v1 @ 1776006: slot 87
+                // (error_onehot) is populated on 242 of 1,240 records, so every
+                // by_example probe on a record that simply did not error failed
+                // that way. The active panel hid this because its records
+                // populate every indexed slot.
                 let vectors = constellation
                     .slots
                     .iter()
-                    .filter(|(slot, _)| indexed_slots.contains(slot))
+                    .filter(|(slot, vector)| {
+                        indexed_slots.contains(slot) && !matches!(vector, SlotVector::Absent { .. })
+                    })
                     .map(|(slot, vector)| (*slot, vector.clone()))
                     .collect::<Vec<_>>();
                 (
