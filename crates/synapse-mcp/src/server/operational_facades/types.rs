@@ -30,6 +30,7 @@ use crate::m3::{
         StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
         StorageRetireOrphanSlotCfsResponse, StorageSearchRebuildParams,
         StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
+        StorageCorpusHistogramParams, StorageCorpusHistogramResponse,
         StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
         StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
     },
@@ -42,6 +43,7 @@ pub enum StorageOperation {
     GcOnce,
     Anchors,
     TemporalPanels,
+    CorpusHistogram,
     TemporalRerank,
     TemporalBackfill,
     SearchRebuild,
@@ -60,6 +62,7 @@ impl StorageOperation {
             Self::GcOnce => "gc_once",
             Self::Anchors => "anchors",
             Self::TemporalPanels => "temporal_panels",
+            Self::CorpusHistogram => "corpus_histogram",
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
             Self::SearchRebuild => "search_rebuild",
@@ -86,6 +89,8 @@ pub struct StorageParams {
     pub anchors: Option<StorageAnchorsParams>,
     #[serde(default)]
     pub temporal_panels: Option<StorageTemporalPanelsParams>,
+    #[serde(default)]
+    pub corpus_histogram: Option<StorageCorpusHistogramParams>,
     #[serde(default)]
     pub temporal_rerank: Option<StorageTemporalRerankParams>,
     #[serde(default)]
@@ -120,6 +125,8 @@ pub struct StorageResponse {
     pub anchors: Option<StorageAnchorsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_panels: Option<StorageTemporalPanelsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus_histogram: Option<StorageCorpusHistogramResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_rerank: Option<StorageTemporalRerankResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

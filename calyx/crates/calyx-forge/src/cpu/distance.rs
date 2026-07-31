@@ -93,9 +93,151 @@ pub fn paired_cosine_batch(
         let right_norm = right_norm_sq.sqrt();
         check_norm_positive(left_norm, "paired_cosine_batch", pair_idx)?;
         check_norm_positive(right_norm, "paired_cosine_batch", pair_idx)?;
-        *score = dot / (left_norm * right_norm);
+        // The same range contract the scalar entry point enforces (#1923): this
+        // site computed `dot / denom` inline and shipped the raw quotient, so a
+        // pair of identical vectors could emit a score just over 1.0 exactly as
+        // `dense_cosine` did. Single-sourced rather than restated (#1922).
+        let quotient = dot / (left_norm * right_norm);
+        *score = calyx_core::clamp_cosine_quotient(quotient).ok_or_else(|| {
+            crate::ForgeError::NumericalInvariant {
+                op: "paired_cosine_batch".to_string(),
+                detail: format!(
+                    "pair {pair_idx} produced cosine {quotient}, further outside [-1,1] than f32 rounding explains"
+                ),
+                remediation: "a cosine outside [-1,1] beyond the rounding tolerance is a real defect in the inputs or the reduction, not a value to clamp; inspect the pair's vectors".to_string(),
+            }
+        })?;
     }
     Ok(())
+}
+
+/// Which operand a cosine failure is attributable to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CosineSide {
+    Left,
+    Right,
+}
+
+impl CosineSide {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+/// Why one cosine could not be computed, in terms a caller maps to its own
+/// error vocabulary (#1922).
+///
+/// The error-code mapping is what kept five cosine sites from sharing one
+/// implementation: `calyx-loom` must return `CALYX_LOOM_*`, `calyx-sextant`
+/// `CALYX_SEXTANT_*`, and the shared primitive returned a `ForgeError` that
+/// neither could emit without string-matching it. A typed enum makes the
+/// mapping the caller's one line of work and the *computation* shared, which is
+/// the correct split.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CosineFailure {
+    /// Operand lengths differ.
+    DimMismatch { left: usize, right: usize },
+    /// Both operands are empty; a cosine over no dimensions is undefined.
+    Empty,
+    /// One operand carries a non-finite element, with the offending index.
+    NonFinite { side: CosineSide, index: usize },
+    /// Both operands are finite but their dot product overflowed.
+    Overflow,
+    /// One operand has zero (or non-finite) norm; the quotient is undefined.
+    ZeroNorm { side: CosineSide },
+    /// The quotient landed further outside `[-1, 1]` than rounding explains.
+    OutOfRange { cosine: f32 },
+}
+
+/// **The** cosine of two dense vectors: the one entry point every site should
+/// reach for (#1922).
+///
+/// It owns, in one place, everything each site used to own separately:
+///
+/// - shape validation, naming both lengths;
+/// - the runtime-dispatched reduction, so "does this CPU have AVX2" is not a
+///   question a new call site can answer wrongly;
+/// - **fused** finiteness classification with per-side attribution — a
+///   non-finite element can only poison the accumulator it feeds, so each norm
+///   is an exact per-side detector and the reduction result is a complete and
+///   strictly stronger check than a second pre-scan pass over the input. The
+///   index is recovered by scanning only on the failure path, where cost is
+///   irrelevant;
+/// - the zero-norm threshold;
+/// - the `[-1, 1]` range contract, single-sourced from
+///   [`calyx_core::clamp_cosine_quotient`] — the defect #1923 found, which the
+///   sites that computed `dot / denom` inline each had to be fixed for
+///   separately, or were never fixed at all.
+///
+/// Determinism is the dispatched kernels' contract and is proven once by
+/// `reduction_paths_agree` (dispatched == portable, bit for bit); it is
+/// referenced here rather than restated.
+///
+/// # Errors
+///
+/// Returns a [`CosineFailure`] the caller maps to its own domain error. This
+/// function never returns a value it could not compute, and never a clamped
+/// stand-in for one.
+pub fn cosine(left: &[f32], right: &[f32]) -> core::result::Result<f32, CosineFailure> {
+    if left.len() != right.len() {
+        return Err(CosineFailure::DimMismatch {
+            left: left.len(),
+            right: right.len(),
+        });
+    }
+    if left.is_empty() {
+        return Err(CosineFailure::Empty);
+    }
+    let (dot_value, left_norm_sq, right_norm_sq) = dot_and_pair_norms(left, right);
+    // Norms first, and per side, for the reason spelled out in
+    // `paired_cosine_batch`: a non-finite `dot` does not say which operand
+    // carried the non-finite value, so testing it first misattributes.
+    if !left_norm_sq.is_finite() {
+        return Err(CosineFailure::NonFinite {
+            side: CosineSide::Left,
+            index: first_non_finite(left),
+        });
+    }
+    if !right_norm_sq.is_finite() {
+        return Err(CosineFailure::NonFinite {
+            side: CosineSide::Right,
+            index: first_non_finite(right),
+        });
+    }
+    if !dot_value.is_finite() {
+        return Err(CosineFailure::Overflow);
+    }
+    let left_norm = left_norm_sq.sqrt();
+    let right_norm = right_norm_sq.sqrt();
+    if !left_norm.is_finite() || left_norm <= 0.0 {
+        return Err(CosineFailure::ZeroNorm {
+            side: CosineSide::Left,
+        });
+    }
+    if !right_norm.is_finite() || right_norm <= 0.0 {
+        return Err(CosineFailure::ZeroNorm {
+            side: CosineSide::Right,
+        });
+    }
+    let quotient = dot_value / (left_norm * right_norm);
+    calyx_core::clamp_cosine_quotient(quotient)
+        .ok_or(CosineFailure::OutOfRange { cosine: quotient })
+}
+
+/// Index of the first non-finite element, for failure-path attribution only.
+///
+/// Returns `values.len()` when every element is finite, which the callers above
+/// can only reach if a reduction reported non-finite over finite inputs — an
+/// overflow, already classified separately.
+fn first_non_finite(values: &[f32]) -> usize {
+    values
+        .iter()
+        .position(|value| !value.is_finite())
+        .unwrap_or(values.len())
 }
 
 fn validate_batch(

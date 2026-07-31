@@ -443,6 +443,44 @@ pub struct StoragePressureSampleParams {
 #[serde(deny_unknown_fields)]
 pub struct StorageTemporalPanelsParams {}
 
+/// Distribution readback over one authoritative source CF (#1920, #1921).
+///
+/// Both issues stalled on the same missing capability: there was no way to ask
+/// "what *kinds* of row does this corpus actually hold". #1920 needed it to
+/// decide whether 32 anchors over 4,420 agent events is the correct rate or a
+/// dropped write, and #1921 needed it to decide whether a text lane measuring
+/// 9.9% of rows was encoding correctly or blind. Both had to be answered by
+/// re-deriving the distribution from source files outside the vault, which
+/// proves nothing about what the vault holds.
+///
+/// This reads the authoritative rows themselves, decodes each one through the
+/// same typed record the writer used, and counts. It is deliberately a *scan*
+/// with an explicit cap and an explicit `complete` flag rather than a cached
+/// aggregate: a stale aggregate that silently disagrees with the corpus is
+/// exactly the failure mode #1918 fixed elsewhere.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCorpusHistogramParams {
+    /// Authoritative source CF to scan. `CF_AGENT_TRANSCRIPTS` and
+    /// `CF_AGENT_EVENTS` are supported; anything else fails closed naming the
+    /// supported set, rather than returning an empty histogram that reads like
+    /// "this corpus has no rows".
+    pub source_cf: String,
+    /// Dimensions to count. Empty means every dimension this CF declares.
+    #[serde(default)]
+    pub dimensions: Vec<String>,
+    /// Cap on rows scanned. Omit for the whole CF (bounded by
+    /// [`CORPUS_HISTOGRAM_MAX_ROWS`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 200_000))]
+    pub max_rows: Option<u64>,
+    /// Cap on distinct values reported per dimension. The full distinct count
+    /// is always reported, so truncation is visible and never silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub max_buckets: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageTemporalRerankParams {
@@ -672,6 +710,44 @@ pub struct StorageTemporalPanelsResponse {
     pub registry_cf: String,
     pub registration_count: u64,
     pub panels: Vec<StorageTemporalPanel>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCorpusHistogramResponse {
+    pub source_of_truth: &'static str,
+    pub source_cf: String,
+    pub rows_scanned: u64,
+    /// Rows that decoded into their typed record.
+    pub rows_decoded: u64,
+    /// Rows present in the CF that would NOT decode. Never silently dropped:
+    /// `rows_scanned - rows_decoded == decode_failures` is an invariant a reader
+    /// can check, so a corpus with unreadable rows cannot masquerade as a
+    /// smaller clean one.
+    pub decode_failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_decode_failure: Option<String>,
+    /// True when the scan reached the end of the CF rather than a row cap.
+    pub complete: bool,
+    pub dimensions: Vec<StorageCorpusHistogramDimension>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCorpusHistogramDimension {
+    pub dimension: String,
+    /// Distinct values observed, before any bucket cap.
+    pub distinct_values: u64,
+    /// True when `buckets` holds fewer than `distinct_values` entries.
+    pub buckets_truncated: bool,
+    pub buckets: Vec<StorageCorpusHistogramBucket>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCorpusHistogramBucket {
+    pub value: String,
+    pub count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1849,6 +1925,13 @@ pub fn required_permissions_temporal_panels(
 }
 
 #[must_use]
+pub fn required_permissions_corpus_histogram(
+    _params: &StorageCorpusHistogramParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
 pub fn required_permissions_temporal_rerank(
     _params: &StorageTemporalRerankParams,
 ) -> RequiredPermissions {
@@ -1897,6 +1980,287 @@ pub fn inspect_storage_anchors(
         .calyx_anchor_scan_for_source(cf_name, &key, &source_value)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(storage_anchors_response(report, source_value_len_bytes))
+}
+
+/// Hard ceiling on rows one histogram pass may scan.
+const CORPUS_HISTOGRAM_MAX_ROWS: u64 = 200_000;
+/// Rows read per physical page while scanning.
+const CORPUS_HISTOGRAM_PAGE_ROWS: usize = 2_000;
+/// Default cap on reported buckets per dimension.
+const CORPUS_HISTOGRAM_DEFAULT_BUCKETS: u32 = 64;
+
+/// Dimensions `CF_AGENT_TRANSCRIPTS` declares.
+const TRANSCRIPT_DIMENSIONS: &[&str] =
+    &["role", "event_kind", "status", "source", "text_presence"];
+/// Dimensions `CF_AGENT_EVENTS` declares.
+const AGENT_EVENT_DIMENSIONS: &[&str] = &["kind", "end_state", "reason_code", "adjudicable"];
+
+fn declared_dimensions(source_cf: &str) -> Option<&'static [&'static str]> {
+    match source_cf {
+        cf::CF_AGENT_TRANSCRIPTS => Some(TRANSCRIPT_DIMENSIONS),
+        cf::CF_AGENT_EVENTS => Some(AGENT_EVENT_DIMENSIONS),
+        _ => None,
+    }
+}
+
+/// Which of a transcript row's prose sources actually carry text.
+///
+/// This is the exact question #1921 turned on, made readable from the vault
+/// instead of re-derived from source files: `content_summary` is what the
+/// `text_bm25` lane measures, and `tool_calls[]` is the prose that lane could
+/// not see. A row counted `tool_prose_only` is a row with real text that the
+/// content-only lane scores as empty.
+fn transcript_text_presence(record: &synapse_core::AgentTranscriptRecord) -> &'static str {
+    let has_content = record
+        .content_summary
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+        || record
+            .source_error
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || record
+            .parse_error
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+    let has_tool_prose = record.tool_calls.iter().any(|tool| {
+        !tool.tool_name.trim().is_empty()
+            || tool
+                .arguments
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+            || tool
+                .result_summary
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+    });
+    match (has_content, has_tool_prose) {
+        (true, true) => "both",
+        (true, false) => "content_only",
+        (false, true) => "tool_prose_only",
+        (false, false) => "none",
+    }
+}
+
+/// Hex-encodes a row key so a decode failure names the exact physical row.
+fn corpus_key_hex(key: &[u8]) -> String {
+    use std::fmt::Write as _;
+    key.iter().fold(String::with_capacity(key.len() * 2), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+fn optional_label(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map_or_else(|| "<absent>".to_owned(), ToOwned::to_owned)
+}
+
+fn json_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|json| json.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "<unencodable>".to_owned())
+}
+
+/// Counts the declared dimensions of one authoritative source CF (#1920/#1921).
+///
+/// # Errors
+///
+/// Fails closed on an unsupported CF, an undeclared dimension, or a scan
+/// failure. A row that will not decode is **counted and reported**, never
+/// skipped silently: a histogram that quietly drops rows is a histogram that
+/// lies about the corpus, which is the class of defect #1918 fixed.
+pub fn inspect_corpus_histogram(
+    db: &synapse_storage::Db,
+    params: &StorageCorpusHistogramParams,
+) -> Result<StorageCorpusHistogramResponse, ErrorData> {
+    let Some(declared) = declared_dimensions(params.source_cf.as_str()) else {
+        return Err(mcp_error_with_remediation(
+            "SYNAPSE_STORAGE_CORPUS_HISTOGRAM_CF_UNSUPPORTED",
+            format!(
+                "corpus histogram does not declare dimensions for source_cf `{}`",
+                params.source_cf
+            ),
+            &format!(
+                "supply one of: {}, {}. A CF with no declared dimensions has no typed record to decode, and returning an empty histogram would read like an empty corpus",
+                cf::CF_AGENT_TRANSCRIPTS,
+                cf::CF_AGENT_EVENTS
+            ),
+        ));
+    };
+    let wanted: Vec<String> = if params.dimensions.is_empty() {
+        declared.iter().map(|name| (*name).to_owned()).collect()
+    } else {
+        for requested in &params.dimensions {
+            if !declared.contains(&requested.as_str()) {
+                return Err(mcp_error_with_remediation(
+                    "SYNAPSE_STORAGE_CORPUS_HISTOGRAM_DIMENSION_UNKNOWN",
+                    format!(
+                        "source_cf `{}` declares no dimension `{requested}`",
+                        params.source_cf
+                    ),
+                    &format!("declared dimensions are: {}", declared.join(", ")),
+                ));
+            }
+        }
+        params.dimensions.clone()
+    };
+
+    let row_cap = params
+        .max_rows
+        .unwrap_or(CORPUS_HISTOGRAM_MAX_ROWS)
+        .clamp(1, CORPUS_HISTOGRAM_MAX_ROWS);
+    let bucket_cap = params
+        .max_buckets
+        .unwrap_or(CORPUS_HISTOGRAM_DEFAULT_BUCKETS)
+        .clamp(1, 1000) as usize;
+
+    let mut counts: BTreeMap<String, BTreeMap<String, u64>> = wanted
+        .iter()
+        .map(|name| (name.clone(), BTreeMap::new()))
+        .collect();
+    let mut rows_scanned = 0_u64;
+    let mut rows_decoded = 0_u64;
+    let mut decode_failures = 0_u64;
+    let mut first_decode_failure: Option<String> = None;
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut more = true;
+
+    while more && rows_scanned < row_cap {
+        let remaining = usize::try_from(row_cap - rows_scanned).unwrap_or(usize::MAX);
+        let page = db
+            .scan_cf_physical_page(
+                params.source_cf.as_str(),
+                cursor.as_deref(),
+                remaining.min(CORPUS_HISTOGRAM_PAGE_ROWS),
+            )
+            .map_err(|error| storage_mcp_error(&error))?;
+        for (key, value) in &page.rows {
+            rows_scanned += 1;
+            let mut record_labels: Vec<(&str, String)> = Vec::new();
+            match params.source_cf.as_str() {
+                cf::CF_AGENT_TRANSCRIPTS => {
+                    match serde_json::from_slice::<synapse_core::AgentTranscriptRecord>(value) {
+                        Ok(record) => {
+                            rows_decoded += 1;
+                            for name in &wanted {
+                                let label = match name.as_str() {
+                                    "role" => record.role.as_ref().map_or_else(
+                                        || "<absent>".to_owned(),
+                                        json_label,
+                                    ),
+                                    "event_kind" => optional_label(record.event_kind.as_deref()),
+                                    "status" => json_label(&record.status),
+                                    "source" => json_label(&record.source),
+                                    _ => transcript_text_presence(&record).to_owned(),
+                                };
+                                record_labels.push((name.as_str(), label));
+                            }
+                        }
+                        Err(error) => {
+                            decode_failures += 1;
+                            if first_decode_failure.is_none() {
+                                first_decode_failure = Some(format!(
+                                    "key_hex={} error={error}",
+                                    corpus_key_hex(key)
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => match serde_json::from_slice::<synapse_core::AgentEventRecord>(value) {
+                    Ok(record) => {
+                        rows_decoded += 1;
+                        for name in &wanted {
+                            let label = match name.as_str() {
+                                "kind" => json_label(&record.kind),
+                                "end_state" => record
+                                    .end_state
+                                    .as_ref()
+                                    .map_or_else(|| "<absent>".to_owned(), json_label),
+                                "reason_code" => optional_label(record.reason_code.as_deref()),
+                                // The exact predicate `agent_events.rs` uses to
+                                // decide whether to write an adjudicated
+                                // `synapse:agent_tool_call_success` anchor. #1920
+                                // asks whether 32 anchors over 4,420 events is
+                                // the correct rate; this counts the denominator
+                                // that question needs.
+                                _ => if matches!(
+                                    record.kind,
+                                    synapse_core::AgentEventKind::ToolCallFinished
+                                ) {
+                                    "tool_call_finished"
+                                } else {
+                                    "not_adjudicable"
+                                }
+                                .to_owned(),
+                            };
+                            record_labels.push((name.as_str(), label));
+                        }
+                    }
+                    Err(error) => {
+                        decode_failures += 1;
+                        if first_decode_failure.is_none() {
+                            first_decode_failure =
+                                Some(format!("key_hex={} error={error}", corpus_key_hex(key)));
+                        }
+                    }
+                },
+            }
+            for (dimension, label) in record_labels {
+                if let Some(bucket) = counts.get_mut(dimension) {
+                    *bucket.entry(label).or_insert(0) += 1;
+                }
+            }
+        }
+        more = page.more;
+        cursor = page.resume_after_physical;
+        if page.rows.is_empty() {
+            break;
+        }
+    }
+
+    let dimensions = wanted
+        .iter()
+        .map(|name| {
+            let bucket_map = counts.remove(name).unwrap_or_default();
+            let distinct_values = bucket_map.len() as u64;
+            let mut buckets: Vec<StorageCorpusHistogramBucket> = bucket_map
+                .into_iter()
+                .map(|(value, count)| StorageCorpusHistogramBucket { value, count })
+                .collect();
+            // Count descending, then value ascending, so the report is
+            // deterministic for equal counts and reproducible across runs.
+            buckets.sort_by(|left, right| {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then_with(|| left.value.cmp(&right.value))
+            });
+            let truncated = buckets.len() > bucket_cap;
+            buckets.truncate(bucket_cap);
+            StorageCorpusHistogramDimension {
+                dimension: name.clone(),
+                distinct_values,
+                buckets_truncated: truncated,
+                buckets,
+            }
+        })
+        .collect();
+
+    Ok(StorageCorpusHistogramResponse {
+        source_of_truth: "authoritative source CF rows decoded through their typed record",
+        source_cf: params.source_cf.clone(),
+        rows_scanned,
+        rows_decoded,
+        decode_failures,
+        first_decode_failure,
+        complete: !more,
+        dimensions,
+    })
 }
 
 pub fn inspect_temporal_panels(

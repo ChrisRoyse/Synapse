@@ -64,9 +64,13 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 /// Current agent-transcript slot layout.
 ///
 /// #1904 added `AT_SLOT_TEXT_BM25`, giving the largest text corpus on the vault
-/// its first lexically-rankable lane. See the episode constant above for why a
-/// new lens is a new generation.
-pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_904_003;
+/// its first lexically-rankable lane. #1921 then measured that lane and found it
+/// could see only 9.2% of the corpus, and added `AT_SLOT_TEXT_FULL_BM25` over
+/// the prose the record already carried but no lens had ever read. See the
+/// episode constant above for why a new lens is a new generation.
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_921_001;
+/// The agent-transcript layout #1921 superseded — the one #1904 introduced.
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921: u32 = 1_904_003;
 /// The agent-transcript layout #1904 superseded.
 pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904: u32 = 1_665_002;
 // #1776 moved these panels off their old panel-local slot ids onto exclusive
@@ -140,7 +144,7 @@ const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100
 /// `u16` and `cf/slot_<id>` directories are named from it, so there is ample
 /// headroom. Raise it when a new panel block needs room; the compile-time
 /// assertion on `PANEL_SLOT_BLOCKS` keeps the two in agreement.
-const CALYX_DURABLE_SLOT_ID_MAX: u16 = 108;
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 112;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -275,6 +279,74 @@ const AT_SLOT_TEXT_BM25: SlotId = SlotId::new(107);
 ///
 /// Re-run the instrument before changing this; do not adjust it by intuition.
 const AT_TEXT_BM25_DIM: u32 = 262_144;
+
+/// Raw term-frequency lexical lane over **every** piece of prose the transcript
+/// record carries, not just `content_summary` (#1921).
+///
+/// `AT_SLOT_TEXT_BM25` (107) is fed by `transcript_text`, which reads only
+/// `content_summary` / `source_error` / `parse_error`. Measured against the real
+/// source corpus (53 session JSONL files, 33,016 lines) that is **9.2%** of
+/// rows — and the vault agreed independently at 326/3,308 = 9.9% (#1921).
+///
+/// The other 90% is not missing. It is carried verbatim on the same record, in
+/// `tool_calls[].tool_name` / `.arguments` / `.result_summary`, and reaches no
+/// lens at all:
+///
+/// | | rows | fraction |
+/// |---|---|---|
+/// | carry `content_summary` (slot 107 sees these) | 3,024 | 0.0917 |
+/// | carry prose only in `tool_calls[]` | 17,445 | 0.5290 |
+/// | carry **any** prose (this slot sees these) | 20,469 | **0.6207** |
+///
+/// In measured tokens that is 140,391 against 2,372,186 — **16.9x** — and in
+/// text-bearing documents 3,026 against 20,490 — **6.77x**.
+///
+/// This is a *new slot*, not a redefinition of 107. A lens is frozen: changing
+/// what `syn.agent_transcript.text_bm25.v1` is handed would silently make two
+/// different measurements share one identity, and every row already written
+/// under it would be reinterpreted. 107 keeps measuring exactly what it always
+/// measured, so the two lanes stay comparable and the gain is itself
+/// measurable — which is the point.
+const AT_SLOT_TEXT_FULL_BM25: SlotId = SlotId::new(109);
+
+/// Sparse dimension for the full-prose agent-transcript lexical lane.
+///
+/// Sized the same way `AT_TEXT_BM25_DIM` was — against the corpus's measured
+/// **distinct-term vocabulary**, because a hashing-trick encoder collides on
+/// terms, not on length — but re-measured, because the full projection is a
+/// different corpus:
+///
+/// ```text
+/// distinct terms, content-only : 9,778
+/// distinct terms, full prose   : 70,894   (7.25x)
+///
+/// dim         load   predicted collision rate
+/// 262,144    0.270      0.2370   <- AT_TEXT_BM25_DIM, reused verbatim
+/// 1,048,576  0.068      0.0654
+/// 2,097,152  0.034      0.0332
+/// ```
+///
+/// Copying `AT_TEXT_BM25_DIM` would have put **23.7%** of the full-prose
+/// vocabulary in a shared cell — the same mistake in kind that copying the
+/// timeline's 2,048 would have been for 107, just less extreme.
+///
+/// 2,097,152 is chosen over 1,048,576 because the cost of a sparse dimension is
+/// O(occupied cells) = O(tokens), never O(dim): the vector stores only occupied
+/// cells and the persisted postings map is keyed by occupied cells. Headroom is
+/// therefore close to free, and at 2x vocabulary growth 2^21 still holds ~6.5%
+/// while 2^20 would have decayed to ~12.6%.
+///
+/// The projection is also proven to fit the lens: `syn::sparse_text_tf` refuses
+/// a document over `MAX_TEXT_TOKENS` (4,096), and measured over the real corpus
+/// the full projection runs p50=38, p90=325, p99=974, p99.9=1,276, **p100=1,388
+/// tokens, with zero documents over the limit**. The per-field caps already in
+/// `AgentTranscriptRecord` (2,048 summary + 8,192 args + 8,192 result chars)
+/// bound it below the lens ceiling, so this lane needs no truncation of its own
+/// and cannot fail closed on length.
+///
+/// Re-measure with `crates/synapse-calyx/examples/lexical_dimension_sizing_fsv.rs`
+/// before changing this; do not adjust it by intuition.
+const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 
 // Slot ids are GLOBAL, not panel-local (#1776).
 //
@@ -425,6 +497,16 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
         first: 107,
         last: 107,
+    },
+    // The agent-transcript panel's third block (#1921). Holds
+    // `AT_SLOT_TEXT_FULL_BM25` (109); 110..=112 are unallocated headroom inside
+    // this panel's own range, so the next transcript lens needs no fourth
+    // block. 108 could not be folded in because it belongs to the episode
+    // panel, and a block is contiguous by construction.
+    PanelSlotBlock {
+        panel: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+        first: 109,
+        last: 112,
     },
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
@@ -1743,6 +1825,10 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (AT_SLOT_MODEL_HASH, "syn.agent_transcript.model_hash.v1"),
     (AT_SLOT_TEXT_SPARSE, "syn.agent_transcript.text_sparse.v1"),
     (AT_SLOT_TEXT_BM25, "syn.agent_transcript.text_bm25.v1"),
+    (
+        AT_SLOT_TEXT_FULL_BM25,
+        "syn.agent_transcript.text_full_bm25.v1",
+    ),
     (AT_SLOT_TOOL_HASH, "syn.agent_transcript.tool_hash.v1"),
     (AT_SLOT_LINE_RANK, "syn.agent_transcript.line_rank.v1"),
     (
@@ -2307,6 +2393,7 @@ pub fn syn_active_panel_contract(
     let slots = match panel_version {
         SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version, &mut registry)?,
         SYN_EPISODE_PANEL_VERSION => episode_panel_slots(panel_version, &mut registry)?,
+        SYN_MCP_USAGE_PANEL_VERSION => mcp_usage_panel_slots(panel_version, &mut registry)?,
         _ => return Ok(None),
     };
     Ok(Some(SynActivePanelContract {
@@ -2728,6 +2815,171 @@ fn episode_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRe
     ])
 }
 
+/// The built-in contract for the MCP-usage panel (#1919).
+///
+/// This panel is not, and is not intended to become, the durable *active*
+/// panel — the active panel serves recall and is the timeline. It is declared
+/// here because it is the only fully-grounded outcome-bearing corpus this vault
+/// has: measured 2026-07-31 on the live vault, `syn-mcp-usage-v1 @ 1776006`
+/// holds **1,100 records at `grounded_fraction` 1.0000, `provisional=false`**,
+/// every one carrying a `synapse:mcp_tool_call_outcome` anchor, which
+/// `SYNAPSE_DECLARED_ENUM_ADJUDICATIONS` splits into good (`ok`) and bad.
+///
+/// Ward's conformal calibration needs exactly two things: an adjudicated corpus
+/// in both polarities, and a *panel definition* to validate the named slots
+/// against. It had the first here and not the second, because a vault manifest
+/// publishes exactly one `Panel` snapshot and this is not it. That, not any
+/// shortage of anchors, is what made the guard uncertifiable (#1919).
+///
+/// Reconstructing the definition from code is sound because these panels are
+/// code-declared and content-addressed: the lens ids this produces are a hash of
+/// the same frozen contracts the ingest path measured with, so a slot validated
+/// here is the same slot that was written. It is not a substitute for the
+/// panel-lifecycle work in #1668, which owns making a second panel *servable*;
+/// it is the minimum needed to stop the guard being blocked by a definition
+/// lookup rather than by evidence.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a panel contract is a one-to-one slot-to-frozen-lens map; splitting it would hide the slot set it exists to declare"
+)]
+fn mcp_usage_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
+    Ok(vec![
+        syn_content_slot(
+            MU_SLOT_TOOL_ONEHOT,
+            "syn.mcp_usage.tool_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.mcp_usage.tool_onehot.v1",
+                Modality::Structured,
+                128,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_OPERATION_ONEHOT,
+            "syn.mcp_usage.operation_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.mcp_usage.operation_onehot.v1",
+                Modality::Structured,
+                128,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_ROUTE_HASH,
+            "syn.mcp_usage.route_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.mcp_usage.route_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_PARAM_SHAPE_HASH,
+            "syn.mcp_usage.param_shape_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.mcp_usage.param_shape_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_STATUS_ONEHOT,
+            "syn.mcp_usage.status_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.mcp_usage.status_onehot.v1",
+                Modality::Structured,
+                64,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_ERROR_ONEHOT,
+            "syn.mcp_usage.error_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.mcp_usage.error_onehot.v1",
+                Modality::Structured,
+                128,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_PROFILE_HASH,
+            "syn.mcp_usage.profile_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.mcp_usage.profile_hash.v1",
+                Modality::Structured,
+                1024,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_SURFACE_HASH,
+            "syn.mcp_usage.tool_surface_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.mcp_usage.tool_surface_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_SESSION_SEQUENCE_RANK,
+            "syn.mcp_usage.session_sequence_rank.v1",
+            RegistryAlgorithmicLens::syn_scalar_rank(
+                "syn.mcp_usage.session_sequence_rank.v1",
+                Modality::Structured,
+                0,
+                RECENCY_RANK_MAX_UNIX_MS_MICROS,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_HOUR_CYCLIC,
+            "syn.mcp_usage.hour_cyclic.v1",
+            RegistryAlgorithmicLens::syn_cyclic_time(
+                "syn.mcp_usage.hour_cyclic.v1",
+                Modality::Structured,
+                24,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_DOW_CYCLIC,
+            "syn.mcp_usage.dow_cyclic.v1",
+            RegistryAlgorithmicLens::syn_cyclic_time(
+                "syn.mcp_usage.dow_cyclic.v1",
+                Modality::Structured,
+                7,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            MU_SLOT_RECORD_VECTOR,
+            "syn.mcp_usage.record_vector.v1",
+            RegistryAlgorithmicLens::syn_record_vector(
+                "syn.mcp_usage.record_vector.v1",
+                Modality::Structured,
+                128,
+            ),
+            panel_version,
+            registry,
+        )?,
+    ])
+}
+
 /// Build the Calyx constellation for an agent event record.
 ///
 /// # Errors
@@ -2973,6 +3225,18 @@ pub fn build_agent_transcript_constellation(
                 AT_TEXT_BM25_DIM,
             ),
             &transcript_text_value,
+        )?,
+    );
+    slots.insert(
+        AT_SLOT_TEXT_FULL_BM25,
+        measure_text(
+            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            AlgorithmicLens::syn_sparse_text_tf(
+                "syn.agent_transcript.text_full_bm25.v1",
+                Modality::Structured,
+                AT_TEXT_FULL_BM25_DIM,
+            ),
+            &transcript_full_text(record),
         )?,
     );
     let transcript_tool_names = transcript_tool_names(record);
@@ -5450,6 +5714,52 @@ fn transcript_text(record: &AgentTranscriptRecord) -> String {
     }
     if let Some(parse_error) = record.parse_error.as_deref().and_then(non_empty) {
         parts.push(format!("parse_error: {parse_error}"));
+    }
+    parts.join("\n")
+}
+
+/// Every piece of prose the transcript record carries (#1921).
+///
+/// [`transcript_text`] reads three optional fields, and on the real corpus all
+/// three are empty on ~90% of rows: a `user/tool_result` line returns from
+/// `ambient_agents.rs::classify_user` before `set_content` is ever called, and a
+/// tool-use-only assistant turn skips it for the same reason. The prose on those
+/// rows is not missing — it sits in `tool_calls[]`, 18.2x more of it by
+/// character count than reaches [`transcript_text`], and until this projection
+/// existed no lens read it.
+///
+/// The tool name is included deliberately and first: it is the single most
+/// query-worthy token on a tool row ("what was I doing with `search_rebuild`"),
+/// and it is the only part of a tool call that is a stable identifier rather
+/// than free text.
+///
+/// Ordering is deterministic — content, then each tool call in the record's own
+/// order, name before arguments before result. The lens is a bag-of-terms so
+/// order does not change the vector, but a deterministic projection means a
+/// re-measure of an unchanged row reproduces byte-identical bytes, which is what
+/// makes the backfill idempotent and `reproduce` meaningful.
+///
+/// Bounding is inherited, not re-applied: every field concatenated here was
+/// already truncated at ingest to its declared cap, and the measured p100 of the
+/// result is 1,388 tokens against the lens's 4,096 limit. This function must
+/// therefore never silently truncate — if a future record does exceed the limit,
+/// the lens fails closed and names the row, which is the correct outcome.
+fn transcript_full_text(record: &AgentTranscriptRecord) -> String {
+    let mut parts = Vec::new();
+    let base = transcript_text(record);
+    if !base.is_empty() {
+        parts.push(base);
+    }
+    for tool in &record.tool_calls {
+        if let Some(name) = non_empty(&tool.tool_name) {
+            parts.push(name.to_owned());
+        }
+        if let Some(arguments) = tool.arguments.as_deref().and_then(non_empty) {
+            parts.push(arguments.to_owned());
+        }
+        if let Some(result) = tool.result_summary.as_deref().and_then(non_empty) {
+            parts.push(result.to_owned());
+        }
     }
     parts.join("\n")
 }

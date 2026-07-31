@@ -201,35 +201,55 @@ pub(crate) fn dense_vectors(
 }
 
 /// Fail-closed cosine between two dense vectors.
+///
+/// This was the workspace's **fifth** independent cosine implementation, and the
+/// one #1922 never counted. Found by the #1923 follow-up audit — "grep the call
+/// sites" — it had exactly the defect #1923 fixed in `calyx_core::dense_cosine`
+/// and it had never been fixed here: it returned `(dot / denom) as f32` raw, so
+/// two identical or near-parallel vectors could produce a "cosine" just above
+/// `1.0`. It also owned its own shape validation, its own finiteness pre-scan
+/// (a second full pass over both inputs, the cost #1912 measured and removed
+/// elsewhere), and its own zero-norm threshold.
+///
+/// It now delegates to the one dispatched entry point (#1922 ask 1) and keeps
+/// only what is genuinely Sextant's: the mapping onto `CALYX_SEXTANT_*` codes.
+/// That mapping was the actual barrier to sharing, and it is one match arm.
 pub(crate) fn dense_cosine(a: &[f32], b: &[f32]) -> Result<f32> {
-    if a.len() != b.len() {
-        return Err(sextant_error(
+    use calyx_forge::cpu::distance::CosineFailure;
+    calyx_forge::cpu::distance::cosine(a, b).map_err(|failure| match failure {
+        CosineFailure::DimMismatch { left, right } => sextant_error(
             CALYX_SEXTANT_DIM_MISMATCH,
-            format!("cosine dims differ: {} vs {}", a.len(), b.len()),
-        ));
-    }
-    let mut dot = 0.0_f64;
-    let mut norm_a = 0.0_f64;
-    let mut norm_b = 0.0_f64;
-    for (x, y) in a.iter().zip(b) {
-        if !x.is_finite() || !y.is_finite() {
-            return Err(sextant_error(
-                CALYX_SEXTANT_VECTOR_SHAPE,
-                "cosine requires finite vector components",
-            ));
-        }
-        dot += f64::from(*x) * f64::from(*y);
-        norm_a += f64::from(*x) * f64::from(*x);
-        norm_b += f64::from(*y) * f64::from(*y);
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom <= f64::EPSILON {
-        return Err(sextant_error(
+            format!("cosine dims differ: {left} vs {right}"),
+        ),
+        CosineFailure::Empty => sextant_error(
             CALYX_SEXTANT_VECTOR_SHAPE,
-            "cosine requires non-zero-norm vectors",
-        ));
-    }
-    Ok((dot / denom) as f32)
+            "cosine requires non-empty vectors",
+        ),
+        CosineFailure::NonFinite { side, index } => sextant_error(
+            CALYX_SEXTANT_VECTOR_SHAPE,
+            format!(
+                "cosine requires finite vector components: {} operand is non-finite at index {index}",
+                side.label()
+            ),
+        ),
+        CosineFailure::Overflow => sextant_error(
+            CALYX_SEXTANT_VECTOR_SHAPE,
+            "cosine dot product overflowed over finite inputs",
+        ),
+        CosineFailure::ZeroNorm { side } => sextant_error(
+            CALYX_SEXTANT_VECTOR_SHAPE,
+            format!(
+                "cosine requires non-zero-norm vectors: {} operand has zero norm",
+                side.label()
+            ),
+        ),
+        CosineFailure::OutOfRange { cosine } => sextant_error(
+            CALYX_SEXTANT_VECTOR_SHAPE,
+            format!(
+                "cosine {cosine} is further outside [-1,1] than f32 rounding explains"
+            ),
+        ),
+    })
 }
 
 fn fold_cosine(per_slot: &[SlotCosine], op: fn(f32, f32) -> f32) -> f32 {

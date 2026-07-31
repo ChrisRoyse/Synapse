@@ -67,11 +67,11 @@
 //! | `verification.rs` | `synapse:verification_outcome` | `Bool(code_count > 0)` |
 //! | `mcp_usage.rs` | `synapse:mcp_steering_enabled` | `Bool(policy.enabled)` |
 //!
-//! The real blocker is narrower and structural, and naming it wrongly sent the
-//! operator to build a path that already exists. Calibration is pinned to the
-//! **single durable active panel** ([`SYNAPSE_CALYX_GUARD_PANEL_MISMATCH`]), and
-//! on this vault that is `syn-timeline-v1`, which receives none of the anchors
-//! above. Measured on 2026-07-30:
+//! The real blocker was narrower and structural, and naming it wrongly sent the
+//! operator to build a path that already exists. Calibration used to be pinned
+//! to the **single durable active panel**, and on this vault that is
+//! `syn-timeline-v1`, which receives none of the anchors above. Measured on
+//! 2026-07-30:
 //!
 //! ```text
 //! panel 1900001 (active, timeline)  548 scanned  0 good  0 bad  548 unadjudicated
@@ -79,15 +79,43 @@
 //!                                   but calibration refuses it: not the active panel
 //! ```
 //!
-//! So the adjudicated outcomes exist on panels the guard may not calibrate
-//! against, and the panel it must calibrate against has no adjudicated outcome
-//! at all. Neither half is a missing feature; together they are a deadlock that
-//! the single-active-panel model has to resolve before Ward can be certified on
-//! this vault (tracked with the panel-lifecycle work).
+//! # Why that pin existed, and why it is gone (#1919)
 //!
-//! Until then `guard calibrate` refuses, and that refusal is the honest state. A
-//! guard that will not calibrate is safe; a guard calibrated on invented badness
-//! is a lie with a confidence interval printed next to it.
+//! It read as a deadlock between two reasonable rules. It was not. Both halves
+//! traced to one thing that had nothing to do with evidence:
+//!
+//! 1. **The panel lookup.** Calibration needs a [`Panel`] for exactly one
+//!    purpose — proving each named slot is dense and `Active`. A vault manifest
+//!    publishes exactly *one* `Panel` snapshot, so that lookup could only ever
+//!    succeed for the active panel. The pin was standing in for a missing
+//!    definition lookup, and it was enforced with an error that told the
+//!    operator the active panel was the only legal target.
+//! 2. **The profile key.** The Guard CF wrote every profile to one constant key,
+//!    `profile\0default`. With a single-key namespace a second panel's profile
+//!    could only overwrite the first, so allowing a second panel would have been
+//!    genuinely unsafe — which is what made the pin look load-bearing.
+//!
+//! Both are fixed by construction rather than by relaxing a gate. The caller
+//! supplies the panel definition (Synapse's panels are code-declared and
+//! content-addressed, so any generation reconstructs deterministically and its
+//! lens ids hash to the same frozen contracts ingest measured with), and
+//! profiles are keyed by panel version, with `profile\0default` kept as a mirror
+//! written **only** for the durable active panel so `calyx-search`'s guarded
+//! reader can never pick up a profile for a panel it is not serving.
+//!
+//! Nothing about the evidence requirement moved: the corpus scan, the
+//! both-polarities requirement, the Clopper-Pearson certification, and the
+//! refusal to manufacture a bad case are all unchanged. A guard that will not
+//! calibrate is safe; a guard calibrated on invented badness is a lie with a
+//! confidence interval printed next to it.
+//!
+//! The corpus this unlocks, measured on the live vault 2026-07-31:
+//!
+//! ```text
+//! panel 1776006 (syn-mcp-usage-v1)  1,100 records  grounded_fraction 1.0000  provisional=false
+//!                                   anchor synapse:mcp_tool_call_outcome, a
+//!                                   SYNAPSE_DECLARED_ENUM_ADJUDICATIONS kind
+//! ```
 
 use std::collections::BTreeMap;
 
@@ -171,6 +199,26 @@ pub struct SynapseCalyxGuardCalibrateParams {
     /// When false the calibration is computed and reported but the Guard CF is
     /// not written (a dry run for operators sizing a corpus).
     pub persist: bool,
+    /// The panel definition to validate the named slots against, when the
+    /// requested panel is **not** the durable active one (#1919).
+    ///
+    /// Calibration needs a `Panel` for exactly one purpose:
+    /// `validate_calibration_slots` must prove every named slot is dense and
+    /// `Active`. A vault manifest publishes exactly one `Panel` snapshot, so
+    /// that lookup could only ever succeed for the active panel — which is why
+    /// calibration was pinned to it, and why the guard was uncertifiable on a
+    /// vault whose active panel carries no adjudicated outcome while another
+    /// panel carries 1,100 fully-adjudicated ones.
+    ///
+    /// The pin was never protecting the *evidence*; it was standing in for a
+    /// missing definition lookup. Supplying the definition removes the pin
+    /// without loosening anything: the corpus scan, the bad-case requirement,
+    /// the Clopper-Pearson certification and the refusal to manufacture badness
+    /// are all unchanged, and the version is still checked to match.
+    ///
+    /// `None` keeps the original behaviour exactly — resolve the durable active
+    /// panel and refuse anything else.
+    pub calibration_panel: Option<Panel>,
 }
 
 impl SynapseCalyxGuardCalibrateParams {
@@ -184,6 +232,7 @@ impl SynapseCalyxGuardCalibrateParams {
             target_far: None,
             max_records: crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             persist: true,
+            calibration_panel: None,
         }
     }
 }
@@ -390,7 +439,8 @@ impl SynapseCalyxVault {
                 "supply a conformal miscoverage budget such as 0.05 (95% confidence)",
             ));
         }
-        let panel = self.active_panel_for_guard(params.panel_version)?;
+        let panel = self
+            .panel_for_guard_calibration(params.panel_version, params.calibration_panel.as_ref())?;
         let corpus = self.collect_adjudicated_corpus(params)?;
 
         // The honesty gate. Refusing is the correct outcome when reality has not
@@ -407,7 +457,7 @@ impl SynapseCalyxVault {
                     corpus.unadjudicated,
                     corpus.adjudicated_without_guarded_slots
                 ),
-                "a conformal FAR bound is only meaningful over a real known-bad distribution, so calibrating on manufactured badness would report `ok` forever and is refused here, not worked around. Note that adjudicated Bool outcomes DO exist in this system — agent_events writes synapse:agent_tool_call_success as Bool(!error_present), so every failed tool call is a Bool(false) — but calibration is pinned to the single durable active panel, and the panels carrying those anchors are not it. Check whether this panel is simply the wrong one to calibrate against before concluding that no adjudication path exists; if the active panel genuinely receives no adjudicated outcome, the gap is in the active-panel model, not in the anchor writers",
+                "a conformal FAR bound is only meaningful over a real known-bad distribution, so calibrating on manufactured badness would report `ok` forever and is refused here, not worked around. This panel genuinely carries no adjudicated bad case — but another panel may: calibration is no longer pinned to the durable active panel (#1919), so name the panel that actually receives outcomes. On this vault that is syn-mcp-usage-v1 @ 1776006 (synapse:mcp_tool_call_outcome, a declared enum adjudication) and syn-agent-event-v1 @ 1665001 (synapse:agent_tool_call_success, Bool(!error_present) — every failed tool call is a Bool(false)). Read `hygiene operation=grounding_gap` per panel to see which is adjudicated before concluding that no adjudication path exists",
             ));
         }
 
@@ -559,18 +609,32 @@ impl SynapseCalyxVault {
                     "inspect the profile fields before retrying the calibration",
                 )
             })?;
-            self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            // The panel-keyed row is the source of truth. The constant
+            // `profile\0default` key is a *mirror*, written only when this panel
+            // is the one `calyx-search` is actually serving, so that reader can
+            // never load a profile calibrated for a different panel (#1919).
+            let panel_key = Self::guard_profile_key(params.panel_version);
+            let mut writes = vec![SynapseCalyxCfWrite {
                 cf: ColumnFamily::Guard,
-                key: SYNAPSE_GUARD_DEFAULT_PROFILE_KEY.to_vec(),
-                value: encoded,
-            }])?;
+                key: panel_key.clone(),
+                value: encoded.clone(),
+            }];
+            if self.is_durable_active_panel(params.panel_version) {
+                writes.push(SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Guard,
+                    key: SYNAPSE_GUARD_DEFAULT_PROFILE_KEY.to_vec(),
+                    value: encoded,
+                });
+            }
+            self.write_cf_batch(writes)?;
             self.flush()?;
-            let Some(row) =
-                self.read_cf_latest(ColumnFamily::Guard, SYNAPSE_GUARD_DEFAULT_PROFILE_KEY)?
-            else {
+            let Some(row) = self.read_cf_latest(ColumnFamily::Guard, &panel_key)? else {
                 return Err(guard_error(
                     "SYNAPSE_CALYX_GUARD_PROFILE_READBACK_MISSING",
-                    "the calibrated guard profile is absent from the Guard CF immediately after a flushed write".to_owned(),
+                    format!(
+                        "the calibrated guard profile for panel {} is absent from the Guard CF immediately after a flushed write",
+                        params.panel_version
+                    ),
                     "inspect the vault Guard CF and the commit path; a write that cannot be read back is never reported as persisted",
                 ));
             };
@@ -626,14 +690,25 @@ impl SynapseCalyxVault {
     ) -> Result<SynapseCalyxGuardVerifyReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("guard_verify");
         let query_cx = crate::parse_cx_id(&params.query_cx_id)?;
-        let Some(row) =
-            self.read_cf_latest(ColumnFamily::Guard, SYNAPSE_GUARD_DEFAULT_PROFILE_KEY)?
-        else {
-            return Err(guard_error(
-                calyx_ward::CALYX_GUARD_PROVISIONAL,
-                "no calibrated Ward guard profile is persisted (Guard CF key `profile\\0default` is absent)".to_owned(),
-                "run guard calibrate for this panel; guarded search and guard verification both fail closed rather than guess a tau",
-            ));
+        // Read the profile calibrated for *this* panel. The legacy constant key
+        // is consulted only as a fallback, so a profile persisted before #1919
+        // keyed the CF by panel still verifies; its `panel_version` is checked
+        // below either way, so the fallback can never apply the wrong profile.
+        let panel_key = Self::guard_profile_key(params.panel_version);
+        let row = match self.read_cf_latest(ColumnFamily::Guard, &panel_key)? {
+            Some(row) => row,
+            None => self
+                .read_cf_latest(ColumnFamily::Guard, SYNAPSE_GUARD_DEFAULT_PROFILE_KEY)?
+                .ok_or_else(|| {
+                    guard_error(
+                        calyx_ward::CALYX_GUARD_PROVISIONAL,
+                        format!(
+                            "no calibrated Ward guard profile is persisted for panel {}: neither the panel-keyed Guard CF row nor the legacy `profile\\0default` row is present",
+                            params.panel_version
+                        ),
+                        "run hygiene operation=guard_calibrate for this panel; guarded search and guard verification both fail closed rather than guess a tau",
+                    )
+                })?,
         };
         let profile: GuardProfile = serde_json::from_slice(&row).map_err(|error| {
             guard_error(
@@ -679,6 +754,11 @@ impl SynapseCalyxVault {
             target_far: None,
             max_records: params.max_records,
             persist: false,
+            // Verification never validates slots against a panel definition —
+            // the required slots come from the persisted profile, which was
+            // already validated at calibration time. Only the corpus scan and
+            // the record's dense vectors are used from here.
+            calibration_panel: None,
         };
         let corpus = self.collect_adjudicated_corpus(&scan)?;
         let query = self.load_record_slots(params.panel_version, query_cx, &scan)?;
@@ -802,26 +882,84 @@ impl SynapseCalyxVault {
         }
     }
 
-    /// Loads the published active [`Panel`] the guard must be calibrated for.
-    fn active_panel_for_guard(&self, panel_version: u32) -> Result<Panel, SynapseCalyxError> {
+    /// Resolves the [`Panel`] definition the guard validates its slots against.
+    ///
+    /// Two sources, in this order, and never a third:
+    ///
+    /// 1. a `calibration_panel` supplied by the caller — the caller owns the
+    ///    catalogue of code-declared panels and can reconstruct any of them
+    ///    deterministically. Its version must match the requested one.
+    /// 2. the durable active panel published in the vault manifest.
+    ///
+    /// A request for a panel that is neither still fails closed, and the error
+    /// now names which of the two lookups came up empty instead of asserting
+    /// that the active panel is the only legal target (#1919).
+    fn panel_for_guard_calibration(
+        &self,
+        panel_version: u32,
+        supplied: Option<&Panel>,
+    ) -> Result<Panel, SynapseCalyxError> {
+        if let Some(panel) = supplied {
+            if panel.version != panel_version {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_PANEL_MISMATCH",
+                    format!(
+                        "guard calibration requested panel {panel_version}, but the supplied panel definition is version {}",
+                        panel.version
+                    ),
+                    "supply the panel definition for the exact version being calibrated; a profile validated against another panel's slot map guards the wrong vectors",
+                ));
+            }
+            return Ok(panel.clone());
+        }
         let state = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
             guard_error(
                 "SYNAPSE_CALYX_GUARD_NO_ACTIVE_PANEL",
-                format!("no durable active panel is published for guard calibration: {error}"),
-                "publish the active panel for this constellation before calibrating a guard profile",
+                format!(
+                    "no panel definition is available for guard calibration: no definition was supplied for panel {panel_version}, and the durable active panel could not be loaded: {error}"
+                ),
+                "supply the panel definition for this version, or publish the active panel, before calibrating a guard profile",
             )
         })?;
         if state.panel.version != panel_version {
             return Err(guard_error(
                 "SYNAPSE_CALYX_GUARD_PANEL_MISMATCH",
                 format!(
-                    "guard calibration requested panel {panel_version}, but the durable active panel is {}",
+                    "guard calibration requested panel {panel_version}, but no definition was supplied for it and the durable active panel is {}",
                     state.panel.version
                 ),
-                "calibrate against the published active panel; a profile bound to another panel fails every guarded query",
+                "supply the panel definition for the requested version (a code-declared panel can be reconstructed), or calibrate against the active panel; a profile whose slots were never validated against a real slot map guards nothing",
             ));
         }
         Ok(state.panel)
+    }
+
+    /// Guard CF key of the calibrated profile for one panel (#1919).
+    ///
+    /// The Guard CF used one constant key for the whole vault, so a second
+    /// panel's profile could only ever overwrite the first. That single-key
+    /// namespace — not any rule about evidence — is what forced calibration to
+    /// be pinned to one panel. Keying by panel makes coexistence structural, and
+    /// makes "a profile bound to another panel fails every guarded query" an
+    /// invariant enforced by the key rather than by refusing to calibrate.
+    #[must_use]
+    fn guard_profile_key(panel_version: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(15 + std::mem::size_of::<u32>());
+        key.extend_from_slice(b"profile\0panel\0");
+        key.extend_from_slice(&panel_version.to_be_bytes());
+        key
+    }
+
+    /// True when `panel_version` is the vault's durable active panel.
+    ///
+    /// Used only to decide whether to *also* mirror the profile onto
+    /// [`SYNAPSE_GUARD_DEFAULT_PROFILE_KEY`], which `calyx-search`'s guarded
+    /// reader looks up by that exact constant. Mirroring only the active panel's
+    /// profile is what keeps that reader correct by construction: it can never
+    /// pick up a profile calibrated for a panel it is not serving.
+    fn is_durable_active_panel(&self, panel_version: u32) -> bool {
+        load_vault_panel_state(&self.config.vault_dir)
+            .is_ok_and(|state| state.panel.version == panel_version)
     }
 
     /// Splits the panel into adjudicated good/bad records, counting everything

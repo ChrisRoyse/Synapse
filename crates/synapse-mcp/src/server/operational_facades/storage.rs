@@ -200,6 +200,50 @@ pub(super) async fn handle(
                 |out| out.temporal_panels = Some(response),
             )))
         }
+        StorageOperation::CorpusHistogram => {
+            let spec = params
+                .0
+                .corpus_histogram
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "corpus_histogram"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_corpus_histogram(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_storage",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=corpus_histogram",
+                )
+            })?;
+            let response = crate::m3::storage::inspect_corpus_histogram(&db, &spec).map_err(
+                |error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "calyx_storage",
+                        STORAGE_SOT,
+                        error,
+                        "name a supported source_cf and declared dimensions; a row that will not decode is counted, not skipped",
+                    )
+                },
+            )?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "{} rows_scanned={} rows_decoded={} decode_failures={} complete={}",
+                    response.source_cf,
+                    response.rows_scanned,
+                    response.rows_decoded,
+                    response.decode_failures,
+                    response.complete
+                ),
+                |out| out.corpus_histogram = Some(response),
+            )))
+        }
         StorageOperation::TemporalRerank => {
             let spec = params
                 .0

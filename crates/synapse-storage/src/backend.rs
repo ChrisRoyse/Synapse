@@ -2877,12 +2877,26 @@ impl StorageBackend for CalyxBackend {
         &self,
         params: &SynapseCalyxGuardCalibrateParams,
     ) -> StorageResult<SynapseCalyxGuardCalibrateReport> {
+        // #1919: Synapse owns the catalogue of code-declared panels; the vault
+        // only knows the single `Panel` its manifest publishes. Reconstruct the
+        // requested generation's definition here and hand it down, so the guard
+        // can calibrate against a panel that carries adjudicated outcomes
+        // without that panel having to become the active one. An unknown
+        // generation supplies nothing and the vault's own active-panel rule
+        // still applies unchanged.
         self.with_vault(
             "calyx_ward",
             "calibrate the native Calyx Ward guard profile",
             true,
             |vault| {
-                vault.guard_calibrate(params).map_err(|source| {
+                let mut params = params.clone();
+                if params.calibration_panel.is_none() {
+                    let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                    params.calibration_panel =
+                        syn_active_panel_contract(params.panel_version, created_at_ms)?
+                            .map(|contract| contract.panel);
+                }
+                vault.guard_calibrate(&params).map_err(|source| {
                     calyx_write_failed(
                         "calyx_ward",
                         "calibrate the native Calyx Ward guard profile",

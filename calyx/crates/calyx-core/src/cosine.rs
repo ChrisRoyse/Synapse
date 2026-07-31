@@ -24,7 +24,24 @@ impl GuardTauProfile for BTreeMap<SlotId, f32> {
 /// round to just over `1.0`. The error is on the order of a few f32 epsilons
 /// (~1.2e-7 each); `1e-4` is three orders of magnitude of headroom above that
 /// and still far below any difference that could carry meaning.
-const COSINE_ROUNDING_TOLERANCE: f32 = 1e-4;
+pub const COSINE_ROUNDING_TOLERANCE: f32 = 1e-4;
+
+/// Applies the shared cosine range contract to an already-computed quotient.
+///
+/// Single-sourced so every cosine site in the workspace enforces the *same*
+/// contract rather than each restating it (#1922). Returns `None` for a value
+/// far enough outside `[-1, 1]` to be a defect rather than rounding, and clamps
+/// anything inside that tolerance to the range a cosine mathematically has.
+#[must_use]
+pub fn clamp_cosine_quotient(cosine: f32) -> Option<f32> {
+    if !cosine.is_finite() {
+        return None;
+    }
+    if cosine > 1.0 + COSINE_ROUNDING_TOLERANCE || cosine < -1.0 - COSINE_ROUNDING_TOLERANCE {
+        return None;
+    }
+    Some(cosine.clamp(-1.0, 1.0))
+}
 
 /// Computes cosine for two dense vectors, failing closed on invalid vectors.
 ///
@@ -68,12 +85,5 @@ pub fn dense_cosine(left: &[f32], right: &[f32]) -> Option<f32> {
     if !denom.is_finite() || denom <= 0.0 {
         return None;
     }
-    let cosine = dot / denom;
-    if !cosine.is_finite() {
-        return None;
-    }
-    if cosine > 1.0 + COSINE_ROUNDING_TOLERANCE || cosine < -1.0 - COSINE_ROUNDING_TOLERANCE {
-        return None;
-    }
-    Some(cosine.clamp(-1.0, 1.0))
+    clamp_cosine_quotient(dot / denom)
 }
