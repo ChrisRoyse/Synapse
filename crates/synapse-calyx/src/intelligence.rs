@@ -1063,6 +1063,46 @@ impl SynapseCalyxAssayParams {
     }
 }
 
+/// Why one lens carries no bits estimate (#1915).
+///
+/// A skipped lens used to be indistinguishable from a measured zero: both
+/// reported `marginal_bits: 0.0` with a `[0,0]` interval. On the live vault
+/// every slot sat below the sample floor, so **every** reported zero was a skip
+/// and no `bits` value on this system had ever come from the estimator. Naming
+/// the reason is what makes "we did not measure this" readable instead of
+/// arriving in the same field, in the same units, as a finding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxSlotBitsState {
+    /// The estimator ran and its output is in `marginal_bits`/`ci_*`.
+    Measured,
+    /// Fewer than [`SYNAPSE_ASSAY_MIN_SAMPLES`] paired samples.
+    InsufficientSamples,
+    /// The estimator refused this column: too many exact same-class duplicates
+    /// for a non-zero kth-neighbour radius. A categorical lens hits this by
+    /// construction — a one-hot over C values and N same-class samples yields
+    /// about N/C duplicates — so it is a property of the lens, not of the data.
+    DegenerateColumn,
+}
+
+impl SynapseCalyxSlotBitsState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::InsufficientSamples => "insufficient_samples",
+            Self::DegenerateColumn => "degenerate_column",
+        }
+    }
+
+    /// Whether `marginal_bits` on this slot is an estimate rather than a
+    /// placeholder. Callers deriving anything from the number must check this.
+    #[must_use]
+    pub const fn is_measured(self) -> bool {
+        matches!(self, Self::Measured)
+    }
+}
+
 /// Per-lens grounded bits about the requested anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxSlotBits {
@@ -1073,6 +1113,14 @@ pub struct SynapseCalyxSlotBits {
     pub n_samples: usize,
     pub sole_carrier: bool,
     pub provisional: bool,
+    /// Whether `marginal_bits` was estimated, and if not, why (#1915).
+    ///
+    /// `marginal_bits` is `0.0` for every non-`Measured` state. That zero is a
+    /// placeholder and must not be read as "this lens carries no information".
+    pub state: SynapseCalyxSlotBitsState,
+    /// What this slot needs before it can be measured, when it was not.
+    /// `None` when `state` is `Measured`.
+    pub unmeasured_reason: Option<String>,
 }
 
 /// Result of one Assay bits pass with the physical Assay CF readback.
@@ -1123,6 +1171,17 @@ pub struct SynapseCalyxSufficiencyReport {
     pub anchored_records: usize,
     pub joint_records: usize,
     pub panel_bits: f32,
+    /// Whether `panel_bits` is an estimate rather than a placeholder (#1915).
+    ///
+    /// `false` means the joint estimator never ran — too few paired samples, or
+    /// a degenerate joint column. `panel_bits` is then `0.0` as a placeholder,
+    /// and `sufficient`/`deficit_bits`/`deficits` are suppressed rather than
+    /// derived from it, because subtracting a placeholder from a genuinely
+    /// computed `anchor_entropy_bits` yields a real-looking deficit and a
+    /// `ProposeLens` recommendation against lenses nobody measured.
+    pub panel_measured: bool,
+    /// Slots excluded from the attribution because they could not be measured.
+    pub unmeasured_slots: usize,
     pub anchor_entropy_bits: f32,
     pub sufficient: bool,
     pub deficit_bits: f32,
@@ -1282,20 +1341,43 @@ impl SynapseCalyxVault {
         let mut slot_bits: Vec<(SlotId, f32)> = Vec::new();
         for (slot, samples) in &gathered.by_slot {
             if samples.x.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
-                slots.push(SynapseCalyxSlotBits {
-                    slot: slot.get(),
-                    marginal_bits: 0.0,
-                    ci_low: 0.0,
-                    ci_high: 0.0,
-                    n_samples: samples.x.len(),
-                    sole_carrier: false,
-                    provisional: true,
-                });
+                slots.push(unmeasured_slot_bits(
+                    slot.get(),
+                    samples.x.len(),
+                    SynapseCalyxSlotBitsState::InsufficientSamples,
+                    format!(
+                        "{} paired sample(s); the KSG estimator requires {SYNAPSE_ASSAY_MIN_SAMPLES}",
+                        samples.x.len()
+                    ),
+                ));
                 continue;
             }
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
-            let estimate = ksg_mi_continuous_discrete(&samples.x, &samples.labels, k)
-                .map_err(|error| loom_math_error("estimate KSG lens bits", &error))?;
+            // A degenerate column is a fact about ONE lens, so it must not end
+            // the whole pass (#1915). `assay_redundancy` already degrades
+            // per-pair with a named reason and returns everything else; before
+            // this, a single categorical lens `?`-ed out of the entire report
+            // and no other slot — including the well-conditioned continuous
+            // ones — was ever reported.
+            let estimate = match ksg_mi_continuous_discrete(&samples.x, &samples.labels, k) {
+                Ok(estimate) => estimate,
+                Err(error) if is_degenerate_column(&error) => {
+                    slots.push(unmeasured_slot_bits(
+                        slot.get(),
+                        samples.x.len(),
+                        SynapseCalyxSlotBitsState::DegenerateColumn,
+                        format!(
+                            "the estimator refused this column: {error}. A categorical/one-hot lens \
+                             is degenerate for a continuous KSG estimator by construction; park or \
+                             retire it, or measure it with a discrete estimator"
+                        ),
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(loom_math_error("estimate KSG lens bits", &error));
+                }
+            };
             slot_bits.push((*slot, estimate.bits));
             store.put(
                 AssayCacheKey::scoped(
@@ -1317,6 +1399,8 @@ impl SynapseCalyxVault {
                 n_samples: estimate.n_samples,
                 sole_carrier: false,
                 provisional: false,
+                state: SynapseCalyxSlotBitsState::Measured,
+                unmeasured_reason: None,
             });
         }
 
@@ -1398,28 +1482,47 @@ impl SynapseCalyxVault {
         // the sufficiency numerator.
         let ksg_k = params.ksg_k.max(1);
         let mut slot_bits: Vec<(SlotId, f32)> = Vec::new();
+        // Slots the estimator could not measure are EXCLUDED, not pushed as
+        // zero (#1915). A placeholder zero here became a concrete
+        // `deficit_bits` and a `ProposeLens` recommendation against a lens
+        // nobody had measured — advice manufactured out of an absence.
+        let mut unmeasured_slots = 0usize;
         for (slot, samples) in &gathered.by_slot {
             if samples.x.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
-                slot_bits.push((*slot, 0.0));
+                unmeasured_slots += 1;
                 continue;
             }
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
-            let estimate = ksg_mi_continuous_discrete(&samples.x, &samples.labels, k)
-                .map_err(|error| loom_math_error("estimate KSG lens bits", &error))?;
-            slot_bits.push((*slot, estimate.bits));
+            match ksg_mi_continuous_discrete(&samples.x, &samples.labels, k) {
+                Ok(estimate) => slot_bits.push((*slot, estimate.bits)),
+                Err(error) if is_degenerate_column(&error) => {
+                    unmeasured_slots += 1;
+                }
+                Err(error) => return Err(loom_math_error("estimate KSG lens bits", &error)),
+            }
         }
         let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
 
         let joint = build_joint_samples(&corpus, &anchor_kind);
         let anchor_entropy_bits = entropy_bits(&joint.labels);
         let joint_records = joint.labels.len();
-        let panel_bits = if joint_records >= SYNAPSE_ASSAY_MIN_SAMPLES {
+        // `panel_measured` is the load-bearing distinction (#1915): below the
+        // floor there is no joint estimate, and `panel_bits = 0.0` is a
+        // placeholder. Subtracting a placeholder from a genuinely computed
+        // anchor entropy produced a real-looking `deficit_bits` and
+        // `sufficient=false` on the live vault, where nothing had been measured
+        // at all.
+        let (panel_bits, panel_measured) = if joint_records >= SYNAPSE_ASSAY_MIN_SAMPLES {
             let k = ksg_k.min(joint_records.saturating_sub(1)).max(1);
-            ksg_mi_continuous_discrete(&joint.x, &joint.labels, k)
-                .map_err(|error| loom_math_error("estimate KSG panel joint bits", &error))?
-                .bits
+            match ksg_mi_continuous_discrete(&joint.x, &joint.labels, k) {
+                Ok(estimate) => (estimate.bits, true),
+                Err(error) if is_degenerate_column(&error) => (0.0, false),
+                Err(error) => {
+                    return Err(loom_math_error("estimate KSG panel joint bits", &error));
+                }
+            }
         } else {
-            0.0
+            (0.0, false)
         };
 
         let mut store = AssayStore::default();
@@ -1501,13 +1604,19 @@ impl SynapseCalyxVault {
                 anchored_records: gathered.anchored_records,
                 joint_records,
                 panel_bits,
+                panel_measured,
+                unmeasured_slots,
                 anchor_entropy_bits,
-                sufficient: sufficiency.sufficient,
-                deficit_bits: sufficiency.deficit_bits,
+                sufficient: panel_measured && sufficiency.sufficient,
+                deficit_bits: if panel_measured {
+                    sufficiency.deficit_bits
+                } else {
+                    0.0
+                },
                 grounded: matches!(trust, TrustTag::Trusted),
                 domain_provisional: verdict.provisional,
                 domain_grounded_fraction: verdict.grounded_fraction,
-                deficits,
+                deficits: if panel_measured { deficits } else { Vec::new() },
                 assay_cf_rows_after,
             });
         }
@@ -1517,9 +1626,15 @@ impl SynapseCalyxVault {
             anchored_records: gathered.anchored_records,
             joint_records,
             panel_bits,
+            panel_measured,
+            unmeasured_slots,
             anchor_entropy_bits,
-            sufficient: panel_bits >= anchor_entropy_bits,
-            deficit_bits: (anchor_entropy_bits - panel_bits).max(0.0),
+            sufficient: panel_measured && panel_bits >= anchor_entropy_bits,
+            deficit_bits: if panel_measured {
+                (anchor_entropy_bits - panel_bits).max(0.0)
+            } else {
+                0.0
+            },
             grounded: false,
             domain_provisional: verdict.provisional,
             domain_grounded_fraction: verdict.grounded_fraction,
@@ -2005,6 +2120,37 @@ struct GatheredAnchoredSamples {
 struct JointAnchoredSamples {
     x: Vec<Vec<f32>>,
     labels: Vec<usize>,
+}
+
+/// A slot the estimator did not measure. `marginal_bits` is a placeholder zero
+/// and `state`/`unmeasured_reason` say so, so nothing downstream can mistake it
+/// for a measured zero (#1915).
+fn unmeasured_slot_bits(
+    slot: u16,
+    n_samples: usize,
+    state: SynapseCalyxSlotBitsState,
+    reason: String,
+) -> SynapseCalyxSlotBits {
+    SynapseCalyxSlotBits {
+        slot,
+        marginal_bits: 0.0,
+        ci_low: 0.0,
+        ci_high: 0.0,
+        n_samples,
+        sole_carrier: false,
+        provisional: true,
+        state,
+        unmeasured_reason: Some(reason),
+    }
+}
+
+/// Whether a math error is the estimator refusing a column whose same-class
+/// samples are too duplicated to give a non-zero kth-neighbour radius.
+///
+/// Matched on the structured code rather than on message text, so a reworded
+/// error cannot silently turn a per-slot skip back into a whole-pass abort.
+fn is_degenerate_column(error: &calyx_core::CalyxError) -> bool {
+    error.code == "CALYX_ASSAY_DEGENERATE_INPUT"
 }
 
 fn gather_anchored_slot_samples(
