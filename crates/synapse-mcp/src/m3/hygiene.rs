@@ -437,7 +437,13 @@ pub struct HygieneAnchorKindCoverage {
 #[serde(deny_unknown_fields)]
 pub struct HygieneSlotGroundingCoverage {
     pub slot: u32,
+    /// Records where this lens produced a real measurement.
     pub records_present: u64,
+    /// Records where this lens is stored but measured nothing — a sparse lane
+    /// over a record with no text for it. Counted separately so coverage cannot
+    /// report a text lane as fully measured on records that have no text
+    /// (#1904); `calyx-search` excludes these same rows from BM25's `N`.
+    pub records_empty_measurement: u64,
     pub grounded_records: u64,
     pub ungrounded_records: u64,
     pub coverage_fraction: f32,
@@ -482,6 +488,7 @@ fn map_slot_grounding(
     HygieneSlotGroundingCoverage {
         slot: u32::from(coverage.slot),
         records_present: coverage.records_present as u64,
+        records_empty_measurement: coverage.records_empty_measurement as u64,
         grounded_records: coverage.grounded_records as u64,
         ungrounded_records: coverage.ungrounded_records as u64,
         coverage_fraction: coverage.coverage_fraction,

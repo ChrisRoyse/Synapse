@@ -43,12 +43,28 @@ pub struct SynapseCalyxAnchorKindCoverage {
     pub coverage_fraction: f32,
 }
 
-/// Per-lens grounded coverage over a panel: of the records where this lens is
-/// present (non-absent), how many carry a grounded anchor.
+/// Per-lens grounded coverage over a panel: of the records where this lens
+/// actually measured something, how many carry a grounded anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxSlotGroundingCoverage {
     pub slot: u16,
+    /// Records where this lens produced a real measurement.
+    ///
+    /// A slot can be stored and still carry nothing. A sparse lens measured over
+    /// a record that has no text for it yields `Sparse { entries: [] }` — which
+    /// is not `Absent`, so it used to be counted here as covered. `calyx-search`
+    /// has always defined that vector the other way (`field_doc_count`: "a row
+    /// whose vector is empty is a document that does not have this field at
+    /// all"), so coverage was reporting as present exactly what the search layer
+    /// excludes from BM25's `N`. See `records_empty_measurement`.
     pub records_present: usize,
+    /// Records where this lens is stored but measured nothing.
+    ///
+    /// Reported rather than silently folded into absence, for the reason #1915
+    /// gave: "skipped" and "measured zero" must not be indistinguishable in the
+    /// payload. A high count here is a real signal — it means the lens is
+    /// declared on a panel whose records frequently lack its source field.
+    pub records_empty_measurement: usize,
     pub grounded_records: usize,
     pub ungrounded_records: usize,
     pub coverage_fraction: f32,
@@ -100,6 +116,7 @@ pub struct SynapseCalyxDomainGroundingVerdict {
 #[derive(Default)]
 struct SlotAccumulator {
     records_present: usize,
+    records_empty_measurement: usize,
     grounded_records: usize,
 }
 
@@ -167,6 +184,10 @@ impl SynapseCalyxVault {
                     continue;
                 }
                 let entry = slots.entry(slot.get()).or_default();
+                if is_empty_measurement(vector) {
+                    entry.records_empty_measurement += 1;
+                    continue;
+                }
                 entry.records_present += 1;
                 if record_is_grounded {
                     entry.grounded_records += 1;
@@ -214,6 +235,7 @@ impl SynapseCalyxVault {
                 SynapseCalyxSlotGroundingCoverage {
                     slot,
                     records_present: acc.records_present,
+                    records_empty_measurement: acc.records_empty_measurement,
                     grounded_records: acc.grounded_records,
                     ungrounded_records: acc.records_present.saturating_sub(acc.grounded_records),
                     coverage_fraction,
@@ -302,4 +324,23 @@ pub fn anchor_kind_label(kind: &AnchorKind) -> String {
 
 const fn is_absent(vector: &SlotVector) -> bool {
     matches!(vector, SlotVector::Absent { .. })
+}
+
+/// True when a slot is stored but carries no measurement.
+///
+/// Only sparse and multi-vector shapes can answer this. For those, "no entries"
+/// is definitionally "no terms were found in this document" — `calyx-search`
+/// already relies on exactly that reading to keep empty rows out of BM25's `N`
+/// and `avgdl`, while retaining the row so a delta can mask it.
+///
+/// A dense vector is deliberately NOT included, even when every component is
+/// zero. For a dense lens zero is a *value*, not an absence: a z-score of a
+/// record sitting exactly at the mean is 0.0, and reading that as "unmeasured"
+/// would invent the opposite error to the one this fixes.
+const fn is_empty_measurement(vector: &SlotVector) -> bool {
+    match vector {
+        SlotVector::Sparse { entries, .. } => entries.is_empty(),
+        SlotVector::Multi { tokens, .. } => tokens.is_empty(),
+        _ => false,
+    }
 }
