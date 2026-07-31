@@ -337,7 +337,12 @@ pub(crate) fn run_derived_state_maintenance() {
                      records are read by no active-panel surface and are counted as stranded"
                 );
             }
-            drive_panel_backfill(&db, &report);
+            // A failed backfill page must not leave the tick counted as a clean
+            // success. It already records its own failure, but without this the
+            // pass would still bump DERIVED_STATE_SUCCESS and refresh
+            // last_success_unix_ms, so an operator reading the counters would see
+            // a healthy cadence over a backfill that has been failing every tick.
+            any_failed |= drive_panel_backfill(&db, &report);
             let mut guard = match DERIVED_STATE_LAST.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -398,7 +403,14 @@ struct BackfillCursor {
 /// Every exit records a named action. "Nothing was owed" and "the budget ran out
 /// mid-corpus" and "the page failed" are three different outcomes and none of
 /// them is allowed to look like the others.
-fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCoverageReport) {
+///
+/// Returns `true` when this pass failed, so the caller can withhold the tick's
+/// success. Without that, a backfill failing on every tick would still refresh
+/// `last_success_unix_ms` and bump the success counter, and the counters would
+/// read as a healthy cadence over a repair that is not happening — the same
+/// shape as the `health`-says-ok-while-coverage-is-1.7% failure this whole
+/// issue is about.
+fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCoverageReport) -> bool {
     let started = std::time::Instant::now();
     let Some(target) = report.most_owed_backfill() else {
         let action = if report.coverage_deficient_panels.is_empty() {
@@ -418,7 +430,11 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         guard.last_backfill_source_cf = None;
         guard.last_backfill_pages = Some(0);
         guard.last_backfill_elapsed_ms = Some(0);
-        return;
+        // Not a failure: "nothing is owed" and "nothing owed is repairable" are
+        // both correct outcomes for this pass. The unrepairable case is a
+        // deficiency of the panel catalog, already raised by health, not a
+        // failure of this driver.
+        return false;
     };
     let Some(source_cf) = target.backfill_source_cf.clone() else {
         // `most_owed_backfill` already filtered on this being present; reaching
@@ -433,7 +449,7 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
                 target.panel_name
             ),
         );
-        return;
+        return true;
     };
 
     // A cursor taken under a different panel generation or a different CF says
@@ -566,4 +582,8 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
     guard.last_backfill_outcome_anchored_rows = Some(outcome_anchored);
     guard.last_backfill_elapsed_ms = Some(elapsed_ms);
     guard.last_backfill_sweep_complete = Some(sweep_complete);
+
+    // `page_failed` and `cursor_absent` are the two exits that already called
+    // record_failure; report them so the tick is not also counted a success.
+    matches!(action, "page_failed" | "cursor_absent")
 }
