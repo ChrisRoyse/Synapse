@@ -232,6 +232,14 @@ pub(crate) fn dense_cosine(a: &[f32], b: &[f32]) -> Result<f32> {
                 side.label()
             ),
         ),
+        CosineFailure::NormOverflow { side } => sextant_error(
+            CALYX_SEXTANT_VECTOR_SHAPE,
+            format!(
+                "cosine {} operand has all-finite components whose squares overflowed f32; no \
+                 single element is at fault",
+                side.label()
+            ),
+        ),
         CosineFailure::Overflow => sextant_error(
             CALYX_SEXTANT_VECTOR_SHAPE,
             "cosine dot product overflowed over finite inputs",

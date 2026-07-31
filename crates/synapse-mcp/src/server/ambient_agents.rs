@@ -87,7 +87,9 @@ use synapse_storage::{
     Db,
     agent_events::agent_event_key,
     agent_transcripts::{agent_transcript_key, agent_transcript_ts_index_key},
-    cf, decode_json, encode_json,
+    cf,
+    constellations::{TRANSCRIPT_TOOL_STATUS_ERROR, TRANSCRIPT_TOOL_STATUS_OK},
+    decode_json, encode_json,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -3108,10 +3110,31 @@ fn classify_user(
                             result_summary: Some(result_summary),
                             result_bytes: Some(result_bytes),
                             result_truncated,
-                            status: block_object
-                                .get("is_error")
-                                .and_then(Value::as_bool)
-                                .and_then(|is_error| is_error.then(|| "error".to_owned())),
+                            // #1926: `is_error` is the only adjudicated outcome
+                            // the ambient path ever observes, and it was being
+                            // collapsed — `false` and *absent* both became
+                            // `None`, which threw away the difference between
+                            // "the provider declared success" and "the provider
+                            // said nothing". Both still adjudicate to success
+                            // (see `agent_transcript_tool_outcome`), but they
+                            // are different observations and #1918 exists
+                            // because two different things were once allowed to
+                            // read as one. A present-but-non-boolean `is_error`
+                            // is refused rather than silently dropped.
+                            status: match block_object.get("is_error") {
+                                None | Some(Value::Null) => None,
+                                Some(Value::Bool(true)) => {
+                                    Some(TRANSCRIPT_TOOL_STATUS_ERROR.to_owned())
+                                }
+                                Some(Value::Bool(false)) => {
+                                    Some(TRANSCRIPT_TOOL_STATUS_OK.to_owned())
+                                }
+                                Some(other) => {
+                                    return Err(format!(
+                                        "TOOL_RESULT_IS_ERROR_NOT_BOOLEAN: is_error={other}"
+                                    ));
+                                }
+                            },
                             ..TranscriptToolCall::default()
                         });
                     }

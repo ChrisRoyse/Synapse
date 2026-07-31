@@ -3,7 +3,8 @@ use std::env;
 use std::time::Duration;
 
 use calyx_core::{
-    AbsentReason, Asymmetry, Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens,
+    AbsentReason, Asymmetry, CalyxErrorCode, Constellation, CxFlags, CxId, Input, InputRef,
+    LedgerRef, Lens,
     METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS, METADATA_SOURCE_SEQUENCE,
     METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE, Modality, Panel, QuantPolicy,
     Slot, SlotId, SlotKey, SlotResource, SlotState, SlotVector, TEMPORAL_LANE_ACTIVE,
@@ -27,10 +28,10 @@ use synapse_core::types::{
 };
 use synapse_telemetry::metrics::{
     CALYX_CONSTELLATION_MEASUREMENT_DURATION_US, CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL,
-    CALYX_CONSTELLATION_MEASUREMENTS_TOTAL,
+    CALYX_CONSTELLATION_MEASUREMENTS_TOTAL, CALYX_SLOT_LENS_REFUSED_TOTAL,
 };
 
-use crate::{StorageError, StorageResult, cf};
+use crate::{GroundingAnchor, GroundingAnchorValue, StorageError, StorageResult, cf};
 
 pub const SYN_TIMELINE_PANEL_NAME: &str = "syn-timeline-v1";
 /// Current timeline slot layout.
@@ -632,6 +633,17 @@ pub struct TemporalMetadataBackfillReport {
     pub inserted_rows: u64,
     pub backfilled_rows: u64,
     pub already_current_rows: u64,
+    /// Rows this page grounded with a declared tool-call outcome anchor
+    /// (#1926). Always 0 for CFs that carry no adjudicated outcome. A sweep
+    /// that re-measures rows but grounds none of them is a visible fact here
+    /// rather than something to infer from a later coverage report.
+    pub outcome_anchored_rows: u64,
+    /// Rows this page examined that carried no outcome to write at all.
+    pub outcome_absent_rows: u64,
+    /// Rows this page examined that were observed tool results the declared
+    /// adjudication declined to decide (#1926). Non-zero here is a real signal:
+    /// the corpus contains a result shape this code does not yet cover.
+    pub outcome_unadjudicable_rows: u64,
     pub latest_seq: u64,
     pub resume_after_physical: Option<Vec<u8>>,
     pub more: bool,
@@ -3203,9 +3215,16 @@ pub fn build_agent_transcript_constellation(
         )?,
     );
     let transcript_text_value = transcript_text(record);
+    // #1924: the three text lanes are the only slots on this panel whose input
+    // is unbounded — every field is capped at ingest, but the *number* of tool
+    // calls on a row is not, so a turn issuing many large calls is the case that
+    // crosses `MAX_TEXT_TOKENS`. They measure through `measure_text_or_absent`,
+    // which leaves the refusing lane `Absent{Error}` and keeps the other twelve
+    // slots. Every other slot below still uses `?`: their inputs are bounded by
+    // construction, so a refusal there would be a defect, not a long row.
     slots.insert(
         AT_SLOT_TEXT_SPARSE,
-        measure_text(
+        measure_text_or_absent(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text(
                 "syn.agent_transcript.text_sparse.v1",
@@ -3217,7 +3236,7 @@ pub fn build_agent_transcript_constellation(
     );
     slots.insert(
         AT_SLOT_TEXT_BM25,
-        measure_text(
+        measure_text_or_absent(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text_tf(
                 "syn.agent_transcript.text_bm25.v1",
@@ -3229,7 +3248,7 @@ pub fn build_agent_transcript_constellation(
     );
     slots.insert(
         AT_SLOT_TEXT_FULL_BM25,
-        measure_text(
+        measure_text_or_absent(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text_tf(
                 "syn.agent_transcript.text_full_bm25.v1",
@@ -5447,6 +5466,73 @@ fn measure_input(
     })
 }
 
+/// Prefix of the `Absent{Error}` reason a lens refusal is recorded under.
+///
+/// Stable and matched on by the coverage readback, so "this lens refused this
+/// row" is a countable fact rather than a log line (#1924).
+pub const SLOT_REFUSED_ABSENT_PREFIX: &str = "lens_refused:";
+
+/// Measures one text slot, degrading an **over-limit** refusal to a per-slot
+/// `Absent{Error}` instead of failing the whole constellation (#1924).
+///
+/// ## Why the blast radius is per-slot, and why only for this one code
+///
+/// Failing closed on an over-long document is correct for the *lens*. It was
+/// the *record* that was wrong: `build_agent_transcript_constellation` measured
+/// every slot with `?`, so a row one token over the text lane's bound also lost
+/// its role one-hot, its status one-hot, its event-kind hash, its token
+/// scalars, its record vector and its temporal lenses. The row became
+/// unmeasured rather than partially measured — the opposite of the per-slot
+/// discipline #1915 established for estimator refusals.
+///
+/// The degrade is deliberately keyed to `CALYX_LENS_INPUT_TOO_LARGE` alone,
+/// which is a property of the data. Every other lens error —
+/// `CALYX_LENS_DIM_MISMATCH`, `CALYX_LENS_NUMERICAL_INVARIANT`,
+/// `CALYX_LENS_FROZEN_VIOLATION` — is a property of the code, means the lens is
+/// broken, and still aborts the record. Turning those into an absent slot would
+/// be a silent fallback, which is exactly what this codebase refuses to do.
+///
+/// The recorded reason carries the lens id and the refusal text, so the readback
+/// can answer "which rows lost which lens, and why" without re-deriving
+/// anything from logs.
+fn measure_text_or_absent(
+    panel_name: &'static str,
+    lens: AlgorithmicLens,
+    text: &str,
+) -> StorageResult<SlotVector> {
+    let input = Input::new(Modality::Structured, text.as_bytes());
+    match lens.measure(&input) {
+        Ok(vector) => Ok(vector),
+        Err(source) if source.code == CalyxErrorCode::LensInputTooLarge.code() => {
+            let lens_id = lens.id().to_string();
+            synapse_telemetry::metrics::counter!(
+                CALYX_SLOT_LENS_REFUSED_TOTAL,
+                "panel" => panel_name,
+                "lens" => lens_id.clone(),
+            )
+            .increment(1);
+            tracing::warn!(
+                code = "CALYX_SLOT_LENS_REFUSED",
+                panel_name,
+                lens_id = %lens_id,
+                detail = %source.message,
+                remediation = "the record keeps every other lens; query the panel's \
+                               records_slot_refused coverage to see how often this fires",
+                "a lens refused an over-limit input; the slot is Absent{{Error}} and the rest of \
+                 the constellation is measured"
+            );
+            Ok(absent(AbsentReason::Error(format!(
+                "{SLOT_REFUSED_ABSENT_PREFIX}{lens_id}: {}",
+                source.message
+            ))))
+        }
+        Err(source) => Err(measurement_error(
+            "Calyx Syn* lens measurement failed",
+            format!("{panel_name}: {}: {source}", lens.id()),
+        )),
+    }
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "call sites pass lightweight display values or owned error strings; taking by value avoids temporary lifetime plumbing in error construction"
@@ -5702,6 +5788,280 @@ fn transcript_usage_total(record: &AgentTranscriptRecord) -> Option<u64> {
     }
     (input.is_some() || output.is_some() || cache_read.is_some() || cache_creation.is_some())
         .then_some(total)
+}
+
+/// Anchor kind carrying the adjudicated outcome of one observed tool call.
+///
+/// Deliberately the same label `agent_events.rs` already writes for the ~29
+/// calls Synapse brokers end to end, because it is the same claim about the
+/// same kind of event. One kind, two evidence paths, one axis to measure bits
+/// on.
+pub const AGENT_TOOL_CALL_SUCCESS_ANCHOR_KIND: &str = "synapse:agent_tool_call_success";
+
+/// `event_kind` written by `ambient_agents.rs::classify_user` for a line whose
+/// content is a `tool_result` block. The adjudication below is scoped to
+/// exactly these rows and nothing else.
+pub const AGENT_TRANSCRIPT_TOOL_RESULT_EVENT_KIND: &str = "user/tool_result";
+
+/// `TranscriptToolCall::status` for a result the provider explicitly marked
+/// `is_error: true`.
+pub const TRANSCRIPT_TOOL_STATUS_ERROR: &str = "error";
+/// `TranscriptToolCall::status` for a result the provider explicitly marked
+/// `is_error: false`.
+///
+/// Distinct from `status: None`, which means the field was **absent**. Both
+/// adjudicate to success (see [`agent_transcript_tool_outcome`]), but they are
+/// different observations and #1918 exists because two different things were
+/// allowed to read as one once already.
+pub const TRANSCRIPT_TOOL_STATUS_OK: &str = "ok";
+
+/// Why a `tool_result` row carries no adjudicable outcome (#1926).
+///
+/// Deliberately **not** an error. A row in one of these states still gets its
+/// durable evidence row and its constellation; it simply gets no anchor,
+/// because there is no single outcome to state about it. Making it an error
+/// would propagate out of `commit_transcript_chunk`, fail the chunk, hold the
+/// ambient cursor, and wedge that session's ingestion permanently — collateral
+/// damage on an unrelated subsystem, not fail-closed behaviour. Fail-closed
+/// here means "never write an outcome I had to guess", and writing nothing
+/// achieves exactly that.
+///
+/// Each variant is counted and labelled so the gap is visible in
+/// `corpus_histogram`'s `tool_outcome` dimension rather than inferred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentTranscriptUnadjudicable {
+    /// The row carried more than one result block, so a row-level anchor would
+    /// be an aggregation of several outcomes rather than an adjudication of one.
+    ///
+    /// Measured as zero across the whole real corpus (9,034 lines, every one
+    /// carrying exactly one block), because Claude Code splits parallel results
+    /// onto separate lines. That is a property of this transcript format, not
+    /// of the protocol: the Messages API pairs two `tool_use` blocks with one
+    /// user message carrying two `tool_result` blocks. So this is unreachable
+    /// today and must not be assumed unreachable tomorrow.
+    MultipleResults,
+    /// The row carried a tool status outside the declared set, so its polarity
+    /// is not something this code is entitled to decide.
+    UndeclaredStatus,
+}
+
+impl AgentTranscriptUnadjudicable {
+    /// Stable label for readbacks and histograms.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MultipleResults => "unadjudicable_multiple_results",
+            Self::UndeclaredStatus => "unadjudicable_undeclared_status",
+        }
+    }
+}
+
+/// What one transcript row's tool outcome resolves to (#1926).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentTranscriptToolOutcome {
+    /// Not an observed tool result; there is nothing to adjudicate.
+    NotAToolResult,
+    /// A single observed result with a declared polarity.
+    Adjudicated(AgentTranscriptToolAdjudication),
+    /// An observed result this code will not decide the polarity of.
+    Unadjudicable(AgentTranscriptUnadjudicable),
+}
+
+impl AgentTranscriptToolOutcome {
+    /// Stable label for readbacks and histograms.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotAToolResult => "no_tool_outcome",
+            Self::Adjudicated(adjudication) => adjudication.label(),
+            Self::Unadjudicable(reason) => reason.label(),
+        }
+    }
+}
+
+/// How a row's adjudicated tool outcome was observed (#1926).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentTranscriptToolAdjudication {
+    /// The provider wrote `is_error: true`.
+    DeclaredError,
+    /// The provider wrote `is_error: false`.
+    DeclaredOk,
+    /// The provider omitted `is_error`.
+    OmittedIsError,
+}
+
+impl AgentTranscriptToolAdjudication {
+    /// Stable label for readbacks and histograms.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DeclaredError => "declared_error",
+            Self::DeclaredOk => "declared_ok",
+            Self::OmittedIsError => "omitted_is_error",
+        }
+    }
+
+    /// The adjudicated outcome this observation carries.
+    #[must_use]
+    pub const fn success(self) -> bool {
+        !matches!(self, Self::DeclaredError)
+    }
+}
+
+/// The **declared** adjudication of one observed tool call (#1926).
+///
+/// ## Why this is a declaration and not an inference
+///
+/// The Anthropic Messages API defines `is_error` on a `tool_result` block as an
+/// *optional* boolean set to `true` when the call failed. Success is encoded by
+/// writing `false` **or by omitting the field entirely** — the reference
+/// lowering emits `is_error: true` on failure and `undefined` otherwise. So
+/// "absent" is not missing data whose meaning must be guessed; it is the
+/// protocol's own spelling of "not an error".
+///
+/// That is what makes `Bool(is_error != true)` an adjudication Synapse is
+/// entitled to write as a grounded anchor rather than a provisional label, and
+/// it is the same standard `SYNAPSE_DECLARED_ENUM_ADJUDICATIONS` holds an enum
+/// anchor to: the split must already be made by a cited authority, never
+/// invented by the consumer.
+///
+/// ## Why one anchor per row is exact, not an aggregation
+///
+/// Measured over the whole real corpus (54 session files): every one of 9,034
+/// `user/tool_result` lines carries **exactly one** `tool_result` block, and
+/// zero lines mix a success and an error. So a row is one tool call, and the
+/// row-level anchor loses nothing. A row that ever carried more than one block,
+/// or a mix, is refused below rather than silently reduced to a majority — an
+/// aggregated outcome is not an adjudicated one.
+///
+/// ## Why this is total rather than fallible
+///
+/// It answers "what outcome does this row carry", and "none I can state" is a
+/// real answer to that question, not a failure to answer it. An earlier draft
+/// returned `Err` for a row it would not adjudicate; that error propagated
+/// through `commit_transcript_chunk`, failed the chunk, held the ambient
+/// cursor, and would have wedged a session's transcript ingestion permanently
+/// the first time a legal multi-result line appeared. Refusing to guess must
+/// cost an anchor, never the evidence.
+///
+/// The refusal is preserved and made *visible* instead: every unadjudicable row
+/// carries a distinct label through `corpus_histogram`'s `tool_outcome`
+/// dimension, so the gap is counted from the vault rather than inferred.
+#[must_use]
+pub fn agent_transcript_tool_outcome(
+    record: &AgentTranscriptRecord,
+) -> AgentTranscriptToolOutcome {
+    if record.event_kind.as_deref() != Some(AGENT_TRANSCRIPT_TOOL_RESULT_EVENT_KIND)
+        || record.status != TranscriptParseStatus::Parsed
+    {
+        return AgentTranscriptToolOutcome::NotAToolResult;
+    }
+    let [tool_call] = record.tool_calls.as_slice() else {
+        return AgentTranscriptToolOutcome::Unadjudicable(
+            AgentTranscriptUnadjudicable::MultipleResults,
+        );
+    };
+    match tool_call.status.as_deref() {
+        Some(TRANSCRIPT_TOOL_STATUS_ERROR) => {
+            AgentTranscriptToolOutcome::Adjudicated(AgentTranscriptToolAdjudication::DeclaredError)
+        }
+        Some(TRANSCRIPT_TOOL_STATUS_OK) => {
+            AgentTranscriptToolOutcome::Adjudicated(AgentTranscriptToolAdjudication::DeclaredOk)
+        }
+        None => AgentTranscriptToolOutcome::Adjudicated(
+            AgentTranscriptToolAdjudication::OmittedIsError,
+        ),
+        Some(_) => AgentTranscriptToolOutcome::Unadjudicable(
+            AgentTranscriptUnadjudicable::UndeclaredStatus,
+        ),
+    }
+}
+
+/// Anchor `source` recorded for an outcome adjudicated from an observed
+/// transcript row, distinct from `synapse-agent-event` so a readback can tell
+/// the two evidence paths apart without joining anything.
+pub const SOURCE_AGENT_TRANSCRIPT_TOOL_RESULT: &str = "synapse-agent-transcript-tool-result";
+
+/// The one ledger-payload shape every grounded anchor is stamped with.
+///
+/// Lives here rather than beside a caller so the schema string, the field set,
+/// and the hashing decisions have exactly one definition. Values are hashed,
+/// never carried verbatim, except for the numeric/boolean cases that cannot
+/// leak content.
+#[must_use]
+pub fn grounding_anchor_ledger_payload(
+    source_cf: &str,
+    source_key: &[u8],
+    source_value: &[u8],
+    anchor: &GroundingAnchor,
+) -> Value {
+    json!({
+        "schema": "synapse.grounding_anchor.v2",
+        "source_cf": source_cf,
+        "source_row_sha256": sha256_hex(source_key),
+        "source_value_sha256": sha256_hex(source_value),
+        "anchor_kind_sha256": sha256_hex(anchor.kind_label.as_bytes()),
+        "anchor_value": grounding_anchor_value_payload(&anchor.value),
+        "anchor_source_sha256": sha256_hex(anchor.source.as_bytes()),
+        "observed_at_ms": anchor.observed_at_ms,
+        "confidence": anchor.confidence,
+    })
+}
+
+fn grounding_anchor_value_payload(value: &GroundingAnchorValue) -> Value {
+    match value {
+        GroundingAnchorValue::Bool(value) => json!({ "type": "bool", "value": value }),
+        GroundingAnchorValue::Enum(value) => json!({
+            "type": "enum",
+            "value_sha256": sha256_hex(value.as_bytes()),
+        }),
+        GroundingAnchorValue::Number(value) => json!({ "type": "number", "value": value }),
+        GroundingAnchorValue::Text(value) => json!({
+            "type": "text",
+            "value_sha256": sha256_hex(value.as_bytes()),
+        }),
+    }
+}
+
+/// Builds the grounded outcome anchor for one transcript row, or `None` when
+/// the row carries no adjudicated outcome (#1926).
+///
+/// An unadjudicable row logs at warn and yields no anchor. It does not fail:
+/// see [`agent_transcript_tool_outcome`] for why refusing to guess must never
+/// cost the evidence row.
+#[must_use]
+pub fn agent_transcript_outcome_anchor(
+    record: &AgentTranscriptRecord,
+) -> Option<GroundingAnchor> {
+    let adjudication = match agent_transcript_tool_outcome(record) {
+        AgentTranscriptToolOutcome::NotAToolResult => return None,
+        AgentTranscriptToolOutcome::Adjudicated(adjudication) => adjudication,
+        AgentTranscriptToolOutcome::Unadjudicable(reason) => {
+            tracing::warn!(
+                code = "AGENT_TRANSCRIPT_TOOL_OUTCOME_UNADJUDICABLE",
+                spawn_id = %record.spawn_id,
+                line_no = record.line_no,
+                reason = reason.label(),
+                tool_calls = record.tool_calls.len(),
+                remediation = "the evidence row and its constellation are intact; this row \
+                               carries no grounded outcome. Query corpus_histogram's \
+                               tool_outcome dimension to count how many rows are in this state \
+                               before extending the declared adjudication",
+                "an observed tool result carries no outcome this code is entitled to declare"
+            );
+            return None;
+        }
+    };
+    Some(GroundingAnchor {
+        kind_label: AGENT_TOOL_CALL_SUCCESS_ANCHOR_KIND.to_owned(),
+        value: GroundingAnchorValue::Bool(adjudication.success()),
+        source: SOURCE_AGENT_TRANSCRIPT_TOOL_RESULT.to_owned(),
+        // The row's own ingestion timestamp. Nanoseconds to milliseconds is the
+        // same reduction `agent_events.rs` applies, so both evidence paths land
+        // on one time base.
+        observed_at_ms: record.ts_ns / 1_000_000,
+        confidence: 1.0,
+    })
 }
 
 fn transcript_text(record: &AgentTranscriptRecord) -> String {

@@ -1692,6 +1692,48 @@ impl Db {
         )
     }
 
+    /// Grounds one already-measured transcript row with its declared tool-call
+    /// outcome, or reports that the row carries no adjudicated outcome (#1926).
+    ///
+    /// Returns `Ok(None)` for every row that is not an observed `tool_result`.
+    /// That is a real answer, not a skip: those rows have nothing to adjudicate.
+    ///
+    /// The caller must have published the row's constellation at the active
+    /// panel version first. Calyx refuses an anchor whose constellation is
+    /// absent (`stale_derived: constellation missing at snapshot`), so an
+    /// un-measured row fails loudly here rather than accumulating a dangling
+    /// anchor that a grounding readback would never see.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row's outcome is not adjudicable or the
+    /// anchor write/readback fails.
+    #[tracing::instrument(skip_all, fields(line_no = record.line_no, backend = self.backend_name()))]
+    pub fn put_agent_transcript_outcome_anchor(
+        &self,
+        source_key: &[u8],
+        source_value: &[u8],
+        record: &synapse_core::AgentTranscriptRecord,
+    ) -> StorageResult<Option<CalyxAnchorWriteReport>> {
+        let Some(anchor) = constellations::agent_transcript_outcome_anchor(record) else {
+            return Ok(None);
+        };
+        let payload = constellations::grounding_anchor_ledger_payload(
+            cf::CF_AGENT_TRANSCRIPTS,
+            source_key,
+            source_value,
+            &anchor,
+        );
+        self.put_grounding_anchor_for_source(
+            cf::CF_AGENT_TRANSCRIPTS,
+            source_key,
+            source_value,
+            anchor,
+            &payload,
+        )
+        .map(Some)
+    }
+
     /// Writes grounded Calyx anchors for many already-persisted source rows in
     /// one durable batch, then reads every physical `Anchors` CF row back.
     ///

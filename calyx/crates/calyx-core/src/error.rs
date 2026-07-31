@@ -119,6 +119,11 @@ error_catalog! {
     LensNumericalInvariant, lens_numerical_invariant, "CALYX_LENS_NUMERICAL_INVARIANT",
     "NaN/Inf/non-unit output", "check lens runtime/normalize";
 
+    LensInputTooLarge, lens_input_too_large, "CALYX_LENS_INPUT_TOO_LARGE",
+    "input exceeds the lens's declared bound",
+    "measure this slot as Absent{Error} and keep the rest of the panel, or split the input; \
+     raising the bound trades a loud failure for a slow one";
+
     LensUnreachable, lens_unreachable, "CALYX_LENS_UNREACHABLE",
     "runtime endpoint down", "restore lens service";
 

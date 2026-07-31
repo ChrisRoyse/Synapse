@@ -23,6 +23,7 @@ pub const CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL: &str =
     "calyx_constellation_measurement_errors_total";
 pub const CALYX_CONSTELLATION_MEASUREMENT_DURATION_US: &str =
     "calyx_constellation_measurement_duration_us";
+pub const CALYX_SLOT_LENS_REFUSED_TOTAL: &str = "calyx_slot_lens_refused_total";
 pub const PROFILES_ACTIVE: &str = "profiles_active";
 pub const PROFILE_RELOADS_TOTAL: &str = "profile_reloads_total";
 pub const AUDIO_LOOPBACK_UNDERRUNS_TOTAL: &str = "audio_loopback_underruns_total";
@@ -173,6 +174,15 @@ pub const M3_METRICS: &[MetricSpec] = &[
         max_label_combinations: 48,
         label_policy: "panel and source_cf are closed sets; outcome is the Calyx put disposition.",
         description: "Native Calyx constellations measured and submitted from Synapse rows.",
+    },
+    MetricSpec {
+        name: CALYX_SLOT_LENS_REFUSED_TOTAL,
+        kind: MetricKind::Counter,
+        unit: Some(Unit::Count),
+        labels: &["panel", "lens"],
+        max_label_combinations: 64,
+        label_policy: "panel and lens are closed sets declared by the panel slot blocks.",
+        description: "Lens refusals degraded to a per-slot Absent{Error} instead of failing the                       whole constellation (#1924). The durable counterpart is the panel's                       records_slot_refused coverage.",
     },
     MetricSpec {
         name: CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL,

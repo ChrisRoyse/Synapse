@@ -742,11 +742,26 @@ fn ensure_power_of_two(label: &str, value: u32) -> Result<u32> {
     }
 }
 
+/// Refuses an input above the lens's declared token bound.
+///
+/// This is `CALYX_LENS_INPUT_TOO_LARGE`, not `CALYX_LENS_NUMERICAL_INVARIANT`,
+/// and the distinction is load-bearing (#1924). An over-long input is a
+/// property of the *data*: the correct response is to leave this one slot
+/// `Absent{Error}` and keep measuring the rest of the panel. A numerical
+/// invariant is a property of the *code*: a NaN or a wrong output dimension
+/// means the lens is broken and the record must not be published at all.
+///
+/// While both refusals shared one code, a caller could only tell them apart by
+/// matching on message text, so the only safe blast radius was "abort the whole
+/// constellation" — which is how one over-long row came to lose its role
+/// one-hot, its token scalars and its temporal lenses along with its text lane.
 fn ensure_token_limit(label: &str, got: usize, max: usize) -> Result<()> {
     if got <= max {
         Ok(())
     } else {
-        Err(numerical(format!("{label} has {got} tokens, max {max}")))
+        Err(CalyxError::lens_input_too_large(format!(
+            "{label} has {got} tokens, max {max}"
+        )))
     }
 }
 

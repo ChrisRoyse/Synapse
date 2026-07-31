@@ -815,6 +815,13 @@ pub struct StorageTemporalBackfillResponse {
     pub inserted_rows: u64,
     pub backfilled_rows: u64,
     pub already_current_rows: u64,
+    /// Rows this page grounded with a declared tool-call outcome (#1926).
+    pub outcome_anchored_rows: u64,
+    /// Rows this page examined that carried no outcome to write at all.
+    pub outcome_absent_rows: u64,
+    /// Rows this page examined that were observed tool results the declared
+    /// adjudication declined to decide (#1926).
+    pub outcome_unadjudicable_rows: u64,
     pub latest_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_after_physical_hex: Option<String>,
@@ -1990,8 +1997,14 @@ const CORPUS_HISTOGRAM_PAGE_ROWS: usize = 2_000;
 const CORPUS_HISTOGRAM_DEFAULT_BUCKETS: u32 = 64;
 
 /// Dimensions `CF_AGENT_TRANSCRIPTS` declares.
-const TRANSCRIPT_DIMENSIONS: &[&str] =
-    &["role", "event_kind", "status", "source", "text_presence"];
+const TRANSCRIPT_DIMENSIONS: &[&str] = &[
+    "role",
+    "event_kind",
+    "status",
+    "source",
+    "text_presence",
+    "tool_outcome",
+];
 /// Dimensions `CF_AGENT_EVENTS` declares.
 const AGENT_EVENT_DIMENSIONS: &[&str] = &["kind", "end_state", "reason_code", "adjudicable"];
 
@@ -2010,6 +2023,23 @@ fn declared_dimensions(source_cf: &str) -> Option<&'static [&'static str]> {
 /// `text_bm25` lane measures, and `tool_calls[]` is the prose that lane could
 /// not see. A row counted `tool_prose_only` is a row with real text that the
 /// content-only lane scores as empty.
+/// How each transcript row's tool-call outcome adjudicates (#1926).
+///
+/// The counterpart to `text_presence`: that dimension made "which rows carry
+/// prose no lens reads" answerable from the vault, and this one makes "which
+/// rows carry an outcome no anchor reads" answerable the same way. It calls the
+/// production adjudication rather than re-deriving it, so a histogram and a
+/// grounding sweep can never disagree about what a row means.
+///
+/// An `unadjudicable_*` row is reported rather than swallowed: a row the
+/// adjudication declines to decide is exactly the row an operator needs to see,
+/// and it is the only place that count is visible.
+fn transcript_tool_outcome_label(record: &synapse_core::AgentTranscriptRecord) -> String {
+    synapse_storage::constellations::agent_transcript_tool_outcome(record)
+        .label()
+        .to_owned()
+}
+
 fn transcript_text_presence(record: &synapse_core::AgentTranscriptRecord) -> &'static str {
     let has_content = record
         .content_summary
@@ -2155,6 +2185,7 @@ pub fn inspect_corpus_histogram(
                                     "event_kind" => optional_label(record.event_kind.as_deref()),
                                     "status" => json_label(&record.status),
                                     "source" => json_label(&record.source),
+                                    "tool_outcome" => transcript_tool_outcome_label(&record),
                                     _ => transcript_text_presence(&record).to_owned(),
                                 };
                                 record_labels.push((name.as_str(), label));
@@ -2369,6 +2400,9 @@ pub fn run_temporal_backfill(
         inserted_rows: report.inserted_rows,
         backfilled_rows: report.backfilled_rows,
         already_current_rows: report.already_current_rows,
+        outcome_anchored_rows: report.outcome_anchored_rows,
+        outcome_absent_rows: report.outcome_absent_rows,
+        outcome_unadjudicable_rows: report.outcome_unadjudicable_rows,
         latest_seq: report.latest_seq,
         resume_after_physical_hex: report.resume_after_physical.as_deref().map(hex_encode),
         more: report.more,

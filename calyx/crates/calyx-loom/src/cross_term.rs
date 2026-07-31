@@ -1,6 +1,7 @@
 //! Cross-term value types and CPU/GPU-parity math kernels.
 
 use calyx_core::{CxId, PanelSlotId, Result, SlotId};
+use calyx_forge::cpu::distance::{CosineFailure, cosine};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
@@ -52,74 +53,89 @@ pub fn canonical_pair(a: SlotId, b: SlotId) -> (SlotId, SlotId) {
 /// scalar loop with no SIMD dispatch of any kind (#1917), because each site
 /// answered "does this CPU have AVX2" independently and this one never asked.
 ///
-/// Two passes became one. The reduction now routes through
-/// [`calyx_forge::cpu::simd::dot_and_pair_norms`], which owns the fold order
-/// and dispatches on AVX2 at runtime with portable and AVX2 paths that are
-/// bit-identical by construction. The finiteness scan that `ensure_same_dim_finite`
-/// performed as a *separate* full pass over both vectors is fused into that
-/// reduction: a non-finite element poisons the accumulator it feeds and stays
-/// poisoned, so a non-finite norm is an exact per-side detector. The dimension
-/// check stays a pre-pass — it is not fusible, and it is cheap.
+/// #1917 gave this site a dispatched reduction. #1922 finished the job: the
+/// whole computation is now [`calyx_forge::cpu::distance::cosine`], and the
+/// only thing left here is the map from that function's typed
+/// [`CosineFailure`] onto Loom's own error codes.
 ///
-/// Classification order is preserved from the pre-fusion code: non-finite
-/// before zero-norm. Each norm is consulted before `dot`, because `dot` mixes
-/// both sides and so cannot say which one carried the bad value — the same
-/// attribution bug `calyx-forge::cpu::distance::paired_cosine_batch` documents
-/// having shipped once already.
+/// That mapping was the actual barrier to consolidation, and it is worth naming
+/// why. `paired_cosine_batch` was already the correct primitive, but it returned
+/// a `ForgeError`, which Loom cannot emit — Loom must return `CALYX_LOOM_*`. The
+/// only way to bridge that without a typed failure was to match on the error's
+/// message text, so instead each of four sites re-derived shape validation,
+/// finiteness classification, the zero-norm threshold and the range contract for
+/// itself. Three of them then had to be found and fixed one at a time (#1908,
+/// #1912, #1917), and the fusion argument had to be written out twice because
+/// there was nowhere to put it once.
 ///
-/// One behaviour is strictly stronger than before: two finite vectors whose
-/// squares overflow `f32` used to pass the finiteness pre-scan and then divide
-/// by an infinite norm, silently yielding `0.0` or `NaN`. That now returns
-/// [`CALYX_LOOM_NON_FINITE_VECTOR`] naming the overflow. A wrong agreement
-/// written to the XTerm CF is worse than a refused one.
+/// Two behaviours are strictly stronger than the pre-unification code, both
+/// inherited from the shared entry point rather than re-implemented:
+///
+/// - two finite vectors whose squares overflow `f32` used to divide by an
+///   infinite norm and silently yield `0.0` or `NaN`; that is now a named
+///   refusal. A wrong agreement written to the XTerm CF is worse than a refused
+///   one.
+/// - the quotient now passes through [`calyx_core::clamp_cosine_quotient`], so
+///   this site gets #1923's range contract that it never had — a pair of
+///   identical vectors can no longer emit a score just above `1.0`.
 pub fn agreement_scalar(a: &[f32], b: &[f32]) -> Result<f32> {
-    ensure_same_dim(a, b)?;
-    let (dot, an, bn) = calyx_forge::cpu::simd::dot_and_pair_norms(a, b);
-    if !an.is_finite() {
-        return Err(non_finite_side_error("left", a));
-    }
-    if !bn.is_finite() {
-        return Err(non_finite_side_error("right", b));
-    }
-    if !dot.is_finite() {
-        return Err(loom_error(
-            CALYX_LOOM_NON_FINITE_VECTOR,
-            format!(
-                "agreement dot product is non-finite over {} finite element(s) on both sides: the accumulation overflowed f32 range",
-                a.len()
-            ),
-        ));
-    }
-    if an <= f32::EPSILON || bn <= f32::EPSILON {
-        return Err(loom_error(
-            CALYX_LOOM_ZERO_NORM_VECTOR,
-            "agreement requires non-zero vectors",
-        ));
-    }
-    Ok(dot / (an.sqrt() * bn.sqrt()))
+    // #1922: the computation is shared; only the error vocabulary is Loom's.
+    // Everything this function used to own itself — the dimension check, the
+    // dispatched reduction, the fused per-side finiteness attribution, the
+    // zero-norm threshold, the `[-1,1]` range contract — now lives once in
+    // `calyx_forge::cpu::distance::cosine`, and a fifth call site cannot get
+    // any of it wrong because there is nothing left for it to re-decide.
+    cosine(a, b).map_err(agreement_failure_error)
 }
 
-/// Name the element that poisoned one side's norm accumulator.
+/// Maps the shared primitive's typed failure onto Loom's error codes.
 ///
-/// Only reached on the failure path, so the scan it performs costs the happy
-/// path nothing — which is the entire point of fusing the check into the
-/// reduction rather than running it up front on every call.
-fn non_finite_side_error(side: &'static str, values: &[f32]) -> calyx_core::CalyxError {
-    for (index, value) in values.iter().enumerate() {
-        if !value.is_finite() {
-            return loom_error(
-                CALYX_LOOM_NON_FINITE_VECTOR,
-                format!("xterm {side} vector element {index} is {value}"),
-            );
-        }
-    }
-    loom_error(
-        CALYX_LOOM_NON_FINITE_VECTOR,
-        format!(
-            "xterm {side} vector norm is non-finite even though all {} elements are finite: the accumulation overflowed f32 range",
-            values.len()
+/// This mapping is the entire remaining Loom-specific surface of an agreement
+/// cosine, and it is deliberately exhaustive: a new [`CosineFailure`] variant
+/// breaks this match rather than falling through to a generic code.
+///
+/// Every code is preserved from the pre-unification implementation so
+/// `loom_agreement_kernel_fsv` keeps measuring the same contract. `Empty` maps
+/// to the **dimension** code, not zero-norm: Loom's `ensure_same_dim` refused
+/// `a.is_empty()` in the same branch as a length disagreement, and a
+/// consolidation that quietly moved an empty pair to a different code would be
+/// exactly the silent behaviour change #1922 asks not to make.
+fn agreement_failure_error(failure: CosineFailure) -> calyx_core::CalyxError {
+    match failure {
+        CosineFailure::DimMismatch { left, right } => loom_error(
+            CALYX_LOOM_DIM_MISMATCH,
+            format!("xterm dims {left} and {right}"),
         ),
-    )
+        CosineFailure::Empty => loom_error(CALYX_LOOM_DIM_MISMATCH, "xterm dims 0 and 0"),
+        CosineFailure::NonFinite { side, index } => loom_error(
+            CALYX_LOOM_NON_FINITE_VECTOR,
+            format!("xterm {} vector element {index} is non-finite", side.label()),
+        ),
+        CosineFailure::NormOverflow { side } => loom_error(
+            CALYX_LOOM_NON_FINITE_VECTOR,
+            format!(
+                "xterm {} vector norm is non-finite even though every element is finite: the \
+                 accumulation overflowed f32 range",
+                side.label()
+            ),
+        ),
+        CosineFailure::Overflow => loom_error(
+            CALYX_LOOM_NON_FINITE_VECTOR,
+            "agreement dot product is non-finite over finite elements on both sides: the \
+             accumulation overflowed f32 range",
+        ),
+        CosineFailure::ZeroNorm { .. } => loom_error(
+            CALYX_LOOM_ZERO_NORM_VECTOR,
+            "agreement requires non-zero vectors",
+        ),
+        CosineFailure::OutOfRange { cosine } => loom_error(
+            CALYX_LOOM_NON_FINITE_VECTOR,
+            format!(
+                "agreement produced cosine {cosine}, further outside [-1,1] than f32 rounding \
+                 explains; this is a defect in the inputs or the reduction, not a value to clamp"
+            ),
+        ),
+    }
 }
 
 pub fn agreement_weight(raw_cosine: f32) -> Result<f32> {

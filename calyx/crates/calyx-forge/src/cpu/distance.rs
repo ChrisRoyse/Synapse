@@ -145,7 +145,18 @@ pub enum CosineFailure {
     Empty,
     /// One operand carries a non-finite element, with the offending index.
     NonFinite { side: CosineSide, index: usize },
-    /// Both operands are finite but their dot product overflowed.
+    /// One operand's elements are all finite, but the sum of their squares
+    /// overflowed `f32`.
+    ///
+    /// Distinct from [`Self::NonFinite`], and the distinction is not cosmetic:
+    /// a caller that conflates the two reports "element N is non-finite" for an
+    /// index that is in-bounds by luck or out of range entirely, and sends
+    /// whoever reads it looking for a bad value that does not exist. This is
+    /// also the case a finiteness *pre-scan* passes without comment, which is
+    /// why the fused reduction is strictly stronger than the scan it replaced.
+    NormOverflow { side: CosineSide },
+    /// Both operands are finite and their norms are representable, but the dot
+    /// product itself overflowed.
     Overflow,
     /// One operand has zero (or non-finite) norm; the quotient is undefined.
     ZeroNorm { side: CosineSide },
@@ -192,21 +203,22 @@ pub fn cosine(left: &[f32], right: &[f32]) -> core::result::Result<f32, CosineFa
     if left.is_empty() {
         return Err(CosineFailure::Empty);
     }
+    // The one legitimate use of the raw fused reduction in the workspace; every
+    // other site is stopped by the `disallowed-methods` entry in clippy.toml
+    // and routed here instead (#1922 ask 3).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "this function is the single cosine entry point the disallow redirects everyone else to"
+    )]
     let (dot_value, left_norm_sq, right_norm_sq) = dot_and_pair_norms(left, right);
     // Norms first, and per side, for the reason spelled out in
     // `paired_cosine_batch`: a non-finite `dot` does not say which operand
     // carried the non-finite value, so testing it first misattributes.
     if !left_norm_sq.is_finite() {
-        return Err(CosineFailure::NonFinite {
-            side: CosineSide::Left,
-            index: first_non_finite(left),
-        });
+        return Err(non_finite_side(CosineSide::Left, left));
     }
     if !right_norm_sq.is_finite() {
-        return Err(CosineFailure::NonFinite {
-            side: CosineSide::Right,
-            index: first_non_finite(right),
-        });
+        return Err(non_finite_side(CosineSide::Right, right));
     }
     if !dot_value.is_finite() {
         return Err(CosineFailure::Overflow);
@@ -228,16 +240,25 @@ pub fn cosine(left: &[f32], right: &[f32]) -> core::result::Result<f32, CosineFa
         .ok_or(CosineFailure::OutOfRange { cosine: quotient })
 }
 
-/// Index of the first non-finite element, for failure-path attribution only.
+/// Classifies why one side's norm came back non-finite.
 ///
-/// Returns `values.len()` when every element is finite, which the callers above
-/// can only reach if a reduction reported non-finite over finite inputs — an
-/// overflow, already classified separately.
-fn first_non_finite(values: &[f32]) -> usize {
+/// Reached only on the failure path, so the scan it performs costs the happy
+/// path nothing — which is the whole point of fusing the finiteness check into
+/// the reduction instead of pre-scanning every call.
+///
+/// The scan is what separates the two causes. A poisoned accumulator can mean
+/// either "an element was non-finite" or "every element was finite and their
+/// squares overflowed", and only one of those has an index to report. Returning
+/// a fabricated index for the second — `values.len()`, which is out of range —
+/// is how a message like "element 16 is non-finite" comes to be printed about a
+/// 16-element vector in which every element is finite.
+fn non_finite_side(side: CosineSide, values: &[f32]) -> CosineFailure {
     values
         .iter()
         .position(|value| !value.is_finite())
-        .unwrap_or(values.len())
+        .map_or(CosineFailure::NormOverflow { side }, |index| {
+            CosineFailure::NonFinite { side, index }
+        })
 }
 
 fn validate_batch(

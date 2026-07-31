@@ -1232,6 +1232,38 @@ impl CalyxBackend {
             read_all_rows_from_vault(vault, cf_name)
         })
     }
+
+    /// Grounds one already-measured transcript row, reporting whether the row
+    /// carried an adjudicated outcome at all (#1926).
+    ///
+    /// `Ok(None)` means "this row has nothing to adjudicate", which is a real
+    /// answer for the ~74% of transcript rows that are not observed tool
+    /// results. It is never used to swallow a failed write.
+    fn put_agent_transcript_outcome_anchor_row(
+        &self,
+        source_key: &[u8],
+        source_value: &[u8],
+        record: &AgentTranscriptRecord,
+    ) -> StorageResult<Option<()>> {
+        let Some(anchor) = constellations::agent_transcript_outcome_anchor(record) else {
+            return Ok(None);
+        };
+        let payload = constellations::grounding_anchor_ledger_payload(
+            cf::CF_AGENT_TRANSCRIPTS,
+            source_key,
+            source_value,
+            &anchor,
+        );
+        <Self as StorageBackend>::put_grounding_anchor_for_source(
+            self,
+            cf::CF_AGENT_TRANSCRIPTS,
+            source_key,
+            source_value,
+            anchor,
+            &payload,
+        )?;
+        Ok(Some(()))
+    }
 }
 
 fn ensure_builtin_temporal_panel_registrations(vault: &SynapseCalyxVault) -> StorageResult<()> {
@@ -2971,6 +3003,9 @@ impl StorageBackend for CalyxBackend {
         let mut inserted_rows = 0_u64;
         let mut backfilled_rows = 0_u64;
         let mut already_current_rows = 0_u64;
+        let mut outcome_anchored_rows = 0_u64;
+        let mut outcome_absent_rows = 0_u64;
+        let mut outcome_unadjudicable_rows = 0_u64;
         for (key, raw) in rows {
             let disposition = self.with_vault(
                 "calyx_temporal_metadata_backfill",
@@ -3060,6 +3095,33 @@ impl StorageBackend for CalyxBackend {
             } else {
                 already_current_rows = already_current_rows.saturating_add(1);
             }
+
+            // #1926: the constellation for this row now exists at the active
+            // panel version, which is the precondition an anchor write has. A
+            // re-measure sweep that left the row ungrounded would have to be
+            // followed by a second full sweep to ground it, against a corpus
+            // that moves between passes — so the outcome is written here, in the
+            // same pass, against the row that was just measured.
+            if source_cf == cf::CF_AGENT_TRANSCRIPTS {
+                let record: AgentTranscriptRecord =
+                    serde_json::from_slice(&raw).map_err(|error| StorageError::ReadFailed {
+                        cf_name: source_cf.to_owned(),
+                        detail: format!(
+                            "decode authoritative agent transcript row for outcome anchoring key_hex={}: {error}",
+                            constellations::hex_encode(&key)
+                        ),
+                    })?;
+                if matches!(
+                    constellations::agent_transcript_tool_outcome(&record),
+                    constellations::AgentTranscriptToolOutcome::Unadjudicable(_)
+                ) {
+                    outcome_unadjudicable_rows = outcome_unadjudicable_rows.saturating_add(1);
+                }
+                match self.put_agent_transcript_outcome_anchor_row(&key, &raw, &record)? {
+                    Some(()) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
+                    None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
+                }
+            }
         }
         let latest_seq = self.with_vault(
             "calyx_temporal_metadata_backfill",
@@ -3073,11 +3135,15 @@ impl StorageBackend for CalyxBackend {
             inserted_rows,
             backfilled_rows,
             already_current_rows,
+            outcome_anchored_rows,
+            outcome_absent_rows,
+            outcome_unadjudicable_rows,
             latest_seq,
             resume_after_physical,
             more,
         })
     }
+
 
     #[allow(clippy::too_many_lines)]
     fn put_timeline_constellation(

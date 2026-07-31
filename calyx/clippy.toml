@@ -1,14 +1,11 @@
-# Workspace Clippy configuration.
+# Clippy configuration for the `calyx/` workspace.
 #
-# `clippy::unwrap_used` and `clippy::expect_used` are denied workspace-wide
-# (see [workspace.lints.clippy] in Cargo.toml) to keep PRODUCTION paths free of
-# panicking unwraps. Test code throughout the workspace legitimately uses
-# `unwrap()`/`expect()`/`unwrap_err()`/`expect_err()` to assert invariants, so
-# allow them in `#[cfg(test)]` / `#[test]` contexts only. Production code remains
-# strict.
-allow-unwrap-in-tests = true
-allow-expect-in-tests = true
-
+# `calyx/Cargo.toml` declares its own `[workspace]`, so Clippy resolves this
+# file rather than the repository-root `clippy.toml` when linting a calyx
+# crate. The cosine guard below must therefore exist in BOTH files: a rule that
+# lives only at the root silently does not apply to the crates that own every
+# cosine implementation, which is precisely the failure mode it guards against.
+#
 # #1922 ask 3: make a fifth undispatched cosine impossible to add by accident.
 #
 # Four independent cosine implementations grew in this workspace, and each one

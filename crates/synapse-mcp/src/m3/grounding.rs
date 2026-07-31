@@ -1,5 +1,5 @@
 use rmcp::ErrorData;
-use serde_json::{Value, json};
+use serde_json::Value;
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{
     CalyxAnchorWriteReport, Db, GroundingAnchor, GroundingAnchorValue, StorageError, constellations,
@@ -105,38 +105,16 @@ pub(crate) fn write_runtime_anchor_for_existing_constellation(
         .map_err(|error| storage_error(context, "put grounded anchor", error))
 }
 
+/// The anchor ledger payload. Single-sourced in `synapse-storage` so the
+/// backfill path — which cannot depend on this crate — stamps byte-identical
+/// payloads for the same anchor (#1926).
 pub(crate) fn anchor_ledger_payload(
     source_cf: &'static str,
     source_key: &[u8],
     source_value: &[u8],
     anchor: &GroundingAnchor,
 ) -> Value {
-    json!({
-        "schema": "synapse.grounding_anchor.v2",
-        "source_cf": source_cf,
-        "source_row_sha256": constellations::sha256_hex(source_key),
-        "source_value_sha256": constellations::sha256_hex(source_value),
-        "anchor_kind_sha256": constellations::sha256_hex(anchor.kind_label.as_bytes()),
-        "anchor_value": anchor_value_payload(&anchor.value),
-        "anchor_source_sha256": constellations::sha256_hex(anchor.source.as_bytes()),
-        "observed_at_ms": anchor.observed_at_ms,
-        "confidence": anchor.confidence,
-    })
-}
-
-fn anchor_value_payload(value: &GroundingAnchorValue) -> Value {
-    match value {
-        GroundingAnchorValue::Bool(value) => json!({ "type": "bool", "value": value }),
-        GroundingAnchorValue::Enum(value) => json!({
-            "type": "enum",
-            "value_sha256": constellations::sha256_hex(value.as_bytes()),
-        }),
-        GroundingAnchorValue::Number(value) => json!({ "type": "number", "value": value }),
-        GroundingAnchorValue::Text(value) => json!({
-            "type": "text",
-            "value_sha256": constellations::sha256_hex(value.as_bytes()),
-        }),
-    }
+    constellations::grounding_anchor_ledger_payload(source_cf, source_key, source_value, anchor)
 }
 
 fn storage_error(context: &'static str, action: &'static str, error: StorageError) -> ErrorData {

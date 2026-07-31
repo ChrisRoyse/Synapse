@@ -444,6 +444,11 @@ pub struct HygieneSlotGroundingCoverage {
     /// report a text lane as fully measured on records that have no text
     /// (#1904); `calyx-search` excludes these same rows from BM25's `N`.
     pub records_empty_measurement: u64,
+    /// Records where this lens *refused* the row and left `Absent{Error}`
+    /// (#1924). A refusal is no longer allowed to abort the whole
+    /// constellation, so it has to be countable here or the loss is invisible.
+    /// Ordinary inapplicable absence is not counted: only an explicit refusal.
+    pub records_slot_refused: u64,
     pub grounded_records: u64,
     pub ungrounded_records: u64,
     pub coverage_fraction: f32,
@@ -489,6 +494,7 @@ fn map_slot_grounding(
         slot: u32::from(coverage.slot),
         records_present: coverage.records_present as u64,
         records_empty_measurement: coverage.records_empty_measurement as u64,
+        records_slot_refused: coverage.records_slot_refused as u64,
         grounded_records: coverage.grounded_records as u64,
         ungrounded_records: coverage.ungrounded_records as u64,
         coverage_fraction: coverage.coverage_fraction,

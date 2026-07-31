@@ -1158,6 +1158,24 @@ pub(super) fn commit_transcript_chunk(
                     synapse_storage::constellations::hex_encode(&row.source_key)
                 )
             })?;
+
+        // #1926: the constellation exists now, so its adjudicated outcome can be
+        // grounded. This is deliberately here and not on a later sweep: the
+        // anchor targets the cx_id derived from the *active* panel version, and
+        // the row that was just measured is the only moment that identity is
+        // guaranteed to resolve. Failing here fails the chunk and holds the
+        // cursor, which is correct — a transcript row that is durable but
+        // silently ungrounded is exactly the state #1926 was filed about.
+        db.put_agent_transcript_outcome_anchor(&row.source_key, &row.encoded, &row.record)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_OUTCOME_ANCHOR_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} source_key_hex={}: {error}; remediation=repair the declared tool-outcome adjudication or the Calyx anchor write and retry from the unchanged cursor",
+                    source_path.display(),
+                    row.record.line_no,
+                    row.source_offset_bytes,
+                    synapse_storage::constellations::hex_encode(&row.source_key)
+                )
+            })?;
     }
 
     tracing::debug!(

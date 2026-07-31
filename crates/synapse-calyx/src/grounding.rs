@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
-use calyx_core::{Anchor, AnchorKind, SlotVector};
+use calyx_core::{AbsentReason, Anchor, AnchorKind, SlotVector};
 use serde::{Deserialize, Serialize};
 
 use crate::{SYNAPSE_INTELLIGENCE_MAX_RECORDS, SynapseCalyxError, SynapseCalyxVault};
@@ -65,6 +65,17 @@ pub struct SynapseCalyxSlotGroundingCoverage {
     /// payload. A high count here is a real signal — it means the lens is
     /// declared on a panel whose records frequently lack its source field.
     pub records_empty_measurement: usize,
+    /// Records where this lens *refused* this row and left `Absent{Error}`.
+    ///
+    /// Distinct from both `records_present` and `records_empty_measurement`,
+    /// and the reason #1924 could be closed without a silent loss: a lens that
+    /// declines an over-limit input no longer takes the whole constellation
+    /// down, so the loss has to be countable somewhere or it becomes invisible.
+    /// An ordinary `Absent{NotApplicable}` — a slot that simply does not apply
+    /// to this record — is still skipped and is NOT counted here; only an
+    /// explicit refusal is. #1918 is the precedent: "skipped" and "refused"
+    /// must not read as the same thing.
+    pub records_slot_refused: usize,
     pub grounded_records: usize,
     pub ungrounded_records: usize,
     pub coverage_fraction: f32,
@@ -117,6 +128,7 @@ pub struct SynapseCalyxDomainGroundingVerdict {
 struct SlotAccumulator {
     records_present: usize,
     records_empty_measurement: usize,
+    records_slot_refused: usize,
     grounded_records: usize,
 }
 
@@ -181,6 +193,23 @@ impl SynapseCalyxVault {
             }
             for (slot, vector) in &constellation.slots {
                 if is_absent(vector) {
+                    // A lens refusal is an absence with a reason, and it is the
+                    // only absence worth counting: it means this row *had*
+                    // something to measure and the lens declined it (#1924).
+                    if let SlotVector::Absent {
+                        reason: AbsentReason::Error(detail),
+                    } = vector
+                    {
+                        slots.entry(slot.get()).or_default().records_slot_refused += 1;
+                        tracing::debug!(
+                            code = "CALYX_SLOT_REFUSAL_OBSERVED",
+                            panel_version,
+                            slot = slot.get(),
+                            cx_id = %base.cx_id,
+                            detail = %detail,
+                            "grounding coverage counted a per-slot lens refusal"
+                        );
+                    }
                     continue;
                 }
                 let entry = slots.entry(slot.get()).or_default();
@@ -236,6 +265,7 @@ impl SynapseCalyxVault {
                     slot,
                     records_present: acc.records_present,
                     records_empty_measurement: acc.records_empty_measurement,
+                    records_slot_refused: acc.records_slot_refused,
                     grounded_records: acc.grounded_records,
                     ungrounded_records: acc.records_present.saturating_sub(acc.grounded_records),
                     coverage_fraction,

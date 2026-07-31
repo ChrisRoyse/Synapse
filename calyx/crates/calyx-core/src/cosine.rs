@@ -37,7 +37,7 @@ pub fn clamp_cosine_quotient(cosine: f32) -> Option<f32> {
     if !cosine.is_finite() {
         return None;
     }
-    if cosine > 1.0 + COSINE_ROUNDING_TOLERANCE || cosine < -1.0 - COSINE_ROUNDING_TOLERANCE {
+    if !(-1.0 - COSINE_ROUNDING_TOLERANCE..=1.0 + COSINE_ROUNDING_TOLERANCE).contains(&cosine) {
         return None;
     }
     Some(cosine.clamp(-1.0, 1.0))
