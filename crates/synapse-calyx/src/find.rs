@@ -72,7 +72,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_core::{Constellation, CxId, SlotId, VaultStore};
-use calyx_registry::load_vault_panel_state;
+use calyx_registry::{VaultPanelState, load_vault_panel_state};
 use calyx_search::{
     FusionChoice, FusionTuning, GuardChoice, PersistedSearchGeneration, PersistedSearchIndexes,
     QueryMeasurement, REBUILD_REQUIRED_REMEDIATION, SearchBudget, SearchError, SearchFreshness,
@@ -224,6 +224,79 @@ pub struct SynapseCalyxFindParams {
     /// Bounded temporal post-boost, applied only when the panel has a registered
     /// temporal policy.
     pub temporal: Option<SynapseCalyxFindTemporal>,
+    /// Which panel generation to query (#1668). `None` targets the durable
+    /// active panel, which is what every caller got before this field existed.
+    ///
+    /// Naming a version explicitly is how a non-active panel is reached — the
+    /// vault manifest publishes exactly one `panel_ref`, so before this the
+    /// active panel was not merely the default target but the only reachable
+    /// one, and the corpora carrying the grounded intelligence are all on other
+    /// panels.
+    ///
+    /// This selects ONE panel. It is deliberately not a list: slot ids are only
+    /// meaningful within a panel, so fusing hits across panels would rank
+    /// incomparable lenses against each other and reintroduce exactly the
+    /// cross-panel ambiguity #1776 closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_version: Option<u32>,
+}
+
+/// Resolves which panel generation one fused find runs against (#1668).
+///
+/// Mirrors Ward's `panel_for_guard_calibration` deliberately: the two surfaces
+/// answer the same question ("which panel definition validates these slots?")
+/// and answering it two different ways is how the guard and the search side
+/// drifted apart in the first place.
+///
+/// Resolution order, fail-closed at every step:
+///
+/// 1. no version requested  -> the durable active panel (unchanged behaviour);
+/// 2. version requested and a definition supplied -> that definition, whose
+///    version must match the request exactly;
+/// 3. version requested, none supplied -> the active panel, but only if it *is*
+///    that version.
+///
+/// A definition is never synthesized, and a near-miss version is never
+/// substituted: querying panel A's index with panel B's slot map would search
+/// the wrong lenses and return hits that look well-formed.
+fn panel_state_for_find(
+    vault_dir: &std::path::Path,
+    requested: Option<u32>,
+    supplied: Option<&VaultPanelState>,
+) -> Result<VaultPanelState, SynapseCalyxError> {
+    let load_active = || {
+        load_vault_panel_state(vault_dir).map_err(|error| {
+            SynapseCalyxError::from_calyx("load durable panel state for fused find", &error)
+        })
+    };
+    let Some(requested) = requested else {
+        return load_active();
+    };
+    if let Some(state) = supplied {
+        if state.panel.version != requested {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_FIND_PANEL_MISMATCH",
+                format!(
+                    "fused find requested panel {requested}, but the supplied panel definition is version {}",
+                    state.panel.version
+                ),
+                "supply the panel contract for the exact version being queried; a query measured through another panel's slot map searches the wrong lenses and its hits cannot be compared to the requested panel's records",
+            ));
+        }
+        return Ok(state.clone());
+    }
+    let active = load_active()?;
+    if active.panel.version == requested {
+        return Ok(active);
+    }
+    Err(SynapseCalyxError::new(
+        "SYNAPSE_CALYX_FIND_PANEL_UNAVAILABLE",
+        format!(
+            "fused find requested panel {requested}, but no definition was supplied for it and the durable active panel is {}",
+            active.panel.version
+        ),
+        "supply the panel contract for the requested version (a code-declared generation can be reconstructed with syn_active_panel_contract), or omit panel_version to query the active panel",
+    ))
 }
 
 /// One lens's rank-level contribution to a fused hit's score.
@@ -370,19 +443,39 @@ impl SynapseCalyxVault {
     /// example record is absent, from a different panel, or exposes no
     /// indexable slot; a text query measures no indexable lens vector; the
     /// fused search fails; or the requested temporal boost cannot be applied.
-    #[allow(clippy::too_many_lines)]
     pub fn find_similar(
         &self,
         params: &SynapseCalyxFindParams,
+    ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
+        self.find_similar_in_panel(params, None)
+    }
+
+    /// [`Self::find_similar`], with an explicit panel contract for the
+    /// generation named by `params.panel_version` (#1668).
+    ///
+    /// `synapse-calyx` cannot reconstruct a code-declared panel itself —
+    /// `syn_active_panel_contract` lives in `synapse-storage`, which depends on
+    /// this crate — so a non-active panel's definition is supplied by the
+    /// caller, exactly as Ward's guard calibration takes one. Passing `None`
+    /// restricts the query to the durable active panel.
+    ///
+    /// # Errors
+    ///
+    /// In addition to [`Self::find_similar`]'s failures: when `supplied`
+    /// disagrees with the requested version, or when a non-active version is
+    /// requested with no definition to validate its slots against.
+    #[allow(clippy::too_many_lines)]
+    pub fn find_similar_in_panel(
+        &self,
+        params: &SynapseCalyxFindParams,
+        supplied: Option<&VaultPanelState>,
     ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
         // Hot-path boundary (#1686): fused find is an off-runtime intelligence
         // query and must never be driven from a tagged reflex/capture tick.
         crate::lowering::hot_context::assert_cold_calyx("find_similar");
 
         let vault_dir = self.config.vault_dir.as_path();
-        let state = load_vault_panel_state(vault_dir).map_err(|error| {
-            SynapseCalyxError::from_calyx("load durable panel state for fused find", &error)
-        })?;
+        let state = panel_state_for_find(vault_dir, params.panel_version, supplied)?;
         let panel_version = state.panel.version;
 
         // Fail closed if a mutation staked a rebuild-required intent: derived
@@ -603,7 +696,7 @@ impl SynapseCalyxVault {
             return Err(SynapseCalyxError::new(
                 "SYNAPSE_CALYX_FIND_EXAMPLE_PANEL_MISMATCH",
                 format!(
-                    "example {cx_id} is on panel {}, but the active search generation is panel {panel_version}",
+                    "example {cx_id} is on panel {}, but the search generation being queried is panel {panel_version}",
                     constellation.panel_version
                 ),
                 "supply an example record from the active panel generation, or rebuild the search indexes for the example's panel",

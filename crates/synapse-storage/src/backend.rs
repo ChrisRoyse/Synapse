@@ -32,8 +32,8 @@ use synapse_calyx::{
     SynapseCalyxKernelParams, SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport,
     SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
-    SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPeriodicityReport,
-    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
+    SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
@@ -2174,31 +2174,38 @@ impl StorageBackend for CalyxBackend {
             "rebuild persisted Calyx search indexes",
             true,
             |vault| {
-                // The manifest holds one active panel; publish the exact
-                // requested panel's authoritative contract before rebuilding so
-                // the generation is rooted at that panel snapshot (issue #1805).
-                // publish_active_panel is idempotent. An unknown panel version
-                // leaves the active panel unchanged and the rebuild fails closed
-                // (NO_ACTIVE_PANEL / SEARCH_PANEL_MISMATCH) rather than silently
-                // rebuilding a different panel.
+                // The generation must be rooted at the requested panel's
+                // authoritative snapshot (#1805). It used to get there by
+                // *publishing* that panel as the vault's active one first,
+                // because the manifest holds a single `panel_ref` and that
+                // pointer was the only way to tell the rebuild which slot map to
+                // use. That made the active-panel pointer a scratch variable: a
+                // rebuild of any non-timeline panel deposed timeline, and the
+                // maintainer's next tick swapped it back (#1668).
+                //
+                // The contract is now handed to the rebuild directly, so the
+                // generation is rooted at exactly the same snapshot with no
+                // manifest mutation at all. Boot publishes the active panel
+                // (see `publish_boot_active_panel`), and rebuilds no longer
+                // touch it.
+                //
+                // An unknown panel version supplies no contract, so the rebuild
+                // falls back to requiring that the requested version *is* the
+                // active panel and fails closed (NO_ACTIVE_PANEL /
+                // SEARCH_PANEL_MISMATCH) rather than silently rebuilding a
+                // different panel — the same refusal as before.
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-                if let Some(contract) =
-                    syn_active_panel_contract(expected_panel_version, created_at_ms)?
-                {
-                    vault
-                        .publish_active_panel(&contract.panel, &contract.registry)
-                        .map_err(|source| {
-                            calyx_write_failed(
-                                "calyx_manifest",
-                                &format!(
-                                    "publish active durable panel generation {expected_panel_version} before search rebuild"
-                                ),
-                                &source,
-                            )
-                        })?;
-                }
+                let supplied = syn_active_panel_contract(expected_panel_version, created_at_ms)?
+                    .map(|contract| SynapseCalyxPanelState {
+                        panel: contract.panel,
+                        registry: contract.registry,
+                        // Read paths never consult the snapshot; it is only
+                        // compared on the publish path, which this no longer
+                        // takes.
+                        registry_snapshot: None,
+                    });
                 vault
-                    .rebuild_search_indexes(expected_panel_version)
+                    .rebuild_search_indexes_for_panel(expected_panel_version, supplied.as_ref())
                     .map_err(|source| {
                         calyx_write_failed(
                             "calyx_search",
@@ -2219,13 +2226,38 @@ impl StorageBackend for CalyxBackend {
             "run fused Calyx find-similar search",
             false,
             |vault| {
-                vault.find_similar(params).map_err(|source| {
-                    calyx_write_failed(
-                        "calyx_search",
-                        "run fused Calyx find-similar search",
-                        &source,
-                    )
-                })
+                // A find that names a non-active panel needs that panel's slot
+                // map to measure its query through (#1668). synapse-calyx cannot
+                // reconstruct it — `syn_active_panel_contract` lives here, in the
+                // crate that depends on it — so the contract is resolved on this
+                // side and handed down.
+                //
+                // `None` (no panel named) and an unknown version both hand down
+                // no contract: the first queries the active panel exactly as
+                // before, the second fails closed naming both lookups rather
+                // than searching a panel whose slots were never validated.
+                let supplied = match params.panel_version {
+                    Some(version) => {
+                        let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                        syn_active_panel_contract(version, created_at_ms)?.map(|contract| {
+                            SynapseCalyxPanelState {
+                                panel: contract.panel,
+                                registry: contract.registry,
+                                registry_snapshot: None,
+                            }
+                        })
+                    }
+                    None => None,
+                };
+                vault
+                    .find_similar_in_panel(params, supplied.as_ref())
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_search",
+                            "run fused Calyx find-similar search",
+                            &source,
+                        )
+                    })
             },
         )
     }

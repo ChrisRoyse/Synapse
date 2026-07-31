@@ -193,6 +193,19 @@ pub struct StorageFindSimilarParams {
     /// Optional bounded temporal post-boost (#1667).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal: Option<StorageFindTemporalParams>,
+    /// Panel generation to query. Omit for the durable active panel (#1668).
+    ///
+    /// The vault manifest publishes exactly one active panel, so before this
+    /// the active panel was the only *reachable* one — while the outcome-bearing
+    /// corpora (`syn-mcp-usage-v1`, `syn-agent-transcript-v1`, `syn-episode-v1`)
+    /// all live on other generations. Naming one here queries it directly.
+    ///
+    /// Exactly one panel per query: slot ids are only meaningful within a panel,
+    /// so fusing across panels would rank incomparable lenses (#1776). A version
+    /// with no code-declared contract fails closed rather than being searched
+    /// through a neighbouring panel's slot map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_version: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -1860,6 +1873,7 @@ pub fn run_find_similar(
         filter: params.filter.clone(),
         explain: params.explain,
         temporal,
+        panel_version: params.panel_version,
     };
     let report = db
         .find_similar(&find_params)

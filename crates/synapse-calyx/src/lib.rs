@@ -54,15 +54,19 @@ use calyx_forge::{
 };
 use calyx_ledger::{ActorId, EntryKind, LedgerEntry, SubjectId, VerifyResult};
 use calyx_registry::{
-    CALYX_NO_ACTIVE_PANEL, Registry, VaultPanelWrite, allocate_vault_panel_generation,
-    list_vault_temporal_panels, load_vault_panel_state, persist_vault_panel_state,
-    read_vault_panel_generation_allocator, read_vault_temporal_panel,
+    CALYX_NO_ACTIVE_PANEL, Registry, VaultPanelState, VaultPanelWrite,
+    allocate_vault_panel_generation, list_vault_temporal_panels, load_vault_panel_state,
+    persist_vault_panel_state, read_vault_panel_generation_allocator, read_vault_temporal_panel,
     register_vault_temporal_panel, reserve_vault_panel_generations,
 };
 pub use calyx_registry::{
     PanelGenerationAllocation, PanelGenerationAllocatorReadback, VaultTemporalPanelRegistration,
     VaultTemporalPanelRegistrationWrite,
 };
+// Re-exported so a caller can hand a non-active panel contract to
+// `find_similar_in_panel` / `rebuild_search_indexes_for_panel` (#1668) without
+// depending on calyx-registry directly.
+pub use calyx_registry::VaultPanelState as SynapseCalyxPanelState;
 pub use calyx_search::{PersistedSearchGeneration, PersistedSearchSlot};
 use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
@@ -3473,30 +3477,76 @@ impl SynapseCalyxVault {
         &self,
         expected_panel_version: u32,
     ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
-        let state = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
-            if error.code == CALYX_NO_ACTIVE_PANEL {
-                SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_NO_ACTIVE_PANEL",
-                    format!(
-                        "no active durable panel is published for search rebuild: {}",
-                        error.message
-                    ),
-                    "publish the active panel for this constellation (publish_active_panel / boot panel publication) before requesting search_rebuild; this is an expected empty state, not shard corruption \u{2014} do not restore from backup",
-                )
-            } else {
-                SynapseCalyxError::from_calyx("load durable panel state for search rebuild", &error)
-            }
-        })?;
-        if state.panel.version != expected_panel_version {
+        self.rebuild_search_indexes_for_panel(expected_panel_version, None)
+    }
+
+    /// [`Self::rebuild_search_indexes`], with an explicit panel contract for a
+    /// generation that is not the durable active one (#1668).
+    ///
+    /// The published artifacts were already panel-scoped
+    /// (`idx/search/panel_{version:010}/`), so building a non-active
+    /// generation writes to its own directory and cannot overwrite the active
+    /// one — what was missing was the *permission*, not the isolation. Supplying
+    /// `None` restricts the rebuild to the active panel, unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rebuild_search_indexes`], plus: when `supplied` disagrees with
+    /// `expected_panel_version`, or when a non-active version is requested with
+    /// no definition to rebuild it from.
+    pub fn rebuild_search_indexes_for_panel(
+        &self,
+        expected_panel_version: u32,
+        supplied: Option<&VaultPanelState>,
+    ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
+        // A supplied contract must be for exactly the requested generation:
+        // rebuilding panel A's index from panel B's slot map would publish a
+        // manifest whose lanes do not describe the rows it indexed.
+        if let Some(state) = supplied
+            && state.panel.version != expected_panel_version
+        {
             return Err(SynapseCalyxError::new(
                 "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
                 format!(
-                    "requested search rebuild panel {expected_panel_version}, but durable active panel is {}",
+                    "requested search rebuild panel {expected_panel_version}, but the supplied panel definition is version {}",
                     state.panel.version
                 ),
-                "read the durable vault panel state and retry with its exact version",
+                "supply the panel contract for the exact version being rebuilt; an index built from another panel's slot map does not describe the rows it indexed",
             ));
         }
+        let state = match supplied {
+            Some(state) => state.clone(),
+            None => {
+                let active = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
+                    if error.code == CALYX_NO_ACTIVE_PANEL {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_NO_ACTIVE_PANEL",
+                            format!(
+                                "no active durable panel is published for search rebuild: {}",
+                                error.message
+                            ),
+                            "publish the active panel for this constellation (publish_active_panel / boot panel publication) before requesting search_rebuild; this is an expected empty state, not shard corruption \u{2014} do not restore from backup",
+                        )
+                    } else {
+                        SynapseCalyxError::from_calyx(
+                            "load durable panel state for search rebuild",
+                            &error,
+                        )
+                    }
+                })?;
+                if active.panel.version != expected_panel_version {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
+                        format!(
+                            "requested search rebuild panel {expected_panel_version}, but no definition was supplied for it and the durable active panel is {}",
+                            active.panel.version
+                        ),
+                        "supply the panel contract for the requested version (a code-declared generation can be reconstructed with syn_active_panel_contract), or retry with the active panel's exact version",
+                    ));
+                }
+                active
+            }
+        };
         let panel_root = self
             .config
             .vault_dir
