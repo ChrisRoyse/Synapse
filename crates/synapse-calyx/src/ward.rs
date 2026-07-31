@@ -39,13 +39,37 @@
 //!
 //! # Where the corpus has to come from
 //!
-//! Synapse has no surface today that writes `Bool(false)` outcome anchors: no
-//! adjudication/rejection path feeds a refuted outcome back onto a Base
-//! constellation. Until one exists, `guard calibrate` on the production vault
-//! will refuse with [`SYNAPSE_CALYX_GUARD_BAD_CORPUS_ABSENT`] naming that gap.
-//! That refusal is the honest state. A guard that will not calibrate is safe; a
-//! guard calibrated on invented badness is a lie with a confidence interval
-//! printed next to it.
+//! This section used to say Synapse had no surface writing `Bool(false)`
+//! outcome anchors. That was wrong, and measuring the live vault is what showed
+//! it. Three surfaces write adjudicated Bool outcomes today:
+//!
+//! | writer | anchor kind | polarity |
+//! |---|---|---|
+//! | `agent_events.rs` | `synapse:agent_tool_call_success` | `Bool(!error_present)` — a failed tool call IS a `Bool(false)` |
+//! | `verification.rs` | `synapse:verification_outcome` | `Bool(code_count > 0)` |
+//! | `mcp_usage.rs` | `synapse:mcp_steering_enabled` | `Bool(policy.enabled)` |
+//!
+//! The real blocker is narrower and structural, and naming it wrongly sent the
+//! operator to build a path that already exists. Calibration is pinned to the
+//! **single durable active panel** ([`SYNAPSE_CALYX_GUARD_PANEL_MISMATCH`]), and
+//! on this vault that is `syn-timeline-v1`, which receives none of the anchors
+//! above. Measured on 2026-07-30:
+//!
+//! ```text
+//! panel 1900001 (active, timeline)  548 scanned  0 good  0 bad  548 unadjudicated
+//! panel 1665001 (agent-event)       carries synapse:agent_tool_call_success,
+//!                                   but calibration refuses it: not the active panel
+//! ```
+//!
+//! So the adjudicated outcomes exist on panels the guard may not calibrate
+//! against, and the panel it must calibrate against has no adjudicated outcome
+//! at all. Neither half is a missing feature; together they are a deadlock that
+//! the single-active-panel model has to resolve before Ward can be certified on
+//! this vault (tracked with the panel-lifecycle work).
+//!
+//! Until then `guard calibrate` refuses, and that refusal is the honest state. A
+//! guard that will not calibrate is safe; a guard calibrated on invented badness
+//! is a lie with a confidence interval printed next to it.
 
 use std::collections::BTreeMap;
 
@@ -298,7 +322,7 @@ impl SynapseCalyxVault {
                     corpus.bad.len(),
                     corpus.unadjudicated
                 ),
-                "a conformal FAR bound is only meaningful over a real known-bad distribution. Synapse has no surface today that writes a refuted outcome (AnchorValue::Bool(false)) back onto a Base constellation, so this corpus must come from a real adjudication path — human review, a deterministic oracle, or a replayed incident set — before the guard can be calibrated. Calibrating on manufactured badness would report `ok` forever and is refused here, not worked around",
+                "a conformal FAR bound is only meaningful over a real known-bad distribution, so calibrating on manufactured badness would report `ok` forever and is refused here, not worked around. Note that adjudicated Bool outcomes DO exist in this system — agent_events writes synapse:agent_tool_call_success as Bool(!error_present), so every failed tool call is a Bool(false) — but calibration is pinned to the single durable active panel, and the panels carrying those anchors are not it. Check whether this panel is simply the wrong one to calibrate against before concluding that no adjudication path exists; if the active panel genuinely receives no adjudicated outcome, the gap is in the active-panel model, not in the anchor writers",
             ));
         }
 

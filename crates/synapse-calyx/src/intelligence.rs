@@ -1083,6 +1083,20 @@ pub enum SynapseCalyxSlotBitsState {
     /// construction — a one-hot over C values and N same-class samples yields
     /// about N/C duplicates — so it is a property of the lens, not of the data.
     DegenerateColumn,
+    /// The estimator refused this column for some other structured reason.
+    ///
+    /// #1915's fix caught exactly one code, `CALYX_ASSAY_DEGENERATE_INPUT`,
+    /// because that was the one the fixture produced. The live vault then
+    /// produced `CALYX_ASSAY_INSUFFICIENT_SAMPLES` — a minority anchor class
+    /// smaller than `k+1` — through the whole-pass abort the same fix had
+    /// otherwise removed, and every other slot went unreported again.
+    ///
+    /// Whitelisting codes was the mistake. A refusal from the estimator is a
+    /// fact about ONE column whatever its code, so the classification is now
+    /// total: named states for the codes we understand, this for the rest, and
+    /// no path back to aborting the report. The originating code is carried in
+    /// `unmeasured_reason` so a new failure mode is still diagnosable.
+    EstimatorRefused,
 }
 
 impl SynapseCalyxSlotBitsState {
@@ -1092,6 +1106,7 @@ impl SynapseCalyxSlotBitsState {
             Self::Measured => "measured",
             Self::InsufficientSamples => "insufficient_samples",
             Self::DegenerateColumn => "degenerate_column",
+            Self::EstimatorRefused => "estimator_refused",
         }
     }
 
@@ -1361,29 +1376,30 @@ impl SynapseCalyxVault {
                 continue;
             }
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
-            // A degenerate column is a fact about ONE lens, so it must not end
+            // An estimator refusal is a fact about ONE lens, so it must not end
             // the whole pass (#1915). `assay_redundancy` already degrades
             // per-pair with a named reason and returns everything else; before
             // this, a single categorical lens `?`-ed out of the entire report
             // and no other slot — including the well-conditioned continuous
             // ones — was ever reported.
+            //
+            // #1915's fix caught exactly one code and left `Err(_) => return`
+            // standing. The live vault then aborted the whole report again with
+            // `CALYX_ASSAY_INSUFFICIENT_SAMPLES` (an anchor whose minority class
+            // held 4 records against k=4), through the very arm that fix was
+            // meant to remove. Classification is total now: no estimator error
+            // reaches a `return`.
             let estimate = match ksg_mi_continuous_discrete(&samples.x, &samples.labels, k) {
                 Ok(estimate) => estimate,
-                Err(error) if is_degenerate_column(&error) => {
+                Err(error) => {
+                    let state = estimator_refusal_state(&error);
                     slots.push(unmeasured_slot_bits(
                         slot.get(),
                         samples.x.len(),
-                        SynapseCalyxSlotBitsState::DegenerateColumn,
-                        format!(
-                            "the estimator refused this column: {error}. A categorical/one-hot lens \
-                             is degenerate for a continuous KSG estimator by construction; park or \
-                             retire it, or measure it with a discrete estimator"
-                        ),
+                        state,
+                        estimator_refusal_reason(state, &error),
                     ));
                     continue;
-                }
-                Err(error) => {
-                    return Err(loom_math_error("estimate KSG lens bits", &error));
                 }
             };
             slot_bits.push((*slot, estimate.bits));
@@ -1503,10 +1519,11 @@ impl SynapseCalyxVault {
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
             match ksg_mi_continuous_discrete(&samples.x, &samples.labels, k) {
                 Ok(estimate) => slot_bits.push((*slot, estimate.bits)),
-                Err(error) if is_degenerate_column(&error) => {
+                // Any estimator refusal excludes the slot from the joint and
+                // from the deficit split; none of them ends the pass (#1915).
+                Err(_) => {
                     unmeasured_slots += 1;
                 }
-                Err(error) => return Err(loom_math_error("estimate KSG lens bits", &error)),
             }
         }
         let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
@@ -1529,10 +1546,11 @@ impl SynapseCalyxVault {
             let k = ksg_k.min(joint_records.saturating_sub(1)).max(1);
             match ksg_mi_continuous_discrete(&joint.x, &joint.labels, k) {
                 Ok(estimate) => (estimate.bits, true),
-                Err(error) if is_degenerate_column(&error) => (0.0, false),
-                Err(error) => {
-                    return Err(loom_math_error("estimate KSG panel joint bits", &error));
-                }
+                // An unestimable joint is reported as unmeasured, exactly like
+                // an unestimable slot. Returning here would have made the whole
+                // sufficiency verdict unavailable because one panel-shaped
+                // corpus defeated the estimator (#1915).
+                Err(_) => (0.0, false),
             }
         } else {
             (0.0, false)
@@ -2174,13 +2192,35 @@ fn unmeasured_slot_bits(
     }
 }
 
-/// Whether a math error is the estimator refusing a column whose same-class
-/// samples are too duplicated to give a non-zero kth-neighbour radius.
+/// Classify an estimator refusal into a per-slot unmeasured state.
 ///
-/// Matched on the structured code rather than on message text, so a reworded
-/// error cannot silently turn a per-slot skip back into a whole-pass abort.
-fn is_degenerate_column(error: &calyx_core::CalyxError) -> bool {
-    error.code == "CALYX_ASSAY_DEGENERATE_INPUT"
+/// Total by construction: every error maps to a state and none maps back to a
+/// whole-pass abort. See [`SynapseCalyxSlotBitsState::EstimatorRefused`] for why
+/// matching a whitelist of codes was the wrong shape.
+fn estimator_refusal_state(error: &calyx_core::CalyxError) -> SynapseCalyxSlotBitsState {
+    match error.code {
+        "CALYX_ASSAY_DEGENERATE_INPUT" => SynapseCalyxSlotBitsState::DegenerateColumn,
+        "CALYX_ASSAY_INSUFFICIENT_SAMPLES" => SynapseCalyxSlotBitsState::InsufficientSamples,
+        _ => SynapseCalyxSlotBitsState::EstimatorRefused,
+    }
+}
+
+/// The operator-facing explanation for a per-slot estimator refusal.
+fn estimator_refusal_reason(
+    state: SynapseCalyxSlotBitsState,
+    error: &calyx_core::CalyxError,
+) -> String {
+    match state {
+        SynapseCalyxSlotBitsState::DegenerateColumn => format!(
+            "the estimator refused this column: {error}. A categorical/one-hot lens is degenerate              for a continuous KSG estimator by construction; park or retire it, or measure it with              a discrete estimator"
+        ),
+        SynapseCalyxSlotBitsState::InsufficientSamples => format!(
+            "the estimator refused this column: {error}. The paired-sample count cleared the              report-level floor, but a per-label class is still too small for this k; anchor more              outcomes in the minority class, or lower ksg_k"
+        ),
+        _ => format!(
+            "the estimator refused this column: {error}. This code has no specific handling yet;              the slot is reported unmeasured rather than ending the pass"
+        ),
+    }
 }
 
 fn gather_anchored_slot_samples(
