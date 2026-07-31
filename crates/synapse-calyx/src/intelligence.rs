@@ -1180,6 +1180,14 @@ pub struct SynapseCalyxSufficiencyReport {
     /// computed `anchor_entropy_bits` yields a real-looking deficit and a
     /// `ProposeLens` recommendation against lenses nobody measured.
     pub panel_measured: bool,
+    /// Whether `panel_bits` was raised to the best single-lens estimate because
+    /// the joint estimator returned less than a lens it contains (#1916).
+    ///
+    /// `true` means the reported value is a defensible lower bound rather than
+    /// the raw joint estimate. Raising it silently would hide that the joint
+    /// estimator is under-performing on this panel's dimensionality, which is
+    /// itself worth seeing.
+    pub panel_floor_applied: bool,
     /// Slots excluded from the attribution because they could not be measured.
     pub unmeasured_slots: usize,
     pub anchor_entropy_bits: f32,
@@ -1503,7 +1511,8 @@ impl SynapseCalyxVault {
         }
         let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
 
-        let joint = build_joint_samples(&corpus, &anchor_kind);
+        let usable_slots: BTreeSet<SlotId> = slot_bits.iter().map(|(slot, _)| *slot).collect();
+        let joint = build_joint_samples(&corpus, &anchor_kind, &usable_slots);
         let anchor_entropy_bits = entropy_bits(&joint.labels);
         let joint_records = joint.labels.len();
         // `panel_measured` is the load-bearing distinction (#1915): below the
@@ -1512,6 +1521,10 @@ impl SynapseCalyxVault {
         // anchor entropy produced a real-looking `deficit_bits` and
         // `sufficient=false` on the live vault, where nothing had been measured
         // at all.
+        let best_slot_bits = slot_bits
+            .iter()
+            .map(|(_, bits)| *bits)
+            .fold(0.0_f32, f32::max);
         let (panel_bits, panel_measured) = if joint_records >= SYNAPSE_ASSAY_MIN_SAMPLES {
             let k = ksg_k.min(joint_records.saturating_sub(1)).max(1);
             match ksg_mi_continuous_discrete(&joint.x, &joint.labels, k) {
@@ -1523,6 +1536,21 @@ impl SynapseCalyxVault {
             }
         } else {
             (0.0, false)
+        };
+        // Monotonicity is a law, not a preference: conditioning cannot destroy
+        // information, so `I(panel;A) >= I(slot_i;A)` for every measured lens.
+        // A joint estimate below the best marginal one is a KSG
+        // dimensionality artefact, and passing it through produced a
+        // `sufficient=false` verdict with a concrete `deficit_bits` on a panel
+        // whose own lens already carried 99% of the available bits (#1916).
+        //
+        // The floor is applied rather than the result discarded: the marginal
+        // estimate IS a valid lower bound on the joint, so raising to it is the
+        // tightest defensible answer, not a fudge.
+        let (panel_bits, panel_floor_applied) = if panel_measured && panel_bits < best_slot_bits {
+            (best_slot_bits, true)
+        } else {
+            (panel_bits, false)
         };
 
         let mut store = AssayStore::default();
@@ -1605,6 +1633,7 @@ impl SynapseCalyxVault {
                 joint_records,
                 panel_bits,
                 panel_measured,
+                panel_floor_applied,
                 unmeasured_slots,
                 anchor_entropy_bits,
                 sufficient: panel_measured && sufficiency.sufficient,
@@ -1627,6 +1656,7 @@ impl SynapseCalyxVault {
             joint_records,
             panel_bits,
             panel_measured,
+            panel_floor_applied,
             unmeasured_slots,
             anchor_entropy_bits,
             sufficient: panel_measured && panel_bits >= anchor_entropy_bits,
@@ -2213,7 +2243,24 @@ fn anchored_records<'corpus>(
 /// Builds the joint panel samples for sufficiency: the concatenation of the
 /// slots present in every anchored record (the coverage intersection), so the
 /// joint feature vector has one consistent dimension.
-fn build_joint_samples(corpus: &DenseCorpus, anchor_kind: &AnchorKind) -> JointAnchoredSamples {
+/// Builds the joint sample for the panel sufficiency estimate.
+///
+/// `usable_slots` excludes every lens the marginal pass individually refused
+/// (#1916). KSG is a k-nearest-neighbour estimator, so each concatenated
+/// dimension that carries no usable geometry dilutes the neighbourhood and
+/// biases the estimate **downward**. Carrying a lens the marginal estimator
+/// already rejected as degenerate therefore cannot help and provably hurts:
+/// on the known-MI fixture the joint came back at 0.800762 bits while one of
+/// its own lenses measured 0.993596, which violates `I(panel;A) >= I(slot;A)`.
+///
+/// An empty `usable_slots` means nothing was measurable, and the caller must
+/// treat the result as unmeasured rather than as a panel carrying no
+/// information.
+fn build_joint_samples(
+    corpus: &DenseCorpus,
+    anchor_kind: &AnchorKind,
+    usable_slots: &BTreeSet<SlotId>,
+) -> JointAnchoredSamples {
     let mut interner: BTreeMap<String, usize> = BTreeMap::new();
     let mut anchored: Vec<(&BTreeMap<SlotId, Vec<f32>>, usize)> = Vec::new();
     for record in &corpus.records {
@@ -2233,7 +2280,14 @@ fn build_joint_samples(corpus: &DenseCorpus, anchor_kind: &AnchorKind) -> JointA
             None => present,
         });
     }
-    let required = required.unwrap_or_default();
+    // Intersect co-presence with the lenses the marginal pass could actually
+    // measure, so a refused lens cannot enter the joint vector as a dilution
+    // dimension (#1916).
+    let required: BTreeSet<SlotId> = required
+        .unwrap_or_default()
+        .intersection(usable_slots)
+        .copied()
+        .collect();
     let mut x = Vec::new();
     let mut labels = Vec::new();
     for (slots, label) in anchored {

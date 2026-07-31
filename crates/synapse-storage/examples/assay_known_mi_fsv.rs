@@ -316,9 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "      ^ I(panel;A) >= I(slot;A) is a law; a joint estimate below a marginal one is"
         );
-        println!(
-            "        a KSG dimensionality artefact from concatenating the degenerate lenses. See #1916."
-        );
+        println!("        a KSG dimensionality artefact. See #1916.");
     }
 
     // Exact equality: a deterministic estimator over an unchanged corpus has no
@@ -339,9 +337,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         verdict(deterministic)
     );
 
-    // `monotone_ok` is deliberately excluded: it tracks #1916, not this fixture's
-    // own claims.
-    let pass = entropy_ok && recovery_ok && deterministic;
+    let pass = entropy_ok && recovery_ok && monotone_ok && deterministic;
     println!(
         "\n{}",
         if pass {
@@ -386,9 +382,10 @@ fn report(
         );
     }
     println!(
-        "  sufficiency: panel_bits={:.6} panel_measured={} unmeasured_slots={} anchor_entropy={:.6} deficit={:.6} sufficient={} deficits={}",
+        "  sufficiency: panel_bits={:.6} panel_measured={} floor_applied={} unmeasured_slots={} anchor_entropy={:.6} deficit={:.6} sufficient={} deficits={}",
         suff.panel_bits,
         suff.panel_measured,
+        suff.panel_floor_applied,
         suff.unmeasured_slots,
         suff.anchor_entropy_bits,
         suff.deficit_bits,
