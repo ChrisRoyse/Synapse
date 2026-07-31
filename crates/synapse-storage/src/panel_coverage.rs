@@ -46,6 +46,43 @@
 //!   panel with no re-measure path reports an **un-backfillable** shortfall
 //!   rather than being quietly counted as covered.
 //!
+//! # Retention: the #1927 ask 3 decision
+//!
+//! Ask 3 asked what happens to the 41,237 records (55% of the `Base` CF) sitting
+//! on superseded generations, and to the constellations whose TTL'd source rows
+//! the GC has expired. Both are answered here, and the answer to both is
+//! **nothing is auto-deleted** — but for two different reasons, and conflating
+//! them is the mistake this section exists to prevent.
+//!
+//! **Orphaned records — sacred, permanently.** A constellation whose source row
+//! an audit TTL expired cannot be re-measured; it is the only surviving record of
+//! the observation. Keeping it is not a deferral, it is the decision. The growth
+//! it implies is bounded by the source CF's TTL policy, which is a decision about
+//! the audit log, not about the measurement. Counted as
+//! [`PanelCoverageReport::orphaned_records_total`].
+//!
+//! **Superseded records — reclaimable in principle, unprovable by a census.** A
+//! constellation is derived state: a frozen pipeline re-measures it from its
+//! source row. An *anchor* is not — it records an observed outcome with a source
+//! and a confidence, and no re-measure regenerates it. So a superseded record
+//! carrying an anchor is sacred, and one without an anchor holds nothing its
+//! source row could not produce again.
+//!
+//! That makes the reclaim rule four conditions per record: its generation is
+//! closed, it carries no grounded anchor, its own source row still exists, and
+//! the same input is already measured at the active generation. This report can
+//! evaluate three of them. It cannot evaluate the third, and the live vault
+//! shows why that matters rather than being pedantic:
+//! `syn-agent-transcript-v1` holds 40,501 superseded records against a
+//! `CF_AGENT_TRANSCRIPTS` of 25,573 rows, so some superseded records certainly
+//! correspond to source rows that are gone — and which ones is a per-record
+//! lookup, not a count.
+//!
+//! Hence [`PanelCoverageReport::superseded_reclaim_candidates`] is an upper
+//! bound with that name, and no reclaim runs off it. Auto-deleting `Base` rows on
+//! a count that cannot prove regenerability would be exactly the silent
+//! destruction the sacred/regenerable split exists to forbid.
+//!
 //! # Fail-visible, not fail-quiet
 //!
 //! A panel version present in the `Base` CF that no catalog entry claims is
@@ -61,6 +98,45 @@ use serde::{Deserialize, Serialize};
 use synapse_calyx::{SYNAPSE_GROUNDING_COVERAGE_FLOOR, SynapseCalyxPanelCensus};
 
 use crate::constellations::builtin_panel_catalog;
+
+/// One superseded generation, carrying the facts the retention decision in
+/// [`PanelCoverageReport::superseded_grounded_records_total`] actually turns on
+/// (#1927 ask 3).
+///
+/// The count alone was never enough. "41,237 records are on old generations" is
+/// a number nobody can act on, because the two things you must know before
+/// touching any of them — does it carry a grounded anchor, and is anything still
+/// writing to it — were both computed by the census and then discarded on the
+/// way out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededGeneration {
+    pub panel_version: u32,
+    pub records: usize,
+    /// Records at **this** generation carrying at least one grounded anchor.
+    ///
+    /// The load-bearing number for ask 3. A constellation is derived state — it
+    /// is re-measured from its source row by a frozen pipeline — but an anchor
+    /// is an observed real outcome with a source and a confidence, and nothing
+    /// regenerates it. A superseded record with an anchor is therefore the only
+    /// copy of something, and is sacred; a superseded record without one holds
+    /// nothing its source row cannot produce again.
+    pub grounded_records: usize,
+    pub earliest_created_at_ms: Option<u64>,
+    pub latest_created_at_ms: Option<u64>,
+    /// True when no record at this generation is newer than the oldest record at
+    /// the active generation — i.e. nothing has written here since the active
+    /// generation opened.
+    ///
+    /// An *open* superseded generation is a defect, not a retention question:
+    /// it means some write path is still measuring at a version the intelligence
+    /// surfaces do not read, so those records are being stranded as they are
+    /// created. That is the #1927 failure reappearing at the write path instead
+    /// of in the history, and it must be fixed before any reclaim is considered
+    /// — reclaiming from a generation something is still filling is a loop.
+    ///
+    /// `false` when either timestamp is missing, because unknown is not closed.
+    pub closed: bool,
+}
 
 /// Fraction of its source CF an active panel generation must cover before the
 /// panel is reported healthy (#1927 ask 4).
@@ -122,8 +198,29 @@ pub struct PanelCoverageRow {
     pub records_exceed_source: bool,
     /// Records stranded on this panel's declared superseded generations.
     pub superseded_records: usize,
-    /// Each superseded generation actually present, with its record count.
-    pub superseded_versions_present: Vec<(u32, usize)>,
+    /// Each superseded generation actually present (#1927 ask 3).
+    pub superseded_versions_present: Vec<SupersededGeneration>,
+    /// Of [`Self::superseded_records`], how many carry a grounded anchor.
+    ///
+    /// Sacred: an anchor is not regenerable from the source row. Non-zero here
+    /// means a reclaim would destroy grounded intelligence unless the anchors
+    /// were carried on to the active generation first.
+    pub superseded_grounded_records: usize,
+    /// Upper bound on superseded records that hold nothing their source row
+    /// could not produce again — an **upper bound, not a delete list**. See
+    /// [`PanelCoverageReport::superseded_reclaim_candidates`] for why this
+    /// cannot be tightened by a census.
+    pub superseded_reclaim_candidates: usize,
+    /// Active-generation constellations whose source row no longer exists,
+    /// because an audit TTL expired it.
+    ///
+    /// `active_version_records - source_cf_rows` on a panel where that is
+    /// positive. These are **sacred and permanent**: nothing can re-measure a
+    /// row that is gone, so the constellation is the only surviving record of
+    /// the observation. This is the second of ask 3's two decisions, and its
+    /// answer is "keep, forever" — the growth it implies is bounded by the
+    /// source CF's TTL policy, not by deleting the measurement.
+    pub orphaned_records: usize,
     /// Active-generation records carrying at least one grounded anchor.
     pub grounded_records: usize,
     pub grounded_fraction: f32,
@@ -202,6 +299,56 @@ pub struct PanelCoverageReport {
     /// number, made visible so the retention decision can be taken on a
     /// measurement instead of an estimate.
     pub superseded_records_total: usize,
+    /// Of [`Self::superseded_records_total`], how many carry a grounded anchor.
+    ///
+    /// # The ask 3 decision, stated
+    ///
+    /// **Superseded `Base` rows are never auto-deleted.** Not "not yet" — the
+    /// census cannot establish the precondition that would make an automatic
+    /// delete safe, and a mechanism that deletes sacred data on an assumption is
+    /// worse than 41,237 stranded rows.
+    ///
+    /// The rule a *deliberate* reclaim must satisfy, per record:
+    ///
+    /// 1. its generation is [`SupersededGeneration::closed`] — nothing is still
+    ///    writing there;
+    /// 2. it carries **no grounded anchor** — an anchor is an observed outcome
+    ///    with a source and a confidence, and no re-measure regenerates it;
+    /// 3. its own source row still exists in the panel's `backfill_source_cf` —
+    ///    without it the record is not derived state, it is the last copy;
+    /// 4. the same input is already measured at the active generation.
+    ///
+    /// Conditions 1, 2 and 4 are answerable from this report. **Condition 3 is
+    /// not**, and that is why the count below its sibling is named
+    /// `superseded_reclaim_candidates` rather than `reclaimable`. Measured on
+    /// the live vault 2026-07-31: `syn-agent-transcript-v1` holds 40,501
+    /// superseded records across two generations against a `CF_AGENT_TRANSCRIPTS`
+    /// holding 25,573 rows, so some superseded records certainly correspond to
+    /// source rows that no longer exist. Which ones cannot be known without
+    /// looking up each record's source key — a per-record probe, not a count.
+    ///
+    /// So the reclaim path, if one is ever built, must confirm condition 3 for
+    /// each record at the moment it acts. This report's job is to make the
+    /// decision *sizable*, and to make the two sacred classes — grounded
+    /// superseded records, and [`Self::orphaned_records_total`] — impossible to
+    /// mistake for reclaimable ones.
+    pub superseded_grounded_records_total: usize,
+    /// Upper bound on the ask 3 reclaim set: superseded, ungrounded, on a closed
+    /// generation, on a panel that has a re-measure path and whose active
+    /// generation already covers its source CF.
+    ///
+    /// An **upper bound**. Condition 3 above is unproven for every record in it.
+    pub superseded_reclaim_candidates: usize,
+    /// Constellations whose source row an audit TTL has expired. Sacred and
+    /// permanent — see [`PanelCoverageRow::orphaned_records`].
+    pub orphaned_records_total: usize,
+    /// Superseded generations that are still being WRITTEN TO — the defect case.
+    ///
+    /// Named `panel@version` so a log line identifies the write path to fix.
+    /// Empty is the healthy state; non-empty means records are being stranded as
+    /// they are created, which is #1927's failure moved from the history to the
+    /// live path.
+    pub open_superseded_generations: Vec<String>,
     pub coverage_floor: f32,
     pub grounding_floor: f32,
     /// Full-CF panels below the coverage floor. Names, so a log line is readable.
@@ -297,6 +444,10 @@ pub fn build_panel_coverage_report(
     let mut panels = Vec::with_capacity(catalog.len());
     let mut claimed_versions: Vec<u32> = Vec::new();
     let mut superseded_records_total = 0usize;
+    let mut superseded_grounded_records_total = 0usize;
+    let mut superseded_reclaim_candidates_total = 0usize;
+    let mut orphaned_records_total = 0usize;
+    let mut open_superseded_generations: Vec<String> = Vec::new();
     let mut coverage_deficient_panels = Vec::new();
     let mut unbackfillable_deficient_panels = Vec::new();
     let mut grounding_deficient_panels = Vec::new();
@@ -314,16 +465,45 @@ pub fn build_panel_coverage_report(
             .map(|row| row.anchor_kind_records.clone())
             .unwrap_or_default();
 
-        let superseded_versions_present: Vec<(u32, usize)> = entry
+        // A superseded generation is "closed" relative to the ACTIVE
+        // generation's oldest record: nothing written here since the active one
+        // opened. Missing on either side means unknown, and unknown is not
+        // closed — a generation whose timestamps the census could not read must
+        // never be reported as safe to reason about.
+        let active_earliest = active.and_then(|row| row.earliest_created_at_ms);
+        let superseded_versions_present: Vec<SupersededGeneration> = entry
             .superseded_versions
             .iter()
-            .filter_map(|version| census.entry(*version).map(|row| (*version, row.records)))
+            .filter_map(|version| {
+                census.entry(*version).map(|row| SupersededGeneration {
+                    panel_version: *version,
+                    records: row.records,
+                    grounded_records: row.grounded_records,
+                    earliest_created_at_ms: row.earliest_created_at_ms,
+                    latest_created_at_ms: row.latest_created_at_ms,
+                    closed: match (row.latest_created_at_ms, active_earliest) {
+                        (Some(latest), Some(active_oldest)) => latest <= active_oldest,
+                        _ => false,
+                    },
+                })
+            })
             .collect();
         let superseded_records: usize = superseded_versions_present
             .iter()
-            .map(|(_, records)| *records)
+            .map(|generation| generation.records)
+            .sum();
+        let superseded_grounded_records: usize = superseded_versions_present
+            .iter()
+            .map(|generation| generation.grounded_records)
             .sum();
         superseded_records_total += superseded_records;
+        superseded_grounded_records_total += superseded_grounded_records;
+        for generation in &superseded_versions_present {
+            if !generation.closed && generation.records > 0 {
+                open_superseded_generations
+                    .push(format!("{}@{}", entry.panel_name, generation.panel_version));
+            }
+        }
 
         let source_is_full_cf = entry.source.is_full_cf();
         let source_cf = entry.source.cf_name().map(str::to_owned);
@@ -358,10 +538,42 @@ pub fn build_panel_coverage_report(
         });
         let records_exceed_source =
             source_cf_row_count.is_some_and(|rows| active_version_records as u64 > rows);
+        // The excess IS the orphan count: on a full-CF panel the active
+        // generation holds one constellation per source row, so anything beyond
+        // the row count is a measurement whose source the GC expired.
+        let orphaned_records = source_cf_row_count.map_or(0, |rows| {
+            (active_version_records as u64).saturating_sub(rows) as usize
+        });
+        orphaned_records_total += orphaned_records;
         let coverage_below_floor =
             coverage_fraction.is_some_and(|fraction| fraction < SYN_PANEL_COVERAGE_FLOOR);
         let grounding_below_floor =
             entry.outcome_bearing && grounded_fraction < SYNAPSE_GROUNDING_COVERAGE_FLOOR;
+
+        // Ask 3's upper bound. Every clause is a precondition that can be
+        // checked from counts; the one that cannot — "this record's own source
+        // row still exists" — is deliberately absent, which is why this is a
+        // candidate count and not a delete list.
+        //
+        // `!coverage_below_floor` matters as much as the rest: reclaiming from
+        // an old generation while the active one has not yet covered the corpus
+        // would delete the only measurement of records the backfill has not
+        // reached. Ordering, not preference.
+        let panel_reclaimable = entry.backfill_source_cf.is_some() && !coverage_below_floor;
+        let superseded_reclaim_candidates: usize = if panel_reclaimable {
+            superseded_versions_present
+                .iter()
+                .filter(|generation| generation.closed)
+                .map(|generation| {
+                    generation
+                        .records
+                        .saturating_sub(generation.grounded_records)
+                })
+                .sum()
+        } else {
+            0
+        };
+        superseded_reclaim_candidates_total += superseded_reclaim_candidates;
 
         if coverage_below_floor {
             coverage_deficient_panels.push(entry.panel_name.to_owned());
@@ -389,6 +601,9 @@ pub fn build_panel_coverage_report(
             records_exceed_source,
             superseded_records,
             superseded_versions_present,
+            superseded_grounded_records,
+            superseded_reclaim_candidates,
+            orphaned_records,
             grounded_records,
             grounded_fraction,
             grounding_below_floor,
@@ -405,9 +620,19 @@ pub fn build_panel_coverage_report(
         .collect();
     // An unclaimed generation is stranded by definition: no active-panel surface
     // reads it, so it belongs in the same total as the declared superseded ones.
+    // Its grounded records belong in the sacred total for the same reason, and
+    // it never contributes reclaim candidates — a generation no catalog entry
+    // claims has no known source CF and no known active counterpart, so none of
+    // the four reclaim conditions can even be evaluated for it.
     superseded_records_total += unknown_panel_versions
         .iter()
         .map(|(_, records)| *records)
+        .sum::<usize>();
+    superseded_grounded_records_total += census
+        .entries
+        .iter()
+        .filter(|row| !claimed_versions.contains(&row.panel_version))
+        .map(|row| row.grounded_records)
         .sum::<usize>();
 
     PanelCoverageReport {
@@ -418,6 +643,10 @@ pub fn build_panel_coverage_report(
         decode_failures: census.decode_failures,
         first_decode_failure: census.first_decode_failure.clone(),
         superseded_records_total,
+        superseded_grounded_records_total,
+        superseded_reclaim_candidates: superseded_reclaim_candidates_total,
+        orphaned_records_total,
+        open_superseded_generations,
         coverage_floor: SYN_PANEL_COVERAGE_FLOOR,
         grounding_floor: SYNAPSE_GROUNDING_COVERAGE_FLOOR,
         coverage_deficient_panels,

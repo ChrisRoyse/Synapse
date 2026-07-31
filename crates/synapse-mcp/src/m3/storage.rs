@@ -743,6 +743,29 @@ pub struct StoragePanelCoverageResponse {
     pub accounting_holds: bool,
     /// Rows on a superseded or unclaimed generation (#1927 ask 3).
     pub superseded_records_total: u64,
+    /// Of those, how many carry a grounded anchor. **Sacred** — an anchor is an
+    /// observed outcome with a source and a confidence, and no re-measure
+    /// regenerates it, so these cannot be reclaimed without carrying the anchors
+    /// forward first.
+    pub superseded_grounded_records_total: u64,
+    /// UPPER BOUND on the ask 3 reclaim set. Superseded rows that are ungrounded,
+    /// on a closed generation, on a panel with a re-measure path whose active
+    /// generation already covers its source CF.
+    ///
+    /// Explicitly **not** a delete list, and no reclaim runs off it. The fourth
+    /// condition — "this record's own source row still exists" — is a per-record
+    /// lookup no census can perform. Superseded `Base` rows are never
+    /// auto-deleted; this number exists so the decision can be sized.
+    pub superseded_reclaim_candidates: u64,
+    /// Constellations whose source row an audit TTL expired. **Sacred and
+    /// permanent**: nothing can re-measure a row that is gone, so the
+    /// constellation is the only surviving record of the observation.
+    pub orphaned_records_total: u64,
+    /// Superseded generations something is STILL WRITING TO, as `panel@version`.
+    ///
+    /// Non-empty is a defect, not a retention state: records are being stranded
+    /// as they are created. Must be empty before any reclaim is considered.
+    pub open_superseded_generations: Vec<String>,
     pub coverage_floor: f32,
     pub grounding_floor: f32,
     pub coverage_deficient_panels: Vec<String>,
@@ -753,6 +776,29 @@ pub struct StoragePanelCoverageResponse {
     pub records_exceed_source_panels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at_unix_ms: Option<u64>,
+}
+
+/// One superseded panel generation in the `panel_coverage` payload (#1927 ask 3).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSupersededGeneration {
+    pub panel_version: u32,
+    pub records: u64,
+    /// Records at this generation carrying a grounded anchor. Non-zero means a
+    /// reclaim here would destroy grounded intelligence.
+    pub grounded_records: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_created_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_created_at_ms: Option<u64>,
+    /// True when nothing at this generation is newer than the oldest record at
+    /// the active generation.
+    ///
+    /// `false` is a DEFECT, not a retention state: some write path is still
+    /// measuring at a version no intelligence surface reads, so records are
+    /// being stranded as they are created. Also `false` when either timestamp is
+    /// unreadable, because unknown is not closed.
+    pub closed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -783,8 +829,30 @@ pub struct StoragePanelCoverageRow {
     /// separately and is NOT a coverage deficiency.
     pub records_exceed_source: bool,
     pub superseded_records: u64,
-    /// Each superseded generation present, as `[panel_version, records]`.
-    pub superseded_versions_present: Vec<[u64; 2]>,
+    /// Each superseded generation present, with the facts the #1927 ask 3
+    /// retention decision turns on.
+    ///
+    /// This was `[panel_version, records]` until #1927 ask 3. A pair of numbers
+    /// could not answer either question a caller has about a stranded
+    /// generation — whether anything there is grounded, and whether anything is
+    /// still writing to it — so both were promoted out of the census instead of
+    /// being recomputed by whoever needed them.
+    pub superseded_versions_present: Vec<StorageSupersededGeneration>,
+    /// Of `superseded_records`, how many carry a grounded anchor. Sacred: an
+    /// anchor is an observed outcome and no re-measure regenerates it.
+    pub superseded_grounded_records: u64,
+    /// UPPER BOUND on superseded records this panel could reclaim: ungrounded,
+    /// on a closed generation, with a re-measure path, and with the active
+    /// generation already covering its source CF.
+    ///
+    /// Not a delete list. The fourth reclaim condition — "this record's own
+    /// source row still exists" — is a per-record lookup that a census cannot
+    /// perform, and on `syn-agent-transcript-v1` it is demonstrably false for
+    /// some of them (40,501 superseded records against 25,573 source rows).
+    pub superseded_reclaim_candidates: u64,
+    /// Active-generation constellations whose source row an audit TTL expired.
+    /// Sacred and permanent — nothing can re-measure a row that is gone.
+    pub orphaned_records: u64,
     pub grounded_records: u64,
     pub grounded_fraction: f32,
     pub grounding_below_floor: bool,
@@ -2252,8 +2320,18 @@ pub fn inspect_panel_coverage(
             superseded_versions_present: panel
                 .superseded_versions_present
                 .iter()
-                .map(|(version, records)| [u64::from(*version), *records as u64])
+                .map(|generation| StorageSupersededGeneration {
+                    panel_version: generation.panel_version,
+                    records: generation.records as u64,
+                    grounded_records: generation.grounded_records as u64,
+                    earliest_created_at_ms: generation.earliest_created_at_ms,
+                    latest_created_at_ms: generation.latest_created_at_ms,
+                    closed: generation.closed,
+                })
                 .collect(),
+            superseded_grounded_records: panel.superseded_grounded_records as u64,
+            superseded_reclaim_candidates: panel.superseded_reclaim_candidates as u64,
+            orphaned_records: panel.orphaned_records as u64,
             grounded_records: panel.grounded_records as u64,
             grounded_fraction: panel.grounded_fraction,
             grounding_below_floor: panel.grounding_below_floor,
@@ -2284,6 +2362,10 @@ pub fn inspect_panel_coverage(
         first_decode_failure: report.first_decode_failure.clone(),
         accounting_holds: report.accounting_holds(),
         superseded_records_total: report.superseded_records_total as u64,
+        superseded_grounded_records_total: report.superseded_grounded_records_total as u64,
+        superseded_reclaim_candidates: report.superseded_reclaim_candidates as u64,
+        orphaned_records_total: report.orphaned_records_total as u64,
+        open_superseded_generations: report.open_superseded_generations.clone(),
         coverage_floor: report.coverage_floor,
         grounding_floor: report.grounding_floor,
         coverage_deficient_panels: report.coverage_deficient_panels.clone(),
