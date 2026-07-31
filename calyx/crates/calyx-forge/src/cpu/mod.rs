@@ -2,6 +2,7 @@ pub mod distance;
 pub mod gemm;
 pub mod guard;
 pub mod normalize;
+pub mod simd;
 pub mod topk;
 
 use crate::{Backend, DeviceInfo, ForgeError, KnnBatch, KnnMetric, Result};
@@ -26,8 +27,16 @@ impl CpuBackend {
         self.avx512
     }
 
+    /// Which CPU kernel family the reductions actually dispatched to on this host.
+    ///
+    /// This used to answer `"f32x16"` / `"f32x8"` from the AVX-512 flag alone,
+    /// which was wrong in both directions: the crate had no AVX-512 kernels for
+    /// distance at all, and `"f32x8"` described a `wide` type that lowers to two
+    /// 128-bit SSE operations at this workspace's `x86-64-v2` baseline. Health
+    /// surfaced that string as `calyx_math_cpu_simd_path`, so the daemon reported
+    /// a width it was not running. It now reports the runtime dispatch decision.
     pub fn simd_path(&self) -> &'static str {
-        if self.avx512 { "f32x16" } else { "f32x8" }
+        simd::backend_name()
     }
 }
 

@@ -27,6 +27,9 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 const CUDA_STARTUP_ENVELOPE_MIB: u64 = 4 * 1024;
 #[cfg(feature = "calyx-cuda")]
 const CUDA_REPLACEMENT_RESERVATION_ENV: &str = "SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID";
+/// Length of the CPU reduction-agreement probe: two full 8-lane chunks plus a
+/// 3-element tail, so both the vector body and the scalar tail are covered.
+const REDUCTION_PROBE_LEN: usize = 19;
 const PROBE_TOLERANCE: f32 = 0.0001;
 const PROBE_DIM: usize = 3;
 const PROBE_QUERY: [f32; PROBE_DIM] = [1.0, 0.0, 0.0];
@@ -746,10 +749,12 @@ fn run_startup_probe(
         .map_err(|error| probe_error("topk", &error))?;
     assert_topk(&topk)?;
 
+    let reduction_backend = assert_reduction_paths_agree()?;
+
     Ok(SynapseCalyxMathProbeReport {
         status: "ok".to_owned(),
         detail: format!(
-            "fixed vectors matched expected dot={EXPECTED_DOT:?} cosine={EXPECTED_COSINE:?} l2_squared={EXPECTED_L2_SQUARED:?} topk={EXPECTED_TOPK:?}"
+            "fixed vectors matched expected dot={EXPECTED_DOT:?} cosine={EXPECTED_COSINE:?} l2_squared={EXPECTED_L2_SQUARED:?} topk={EXPECTED_TOPK:?}; cpu reduction backend={reduction_backend} agrees bit-for-bit with the portable path over {REDUCTION_PROBE_LEN} elements"
         ),
         tolerance: PROBE_TOLERANCE,
         dot,
@@ -760,6 +765,36 @@ fn run_startup_probe(
             .map(|(index, score)| SynapseCalyxMathProbeTopKEntry { index, score })
             .collect(),
     })
+}
+
+/// Prove on this host that `calyx-forge`'s runtime-dispatched CPU kernels return
+/// bit-identical results to its portable kernels.
+///
+/// The fixed probe above runs at `PROBE_DIM = 3`, which is shorter than the
+/// 8-lane accumulator, so it exercises only the scalar tail and would not notice
+/// a dispatched kernel that disagreed in its vector body. This check uses a
+/// length that is deliberately **not** a multiple of the lane width, so both the
+/// vector body and the tail are covered, and it fails closed: a host where the
+/// two paths disagree has a broken reduction contract and must not open a vault
+/// whose derived artifacts would then depend on which kernel happened to run.
+fn assert_reduction_paths_agree() -> Result<&'static str, SynapseCalyxError> {
+    let left: Vec<f32> = (0..REDUCTION_PROBE_LEN)
+        .map(|index| (index as f32).mul_add(0.37, -2.5))
+        .collect();
+    let right: Vec<f32> = (0..REDUCTION_PROBE_LEN)
+        .map(|index| (index as f32).mul_add(-0.11, 1.75))
+        .collect();
+    match calyx_forge::cpu::simd::reduction_paths_agree(&left, &right) {
+        None => Ok(calyx_forge::cpu::simd::backend_name()),
+        Some(kernel) => Err(probe_mismatch(format!(
+            "cpu reduction kernel `{kernel}` disagrees bit-for-bit between the runtime-dispatched \
+             backend `{}` and the portable f32x8 backend over {REDUCTION_PROBE_LEN} elements; the \
+             two paths are required to fold identically (calyx-forge cpu::simd), so a mismatch \
+             means the dispatched kernel changed the reduction order and every derived artifact \
+             would depend on which kernel ran",
+            calyx_forge::cpu::simd::backend_name()
+        ))),
+    }
 }
 
 fn assert_close_vec(

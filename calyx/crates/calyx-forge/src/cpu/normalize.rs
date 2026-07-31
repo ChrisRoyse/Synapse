@@ -1,6 +1,5 @@
-use wide::f32x16;
-
 use crate::cpu::guard::{check_finite, check_norm_positive, check_shape_2d};
+use crate::cpu::simd::kernels;
 use crate::{ForgeError, Result};
 
 pub fn normalize_f32(vecs: &mut [f32], dim: usize) -> Result<()> {
@@ -36,39 +35,12 @@ pub fn normalize_f32(vecs: &mut [f32], dim: usize) -> Result<()> {
     Ok(())
 }
 
+/// Both reductions route through the runtime-dispatched kernels in
+/// [`crate::cpu::simd`], which own the fold order.
 fn sum_squares(values: &[f32]) -> f32 {
-    let mut sum = 0.0;
-    let mut offset = 0;
-    while offset + 16 <= values.len() {
-        let chunk = load16(values, offset);
-        // DETERMINISM: row elements are consumed in ascending offset order; each
-        // f32x16 chunk contributes one reduce_add() subtotal before scalar tail.
-        sum += (chunk * chunk).reduce_add();
-        offset += 16;
-    }
-    while offset < values.len() {
-        sum += values[offset] * values[offset];
-        offset += 1;
-    }
-    sum
+    (kernels().sum_squares)(values)
 }
 
 fn scale_row(values: &mut [f32], scale: f32) {
-    let scale_vec = f32x16::splat(scale);
-    let mut offset = 0;
-    while offset + 16 <= values.len() {
-        let scaled = load16(values, offset) * scale_vec;
-        values[offset..offset + 16].copy_from_slice(&scaled.to_array());
-        offset += 16;
-    }
-    while offset < values.len() {
-        values[offset] *= scale;
-        offset += 1;
-    }
-}
-
-fn load16(values: &[f32], offset: usize) -> f32x16 {
-    let mut lanes = [0.0; 16];
-    lanes.copy_from_slice(&values[offset..offset + 16]);
-    f32x16::from(lanes)
+    (kernels().scale_row)(values, scale);
 }

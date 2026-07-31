@@ -34,7 +34,7 @@
 //! |---|---|---|
 //! | cosine | 32-dim x 20k rows | the live timeline panel's dense record-vector lane |
 //! | cosine | 384-dim x 20k rows | embedder-scale, for the lanes a future panel would add |
-//! | gemm | 64x64x256 | the tiled path, exercising `TILE_M`/`TILE_K` |
+//! | gemm | 64x64x256 | the tiled path, exercising `TILE_M` |
 //! | sha256 | 256 MB | the backup I took hashed 1,536 files / 266 MB |
 //!
 //! Run it once per baseline and compare. The compile-time feature set is printed
@@ -81,16 +81,123 @@ fn checksum(values: &[f32]) -> f64 {
     values.iter().map(|value| f64::from(*value)).sum()
 }
 
-fn report(label: &str, elapsed: std::time::Duration, units: f64, unit: &str, check: f64) {
+/// Returns the measured rate so the caller can gate on it. #1912's bar is a
+/// comparison between phases ("forge must not be slower than no SIMD at all"),
+/// which is unanswerable if every phase only prints.
+fn report(label: &str, elapsed: std::time::Duration, units: f64, unit: &str, check: f64) -> f64 {
     let secs = elapsed.as_secs_f64();
+    let rate = units / secs;
     println!(
         "  {label:<28} {:>9.1} ms   {:>12.2} {unit}/s   checksum={check:.6}",
         secs * 1000.0,
-        units / secs,
+        rate,
     );
+    rate
 }
 
-fn cosine_phase(backend: &CpuBackend, dim: usize) -> Result<(), Box<dyn Error>> {
+/// #1912 claim: the runtime-dispatched CPU kernels and the portable ones must
+/// return **bit-identical** results, so the answer does not depend on which
+/// kernel this host happened to select.
+///
+/// This is checked over the same corpus the phases below are timed on, at both
+/// measured dims and at a length that is not a multiple of the 8-lane
+/// accumulator, so the vector body and the scalar tail are both covered.
+fn reduction_agreement_claim() -> bool {
+    let mut ok = true;
+    for dim in [32_usize, 384, 19, 7] {
+        let left = fill(dim, 0x4007_0001);
+        let right = fill(dim, 0x4007_0002);
+        match calyx_forge::cpu::simd::reduction_paths_agree(&left, &right) {
+            None => println!("  dim={dim:<4} dispatched == portable  bit-identical            OK"),
+            Some(kernel) => {
+                println!("  dim={dim:<4} kernel `{kernel}` DISAGREES between paths          FAIL");
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+/// The old `wide::f32x16::reduce_add()` fold, written out rather than invoked.
+///
+/// At the `x86-64-v2` baseline `f32x16` is `{a: f32x8, b: f32x8}` and `f32x8` is
+/// `{a: f32x4, b: f32x4}`, with `f32x4::reduce_add` being `arr.iter().sum()` —
+/// a left-associative chain. So the 16 lanes fold as four left-associative
+/// quads, combined `(q0+q1) + (q2+q3)`. Spelling it out here avoids adding a
+/// `wide` dependency to this workspace just to reproduce a deleted code path,
+/// and it makes the ordering the instrument compares against explicit rather
+/// than implied by a crate version.
+///
+/// This lives only in the instrument. Keeping a second reduction in the crate is
+/// exactly the condition #1912 was filed about.
+fn legacy_fold16(lanes: &[f32; 16]) -> f32 {
+    let quad = |base: usize| ((lanes[base] + lanes[base + 1]) + lanes[base + 2]) + lanes[base + 3];
+    (quad(0) + quad(4)) + (quad(8) + quad(12))
+}
+
+fn legacy_cosine(query: &[f32], candidate: &[f32]) -> f32 {
+    let mut dot_sum = 0.0_f32;
+    let mut query_norm_sum = 0.0_f32;
+    let mut cand_norm_sum = 0.0_f32;
+    let mut offset = 0;
+    while offset + 16 <= query.len() {
+        let mut dot_lanes = [0.0_f32; 16];
+        let mut query_lanes = [0.0_f32; 16];
+        let mut cand_lanes = [0.0_f32; 16];
+        for lane in 0..16 {
+            let q = query[offset + lane];
+            let c = candidate[offset + lane];
+            dot_lanes[lane] = q * c;
+            query_lanes[lane] = q * q;
+            cand_lanes[lane] = c * c;
+        }
+        dot_sum += legacy_fold16(&dot_lanes);
+        query_norm_sum += legacy_fold16(&query_lanes);
+        cand_norm_sum += legacy_fold16(&cand_lanes);
+        offset += 16;
+    }
+    while offset < query.len() {
+        dot_sum += query[offset] * candidate[offset];
+        query_norm_sum += query[offset] * query[offset];
+        cand_norm_sum += candidate[offset] * candidate[offset];
+        offset += 1;
+    }
+    dot_sum / (query_norm_sum.sqrt() * cand_norm_sum.sqrt())
+}
+
+/// #1912 ask 4: the checksums DID move, so state by how much.
+///
+/// `calyx-forge`'s cosine reaches durable state through one path — the
+/// between-record kNN in `synapse-calyx`'s weave, whose edge `score` is written
+/// to `ColumnFamily::Graph`. So "no durable state can reach the difference" is
+/// not the honest answer; the honest answer is a measured bound on how far a
+/// persisted edge score can move, which is what this reports.
+fn reassociation_delta_claim(backend: &CpuBackend, dim: usize) -> Result<f64, Box<dyn Error>> {
+    let query = fill(dim, 0xC057_0001);
+    let corpus = fill(dim * ROWS, 0xC057_0002);
+    let mut current = vec![0.0_f32; ROWS];
+    backend.cosine(&query, &corpus, dim, &mut current)?;
+
+    let mut max_abs = 0.0_f64;
+    let mut sum_abs = 0.0_f64;
+    let mut changed = 0_usize;
+    for (row, new_score) in current.iter().enumerate() {
+        let old_score = legacy_cosine(&query, &corpus[row * dim..(row + 1) * dim]);
+        let delta = (f64::from(*new_score) - f64::from(old_score)).abs();
+        if delta > 0.0 {
+            changed += 1;
+        }
+        sum_abs += delta;
+        max_abs = max_abs.max(delta);
+    }
+    println!(
+        "  dim={dim:<4} rows={ROWS}  changed={changed:<6} max|delta|={max_abs:.3e}  mean|delta|={:.3e}",
+        sum_abs / ROWS as f64
+    );
+    Ok(max_abs)
+}
+
+fn cosine_phase(backend: &CpuBackend, dim: usize) -> Result<f64, Box<dyn Error>> {
     let query = fill(dim, 0xC057_0001);
     let corpus = fill(dim * ROWS, 0xC057_0002);
     let mut out = vec![0.0_f32; ROWS];
@@ -102,17 +209,16 @@ fn cosine_phase(backend: &CpuBackend, dim: usize) -> Result<(), Box<dyn Error>> 
         backend.cosine(&query, &corpus, dim, &mut out)?;
     }
     let elapsed = started.elapsed();
-    report(
+    Ok(report(
         &format!("cosine dim={dim}"),
         elapsed,
         (ROWS * passes) as f64,
         "rows",
         checksum(&out),
-    );
-    Ok(())
+    ))
 }
 
-fn gemm_phase(backend: &CpuBackend) -> Result<(), Box<dyn Error>> {
+fn gemm_phase(backend: &CpuBackend) -> Result<f64, Box<dyn Error>> {
     let (m, k, n) = (64_usize, 64_usize, 256_usize);
     let a = fill(m * k, 0x6E33_0001);
     let b = fill(k * n, 0x6E33_0002);
@@ -126,14 +232,13 @@ fn gemm_phase(backend: &CpuBackend) -> Result<(), Box<dyn Error>> {
     let elapsed = started.elapsed();
     // 2 flops per multiply-accumulate.
     let flops = 2.0 * (m * k * n * passes) as f64;
-    report(
+    Ok(report(
         &format!("gemm {m}x{k}x{n}"),
         elapsed,
         flops / 1e9,
         "GFLOP",
         checksum(&out),
-    );
-    Ok(())
+    ))
 }
 
 /// Byte-for-byte the scoring kernel the live `flat_dense` lanes actually run:
@@ -160,7 +265,7 @@ fn hot_path_cosine(left: &[f32], right: &[f32]) -> f32 {
     }
 }
 
-fn hot_path_phase(dim: usize) {
+fn hot_path_phase(dim: usize) -> f64 {
     let query = fill(dim, 0x4007_0001);
     let corpus = fill(dim * ROWS, 0x4007_0002);
     let mut out = vec![0.0_f32; ROWS];
@@ -181,7 +286,7 @@ fn hot_path_phase(dim: usize) {
         (ROWS * passes) as f64,
         "rows",
         checksum(&out),
-    );
+    )
 }
 
 /// The alternative that already exists in-tree: `calyx-sextant`'s
@@ -191,7 +296,7 @@ fn hot_path_phase(dim: usize) {
 /// not depend on the compile baseline at all — which is exactly the property the
 /// flat-dense lane is missing. `cosine_distance` returns `1 - cos`, so the
 /// similarity the flat lane wants is `1 - distance`.
-fn dispatched_phase(dim: usize) {
+fn dispatched_phase(dim: usize) -> f64 {
     let query = fill(dim, 0x4007_0001);
     let corpus = fill(dim * ROWS, 0x4007_0002);
     let mut out = vec![0.0_f32; ROWS];
@@ -218,7 +323,7 @@ fn dispatched_phase(dim: usize) {
         (ROWS * passes) as f64,
         "rows",
         checksum(&out),
-    );
+    )
 }
 
 fn sha_phase() {
@@ -297,19 +402,60 @@ fn main() -> Result<(), Box<dyn Error>> {
         backend.avx512_available()
     );
 
+    println!("\n--- #1912 claim A: forge dispatched kernels == forge portable kernels ---");
+    let agree = reduction_agreement_claim();
+
     println!("\n--- measured (checksums must be identical across baselines) ---");
     println!("  [HOT = the kernel the live flat_dense lanes actually run]");
-    hot_path_phase(32);
-    hot_path_phase(384);
+    let hot32 = hot_path_phase(32);
+    let hot384 = hot_path_phase(384);
     println!(
         "  [DISPATCHED = calyx-sextant runtime-AVX2 kernel, backend={}]",
         calyx_sextant::index::distance::kernel_backend()
     );
     dispatched_phase(32);
     dispatched_phase(384);
-    cosine_phase(&backend, 32)?;
-    cosine_phase(&backend, 384)?;
+    let forge32 = cosine_phase(&backend, 32)?;
+    let forge384 = cosine_phase(&backend, 384)?;
     gemm_phase(&backend)?;
     sha_phase();
-    Ok(())
+
+    // #1912 ask 3: "faster than before" is not the bar, "not slower than no SIMD
+    // at all" is. Gate on it here so a regression fails the instrument rather
+    // than waiting for someone to compare two columns by eye.
+    println!("\n--- #1912 claim C: how far the reassociation moves a persisted score ---");
+    println!(
+        "  (forge cosine reaches durable state via the between-record kNN -> ColumnFamily::Graph edge score)"
+    );
+    let delta32 = reassociation_delta_claim(&backend, 32)?;
+    let delta384 = reassociation_delta_claim(&backend, 384)?;
+    // f32 carries ~7 decimal digits, so a cosine in [-1,1] has ~1.2e-7 of
+    // representable resolution. A reassociation that stays inside a few ULP is
+    // arithmetically indistinguishable from the old answer at f32 precision.
+    let delta_bound = 1e-6;
+    let delta_ok = delta32 < delta_bound && delta384 < delta_bound;
+    println!(
+        "  bound={delta_bound:.0e}  observed_max={:.3e}  {}",
+        delta32.max(delta384),
+        if delta_ok { "OK" } else { "FAIL" }
+    );
+
+    println!("\n--- #1912 claim B: forge must not be slower than the plain scalar loop ---");
+    let mut ok = agree && delta_ok;
+    for (dim, forge, scalar) in [(32, forge32, hot32), (384, forge384, hot384)] {
+        let ratio = forge / scalar;
+        let verdict = if ratio >= 1.0 { "OK" } else { "FAIL" };
+        println!(
+            "  dim={dim:<4} forge={forge:>12.0}  scalar={scalar:>12.0}  ratio={ratio:>5.2}x  {verdict}"
+        );
+        ok &= ratio >= 1.0;
+    }
+
+    println!();
+    if ok {
+        println!("PASS: the dispatched CPU kernels agree bit-for-bit and clear the scalar floor");
+        Ok(())
+    } else {
+        Err("host_math_baseline_fsv: a #1912 claim failed; see the FAIL rows above".into())
+    }
 }
