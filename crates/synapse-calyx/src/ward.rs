@@ -20,13 +20,31 @@
 //! **no guarantee at all** — and it prints `ok` forever. So this module never
 //! manufactures a bad case.
 //!
-//! The corpus is therefore drawn from exactly one thing the vault can state
-//! about itself without interpretation: an [`Anchor`] whose value is
-//! [`AnchorValue::Bool`] with `confidence > 0`. `Bool(true)` is an adjudicated
-//! good outcome, `Bool(false)` an adjudicated bad one. Every other anchor value
-//! (`Number`, `Enum`, `Text`, `OneHot`, `Vector`) has no repo-wide polarity
-//! convention, so assigning it one here would be exactly the fabrication above:
-//! those records are counted as *unadjudicated* and reported, never scored.
+//! The corpus is therefore drawn from what the vault can state about itself
+//! without *inference*. Two sources qualify, and the difference between them is
+//! the whole point:
+//!
+//! 1. An [`Anchor`] whose value is [`AnchorValue::Bool`] with `confidence > 0`.
+//!    `Bool(true)` is an adjudicated good outcome, `Bool(false)` an adjudicated
+//!    bad one. No interpretation is involved at all.
+//! 2. An [`AnchorValue::Enum`] whose **kind** appears in
+//!    [`SYNAPSE_DECLARED_ENUM_ADJUDICATIONS`] — a closed, hand-written table in
+//!    which a specific anchor kind declares which of its values means "good",
+//!    citing the production code that already makes that same split.
+//!
+//! `Number`, `Text`, `OneHot`, `Vector`, and any enum kind **not** in that
+//! table, have no polarity here and are counted as *unadjudicated* and
+//! reported, never scored.
+//!
+//! Source 2 is not a weakening of the honesty rule, and it is worth being
+//! precise about why. The rule that matters is *never invent a bad case*. A
+//! declared enum adjudication invents nothing: the outcomes are real, observed,
+//! already-recorded failures, and the mapping from value to polarity is not
+//! guessed by Ward but copied from the subsystem that writes the anchor and
+//! already partitions the same field the same way. What Ward must never do is
+//! decide on its own that some unfamiliar enum value looks like a failure —
+//! and it still cannot, because the table is exhaustive and fails closed on
+//! anything absent from it.
 //!
 //! The score function is the one the guard actually enforces with —
 //! `dense_cosine(produced, matched)` — so calibration and deployment measure the
@@ -75,7 +93,7 @@ use std::collections::BTreeMap;
 
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
-use calyx_core::{AnchorValue, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine};
+use calyx_core::{AnchorKind, AnchorValue, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine};
 use calyx_registry::load_vault_panel_state;
 use calyx_ward::{
     CalibrationInput, GuardId, GuardPolicy, GuardProfile, MIN_BAD_SCORES, NoveltyAction, SlotKind,
@@ -202,6 +220,10 @@ pub struct SynapseCalyxGuardCalibrateReport {
     pub adjudicated_bad: usize,
     pub unadjudicated: usize,
     pub conflicting: usize,
+    /// Adjudicated records dropped because they carry none of the requested
+    /// guard slots. A large value here against a healthy `adjudicated_*` count
+    /// means the named slots are wrong for this panel, not that the corpus is.
+    pub adjudicated_without_guarded_slots: usize,
     pub estimator: String,
     pub slots: Vec<SynapseCalyxGuardSlotCalibration>,
     pub persisted: bool,
@@ -252,6 +274,63 @@ pub struct SynapseCalyxGuardVerifyReport {
     pub trusted_exemplars: usize,
 }
 
+/// One enum anchor kind whose value set carries a **declared** good/bad
+/// polarity, and the production code that declares it.
+///
+/// Ward accepts a polarity here only when some other part of the system already
+/// partitions the identical field the identical way. `declared_by` is not a
+/// comment — it is the evidence that this entry copies an existing decision
+/// rather than inventing one, and an entry that cannot cite such a site does
+/// not belong in the table.
+#[derive(Clone, Copy, Debug)]
+pub struct DeclaredEnumAdjudication {
+    /// The anchor kind label, matching [`AnchorKind::Label`].
+    pub kind_label: &'static str,
+    /// The single value that means "good". Every other value of this kind is
+    /// adjudicated bad.
+    pub good_value: &'static str,
+    /// Where in the codebase this same partition is already made.
+    pub declared_by: &'static str,
+}
+
+/// The closed set of enum anchor kinds Ward may adjudicate.
+///
+/// Adding an entry is a deliberate act with a burden of proof: name the code
+/// that already splits the field this way. Removing one only ever narrows what
+/// the guard will calibrate on, which is the safe direction.
+///
+/// Measured on the live vault 2026-07-30: `synapse:mcp_tool_call_outcome`
+/// covers 1,002 records at 1.0000 grounded coverage on panel 1776006, split
+/// 791 good / 211 bad. The 211 is confirmed twice over and independently — the
+/// `syn.mcp_usage.error_onehot.v1` lane is present on exactly 211 of those
+/// records (every other full-coverage lane reports 1,002), and the assay's
+/// measured anchor entropy of 0.7421873 bits solves to p = 0.2107, i.e.
+/// 211/1002. That is the only corpus on this vault with both polarities in
+/// quantity.
+pub const SYNAPSE_DECLARED_ENUM_ADJUDICATIONS: &[DeclaredEnumAdjudication] =
+    &[DeclaredEnumAdjudication {
+        kind_label: "synapse:mcp_tool_call_outcome",
+        good_value: "ok",
+        declared_by: "crates/synapse-mcp/src/server/mcp_usage.rs — usage_evidence() counts \
+                      `status == \"ok\"` as success_rows and `status != \"ok\"` as error_rows \
+                      over these exact CF_KV rows",
+    }];
+
+/// The declared verdict for one enum anchor, or `None` when this kind has no
+/// declared polarity and must stay unadjudicated.
+fn declared_enum_verdict(kind: &AnchorKind, value: &str) -> Option<bool> {
+    let AnchorKind::Label(label) = kind else {
+        // Only `Label` kinds are addressable by name. The structural kinds
+        // (TestPass, Thumbs, Reward, ...) carry their own semantics and are not
+        // routed through this table.
+        return None;
+    };
+    SYNAPSE_DECLARED_ENUM_ADJUDICATIONS
+        .iter()
+        .find(|declared| declared.kind_label == label)
+        .map(|declared| value == declared.good_value)
+}
+
 /// One record's adjudicated slot vectors.
 struct AdjudicatedRecord {
     cx_id: CxId,
@@ -265,6 +344,11 @@ struct AdjudicatedCorpus {
     records_scanned: usize,
     unadjudicated: usize,
     conflicting: usize,
+    /// Adjudicated records carrying none of the requested guard slots.
+    ///
+    /// Previously an uncounted `continue`, which is how the #1894 hydration
+    /// defect stayed invisible: every record landed here and nothing said so.
+    adjudicated_without_guarded_slots: usize,
 }
 
 impl SynapseCalyxVault {
@@ -315,12 +399,13 @@ impl SynapseCalyxVault {
             return Err(guard_error(
                 "SYNAPSE_CALYX_GUARD_BAD_CORPUS_ABSENT",
                 format!(
-                    "panel {} has no adjudicated bad case: {} record(s) scanned, {} adjudicated good (anchor Bool(true), confidence > 0), {} adjudicated bad (anchor Bool(false), confidence > 0), {} unadjudicated (anchors carrying Number/Enum/Text/OneHot/Vector values, which have no repo-wide good/bad polarity and are never interpreted as one)",
+                    "panel {} has no adjudicated bad case: {} record(s) scanned, {} adjudicated good (Bool(true), or a declared Enum good value, with confidence > 0), {} adjudicated bad (Bool(false), or any other value of a declared Enum kind), {} unadjudicated (anchors carrying Number/Text/OneHot/Vector values, or an Enum whose kind is not in SYNAPSE_DECLARED_ENUM_ADJUDICATIONS — none of which has a polarity Ward may infer), {} adjudicated but carrying none of the requested guard slots",
                     params.panel_version,
                     corpus.records_scanned,
                     corpus.good.len(),
                     corpus.bad.len(),
-                    corpus.unadjudicated
+                    corpus.unadjudicated,
+                    corpus.adjudicated_without_guarded_slots
                 ),
                 "a conformal FAR bound is only meaningful over a real known-bad distribution, so calibrating on manufactured badness would report `ok` forever and is refused here, not worked around. Note that adjudicated Bool outcomes DO exist in this system — agent_events writes synapse:agent_tool_call_success as Bool(!error_present), so every failed tool call is a Bool(false) — but calibration is pinned to the single durable active panel, and the panels carrying those anchors are not it. Check whether this panel is simply the wrong one to calibrate against before concluding that no adjudication path exists; if the active panel genuinely receives no adjudicated outcome, the gap is in the active-panel model, not in the anchor writers",
             ));
@@ -515,6 +600,7 @@ impl SynapseCalyxVault {
             adjudicated_bad: corpus.bad.len(),
             unadjudicated: corpus.unadjudicated,
             conflicting: corpus.conflicting,
+            adjudicated_without_guarded_slots: corpus.adjudicated_without_guarded_slots,
             estimator: calyx_ward::ESTIMATOR.to_owned(),
             slots,
             persisted: params.persist,
@@ -754,7 +840,9 @@ impl SynapseCalyxVault {
             records_scanned: 0,
             unadjudicated: 0,
             conflicting: 0,
+            adjudicated_without_guarded_slots: 0,
         };
+        let snapshot = self.read_snapshot();
         for (_, value) in self.scan_cf_latest(ColumnFamily::Base)? {
             let constellation = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -779,6 +867,23 @@ impl SynapseCalyxVault {
                         bad = true;
                         adjudicated = true;
                     }
+                    // An enum is adjudicable only when its kind appears in the
+                    // closed declaration table, which copies a partition the
+                    // writing subsystem already makes. An undeclared kind falls
+                    // through to unadjudicated, so this stays fail-closed.
+                    AnchorValue::Enum(ref value) => {
+                        match declared_enum_verdict(&anchor.kind, value) {
+                            Some(true) => {
+                                good = true;
+                                adjudicated = true;
+                            }
+                            Some(false) => {
+                                bad = true;
+                                adjudicated = true;
+                            }
+                            None => {}
+                        }
+                    }
                     // No repo-wide polarity convention exists for these values.
                     // Interpreting one would fabricate the very labels the
                     // conformal bound is a statement about.
@@ -793,9 +898,24 @@ impl SynapseCalyxVault {
                 corpus.conflicting += 1;
                 continue;
             }
+            // A Base row carries only `(slot_id, slot_hash)` pairs: every slot
+            // it decodes to is `SlotVector::Absent`, by design, because the
+            // vectors live in the per-slot CFs (#1894). Reading `slots`
+            // straight off the decoded row therefore found NOTHING on every
+            // record of every panel, so `slots.is_empty()` was always true and
+            // every adjudicated record was dropped by the `continue` below —
+            // silently, without a counter.
+            //
+            // That made `guard_calibrate` incapable of scoring a single record
+            // on any vault, including one with a perfect Bool corpus. It went
+            // unnoticed because the guard has always refused earlier, at
+            // PANEL_MISMATCH or BAD_CORPUS_ABSENT, and never reached this line
+            // on real data. `load_panel_dense_corpus` hydrates for exactly this
+            // reason; the guard has to as well.
+            let hydrated = self.hydrated_constellation(constellation.cx_id, snapshot)?;
             let mut slots = BTreeMap::new();
             for slot in &wanted {
-                if let Some(vector) = constellation
+                if let Some(vector) = hydrated
                     .slots
                     .get(&SlotId::new(*slot))
                     .and_then(guard_dense_vector)
@@ -804,6 +924,12 @@ impl SynapseCalyxVault {
                 }
             }
             if slots.is_empty() {
+                // Counted, not swallowed. An adjudicated record that carries
+                // none of the requested slots is a real finding — it usually
+                // means the caller named a slot this panel does not measure, or
+                // measures only on a subset — and the previous silent `continue`
+                // is what let the hydration defect above hide.
+                corpus.adjudicated_without_guarded_slots += 1;
                 continue;
             }
             let record = AdjudicatedRecord {
