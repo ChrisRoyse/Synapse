@@ -125,14 +125,26 @@ pub const SYNAPSE_FIND_GUARD_DISABLED_CODE: &str = "SYNAPSE_CALYX_FIND_GUARD_DIS
 const SYNAPSE_FIND_GUARD_REQUESTED_MODE: &str = "off";
 
 /// Why the guard is off, stated as fact rather than as a promise.
-const SYNAPSE_FIND_GUARD_DISABLED_REASON: &str = "the Ward in-region guard (#1677) has no Synapse wiring: calyx-ward is not a direct dependency of any synapse-* crate, nothing in Synapse ever writes the Guard CF, and that CF is empty on the live vault; these hits are therefore the raw unguarded fused recall and were NOT filtered for in-region membership";
+///
+/// This text asserted three things, and two of them stopped being true. It
+/// claimed `calyx-ward` was not a direct dependency of any `synapse-*` crate
+/// (it is — `synapse-calyx/Cargo.toml`) and that nothing in Synapse ever writes
+/// the Guard CF (`crate::ward::guard_calibrate` does). Only the third — that
+/// the CF is empty on the live vault — still holds, and for a reason this text
+/// never named.
+///
+/// That matters for the same reason it mattered in `ward.rs` (#1919): an
+/// operator following a stale remediation goes and builds a path that already
+/// exists, and never looks at the thing actually blocking them. The blocker is
+/// the panel binding, not the wiring.
+const SYNAPSE_FIND_GUARD_DISABLED_REASON: &str = "the Ward in-region guard seam is not wired into fused find: this pass requests guard=off, so these hits are the raw unguarded fused recall and were NOT filtered for in-region membership. Ward itself IS wired — calyx-ward is a direct dependency of synapse-calyx and `hygiene guard_calibrate` writes the Guard CF — but that CF is empty on the live vault because calibration is pinned to the single durable active panel, which carries no adjudicated outcome, so every calibration attempt correctly refuses with SYNAPSE_CALYX_GUARD_BAD_CORPUS_ABSENT (#1919). The gap is the panel binding and the find-side seam, NOT the absence of a calibration path";
 
 /// Exact, ordered prerequisites for enabling the calibrated in-region guard.
 /// Each line names a physical artifact or code seam that must exist first.
 const SYNAPSE_FIND_GUARD_ENABLE_REQUIREMENTS: &[&str] = &[
     "1. open the vault with ColumnFamily::Guard selected: calyx-search reads the profile via read_cf_at(Guard, b\"profile\\0default\") and an unselected CF returns None, which is indistinguishable from a missing profile",
     "2. persist a calibrated calyx_ward::GuardProfile at Guard CF key profile\\0default whose panel_version equals the active panel; a missing/uncalibrated/panel-mismatched profile fails closed with CALYX_GUARD_PROVISIONAL",
-    "3. take calyx-ward as a direct dependency of a Synapse crate and wire a calibration pass (calyx_ward::calibrate) that produces that profile from real in-region/out-of-region evidence; today Ward reaches Synapse only transitively",
+    "3. DONE — calyx-ward is a direct dependency of synapse-calyx and crate::ward::guard_calibrate produces a profile from real adjudicated evidence, verified end to end by crates/synapse-storage/examples/ward_declared_enum_adjudication_fsv.rs. What remains is upstream of it: calibration is pinned to the single durable active panel, and on this vault that panel carries no adjudicated outcome while the panels that do (syn-mcp-usage-v1 @ 1776006, ~1000 records at 1.0 coverage) can never be active under the single-active-panel model (#1919 step 2, #1668)",
     "4. thread an explicit guard mode (and optional operator cosine tau in (0.0, 1.0]) through SynapseCalyxFindParams to the GuardChoice argument, so guarding is a caller decision, never a silent default",
     "5. surface SearchOutcome::dropped_guard_hits and each hit's guard verdict in the report, so a guarded result stays auditable instead of silently returning a smaller set",
 ];
