@@ -198,6 +198,39 @@ catch {
 }
 
 # ---------------------------------------------------------------------------
+# Report — is the pre-push hook actually armed on this clone? (#1931)
+# ---------------------------------------------------------------------------
+#
+# `.githooks/pre-push` calls itself the CI replacement and delegates to this
+# script, but it only runs if `core.hooksPath` points at it, and that is a manual
+# `git config` nobody is prompted to perform. Measured 2026-07-31 on the primary
+# clone: unset, `.git/hooks/` holding only samples — so the backstop had never
+# run there.
+#
+# REPORTED, not enforced. Arming the hook is per-clone local config; failing a
+# lint run over it would make this script unusable in a fresh checkout and in
+# any context that legitimately has no hook (a CI-less scratch clone, a bisect
+# worktree). What was missing was not enforcement, it was that an unarmed clone
+# looked exactly like an armed one.
+
+Write-Gate 'Report    pre-push hook armed on this clone? (#1931)'
+$hooksPath = (& git -C $RepoRoot config --get core.hooksPath 2>$null)
+if ($LASTEXITCODE -ne 0) { $hooksPath = '' }
+$hooksPath = "$hooksPath".Trim()
+if ($hooksPath -eq '.githooks') {
+    Write-Host "   OK   core.hooksPath = .githooks; git push runs the gates above first" -ForegroundColor Green
+}
+elseif ([string]::IsNullOrWhiteSpace($hooksPath)) {
+    Write-Host '   NOT ARMED  core.hooksPath is unset, so .githooks/pre-push never runs and' -ForegroundColor Yellow
+    Write-Host '              `git push` gates nothing on this clone.' -ForegroundColor Yellow
+    Write-Host '              arm it with:  git config core.hooksPath .githooks' -ForegroundColor Yellow
+}
+else {
+    Write-Host "   NOT ARMED  core.hooksPath = '$hooksPath', which is not .githooks; the" -ForegroundColor Yellow
+    Write-Host '              repository pre-push gate is being bypassed by another hook dir.' -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------------------
 # Report — [workspace.lints] policy divergence (informational, never a failure)
 # ---------------------------------------------------------------------------
 

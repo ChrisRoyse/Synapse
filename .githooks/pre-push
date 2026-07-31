@@ -1,30 +1,56 @@
 #!/bin/sh
 # Synapse local pre-push gate (the project's CI replacement; #351 forbids GitHub
-# Actions, so local Cargo gates are the automated backstop). Runs the deny-level
-# fmt + clippy gates over every touched Rust workspace before any push so
-# [skip ci] branches can never push lint-red / non-compiling code. The root
-# Synapse workspace and the absorbed Calyx nested workspace are intentionally
-# separate Cargo workspaces, so they must be gated by separate Cargo invocations.
+# Actions, so local gates are the automated backstop).
 #
 # Install once per clone:   git config core.hooksPath .githooks
+#   `scripts/lint.ps1` reports when this is not done, so an unarmed clone is
+#   visible rather than silent (#1931 ask 2).
 # Bypass for a genuine emergency (e.g. a docs-only hotfix you cannot compile):
-#   git push --no-verify   (use sparingly — you are skipping the only gate).
+#   git push --no-verify
+#   NOTE this is a bigger claim than it used to be. Since #1929/#1930 the gate
+#   also covers RUSTSEC advisories, licence policy, wildcard dependencies and
+#   lock-graph agreement, so --no-verify now skips a supply-chain check and not
+#   only a lint pass.
 #
-# Scope: for changed root Rust/Cargo files, gate `Cargo.toml`; for changed
-# `calyx/` Rust/Cargo files, gate `calyx/Cargo.toml`. The full test suites are
-# intentionally NOT run here; they are minutes long and the agent runs them
-# manually per doctrine D1/D5. This hook is the fast compile+lint backstop, not a
-# substitute for manual FSV. The gate is deny-level: warning-only output is
-# accepted, captured to a local log, and summarized so push output clearly
-# distinguishes accepted warnings from blocking failures.
+# ---------------------------------------------------------------------------
+# WHY THIS DELEGATES INSTEAD OF IMPLEMENTING THE GATES (#1931)
+# ---------------------------------------------------------------------------
+#
+# This hook used to run `cargo fmt` and `cargo clippy` itself, per touched
+# workspace. That made it a SECOND definition of "the gates", and it fell behind
+# the first one twice without anyone noticing: #1928 added the clippy.toml and
+# toolchain-pin agreement gates, then #1929/#1930 added lock-graph agreement and
+# `cargo deny`, and this file knew about none of the four. A push could therefore
+# introduce a RUSTSEC advisory, a disallowed licence, a wildcard dependency, a
+# toolchain-pin split or a lock divergence and still be waved through by "the
+# automated backstop".
+#
+# The root cause was the duplication, not any of the individual omissions, so the
+# fix is to have exactly one definition. `scripts/lint.ps1` is it; this hook
+# decides *whether* to run it and reports the result. Extending the gate set now
+# reaches both entry points by construction.
+#
+# What stays here is the part that is genuinely hook-specific: deciding from the
+# pushed ref range whether this push touches anything the gates can speak about,
+# so a docs-only push is not charged a compile.
+#
+# COST NOTE: `scripts/lint.ps1` always covers BOTH workspaces, where this hook
+# used to gate only the touched one. That is deliberate — the root workspace
+# compiles calyx sources, so "only calyx changed" was never a reason to leave the
+# root ungated — and with a warm target directory the untouched side is a
+# no-op re-check rather than a rebuild.
 
 set -e
 
-# Skip Cargo gates when the push contains no Rust / Cargo changes for a given
-# workspace (docs, snapshots, tool-result logs). Compare each pushed local sha
-# against its remote counterpart from stdin.
-needs_root_gate=0
-needs_calyx_gate=0
+# ---------------------------------------------------------------------------
+# Scope — does this push touch anything the gates can speak about?
+# ---------------------------------------------------------------------------
+#
+# Wider than "*.rs" on purpose. deny.toml, clippy.toml, rust-toolchain.toml, the
+# lock files and the gate scripts themselves are all inputs to a gate, and a push
+# that changes one of them while touching no Rust at all is exactly the push that
+# most needs checking.
+needs_gate=0
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   # Deleted branch (local_sha all zeros) — nothing to check.
   case "$local_sha" in *[!0]*) : ;; *) continue ;; esac
@@ -40,114 +66,58 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     exit 1
   fi
 
-  if printf '%s\n' "$changed_paths" | grep -qE '^calyx/(.*\.rs|(.*/)?Cargo\.(toml|lock))$'; then
-    needs_calyx_gate=1
-  fi
-  if printf '%s\n' "$changed_paths" | grep -vE '^calyx/' | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
-    needs_root_gate=1
+  if printf '%s\n' "$changed_paths" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)(deny|clippy|rust-toolchain)\.toml$|^scripts/(lint|calyx-lock|install-cargo-deny)\.ps1$'; then
+    needs_gate=1
   fi
 done
 
-if [ "$needs_root_gate" -eq 0 ] && [ "$needs_calyx_gate" -eq 0 ]; then
-  echo "pre-push: no Rust/Cargo changes in this push — skipping clippy gate."
+if [ "$needs_gate" -eq 0 ]; then
+  echo "pre-push: no Rust/Cargo/gate-config changes in this push — skipping the lint gate."
   exit 0
 fi
 
-log_dir=$(git rev-parse --git-path synapse-pre-push-logs 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}")
-mkdir -p "$log_dir"
+# ---------------------------------------------------------------------------
+# Delegate — and fail closed if the gate cannot be run
+# ---------------------------------------------------------------------------
+#
+# An absent pwsh or an absent lint.ps1 must BLOCK. The whole subject of #1930 was
+# a gate that reported success while checking nothing; a hook that shrugged and
+# exited 0 because it could not find its own gate would be the same bug wearing
+# a different hat.
+repo_root=$(git rev-parse --show-toplevel)
+lint_script="$repo_root/scripts/lint.ps1"
 
-run_fmt_gate() {
-  workspace_name=$1
-  manifest_path=$2
-  fmt_log="$log_dir/fmt-${workspace_name}-$(date +%Y%m%dT%H%M%S)-$$.log"
-
-  if [ -n "$manifest_path" ]; then
-    echo "pre-push: running ${workspace_name} rustfmt gate (cargo fmt --manifest-path ${manifest_path} --all --check) ..."
-    if cargo fmt --manifest-path "$manifest_path" --all --check >"$fmt_log" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
-  else
-    echo "pre-push: running ${workspace_name} rustfmt gate (cargo fmt --all --check) ..."
-    if cargo fmt --all --check >"$fmt_log" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
-  fi
-
-  if [ "$status" -ne 0 ]; then
-    echo ""
-    echo "pre-push: BLOCKED — ${workspace_name} rustfmt gate failed (workspace is not fmt-clean under"
-    echo "          the pinned toolchain). Run the command printed above without '--check' and re-push."
-    echo "pre-push: diff follows (full log: $fmt_log):"
-    sed -n '1,120p' "$fmt_log" || true
-    exit "$status"
-  fi
-
-  rm -f "$fmt_log"
-  echo "pre-push: ${workspace_name} rustfmt gate green."
-}
-
-run_clippy_gate() {
-  workspace_name=$1
-  manifest_path=$2
-  log_path="$log_dir/clippy-${workspace_name}-$(date +%Y%m%dT%H%M%S)-$$.log"
-
-  if [ -n "$manifest_path" ]; then
-    echo "pre-push: running ${workspace_name} clippy gate (cargo clippy --manifest-path ${manifest_path} --workspace --all-targets) ..."
-    if cargo clippy --manifest-path "$manifest_path" --workspace --all-targets >"$log_path" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
-  else
-    echo "pre-push: running ${workspace_name} clippy gate (cargo clippy --workspace --all-targets) ..."
-    if cargo clippy --workspace --all-targets >"$log_path" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
-  fi
-
-  if [ "$status" -eq 0 ]; then
-    warning_count=$(grep -c '^warning:' "$log_path" 2>/dev/null || true)
-    warning_count=${warning_count:-0}
-    if [ "$warning_count" -gt 0 ]; then
-      echo "pre-push: ${workspace_name} clippy gate green with ${warning_count} accepted warning lines; deny-level failures=0."
-      echo "pre-push: full clippy log: $log_path"
-    else
-      rm -f "$log_path"
-      echo "pre-push: ${workspace_name} clippy gate green (0 warnings)."
-    fi
-    return
-  fi
-
-  echo ""
-  echo "pre-push: BLOCKED — ${workspace_name} clippy gate failed. Full clippy log: $log_path"
-  echo "pre-push: first 240 log lines follow:"
-  sed -n '1,240p' "$log_path" || true
-  total_lines=$(wc -l <"$log_path" 2>/dev/null | tr -d ' ' || true)
-  total_lines=${total_lines:-0}
-  if [ "$total_lines" -gt 240 ]; then
-    echo "pre-push: output truncated; inspect the full log above for all diagnostics."
-  fi
-  echo ""
-  echo "pre-push: BLOCKED — clippy gate failed. Fix the lint/build errors above, or"
-  echo "          re-run with 'git push --no-verify' only if this is a genuine"
-  echo "          non-compiling emergency. Local Cargo gates are the automated backstop (#351)."
-  exit "$status"
-}
-
-if [ "$needs_root_gate" -eq 1 ]; then
-  run_fmt_gate root ""
-  run_clippy_gate root ""
+if [ ! -f "$lint_script" ]; then
+  echo "pre-push: BLOCKED — $lint_script not found, so the gates cannot be run."
+  echo "          This hook delegates to it and will not approve a push it did not check."
+  exit 1
 fi
 
-if [ "$needs_calyx_gate" -eq 1 ]; then
-  run_fmt_gate calyx "calyx/Cargo.toml"
-  run_clippy_gate calyx "calyx/Cargo.toml"
+if command -v pwsh >/dev/null 2>&1; then
+  shell_bin=pwsh
+elif command -v powershell >/dev/null 2>&1; then
+  shell_bin=powershell
+else
+  echo "pre-push: BLOCKED — neither 'pwsh' nor 'powershell' is on PATH, so scripts/lint.ps1"
+  echo "          cannot be run. Install PowerShell 7 (pwsh) or push with --no-verify only if"
+  echo "          you have run the gates by hand and read the output."
+  exit 1
 fi
 
-exit 0
+echo "pre-push: running the full gate set via scripts/lint.ps1 ($shell_bin) ..."
+echo "pre-push:   1 clippy.toml contract   2 toolchain pin   3 lock-graph agreement"
+echo "pre-push:   4 cargo fmt              5 cargo deny      6 cargo clippy"
+
+if "$shell_bin" -NoProfile -File "$lint_script"; then
+  echo "pre-push: gate green — every gate passed in both workspaces."
+  exit 0
+fi
+
+status=$?
+echo ""
+echo "pre-push: BLOCKED — scripts/lint.ps1 exited $status. The failing gate, its error code"
+echo "          and its remediation are printed above; lint.ps1 names all three and does not"
+echo "          have a partial-success exit path."
+echo "pre-push: re-run 'pwsh -File scripts/lint.ps1' to iterate, or 'git push --no-verify'"
+echo "          only for a genuine emergency. Local gates are the automated backstop (#351)."
+exit "$status"
