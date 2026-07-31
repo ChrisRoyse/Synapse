@@ -704,6 +704,7 @@ dependencies = [
  "blake3",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-ledger",
  "calyx-ward",
  "serde",

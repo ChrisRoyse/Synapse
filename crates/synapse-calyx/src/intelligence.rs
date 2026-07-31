@@ -1586,30 +1586,54 @@ impl SynapseCalyxVault {
             } else {
                 TrustTag::Provisional
             };
-        store.put(
-            cache_key.clone(),
-            AssaySubject::Panel,
-            MiEstimate::point(
-                panel_bits,
-                joint_records,
-                EstimatorKind::PanelSufficiency,
-                trust,
-            ),
-            "synapse-assay-sufficiency",
-            seq,
-        );
-        store.put(
-            cache_key,
-            AssaySubject::OutcomeEntropy,
-            MiEstimate::point(
-                anchor_entropy_bits,
-                joint_records,
-                EstimatorKind::OutcomeEntropy,
-                trust,
-            ),
-            "synapse-assay-sufficiency",
-            seq,
-        );
+        // A placeholder must not enter the source of truth (#1915). When the
+        // joint estimator never ran, `panel_bits` is `0.0` as a stand-in, and
+        // persisting that as an `AssaySubject::Panel` row makes the Assay CF —
+        // the thing every downstream reader treats as authoritative — assert a
+        // measured zero. Worse, `trust` above is derived from the sample count
+        // alone, so a corpus over the floor whose joint the estimator *refused*
+        // wrote the placeholder tagged `Trusted`: the exact "0.0 that was never
+        // measured, indistinguishable from a measured 0.0" this issue is about,
+        // reached at the persistence layer instead of the report layer.
+        //
+        // `assay_bits` already handles this correctly by never storing a row
+        // for an unmeasured slot. The panel row now follows the same rule: no
+        // measurement, no row. Absence of the row is the honest encoding of
+        // absence of the measurement, and `panel_measured` in the report says
+        // so explicitly to anyone reading the report rather than the CF.
+        if panel_measured {
+            store.put(
+                cache_key.clone(),
+                AssaySubject::Panel,
+                MiEstimate::point(
+                    panel_bits,
+                    joint_records,
+                    EstimatorKind::PanelSufficiency,
+                    trust,
+                ),
+                "synapse-assay-sufficiency",
+                seq,
+            );
+        }
+        // The outcome entropy is genuinely computed from the anchor labels and
+        // is persisted on its own terms — but `entropy_bits` over an empty
+        // label set is also `0.0`, and that zero is no more a measurement than
+        // the panel one. Zero joint records means zero labels means nothing to
+        // take the entropy of.
+        if joint_records > 0 {
+            store.put(
+                cache_key,
+                AssaySubject::OutcomeEntropy,
+                MiEstimate::point(
+                    anchor_entropy_bits,
+                    joint_records,
+                    EstimatorKind::OutcomeEntropy,
+                    trust,
+                ),
+                "synapse-assay-sufficiency",
+                seq,
+            );
+        }
         let assay_cf_rows_after = self.persist_assay_store(&store)?;
         // #1670 control-doctrine marker; independent of the `trust` tag above.
         let verdict = self.domain_grounding_verdict(params.panel_version, max_records)?;

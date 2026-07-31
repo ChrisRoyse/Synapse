@@ -997,6 +997,27 @@ pub struct StorageIntelligenceSlotBits {
     pub n_samples: u64,
     pub sole_carrier: bool,
     pub provisional: bool,
+    /// Whether `marginal_bits` was estimated, and if not, why (#1915).
+    ///
+    /// One of `measured`, `insufficient_samples`, `degenerate_column`,
+    /// `estimator_refused`. **`marginal_bits` is `0.0` for every state except
+    /// `measured`, and that zero is a placeholder, not a measurement of zero
+    /// information.** Anything derived from the number must check this first.
+    ///
+    /// `provisional` does not answer this question: it is set for a below-floor
+    /// skip *and* for an under-anchored domain, so it cannot distinguish "never
+    /// measured" from "measured on thin evidence". Reading the two as the same
+    /// thing is how six unmeasured zeros became six concrete per-lens deficits
+    /// and a `ProposeLens` recommendation on the live vault.
+    ///
+    /// This is the field the fix in `b25f2372`/`78076663` added to the
+    /// `synapse-calyx` report. It was not forwarded here, so the daemon surface
+    /// — the one the defect was originally observed on — still could not tell
+    /// the two zeros apart.
+    pub state: &'static str,
+    /// What this slot needs before it can be measured, when it was not.
+    /// `None` when `state` is `measured`.
+    pub unmeasured_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1043,6 +1064,30 @@ pub struct StorageIntelligenceSufficiencyReport {
     pub anchored_records: u64,
     pub joint_records: u64,
     pub panel_bits: f32,
+    /// Whether `panel_bits` is an estimate rather than a placeholder (#1915).
+    ///
+    /// `false` means the joint estimator never ran — too few paired samples, or
+    /// a joint column it refused — and `panel_bits` is `0.0` as a stand-in.
+    /// `sufficient`, `deficit_bits` and `deficits` are then suppressed rather
+    /// than derived from it. They were not, once: subtracting this placeholder
+    /// from a genuinely computed `anchor_entropy_bits` produced a real-looking
+    /// deficit and a per-lens `ProposeLens` recommendation on a panel where
+    /// nothing had been measured at all.
+    pub panel_measured: bool,
+    /// Whether `panel_bits` was raised to the best single-lens estimate because
+    /// the joint estimator returned less than a lens the panel contains (#1916).
+    ///
+    /// `I(panel;A) >= I(slot_i;A)` is a law — conditioning cannot destroy
+    /// information — so a joint estimate below a marginal one from the same
+    /// corpus is a KSG dimensionality artefact, not a finding. The floor is
+    /// applied because the marginal IS a valid lower bound on the joint, and
+    /// it is *reported* because a panel that needs it is telling you its
+    /// declared dimensionality is outrunning its estimator.
+    pub panel_floor_applied: bool,
+    /// Slots excluded from the joint and from the deficit attribution because
+    /// the marginal estimator could not measure them. Cross-reference the
+    /// `state` field on the `bits` report for the per-slot reason.
+    pub unmeasured_slots: u64,
     pub anchor_entropy_bits: f32,
     pub sufficient: bool,
     pub deficit_bits: f32,
@@ -2112,6 +2157,8 @@ pub fn run_intelligence_bits(
                 n_samples: slot.n_samples as u64,
                 sole_carrier: slot.sole_carrier,
                 provisional: slot.provisional,
+                state: slot.state.as_str(),
+                unmeasured_reason: slot.unmeasured_reason,
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
@@ -2133,6 +2180,9 @@ pub fn run_intelligence_sufficiency(
         anchored_records: report.anchored_records as u64,
         joint_records: report.joint_records as u64,
         panel_bits: report.panel_bits,
+        panel_measured: report.panel_measured,
+        panel_floor_applied: report.panel_floor_applied,
+        unmeasured_slots: report.unmeasured_slots as u64,
         anchor_entropy_bits: report.anchor_entropy_bits,
         sufficient: report.sufficient,
         deficit_bits: report.deficit_bits,

@@ -86,6 +86,30 @@ pub fn backend_name() -> &'static str {
     kernels().name
 }
 
+/// The dispatched three-way reduction `(dot, |left|^2, |right|^2)` in one pass.
+///
+/// Exported so a crate that needs a cosine does not hand-roll a fifth scalar
+/// loop (#1917). Four independent cosine implementations existed in this
+/// workspace, each answering "does this CPU have AVX2" its own way; three had
+/// to be fixed separately (#1908, #1912) before the fourth — `calyx-loom`'s
+/// `agreement_scalar`, on the widest cosine path in the system — was found
+/// still undispatched. The dispatch decision belongs here, once.
+///
+/// Callers own the shape contract: elements past `min(left.len(),
+/// right.len())` do not contribute. Check the dimensions before calling if
+/// unequal lengths are an error in your domain — that check is not fusible
+/// into the reduction and is cheap.
+///
+/// The finiteness scan **is** fusible and should not be a separate pass: a
+/// non-finite element poisons the accumulator it feeds and stays poisoned, so
+/// a non-finite `left_norm_sq` names the left row and a non-finite
+/// `right_norm_sq` names the right row. See [`super::guard::non_finite_row_error`]
+/// for why that detector is strictly stronger than a pre-scan.
+#[must_use]
+pub fn dot_and_pair_norms(left: &[f32], right: &[f32]) -> (f32, f32, f32) {
+    (kernels().dot_and_pair_norms)(left, right)
+}
+
 type Reduce1 = fn(&[f32]) -> f32;
 type Reduce2 = fn(&[f32], &[f32]) -> f32;
 type ReduceDotNorm = fn(&[f32], &[f32]) -> (f32, f32);

@@ -9,13 +9,16 @@ publish.workspace = true
 
 [features]
 default = []
-cuda = ["dep:calyx-forge", "calyx-forge/cuda"]
+cuda = ["calyx-forge/cuda"]
 
 [dependencies]
 blake3.workspace = true
 calyx-aster = { path = "../calyx-aster" }
 calyx-core = { path = "../calyx-core" }
-calyx-forge = { path = "../calyx-forge", optional = true }
+# Not optional: `agreement_scalar` routes its reduction at the shared
+# runtime-dispatched CPU kernel rather than hand-rolling a fifth scalar cosine
+# loop (#1917). The CUDA backend stays feature-gated behind `cuda`.
+calyx-forge = { path = "../calyx-forge" }
 calyx-ledger = { path = "../calyx-ledger" }
 calyx-ward = { path = "../calyx-ward" }
 serde.workspace = true
