@@ -61,6 +61,25 @@ pub enum WardError {
     InvalidCalibrationInput {
         reason: &'static str,
     },
+    /// No tau inside the legal cosine range `[-1, 1]` achieves the requested
+    /// false-accept rate, so the corpus is not separable at this target on this
+    /// slot (#1925).
+    ///
+    /// This used to be silently reported as success. `conformal_tau` fell
+    /// through to `next_above(max_bad_score)`, and when the worst bad score was
+    /// `1.0` — which is guaranteed the moment any bad record shares a slot
+    /// vector with a good one, and duplicate vectors are the norm on one-hot,
+    /// cyclic and any categorical-derived lens — the tau became
+    /// `1.0000001192092896`. No cosine can reach that, so the profile rejected
+    /// **everything** while reporting `achieved_far = 0` and a passing
+    /// Clopper-Pearson tail: the degenerate outcome wearing the best possible
+    /// numbers.
+    TauUnreachable {
+        slot: SlotId,
+        tau: f32,
+        max_bad_score: f32,
+        target_far: f32,
+    },
     InvalidRequiredSlotDerivation {
         reason: &'static str,
     },
@@ -131,6 +150,7 @@ impl WardError {
             }
             Self::InsufficientCalibrationData { .. }
             | Self::InvalidCalibrationInput { .. }
+            | Self::TauUnreachable { .. }
             | Self::InvalidRequiredSlotDerivation { .. } => CALYX_GUARD_PROVISIONAL,
             Self::InertProfile { .. } => CALYX_GUARD_INERT_PROFILE,
             Self::MissingSlot { .. } => CALYX_GUARD_MISSING_SLOT,
@@ -188,6 +208,20 @@ impl fmt::Display for WardError {
             Self::InsufficientCalibrationData { n, min } => write!(
                 f,
                 "{CALYX_GUARD_PROVISIONAL}: insufficient calibration data n={n} min={min}"
+            ),
+            Self::TauUnreachable {
+                slot,
+                tau,
+                max_bad_score,
+                target_far,
+            } => write!(
+                f,
+                "{CALYX_GUARD_PROVISIONAL}: slot {slot} is not separable at target_far={target_far}: \
+                 the only tau achieving it is {tau}, which is outside the cosine range [-1,1] \
+                 (the worst adjudicated bad case scores {max_bad_score}, so no threshold can admit \
+                 a good record without admitting it). This slot carries no signal separating good \
+                 from bad on this corpus; a profile persisted here would reject every input while \
+                 reporting a perfect false-accept rate"
             ),
             Self::InvalidCalibrationInput { reason } => write!(
                 f,

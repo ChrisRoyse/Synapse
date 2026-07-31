@@ -1998,6 +1998,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "inspect the native Registry CF and repair any malformed or missing panel contract",
             ),
             op(
+                "corpus_histogram",
+                false,
+                false,
+                "authoritative source CF rows decoded through their typed record",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "name a source CF that declares dimensions and only dimensions it declares; a row that will not decode is counted and its key reported, never skipped",
+            ),
+            op(
                 "temporal_rerank",
                 false,
                 false,
@@ -6079,6 +6088,7 @@ mod facade_schema_parity_tests {
             "gc_once",
             "anchors",
             "temporal_panels",
+            "corpus_histogram",
             "temporal_rerank",
             "temporal_backfill",
             "search_rebuild",

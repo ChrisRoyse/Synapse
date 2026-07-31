@@ -118,7 +118,7 @@ pub fn calibrate_slot(
 
     let mut bad_scores = sorted_scores(&input.bad_scores)?;
     let good_scores = sorted_scores(&input.good_scores)?;
-    let tau = conformal_tau(&bad_scores, input.target_far, alpha)?;
+    let tau = conformal_tau(input.slot, &bad_scores, input.target_far, alpha)?;
     let far = fraction(
         input
             .bad_scores
@@ -218,7 +218,39 @@ fn sorted_scores(scores: &[f32]) -> Result<Vec<f32>, WardError> {
     Ok(scores)
 }
 
-fn conformal_tau(sorted_bad_scores: &[f32], target_far: f32, alpha: f32) -> Result<f32, WardError> {
+/// Largest tau a cosine can ever reach.
+///
+/// A guard scores with `dense_cosine`, which returns a value in `[-1, 1]`
+/// (enforced since #1923). A tau above `1.0` is therefore not a strict
+/// threshold — it is an unsatisfiable one, and a profile carrying it rejects
+/// every input that will ever be presented to it. See
+/// [`WardError::TauUnreachable`] (#1925).
+const MAX_REACHABLE_TAU: f32 = 1.0;
+
+/// Rejects a tau no cosine can reach, instead of returning it as a threshold.
+fn reachable_tau(
+    slot: SlotId,
+    tau: f32,
+    sorted_bad_scores: &[f32],
+    target_far: f32,
+) -> Result<f32, WardError> {
+    if tau > MAX_REACHABLE_TAU {
+        return Err(WardError::TauUnreachable {
+            slot,
+            tau,
+            max_bad_score: *sorted_bad_scores.last().expect("non-empty"),
+            target_far,
+        });
+    }
+    Ok(tau)
+}
+
+fn conformal_tau(
+    slot: SlotId,
+    sorted_bad_scores: &[f32],
+    target_far: f32,
+    alpha: f32,
+) -> Result<f32, WardError> {
     if sorted_bad_scores.is_empty() {
         return Err(WardError::InsufficientCalibrationData {
             n: 0,
@@ -226,7 +258,12 @@ fn conformal_tau(sorted_bad_scores: &[f32], target_far: f32, alpha: f32) -> Resu
         });
     }
     if target_far == 0.0 {
-        return Ok(next_above(*sorted_bad_scores.last().expect("non-empty")));
+        return reachable_tau(
+            slot,
+            next_above(*sorted_bad_scores.last().expect("non-empty")),
+            sorted_bad_scores,
+            target_far,
+        );
     }
     let mut candidates = Vec::with_capacity(sorted_bad_scores.len() * 2);
     for score in sorted_bad_scores {
@@ -246,10 +283,20 @@ fn conformal_tau(sorted_bad_scores: &[f32], target_far: f32, alpha: f32) -> Resu
         if candidate_far <= target_far + f32::EPSILON
             && confidence_bound_satisfied(bad_accepts, sorted_bad_scores.len(), target_far, alpha)
         {
-            return Ok(candidate);
+            return reachable_tau(slot, candidate, sorted_bad_scores, target_far);
         }
     }
-    Ok(next_above(*sorted_bad_scores.last().expect("non-empty")))
+    // No candidate inside the corpus satisfied both the FAR target and the
+    // confidence bound. The fallback is the smallest threshold that admits no
+    // bad case at all — which is only a *threshold* if it is reachable. When
+    // the worst bad case scores 1.0 it is not, and returning it would report
+    // the degenerate "rejects everything" profile as a perfect FAR (#1925).
+    reachable_tau(
+        slot,
+        next_above(*sorted_bad_scores.last().expect("non-empty")),
+        sorted_bad_scores,
+        target_far,
+    )
 }
 
 fn confidence_bound_satisfied(
