@@ -5345,6 +5345,7 @@ dependencies = [
  "calyx-core",
  "calyx-forge",
  "calyx-lenses",
+ "calyx-loom",
  "calyx-registry",
  "calyx-search",
  "calyx-sextant",

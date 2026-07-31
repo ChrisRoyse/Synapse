@@ -38,6 +38,10 @@ calyx-search = { path = "../../calyx/crates/calyx-search" }
 # kernels so the host's instruction baseline is chosen from a measurement.
 calyx-forge = { path = "../../calyx/crates/calyx-forge" }
 calyx-sextant = { path = "../../calyx/crates/calyx-sextant" }
+# Used only by loom_agreement_kernel_fsv, which measures the weave cosine
+# against the scalar loop it replaced so the persisted-value delta is a
+# measurement rather than an assertion (issue #1917).
+calyx-loom = { path = "../../calyx/crates/calyx-loom" }
 
 [lints]
 workspace = true
