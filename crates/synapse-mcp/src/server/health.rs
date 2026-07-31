@@ -523,6 +523,10 @@ impl SynapseService {
             self.calyx_search_generation_health(),
         );
         subsystems.insert(
+            "calyx_panel_coverage".to_owned(),
+            Self::calyx_panel_coverage_health(),
+        );
+        subsystems.insert(
             "calyx_derived_state".to_owned(),
             Self::calyx_derived_state_health(),
         );
@@ -823,6 +827,140 @@ impl SynapseService {
                 .last_search_state_after
                 .as_ref()
                 .and_then(|status| status.delta_changed_keys),
+            ..SubsystemHealth::default()
+        }
+    }
+
+    /// Raises panel coverage and grounding as named deficiencies (#1927 ask 4,
+    /// #1920 asks 1/4).
+    ///
+    /// The measured failure this exists to stop: `syn-agent-transcript-v1`
+    /// bumped to a new panel version and the active generation was left holding
+    /// **389 of 22,999** source rows, while `health` reported `ok` for as long as
+    /// it stayed that way. Every surface scoped to the active panel — `bits`,
+    /// `sufficiency`, `kernel`, and grounded anchor writes — was operating on
+    /// 1.7% of the corpus, and the only way to notice was to run
+    /// `hygiene grounding_gap` against a guessed version number and compare it by
+    /// hand to `storage corpus_histogram`. That is the same shape as #1907, where
+    /// a readback said fine while recall was zero, and it has the same fix:
+    /// measure the thing, do not assume it.
+    ///
+    /// `error` rather than `degraded` when a panel is below the coverage floor,
+    /// deliberately. A panel measuring a fraction of its corpus is not a slow
+    /// subsystem — it is a subsystem returning confident answers about a corpus
+    /// it cannot see.
+    ///
+    /// Reads the published census; never measures one on the request path.
+    fn calyx_panel_coverage_health() -> SubsystemHealth {
+        let readback = synapse_storage::derived_state::derived_state_readback();
+        let Some(report) = readback.last_panel_coverage else {
+            return SubsystemHealth {
+                status: "starting".to_owned(),
+                detail: Some(
+                    "the derived-state maintainer has not completed a panel-coverage census yet; \
+                     coverage is measured on its periodic tick, not on this request"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        };
+
+        let min_fraction = report
+            .panels
+            .iter()
+            .filter_map(|panel| panel.coverage_fraction)
+            .fold(f32::INFINITY, f32::min);
+        let min_fraction = if min_fraction.is_finite() {
+            Some(min_fraction)
+        } else {
+            None
+        };
+
+        // Three independent reasons to fail, kept separate so the detail names
+        // which one fired rather than leaving the reader to infer it.
+        let mut reasons: Vec<String> = Vec::new();
+        if report.decode_failures > 0 {
+            reasons.push(format!(
+                "{} Base rows would not decode ({}), so every count below is over a subset",
+                report.decode_failures,
+                report
+                    .first_decode_failure
+                    .as_deref()
+                    .unwrap_or("<no detail>")
+            ));
+        }
+        if !report.coverage_deficient_panels.is_empty() {
+            reasons.push(format!(
+                "panels below the {:.2} coverage floor: {:?}{}",
+                report.coverage_floor,
+                report.coverage_deficient_panels,
+                if report.unbackfillable_deficient_panels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (NO re-measure path exists for {:?}; the maintainer cannot repair these)",
+                        report.unbackfillable_deficient_panels
+                    )
+                }
+            ));
+        }
+        if !report.unknown_panel_versions.is_empty() {
+            reasons.push(format!(
+                "Base holds panel generations no catalog entry claims: {:?}",
+                report.unknown_panel_versions
+            ));
+        }
+
+        let status = if reasons.is_empty() { "ok" } else { "error" };
+
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail: Some(format!(
+                "{}base_cf_rows={} records_total={} superseded_records={} \
+                 grounding_deficient_panels={:?} records_exceed_source_panels={:?} \
+                 backfill={} panel={} pages={} inserted={} \
+                 anchored={} elapsed_ms={} panels=[{}]",
+                if reasons.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}; ", reasons.join("; "))
+                },
+                report.base_cf_rows,
+                report.records_total,
+                report.superseded_records_total,
+                report.grounding_deficient_panels,
+                report.records_exceed_source_panels,
+                readback.last_backfill_action.as_deref().unwrap_or("<none>"),
+                readback.last_backfill_panel.as_deref().unwrap_or("<none>"),
+                readback.last_backfill_pages.unwrap_or(0),
+                readback.last_backfill_inserted_rows.unwrap_or(0),
+                readback.last_backfill_outcome_anchored_rows.unwrap_or(0),
+                readback.last_backfill_elapsed_ms.unwrap_or(0),
+                report.summary_line(),
+            )),
+            calyx_panel_coverage_panels: Some(report.panels.len() as u64),
+            calyx_panel_coverage_deficient_panels: Some(
+                report.coverage_deficient_panels.len() as u64
+            ),
+            calyx_panel_coverage_unbackfillable_panels: Some(
+                report.unbackfillable_deficient_panels.len() as u64,
+            ),
+            calyx_panel_grounding_deficient_panels: Some(
+                report.grounding_deficient_panels.len() as u64
+            ),
+            calyx_panel_coverage_min_fraction: min_fraction,
+            calyx_panel_coverage_floor: Some(report.coverage_floor),
+            calyx_panel_superseded_records: Some(report.superseded_records_total as u64),
+            calyx_panel_base_cf_rows: Some(report.base_cf_rows as u64),
+            calyx_panel_census_decode_failures: Some(report.decode_failures as u64),
+            calyx_panel_coverage_measured_at_unix_ms: report.measured_at_unix_ms,
+            calyx_panel_backfill_action: readback.last_backfill_action,
+            calyx_panel_backfill_panel: readback.last_backfill_panel,
+            calyx_panel_backfill_pages: readback.last_backfill_pages,
+            calyx_panel_backfill_inserted_rows: readback.last_backfill_inserted_rows,
+            calyx_panel_backfill_outcome_anchored_rows: readback
+                .last_backfill_outcome_anchored_rows,
+            calyx_panel_backfill_elapsed_ms: readback.last_backfill_elapsed_ms,
             ..SubsystemHealth::default()
         }
     }

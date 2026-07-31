@@ -361,6 +361,59 @@ pub struct SubsystemHealth {
     pub calyx_lens_coverage_records_measured: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_lens_coverage_measured_at_unix_ms: Option<u64>,
+
+    // --- panel coverage and grounding census (issues #1927, #1920) ---
+    // A panel version bump left the active generation measuring 1.7% of its
+    // source CF and `health` reported `ok` throughout, because nothing compared
+    // the two counts. These fields are that comparison, published by the
+    // derived-state maintainer and read here without touching a corpus.
+    /// Declared panels in the census.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_coverage_panels: Option<u64>,
+    /// Full-CF panels whose active generation is below the coverage floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_coverage_deficient_panels: Option<u64>,
+    /// Deficient panels with NO re-measure path. The maintainer cannot repair
+    /// these, so they are counted apart from the ones it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_coverage_unbackfillable_panels: Option<u64>,
+    /// Outcome-bearing panels below the grounding floor. Observation-shaped
+    /// panels are excluded by declaration, not by threshold (#1920 ask 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_grounding_deficient_panels: Option<u64>,
+    /// Lowest active-generation coverage fraction across every full-CF panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_coverage_min_fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_coverage_floor: Option<f32>,
+    /// `Base` rows on a superseded or unclaimed generation: read by no
+    /// active-panel surface, still occupying the CF (#1927 ask 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_superseded_records: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_base_cf_rows: Option<u64>,
+    /// `Base` rows that would not decode during the census. Non-zero means the
+    /// counts above are over a subset, and the report says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_census_decode_failures: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_coverage_measured_at_unix_ms: Option<u64>,
+    /// What the maintainer's backfill driver did last tick: `none_owed` |
+    /// `owed_but_unbackfillable` | `sweep_complete` | `budget_exhausted` |
+    /// `page_failed` | `cursor_absent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_panel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_pages: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_inserted_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_outcome_anchored_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_elapsed_ms: Option<u64>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vram_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

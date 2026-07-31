@@ -60,6 +60,26 @@ pub const DERIVED_STATE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// affordable on a five-minute tick.
 pub const LENS_COVERAGE_SAMPLE_RECORDS: usize = 256;
 
+/// Source rows re-measured per backfill page (#1927 ask 2).
+///
+/// The `temporal_backfill` route caps a page at 1,000 rows, so this is that cap
+/// rather than an independent choice; pages smaller than the cap only add
+/// per-call overhead to the same total work.
+pub const PANEL_BACKFILL_PAGE_ROWS: usize = 1_000;
+
+/// Wall-clock the maintainer will spend driving backfill pages in one tick.
+///
+/// Chosen from the measured rate, not picked: driving this by hand on #1927 took
+/// **over 10 minutes for 20 pages** and still did not finish 23k rows, i.e.
+/// roughly 30 s per 1,000-row page. A 60 s budget is therefore about two pages a
+/// tick — enough that a 23k-row corpus converges in roughly an hour of unattended
+/// running, and small enough that the pass never occupies a meaningful share of
+/// the five-minute interval it shares with the search-generation rebuild and the
+/// lens-coverage sample. It runs on the dedicated blocking maintenance pool under
+/// an admission permit, so it can never park a runtime worker serving MCP
+/// requests.
+pub const PANEL_BACKFILL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 static DERIVED_STATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_FAILURE: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +113,23 @@ pub struct DerivedStateReadback {
     /// Lens coverage measured by the last pass.
     pub last_lens_coverage: Option<SynapseCalyxLensCoverageStatus>,
     pub last_lens_coverage_unix_ms: Option<u64>,
+    /// Per-panel coverage and grounding census from the last pass (#1927 ask 1,
+    /// #1920 ask 1). `health` reads this rather than measuring a corpus.
+    pub last_panel_coverage: Option<crate::panel_coverage::PanelCoverageReport>,
+    pub last_panel_coverage_unix_ms: Option<u64>,
+    /// What the last pass did about the panel most owed a backfill (#1927 ask 2).
+    pub last_backfill_action: Option<String>,
+    pub last_backfill_panel: Option<String>,
+    pub last_backfill_source_cf: Option<String>,
+    pub last_backfill_pages: Option<u64>,
+    pub last_backfill_examined_rows: Option<u64>,
+    pub last_backfill_inserted_rows: Option<u64>,
+    pub last_backfill_already_current_rows: Option<u64>,
+    pub last_backfill_outcome_anchored_rows: Option<u64>,
+    pub last_backfill_elapsed_ms: Option<u64>,
+    /// True when the sweep reached the end of its source CF this tick, so the
+    /// cursor reset to the start of the CF for the next generation bump.
+    pub last_backfill_sweep_complete: Option<bool>,
     /// The last failure, retained across later successes so a lifetime failure
     /// counter can never outlive its own evidence (the #1889 lesson).
     pub last_failure_code: Option<String>,
@@ -270,6 +307,53 @@ pub(crate) fn run_derived_state_maintenance() {
         }
     }
 
+    // --- Panel coverage census + driven backfill (#1927 asks 1/2, #1920 ask 1) ---
+    //
+    // Deliberately last and deliberately independent of the two halves above:
+    // this is the expensive half (a whole-Base scan plus up to a minute of
+    // re-measure work), and a failure in it must not cost the search generation
+    // or the lens-coverage sample that already succeeded.
+    match db.measure_panel_coverage() {
+        Ok(report) => {
+            if !report.coverage_deficient_panels.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_PANEL_COVERAGE_DEFICIENT",
+                    coverage_deficient_panels = ?report.coverage_deficient_panels,
+                    unbackfillable_deficient_panels = ?report.unbackfillable_deficient_panels,
+                    coverage_floor = report.coverage_floor,
+                    superseded_records_total = report.superseded_records_total,
+                    detail = %report.summary_line(),
+                    "one or more panels measure less than the declared fraction of their source \
+                     CF; every surface scoped to the active panel sees only that fraction of the \
+                     corpus, and a grounded anchor cannot even be written for a source row whose \
+                     constellation is absent at the active version"
+                );
+            }
+            if !report.unknown_panel_versions.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_PANEL_VERSION_UNCLAIMED",
+                    unknown_panel_versions = ?report.unknown_panel_versions,
+                    "the Base CF holds panel generations that no catalog entry claims; their \
+                     records are read by no active-panel surface and are counted as stranded"
+                );
+            }
+            drive_panel_backfill(&db, &report);
+            let mut guard = match DERIVED_STATE_LAST.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.last_panel_coverage_unix_ms = now_unix_ms();
+            guard.last_panel_coverage = Some(report);
+        }
+        Err(error) => {
+            any_failed = true;
+            record_failure(
+                "STORAGE_DERIVED_STATE_PANEL_COVERAGE_FAILED",
+                format!("measure Calyx panel coverage: {error}"),
+            );
+        }
+    }
+
     let mut guard = match DERIVED_STATE_LAST.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -281,4 +365,205 @@ pub(crate) fn run_derived_state_maintenance() {
         guard.last_skip_code = None;
         guard.last_skip_detail = None;
     }
+}
+
+/// Where the last backfill page stopped, so the next tick resumes instead of
+/// re-walking the corpus from the start.
+///
+/// Process-local on purpose. A restart resets it to the start of the CF, which
+/// re-examines already-current rows — the cheap path in `backfill_temporal_metadata`,
+/// which recognises them and does not rewrite — rather than skipping rows it has
+/// not proven were measured. Persisting a cursor would trade that self-healing
+/// property for a saved scan, and a cursor that outlives the panel generation it
+/// was taken under is exactly how rows get silently skipped.
+static BACKFILL_CURSOR: LazyLock<Mutex<Option<BackfillCursor>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone, Debug)]
+struct BackfillCursor {
+    panel_version: u32,
+    source_cf: String,
+    after_physical: Vec<u8>,
+}
+
+/// Drives `temporal_backfill` pages for the panel most owed one, under
+/// [`PANEL_BACKFILL_TICK_BUDGET`] (#1927 ask 2).
+///
+/// The backfill mechanism already existed and was already correct; nothing drove
+/// it, so a panel could sit at 1.7% coverage indefinitely with `health`
+/// reporting `ok`. This is the driver, and it is shaped exactly like the search
+/// generation half above: measure the state, decide, act within a bounded
+/// budget, publish what happened.
+///
+/// Every exit records a named action. "Nothing was owed" and "the budget ran out
+/// mid-corpus" and "the page failed" are three different outcomes and none of
+/// them is allowed to look like the others.
+fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCoverageReport) {
+    let started = std::time::Instant::now();
+    let Some(target) = report.most_owed_backfill() else {
+        let action = if report.coverage_deficient_panels.is_empty() {
+            "none_owed"
+        } else {
+            // Deficient, but no panel that is deficient has a re-measure path.
+            // Reporting this as "none owed" would be the silent-success failure
+            // this whole issue is about.
+            "owed_but_unbackfillable"
+        };
+        let mut guard = match DERIVED_STATE_LAST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.last_backfill_action = Some(action.to_owned());
+        guard.last_backfill_panel = None;
+        guard.last_backfill_source_cf = None;
+        guard.last_backfill_pages = Some(0);
+        guard.last_backfill_elapsed_ms = Some(0);
+        return;
+    };
+    let Some(source_cf) = target.backfill_source_cf.clone() else {
+        // `most_owed_backfill` already filtered on this being present; reaching
+        // here means the two predicates disagree, which is a code defect worth
+        // shouting about rather than a state worth handling.
+        record_failure(
+            "STORAGE_DERIVED_STATE_BACKFILL_TARGET_HAS_NO_SOURCE",
+            format!(
+                "panel {} was selected as most-owed backfill but declares no backfill_source_cf; \
+                 PanelCoverageRow::backfill_owed and PanelCoverageReport::most_owed_backfill \
+                 disagree",
+                target.panel_name
+            ),
+        );
+        return;
+    };
+
+    // A cursor taken under a different panel generation or a different CF says
+    // nothing about where this sweep should resume, so it is discarded rather
+    // than reused.
+    let mut after_physical = {
+        let guard = match BACKFILL_CURSOR.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .as_ref()
+            .filter(|cursor| {
+                cursor.panel_version == target.panel_version && cursor.source_cf == source_cf
+            })
+            .map(|cursor| cursor.after_physical.clone())
+    };
+
+    let mut pages = 0_u64;
+    let mut examined = 0_u64;
+    let mut inserted = 0_u64;
+    let mut already_current = 0_u64;
+    let mut outcome_anchored = 0_u64;
+    let mut sweep_complete = false;
+    let mut action = "budget_exhausted";
+
+    while started.elapsed() < PANEL_BACKFILL_TICK_BUDGET {
+        let page = match db.backfill_temporal_metadata(
+            &source_cf,
+            None,
+            after_physical.as_deref(),
+            PANEL_BACKFILL_PAGE_ROWS,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                // The cursor is left exactly where it was. A failing page must
+                // be retried from the same offset next tick, never skipped:
+                // advancing past a page that did not complete would leave rows
+                // unmeasured with nothing recording that they were passed over.
+                record_failure(
+                    "STORAGE_DERIVED_STATE_BACKFILL_PAGE_FAILED",
+                    format!(
+                        "backfill page for panel {} from {source_cf}: {error}",
+                        target.panel_name
+                    ),
+                );
+                action = "page_failed";
+                break;
+            }
+        };
+        pages += 1;
+        examined += page.examined_rows;
+        inserted += page.inserted_rows;
+        already_current += page.already_current_rows;
+        outcome_anchored += page.outcome_anchored_rows;
+
+        if page.more {
+            match page.resume_after_physical {
+                Some(cursor) => after_physical = Some(cursor),
+                None => {
+                    // `more` without a resume cursor would make the next page
+                    // restart from the beginning and loop forever.
+                    record_failure(
+                        "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_ABSENT",
+                        format!(
+                            "backfill page for {source_cf} reported more=true with no \
+                             resume_after_physical; the sweep cannot advance"
+                        ),
+                    );
+                    action = "cursor_absent";
+                    break;
+                }
+            }
+        } else {
+            sweep_complete = true;
+            action = "sweep_complete";
+            break;
+        }
+    }
+
+    {
+        let mut guard = match BACKFILL_CURSOR.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = if sweep_complete {
+            // The next sweep starts from the head of the CF. That is the correct
+            // posture after a generation bump: the rows re-measured first are
+            // the oldest, which are the ones no live write will ever reach.
+            None
+        } else {
+            after_physical.map(|cursor| BackfillCursor {
+                panel_version: target.panel_version,
+                source_cf: source_cf.clone(),
+                after_physical: cursor,
+            })
+        };
+    }
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_BACKFILL_PASS",
+        action,
+        panel = %target.panel_name,
+        panel_version = target.panel_version,
+        source_cf = %source_cf,
+        coverage_fraction = ?target.coverage_fraction,
+        uncovered_rows = ?target.uncovered_rows(),
+        pages,
+        examined,
+        inserted,
+        already_current,
+        outcome_anchored,
+        sweep_complete,
+        elapsed_ms,
+        "drove the unattended panel backfill toward the active generation"
+    );
+
+    let mut guard = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.last_backfill_action = Some(action.to_owned());
+    guard.last_backfill_panel = Some(target.panel_name.clone());
+    guard.last_backfill_source_cf = Some(source_cf);
+    guard.last_backfill_pages = Some(pages);
+    guard.last_backfill_examined_rows = Some(examined);
+    guard.last_backfill_inserted_rows = Some(inserted);
+    guard.last_backfill_already_current_rows = Some(already_current);
+    guard.last_backfill_outcome_anchored_rows = Some(outcome_anchored);
+    guard.last_backfill_elapsed_ms = Some(elapsed_ms);
+    guard.last_backfill_sweep_complete = Some(sweep_complete);
 }

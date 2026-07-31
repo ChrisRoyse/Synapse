@@ -244,6 +244,73 @@ pub(super) async fn handle(
                 |out| out.corpus_histogram = Some(response),
             )))
         }
+        StorageOperation::PanelCoverage => {
+            let spec = params
+                .0
+                .panel_coverage
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "panel_coverage"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_panel_coverage(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_storage",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=panel_coverage",
+                )
+            })?;
+            // A whole-Base scan plus one row count per declared full-CF source
+            // is strictly blocking work and must never occupy a runtime worker
+            // serving MCP requests.
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::storage::inspect_panel_coverage(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_storage",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("panel-coverage blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs for SYNAPSE_CALYX_PANEL_CENSUS records; the census task terminated abnormally",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_storage",
+                    STORAGE_SOT,
+                    error,
+                    "the census is recomputed from the physical Base CF at call time; a failure here means the vault or a declared source CF could not be scanned, or the row accounting did not add up",
+                )
+            })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "panels={} base_cf_rows={} records_total={} decode_failures={} \
+                     accounting_holds={} superseded_records={} coverage_deficient={:?} \
+                     grounding_deficient={:?}",
+                    response.panels.len(),
+                    response.base_cf_rows,
+                    response.records_total,
+                    response.decode_failures,
+                    response.accounting_holds,
+                    response.superseded_records_total,
+                    response.coverage_deficient_panels,
+                    response.grounding_deficient_panels,
+                ),
+                |out| out.panel_coverage = Some(response),
+            )))
+        }
         StorageOperation::TemporalRerank => {
             let spec = params
                 .0

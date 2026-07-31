@@ -9,6 +9,7 @@ pub mod episodes;
 pub mod error;
 mod gc;
 pub mod maintenance;
+pub mod panel_coverage;
 mod pressure;
 pub mod routines;
 pub mod timeline;
@@ -996,6 +997,27 @@ impl Db {
     ) -> StorageResult<Vec<constellations::ExactMatchConfirmation>> {
         self.backend
             .confirm_exact_matches(panel_version, slot, value, cx_ids)
+    }
+
+    /// Censuses every panel generation in the `Base` CF and joins it against the
+    /// declared panel catalog and its source-CF row counts (#1927 ask 1,
+    /// #1920 ask 1).
+    ///
+    /// One decode-only `Base` scan with no per-slot hydration, plus one row
+    /// count per declared full-CF source. This is the cheap sibling of
+    /// `hygiene grounding_gap`: it answers "how covered and how grounded is each
+    /// panel" without the per-lens hydration that makes `grounding_gap` a heavy
+    /// pass, which is what makes it affordable on the derived-state tick.
+    ///
+    /// Blocking work — admit it off the async runtime workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the vault is unavailable, a
+    /// source CF cannot be scanned, or the physical row accounting does not add
+    /// up (`base_cf_rows != records_total + decode_failures`).
+    pub fn measure_panel_coverage(&self) -> StorageResult<panel_coverage::PanelCoverageReport> {
+        self.backend.measure_panel_coverage()
     }
 
     /// Reconstructs temporal metadata from authoritative timeline or episode

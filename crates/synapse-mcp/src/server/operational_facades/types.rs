@@ -27,12 +27,12 @@ use crate::m3::{
         StorageCorpusHistogramParams, StorageCorpusHistogramResponse, StorageFindSimilarParams,
         StorageFindSimilarResponse, StorageGcOnceParams, StorageGcOnceResponse,
         StorageInspectParams, StorageInspectResponse, StorageIntelligenceParams,
-        StorageIntelligenceResponse, StorageRestoreVerifyParams, StorageRestoreVerifyResponse,
-        StorageRetireOrphanSlotCfsParams, StorageRetireOrphanSlotCfsResponse,
-        StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
-        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
-        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
-        StorageTemporalRerankResponse,
+        StorageIntelligenceResponse, StoragePanelCoverageParams, StoragePanelCoverageResponse,
+        StorageRestoreVerifyParams, StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
+        StorageRetireOrphanSlotCfsResponse, StorageSearchRebuildParams,
+        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
+        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
+        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -44,6 +44,7 @@ pub enum StorageOperation {
     Anchors,
     TemporalPanels,
     CorpusHistogram,
+    PanelCoverage,
     TemporalRerank,
     TemporalBackfill,
     SearchRebuild,
@@ -63,6 +64,7 @@ impl StorageOperation {
             Self::Anchors => "anchors",
             Self::TemporalPanels => "temporal_panels",
             Self::CorpusHistogram => "corpus_histogram",
+            Self::PanelCoverage => "panel_coverage",
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
             Self::SearchRebuild => "search_rebuild",
@@ -91,6 +93,8 @@ pub struct StorageParams {
     pub temporal_panels: Option<StorageTemporalPanelsParams>,
     #[serde(default)]
     pub corpus_histogram: Option<StorageCorpusHistogramParams>,
+    #[serde(default)]
+    pub panel_coverage: Option<StoragePanelCoverageParams>,
     #[serde(default)]
     pub temporal_rerank: Option<StorageTemporalRerankParams>,
     #[serde(default)]
@@ -127,6 +131,8 @@ pub struct StorageResponse {
     pub temporal_panels: Option<StorageTemporalPanelsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpus_histogram: Option<StorageCorpusHistogramResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_coverage: Option<StoragePanelCoverageResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_rerank: Option<StorageTemporalRerankResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

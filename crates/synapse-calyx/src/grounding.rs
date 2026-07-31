@@ -326,6 +326,223 @@ impl SynapseCalyxVault {
     }
 }
 
+/// One panel generation's census row: how many `Base` constellations carry this
+/// exact `panel_version`, and how many of them are grounded.
+///
+/// Deliberately NOT per-lens. Per-lens coverage requires hydrating every record
+/// from its per-slot CFs (issue #1894), which is what makes
+/// [`SynapseCalyxVault::grounding_gap_report`] a heavy pass. The two numbers a
+/// coverage question actually needs — *how many records exist at this version*
+/// and *how many carry a grounded anchor* — both live on the `Base` row itself,
+/// so this row is filled by a decode with no hydration at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxPanelCensusEntry {
+    pub panel_version: u32,
+    /// `Base` constellations carrying this exact panel version.
+    pub records: usize,
+    /// Records carrying at least one grounded anchor (confidence > 0).
+    pub grounded_records: usize,
+    /// Record counts per grounded anchor-kind label. A record with two grounded
+    /// kinds counts once under each.
+    pub anchor_kind_records: BTreeMap<String, usize>,
+    /// Oldest and newest `created_at` (Calyx stamps milliseconds) seen at this
+    /// version. A superseded generation whose newest record predates the active
+    /// generation's oldest is a *closed* generation; overlap means writes are
+    /// still landing on two versions at once, which is a defect.
+    pub earliest_created_at_ms: Option<u64>,
+    pub latest_created_at_ms: Option<u64>,
+}
+
+impl SynapseCalyxPanelCensusEntry {
+    /// Grounded fraction over this generation's own records.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "record counts are bounded by the physical Base CF row count"
+    )]
+    pub fn grounded_fraction(&self) -> f32 {
+        if self.records == 0 {
+            return 0.0;
+        }
+        self.grounded_records as f32 / self.records as f32
+    }
+}
+
+/// Whole-vault panel census: every panel generation physically present in the
+/// `Base` CF, from ONE decode-only scan.
+///
+/// Why this exists (issues #1927 ask 1, #1920 ask 1). Both asked for the same
+/// missing readback from opposite directions:
+///
+/// * #1927 — a panel version bump left the active generation holding 389 of
+///   22,999 source rows, and the only way to notice was to call
+///   `grounding_gap` against a *guessed* version number and compare it by hand
+///   to `corpus_histogram`.
+/// * #1920 — "add a per-panel anchored-fraction readback that does not require
+///   running `grounding_gap` over a whole panel. Right now the only way to learn
+///   that a panel is unmeasurable is to try to measure it and read the refusal."
+///
+/// One scan answers both, and it enumerates the versions rather than taking them
+/// as input: a generation nobody remembered to ask about is exactly the one that
+/// strands records. `records_at()` returning 0 for a version that is *in* the
+/// catalog and `unknown` holding a version that is *not* are different facts and
+/// are reported as such.
+///
+/// Cost: one `scan_cf_latest(Base)` plus one `decode_constellation_base` per
+/// row. No `hydrated_constellation` call, so no per-slot CF read — that is the
+/// entire difference from `grounding_gap_report`, and the reason this is
+/// affordable on a periodic tick.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxPanelCensus {
+    /// One entry per distinct panel version present, ascending.
+    pub entries: Vec<SynapseCalyxPanelCensusEntry>,
+    /// Physical `Base` CF row count read back at call time.
+    pub base_cf_rows: usize,
+    /// Rows whose `Base` encoding would not decode.
+    ///
+    /// Counted and surfaced, never skipped. `base_cf_rows - decode_failures`
+    /// must equal the sum of every entry's `records`; a caller can check that
+    /// invariant, which is what stops a corpus with unreadable rows from
+    /// masquerading as a smaller clean one (the #1918 lesson, applied here).
+    pub decode_failures: usize,
+    /// The first decode failure's detail, so a non-zero count is actionable
+    /// rather than merely alarming.
+    pub first_decode_failure: Option<String>,
+    pub measured_at_unix_ms: Option<u64>,
+}
+
+impl SynapseCalyxPanelCensus {
+    /// Records present at one exact panel version (0 when the version is absent).
+    #[must_use]
+    pub fn records_at(&self, panel_version: u32) -> usize {
+        self.entry(panel_version).map_or(0, |entry| entry.records)
+    }
+
+    /// The census row for one exact panel version, if that version is present.
+    #[must_use]
+    pub fn entry(&self, panel_version: u32) -> Option<&SynapseCalyxPanelCensusEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.panel_version == panel_version)
+    }
+
+    /// Sum of every entry's `records`. Equals `base_cf_rows - decode_failures`
+    /// on a healthy vault.
+    #[must_use]
+    pub fn records_total(&self) -> usize {
+        self.entries.iter().map(|entry| entry.records).sum()
+    }
+}
+
+impl SynapseCalyxVault {
+    /// Censuses every panel generation in the `Base` CF in one decode-only pass.
+    ///
+    /// Read-only and unbounded by design: it must see *every* row, because its
+    /// whole job is to find the generations nobody thought to ask about. A cap
+    /// would make "this version holds 0 records" and "the scan stopped before
+    /// reaching them" indistinguishable, which is the failure this readback
+    /// exists to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the `Base` CF cannot be
+    /// scanned. A row that fails to *decode* is counted into `decode_failures`
+    /// and does not abort the pass: one unreadable row must not cost the census
+    /// of every other generation, and a silently-dropped row would be worse than
+    /// either.
+    pub fn panel_census(&self) -> Result<SynapseCalyxPanelCensus, SynapseCalyxError> {
+        // Hot-path boundary (#1686): a whole-Base scan is off-runtime
+        // maintenance work and must never be driven from a tagged reflex tick.
+        crate::lowering::hot_context::assert_cold_calyx("panel_census");
+
+        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
+        let base_cf_rows = rows.len();
+
+        let mut by_version: BTreeMap<u32, SynapseCalyxPanelCensusEntry> = BTreeMap::new();
+        let mut decode_failures = 0usize;
+        let mut first_decode_failure: Option<String> = None;
+
+        for (key, value) in rows {
+            let base = match decode_constellation_base(&value) {
+                Ok(base) => base,
+                Err(error) => {
+                    decode_failures += 1;
+                    if first_decode_failure.is_none() {
+                        first_decode_failure =
+                            Some(format!("key_hex={} error={error}", hex_lower(&key)));
+                    }
+                    continue;
+                }
+            };
+            let entry = by_version.entry(base.panel_version).or_insert_with(|| {
+                SynapseCalyxPanelCensusEntry {
+                    panel_version: base.panel_version,
+                    records: 0,
+                    grounded_records: 0,
+                    anchor_kind_records: BTreeMap::new(),
+                    earliest_created_at_ms: None,
+                    latest_created_at_ms: None,
+                }
+            });
+            entry.records += 1;
+            entry.earliest_created_at_ms = Some(
+                entry
+                    .earliest_created_at_ms
+                    .map_or(base.created_at, |seen| seen.min(base.created_at)),
+            );
+            entry.latest_created_at_ms = Some(
+                entry
+                    .latest_created_at_ms
+                    .map_or(base.created_at, |seen| seen.max(base.created_at)),
+            );
+            // Anchors are carried on the Base row itself (they are encoded into
+            // it alongside the scalars), which is precisely why this pass does
+            // not need to hydrate. Slot *vectors* are the thing that lives in
+            // the per-slot CFs (#1894), and this census reads no slot vector.
+            let grounded_kinds = grounded_anchor_kinds(&base.anchors);
+            if !grounded_kinds.is_empty() {
+                entry.grounded_records += 1;
+            }
+            for kind in grounded_kinds {
+                *entry.anchor_kind_records.entry(kind).or_default() += 1;
+            }
+        }
+
+        if decode_failures > 0 {
+            tracing::error!(
+                code = "SYNAPSE_CALYX_PANEL_CENSUS_DECODE_FAILURES",
+                decode_failures,
+                base_cf_rows,
+                first_decode_failure = ?first_decode_failure,
+                "Base rows would not decode during the panel census; every count below is over \
+                 the rows that DID decode, and base_cf_rows - decode_failures is the denominator \
+                 to check against"
+            );
+        }
+
+        Ok(SynapseCalyxPanelCensus {
+            entries: by_version.into_values().collect(),
+            base_cf_rows,
+            decode_failures,
+            first_decode_failure,
+            measured_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+        })
+    }
+}
+
+/// Lowercase hex for a physical row key, so a decode failure names the exact row.
+fn hex_lower(key: &[u8]) -> String {
+    use std::fmt::Write as _;
+    key.iter()
+        .fold(String::with_capacity(key.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 /// Returns the set of anchor-kind labels carried by a record's *grounded*
 /// anchors (confidence > 0). An ungrounded (zero/negative confidence) anchor is
 /// never counted, matching the grounded-anchor definition the assay path uses.

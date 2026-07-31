@@ -2007,6 +2007,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "name a source CF that declares dimensions and only dimensions it declares; a row that will not decode is counted and its key reported, never skipped",
             ),
             op(
+                "panel_coverage",
+                false,
+                false,
+                "Calyx Base CF panel-version census joined against the declared panel catalog and its source CF row counts",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "the census is recomputed from the physical Base CF at call time; a failure means the vault or a declared source CF could not be scanned, or base_cf_rows did not equal records_total + decode_failures",
+            ),
+            op(
                 "temporal_rerank",
                 false,
                 false,
@@ -6089,6 +6098,7 @@ mod facade_schema_parity_tests {
             "anchors",
             "temporal_panels",
             "corpus_histogram",
+            "panel_coverage",
             "temporal_rerank",
             "temporal_backfill",
             "search_rebuild",

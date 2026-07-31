@@ -111,7 +111,8 @@ pub use find::{
 pub use grounding::{
     SYNAPSE_GROUNDING_COVERAGE_FLOOR, SYNAPSE_GROUNDING_MAX_UNGROUNDED_SLOTS,
     SynapseCalyxAnchorKindCoverage, SynapseCalyxDomainGroundingVerdict,
-    SynapseCalyxGroundingGapReport, SynapseCalyxSlotGroundingCoverage,
+    SynapseCalyxGroundingGapReport, SynapseCalyxPanelCensus, SynapseCalyxPanelCensusEntry,
+    SynapseCalyxSlotGroundingCoverage,
 };
 pub use intelligence::{
     SYNAPSE_ASSAY_BIT_FLOOR, SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES,

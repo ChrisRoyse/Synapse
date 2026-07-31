@@ -20,6 +20,7 @@ pub(super) fn storage_response(
         anchors: None,
         temporal_panels: None,
         corpus_histogram: None,
+        panel_coverage: None,
         temporal_rerank: None,
         temporal_backfill: None,
         search_rebuild: None,

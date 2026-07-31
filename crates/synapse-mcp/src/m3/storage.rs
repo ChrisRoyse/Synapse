@@ -712,6 +712,99 @@ pub struct StorageTemporalPanelsResponse {
     pub panels: Vec<StorageTemporalPanel>,
 }
 
+/// Per-panel coverage and grounding census request (#1927 ask 1, #1920 ask 1).
+///
+/// Takes no parameters on purpose. Its whole job is to enumerate the panel
+/// generations physically present in the `Base` CF, including the ones nobody
+/// remembered to ask about — a version parameter would reintroduce the exact
+/// problem it was built to remove, which is that the only way to learn a panel
+/// was stranded was to guess its version number and check by hand.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePanelCoverageParams {}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePanelCoverageResponse {
+    pub source_of_truth: &'static str,
+    pub panels: Vec<StoragePanelCoverageRow>,
+    /// Panel generations present in `Base` that no catalog entry claims,
+    /// as `[panel_version, records]`. Read by no active-panel surface.
+    pub unknown_panel_versions: Vec<[u64; 2]>,
+    pub base_cf_rows: u64,
+    pub records_total: u64,
+    /// `Base` rows that would not decode. `base_cf_rows - decode_failures ==
+    /// records_total` is the invariant a caller checks before trusting any
+    /// fraction below it.
+    pub decode_failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_decode_failure: Option<String>,
+    /// True when that invariant holds. False means the counts are over a subset.
+    pub accounting_holds: bool,
+    /// Rows on a superseded or unclaimed generation (#1927 ask 3).
+    pub superseded_records_total: u64,
+    pub coverage_floor: f32,
+    pub grounding_floor: f32,
+    pub coverage_deficient_panels: Vec<String>,
+    /// Deficient panels the maintainer has no re-measure path for.
+    pub unbackfillable_deficient_panels: Vec<String>,
+    pub grounding_deficient_panels: Vec<String>,
+    /// Panels whose constellations outlive their TTL-expiring source rows.
+    pub records_exceed_source_panels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePanelCoverageRow {
+    pub panel_name: String,
+    pub panel_version: u32,
+    /// Declared, not inferred: whether a 0.0 grounded fraction is a gap or is
+    /// correct for this panel's shape (#1920 ask 3).
+    pub outcome_bearing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cf: Option<String>,
+    /// True when `source_cf_rows` is this panel's real denominator. False for
+    /// sampled/prefix-filtered panels, which get no coverage fraction at all.
+    pub source_is_full_cf: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cf_rows: Option<u64>,
+    pub active_version_records: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncovered_rows: Option<u64>,
+    pub coverage_below_floor: bool,
+    /// True when this panel holds MORE constellations than its source CF holds
+    /// rows, because an audit TTL expired the source rows while the Base
+    /// constellations measured from them are never auto-deleted. The opposite
+    /// condition to a shortfall, with the opposite remedy, so it is reported
+    /// separately and is NOT a coverage deficiency.
+    pub records_exceed_source: bool,
+    pub superseded_records: u64,
+    /// Each superseded generation present, as `[panel_version, records]`.
+    pub superseded_versions_present: Vec<[u64; 2]>,
+    pub grounded_records: u64,
+    pub grounded_fraction: f32,
+    pub grounding_below_floor: bool,
+    /// Whether the KSG estimator can run on this panel at all, i.e.
+    /// `grounded_records >= assay_min_samples` (#1920 ask 4). False means
+    /// `bits`, `sufficiency` and `redundancy` will refuse for want of paired
+    /// samples no matter which slot they are pointed at — knowable here, before
+    /// any of them is called.
+    pub assay_measurable: bool,
+    /// Grounded records still needed before the estimator can run.
+    pub assay_samples_short: u64,
+    pub assay_min_samples: u64,
+    pub anchor_kind_records: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_source_cf: Option<String>,
+    /// True when this panel is short AND repairable — the maintainer's work
+    /// predicate, surfaced so an operator sees the same predicate it uses.
+    pub backfill_owed: bool,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageCorpusHistogramResponse {
@@ -1939,6 +2032,13 @@ pub fn required_permissions_corpus_histogram(
 }
 
 #[must_use]
+pub fn required_permissions_panel_coverage(
+    _params: &StoragePanelCoverageParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
 pub fn required_permissions_temporal_rerank(
     _params: &StorageTemporalRerankParams,
 ) -> RequiredPermissions {
@@ -2104,6 +2204,96 @@ fn json_label<T: Serialize>(value: &T) -> String {
 /// failure. A row that will not decode is **counted and reported**, never
 /// skipped silently: a histogram that quietly drops rows is a histogram that
 /// lies about the corpus, which is the class of defect #1918 fixed.
+/// Censuses every panel generation in the `Base` CF and joins it against the
+/// declared panel catalog (#1927 ask 1, #1920 ask 1).
+///
+/// Recomputed from the physical `Base` CF at call time — never a cached
+/// aggregate. That is the same choice `corpus_histogram` made and for the same
+/// reason: a stale aggregate that quietly disagrees with the corpus is the
+/// failure mode #1918 fixed, and #1907 is the precedent for what it costs (a
+/// readback said fine while recall was zero).
+///
+/// Blocking: one full `Base` scan plus one row count per declared full-CF
+/// source. The facade admits it off the runtime workers.
+///
+/// # Errors
+///
+/// Fails closed when the vault is unavailable, a source CF cannot be scanned, or
+/// the physical row accounting does not add up.
+pub fn inspect_panel_coverage(
+    db: &synapse_storage::Db,
+    _params: &StoragePanelCoverageParams,
+) -> Result<StoragePanelCoverageResponse, ErrorData> {
+    let report = db.measure_panel_coverage().map_err(|error| {
+        mcp_error_with_remediation(
+            "SYNAPSE_STORAGE_PANEL_COVERAGE_FAILED",
+            format!("panel coverage census failed: {error}"),
+            "the census reads the physical Base CF and the declared source CFs; repair \
+             storage/Calyx initialization and retry storage operation=panel_coverage",
+        )
+    })?;
+
+    let panels = report
+        .panels
+        .iter()
+        .map(|panel| StoragePanelCoverageRow {
+            panel_name: panel.panel_name.clone(),
+            panel_version: panel.panel_version,
+            outcome_bearing: panel.outcome_bearing,
+            source_cf: panel.source_cf.clone(),
+            source_is_full_cf: panel.source_is_full_cf,
+            source_cf_rows: panel.source_cf_rows,
+            active_version_records: panel.active_version_records as u64,
+            coverage_fraction: panel.coverage_fraction,
+            uncovered_rows: panel.uncovered_rows(),
+            coverage_below_floor: panel.coverage_below_floor,
+            records_exceed_source: panel.records_exceed_source,
+            superseded_records: panel.superseded_records as u64,
+            superseded_versions_present: panel
+                .superseded_versions_present
+                .iter()
+                .map(|(version, records)| [u64::from(*version), *records as u64])
+                .collect(),
+            grounded_records: panel.grounded_records as u64,
+            grounded_fraction: panel.grounded_fraction,
+            grounding_below_floor: panel.grounding_below_floor,
+            assay_measurable: panel.assay_measurable(),
+            assay_samples_short: panel.assay_samples_short() as u64,
+            assay_min_samples: synapse_calyx::SYNAPSE_ASSAY_MIN_SAMPLES as u64,
+            anchor_kind_records: panel
+                .anchor_kind_records
+                .iter()
+                .map(|(kind, count)| (kind.clone(), *count as u64))
+                .collect(),
+            backfill_source_cf: panel.backfill_source_cf.clone(),
+            backfill_owed: panel.backfill_owed(),
+        })
+        .collect();
+
+    Ok(StoragePanelCoverageResponse {
+        source_of_truth: "Calyx Base CF panel-version census + declared source CF row counts",
+        panels,
+        unknown_panel_versions: report
+            .unknown_panel_versions
+            .iter()
+            .map(|(version, records)| [u64::from(*version), *records as u64])
+            .collect(),
+        base_cf_rows: report.base_cf_rows as u64,
+        records_total: report.records_total as u64,
+        decode_failures: report.decode_failures as u64,
+        first_decode_failure: report.first_decode_failure.clone(),
+        accounting_holds: report.accounting_holds(),
+        superseded_records_total: report.superseded_records_total as u64,
+        coverage_floor: report.coverage_floor,
+        grounding_floor: report.grounding_floor,
+        coverage_deficient_panels: report.coverage_deficient_panels.clone(),
+        unbackfillable_deficient_panels: report.unbackfillable_deficient_panels.clone(),
+        grounding_deficient_panels: report.grounding_deficient_panels.clone(),
+        records_exceed_source_panels: report.records_exceed_source_panels.clone(),
+        measured_at_unix_ms: report.measured_at_unix_ms,
+    })
+}
+
 pub fn inspect_corpus_histogram(
     db: &synapse_storage::Db,
     params: &StorageCorpusHistogramParams,

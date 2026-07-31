@@ -22,6 +22,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("anchors", params.anchors.is_some()),
             ("temporal_panels", params.temporal_panels.is_some()),
             ("corpus_histogram", params.corpus_histogram.is_some()),
+            ("panel_coverage", params.panel_coverage.is_some()),
             ("temporal_rerank", params.temporal_rerank.is_some()),
             ("temporal_backfill", params.temporal_backfill.is_some()),
             ("search_rebuild", params.search_rebuild.is_some()),

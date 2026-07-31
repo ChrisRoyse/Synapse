@@ -460,6 +460,8 @@ pub trait StorageBackend: Send + Sync {
         &self,
         max_records: usize,
     ) -> StorageResult<synapse_calyx::SynapseCalyxLensCoverageStatus>;
+    /// Per-panel coverage and grounding census (#1927 ask 1, #1920 ask 1).
+    fn measure_panel_coverage(&self) -> StorageResult<crate::panel_coverage::PanelCoverageReport>;
     fn pressure_level(&self) -> pressure::DiskPressureLevel;
     fn pressure_permits_write(&self, cf_name: &str) -> bool;
     fn pressure_transition_codes(&self) -> StorageResult<Vec<&'static str>>;
@@ -2014,6 +2016,59 @@ impl StorageBackend for CalyxBackend {
                     })
             },
         )
+    }
+
+    fn measure_panel_coverage(&self) -> StorageResult<crate::panel_coverage::PanelCoverageReport> {
+        let census = self.vault.with_vault(
+            "calyx_panel_census",
+            "census every Calyx panel generation in the Base CF",
+            true,
+            |vault| {
+                vault.panel_census().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_panel_census",
+                        "census every Calyx panel generation in the Base CF",
+                        &source,
+                    )
+                })
+            },
+        )?;
+
+        // Count ONLY the CFs that are a declared full-CF denominator. Counting
+        // every CF would read ~28k unrelated CF_KV rows for a number the report
+        // deliberately does not derive a fraction from (a subset-fed panel has
+        // no meaningful denominator), and this pass runs on a five-minute tick.
+        let mut source_cf_rows = BTreeMap::new();
+        for entry in constellations::builtin_panel_catalog() {
+            if !entry.source.is_full_cf() {
+                continue;
+            }
+            let Some(cf_name) = entry.source.cf_name() else {
+                continue;
+            };
+            if source_cf_rows.contains_key(cf_name) {
+                continue;
+            }
+            let rows = self.read_all_rows(cf_name)?.len() as u64;
+            source_cf_rows.insert(cf_name.to_owned(), rows);
+        }
+
+        let report = crate::panel_coverage::build_panel_coverage_report(&census, &source_cf_rows);
+        if !report.accounting_holds() {
+            // Never a silent discrepancy: the caller is told the counts do not
+            // add up, with all three numbers, rather than being handed a report
+            // whose denominators cannot be trusted.
+            return Err(StorageError::ReadFailed {
+                cf_name: "calyx_panel_census".to_owned(),
+                detail: format!(
+                    "SYNAPSE_PANEL_CENSUS_ACCOUNTING_MISMATCH: base_cf_rows={} != records_total={} \
+                     + decode_failures={}; every Base row must be counted into exactly one panel \
+                     generation or into the decode-failure count",
+                    report.base_cf_rows, report.records_total, report.decode_failures
+                ),
+            });
+        }
+        Ok(report)
     }
 
     fn pressure_level(&self) -> pressure::DiskPressureLevel {

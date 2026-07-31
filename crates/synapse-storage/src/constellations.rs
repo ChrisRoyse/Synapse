@@ -1963,51 +1963,239 @@ pub fn syn_slot_lens_names() -> BTreeMap<u16, String> {
         .collect()
 }
 
-/// One built-in panel generation, for the `panel list` action.
+/// How a panel's record population relates to a physical source column family.
+///
+/// This is the declaration that makes a coverage *fraction* meaningful. #1927
+/// asks for "`active_version_records` vs `source_cf_rows`", and that ratio is
+/// only a coverage number when the panel is supposed to hold one constellation
+/// per source row. For a panel fed by a filtered or sampled subset of a CF the
+/// same ratio is a meaningless number that would read as a permanent 2% outage,
+/// so those panels declare the weaker relationship instead of borrowing the
+/// stronger one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelSource {
+    /// One constellation per row of this CF. A coverage fraction below 1.0 means
+    /// rows are stranded and a backfill is owed.
+    FullCf(&'static str),
+    /// Fed by a *subset* of this CF (a key prefix, a sampling rate, a row-kind
+    /// filter). Record count and CF row count are both reported, and no coverage
+    /// fraction is derived from them, because the denominator is wrong.
+    SubsetOfCf(&'static str),
+    /// Built from a derived snapshot rather than per source row (the #1685
+    /// graph-position and hierarchy panels, and the recurrence-subject panel,
+    /// whose records are subjects rather than occurrences). No source CF.
+    Derived,
+}
+
+impl PanelSource {
+    /// The CF this panel reads, when it reads one.
+    #[must_use]
+    pub const fn cf_name(self) -> Option<&'static str> {
+        match self {
+            Self::FullCf(cf) | Self::SubsetOfCf(cf) => Some(cf),
+            Self::Derived => None,
+        }
+    }
+
+    /// True only when `records / cf_rows` is a coverage fraction rather than an
+    /// arbitrary ratio of two different populations.
+    #[must_use]
+    pub const fn is_full_cf(self) -> bool {
+        matches!(self, Self::FullCf(_))
+    }
+}
+
+/// One built-in panel, with the declarations coverage and grounding readbacks
+/// need in order to interpret a number instead of guessing at it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PanelCatalogEntry {
     pub panel_name: &'static str,
+    /// The generation new records are written at today.
     pub panel_version: u32,
+    /// What this panel's population is drawn from.
+    pub source: PanelSource,
+    /// **#1920 ask 3.** Whether this panel is supposed to carry grounded outcome
+    /// anchors at all, declared rather than inferred from its coverage.
+    ///
+    /// The census across all fourteen panels split them cleanly and the split is
+    /// recorded here so it stops being re-derived: timeline, action, reflex,
+    /// process, observation, recurrence-subject and the three graphpos/path
+    /// panels are *observations* — a timeline row records that something was
+    /// seen, not how it turned out — and their 0.0 grounded coverage is correct,
+    /// not a gap. Episode, outcome, mcp-usage, agent-event and agent-transcript
+    /// are outcome-bearing, and a 0.0 there IS a gap.
+    ///
+    /// Load-bearing, not cosmetic: a grounding readback must not report a
+    /// deliberate 0.0 as a deficiency, and the intelligence surfaces must not
+    /// wait for bits from a panel that will never have an anchor to measure them
+    /// about.
+    pub outcome_bearing: bool,
+    /// Generations this panel has been through, newest-superseded first.
+    ///
+    /// Rows at these versions are still physically in the `Base` CF and are
+    /// still counted by every whole-CF row count, but nothing reads them: a
+    /// record is only found by a surface scoped to the *active* version. Naming
+    /// them is what lets the coverage readback separate "stranded on a
+    /// superseded generation" from "never measured at all" — two states with
+    /// opposite remedies.
+    pub superseded_versions: &'static [u32],
+    /// The CF `Db::backfill_temporal_metadata` can re-measure this panel from,
+    /// when there is one.
+    ///
+    /// **#1927 ask 2** needs exactly this: the maintainer cannot drive a
+    /// backfill for a panel whose re-measure path does not exist, and silently
+    /// treating "no path" as "already covered" is how a panel sits at 1.7%
+    /// indefinitely with health reporting ok. A `None` here is reported as an
+    /// un-backfillable shortfall, not as success.
+    pub backfill_source_cf: Option<&'static str>,
 }
 
-/// The built-in panel catalog: every `syn-*` panel and its first generation.
+/// The built-in panel catalog: every `syn-*` panel, its active generation, and
+/// the declarations #1920 ask 3 and #1927 asks 1/3 require.
+///
+/// `builtin_panel_catalog` previously existed with a doc comment saying it was
+/// "for the `panel list` action" and **had no caller anywhere in the workspace**
+/// (#1920's census comment found this). It is now the single source of truth the
+/// panel-coverage readback joins the physical census against.
 #[must_use]
 pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
     vec![
-        entry(SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION),
-        entry(SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION),
-        entry(SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION),
-        entry(
-            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
-        ),
-        entry(SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION),
-        entry(SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION),
-        entry(SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION),
-        entry(SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION),
-        entry(SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION),
-        entry(SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION),
-        entry(
-            SYN_RECURRENCE_SUBJECT_PANEL_NAME,
-            SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
-        ),
-        entry(SYN_GRAPHPOS_APP_PANEL_NAME, SYN_GRAPHPOS_APP_PANEL_VERSION),
-        entry(
-            SYN_GRAPHPOS_PROCESS_PANEL_NAME,
-            SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
-        ),
-        entry(
-            SYN_PATH_HIERARCHY_PANEL_NAME,
-            SYN_PATH_HIERARCHY_PANEL_VERSION,
-        ),
+        // --- observation-shaped: correctly unanchored (#1920 ask 3) ---
+        PanelCatalogEntry {
+            panel_name: SYN_TIMELINE_PANEL_NAME,
+            panel_version: SYN_TIMELINE_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_TIMELINE),
+            outcome_bearing: false,
+            superseded_versions: &[SYN_TIMELINE_PANEL_VERSION_PRE_1900],
+            backfill_source_cf: Some(cf::CF_TIMELINE),
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_ACTION_PANEL_NAME,
+            panel_version: SYN_ACTION_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_ACTION_LOG),
+            outcome_bearing: false,
+            superseded_versions: &[1_666_001],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_REFLEX_PANEL_NAME,
+            panel_version: SYN_REFLEX_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_REFLEX_AUDIT),
+            outcome_bearing: false,
+            superseded_versions: &[1_666_002],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_PROCESS_PANEL_NAME,
+            panel_version: SYN_PROCESS_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_PROCESS_HISTORY),
+            outcome_bearing: false,
+            superseded_versions: &[1_666_003],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_OBSERVATION_PANEL_NAME,
+            panel_version: SYN_OBSERVATION_PANEL_VERSION,
+            // Sampled: one constellation every
+            // SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT rows, so the CF row count
+            // is deliberately NOT this panel's denominator.
+            source: PanelSource::SubsetOfCf(cf::CF_OBSERVATIONS),
+            outcome_bearing: false,
+            superseded_versions: &[1_666_004],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+            panel_version: SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
+            // A record here is a recurrence *subject*, not an occurrence, so no
+            // CF is its population.
+            source: PanelSource::Derived,
+            outcome_bearing: false,
+            superseded_versions: &[1_667_001],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_GRAPHPOS_APP_PANEL_NAME,
+            panel_version: SYN_GRAPHPOS_APP_PANEL_VERSION,
+            source: PanelSource::Derived,
+            outcome_bearing: false,
+            superseded_versions: &[],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_GRAPHPOS_PROCESS_PANEL_NAME,
+            panel_version: SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
+            source: PanelSource::Derived,
+            outcome_bearing: false,
+            superseded_versions: &[],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_PATH_HIERARCHY_PANEL_NAME,
+            panel_version: SYN_PATH_HIERARCHY_PANEL_VERSION,
+            source: PanelSource::Derived,
+            outcome_bearing: false,
+            superseded_versions: &[],
+            backfill_source_cf: None,
+        },
+        // --- outcome-bearing: a 0.0 here IS a gap (#1920 ask 3) ---
+        PanelCatalogEntry {
+            panel_name: SYN_EPISODE_PANEL_NAME,
+            panel_version: SYN_EPISODE_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_EPISODES),
+            outcome_bearing: true,
+            superseded_versions: &[SYN_EPISODE_PANEL_VERSION_PRE_1904],
+            backfill_source_cf: Some(cf::CF_EPISODES),
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_AGENT_EVENT_PANEL_NAME,
+            panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_AGENT_EVENTS),
+            outcome_bearing: true,
+            superseded_versions: &[],
+            // No re-measure path exists for this CF (#1927 ask 2 reports the
+            // shortfall rather than treating the absence as coverage).
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            panel_version: SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+            source: PanelSource::FullCf(cf::CF_AGENT_TRANSCRIPTS),
+            outcome_bearing: true,
+            superseded_versions: &[
+                SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921,
+                SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904,
+            ],
+            backfill_source_cf: Some(cf::CF_AGENT_TRANSCRIPTS),
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_OUTCOME_PANEL_NAME,
+            panel_version: SYN_OUTCOME_PANEL_VERSION,
+            // CF_KV and CF_ROUTINE_STATE both feed this panel, and CF_KV holds
+            // many unrelated row families, so neither count is a denominator.
+            source: PanelSource::SubsetOfCf(cf::CF_KV),
+            outcome_bearing: true,
+            superseded_versions: &[1_669_001],
+            backfill_source_cf: None,
+        },
+        PanelCatalogEntry {
+            panel_name: SYN_MCP_USAGE_PANEL_NAME,
+            panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+            // The `mcp-usage/v1/` key prefix within CF_KV.
+            source: PanelSource::SubsetOfCf(cf::CF_KV),
+            outcome_bearing: true,
+            superseded_versions: &[1_691_001],
+            backfill_source_cf: None,
+        },
     ]
 }
 
-const fn entry(panel_name: &'static str, panel_version: u32) -> PanelCatalogEntry {
-    PanelCatalogEntry {
-        panel_name,
-        panel_version,
-    }
+/// The catalog entry owning one panel version, whether active or superseded.
+#[must_use]
+pub fn panel_catalog_entry_for_version(panel_version: u32) -> Option<PanelCatalogEntry> {
+    builtin_panel_catalog().into_iter().find(|entry| {
+        entry.panel_version == panel_version || entry.superseded_versions.contains(&panel_version)
+    })
 }
 
 fn validate_unit_metric(field: &str, value: f32, unit_range: bool) -> StorageResult<()> {
