@@ -22,6 +22,15 @@ impl ServerHandler for SynapseService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
+        // Entry marker: the only fixed point that separates transport/rmcp time
+        // from in-handler time. Without it the interval between a response and
+        // the next call's first durable lifecycle event is unattributable, and
+        // that interval is the largest single component of tool-call latency.
+        tracing::info!(
+            code = "MCP_TOOL_CALL_ENTERED",
+            tool = %tool_name,
+            "call_tool entered"
+        );
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
         // #1800: stamp request activity so idle-abandoned sessions become
         // reapable before shutdown. Only refreshes an existing live row.

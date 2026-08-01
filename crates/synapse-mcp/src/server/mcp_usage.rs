@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
@@ -28,6 +28,11 @@ const STEERING_HINT_SIZE_LIMIT_BYTES: usize = 4 * 1024;
 const PROMOTED_VALUE_SIZE_LIMIT_BYTES: usize = 1024;
 const PROMOTED_VALUE_DEPTH_LIMIT: u32 = 8;
 const STEERING_EVIDENCE_FLOOR: u64 = 1;
+/// Every tool call pays the usage-bookkeeping cost synchronously before its
+/// response is returned, so it is a floor on every caller's latency. Emit the
+/// per-phase split whenever it exceeds this budget, naming which phase spent
+/// the time; a quiet log is the evidence that the floor is back under budget.
+const USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_MS: u128 = 15;
 const KNOWN_BAD_COST_HINT_ID: &str = "cost_summarize_unbounded_scan";
 const KNOWN_BAD_COST_ROUTE_ID: &str = "cost.summarize";
 const KNOWN_BAD_COST_ERROR_TYPE: &str = "AGENT_COST_FLEET_ROLLUP_UNAVAILABLE";
@@ -315,6 +320,25 @@ pub(crate) fn argument_shape_from_arguments(
     finalize_argument_shape(top_level_keys, nested_paths)
 }
 
+/// Report the per-phase split of the synchronous usage-bookkeeping that every
+/// tool call pays before its response is returned. `route` names the call so a
+/// slow phase can be attributed to the route that provoked it.
+fn log_usage_bookkeeping_split(route: &str, steering_ms: u128, persist_ms: u128) {
+    let total_ms = steering_ms.saturating_add(persist_ms);
+    if total_ms < USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_MS {
+        return;
+    }
+    tracing::info!(
+        code = "MCP_USAGE_BOOKKEEPING_SLOW",
+        route,
+        steering_ms = steering_ms as u64,
+        persist_ms = persist_ms as u64,
+        total_ms = total_ms as u64,
+        threshold_ms = USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_MS as u64,
+        "synchronous MCP usage bookkeeping exceeded its per-call latency budget"
+    );
+}
+
 pub(crate) fn record_success_and_attach_steering(
     service: &SynapseService,
     finished: FinishedToolCallReadback,
@@ -323,7 +347,14 @@ pub(crate) fn record_success_and_attach_steering(
 ) -> Result<(), ErrorData> {
     let (response_size_bytes, response_content_count) = success_response_measurements(result)?;
     let db = service_mcp_usage_db(service)?;
+    let route = finished
+        .route_id
+        .clone()
+        .unwrap_or_else(|| finished.tool.clone());
+    let steering_started = Instant::now();
     let steering = steering_for_finished_call(&db, &finished, None, &argument_shape)?;
+    let steering_ms = steering_started.elapsed().as_millis();
+    let persist_started = Instant::now();
     let readback = persist_finished_call(
         &db,
         finished,
@@ -332,6 +363,7 @@ pub(crate) fn record_success_and_attach_steering(
         response_content_count,
         steering.as_ref().map(|block| block.hint_id.clone()),
     )?;
+    log_usage_bookkeeping_split(&route, steering_ms, persist_started.elapsed().as_millis());
     tracing::debug!(
         code = "MCP_USAGE_CALL_PERSISTED",
         row_key = %readback.storage.row_key,
@@ -354,8 +386,15 @@ pub(crate) fn record_error_and_attach_steering(
     let error_type = error_type_from_snapshot(finished.error.as_ref(), finished.panic.as_ref());
     let (response_size_bytes, response_content_count) = error_response_measurements(&error)?;
     let db = service_mcp_usage_db(service)?;
+    let route = finished
+        .route_id
+        .clone()
+        .unwrap_or_else(|| finished.tool.clone());
+    let steering_started = Instant::now();
     let steering =
         steering_for_finished_call(&db, &finished, error_type.as_deref(), &argument_shape)?;
+    let steering_ms = steering_started.elapsed().as_millis();
+    let persist_started = Instant::now();
     let readback = persist_finished_call(
         &db,
         finished,
@@ -364,6 +403,7 @@ pub(crate) fn record_error_and_attach_steering(
         response_content_count,
         steering.as_ref().map(|block| block.hint_id.clone()),
     )?;
+    log_usage_bookkeeping_split(&route, steering_ms, persist_started.elapsed().as_millis());
     tracing::debug!(
         code = "MCP_USAGE_CALL_PERSISTED",
         row_key = %readback.storage.row_key,
