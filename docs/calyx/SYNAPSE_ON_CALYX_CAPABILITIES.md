@@ -40,6 +40,7 @@ Because real outcomes are attached as **anchors** — routine confirmations and 
 - **Which signals are redundant** — pairwise redundancy and effective rank say how many *truly independent* measurements exist; redundant lenses get parked automatically.
 - **Whether the panel is sufficient** — `I(panel; outcome) ≥ H(outcome)`: can the captured data explain the outcome at all? If not, the deficit names which measurement is short and by how many bits — a concrete to-do list for new lenses.
 - **Honesty by default** — below the sample floor, results are tagged provisional; the system never dresses up thin evidence as knowledge.
+- **The right instrument per lens** — Synapse's panels deliberately mix explicit encoders (one-hot, hash, cyclic, ordinal) with continuous ones (record vectors, rank scalars), and the two need different estimators. A k-nearest-neighbour estimator is *undefined* on a categorical column, because many samples sit at exactly the same coordinate and its k-th neighbour radius is zero; a contingency-table estimator is exact there but needs a bias correction to be honest. Every bits result therefore names the instrument that produced it, the rule that chose it, and the column cardinality the rule keyed on — so a number is comparable across a mixed panel instead of silently meaning two different things (#1672).
 
 ## 4. Temporal and causal understanding of the operator's world
 
