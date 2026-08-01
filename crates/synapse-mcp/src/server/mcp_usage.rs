@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::model::{CallToolResult, Content};
@@ -9,7 +10,7 @@ use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 use synapse_storage::{
     CalyxAnchorValueReadback, CalyxAnchorWriteReport, ConstellationPutReport, Db, GroundingAnchor,
-    McpUsageGroundedPublicationReport, cf,
+    cf,
 };
 
 use crate::daemon_lifecycle::FinishedToolCallReadback;
@@ -290,12 +291,6 @@ struct PersistedUsageRecord {
     record: McpUsageRecord,
 }
 
-struct UsagePersistReadback {
-    storage: McpUsageStorageReadback,
-    constellation: McpUsageConstellationReadback,
-    anchor: McpUsageAnchorReadback,
-}
-
 struct UsageEvidence {
     rows: Vec<PersistedUsageRecord>,
     success_rows: u64,
@@ -355,8 +350,9 @@ pub(crate) fn record_success_and_attach_steering(
     let steering = steering_for_finished_call(&db, &finished, None, &argument_shape)?;
     let steering_ms = steering_started.elapsed().as_millis();
     let persist_started = Instant::now();
-    let readback = persist_finished_call(
-        &db,
+    persist_finished_call(
+        db,
+        service,
         finished,
         argument_shape,
         response_size_bytes,
@@ -364,13 +360,6 @@ pub(crate) fn record_success_and_attach_steering(
         steering.as_ref().map(|block| block.hint_id.clone()),
     )?;
     log_usage_bookkeeping_split(&route, steering_ms, persist_started.elapsed().as_millis());
-    tracing::debug!(
-        code = "MCP_USAGE_CALL_PERSISTED",
-        row_key = %readback.storage.row_key,
-        cx_id = %readback.constellation.cx_id,
-        anchor_kind = %readback.anchor.anchor_kind,
-        "MCP tool-call usage row, Calyx constellation, and grounded anchor read back"
-    );
     if let Some(block) = steering {
         attach_steering_to_success(result, block)?;
     }
@@ -395,8 +384,9 @@ pub(crate) fn record_error_and_attach_steering(
         steering_for_finished_call(&db, &finished, error_type.as_deref(), &argument_shape)?;
     let steering_ms = steering_started.elapsed().as_millis();
     let persist_started = Instant::now();
-    let readback = persist_finished_call(
-        &db,
+    persist_finished_call(
+        db,
+        service,
         finished,
         argument_shape,
         response_size_bytes,
@@ -404,13 +394,6 @@ pub(crate) fn record_error_and_attach_steering(
         steering.as_ref().map(|block| block.hint_id.clone()),
     )?;
     log_usage_bookkeeping_split(&route, steering_ms, persist_started.elapsed().as_millis());
-    tracing::debug!(
-        code = "MCP_USAGE_CALL_PERSISTED",
-        row_key = %readback.storage.row_key,
-        cx_id = %readback.constellation.cx_id,
-        anchor_kind = %readback.anchor.anchor_kind,
-        "MCP tool-call usage row, Calyx constellation, and grounded anchor read back"
-    );
     if let Some(block) = steering {
         attach_steering_to_error(&mut error, block)?;
     }
@@ -715,14 +698,22 @@ fn value_kind(value: &Value) -> &'static str {
     }
 }
 
+/// Prepare the grounded usage observation and hand it to the dedicated writer.
+///
+/// Everything that can fail deterministically from this call's own inputs —
+/// JSON serialization, the row key, the anchor, the ledger payload — is done
+/// here, on the calling thread, so those failures stay attached to the call
+/// that caused them. What is handed off is the commit alone, which is the ~19.6
+/// ms this call used to pay before its response could be written (#1936).
 fn persist_finished_call(
-    db: &Db,
+    db: Arc<Db>,
+    service: &SynapseService,
     finished: FinishedToolCallReadback,
     argument_shape: McpArgumentShape,
     response_size_bytes: u64,
     response_content_count: u64,
     steering_hint_id: Option<String>,
-) -> Result<UsagePersistReadback, ErrorData> {
+) -> Result<(), ErrorData> {
     let session_hash = finished.mcp_session_id.as_deref().map(sha256_text);
     let observed_at_unix_ms = finished.finished_at_unix_ms;
     // The daemon lifecycle sequence is already a durable, monotone ordering
@@ -770,7 +761,6 @@ fn persist_finished_call(
     );
     let record_value = serde_json::to_value(&record).map_err(serialize_mcp_usage_error)?;
     let encoded = serde_json::to_vec(&record_value).map_err(serialize_mcp_usage_error)?;
-    let source_rows = vec![(row_key.as_bytes().to_vec(), encoded.clone())];
     let anchor = grounding::enum_anchor(
         "synapse:mcp_tool_call_outcome",
         &record.status,
@@ -779,35 +769,18 @@ fn persist_finished_call(
     );
     let ledger_payload =
         grounding::anchor_ledger_payload(cf::CF_KV, row_key.as_bytes(), &encoded, &anchor);
-    let publication = db
-        .put_mcp_usage_grounded_publication(
-            source_rows,
-            row_key.as_bytes(),
-            &encoded,
-            &record_value,
+    service
+        .usage_writer()
+        .enqueue(super::usage_writer::UsageObservation {
+            db,
+            route: record.route_id.clone(),
+            row_key,
+            encoded,
+            record_value,
             anchor,
-            &ledger_payload,
-        )
-        .map_err(|error| storage_mcp_error("atomically publish grounded MCP usage", error))?;
-    if publication.source_row_count != publication.source_readback_exact_match_count {
-        return Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "MCP_USAGE_ATOMIC_SOURCE_READBACK_MISMATCH: source_rows={} exact_readbacks={} committed_seq={}",
-                publication.source_row_count,
-                publication.source_readback_exact_match_count,
-                publication.committed_seq
-            ),
-        ));
-    }
-    let storage = atomic_usage_source_readback(&publication, &row_key, &encoded)?;
-    let constellation = constellation_readback(publication.constellation);
-    let anchor = anchor_readback(publication.anchor);
-    Ok(UsagePersistReadback {
-        storage,
-        constellation,
-        anchor,
-    })
+            ledger_payload,
+            queued_at: Instant::now(),
+        })
 }
 
 fn put_usage_kv_and_readback(
@@ -854,39 +827,6 @@ fn put_usage_kv_and_readback(
         value_len_bytes: u64::try_from(readback.len()).unwrap_or(u64::MAX),
         value_sha256: sha256_hex(&readback),
         exact_value_match,
-    })
-}
-
-fn atomic_usage_source_readback(
-    publication: &McpUsageGroundedPublicationReport,
-    row_key: &str,
-    encoded: &[u8],
-) -> Result<McpUsageStorageReadback, ErrorData> {
-    let expected_key_hex = hex_encode(row_key.as_bytes());
-    let expected_value_len_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
-    let expected_value_sha256 = sha256_hex(encoded);
-    if publication.source_key_hex != expected_key_hex
-        || publication.source_value_len_bytes != expected_value_len_bytes
-        || publication.source_value_sha256 != expected_value_sha256
-    {
-        return Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "MCP_USAGE_ATOMIC_PHYSICAL_READBACK_MISMATCH: cf={} row_key={row_key} expected_key_hex={expected_key_hex} actual_key_hex={} expected_value_len_bytes={expected_value_len_bytes} actual_value_len_bytes={} expected_sha256={expected_value_sha256} actual_sha256={}",
-                cf::CF_KV,
-                publication.source_key_hex,
-                publication.source_value_len_bytes,
-                publication.source_value_sha256
-            ),
-        ));
-    }
-    Ok(McpUsageStorageReadback {
-        cf_name: cf::CF_KV.to_owned(),
-        row_key: row_key.to_owned(),
-        row_key_hex: publication.source_key_hex.clone(),
-        value_len_bytes: publication.source_value_len_bytes,
-        value_sha256: publication.source_value_sha256.clone(),
-        exact_value_match: true,
     })
 }
 

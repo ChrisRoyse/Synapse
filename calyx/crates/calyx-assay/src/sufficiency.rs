@@ -17,6 +17,133 @@ pub use joint::{PanelJointBasis, panel_joint_with_union_floor};
 
 pub const CALYX_ASSAY_INVALID_SCOPE: &str = "CALYX_ASSAY_INVALID_SCOPE";
 
+/// Units in the last place within which two independently-rounded `f32`
+/// estimates of the same quantity are treated as indistinguishable.
+///
+/// This is deliberately *not* a bit budget. The sufficiency contract is
+/// `sufficient <=> I(panel;anchor) >= H(anchor)` with no slack, and that stays
+/// exact. What this constant bounds is the *instrument*, not the threshold: a
+/// panel whose probe reproduces the outcome on the held-out folds computes one
+/// quantity twice, by two different code paths (`I` through the probe, `H`
+/// through `entropy_bits`), and the two results differ by their own accumulated
+/// rounding. #1945 measured that gap at 6.0e-8 bits on the real corpus — under
+/// one ulp at that magnitude — and an exact `>=` turned it into a `false`
+/// verdict on a panel that measures the outcome exactly.
+///
+/// Four ulps sits inside the 1–5 range the float-comparison literature
+/// recommends for values separated by a handful of rounding steps. Because the
+/// tolerance is `EPSILON * magnitude * ulps`, it scales with the operands: at
+/// the ~1-bit magnitudes this code sees it is ~5e-7 bits, so the 0.001-bit
+/// genuine shortfall the contract must still reject is three orders of
+/// magnitude above it and reports insufficient exactly as before.
+const SUFFICIENCY_RESOLUTION_ULPS: f32 = 4.0;
+
+/// The numerical resolution shared by two `f32` estimates at their own
+/// magnitude: `EPSILON * max(|left|,|right|) * ULPS`.
+///
+/// A relative bound rather than an absolute one, because the granularity of an
+/// `f32` changes with its exponent — an absolute epsilon that is right at 1 bit
+/// is far too coarse at 1e-3 bits and finer than the representation at 1e3.
+/// Values at or below the smallest normal magnitude fall back to that
+/// magnitude, so the bound never collapses to zero and never widens near zero.
+pub fn estimator_resolution_bits(left: f32, right: f32) -> f32 {
+    let magnitude = left.abs().max(right.abs()).max(f32::MIN_POSITIVE);
+    f32::EPSILON * magnitude * SUFFICIENCY_RESOLUTION_ULPS
+}
+
+/// Render a bits deficit so that a non-zero shortfall can never display as
+/// zero.
+///
+/// #1945's second, independent defect: the capability card printed
+/// `deficit_bits={:.6}`, under which every real deficit below 5e-7 bits renders
+/// as `0.000000`. That is not a rounding nicety — it produces "insufficient, by
+/// nothing", which is unactionable in both directions: a reader cannot tell
+/// whether the panel is short and by how much, or whether the verdict is noise.
+///
+/// Below the fixed-point resolution the value switches to scientific notation,
+/// which has no such floor. An exact zero still prints as zero, because that
+/// one is a real measurement rather than a rounded-away one.
+///
+/// Lives here rather than in the one instrument that had the bug because the
+/// trap belongs to the quantity, not to that renderer: any consumer formatting
+/// a bits deficit at fixed precision hits it.
+pub fn format_deficit_bits(value: f32, precision: usize) -> String {
+    if value == 0.0 {
+        return format!("{value:.precision$}");
+    }
+    let smallest_representable = 0.5 * 10f32.powi(-(i32::try_from(precision).unwrap_or(i32::MAX)));
+    if value.abs() < smallest_representable {
+        format!("{value:.3e}")
+    } else {
+        format!("{value:.precision$}")
+    }
+}
+
+/// Which of the three mutually exclusive numerical situations produced a
+/// sufficiency verdict. Reported alongside the verdict so a consumer can tell a
+/// panel that genuinely clears the anchor from one that ties it inside the
+/// estimator's own resolution — the two are the same `sufficient=true` and are
+/// not the same finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SufficiencyVerdictBasis {
+    /// The basis exceeds anchor entropy by more than the estimators' shared
+    /// resolution: sufficient, and resolvably so.
+    ExceedsAnchorEntropy,
+    /// The two estimates differ by no more than their shared resolution. A
+    /// difference the instrument cannot resolve is not a difference, so this is
+    /// sufficient, and the reported deficit is exactly zero.
+    WithinEstimatorResolution,
+    /// A shortfall the instrument can resolve: insufficient.
+    ShortOfAnchorEntropy,
+}
+
+impl SufficiencyVerdictBasis {
+    pub fn is_sufficient(self) -> bool {
+        !matches!(self, Self::ShortOfAnchorEntropy)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExceedsAnchorEntropy => "exceeds_anchor_entropy",
+            Self::WithinEstimatorResolution => "within_estimator_resolution",
+            Self::ShortOfAnchorEntropy => "short_of_anchor_entropy",
+        }
+    }
+}
+
+/// Decide `basis_bits >= anchor_entropy_bits` on a resolution-aware basis.
+///
+/// Returns the verdict basis, the resolution that decided it, and the deficit —
+/// which is exactly `0.0` whenever the verdict is sufficient, so no consumer can
+/// observe the self-contradicting "insufficient by nothing" state of #1945.
+pub fn sufficiency_verdict(
+    basis_bits: f32,
+    anchor_entropy_bits: f32,
+) -> (SufficiencyVerdictBasis, f32, f32) {
+    let resolution_bits = estimator_resolution_bits(basis_bits, anchor_entropy_bits);
+    let gap_bits = anchor_entropy_bits - basis_bits;
+    if gap_bits.abs() <= resolution_bits {
+        return (
+            SufficiencyVerdictBasis::WithinEstimatorResolution,
+            resolution_bits,
+            0.0,
+        );
+    }
+    if gap_bits < 0.0 {
+        return (
+            SufficiencyVerdictBasis::ExceedsAnchorEntropy,
+            resolution_bits,
+            0.0,
+        );
+    }
+    (
+        SufficiencyVerdictBasis::ShortOfAnchorEntropy,
+        resolution_bits,
+        gap_bits,
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeficitSuggestedAction {
@@ -108,6 +235,15 @@ pub struct PanelSufficiency {
     pub observation_scope: Option<ObservationScope>,
     pub sufficient: bool,
     pub deficit_bits: f32,
+    /// Which numerical situation produced `sufficient`. A `sufficient=true`
+    /// carried by `WithinEstimatorResolution` is a tie inside the instrument's
+    /// own precision, not a panel that clears the anchor with room to spare.
+    #[serde(default = "default_verdict_basis")]
+    pub verdict_basis: SufficiencyVerdictBasis,
+    /// The `f32` resolution the two estimates share at their own magnitude,
+    /// which is the quantity the verdict was decided against.
+    #[serde(default)]
+    pub estimator_resolution_bits: f32,
     pub deficits: Vec<SufficiencyDeficit>,
     pub trust: TrustTag,
     pub estimate_bound: EstimateBound,
@@ -339,8 +475,15 @@ fn panel_sufficiency_with_trust_and_basis(
     trust: TrustTag,
     context: DeficitRoutingContext,
 ) -> PanelSufficiency {
-    let deficit_bits = (anchor_entropy_bits - basis.sufficiency_basis_bits).max(0.0);
-    let sufficient = basis.sufficiency_basis_bits >= anchor_entropy_bits;
+    // #1945: the two sides are two f32 estimates of one quantity produced by
+    // two code paths. An exact `>=` between them decides the verdict on their
+    // accumulated rounding, and it fails in the direction that matters — a
+    // panel that recovers the outcome exactly is reported as falling short.
+    // The threshold itself is unchanged and carries no slack; only the
+    // instrument's resolution is accounted for.
+    let (verdict_basis, estimator_resolution_bits, deficit_bits) =
+        sufficiency_verdict(basis.sufficiency_basis_bits, anchor_entropy_bits);
+    let sufficient = verdict_basis.is_sufficient();
     let deficits = if sufficient {
         Vec::new()
     } else {
@@ -353,6 +496,8 @@ fn panel_sufficiency_with_trust_and_basis(
         observation_scope: context.observation_scope.clone(),
         sufficient,
         deficit_bits,
+        verdict_basis,
+        estimator_resolution_bits,
         deficits,
         trust,
         estimate_bound: basis.estimate_bound,
@@ -446,6 +591,10 @@ fn per_slot_gap_map(deficit_bits: f32, slots: &[SlotAttribution]) -> BTreeMap<Sl
             (slot.slot, deficit_bits * weight / total_missing_weight)
         })
         .collect()
+}
+
+fn default_verdict_basis() -> SufficiencyVerdictBasis {
+    SufficiencyVerdictBasis::ShortOfAnchorEntropy
 }
 
 fn invalid_scope(message: impl Into<String>) -> CalyxError {

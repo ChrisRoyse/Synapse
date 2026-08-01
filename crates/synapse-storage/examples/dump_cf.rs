@@ -2290,7 +2290,7 @@ fn ensemble_card_report(
     write_stdout_line(
         &mut stdout,
         format_args!(
-            "card schema_version={} source={} pid_method={} panel_lens_count={} n_samples={} anchor_entropy_bits={:.6} panel_bits={:.6} n_eff={:.4} sufficient={} deficit_bits={:.6} keep={} park={} retire={} pairs_monotonicity_floored={}",
+            "card schema_version={} source={} pid_method={} panel_lens_count={} n_samples={} anchor_entropy_bits={:.6} panel_bits={:.6} n_eff={:.4} sufficient={} deficit_bits={} keep={} park={} retire={} pairs_monotonicity_floored={}",
             card.schema_version,
             card.source,
             card.pid_method,
@@ -2300,7 +2300,7 @@ fn ensemble_card_report(
             card.panel_bits,
             card.n_eff,
             card.sufficient,
-            card.deficit_bits,
+            calyx_assay::sufficiency::format_deficit_bits(card.deficit_bits, 6),
             card.keep_count,
             card.park_count,
             card.retire_count,
@@ -2315,12 +2315,14 @@ fn ensemble_card_report(
     write_stdout_line(
         &mut stdout,
         format_args!(
-            "sufficiency basis_bits={:.9} panel_bits={:.9} anchor_entropy_bits={:.9} deficit_bits={:.9} sufficient={} trust={:?}",
+            "sufficiency basis_bits={:.9} panel_bits={:.9} anchor_entropy_bits={:.9} deficit_bits={} sufficient={} verdict_basis={} estimator_resolution_bits={:.3e} trust={:?}",
             card.sufficiency.sufficiency_basis_bits,
             card.sufficiency.panel_bits,
             card.anchor_entropy_bits,
-            card.sufficiency.deficit_bits,
+            calyx_assay::sufficiency::format_deficit_bits(card.sufficiency.deficit_bits, 9),
             card.sufficiency.sufficient,
+            card.sufficiency.verdict_basis.as_str(),
+            card.sufficiency.estimator_resolution_bits,
             card.sufficiency.trust,
         ),
     )?;

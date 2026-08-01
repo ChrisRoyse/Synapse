@@ -12,6 +12,45 @@ pub const MODALITY_COVERAGE_THRESHOLD_BITS: f64 = 0.10;
 
 const METRIC_EPSILON: f64 = 1e-12;
 
+/// Units in the last place within which `I` and `H` are treated as one value.
+///
+/// See [`dpi_resolution_bits`] for why the resolution is `f32`'s and not
+/// `f64`'s. Four ulps matches the sufficiency verdict in `calyx-assay`, so the
+/// two places that compare these same two quantities agree on when they are
+/// distinguishable.
+const DPI_RESOLUTION_ULPS: f64 = 4.0;
+
+/// The numerical resolution shared by an `I` and an `H` at their own magnitude.
+///
+/// These arrive here as `f64`, but every producer of them in this tree is an
+/// `f32` estimator — Calyx carries bits as `f32` end to end — so they are
+/// upcast `f32`s and carry `f32` rounding. Deriving the tolerance from
+/// `f64::EPSILON` would therefore be tighter than the values can support, and a
+/// fixed `METRIC_EPSILON` of 1e-12 already is: #1945 measured two estimates of
+/// one quantity differing by 6.0e-8, which is four orders of magnitude above
+/// 1e-12 and would trip the DPI guard below as a hard error.
+///
+/// This is a resolution, not slack. At the ~1-bit magnitudes these metrics
+/// carry it is ~5e-7 bits, so a real DPI violation — an estimator reporting
+/// more mutual information than the outcome contains — is still rejected at any
+/// magnitude an estimator bug would actually produce.
+fn dpi_resolution_bits(mutual_info_i: f64, entropy_h: f64) -> f64 {
+    let magnitude = mutual_info_i
+        .abs()
+        .max(entropy_h.abs())
+        .max(f64::from(f32::MIN_POSITIVE));
+    f64::from(f32::EPSILON) * magnitude * DPI_RESOLUTION_ULPS
+}
+
+/// Whether `I` exceeds `H` by more than the two estimates can resolve.
+///
+/// `I <= H` is an identity every correct estimator satisfies, so a resolvable
+/// excess is a real defect and must stay a hard error. An excess smaller than
+/// the estimators' own resolution is not evidence of one.
+pub(crate) fn violates_dpi(mutual_info_i: f64, entropy_h: f64) -> bool {
+    mutual_info_i - entropy_h > dpi_resolution_bits(mutual_info_i, entropy_h)
+}
+
 pub type ModalityId = Modality;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -261,7 +300,7 @@ fn validate_metric(metric: &'static str, value: f64) -> Result<f64> {
 }
 
 fn validate_dpi(anchor: &AnchorId, entropy_h: f64, mutual_info_i: f64) -> Result<f64> {
-    if mutual_info_i > entropy_h + METRIC_EPSILON {
+    if violates_dpi(mutual_info_i, entropy_h) {
         return Err(CalyxError {
             code: CALYX_ASSAY_INVALID_METRIC,
             message: format!(

@@ -282,7 +282,7 @@ fn validate_deficit(deficit: &DeficitMap) -> Result<()> {
         validate_metric("entropy_h", gap.entropy_h)?;
         validate_metric("mutual_info_i", gap.mutual_info_i)?;
         validate_metric("gap", gap.gap)?;
-        if gap.mutual_info_i > gap.entropy_h + METRIC_EPSILON {
+        if super::deficit_localize::violates_dpi(gap.mutual_info_i, gap.entropy_h) {
             return Err(invalid_deficit(format!(
                 "anchor '{}' violates DPI: I={} > H={}",
                 gap.anchor_class, gap.mutual_info_i, gap.entropy_h

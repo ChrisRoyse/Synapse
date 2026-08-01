@@ -549,6 +549,7 @@ impl SynapseService {
         );
         subsystems.insert("process_qos".to_owned(), Self::process_qos_health());
         subsystems.insert("daemon_drain".to_owned(), self.daemon_drain_health());
+        subsystems.insert("usage_writer".to_owned(), self.usage_writer_health());
         subsystems.insert(
             "daemon_lifecycle".to_owned(),
             crate::daemon_lifecycle::health_subsystem(),
@@ -1749,6 +1750,36 @@ impl SynapseService {
         SubsystemHealth {
             status: status.to_owned(),
             detail: Some(detail),
+            ..SubsystemHealth::default()
+        }
+    }
+
+    /// State of the dedicated grounded-usage writer (#1936).
+    ///
+    /// The queue is the daemon's evidence backlog: every tool call's outcome
+    /// passes through it on the way into the corpus. Reporting it here means
+    /// the backlog can be read on demand rather than only when a threshold log
+    /// fires — and a `failed` count above zero is a corpus that is missing
+    /// observations, which is a grounding fault and is reported as `error`
+    /// rather than folded into a healthy verdict.
+    fn usage_writer_health(&self) -> SubsystemHealth {
+        let writer = self.usage_writer();
+        let depth = writer.depth();
+        let committed = writer.committed();
+        let failed = writer.failed();
+        let status = if failed > 0 {
+            "error"
+        } else if writer.is_backlogged() {
+            "backlog"
+        } else {
+            "ok"
+        };
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail: Some(format!(
+                "queue_depth={depth} committed={committed} failed={failed} source_of_truth={}",
+                super::mcp_usage::MCP_USAGE_SOURCE_OF_TRUTH
+            )),
             ..SubsystemHealth::default()
         }
     }

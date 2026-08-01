@@ -282,6 +282,7 @@ mod timeline_facades;
 mod timeline_query;
 mod tool_profiles;
 pub(crate) mod url_redaction;
+pub(crate) mod usage_writer;
 mod verification;
 mod workspace_blackboard;
 
@@ -709,6 +710,11 @@ pub struct SynapseService {
     authority_finalizers: AuthorityFinalizerSupervisor,
     session_processes: session_lifecycle::SharedSessionProcessResources,
     terminated_sessions: session_lifecycle::SharedTerminatedSessions,
+    /// The daemon-wide grounded-usage writer (#1936). `Arc` rather than a
+    /// per-clone thread: every `SynapseService` clone enqueues onto the one
+    /// writer, so the queue depth is the daemon's real backlog and the shutdown
+    /// drain covers every observation the daemon ever accepted.
+    usage_writer: Arc<usage_writer::UsageWriterHandle>,
 }
 
 fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
@@ -803,6 +809,7 @@ impl SynapseService {
             authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
             terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            usage_writer: Arc::new(usage_writer::UsageWriterHandle::start()),
         })
     }
 
@@ -851,6 +858,7 @@ impl SynapseService {
             authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
             terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            usage_writer: Arc::new(usage_writer::UsageWriterHandle::start()),
         })
     }
 
@@ -899,6 +907,7 @@ impl SynapseService {
             authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
             terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            usage_writer: Arc::new(usage_writer::UsageWriterHandle::start()),
         })
     }
 
@@ -922,6 +931,11 @@ impl SynapseService {
 
     pub(crate) fn m3_state_handle(&self) -> SharedM3State {
         Arc::clone(&self.m3_state)
+    }
+
+    /// The daemon-wide grounded-usage writer (#1936).
+    pub(crate) fn usage_writer(&self) -> &usage_writer::UsageWriterHandle {
+        &self.usage_writer
     }
 
     pub(crate) fn drain_state_handle(&self) -> drain::DaemonDrainState {
@@ -1548,6 +1562,31 @@ impl SynapseService {
         // non-zero readback already fails closed and a later drain can consume
         // any outcome published by the retained owner.
         take_authority_join_failures(&self.authority_finalizers.join_failures, &mut errors);
+        // #1936: the grounded usage observation is committed off the response
+        // path now, so at this instant the queue may still hold observations
+        // for calls whose callers already received a success. Every authority
+        // transaction has completed above, so no further observation can be
+        // enqueued and this drain is bounded. Draining here is what keeps the
+        // move off the response path from becoming a move into oblivion: an
+        // orderly shutdown still writes everything it accepted.
+        let usage_writer = Arc::clone(&self.usage_writer);
+        let undrained = tokio::task::spawn_blocking(move || usage_writer.drain_for_shutdown())
+            .await
+            .unwrap_or_else(|error| {
+                errors.push(format!("grounded-usage writer drain task failed: {error}"));
+                -1
+            });
+        if undrained != 0 {
+            errors.push(format!(
+                "grounded-usage writer did not drain at shutdown: {undrained} observation(s) unwritten"
+            ));
+        }
+        if self.usage_writer.failed() != 0 {
+            errors.push(format!(
+                "grounded-usage writer failed to commit {} observation(s); see MCP_USAGE_WRITER_COMMIT_FAILED",
+                self.usage_writer.failed()
+            ));
+        }
         tracing::info!(
             code = "AUTHORITY_TRANSACTIONS_DRAINED",
             admission_closed = readback.admission_closed,
