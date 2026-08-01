@@ -691,7 +691,42 @@ impl SynapseService {
         // `lagging` generation are all measured facts about a generation that
         // cannot serve, and every one of them stays `error`.
         let never_measured = measured_delta.is_none() && state == "built_delta_unmeasured";
-        let health_status = if state == "built" {
+        // #1938: the active panel being healthy says nothing about the other
+        // published generations, and until this it was the only thing reported.
+        // A generation that cannot be maintained, or one whose maintenance
+        // failed, means some corpus is heading for — or already past — the bound
+        // at which its every query fails closed. That is not an `ok` vault
+        // merely because the manifest happens to point somewhere else.
+        let sweep = derived_state.last_search_sweep.as_ref();
+        let sweep_unmaintainable = sweep.map_or(0, |sweep| {
+            sweep
+                .generations
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.disposition,
+                        synapse_storage::search_sweep::GenerationDisposition::UnmaintainableNoContract
+                    )
+                })
+                .count() as u64
+        });
+        let sweep_failed = sweep.map_or(0, |sweep| {
+            sweep
+                .generations
+                .iter()
+                .filter(|entry| entry.disposition.is_failure())
+                .count() as u64
+        });
+        let sweep_lagging = sweep.map_or(0, |sweep| {
+            sweep
+                .generations
+                .iter()
+                .filter(|entry| entry.keys_to_bound() == Some(0))
+                .count() as u64
+        });
+        let health_status = if sweep_failed > 0 || sweep_unmaintainable > 0 || sweep_lagging > 0 {
+            "error"
+        } else if state == "built" {
             "ok"
         } else if never_measured {
             "starting"
@@ -714,7 +749,29 @@ impl SynapseService {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
+        let closest =
+            sweep.and_then(synapse_storage::search_sweep::SearchGenerationSweep::closest_to_bound);
         SubsystemHealth {
+            calyx_search_generations_total: sweep.map(|sweep| sweep.generations.len() as u64),
+            calyx_search_generations_maintained: sweep.map(|sweep| {
+                sweep
+                    .generations
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.disposition,
+                            synapse_storage::search_sweep::GenerationDisposition::Maintained(_)
+                        )
+                    })
+                    .count() as u64
+            }),
+            calyx_search_generations_unmaintainable: sweep.map(|_| sweep_unmaintainable),
+            calyx_search_generations_failed: sweep.map(|_| sweep_failed),
+            calyx_search_generations_closest_panel_version: closest.map(|(panel, _)| panel),
+            calyx_search_generations_closest_keys_to_bound: closest.map(|(_, keys)| keys),
+            calyx_search_generations_detail: sweep
+                .map(synapse_storage::search_sweep::SearchGenerationSweep::summary_line),
+            calyx_search_generations_swept_at_unix_ms: derived_state.last_search_sweep_unix_ms,
             status: health_status.to_owned(),
             detail: Some(format!(
                 "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} delta_changed_keys={:?} delta_measured_at_unix_ms={:?}                  delta_composition={} max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",

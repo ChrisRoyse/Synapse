@@ -453,9 +453,11 @@ pub trait StorageBackend: Send + Sync {
     fn spawn_gc_task(&self) -> StorageResult<gc::GcTask>;
     fn spawn_checkpoint_task(&self) -> StorageResult<gc::GcTask>;
     fn spawn_derived_state_task(&self) -> StorageResult<gc::GcTask>;
+    /// Keeps **every** published search generation inside its reconciliation
+    /// bound, not only the active panel's (#1938).
     fn maintain_calyx_search_generation(
         &self,
-    ) -> StorageResult<synapse_calyx::SearchGenerationMaintenanceReport>;
+    ) -> StorageResult<crate::search_sweep::SearchGenerationSweep>;
     fn measure_calyx_lens_coverage(
         &self,
         max_records: usize,
@@ -476,6 +478,30 @@ pub trait StorageBackend: Send + Sync {
     fn calyx_search_generation_status(
         &self,
     ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus>;
+    /// The same state for one **named** panel generation, active or not, with
+    /// the changed-key delta optionally measured (#1938).
+    ///
+    /// `measure_delta = true` is the expensive path: it scans the `Base` CF and
+    /// every indexed slot CF exactly as the query path's delta collector does,
+    /// so the number is the one a query will be judged against rather than a
+    /// proxy for it. Never call it from a request path.
+    fn calyx_search_generation_status_for_panel(
+        &self,
+        panel_version: u32,
+        measure_delta: bool,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus>;
+    /// One constellation's `Base` and slot row MVCC sequences (#1935), the fact
+    /// set that identifies a writer which staged a slot row without its own
+    /// `Base` row.
+    fn diagnose_constellation_row_sequences(
+        &self,
+        cx_id: calyx_core::CxId,
+    ) -> StorageResult<synapse_calyx::ConstellationRowSequences>;
+    /// Keys one native CF's MVCC changed-key history reports after `after_seq`
+    /// (#1935), for comparison against that CF's plain row count.
+    fn calyx_changed_key_count_after(&self, cf_name: &str, after_seq: u64) -> StorageResult<u64>;
+    /// Rows one native Calyx CF holds at the latest snapshot (#1935).
+    fn calyx_cf_row_count(&self, cf_name: &str) -> StorageResult<u64>;
     /// Publishes the lowered guard-threshold artifact through the vault's own
     /// single producer (#1885).
     ///
@@ -1968,21 +1994,137 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one sweep over one discovered generation set; the discovery, the per-generation disposition and the accounting are a single policy, and splitting them is what let the set being maintained drift away from the set that exists"
+    )]
     fn maintain_calyx_search_generation(
         &self,
-    ) -> StorageResult<synapse_calyx::SearchGenerationMaintenanceReport> {
+    ) -> StorageResult<crate::search_sweep::SearchGenerationSweep> {
+        use crate::search_sweep::{
+            GenerationDisposition, PanelGenerationMaintenance, SearchGenerationSweep,
+        };
+
         self.vault.with_vault(
             "calyx_search_generation",
-            "maintain the persisted Calyx search generation",
+            "maintain every published Calyx search generation",
             true,
             |vault| {
-                vault.maintain_search_generation().map_err(|source| {
+                let started = std::time::Instant::now();
+                // The set owed maintenance is what is *published on disk*, not
+                // what the manifest points at (#1938). Reading the active-panel
+                // pointer to answer "which generations exist" is what left every
+                // non-active generation with no maintainer.
+                let published = vault.published_search_generations().map_err(|source| {
                     calyx_write_failed(
                         "calyx_search_generation",
-                        "maintain the persisted Calyx search generation",
+                        "enumerate the published Calyx search generations",
                         &source,
                     )
-                })
+                })?;
+
+                // The active panel is swept even when it has no generation yet,
+                // because that is the InitialBuild case: a panel that has never
+                // been built has no directory to be discovered by.
+                let active_panel_version = vault.active_panel_version().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_search_generation",
+                        "read the active durable panel for the search-generation sweep",
+                        &source,
+                    )
+                })?;
+                let mut targets = published.panels.clone();
+                if let Some(active) = active_panel_version
+                    && !targets.contains(&active)
+                {
+                    targets.push(active);
+                }
+                targets.sort_unstable();
+                targets.dedup();
+
+                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                let mut generations = Vec::with_capacity(targets.len());
+                for panel_version in targets {
+                    let is_active_panel = active_panel_version == Some(panel_version);
+                    // A non-active generation can only be rebuilt from its own
+                    // code-declared contract. Resolving it here, before the
+                    // attempt, turns "no contract" from a rebuild failure into a
+                    // named terminal state (#1938 ask 2).
+                    let supplied =
+                        syn_active_panel_contract(panel_version, created_at_ms)?.map(|contract| {
+                            SynapseCalyxPanelState {
+                                panel: contract.panel,
+                                registry: contract.registry,
+                                registry_snapshot: None,
+                            }
+                        });
+                    if supplied.is_none() && !is_active_panel {
+                        tracing::warn!(
+                            code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
+                            panel_version,
+                            index_root = %published.index_root.display(),
+                            "a search generation is published for a panel version with no \
+                             code-declared slot contract; nothing can rebuild it and no query can \
+                             measure through it, so it will never re-enter its reconciliation \
+                             bound. Retire the generation directory or declare the panel contract"
+                        );
+                        generations.push(PanelGenerationMaintenance {
+                            panel_version,
+                            is_active_panel,
+                            disposition: GenerationDisposition::UnmaintainableNoContract,
+                        });
+                        continue;
+                    }
+                    // One generation's failure must not cost every other
+                    // generation its maintenance — but it is still a failure of
+                    // the pass, recorded against the exact panel that produced
+                    // it rather than collapsed into a single pass-level error.
+                    let disposition = match vault
+                        .maintain_search_generation_for_panel(panel_version, supplied.as_ref())
+                    {
+                        Ok(report) => GenerationDisposition::Maintained(Box::new(report)),
+                        Err(source) => {
+                            tracing::error!(
+                                code = "STORAGE_SEARCH_GENERATION_MAINTENANCE_FAILED",
+                                panel_version,
+                                is_active_panel,
+                                failure_code = %source.code,
+                                detail = %source.message,
+                                remediation = %source.remediation,
+                                "maintaining one published search generation failed; the sweep \
+                                 continues with the remaining generations and the pass is \
+                                 recorded as failed"
+                            );
+                            GenerationDisposition::Failed {
+                                code: source.code.to_string(),
+                                detail: format!("{}: {}", source.message, source.remediation),
+                            }
+                        }
+                    };
+                    generations.push(PanelGenerationMaintenance {
+                        panel_version,
+                        is_active_panel,
+                        disposition,
+                    });
+                }
+
+                let sweep = SearchGenerationSweep {
+                    index_root: published.index_root.display().to_string(),
+                    active_panel_version,
+                    generations,
+                    unrecognized_index_entries: published.unrecognized,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                };
+                tracing::info!(
+                    code = "STORAGE_SEARCH_GENERATION_SWEEP_COMPLETED",
+                    generations = sweep.generations.len(),
+                    any_failed = sweep.any_failed(),
+                    closest_to_bound = ?sweep.closest_to_bound(),
+                    elapsed_ms = sweep.elapsed_ms,
+                    detail = %sweep.summary_line(),
+                    "swept every published Calyx search generation"
+                );
+                Ok(sweep)
             },
         )
     }
@@ -2140,6 +2282,83 @@ impl StorageBackend for CalyxBackend {
                         "read Calyx persisted search generation status",
                         &source,
                     )
+                })
+            },
+        )
+    }
+
+    fn calyx_search_generation_status_for_panel(
+        &self,
+        panel_version: u32,
+        measure_delta: bool,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus> {
+        self.with_vault(
+            "<calyx-vault>",
+            "read one panel's Calyx persisted search generation status",
+            false,
+            |vault| {
+                vault
+                    .search_generation_status_for_panel(panel_version, measure_delta)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "<calyx-vault>",
+                            "read one panel's Calyx persisted search generation status",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn diagnose_constellation_row_sequences(
+        &self,
+        cx_id: calyx_core::CxId,
+    ) -> StorageResult<synapse_calyx::ConstellationRowSequences> {
+        self.with_vault(
+            "<calyx-vault>",
+            "read one constellation's Base and slot row MVCC sequences",
+            false,
+            |vault| {
+                vault
+                    .diagnose_constellation_row_sequences(cx_id)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "<calyx-vault>",
+                            "read one constellation's Base and slot row MVCC sequences",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn calyx_changed_key_count_after(&self, cf_name: &str, after_seq: u64) -> StorageResult<u64> {
+        self.with_vault(
+            "<calyx-vault>",
+            "count a native CF's MVCC changed keys",
+            false,
+            |vault| {
+                vault
+                    .changed_key_count_after(cf_name, after_seq)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "<calyx-vault>",
+                            "count a native CF's MVCC changed keys",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn calyx_cf_row_count(&self, cf_name: &str) -> StorageResult<u64> {
+        self.with_vault(
+            "<calyx-vault>",
+            "count a native Calyx CF's rows",
+            false,
+            |vault| {
+                vault.cf_row_count(cf_name).map_err(|source| {
+                    calyx_write_failed("<calyx-vault>", "count a native Calyx CF's rows", &source)
                 })
             },
         )

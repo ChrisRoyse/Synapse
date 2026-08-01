@@ -308,13 +308,52 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_remediation: Option<String>,
 
+    // --- every published search generation (issue #1938) ---
+    // The fields above describe exactly one generation: the active panel's.
+    // That was the whole defect. #1668 made non-active panels queryable, and
+    // every MCP tool call advances the vault sequence, so a non-active
+    // generation's reconciliation delta grows continuously until its queries
+    // fail closed — invisibly, because nothing reported it. These fields report
+    // the bound-distance for EVERY published generation, so "this panel is about
+    // to stop answering" is visible before the first failed query.
+    /// Published search generations the unattended sweep considered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_total: Option<u64>,
+    /// Generations swept without a failure and inside their bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_maintained: Option<u64>,
+    /// Generations whose panel version has no code-declared slot contract, so
+    /// no rebuild can ever return them to their bound. A declared terminal
+    /// state, not a transient one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_unmaintainable: Option<u64>,
+    /// Generations whose maintenance failed on the last sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_failed: Option<u64>,
+    /// The panel holding the least remaining headroom to the reconciliation
+    /// bound. The vault is as close to a failing query as its closest
+    /// generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_closest_panel_version: Option<u32>,
+    /// Changed keys that panel can still absorb before its queries fail closed.
+    /// Zero means the bound is already crossed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_closest_keys_to_bound: Option<u64>,
+    /// One line per generation: version, disposition, action, delta, headroom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_swept_at_unix_ms: Option<u64>,
+
     // --- unattended derived-state maintenance (issues #1891, #1894) ---
     // The generation above is only ever `built` because something keeps it that
     // way. These fields report whether that something is running and what it
     // last decided, so a maintainer that has silently stopped is visible before
     // the generation it maintains expires.
     /// `initial_build` | `refresh_over_existing` | `none_needed` |
-    /// `deferred_by_interval` | `no_active_panel`.
+    /// `deferred_by_interval`, for the **active panel's** generation. Every
+    /// published generation's outcome is in `calyx_search_generations_detail`
+    /// (#1938); this field is the active one so it means what it always meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_search_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

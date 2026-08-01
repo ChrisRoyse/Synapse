@@ -635,8 +635,10 @@ pub enum SearchGenerationMaintenanceAction {
     /// A build was due but was held back by
     /// [`SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS`].
     DeferredByInterval,
-    /// No active durable panel is published, so no generation can exist yet.
-    NoActivePanel,
+    // There is deliberately no `NoActivePanel` action. Maintenance is addressed
+    // by generation, not by the active-panel pointer (#1938); "no active panel
+    // is published" is a fact about the vault that the sweep reports as
+    // `active_panel_version: None`, not an outcome of maintaining a generation.
 }
 
 impl SearchGenerationMaintenanceAction {
@@ -647,7 +649,6 @@ impl SearchGenerationMaintenanceAction {
             Self::RefreshOverExisting => "refresh_over_existing",
             Self::NoneNeeded => "none_needed",
             Self::DeferredByInterval => "deferred_by_interval",
-            Self::NoActivePanel => "no_active_panel",
         }
     }
 
@@ -657,6 +658,42 @@ impl SearchGenerationMaintenanceAction {
     pub const fn is_destructive(self) -> bool {
         matches!(self, Self::RefreshOverExisting)
     }
+}
+
+/// One constellation's `Base` and slot row MVCC sequences (issue #1935).
+///
+/// The fact set that identifies which writer left a slot row newer than its own
+/// `Base` row. Read straight off the version chains, never derived.
+#[derive(Clone, Debug)]
+pub struct ConstellationRowSequences {
+    pub cx_id: String,
+    pub latest_seq: u64,
+    /// The panel the `Base` row declares, when the row is present.
+    pub panel_version: Option<u32>,
+    pub base_row_present: bool,
+    pub base_row_seq: Option<u64>,
+    /// `(slot id, row sequence)` for every slot the `Base` row declares, in slot
+    /// order. `None` means the slot is declared but has no visible row.
+    pub slot_row_seqs: Vec<(u16, Option<u64>)>,
+}
+
+/// The search generations physically published under a vault's index root
+/// (issue #1938).
+///
+/// The set that exists is discovered from disk, never inferred from the active
+/// panel pointer: those are different questions, and answering the second when
+/// the first was asked is what left non-active generations with no maintainer.
+#[derive(Clone, Debug, Default)]
+pub struct PublishedSearchGenerations {
+    /// `<vault_dir>/idx/search`, reported so an operator can go look even when
+    /// the listing is empty.
+    pub index_root: std::path::PathBuf,
+    /// Panel versions holding a published `manifest.json`, ascending.
+    pub panels: Vec<u32>,
+    /// Entries under the index root that are not a published panel generation.
+    /// Reported rather than skipped: a sweep that silently narrows its own scope
+    /// is indistinguishable from a sweep that covered everything.
+    pub unrecognized: Vec<String>,
 }
 
 /// One unattended search-generation maintenance pass, with the state read back
@@ -3061,30 +3098,26 @@ impl SynapseCalyxVault {
     pub fn search_generation_status(
         &self,
     ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
-        self.search_generation_status_inner(false)
-    }
-
-    /// The same report, with the generation's changed-key delta actually
-    /// measured (issue #1891).
-    ///
-    /// This is the expensive path: it scans the `Base` CF and every indexed
-    /// slot CF for keys committed after the generation's `base_seq`, exactly as
-    /// the query path's delta collector does, so the number it reports is the
-    /// number a query will be judged against rather than a proxy for it.
-    ///
-    /// It exists as a separate entry point because that scan is far too heavy to
-    /// run on every `health` request. The unattended maintainer calls it on its
-    /// tick and publishes the result; `health` reports that published
-    /// measurement with its age.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured error when the generation state cannot be read or
-    /// the changed-key scan fails.
-    pub fn search_generation_status_with_delta(
-        &self,
-    ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
-        self.search_generation_status_inner(true)
+        let vault_dir = self.config.vault_dir.as_path();
+        let (panel_version, panel_state_error) = match load_vault_panel_state(vault_dir) {
+            Ok(state) => (Some(state.panel.version), None),
+            Err(error) if error.code == CALYX_NO_ACTIVE_PANEL => (
+                None,
+                Some(format!(
+                    "no active durable panel is published, so no search generation can exist: {}",
+                    error.message
+                )),
+            ),
+            Err(error) => (None, Some(format!("{}: {}", error.code, error.message))),
+        };
+        let Some(panel_version) = panel_version else {
+            return Ok(search_generation_status_without_panel(
+                panel_state_error,
+                self.vault.latest_seq(),
+                calyx_search::MAX_RECONCILED_DELTA_KEYS as u64,
+            ));
+        };
+        self.search_generation_status_for_panel(panel_version, false)
     }
 
     /// Counts the distinct constellations changed since `base_seq` for exactly
@@ -3130,37 +3163,35 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// The generation report for **one named panel**, whether or not that
+    /// panel is the vault's active one (issue #1938).
+    ///
+    /// Every read here is already panel-scoped on disk
+    /// (`idx/search/panel_{version:010}/`) and in the delta measurement, so
+    /// naming the panel is the whole difference. What the active-panel entry
+    /// points add on top is resolving *which* version to ask about; that
+    /// resolution is not part of reading a generation's state, and conflating
+    /// the two is why a non-active generation's state was unreportable and
+    /// therefore unmaintained.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the rebuild-required marker exists but
+    /// cannot be parsed, when the manifest exists but cannot be hashed, or when
+    /// a requested delta measurement fails.
     #[allow(
         clippy::too_many_lines,
         reason = "one status read over one pinned view; splitting it would let the manifest facts and the delta measurement come from different snapshots, which is the class of drift this surface exists to report"
     )]
-    fn search_generation_status_inner(
+    pub fn search_generation_status_for_panel(
         &self,
+        panel_version: u32,
         measure_delta: bool,
     ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
         let vault_dir = self.config.vault_dir.as_path();
         let vault_latest_seq = self.vault.latest_seq();
         let max_reconciled_delta_keys = calyx_search::MAX_RECONCILED_DELTA_KEYS as u64;
-
-        let (panel_version, panel_state_error) = match load_vault_panel_state(vault_dir) {
-            Ok(state) => (Some(state.panel.version), None),
-            Err(error) if error.code == CALYX_NO_ACTIVE_PANEL => (
-                None,
-                Some(format!(
-                    "no active durable panel is published, so no search generation can exist: {}",
-                    error.message
-                )),
-            ),
-            Err(error) => (None, Some(format!("{}: {}", error.code, error.message))),
-        };
-
-        let Some(panel_version) = panel_version else {
-            return Ok(search_generation_status_without_panel(
-                panel_state_error,
-                vault_latest_seq,
-                max_reconciled_delta_keys,
-            ));
-        };
+        let panel_state_error = None;
 
         let manifest = calyx_search::manifest_path(vault_dir, panel_version);
         let manifest_present = manifest.is_file();
@@ -3259,10 +3290,257 @@ impl SynapseCalyxVault {
         })
     }
 
-    /// Keeps the persisted search generation inside its freshness budget,
-    /// unattended (issue #1891, ask 2).
+    /// The MVCC sequence of one constellation's `Base` row and of every slot
+    /// row it declares (issue #1935).
     ///
-    /// Before this, the generation could only ever be created or repaired by a
+    /// `CALYX_SEARCH_DELTA_INCOMPLETE` reports that a slot row changed after a
+    /// generation's base sequence while its `Base` row did not. That names the
+    /// broken invariant but not the writer that broke it. The shape of these
+    /// sequences does:
+    ///
+    /// * every declared slot at one sequence with `Base` older — a
+    ///   whole-constellation writer staged the slot rows and skipped `Base`;
+    /// * one slot newer than the rest — a single-slot writer that did not
+    ///   restate the `Base` integrity record (#1888);
+    /// * `Base` at or after every slot — this constellation is not the cause.
+    ///
+    /// Read-only, one constellation, no scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the row sequences cannot be read — which
+    /// includes a vault opened in latest-only recovery mode, where per-row
+    /// sequences do not exist and reporting one would be a fabrication.
+    pub fn diagnose_constellation_row_sequences(
+        &self,
+        cx_id: calyx_core::CxId,
+    ) -> Result<ConstellationRowSequences, SynapseCalyxError> {
+        let latest_seq = self.vault.latest_seq();
+        let base_key = calyx_aster::cf::base_key(cx_id);
+        let slot_key = calyx_aster::cf::slot_key(cx_id);
+        let seq_of = |cf: calyx_aster::cf::ColumnFamily, key: &[u8]| {
+            self.vault.seq_for_key_at(latest_seq, cf, key).map_err(|e| {
+                SynapseCalyxError::from_calyx("read a constellation row's MVCC sequence", &e)
+            })
+        };
+        let base_row_seq = seq_of(calyx_aster::cf::ColumnFamily::Base, &base_key)?;
+        let base_row_present = self
+            .vault
+            .read_cf_at(latest_seq, calyx_aster::cf::ColumnFamily::Base, &base_key)
+            .map_err(|e| SynapseCalyxError::from_calyx("read a constellation Base row", &e))?
+            .is_some();
+        // The declared slot set comes from the Base row itself, so this reports
+        // the slots this constellation actually claims rather than a panel's
+        // slot list, which may have moved on.
+        let mut slot_row_seqs = Vec::new();
+        let mut panel_version = None;
+        if let Some(bytes) = self
+            .vault
+            .read_cf_at(latest_seq, calyx_aster::cf::ColumnFamily::Base, &base_key)
+            .map_err(|e| SynapseCalyxError::from_calyx("read a constellation Base row", &e))?
+        {
+            // The slot membership comes from the row's own **slot-hash table**,
+            // not from the decoded `Constellation`: a decoded Base row carries
+            // no slot vectors at all (#1894), so its `slots` map is empty and
+            // enumerating it would report every constellation as declaring
+            // nothing. The hash table is the durable membership record, and it
+            // is also the integrity record a qualified slot write must restate
+            // (#1888) — so it is the right source of truth for this question.
+            let (constellation, slot_hashes) =
+                calyx_aster::vault::encode::decode_constellation_base_with_slot_hashes(&bytes)
+                    .map_err(|e| {
+                        SynapseCalyxError::from_calyx("decode a Base row with its slot hashes", &e)
+                    })?;
+            panel_version = Some(constellation.panel_version);
+            for (slot, _) in slot_hashes {
+                slot_row_seqs.push((
+                    slot.get(),
+                    seq_of(calyx_aster::cf::ColumnFamily::slot(slot), &slot_key)?,
+                ));
+            }
+        }
+        Ok(ConstellationRowSequences {
+            cx_id: cx_id.to_string(),
+            latest_seq,
+            panel_version,
+            base_row_present,
+            base_row_seq,
+            slot_row_seqs,
+        })
+    }
+
+    /// How many keys of one native column family the MVCC changed-key history
+    /// reports as changed after `after_seq` (issue #1935).
+    ///
+    /// Exposed next to a plain row count so the two can be compared. The
+    /// changed-key history is the input to every generation-freshness decision,
+    /// and if it reports a whole column family as changed then those decisions
+    /// are being made on a quantity that is not "writes since".
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the CF name is not a native column
+    /// family, or when the history cannot prove the requested range.
+    pub fn changed_key_count_after(
+        &self,
+        cf_name: &str,
+        after_seq: u64,
+    ) -> Result<u64, SynapseCalyxError> {
+        let cf = calyx_aster::cf::ColumnFamily::from_name(cf_name).ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_UNKNOWN_COLUMN_FAMILY",
+                format!("{cf_name} is not a native Calyx column family"),
+                "name a native column family (base, anchors, scalars, slot_<n>, kv, ...)",
+            )
+        })?;
+        let snapshot = self.vault.pin_reader(Freshness::FreshDerived, 30_000);
+        let keys = self
+            .vault
+            .changed_cf_keys_after_snapshot(snapshot, cf, after_seq);
+        let _released = self.vault.release_reader(snapshot.lease().id());
+        let keys = keys.map_err(|error| {
+            SynapseCalyxError::from_calyx("read the MVCC changed-key history", &error)
+        })?;
+        Ok(keys.len() as u64)
+    }
+
+    /// Rows one native column family holds at the latest snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the CF name is not a native column
+    /// family or the scan fails.
+    pub fn cf_row_count(&self, cf_name: &str) -> Result<u64, SynapseCalyxError> {
+        let cf = calyx_aster::cf::ColumnFamily::from_name(cf_name).ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_UNKNOWN_COLUMN_FAMILY",
+                format!("{cf_name} is not a native Calyx column family"),
+                "name a native column family (base, anchors, scalars, slot_<n>, kv, ...)",
+            )
+        })?;
+        let rows = self.vault.scan_cf_latest(cf).map_err(|error| {
+            SynapseCalyxError::from_calyx("scan a native column family", &error)
+        })?;
+        Ok(rows.len() as u64)
+    }
+
+    /// The panel version the vault manifest currently publishes as active, or
+    /// `None` when no active panel is published.
+    ///
+    /// `None` is a real, expected state (a vault before boot publication), not
+    /// an error — but every *other* failure to read the durable panel state is,
+    /// because then "which panel is active" would be a guess.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the durable panel state exists but
+    /// cannot be read or decoded.
+    pub fn active_panel_version(&self) -> Result<Option<u32>, SynapseCalyxError> {
+        match load_vault_panel_state(&self.config.vault_dir) {
+            Ok(state) => Ok(Some(state.panel.version)),
+            Err(error) if error.code == CALYX_NO_ACTIVE_PANEL => Ok(None),
+            Err(error) => Err(SynapseCalyxError::from_calyx(
+                "read the durable active panel state",
+                &error,
+            )),
+        }
+    }
+
+    /// Every panel generation that has a **published search generation on
+    /// disk**, discovered by reading the index root rather than by asking the
+    /// manifest which panel is active (issue #1938).
+    ///
+    /// This is the set that has to be *kept* usable. Before this, the only
+    /// generation anything could name was the active panel's, so a generation
+    /// built for any other panel had no maintainer and could only rot: every
+    /// MCP tool call appends an `mcp-usage` row, which advances the vault
+    /// sequence, which grows every generation's reconciliation delta — including
+    /// the ones nothing was watching. The transcript corpus was reachable for
+    /// about two hours after it was built and then required a break-glass
+    /// rebuild to use again.
+    ///
+    /// Discovery is by directory listing because the directory *is* the
+    /// publication: `rebuild_search_indexes_for_panel` writes
+    /// `idx/search/panel_{version:010}/manifest.json` and nothing else records
+    /// that a generation exists. Any entry under the index root that is not a
+    /// recognised panel directory is returned in `unrecognized` rather than
+    /// dropped, so an unreadable or unexpected artifact is a reported fact and
+    /// never a silently narrower sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the index root exists but cannot be
+    /// listed. An index root that does not exist is not an error: it is the
+    /// state "no generation has ever been published", which the empty result
+    /// reports exactly.
+    pub fn published_search_generations(
+        &self,
+    ) -> Result<PublishedSearchGenerations, SynapseCalyxError> {
+        let index_root = self.config.vault_dir.join("idx").join("search");
+        let entries = match std::fs::read_dir(&index_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PublishedSearchGenerations::default());
+            }
+            Err(error) => {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_INDEX_ROOT_UNREADABLE",
+                    format!(
+                        "list the persisted search index root {}: {error}",
+                        index_root.display()
+                    ),
+                    "the set of published search generations cannot be enumerated, so the \
+                     unattended maintainer cannot know which generations it owes maintenance to; \
+                     check the vault directory's permissions and that the volume is mounted",
+                ));
+            }
+        };
+        let mut panels = Vec::new();
+        let mut unrecognized = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_INDEX_ROOT_UNREADABLE",
+                    format!(
+                        "read an entry of the persisted search index root {}: {error}",
+                        index_root.display()
+                    ),
+                    "the set of published search generations cannot be enumerated; check the \
+                     vault directory's permissions and that the volume is mounted",
+                )
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(digits) = name.strip_prefix("panel_") else {
+                unrecognized.push(name);
+                continue;
+            };
+            let Ok(version) = digits.parse::<u32>() else {
+                unrecognized.push(name);
+                continue;
+            };
+            // A directory without a manifest is not a published generation: the
+            // rebuild creates the directory before it publishes, so treating the
+            // directory alone as a publication would charge maintenance for a
+            // generation that has never existed.
+            if calyx_search::manifest_path(&self.config.vault_dir, version).is_file() {
+                panels.push(version);
+            } else {
+                unrecognized.push(format!("{name} (no manifest.json)"));
+            }
+        }
+        panels.sort_unstable();
+        unrecognized.sort();
+        Ok(PublishedSearchGenerations {
+            index_root,
+            panels,
+            unrecognized,
+        })
+    }
+
+    /// Keeps **one named** persisted search generation inside its freshness
+    /// budget, unattended (issue #1891 ask 2; extended to any panel by #1938).
+    ///
+    /// Before #1891, the generation could only ever be created or repaired by a
     /// human-driven break-glass ceremony. On the production vault that ceremony
     /// had run exactly once: the generation was built at seq 55908 and then
     /// silently allowed to expire, drifting 13,685 sequences past the bounded
@@ -3270,8 +3548,23 @@ impl SynapseCalyxVault {
     /// nothing brought it back. An always-on capability whose only repair is a
     /// manual ceremony is off by default, forever.
     ///
+    /// **There is deliberately no active-panel-only entry point.** #1938 was the
+    /// same defect one level up: maintenance was addressed by the active-panel
+    /// pointer rather than by the generation, so every generation the pointer did
+    /// not name had no maintainer and could only rot. A convenience wrapper that
+    /// maintains "the" generation would reintroduce exactly that. The caller
+    /// enumerates what exists ([`Self::published_search_generations`]) and asks
+    /// for each one by name.
+    ///
+    /// `supplied` is that panel's slot contract, which the caller resolves
+    /// because reconstructing it lives in `synapse-storage`, the crate that
+    /// declares the panels. `None` means "this is the active panel", exactly as
+    /// on [`Self::rebuild_search_indexes_for_panel`]; a non-active panel with no
+    /// contract cannot be rebuilt and must not be asked to be — the caller
+    /// classifies that case rather than discovering it as a rebuild failure.
+    ///
     /// The two builds are classified separately, because they are not the same
-    /// operation (ask 3): an **initial build** over an absent generation
+    /// operation (#1891 ask 3): an **initial build** over an absent generation
     /// replaces nothing and is non-destructive, whereas a **refresh over an
     /// existing generation** republishes a live artifact. Both are admitted
     /// here, but they are reported and logged distinctly so the destructive one
@@ -3280,51 +3573,48 @@ impl SynapseCalyxVault {
     /// The pass is triple-bounded so it can run on a periodic tick without
     /// becoming the thing that starves the vault:
     ///
-    /// * it does nothing at all while the seq lag is inside
-    ///   [`SEARCH_GENERATION_REFRESH_SEQ_LAG`],
-    ///   which is half the query-time reconciliation limit, so the generation is
-    ///   refreshed *before* recall dies rather than after;
+    /// * it does nothing at all while the measured changed-key delta is inside
+    ///   [`SEARCH_GENERATION_REFRESH_DELTA_KEYS`], which is half the query-time
+    ///   reconciliation limit, so the generation is refreshed *before* recall
+    ///   dies rather than after;
     /// * it refuses to build twice inside
-    ///   [`SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS`];
-    /// * it never builds when no active durable panel is published, because
-    ///   there is nothing to build against.
+    ///   [`SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS`] — a per-generation bound,
+    ///   read from that generation's own manifest mtime, so one hot corpus
+    ///   cannot spend another's maintenance budget;
+    /// * it never builds a panel it has no contract for.
     ///
-    /// The result is verified by re-reading the generation state off disk after
-    /// the build, not by trusting the build's own return value.
+    /// The result is verified by re-reading **that panel's** generation state off
+    /// disk after the build, not by trusting the build's own return value.
     ///
     /// # Errors
     ///
     /// Returns a structured error when the generation state cannot be read, or
     /// when a build it decided to run fails. It does not error merely because
     /// no build was needed.
+    pub fn maintain_search_generation_for_panel(
+        &self,
+        panel_version: u32,
+        supplied: Option<&VaultPanelState>,
+    ) -> Result<SearchGenerationMaintenanceReport, SynapseCalyxError> {
+        let started = std::time::Instant::now();
+        let before = self.search_generation_status_for_panel(panel_version, true)?;
+        self.decide_and_maintain(panel_version, before, supplied, started)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the decision and its five named outcomes are one policy; splitting them would separate a branch from the state it was decided against, which is exactly how the generation was allowed to expire unobserved"
     )]
-    pub fn maintain_search_generation(
+    fn decide_and_maintain(
         &self,
+        panel_version: u32,
+        before: SynapseCalyxSearchGenerationStatus,
+        supplied: Option<&VaultPanelState>,
+        started: std::time::Instant,
     ) -> Result<SearchGenerationMaintenanceReport, SynapseCalyxError> {
-        let started = std::time::Instant::now();
-        // The delta-measuring path: the decision must be made on the same
-        // quantity the query-time limit is enforced on (#1891).
-        let before = self.search_generation_status_with_delta()?;
         let elapsed = |started: std::time::Instant| {
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
         };
-
-        let Some(panel_version) = before.panel_version else {
-            return Ok(SearchGenerationMaintenanceReport {
-                action: SearchGenerationMaintenanceAction::NoActivePanel,
-                reason: before
-                    .panel_state_error
-                    .clone()
-                    .unwrap_or_else(|| "no active durable panel is published".to_owned()),
-                before,
-                after: None,
-                elapsed_ms: elapsed(started),
-            });
-        };
-
         // Treat an unmeasured delta as unbounded rather than as zero: a missing
         // measurement must never read as "nothing to do".
         let delta_keys = before.delta_changed_keys.unwrap_or(u64::MAX);
@@ -3435,11 +3725,14 @@ impl SynapseCalyxVault {
             already_unusable,
             "building the persisted search generation unattended"
         );
-        self.rebuild_search_indexes(panel_version)?;
+        self.rebuild_search_indexes_for_panel(panel_version, supplied)?;
 
         // Source of truth is the manifest on disk, re-read independently of the
-        // build that just claimed to write it.
-        let after = self.search_generation_status_with_delta()?;
+        // build that just claimed to write it. Scoped to the exact panel that
+        // was built: reading the *active* panel's state back after building a
+        // non-active generation would report a healthy generation that has
+        // nothing to do with the work just performed.
+        let after = self.search_generation_status_for_panel(panel_version, true)?;
         tracing::info!(
             code = "SYNAPSE_CALYX_SEARCH_GENERATION_MAINTENANCE_COMMITTED",
             panel_version,

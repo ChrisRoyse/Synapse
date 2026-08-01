@@ -12,6 +12,7 @@ pub mod maintenance;
 pub mod panel_coverage;
 mod pressure;
 pub mod routines;
+pub mod search_sweep;
 pub mod timeline;
 
 use std::fmt;
@@ -691,15 +692,18 @@ impl Db {
         self.backend.spawn_derived_state_task()
     }
 
-    /// Runs one unattended search-generation maintenance decision and build.
+    /// Sweeps **every** published search generation, deciding and building each
+    /// one against its own freshness budget (#1938).
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the generation state cannot be read or a
-    /// build it decided to run fails.
+    /// Returns a storage error when the published set cannot be enumerated or
+    /// the active panel state cannot be read. A failure maintaining one
+    /// generation is recorded on that generation's entry and does not stop the
+    /// remaining generations from being maintained.
     pub fn maintain_calyx_search_generation(
         &self,
-    ) -> StorageResult<synapse_calyx::SearchGenerationMaintenanceReport> {
+    ) -> StorageResult<crate::search_sweep::SearchGenerationSweep> {
         self.backend.maintain_calyx_search_generation()
     }
 
@@ -1063,6 +1067,61 @@ impl Db {
         &self,
     ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus> {
         self.backend.calyx_search_generation_status()
+    }
+
+    /// The same state for one **named** panel generation, active or not (#1938).
+    ///
+    /// `measure_delta = true` scans the `Base` CF and every indexed slot CF; it
+    /// is a maintenance-path read, never a request-path one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::calyx_search_generation_status`], plus a failure of the
+    /// changed-key scan when one was requested.
+    pub fn calyx_search_generation_status_for_panel(
+        &self,
+        panel_version: u32,
+        measure_delta: bool,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchGenerationStatus> {
+        self.backend
+            .calyx_search_generation_status_for_panel(panel_version, measure_delta)
+    }
+
+    /// One constellation's `Base` and slot row MVCC sequences (#1935).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row sequences cannot be read.
+    pub fn diagnose_constellation_row_sequences(
+        &self,
+        cx_id: calyx_core::CxId,
+    ) -> StorageResult<synapse_calyx::ConstellationRowSequences> {
+        self.backend.diagnose_constellation_row_sequences(cx_id)
+    }
+
+    /// Keys one native CF's MVCC changed-key history reports after `after_seq`
+    /// (#1935).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the CF is unknown or the history cannot
+    /// prove the range.
+    pub fn calyx_changed_key_count_after(
+        &self,
+        cf_name: &str,
+        after_seq: u64,
+    ) -> StorageResult<u64> {
+        self.backend
+            .calyx_changed_key_count_after(cf_name, after_seq)
+    }
+
+    /// Rows one native Calyx CF holds at the latest snapshot (#1935).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the CF is unknown or the scan fails.
+    pub fn calyx_cf_row_count(&self, cf_name: &str) -> StorageResult<u64> {
+        self.backend.calyx_cf_row_count(cf_name)
     }
 
     /// Publishes the lowered guard-threshold hot-path artifact (#1686) through

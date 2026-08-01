@@ -782,7 +782,7 @@ impl VersionedCfStore {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
-        self.restore_batch_with_attribution(seq, rows, PanelAttribution::Strict)
+        self.restore_batch_with_attribution(seq, rows, PanelAttribution::ReplayedCommit)
     }
 
     /// Restores checkpoint SST rows. A model-3 manifest is the watermark SoT,
@@ -833,8 +833,10 @@ impl VersionedCfStore {
                 "MVCC router lock was poisoned during atomic recovery restore",
             )
         })?;
-        let latest_router = if attribution == PanelAttribution::Strict
-            && self.router_latest_readback.load(Ordering::Acquire)
+        let latest_router = if matches!(
+            attribution,
+            PanelAttribution::Strict | PanelAttribution::ReplayedCommit
+        ) && self.router_latest_readback.load(Ordering::Acquire)
         {
             router.as_ref()
         } else {
@@ -1073,8 +1075,19 @@ impl VersionedCfStore {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PanelAttribution {
-    /// Live or WAL-tail mutation: every quantized slot must resolve to Base.
+    /// Live mutation: every quantized slot must resolve to Base **and** carry
+    /// its own Base row in the same batch (#1935).
     Strict,
+    /// WAL-tail replay of an already-committed batch: same resolution as
+    /// [`Self::Strict`], but a missing same-batch `Base` row is reported rather
+    /// than refused.
+    ///
+    /// A commit-time gate cannot retroactively reject history. Refusing here
+    /// would make a vault whose WAL tail predates the gate impossible to open,
+    /// which converts a derived-index defect into total data unavailability.
+    /// The condition is logged at `error` with the exact CF and key length, so a
+    /// pre-existing violation is loud rather than silent.
+    ReplayedCommit,
     /// Legacy checkpoint rows: derive a conservative migration baseline, but
     /// tolerate an already-orphaned slot awaiting physical GC.
     HistoricalMigration,
@@ -1129,6 +1142,57 @@ fn search_panels_affected_by_batch(
             }
         ) {
             continue;
+        }
+        // A live quantized slot write must carry its own `Base` row in THIS
+        // batch — a merely *visible* one is not enough (issue #1935).
+        //
+        // Two invariants rest on this and neither survives a slot-only write:
+        //
+        // * the `Base` slot hash **is** the vector's integrity record (#1888),
+        //   so a slot row written without restating it leaves every later
+        //   verifier checking the new vector against the old hash;
+        // * `calyx_search::measure_panel_delta` scopes a generation's
+        //   reconciliation set to the panel's changed `Base` keys, which is
+        //   complete only if every slot write moves its `Base` row with it.
+        //
+        // The read side cannot police this: bounded native-CF compaction
+        // re-stamps a whole column family's rows into the changed-key history
+        // (the SST row format has no per-row commit sequence — see
+        // `PanelAttribution::ManifestBaseline` below), so "this slot key
+        // changed and its `Base` row did not" is the *expected* state after a
+        // compaction and says nothing about any writer. Measured on the
+        // production vault, that made 100.00% of `slot_35`'s 68,691 rows look
+        // like contract violations and raised CALYX_ASTER_CORRUPT_SHARD —
+        // whose catalog remediation is `restore from restic/snapshot` — against
+        // a healthy vault. So the invariant is enforced here, at the only place
+        // that can tell a write from a rewrite: the write itself.
+        //
+        // Tombstones are exempt below: a slot deletion carries no vector and no
+        // integrity record to restate.
+        if !is_tombstone_value(value) && !staged_base_panels.contains_key(key) {
+            match attribution {
+                PanelAttribution::Strict => {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "live quantized slot write has no same-batch Base row (cf={}, key_len={}); the Base slot hash is this vector's integrity record and the panel-scoped search delta is scoped to changed Base keys, so a slot row must be staged atomically with its own Base row",
+                        cf.name(),
+                        key.len()
+                    )));
+                }
+                PanelAttribution::ReplayedCommit => {
+                    tracing::error!(
+                        code = "CALYX_MVCC_REPLAYED_SLOT_WRITE_WITHOUT_SAME_BATCH_BASE",
+                        cf = cf.name(),
+                        key_len = key.len(),
+                        visible_seq,
+                        "replayed an already-committed batch whose live quantized slot write \
+                         carries no same-batch Base row; the row's Base slot hash no longer \
+                         describes its vector and this generation's reconciliation delta cannot \
+                         be proven complete from Base alone. Rebuild the affected panel search \
+                         generation and repair the writer that produced this batch"
+                    );
+                }
+                PanelAttribution::HistoricalMigration | PanelAttribution::ManifestBaseline => {}
+            }
         }
         let panel_version = match staged_base_panels.get(key) {
             Some(panel_version) => *panel_version,

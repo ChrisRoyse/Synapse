@@ -110,6 +110,12 @@ pub struct DerivedStateReadback {
     /// Generation state read back **from disk** after the last pass.
     pub last_search_state_after: Option<SynapseCalyxSearchGenerationStatus>,
     pub last_search_elapsed_ms: Option<u64>,
+    /// Every published search generation's maintenance outcome from the last
+    /// pass (#1938), so `health` can report how close each generation is to the
+    /// bound at which its queries start failing — before the first one does,
+    /// rather than after.
+    pub last_search_sweep: Option<crate::search_sweep::SearchGenerationSweep>,
+    pub last_search_sweep_unix_ms: Option<u64>,
     /// Lens coverage measured by the last pass.
     pub last_lens_coverage: Option<SynapseCalyxLensCoverageStatus>,
     pub last_lens_coverage_unix_ms: Option<u64>,
@@ -240,28 +246,76 @@ pub(crate) fn run_derived_state_maintenance() {
 
     let mut any_failed = false;
 
-    // --- Search generation (#1891 ask 2) ---
+    // --- Search generations (#1891 ask 2, extended to every published
+    // generation by #1938) ---
     match db.maintain_calyx_search_generation() {
-        Ok(report) => {
+        Ok(sweep) => {
+            // A generation nothing could maintain, and a generation whose
+            // maintenance failed, both mean some corpus is heading for or
+            // already past its reconciliation bound. Neither may be reported as
+            // a clean pass.
+            if sweep.any_failed() {
+                any_failed = true;
+                record_failure(
+                    "STORAGE_DERIVED_STATE_SEARCH_GENERATION_FAILED",
+                    format!(
+                        "maintaining at least one published Calyx search generation failed: {}",
+                        sweep.summary_line()
+                    ),
+                );
+            }
+            let unmaintainable: Vec<u32> = sweep
+                .generations
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.disposition,
+                        crate::search_sweep::GenerationDisposition::UnmaintainableNoContract
+                    )
+                })
+                .map(|entry| entry.panel_version)
+                .collect();
+            if !unmaintainable.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_SEARCH_GENERATION_UNMAINTAINABLE",
+                    unmaintainable_panels = ?unmaintainable,
+                    detail = %sweep.summary_line(),
+                    "one or more published search generations belong to panel versions with no \
+                     code-declared slot contract; they can never be rebuilt into their \
+                     reconciliation bound and no query can measure through them"
+                );
+            }
             let mut guard = match DERIVED_STATE_LAST.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard.last_search_action = Some(report.action.as_str().to_owned());
-            guard.last_search_reason = Some(report.reason.clone());
-            guard.last_search_elapsed_ms = Some(report.elapsed_ms);
-            guard.last_search_state_after = Some(
-                report
-                    .after
-                    .clone()
-                    .unwrap_or_else(|| report.before.clone()),
-            );
+            // The single-generation fields keep reporting the **active** panel,
+            // so the pre-#1938 health field means exactly what it always meant.
+            // The sweep is published alongside it rather than folded into it: a
+            // per-generation fact collapsed into one number is how a degrading
+            // generation stayed invisible in the first place.
+            if let Some(active) = sweep.active_generation()
+                && let crate::search_sweep::GenerationDisposition::Maintained(report) =
+                    &active.disposition
+            {
+                guard.last_search_action = Some(report.action.as_str().to_owned());
+                guard.last_search_reason = Some(report.reason.clone());
+                guard.last_search_elapsed_ms = Some(report.elapsed_ms);
+                guard.last_search_state_after = Some(
+                    report
+                        .after
+                        .clone()
+                        .unwrap_or_else(|| report.before.clone()),
+                );
+            }
+            guard.last_search_sweep = Some(sweep);
+            guard.last_search_sweep_unix_ms = now_unix_ms();
         }
         Err(error) => {
             any_failed = true;
             record_failure(
                 "STORAGE_DERIVED_STATE_SEARCH_GENERATION_FAILED",
-                format!("maintain the persisted Calyx search generation: {error}"),
+                format!("sweep the published Calyx search generations: {error}"),
             );
         }
     }

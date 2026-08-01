@@ -173,16 +173,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     report("measured_for_OLD", &after_old);
     report("measured_for_NEW", &after_new);
 
-    println!("\nEXPECTED  OLD distinct_changed=1   NEW distinct_changed=0 slot_other_generation=1");
     println!(
-        "OBSERVED  OLD distinct_changed={}   NEW distinct_changed={} slot_other_generation={}",
+        "\nEXPECTED  OLD distinct_changed=1   NEW distinct_changed=0 slot_keys_not_in_base_set=1"
+    );
+    println!(
+        "OBSERVED  OLD distinct_changed={}   NEW distinct_changed={} slot_keys_not_in_base_set={}",
         after_old.changed_len(),
         after_new.changed_len(),
-        after_new.slot_keys_other_generation
+        after_new.slot_keys_not_in_base_set
     );
     let pass = after_old.changed_len() == 1
         && after_new.changed_len() == 0
-        && after_new.slot_keys_other_generation == 1;
+        && after_new.slot_keys_not_in_base_set == 1;
     println!("VERDICT   newer_generation_unmoved_by_older_ingest={pass}");
     Ok(())
 }
