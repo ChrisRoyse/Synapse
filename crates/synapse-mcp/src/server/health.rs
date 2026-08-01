@@ -1090,10 +1090,17 @@ impl SynapseService {
                     .panels
                     .iter()
                     .map(|panel| format!(
-                        "{}:n_lenses={} slots={:?} measured={}/{} blind_spot_records={} ({:.4})",
+                        "{}:n_lenses={} measurable_slots={:?} unusable_slots={:?} measured={}/{} \
+                         blind_spot_records={} ({:.4})",
                         panel.panel_version,
                         panel.n_lenses,
-                        panel.dense_slots,
+                        panel.measurable_slots,
+                        panel
+                            .slot_states
+                            .iter()
+                            .filter(|state| !state.measurable)
+                            .map(|state| state.slot)
+                            .collect::<Vec<_>>(),
                         panel.records_measured,
                         panel.records_scanned,
                         panel.blind_spot_records,

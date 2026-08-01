@@ -13,14 +13,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
     AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, Direction,
-    EstimatorKind, InterEventHazardReport, MiEstimate, MiEstimatorChoice, MiEstimatorPick,
-    MmdConfig, PeriodogramConfig, RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport,
-    TEResult, TeEstimator, TiedOccurrenceCollapse, TrustTag, autocorrelation, bin_event_counts,
-    bits_report_with_anchor, collapse_tied_occurrences, entropy_bits,
-    inter_event_hazard_with_alpha, lomb_scargle_with_config, mi_about_labels, mmd_change_point,
-    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution,
-    recurrence_rate_cusum, stable_rank, synergy_pair, synergy_report, transfer_entropy_sweep,
-    unmeasured_synergy_pair,
+    EstimatorKind, InterEventHazardReport, MiEstimate, MiEstimator, MiEstimatorChoice,
+    MiEstimatorPick, MmdConfig, PeriodogramConfig, RateShift, SIGNIFICANT_PEAK_FAP,
+    SlotAttribution, SynergyEstimators, SynergyPairState, SynergyReport, TEResult, TeEstimator,
+    TiedOccurrenceCollapse, TrustTag, autocorrelation, bin_event_counts, bits_report_with_anchor,
+    collapse_tied_occurrences, entropy_bits, inter_event_hazard_with_alpha,
+    lomb_scargle_with_config, mi_about_labels, mmd_change_point, panel_sufficiency_with_anchor,
+    partitioned_histogram_nmi, per_sensor_attribution, recurrence_rate_cusum, resolve_mi_estimator,
+    stable_rank, synergy_pair, synergy_report, transfer_entropy_sweep, unmeasured_synergy_pair,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
@@ -177,7 +177,18 @@ pub struct SynapseCalyxNeffEstimate {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxAbundanceReport {
     pub panel_version: u32,
+    /// Lenses the panel **declares** — the `N` in the DDA yield. A lens the
+    /// association engine cannot consume is reported in `slot_states`, never
+    /// subtracted from this count (#1939).
     pub n_lenses: usize,
+    /// Lenses that actually reached the corpus. `measurable_lenses < n_lenses`
+    /// means the panel is carrying dark lenses; `slot_states` names them.
+    #[serde(default)]
+    pub measurable_lenses: usize,
+    /// Per declared lens: its vector kind, whether the engine could measure on
+    /// it, and why not when it could not (#1939).
+    #[serde(default)]
+    pub slot_states: Vec<SynapseCalyxCorpusSlotState>,
     pub n_constellations: usize,
     pub c_n2_upper_bound: usize,
     pub materialized: usize,
@@ -218,7 +229,14 @@ pub struct SynapseCalyxWeaveReport {
     pub panel_version: u32,
     pub records_scanned: usize,
     pub records_woven: usize,
+    /// Lenses the panel declares (#1939).
     pub n_lenses: usize,
+    /// Lenses that reached the corpus and could be woven.
+    #[serde(default)]
+    pub measurable_lenses: usize,
+    /// Per declared lens: kind, measurability, and the reason when not (#1939).
+    #[serde(default)]
+    pub slot_states: Vec<SynapseCalyxCorpusSlotState>,
     pub cross_terms_materialized: usize,
     pub agreement_edges_persisted: usize,
     pub between_record_edges_persisted: usize,
@@ -378,9 +396,9 @@ impl SynapseCalyxVault {
         let xterm_cf_rows_after = self.scan_cf_latest(ColumnFamily::XTerm)?.len();
         let graph_cf_rows_after = self.scan_cf_latest(ColumnFamily::Graph)?.len();
 
-        let abundance = self.build_abundance_report(
+        let mut abundance = self.build_abundance_report(
             params.panel_version,
-            lens_ids.len(),
+            corpus.n_lenses(),
             corpus.records.len(),
             cross_terms_materialized,
             measured_slot_instances,
@@ -388,12 +406,16 @@ impl SynapseCalyxVault {
             xterm_cf_rows_after,
             graph_cf_rows_after,
         )?;
+        abundance.measurable_lenses = lens_ids.len();
+        abundance.slot_states = corpus.slot_states();
 
         Ok(SynapseCalyxWeaveReport {
             panel_version: params.panel_version,
             records_scanned,
             records_woven,
-            n_lenses: lens_ids.len(),
+            n_lenses: corpus.n_lenses(),
+            measurable_lenses: lens_ids.len(),
+            slot_states: corpus.slot_states(),
             cross_terms_materialized,
             agreement_edges_persisted: agreement_edges.len(),
             between_record_edges_persisted: between_record_edges.len(),
@@ -402,7 +424,7 @@ impl SynapseCalyxVault {
             since_ts_ns: params.since_ts_ns,
             until_ts_ns: params.until_ts_ns,
             records_outside_window,
-            dda_signal_yield: dda_signal_yield(corpus.records.len(), lens_ids.len()),
+            dda_signal_yield: dda_signal_yield(corpus.records.len(), corpus.n_lenses()),
             lens_pairs_possible: blind_spots.pairs_possible,
             lens_pairs_co_present: blind_spots.pairs_co_present,
             blind_spot_pairs: blind_spots.blind_pairs,
@@ -469,12 +491,13 @@ impl SynapseCalyxVault {
                 panel_version: *panel_version,
                 records_scanned: corpus.records_scanned,
                 records_measured,
-                n_lenses: corpus.panel_dense_slots.len(),
-                dense_slots: corpus
-                    .panel_dense_slots
+                n_lenses: corpus.n_lenses(),
+                measurable_slots: corpus
+                    .measurable_slots()
                     .iter()
                     .map(|slot| slot.get())
                     .collect(),
+                slot_states: corpus.slot_states(),
                 blind_spot_records,
                 blind_spot_fraction,
             });
@@ -522,16 +545,24 @@ impl SynapseCalyxVault {
         }
         let xterm_cf_rows = self.scan_cf_latest(ColumnFamily::XTerm)?.len();
         let graph_cf_rows = self.scan_cf_latest(ColumnFamily::Graph)?.len();
-        self.build_abundance_report(
+        // `N` is the panel contract, not the subset one loader accepted: the
+        // DDA yield `n·(N + C(N,2) + 1)` is a statement about the panel, and
+        // shrinking `N` to the carried subset understates the association
+        // structure the panel is designed to hold instead of reporting the
+        // shortfall (#1939).
+        let mut report = self.build_abundance_report(
             panel_version,
-            lens_ids.len(),
+            corpus.n_lenses(),
             corpus.records.len(),
             xterm_cf_rows,
             measured_slot_instances,
             xterm_cf_rows,
             xterm_cf_rows,
             graph_cf_rows,
-        )
+        )?;
+        report.measurable_lenses = lens_ids.len();
+        report.slot_states = corpus.slot_states();
+        Ok(report)
     }
 
     /// Assembles the abundance report, reading the DPI ceiling back out of the
@@ -580,6 +611,11 @@ impl SynapseCalyxVault {
         Ok(SynapseCalyxAbundanceReport {
             panel_version,
             n_lenses: report.n_lenses,
+            // Overwritten by callers that hold the corpus; a caller without one
+            // reports the declared count as also measurable rather than
+            // inventing a shortfall.
+            measurable_lenses: report.n_lenses,
+            slot_states: Vec::new(),
             n_constellations: report.n_constellations,
             c_n2_upper_bound: report.c_n2_upper_bound,
             materialized: report.materialized,
@@ -646,13 +682,33 @@ impl SynapseCalyxVault {
         self.load_panel_dense_corpus_in_window(panel_version, max_records, TimeWindowNs::default())
     }
 
-    /// Scans the `Base` CF once and returns the dense-slot corpus for a panel.
+    /// Scans the `Base` CF once and returns the panel corpus.
     ///
-    /// `panel_dense_slots` records every dense lens the corpus carries, so a lens
-    /// that is dark on some records is reportable as a blind spot instead of
-    /// silently vanishing from the lens count. It is collected from the hydrated
-    /// records, because a Base row alone cannot say which of its slots are dense
-    /// — it stores only slot ids and hashes (issue #1894).
+    /// `panel_slots` records **every** lens the corpus carries with the kind of
+    /// vector it actually stores, so the lens count equals the panel contract
+    /// rather than the subset one code path happened to accept, and a lens the
+    /// stack cannot consume is reported with a named reason instead of
+    /// vanishing (issue #1939). It is collected from the hydrated records,
+    /// because a Base row alone cannot say which of its slots are dense — it
+    /// stores only slot ids and hashes (issue #1894).
+    ///
+    /// # Sparse lenses (#1939)
+    ///
+    /// A sparse slot is carried, not dropped, by **densifying it over its
+    /// corpus-observed support**: the set of indices some record in the corpus
+    /// actually occupies. That transformation is exact, not an approximation —
+    /// every excluded index is zero in every record, so it contributes nothing
+    /// to a dot product, a norm, a Chebyshev distance, or an interned
+    /// whole-value identity. The densified column is therefore the *same*
+    /// measurement, expressed in the width the association engine can consume,
+    /// and every existing dense consumer (cross-terms, kNN, the MI estimators,
+    /// the kernel) becomes correct for sparse lenses without a second
+    /// implementation of the same math.
+    ///
+    /// The observed support is bounded by [`SYNAPSE_SPARSE_SLOT_MAX_SUPPORT`].
+    /// Above it the slot is reported unusable with the measured support in the
+    /// reason — never silently narrowed, and never densified into a width the
+    /// bounded estimators cannot finish.
     fn load_panel_dense_corpus_in_window(
         &self,
         panel_version: u32,
@@ -668,10 +724,11 @@ impl SynapseCalyxVault {
         // redundancy/kernel were all vacuously zero — reported honestly, but
         // measuring nothing (issue #1894). Hydrate the slots from their CFs.
         let snapshot = self.read_snapshot();
-        let mut records = Vec::new();
+        let mut records: Vec<DenseRecord> = Vec::new();
         let mut records_scanned = 0usize;
         let mut records_outside_window = 0usize;
-        let mut panel_dense_slots: BTreeSet<SlotId> = BTreeSet::new();
+        let mut panel_slots: BTreeMap<SlotId, SynapseCalyxSlotKind> = BTreeMap::new();
+        let mut sparse_support: BTreeMap<SlotId, BTreeSet<u32>> = BTreeMap::new();
         for (_, value) in rows {
             let base = decode_constellation_base(&value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -689,17 +746,77 @@ impl SynapseCalyxVault {
             }
             let hydrated = self.hydrated_constellation(base.cx_id, snapshot)?;
             for (slot, vector) in &hydrated.slots {
-                if matches!(vector, SlotVector::Dense { .. }) {
-                    panel_dense_slots.insert(*slot);
+                let kind = SynapseCalyxSlotKind::of(vector);
+                // A slot that is `Absent` on this record but present on another
+                // must not be recorded as absent for the panel: `Absent` is an
+                // explicit per-record absence, never a statement about the lens.
+                let entry = panel_slots.entry(*slot).or_insert(kind);
+                if *entry == SynapseCalyxSlotKind::Absent {
+                    *entry = kind;
+                }
+                if let SlotVector::Sparse { entries, .. } = vector {
+                    let support = sparse_support.entry(*slot).or_default();
+                    for entry in entries {
+                        support.insert(entry.idx);
+                    }
                 }
             }
             records.push(DenseRecord::from_constellation(&hydrated));
         }
+
+        // Densify every sparse slot whose observed support fits the bound. This
+        // happens after the scan because the support is a property of the
+        // corpus, not of any one record.
+        let mut densified_sparse_slots: BTreeMap<SlotId, usize> = BTreeMap::new();
+        let mut unusable_slots: BTreeMap<SlotId, String> = BTreeMap::new();
+        for (slot, support) in &sparse_support {
+            if support.len() > SYNAPSE_SPARSE_SLOT_MAX_SUPPORT {
+                unusable_slots.insert(
+                    *slot,
+                    format!(
+                        "sparse lens occupies {} distinct index(es) across the {} scanned \
+                         record(s), above the densification bound of \
+                         {SYNAPSE_SPARSE_SLOT_MAX_SUPPORT}. Densifying over the observed support \
+                         is exact, but at this width the bounded association and \
+                         mutual-information passes cannot complete: the kNN and KSG paths are \
+                         quadratic in records and linear in width. Narrow the lens (coarser \
+                         hashing/bucketing) or lower max_records",
+                        support.len(),
+                        records.len()
+                    ),
+                );
+                continue;
+            }
+            let index_of: BTreeMap<u32, usize> = support
+                .iter()
+                .enumerate()
+                .map(|(position, idx)| (*idx, position))
+                .collect();
+            let width = support.len();
+            for record in &mut records {
+                let Some(entries) = record.sparse.get(slot) else {
+                    continue;
+                };
+                let mut dense = vec![0.0f32; width];
+                for (idx, value) in entries {
+                    // Every occupied index is in the map by construction: the
+                    // support was built from these same entries.
+                    if let Some(position) = index_of.get(idx) {
+                        dense[*position] += *value;
+                    }
+                }
+                record.slots.insert(*slot, dense);
+            }
+            densified_sparse_slots.insert(*slot, width);
+        }
+
         Ok(DenseCorpus {
             records,
             records_scanned,
             records_outside_window,
-            panel_dense_slots,
+            panel_slots,
+            densified_sparse_slots,
+            unusable_slots,
         })
     }
 
@@ -747,12 +864,62 @@ impl SynapseCalyxVault {
     }
 }
 
-/// One record reduced to its dense slot vectors (sparse/multi/absent slots are
-/// excluded: cosine/KSG over huge sparse lenses is impractical and their signal
-/// is served by the search/BM25 path, not the association engine).
+/// Largest corpus-observed sparse support the loader will densify (#1939).
+///
+/// Densifying a sparse slot over exactly the indices some record occupies is
+/// lossless, so the bound is not about fidelity — it is about what the bounded
+/// downstream passes can finish. The kNN and KSG paths are quadratic in records
+/// and linear in slot width, and the widest dense lane any Syn* panel carries
+/// today is 128, so 512 leaves four times that headroom while keeping one pass
+/// bounded. A lens above it is reported unusable with its measured support,
+/// never narrowed and never dropped.
+const SYNAPSE_SPARSE_SLOT_MAX_SUPPORT: usize = 512;
+
+/// What kind of vector a panel slot actually stores, measured from the hydrated
+/// records rather than declared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxSlotKind {
+    Dense,
+    Sparse,
+    Multi,
+    /// Explicitly absent on every record scanned. Never a zero vector (#1894).
+    Absent,
+}
+
+impl SynapseCalyxSlotKind {
+    fn of(vector: &SlotVector) -> Self {
+        match vector {
+            SlotVector::Dense { .. } => Self::Dense,
+            SlotVector::Sparse { .. } => Self::Sparse,
+            SlotVector::Multi { .. } => Self::Multi,
+            SlotVector::Absent { .. } => Self::Absent,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::Sparse => "sparse",
+            Self::Multi => "multi",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// One record's slot vectors in the form the association engine consumes.
+///
+/// `slots` holds every lens the engine can measure: the dense ones verbatim,
+/// and the sparse ones densified over the corpus-observed support (#1939) —
+/// which is exact, not lossy, because every excluded index is zero in every
+/// record. `sparse` keeps the raw entries the densification is built from, so
+/// the loader can widen a slot after the scan, when the corpus-wide support is
+/// finally known.
 struct DenseRecord {
     cx_id: CxId,
     slots: BTreeMap<SlotId, Vec<f32>>,
+    sparse: BTreeMap<SlotId, Vec<(u32, f32)>>,
     anchors: Vec<Anchor>,
 }
 
@@ -763,9 +930,26 @@ impl DenseRecord {
             .iter()
             .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
             .collect();
+        let sparse = constellation
+            .slots
+            .iter()
+            .filter_map(|(slot, vector)| match vector {
+                SlotVector::Sparse { entries, .. } => Some((
+                    *slot,
+                    entries
+                        .iter()
+                        .map(|entry| (entry.idx, entry.val))
+                        .collect::<Vec<_>>(),
+                )),
+                SlotVector::Dense { .. } | SlotVector::Multi { .. } | SlotVector::Absent { .. } => {
+                    None
+                }
+            })
+            .collect();
         Self {
             cx_id: constellation.cx_id,
             slots,
+            sparse,
             anchors: constellation.anchors.clone(),
         }
     }
@@ -776,8 +960,70 @@ struct DenseCorpus {
     records_scanned: usize,
     /// Panel rows excluded by the `created_at` window.
     records_outside_window: usize,
-    /// Every dense lens the panel carries across all scanned rows.
-    panel_dense_slots: BTreeSet<SlotId>,
+    /// **Every** lens the panel carries, with the kind of vector it stores.
+    /// This is the lens count the panel contract declares; a surface that
+    /// cannot consume one of them says so per slot (#1939).
+    panel_slots: BTreeMap<SlotId, SynapseCalyxSlotKind>,
+    /// Sparse slots carried into the corpus, mapped to the densified width
+    /// (their corpus-observed support).
+    densified_sparse_slots: BTreeMap<SlotId, usize>,
+    /// Slots the loader could not carry, mapped to the named reason (#1939).
+    unusable_slots: BTreeMap<SlotId, String>,
+}
+
+impl DenseCorpus {
+    /// Slots the association engine can actually measure on: every dense lens
+    /// plus every densified sparse lens.
+    fn measurable_slots(&self) -> BTreeSet<SlotId> {
+        self.panel_slots
+            .iter()
+            .filter(|(slot, kind)| {
+                (**kind == SynapseCalyxSlotKind::Dense
+                    || self.densified_sparse_slots.contains_key(*slot))
+                    && !self.unusable_slots.contains_key(*slot)
+            })
+            .map(|(slot, _)| *slot)
+            .collect()
+    }
+
+    /// The panel's declared lens count — what `n_lenses` must report, so a dark
+    /// lens shows up as a blind spot rather than shrinking the denominator
+    /// (#1939).
+    fn n_lenses(&self) -> usize {
+        self.panel_slots.len()
+    }
+
+    /// Per-slot report of what the loader did with each declared lens.
+    fn slot_states(&self) -> Vec<SynapseCalyxCorpusSlotState> {
+        self.panel_slots
+            .iter()
+            .map(|(slot, kind)| SynapseCalyxCorpusSlotState {
+                slot: slot.get(),
+                kind: kind.as_str().to_owned(),
+                measurable: !self.unusable_slots.contains_key(slot)
+                    && (*kind == SynapseCalyxSlotKind::Dense
+                        || self.densified_sparse_slots.contains_key(slot)),
+                densified_support: self.densified_sparse_slots.get(slot).copied(),
+                unusable_reason: self.unusable_slots.get(slot).cloned(),
+            })
+            .collect()
+    }
+}
+
+/// What the corpus loader did with one declared panel lens (#1939).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxCorpusSlotState {
+    pub slot: u16,
+    /// `dense` | `sparse` | `multi` | `absent`.
+    pub kind: String,
+    /// True when the association engine can measure on this slot.
+    pub measurable: bool,
+    /// For a carried sparse lens, the corpus-observed support it was densified
+    /// over — the exact width, with every all-zero index excluded.
+    pub densified_support: Option<usize>,
+    /// Why this lens is not measurable; present exactly when `measurable` is
+    /// false and the loader has a specific reason beyond its vector kind.
+    pub unusable_reason: Option<String>,
 }
 
 fn dense_vector(vector: &SlotVector) -> Option<Vec<f32>> {
@@ -894,9 +1140,13 @@ fn blind_spot_summary(corpus: &DenseCorpus) -> BlindSpotSummary {
             });
         }
     }
+    // Dark over the whole declared panel, not just the slots one code path
+    // accepted: a lens the loader could not carry is exactly a blind spot, and
+    // reporting it as "not dark" because it never entered the corpus is the
+    // defect #1939 named (#1939).
     let dark_slots = corpus
-        .panel_dense_slots
-        .iter()
+        .panel_slots
+        .keys()
         .filter(|slot| !present_counts.contains_key(*slot))
         .map(|slot| slot.get())
         .collect();
@@ -1255,10 +1505,16 @@ pub struct SynapseCalyxPanelLensCoverage {
     pub records_scanned: usize,
     /// Rows actually hydrated and measured, bounded by the pass budget.
     pub records_measured: usize,
-    /// Distinct dense lenses the measured records carry between them.
+    /// Lenses the panel **declares** — every slot the measured records carry,
+    /// whatever its vector kind. A lens the stack cannot consume is reported in
+    /// `slot_states`, never subtracted from this count (#1939).
     pub n_lenses: usize,
-    pub dense_slots: Vec<u16>,
-    /// Measured records carrying fewer than two co-present dense lenses.
+    /// Lenses the association engine can measure on: the dense ones plus the
+    /// sparse ones the loader densified over their observed support.
+    pub measurable_slots: Vec<u16>,
+    /// What the loader did with each declared lens, per slot (#1939).
+    pub slot_states: Vec<SynapseCalyxCorpusSlotState>,
+    /// Measured records carrying fewer than two co-present measurable lenses.
     pub blind_spot_records: usize,
     pub blind_spot_fraction: f32,
 }
@@ -1856,6 +2112,16 @@ impl SynapseCalyxVault {
                     .insert(index, project_scalar(vector));
             }
         }
+        // The lens set is the panel's **declared** slots, not the subset that
+        // produced a sketch. A lens the corpus loader could not carry — a
+        // sparse lens above the densification bound, a lens absent on every
+        // record — must appear here with an empty column and a named skip on
+        // every pair it touches, so `n_lenses` and `pairs_possible` state the
+        // panel contract and the shortfall is visible (#1939). Shrinking the
+        // denominator instead makes a 12-lens panel report a healthy 8.
+        for slot in corpus.panel_slots.keys() {
+            sketches.entry(*slot).or_default();
+        }
         let slot_ids: Vec<SlotId> = sketches.keys().copied().collect();
         let n_lenses = slot_ids.len();
 
@@ -1909,6 +2175,28 @@ impl SynapseCalyxVault {
                         n_paired: paired_a.len(),
                     });
                 };
+                // A lens the loader refused is named as such rather than
+                // reported as a thin sample: the two call for different action
+                // (narrow the lens vs widen the window), and #1939 was exactly
+                // the case of a refusal that no surface could observe.
+                if let Some(reason) = corpus.unusable_slots.get(&slot_a).or_else(|| {
+                    corpus
+                        .unusable_slots
+                        .get(&slot_b)
+                        .filter(|_| corpus.unusable_slots.contains_key(&slot_b))
+                }) {
+                    let offending = if corpus.unusable_slots.contains_key(&slot_a) {
+                        slot_a
+                    } else {
+                        slot_b
+                    };
+                    skip(
+                        "lens_not_carried_by_corpus",
+                        Some(offending),
+                        reason.clone(),
+                    );
+                    continue;
+                }
                 if paired_a.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
                     skip(
                         "insufficient_paired_samples",
@@ -2200,28 +2488,48 @@ impl SynapseCalyxVault {
                     labels.push(*label);
                 }
                 if labels.len() < SYNAPSE_ASSAY_MIN_SAMPLES {
-                    pairs.push(unmeasured_synergy_pair(*slot_a, *slot_b, labels.len()));
+                    pairs.push(unmeasured_synergy_pair(
+                        *slot_a,
+                        *slot_b,
+                        labels.len(),
+                        SynergyPairState::InsufficientSamples,
+                        format!(
+                            "only {} record(s) carry both lens {} and lens {} together with the \
+                             anchor; the synergy floor is {SYNAPSE_ASSAY_MIN_SAMPLES} paired \
+                             samples",
+                            labels.len(),
+                            slot_a.get(),
+                            slot_b.get()
+                        ),
+                    ));
                     continue;
                 }
                 let k = ksg_k.min(labels.len().saturating_sub(1)).max(1);
-                // The pair, and each of its halves, gets the instrument its own
-                // column warrants: a concatenated pair of one-hots is still
-                // categorical, while a one-hot concatenated with a record
-                // vector is not. A refusal on any of the three leaves the pair
-                // unmeasured rather than ending the report (#1672, #1915).
-                let Some((pair_bits, left_bits, right_bits)) =
-                    synergy_pair_bits(&joint, &left, &right, &labels, k)
-                else {
-                    pairs.push(unmeasured_synergy_pair(*slot_a, *slot_b, labels.len()));
-                    continue;
+                // All three terms must come from one instrument or the
+                // difference is not a measurement (#1941). A refusal leaves the
+                // pair unmeasured with a named reason rather than ending the
+                // report (#1672, #1915).
+                let terms = match synergy_pair_bits(&joint, &left, &right, &labels, k) {
+                    Ok(terms) => terms,
+                    Err((state, reason)) => {
+                        pairs.push(unmeasured_synergy_pair(
+                            *slot_a,
+                            *slot_b,
+                            labels.len(),
+                            state.into(),
+                            reason,
+                        ));
+                        continue;
+                    }
                 };
                 let pair = synergy_pair(
                     *slot_a,
                     *slot_b,
-                    pair_bits,
-                    left_bits,
-                    right_bits,
+                    terms.pair_bits,
+                    terms.left_bits,
+                    terms.right_bits,
                     labels.len(),
+                    terms.estimators,
                 )
                 .map_err(|error| loom_math_error("compute pair synergy gain", &error))?;
                 if pair.synergistic {
@@ -2331,29 +2639,179 @@ fn unmeasured_slot_bits_with_pick(
     bits
 }
 
-/// Bits for a synergy pair and each of its halves, or `None` when any of the
-/// three columns is refused.
+/// The three same-instrument bit terms of one synergy pair.
+struct SynergyTerms {
+    pair_bits: f32,
+    left_bits: f32,
+    right_bits: f32,
+    estimators: SynergyEstimators,
+}
+
+/// Bits for a synergy pair and each of its halves, **all three from one
+/// instrument**, or a named refusal.
 ///
-/// All three must come from the same pass: `gain = pair − max(left, right)` is
-/// only a gain if the three numbers are comparable, and a pair measured while
-/// one half is missing would report the pair's own bits as pure synergy.
+/// Two conditions make `gain = pair − max(left, right)` a measurement rather
+/// than arithmetic on two unrelated numbers (#1941):
+///
+/// *Same samples.* Enforced by the caller, which builds all three columns from
+/// the same anchored record subset.
+///
+/// *Same instrument.* Enforced here. `Auto` resolves each column independently
+/// from its own cardinality, so on a hybrid panel the concatenated pair and its
+/// halves routinely land on different estimators — a one-hot half on the
+/// Miller-Madow-corrected plug-in, the pair on KSG because a record-vector
+/// component makes every row distinct. Subtracting one from the other
+/// reintroduces exactly the non-cancelling bias KSG is constructed to remove
+/// (Kraskov et al. 2004), and the difference estimates nothing.
+///
+/// So: resolve all three under `Auto`; if they already agree, measure with
+/// `Auto`. If they disagree, try to *pin* all three to one instrument — the
+/// discrete plug-in first (exact for a genuinely discrete column, and its
+/// sparsity guard refuses a concatenation too wide for its bias correction),
+/// then KSG (whose degenerate-radius guard refuses a categorical column). The
+/// first pinning under which all three columns yield an estimate wins. When
+/// neither does, the pair is genuinely unmeasurable as a gain and is refused
+/// with the reason, never reported as a number.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the estimator agreement check, the ordered pinning attempts and the two refusal messages are one decision: splitting them would let a caller take a pinned measurement without the homogeneity check that makes it a measurement"
+)]
 fn synergy_pair_bits(
     joint: &[Vec<f32>],
     left: &[Vec<f32>],
     right: &[Vec<f32>],
     labels: &[usize],
     k: usize,
-) -> Option<(f32, f32, f32)> {
-    let measure = |column: &[Vec<f32>]| {
-        mi_about_labels(MiEstimatorChoice::Auto, column, labels, k, None)
-            .ok()
-            .and_then(|outcome| outcome.estimate.ok())
+) -> Result<SynergyTerms, (SynapseCalyxSynergyRefusal, String)> {
+    let columns = [("pair", joint), ("left", left), ("right", right)];
+    let mut auto_picks = Vec::with_capacity(3);
+    for (name, column) in columns {
+        match resolve_mi_estimator(MiEstimatorChoice::Auto, column, labels, k) {
+            Ok(pick) => auto_picks.push((name, pick)),
+            Err(error) => {
+                return Err((
+                    SynapseCalyxSynergyRefusal::EstimatorRefused,
+                    format!(
+                        "estimator selection refused the {name} column of this pair: {error}. All \
+                         three terms of a synergy gain must be measurable; the pair is reported \
+                         unmeasured rather than partially"
+                    ),
+                ));
+            }
+        }
+    }
+    let auto_summary = auto_picks
+        .iter()
+        .map(|(name, pick)| format!("{name}={}", pick.estimator.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let homogeneous_auto = auto_picks
+        .iter()
+        .all(|(_, pick)| pick.estimator == auto_picks[0].1.estimator);
+
+    // Candidate pinnings, most-preferred first. `Auto` is first only when it is
+    // already homogeneous, so a pin never overrides an instrument the columns
+    // themselves agreed on.
+    let mut attempts: Vec<MiEstimatorChoice> = Vec::with_capacity(3);
+    if homogeneous_auto {
+        attempts.push(MiEstimatorChoice::Auto);
+    } else {
+        attempts.push(MiEstimatorChoice::DiscretePlugin);
+        attempts.push(MiEstimatorChoice::ContinuousKsg);
+    }
+
+    let mut refusals: Vec<String> = Vec::new();
+    for choice in attempts {
+        let mut measured: Vec<(f32, MiEstimator)> = Vec::with_capacity(3);
+        let mut failed = false;
+        for (name, column) in columns {
+            match mi_about_labels(choice, column, labels, k, None) {
+                Ok(outcome) => match outcome.estimate {
+                    Ok(estimate) => measured.push((estimate.bits, outcome.pick.estimator)),
+                    Err(error) => {
+                        refusals.push(format!(
+                            "pinning to {} refused the {name} column: {error}",
+                            outcome.pick.estimator.as_str()
+                        ));
+                        failed = true;
+                        break;
+                    }
+                },
+                Err(error) => {
+                    refusals.push(format!("pinning refused the {name} column: {error}"));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+        let estimators = SynergyEstimators {
+            pair: measured[0].1,
+            left: measured[1].1,
+            right: measured[2].1,
+        };
+        // Belt and braces: `Auto` is only attempted when selection already
+        // agreed, and a pin resolves every column to the pinned instrument, so
+        // this cannot fire — but the invariant the whole function exists to
+        // hold is checked rather than assumed.
+        if !estimators.is_homogeneous() {
+            refusals.push(format!(
+                "a pinned pass still produced mixed instruments (pair={} left={} right={})",
+                estimators.pair.as_str(),
+                estimators.left.as_str(),
+                estimators.right.as_str()
+            ));
+            continue;
+        }
+        return Ok(SynergyTerms {
+            pair_bits: measured[0].0,
+            left_bits: measured[1].0,
+            right_bits: measured[2].0,
+            estimators,
+        });
+    }
+
+    let state = if homogeneous_auto {
+        SynapseCalyxSynergyRefusal::EstimatorRefused
+    } else {
+        SynapseCalyxSynergyRefusal::CrossEstimatorUnpinnable
     };
-    Some((
-        measure(joint)?.bits,
-        measure(left)?.bits,
-        measure(right)?.bits,
-    ))
+    let reason = if homogeneous_auto {
+        format!(
+            "all three columns selected the same instrument ({auto_summary}) but it refused at \
+             least one of them: {}. The pair is reported unmeasured rather than partially",
+            refusals.join("; ")
+        )
+    } else {
+        format!(
+            "the three terms of this pair resolve to different instruments ({auto_summary}), and \
+             no single instrument can measure all three: {}. `gain = pair - max(left, right)` \
+             across two instruments subtracts estimates whose biases do not cancel (Kraskov et \
+             al. 2004), so it estimates nothing and is refused rather than reported",
+            refusals.join("; ")
+        )
+    };
+    Err((state, reason))
+}
+
+/// Which refusal a synergy pair carries. Mirrors [`SynergyPairState`]'s
+/// non-measured arms; the sample-count arm is raised by the caller before any
+/// column is built.
+#[derive(Clone, Copy, Debug)]
+enum SynapseCalyxSynergyRefusal {
+    EstimatorRefused,
+    CrossEstimatorUnpinnable,
+}
+
+impl From<SynapseCalyxSynergyRefusal> for SynergyPairState {
+    fn from(value: SynapseCalyxSynergyRefusal) -> Self {
+        match value {
+            SynapseCalyxSynergyRefusal::EstimatorRefused => Self::EstimatorRefused,
+            SynapseCalyxSynergyRefusal::CrossEstimatorUnpinnable => Self::CrossEstimatorUnpinnable,
+        }
+    }
 }
 
 /// Stamp the resolved estimator and the measured column facts onto a slot row.

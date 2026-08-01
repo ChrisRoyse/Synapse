@@ -23,6 +23,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{SYNAPSE_INTELLIGENCE_MAX_RECORDS, SynapseCalyxError, SynapseCalyxVault};
 
+/// Metadata key naming the column family a constellation was measured from.
+///
+/// Defined here, at the layer that *reads* it for the #1940 orphan probe, and
+/// re-exported by `synapse_storage::constellations` as `META_SOURCE_CF` so the
+/// writer and the reader cannot drift apart into two spellings of one key.
+pub const METADATA_SOURCE_CF: &str = "synapse_source_cf";
+/// Metadata key holding the lowercase-hex source row key a constellation was
+/// measured from. See [`METADATA_SOURCE_CF`].
+pub const METADATA_SOURCE_KEY_HEX: &str = "synapse_source_key_hex";
+
 /// Coverage floor governing the grounded-vs-provisional control-doctrine boundary.
 ///
 /// A domain (panel) at or above this fraction of grounded records is
@@ -351,6 +361,24 @@ pub struct SynapseCalyxPanelCensusEntry {
     /// still landing on two versions at once, which is a defect.
     pub earliest_created_at_ms: Option<u64>,
     pub latest_created_at_ms: Option<u64>,
+    /// Each record's declared provenance at this generation: source CF name →
+    /// the set of source row keys (lowercase hex) measured from it (#1940).
+    ///
+    /// This is what turns the orphan count from a subtraction into a probe. The
+    /// old count was `active_version_records - source_cf_rows`, which is a
+    /// difference between two populations that are not the same set: the
+    /// minuend counts one generation, the subtrahend counts every row of the
+    /// source CF including rows measured onto a *superseded* generation and
+    /// rows not yet measured at all. On the live vault 2026-08-01 that
+    /// arithmetic reported 667 orphans where the probe finds 227.
+    ///
+    /// A set rather than a count because the question is membership — "does
+    /// this record's own source row still exist" — and no count can answer it.
+    pub source_key_hexes: BTreeMap<String, BTreeSet<String>>,
+    /// Records at this generation carrying no source provenance at all, so the
+    /// probe cannot even be attempted for them (#1940). Reported, never folded
+    /// into either the covered or the orphaned count.
+    pub unattributed_records: usize,
 }
 
 impl SynapseCalyxPanelCensusEntry {
@@ -482,9 +510,28 @@ impl SynapseCalyxVault {
                     anchor_kind_records: BTreeMap::new(),
                     earliest_created_at_ms: None,
                     latest_created_at_ms: None,
+                    source_key_hexes: BTreeMap::new(),
+                    unattributed_records: 0,
                 }
             });
             entry.records += 1;
+            // #1940: the declared provenance of each record, kept so the
+            // orphan count can be a per-record probe against the source CF
+            // rather than a subtraction of two counts taken over different
+            // populations.
+            match (
+                base.metadata.get(METADATA_SOURCE_CF),
+                base.metadata.get(METADATA_SOURCE_KEY_HEX),
+            ) {
+                (Some(source_cf), Some(source_key_hex)) => {
+                    entry
+                        .source_key_hexes
+                        .entry(source_cf.clone())
+                        .or_default()
+                        .insert(source_key_hex.clone());
+                }
+                _ => entry.unattributed_records += 1,
+            }
             entry.earliest_created_at_ms = Some(
                 entry
                     .earliest_created_at_ms

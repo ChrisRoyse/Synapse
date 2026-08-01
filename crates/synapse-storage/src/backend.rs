@@ -365,13 +365,20 @@ impl FromStr for StorageBackendKind {
     }
 }
 
-/// One measured lens pair from a synergy pass (#1672).
+/// One lens pair from a synergy pass (#1672, #1941).
 ///
-/// `gain_bits` is `pair_bits - max(left_bits, right_bits)` — the bits the pair
-/// carries about the outcome beyond what its better half carries alone
-/// (`WholeMinusMax`, Griffith & Koch arXiv:1205.4265). A negative gain is the
-/// redundant regime and is reported as measured, never clamped.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// `gain_bits` is `max(0, pair_bits - max(left_bits, right_bits))` — the bits
+/// the pair carries about the outcome beyond what its better half carries alone
+/// (`WholeMinusMax`, Griffith & Koch arXiv:1205.4265), floored by the
+/// data-processing inequality. `raw_gain_bits` keeps the unclamped difference
+/// and `monotonicity_floor_applied` marks a row the floor had to move, so a
+/// clamped row is visibly clamped (#1941).
+///
+/// All three terms come from one estimator, named per component so the caller
+/// can see it rather than assume it. A pair whose three columns could not be
+/// measured by any single instrument is refused, not reported: `state` says
+/// which refusal and `unmeasured_reason` says why.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseSynergyPair {
     pub slot_a: u16,
     pub slot_b: u16,
@@ -379,9 +386,21 @@ pub struct SynapseSynergyPair {
     pub left_bits: f32,
     pub right_bits: f32,
     pub gain_bits: f32,
+    pub raw_gain_bits: f32,
+    pub monotonicity_floor_applied: bool,
+    /// The instrument behind `pair_bits`; `None` when the pair is unmeasured.
+    pub pair_estimator: Option<String>,
+    /// The instrument behind `left_bits`; `None` when the pair is unmeasured.
+    pub left_estimator: Option<String>,
+    /// The instrument behind `right_bits`; `None` when the pair is unmeasured.
+    pub right_estimator: Option<String>,
     pub n_samples: usize,
     pub synergistic: bool,
     pub provisional: bool,
+    /// `measured` | `insufficient_samples` | `estimator_refused` |
+    /// `cross_estimator_unpinnable`.
+    pub state: String,
+    pub unmeasured_reason: Option<String>,
 }
 
 /// Result of one Assay synergy pass, with the physical Assay CF readback and
@@ -396,6 +415,14 @@ pub struct SynapseSynergyReport {
     /// Lenses actually paired under the bounded synergy budget.
     pub lenses_paired: usize,
     pub pairs_evaluated: usize,
+    /// Pairs reported without a measured gain, for any reason (#1941).
+    pub pairs_unmeasured: usize,
+    /// Pairs refused because no single instrument could measure all three
+    /// terms, so their difference would not have been a measurement (#1941).
+    pub pairs_cross_estimator_unpinnable: usize,
+    /// Measured pairs whose raw gain was negative and was floored at zero by
+    /// the data-processing inequality (#1941).
+    pub pairs_monotonicity_floored: usize,
     pub synergistic_pairs: usize,
     pub max_gain_bits: f32,
     /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
@@ -2181,21 +2208,67 @@ impl StorageBackend for CalyxBackend {
         // deliberately does not derive a fraction from (a subset-fed panel has
         // no meaningful denominator), and this pass runs on a five-minute tick.
         let mut source_cf_rows = BTreeMap::new();
+        // #1940: the KEYS, not just the count. The orphan question — "does this
+        // record's own source row still exist" — is a membership test, and the
+        // rows are already in hand here, so keeping their keys costs one pass
+        // over an array that was going to be dropped anyway.
+        let mut source_cf_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for entry in constellations::builtin_panel_catalog() {
-            if !entry.source.is_full_cf() {
-                continue;
-            }
             let Some(cf_name) = entry.source.cf_name() else {
                 continue;
             };
-            if source_cf_rows.contains_key(cf_name) {
+            if source_cf_keys.contains_key(cf_name) {
                 continue;
             }
-            let rows = self.read_all_rows(cf_name)?.len() as u64;
-            source_cf_rows.insert(cf_name.to_owned(), rows);
+            // The row COUNT is still only taken for a declared full-CF
+            // denominator: a subset-fed panel has no meaningful coverage
+            // fraction, and deriving one would read as a permanent outage.
+            //
+            // The KEY SET is taken for every source CF, including subset-fed
+            // ones (#1940). The orphan probe is a per-record membership test —
+            // "is this record's own source row still there" — and that question
+            // is exactly as meaningful for a sampled panel as for a full-CF
+            // one. Skipping them made the census silently under-report:
+            // measured 2026-08-01 it found 226 of the 227 orphans an
+            // independent audit found, missing `syn-observation-v1`'s one
+            // record purely because its panel is sampled.
+            if entry.source.is_full_cf() {
+                let rows = self.read_all_rows(cf_name)?;
+                source_cf_rows.insert(cf_name.to_owned(), rows.len() as u64);
+            }
+            // The KEY SET is read with expired rows INCLUDED, and that is not
+            // the same question the row count above answers (#1940).
+            //
+            // `source_cf_rows` is a coverage denominator: "how many source rows
+            // is this panel supposed to have measured". A row past its TTL is
+            // on its way out and measuring it is pointless, so it is excluded.
+            //
+            // The orphan probe asks something else: "can this record's own
+            // source row still be read". A row past its TTL but still
+            // physically in the vault CAN be read and re-measured until the GC
+            // actually removes it, so counting it as gone would overstate the
+            // loss — the same call `--audit-source-coverage` makes for the same
+            // reason (#1882). Measured on the live vault 2026-08-01, the two
+            // readings of CF_ACTION_LOG differ by a factor of nine (82 unexpired
+            // vs 747 physically present), so this is the difference between
+            // reporting 665 orphans and the true 224.
+            let present = self.with_vault(cf_name, "scan Calyx KV namespace", false, |vault| {
+                read_all_rows_from_vault_including_expired(vault, cf_name)
+            })?;
+            source_cf_keys.insert(
+                cf_name.to_owned(),
+                present
+                    .iter()
+                    .map(|(key, _)| constellations::hex_encode(key))
+                    .collect(),
+            );
         }
 
-        let report = crate::panel_coverage::build_panel_coverage_report(&census, &source_cf_rows);
+        let report = crate::panel_coverage::build_panel_coverage_report(
+            &census,
+            &source_cf_rows,
+            &source_cf_keys,
+        );
         if !report.accounting_holds() {
             // Never a silent discrepancy: the caller is told the counts do not
             // add up, with all three numbers, rather than being handed a report
@@ -2959,6 +3032,9 @@ impl StorageBackend for CalyxBackend {
                     n_lenses: report.n_lenses,
                     lenses_paired: report.lenses_paired,
                     pairs_evaluated: report.pairs_evaluated,
+                    pairs_unmeasured: report.pairs_unmeasured,
+                    pairs_cross_estimator_unpinnable: report.pairs_cross_estimator_unpinnable,
+                    pairs_monotonicity_floored: report.pairs_monotonicity_floored,
                     synergistic_pairs: report.synergistic_pairs,
                     max_gain_bits: report.max_gain_bits,
                     domain_provisional: verdict.provisional,
@@ -2973,9 +3049,16 @@ impl StorageBackend for CalyxBackend {
                             left_bits: pair.left_bits,
                             right_bits: pair.right_bits,
                             gain_bits: pair.gain_bits,
+                            raw_gain_bits: pair.raw_gain_bits,
+                            monotonicity_floor_applied: pair.monotonicity_floor_applied,
+                            pair_estimator: pair.estimators.map(|e| e.pair.as_str().to_owned()),
+                            left_estimator: pair.estimators.map(|e| e.left.as_str().to_owned()),
+                            right_estimator: pair.estimators.map(|e| e.right.as_str().to_owned()),
                             n_samples: pair.n_samples,
                             synergistic: pair.synergistic,
                             provisional: pair.provisional,
+                            state: pair.state.as_str().to_owned(),
+                            unmeasured_reason: pair.unmeasured_reason,
                         })
                         .collect(),
                     assay_cf_rows_after,

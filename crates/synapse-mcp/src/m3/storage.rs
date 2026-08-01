@@ -770,10 +770,26 @@ pub struct StoragePanelCoverageResponse {
     /// lookup no census can perform. Superseded `Base` rows are never
     /// auto-deleted; this number exists so the decision can be sized.
     pub superseded_reclaim_candidates: u64,
-    /// Constellations whose source row an audit TTL expired. **Sacred and
-    /// permanent**: nothing can re-measure a row that is gone, so the
-    /// constellation is the only surviving record of the observation.
+    /// Constellations whose own source row is gone, by per-record probe
+    /// (#1940). **Sacred and permanent**: nothing can re-measure a row that is
+    /// gone, so the constellation is the only surviving record of the
+    /// observation.
     pub orphaned_records_total: u64,
+    /// Of those, the ones on a declared TTL-managed source. Expected.
+    pub orphaned_source_evicted_total: u64,
+    /// Of those, the ones on a source with no TTL. **Non-zero is an integrity
+    /// finding**, not a retention state (#1940).
+    pub orphaned_source_missing_total: u64,
+    /// Active-generation records with no source provenance to probe (#1940).
+    pub unattributed_records_total: u64,
+    /// Records on superseded generations whose own source row is gone (#1940).
+    /// None of them is reclaimable, whatever else holds — nothing can
+    /// re-measure a row that no longer exists.
+    pub superseded_orphaned_records_total: u64,
+    /// Panels carrying a non-zero `orphaned_source_missing` — the finding, as
+    /// distinct from `records_exceed_source_panels`, which is an arithmetic
+    /// observation expected on any TTL-managed source (#1940).
+    pub orphaned_source_missing_panels: Vec<String>,
     /// Superseded generations something is STILL WRITING TO, as `panel@version`.
     ///
     /// Non-empty is a defect, not a retention state: records are being stranded
@@ -863,9 +879,27 @@ pub struct StoragePanelCoverageRow {
     /// perform, and on `syn-agent-transcript-v1` it is demonstrably false for
     /// some of them (40,501 superseded records against 25,573 source rows).
     pub superseded_reclaim_candidates: u64,
-    /// Active-generation constellations whose source row an audit TTL expired.
-    /// Sacred and permanent — nothing can re-measure a row that is gone.
+    /// Active-generation constellations whose own source row is gone,
+    /// established by a per-record source-key probe rather than by subtracting
+    /// two counts taken over different populations (#1940). Sacred and
+    /// permanent — nothing can re-measure a row that is gone.
     pub orphaned_records: u64,
+    /// Of those, the ones whose source CF is declared TTL-managed: the
+    /// retention policy working as designed. Expected, **not** a finding.
+    pub orphaned_source_evicted: u64,
+    /// Of those, the ones whose source CF has no TTL. Non-zero is a real
+    /// integrity finding: a constellation whose provenance points at a row
+    /// never written, or destroyed outside the retention path.
+    pub orphaned_source_missing: u64,
+    /// Active-generation records carrying no source provenance at all, so no
+    /// probe is possible. "Cannot ask" is not "answered no".
+    pub unattributed_records: u64,
+    /// The same probe over this panel's **superseded** generations. On the live
+    /// vault this is where every real orphan lives, and each one fails the
+    /// #1927 ask 3 reclaim rule's condition 3 — nothing can re-measure it.
+    pub superseded_orphaned_records: u64,
+    /// Of those, the ones on a source CF with no TTL (an integrity finding).
+    pub superseded_orphaned_source_missing: u64,
     pub grounded_records: u64,
     pub grounded_fraction: f32,
     pub grounding_below_floor: bool,
@@ -1168,7 +1202,16 @@ pub struct StorageIntelligenceNeffEstimate {
 pub struct StorageIntelligenceAbundanceReport {
     pub source_of_truth: &'static str,
     pub panel_version: u32,
+    /// Lenses the panel **declares** — the `N` behind `c_n2_upper_bound` and
+    /// `dda_signal_yield`. A lens the association engine cannot consume is
+    /// reported in `slot_states`, never subtracted from this count (#1939).
     pub n_lenses: u64,
+    /// Lenses that actually reached the corpus. Below `n_lenses` means the
+    /// panel is carrying dark lenses; `slot_states` names each one.
+    pub measurable_lenses: u64,
+    /// Per declared lens: vector kind, whether the engine measured on it, and
+    /// the named reason when it did not (#1939).
+    pub slot_states: Vec<StorageIntelligenceCorpusSlotState>,
     pub n_constellations: u64,
     pub c_n2_upper_bound: u64,
     pub materialized: u64,
@@ -1218,7 +1261,12 @@ pub struct StorageIntelligenceWeaveResponse {
     pub panel_version: u32,
     pub records_scanned: u64,
     pub records_woven: u64,
+    /// Lenses the panel declares (#1939).
     pub n_lenses: u64,
+    /// Lenses that reached the corpus and could be woven.
+    pub measurable_lenses: u64,
+    /// Per declared lens: kind, measurability, and the reason when not (#1939).
+    pub slot_states: Vec<StorageIntelligenceCorpusSlotState>,
     pub cross_terms_materialized: u64,
     pub agreement_edges_persisted: u64,
     pub between_record_edges_persisted: u64,
@@ -1443,9 +1491,38 @@ pub struct StorageIntelligenceRedundancyReport {
     pub assay_cf_rows_after: u64,
 }
 
-/// One measured lens pair from a synergy pass: the joint bits, both marginals
-/// over the same records, and `gain = pair_bits - max(left, right)`.
-#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+/// What the corpus loader did with one declared panel lens (#1939).
+///
+/// A panel declares its lens set; the association engine can only measure on
+/// the slots it can actually carry. Reporting the difference per slot — rather
+/// than by quietly shrinking `n_lenses` — is what makes a dark lens a finding
+/// instead of an invisible absence.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCorpusSlotState {
+    pub slot: u32,
+    /// `dense` | `sparse` | `multi` | `absent`.
+    pub kind: String,
+    /// True when the association engine can measure on this slot.
+    pub measurable: bool,
+    /// For a carried sparse lens, the corpus-observed support it was densified
+    /// over. Densifying over exactly the occupied indices is lossless: every
+    /// excluded index is zero in every record.
+    pub densified_support: Option<u64>,
+    /// Why this lens is not measurable; present exactly when `measurable` is
+    /// false and the loader has a reason beyond the slot's vector kind.
+    pub unusable_reason: Option<String>,
+}
+
+/// One lens pair from a synergy pass: the joint bits, both marginals over the
+/// same records **and from the same estimator**, and
+/// `gain = max(0, pair_bits - max(left, right))`.
+///
+/// The floor is the data-processing inequality, which `[a‖b]` determines `a`
+/// makes a law rather than a preference; `raw_gain_bits` keeps the unclamped
+/// difference and `monotonicity_floor_applied` marks the row, so a clamped
+/// value is visibly clamped (#1941).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceSynergyPair {
     pub slot_a: u32,
@@ -1454,10 +1531,29 @@ pub struct StorageIntelligenceSynergyPair {
     pub left_bits: f32,
     pub right_bits: f32,
     pub gain_bits: f32,
+    /// `pair_bits - max(left_bits, right_bits)` before the monotonicity floor.
+    pub raw_gain_bits: f32,
+    /// True when the raw gain was negative and the floor moved it to zero.
+    pub monotonicity_floor_applied: bool,
+    /// Instrument behind `pair_bits` (`discrete_plugin` | `continuous_ksg`);
+    /// `None` when the pair is unmeasured. All three always agree — a pair
+    /// whose terms could not share one instrument is refused, not reported.
+    pub pair_estimator: Option<String>,
+    /// Instrument behind `left_bits`.
+    pub left_estimator: Option<String>,
+    /// Instrument behind `right_bits`.
+    pub right_estimator: Option<String>,
     pub n_samples: u64,
     pub synergistic: bool,
-    /// True when the pair had too few paired samples to measure at all.
+    /// True when the pair carries no trustworthy measurement — unmeasured, or
+    /// measured with the monotonicity floor applied.
     pub provisional: bool,
+    /// `measured` | `insufficient_samples` | `estimator_refused` |
+    /// `cross_estimator_unpinnable`.
+    pub state: String,
+    /// Why this pair carries no measured gain; present exactly when `state` is
+    /// not `measured`.
+    pub unmeasured_reason: Option<String>,
 }
 
 /// Result of one Assay synergy pass with the physical Assay CF readback.
@@ -1472,6 +1568,14 @@ pub struct StorageIntelligenceSynergyReport {
     /// Lenses paired under the bounded synergy budget (top marginal bits).
     pub lenses_paired: u64,
     pub pairs_evaluated: u64,
+    /// Pairs reported without a measured gain, for any reason (#1941).
+    pub pairs_unmeasured: u64,
+    /// Pairs refused because no single instrument could measure all three
+    /// terms; their difference would not have been a measurement (#1941).
+    pub pairs_cross_estimator_unpinnable: u64,
+    /// Measured pairs whose raw gain was negative and got floored at zero
+    /// (#1941).
+    pub pairs_monotonicity_floored: u64,
     pub synergistic_pairs: u64,
     pub max_gain_bits: f32,
     /// #1670 control-doctrine marker: domain anchor coverage below the floor.
@@ -2367,6 +2471,11 @@ pub fn inspect_panel_coverage(
             superseded_grounded_records: panel.superseded_grounded_records as u64,
             superseded_reclaim_candidates: panel.superseded_reclaim_candidates as u64,
             orphaned_records: panel.orphaned_records as u64,
+            orphaned_source_evicted: panel.orphaned_source_evicted as u64,
+            orphaned_source_missing: panel.orphaned_source_missing as u64,
+            unattributed_records: panel.unattributed_records as u64,
+            superseded_orphaned_records: panel.superseded_orphaned_records as u64,
+            superseded_orphaned_source_missing: panel.superseded_orphaned_source_missing as u64,
             grounded_records: panel.grounded_records as u64,
             grounded_fraction: panel.grounded_fraction,
             grounding_below_floor: panel.grounding_below_floor,
@@ -2400,6 +2509,11 @@ pub fn inspect_panel_coverage(
         superseded_grounded_records_total: report.superseded_grounded_records_total as u64,
         superseded_reclaim_candidates: report.superseded_reclaim_candidates as u64,
         orphaned_records_total: report.orphaned_records_total as u64,
+        orphaned_source_evicted_total: report.orphaned_source_evicted_total as u64,
+        orphaned_source_missing_total: report.orphaned_source_missing_total as u64,
+        unattributed_records_total: report.unattributed_records_total as u64,
+        superseded_orphaned_records_total: report.superseded_orphaned_records_total as u64,
+        orphaned_source_missing_panels: report.orphaned_source_missing_panels.clone(),
         open_superseded_generations: report.open_superseded_generations.clone(),
         coverage_floor: report.coverage_floor,
         grounding_floor: report.grounding_floor,
@@ -2749,6 +2863,13 @@ pub fn run_intelligence_weave(
         records_scanned: report.records_scanned as u64,
         records_woven: report.records_woven as u64,
         n_lenses: report.n_lenses as u64,
+        measurable_lenses: report.measurable_lenses as u64,
+        slot_states: report
+            .slot_states
+            .clone()
+            .into_iter()
+            .map(storage_intelligence_slot_state)
+            .collect(),
         cross_terms_materialized: report.cross_terms_materialized as u64,
         agreement_edges_persisted: report.agreement_edges_persisted as u64,
         between_record_edges_persisted: report.between_record_edges_persisted as u64,
@@ -3004,6 +3125,9 @@ pub fn run_intelligence_synergy(
         n_lenses: report.n_lenses as u64,
         lenses_paired: report.lenses_paired as u64,
         pairs_evaluated: report.pairs_evaluated as u64,
+        pairs_unmeasured: report.pairs_unmeasured as u64,
+        pairs_cross_estimator_unpinnable: report.pairs_cross_estimator_unpinnable as u64,
+        pairs_monotonicity_floored: report.pairs_monotonicity_floored as u64,
         synergistic_pairs: report.synergistic_pairs as u64,
         max_gain_bits: report.max_gain_bits,
         domain_provisional: report.domain_provisional,
@@ -3018,9 +3142,16 @@ pub fn run_intelligence_synergy(
                 left_bits: pair.left_bits,
                 right_bits: pair.right_bits,
                 gain_bits: pair.gain_bits,
+                raw_gain_bits: pair.raw_gain_bits,
+                monotonicity_floor_applied: pair.monotonicity_floor_applied,
+                pair_estimator: pair.pair_estimator,
+                left_estimator: pair.left_estimator,
+                right_estimator: pair.right_estimator,
                 n_samples: pair.n_samples as u64,
                 synergistic: pair.synergistic,
                 provisional: pair.provisional,
+                state: pair.state,
+                unmeasured_reason: pair.unmeasured_reason,
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
@@ -3332,6 +3463,18 @@ fn storage_intelligence_agreement_edge(
     }
 }
 
+fn storage_intelligence_slot_state(
+    state: synapse_calyx::SynapseCalyxCorpusSlotState,
+) -> StorageIntelligenceCorpusSlotState {
+    StorageIntelligenceCorpusSlotState {
+        slot: u32::from(state.slot),
+        kind: state.kind,
+        measurable: state.measurable,
+        densified_support: state.densified_support.map(|support| support as u64),
+        unusable_reason: state.unusable_reason,
+    }
+}
+
 fn storage_intelligence_abundance(
     report: synapse_calyx::SynapseCalyxAbundanceReport,
 ) -> StorageIntelligenceAbundanceReport {
@@ -3339,6 +3482,12 @@ fn storage_intelligence_abundance(
         source_of_truth: "Calyx Base + XTerm + Graph CF rows",
         panel_version: report.panel_version,
         n_lenses: report.n_lenses as u64,
+        measurable_lenses: report.measurable_lenses as u64,
+        slot_states: report
+            .slot_states
+            .into_iter()
+            .map(storage_intelligence_slot_state)
+            .collect(),
         n_constellations: report.n_constellations as u64,
         c_n2_upper_bound: report.c_n2_upper_bound as u64,
         materialized: report.materialized as u64,

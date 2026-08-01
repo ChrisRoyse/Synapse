@@ -127,8 +127,12 @@ pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
 
 pub const META_PANEL_NAME: &str = "synapse_panel_name";
-pub const META_SOURCE_CF: &str = "synapse_source_cf";
-pub const META_SOURCE_KEY_HEX: &str = "synapse_source_key_hex";
+// One definition, shared with the layer that reads these back for the #1940
+// orphan probe. Re-exported rather than re-spelled, so the writer and the
+// reader cannot drift into two different strings for one key.
+pub use synapse_calyx::{
+    METADATA_SOURCE_CF as META_SOURCE_CF, METADATA_SOURCE_KEY_HEX as META_SOURCE_KEY_HEX,
+};
 pub const META_RAW_SHA256: &str = "synapse_raw_sha256";
 pub const META_RAW_LEN_BYTES: &str = "synapse_raw_len_bytes";
 pub const META_TIME_BASIS: &str = "synapse_time_basis";
@@ -2030,6 +2034,27 @@ pub struct PanelCatalogEntry {
     /// wait for bits from a panel that will never have an anchor to measure them
     /// about.
     pub outcome_bearing: bool,
+    /// **#1940.** Whether this panel's source CF carries an audit TTL, so its
+    /// rows are expected to be evicted out from under the constellations
+    /// measured from them. Declared here rather than inferred, for the same
+    /// reason `outcome_bearing` is: it decides whether an observation is a
+    /// finding.
+    ///
+    /// A constellation whose source row is gone is *sacred and permanent*
+    /// either way — nothing can re-measure a row that no longer exists. But the
+    /// two causes call for opposite responses. On a TTL-managed source the
+    /// absence is the retention policy working as designed, and reporting it as
+    /// an anomaly on every census trains readers to ignore the field. On a
+    /// source with no TTL, the same absence means a constellation's provenance
+    /// points at a row that was never written or was destroyed outside the
+    /// retention path — a grounding violation, and a real integrity finding.
+    ///
+    /// Measured on the live vault 2026-08-01 by per-record source-key probe:
+    /// 227 of 81,733 attributed constellations had lost their source row, and
+    /// every one of them belonged to a panel declared TTL-managed here
+    /// (`syn-action-v1` 224, `syn-process-v1` 2, `syn-observation-v1` 1). Zero
+    /// belonged to a non-TTL source.
+    pub source_ttl_managed: bool,
     /// Generations this panel has been through, newest-superseded first.
     ///
     /// Rows at these versions are still physically in the `Base` CF and are
@@ -2066,6 +2091,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_TIMELINE_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_TIMELINE),
             outcome_bearing: false,
+            source_ttl_managed: false,
             superseded_versions: &[SYN_TIMELINE_PANEL_VERSION_PRE_1900],
             backfill_source_cf: Some(cf::CF_TIMELINE),
         },
@@ -2074,6 +2100,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_ACTION_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_ACTION_LOG),
             outcome_bearing: false,
+            source_ttl_managed: true,
             superseded_versions: &[1_666_001],
             backfill_source_cf: None,
         },
@@ -2082,6 +2109,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_REFLEX_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_REFLEX_AUDIT),
             outcome_bearing: false,
+            source_ttl_managed: true,
             superseded_versions: &[1_666_002],
             backfill_source_cf: None,
         },
@@ -2090,6 +2118,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_PROCESS_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_PROCESS_HISTORY),
             outcome_bearing: false,
+            source_ttl_managed: true,
             superseded_versions: &[1_666_003],
             backfill_source_cf: None,
         },
@@ -2101,6 +2130,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             // is deliberately NOT this panel's denominator.
             source: PanelSource::SubsetOfCf(cf::CF_OBSERVATIONS),
             outcome_bearing: false,
+            source_ttl_managed: true,
             superseded_versions: &[1_666_004],
             backfill_source_cf: None,
         },
@@ -2111,6 +2141,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             // CF is its population.
             source: PanelSource::Derived,
             outcome_bearing: false,
+            source_ttl_managed: false,
             superseded_versions: &[1_667_001],
             backfill_source_cf: None,
         },
@@ -2119,6 +2150,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_GRAPHPOS_APP_PANEL_VERSION,
             source: PanelSource::Derived,
             outcome_bearing: false,
+            source_ttl_managed: false,
             superseded_versions: &[],
             backfill_source_cf: None,
         },
@@ -2127,6 +2159,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
             source: PanelSource::Derived,
             outcome_bearing: false,
+            source_ttl_managed: false,
             superseded_versions: &[],
             backfill_source_cf: None,
         },
@@ -2135,6 +2168,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_PATH_HIERARCHY_PANEL_VERSION,
             source: PanelSource::Derived,
             outcome_bearing: false,
+            source_ttl_managed: false,
             superseded_versions: &[],
             backfill_source_cf: None,
         },
@@ -2144,6 +2178,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_EPISODE_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_EPISODES),
             outcome_bearing: true,
+            source_ttl_managed: false,
             superseded_versions: &[SYN_EPISODE_PANEL_VERSION_PRE_1904],
             backfill_source_cf: Some(cf::CF_EPISODES),
         },
@@ -2152,6 +2187,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_AGENT_EVENTS),
             outcome_bearing: true,
+            source_ttl_managed: false,
             superseded_versions: &[],
             // No re-measure path exists for this CF (#1927 ask 2 reports the
             // shortfall rather than treating the absence as coverage).
@@ -2162,6 +2198,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_version: SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_AGENT_TRANSCRIPTS),
             outcome_bearing: true,
+            source_ttl_managed: false,
             superseded_versions: &[
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904,
@@ -2175,6 +2212,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             // many unrelated row families, so neither count is a denominator.
             source: PanelSource::SubsetOfCf(cf::CF_KV),
             outcome_bearing: true,
+            source_ttl_managed: false,
             superseded_versions: &[1_669_001],
             backfill_source_cf: None,
         },
@@ -2184,6 +2222,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             // The `mcp-usage/v1/` key prefix within CF_KV.
             source: PanelSource::SubsetOfCf(cf::CF_KV),
             outcome_bearing: true,
+            source_ttl_managed: false,
             superseded_versions: &[1_691_001],
             backfill_source_cf: None,
         },

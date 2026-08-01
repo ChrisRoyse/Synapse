@@ -40,8 +40,10 @@
 //! 4. An **open** superseded generation (something still writing to it)
 //!    contributes zero candidates and is named in
 //!    `open_superseded_generations`.
-//! 5. `orphaned_records` reconstructs from an independently-read CF row count:
-//!    `active_version_records - source_cf_rows` where positive.
+//! 5. `orphaned_records` is a **per-record source-key probe**, not a
+//!    subtraction (#1940), and splits into `orphaned_source_evicted` (the
+//!    source CF is declared TTL-managed — expected) and
+//!    `orphaned_source_missing` (it is not — a real integrity finding).
 //! 6. Per-panel totals sum to the report-level totals.
 //!
 //! # Usage
@@ -56,13 +58,13 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use synapse_calyx::{SynapseCalyxPanelCensus, SynapseCalyxPanelCensusEntry};
 use synapse_storage::Db;
 use synapse_storage::constellations::{
-    PanelSource, SYN_TIMELINE_PANEL_VERSION, SYN_TIMELINE_PANEL_VERSION_PRE_1900,
-    builtin_panel_catalog,
+    PanelSource, SYN_ACTION_PANEL_VERSION, SYN_TIMELINE_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_VERSION_PRE_1900, builtin_panel_catalog,
 };
 use synapse_storage::panel_coverage::build_panel_coverage_report;
 
@@ -76,6 +78,19 @@ const TIMELINE_CF: &str = "CF_TIMELINE";
 
 fn verdict(ok: bool) -> &'static str {
     if ok { "OK" } else { "FAIL" }
+}
+
+/// A synthetic source row key, so a record's declared provenance is a value the
+/// #1940 probe can test for membership.
+fn source_key(index: usize) -> String {
+    format!("{index:08x}")
+}
+
+/// The set of source keys a CF physically holds: `present` of them, starting at
+/// index 0. Every record above that index is an orphan by construction, which
+/// is what makes the expected probe output known in advance.
+fn source_keys(cf: &str, present: usize) -> BTreeMap<String, BTreeSet<String>> {
+    BTreeMap::from([(cf.to_owned(), (0..present).map(source_key).collect())])
 }
 
 /// Build a census holding exactly one active and one superseded generation of
@@ -94,6 +109,14 @@ fn synthetic_census(
         anchor_kind_records: BTreeMap::new(),
         earliest_created_at_ms: Some(earliest),
         latest_created_at_ms: Some(latest),
+        // Each record declares its own source key, so the #1940 orphan probe
+        // has something to probe. `source_keys` below overrides these for the
+        // cases that exercise the probe itself.
+        source_key_hexes: BTreeMap::from([(
+            TIMELINE_CF.to_owned(),
+            (0..records).map(source_key).collect(),
+        )]),
+        unattributed_records: 0,
     };
     SynapseCalyxPanelCensus {
         entries: vec![
@@ -136,7 +159,11 @@ fn run_synthetic_cases() -> Vec<String> {
     // by construction: closed=false, named in open_superseded_generations, and
     // ZERO candidates despite all 100 records being ungrounded.
     let rows = BTreeMap::from([(TIMELINE_CF.to_owned(), 1000u64)]);
-    let report = build_panel_coverage_report(&synthetic_census(1000, 400, 100, 0, 500), &rows);
+    let report = build_panel_coverage_report(
+        &synthetic_census(1000, 400, 100, 0, 500),
+        &rows,
+        &source_keys(TIMELINE_CF, 1000),
+    );
     let Some(panel) = timeline(&report) else {
         failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
         return failures;
@@ -170,7 +197,11 @@ fn run_synthetic_cases() -> Vec<String> {
     // reclaiming while the active generation covers 1.7% of the corpus would
     // delete the only measurement of records the backfill has not reached.
     let rows = BTreeMap::from([(TIMELINE_CF.to_owned(), 22_999u64)]);
-    let report = build_panel_coverage_report(&synthetic_census(389, 900, 100, 0, 500), &rows);
+    let report = build_panel_coverage_report(
+        &synthetic_census(389, 900, 100, 0, 500),
+        &rows,
+        &source_keys(TIMELINE_CF, 22_999),
+    );
     let Some(panel) = timeline(&report) else {
         failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
         return failures;
@@ -201,7 +232,11 @@ fn run_synthetic_cases() -> Vec<String> {
     // superseded_grounded_records exactly 40. The failure this catches is a
     // candidate count of 100 — which would mean a reclaim eats 40 anchors.
     let rows = BTreeMap::from([(TIMELINE_CF.to_owned(), 1000u64)]);
-    let report = build_panel_coverage_report(&synthetic_census(1000, 900, 100, 40, 500), &rows);
+    let report = build_panel_coverage_report(
+        &synthetic_census(1000, 900, 100, 40, 500),
+        &rows,
+        &source_keys(TIMELINE_CF, 1000),
+    );
     let Some(panel) = timeline(&report) else {
         failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
         return failures;
@@ -227,7 +262,11 @@ fn run_synthetic_cases() -> Vec<String> {
     // --- S4: every superseded record grounded ----------------------------
     // The whole generation is sacred. 0 candidates, and the 50 are counted as
     // grounded rather than quietly dropped from both totals.
-    let report = build_panel_coverage_report(&synthetic_census(1000, 900, 50, 50, 500), &rows);
+    let report = build_panel_coverage_report(
+        &synthetic_census(1000, 900, 50, 50, 500),
+        &rows,
+        &source_keys(TIMELINE_CF, 1000),
+    );
     let Some(panel) = timeline(&report) else {
         failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
         return failures;
@@ -254,7 +293,7 @@ fn run_synthetic_cases() -> Vec<String> {
     // treated as safe. Expected: closed=false, 0 candidates, named as open.
     let mut census = synthetic_census(1000, 900, 100, 0, 500);
     census.entries[0].latest_created_at_ms = None;
-    let report = build_panel_coverage_report(&census, &rows);
+    let report = build_panel_coverage_report(&census, &rows, &source_keys(TIMELINE_CF, 1000));
     let Some(panel) = timeline(&report) else {
         failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
         return failures;
@@ -272,6 +311,152 @@ fn run_synthetic_cases() -> Vec<String> {
         failures.push(format!(
             "S5: closed={} candidates={}",
             panel.superseded_versions_present[0].closed, panel.superseded_reclaim_candidates
+        ));
+    }
+
+    // --- S6: the #1940 defect, at the exact point it hid ------------------
+    // 1000 active records, and the source CF holds 1000 rows — so the OLD
+    // arithmetic `active_version_records - source_cf_rows` is exactly 0 and
+    // reports a clean panel. But the source CF holds keys 0..998 while the
+    // records declare keys 0..999, so record 999's own source row is gone.
+    //
+    // Expected, by construction: orphaned_records = 1, not 0. This is the case
+    // no subtraction can see, because the two counts agree while the sets do
+    // not. `syn-timeline-v1` declares source_ttl_managed = false, so the one
+    // orphan must be classified MISSING (an integrity finding) and the panel
+    // must be named in orphaned_source_missing_panels.
+    let rows = BTreeMap::from([(TIMELINE_CF.to_owned(), 1000u64)]);
+    let report = build_panel_coverage_report(
+        &synthetic_census(1000, 900, 0, 0, 500),
+        &rows,
+        &source_keys(TIMELINE_CF, 999),
+    );
+    let Some(panel) = timeline(&report) else {
+        failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
+        return failures;
+    };
+    let subtraction_would_say =
+        (panel.active_version_records as u64).saturating_sub(panel.source_cf_rows.unwrap_or(0));
+    let held = panel.orphaned_records == 1
+        && panel.orphaned_source_missing == 1
+        && panel.orphaned_source_evicted == 0
+        && panel.unattributed_records == 0
+        && subtraction_would_say == 0
+        && report.orphaned_source_missing_panels == vec!["syn-timeline-v1".to_owned()];
+    println!(
+        "  S6 probe vs subtraction (1000 records, 1000 source rows, 999 keys present)\n     \
+         subtraction_would_say={subtraction_would_say} (expected 0 — the defect) \
+         probe orphaned={} missing={} evicted={} unattributed={} named={:?}  {}",
+        panel.orphaned_records,
+        panel.orphaned_source_missing,
+        panel.orphaned_source_evicted,
+        panel.unattributed_records,
+        report.orphaned_source_missing_panels,
+        verdict(held)
+    );
+    if !held {
+        failures.push(format!(
+            "S6: orphaned={} missing={} evicted={} subtraction={subtraction_would_say} named={:?}",
+            panel.orphaned_records,
+            panel.orphaned_source_missing,
+            panel.orphaned_source_evicted,
+            report.orphaned_source_missing_panels
+        ));
+    }
+
+    // --- S7: a TTL-managed source is EVICTED, not MISSING -----------------
+    // The same shape on `syn-action-v1`, which declares source_ttl_managed =
+    // true over CF_ACTION_LOG. 40 active records, 37 source keys present, so 3
+    // orphans — and all 3 must land in `orphaned_source_evicted`, with the
+    // panel absent from orphaned_source_missing_panels. This is ask 2: the
+    // expected class must stop being reported as a finding.
+    let action_cf = "CF_ACTION_LOG";
+    let mut census = synthetic_census(0, 900, 0, 0, 500);
+    census.entries.push(SynapseCalyxPanelCensusEntry {
+        panel_version: SYN_ACTION_PANEL_VERSION,
+        records: 40,
+        grounded_records: 0,
+        anchor_kind_records: BTreeMap::new(),
+        earliest_created_at_ms: Some(900),
+        latest_created_at_ms: Some(901),
+        source_key_hexes: BTreeMap::from([(
+            action_cf.to_owned(),
+            (0..40).map(source_key).collect(),
+        )]),
+        unattributed_records: 0,
+    });
+    census.base_cf_rows += 40;
+    let rows = BTreeMap::from([(action_cf.to_owned(), 40u64)]);
+    let report = build_panel_coverage_report(&census, &rows, &source_keys(action_cf, 37));
+    let action = report
+        .panels
+        .iter()
+        .find(|panel| panel.panel_version == SYN_ACTION_PANEL_VERSION)
+        .cloned();
+    let Some(action) = action else {
+        failures.push("syn-action-v1 absent from a synthetic report".to_owned());
+        return failures;
+    };
+    let held = action.orphaned_records == 3
+        && action.orphaned_source_evicted == 3
+        && action.orphaned_source_missing == 0
+        && report.orphaned_source_missing_panels.is_empty()
+        && report.orphaned_source_evicted_total == 3;
+    println!(
+        "  S7 TTL-managed source (40 records, 37 keys present, CF_ACTION_LOG)\n     \
+         orphaned={} evicted={} (expected 3) missing={} (expected 0) missing_panels={:?} \
+         (expected [])  {}",
+        action.orphaned_records,
+        action.orphaned_source_evicted,
+        action.orphaned_source_missing,
+        report.orphaned_source_missing_panels,
+        verdict(held)
+    );
+    if !held {
+        failures.push(format!(
+            "S7: orphaned={} evicted={} missing={} missing_panels={:?}",
+            action.orphaned_records,
+            action.orphaned_source_evicted,
+            action.orphaned_source_missing,
+            report.orphaned_source_missing_panels
+        ));
+    }
+
+    // --- S8: no provenance is UNATTRIBUTED, never "covered" ---------------
+    // 10 active records that declare no source at all. The probe cannot be
+    // attempted, so they must be neither orphaned nor silently counted as
+    // covered: unattributed = 10, orphaned = 0.
+    let mut census = synthetic_census(10, 900, 0, 0, 500);
+    let Some(active) = census
+        .entries
+        .iter_mut()
+        .find(|entry| entry.panel_version == SYN_TIMELINE_PANEL_VERSION)
+    else {
+        failures.push("S8: synthetic census lacks the active timeline generation".to_owned());
+        return failures;
+    };
+    active.source_key_hexes.clear();
+    active.unattributed_records = 10;
+    let rows = BTreeMap::from([(TIMELINE_CF.to_owned(), 10u64)]);
+    let report = build_panel_coverage_report(&census, &rows, &source_keys(TIMELINE_CF, 10));
+    let Some(panel) = timeline(&report) else {
+        failures.push("syn-timeline-v1 absent from a synthetic report".to_owned());
+        return failures;
+    };
+    let held = panel.unattributed_records == 10
+        && panel.orphaned_records == 0
+        && report.unattributed_records_total == 10;
+    println!(
+        "  S8 no provenance (10 records, no source_cf/source_key metadata)\n     \
+         unattributed={} (expected 10) orphaned={} (expected 0 — cannot ask is not answered no)  {}",
+        panel.unattributed_records,
+        panel.orphaned_records,
+        verdict(held)
+    );
+    if !held {
+        failures.push(format!(
+            "S8: unattributed={} orphaned={}",
+            panel.unattributed_records, panel.orphaned_records
         ));
     }
 
@@ -561,9 +746,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     // ------------------------------------------------------------------
-    // CHECK 5 — orphan count reconstructs from an independent row count
+    // CHECK 5 — the orphan count is a probe, and it splits by declaration
     // ------------------------------------------------------------------
-    println!("== CHECK 5: orphaned_records == active_records - independent CF row count ==");
+    //
+    // This check used to assert `orphaned_records == active_records -
+    // source_cf_rows`, which is the very arithmetic #1940 found to be wrong: it
+    // subtracts two counts taken over different populations, so it can be
+    // non-zero with no record orphaned and zero with records orphaned. It now
+    // asserts the two properties that hold of a real probe:
+    //
+    //   * the classes partition the count exactly, and
+    //   * every orphan lands in the class its panel's DECLARED
+    //     `source_ttl_managed` dictates — evicted (expected) or missing
+    //     (a finding).
+    //
+    // The subtraction is still printed, as the number the old code would have
+    // reported, so the divergence is visible rather than asserted away.
+    println!("== CHECK 5: orphaned_records is a per-record probe, split by declaration ==");
     for entry in builtin_panel_catalog() {
         let PanelSource::FullCf(cf) = entry.source else {
             continue;
@@ -576,24 +775,73 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         };
         let independent = cf_counts.get(cf).copied().unwrap_or(0);
-        let expected = (panel.active_version_records as u64).saturating_sub(independent) as usize;
-        let held = panel.orphaned_records == expected;
+        let old_subtraction =
+            (panel.active_version_records as u64).saturating_sub(independent) as usize;
+        let partitions =
+            panel.orphaned_source_evicted + panel.orphaned_source_missing == panel.orphaned_records;
+        let classified = if entry.source_ttl_managed {
+            panel.orphaned_source_missing == 0
+        } else {
+            panel.orphaned_source_evicted == 0
+        };
+        let named = (panel.orphaned_source_missing > 0)
+            == report
+                .orphaned_source_missing_panels
+                .contains(&entry.panel_name.to_owned());
+        let held = partitions && classified && named;
         if !held {
             failures.push(format!(
-                "{}: orphaned_records={} but {} records - {independent} rows = {expected}",
-                entry.panel_name, panel.orphaned_records, panel.active_version_records
+                "{}: orphaned={} evicted={} missing={} ttl_managed={} named_ok={named}",
+                entry.panel_name,
+                panel.orphaned_records,
+                panel.orphaned_source_evicted,
+                panel.orphaned_source_missing,
+                entry.source_ttl_managed
             ));
         }
-        if panel.orphaned_records > 0 || !held {
+        if panel.orphaned_records > 0 || old_subtraction > 0 || !held {
             println!(
-                "  {:<28} records={} - {cf} rows={independent} -> orphaned={} (expected {expected}) {}",
+                "  {:<28} probe orphaned={} (evicted={} missing={}) ttl_managed={} \
+                 | old subtraction {} records - {cf} rows={independent} would say {old_subtraction} {}",
                 entry.panel_name,
-                panel.active_version_records,
                 panel.orphaned_records,
+                panel.orphaned_source_evicted,
+                panel.orphaned_source_missing,
+                entry.source_ttl_managed,
+                panel.active_version_records,
                 verdict(held)
             );
         }
     }
+    for entry in builtin_panel_catalog() {
+        let Some(panel) = report
+            .panels
+            .iter()
+            .find(|row| row.panel_version == entry.panel_version)
+        else {
+            continue;
+        };
+        if panel.superseded_orphaned_records > 0 {
+            println!(
+                "  {:<28} SUPERSEDED probe orphaned={} (missing={}) ttl_managed={} \
+                 — not reclaimable: nothing can re-measure a row that is gone",
+                entry.panel_name,
+                panel.superseded_orphaned_records,
+                panel.superseded_orphaned_source_missing,
+                entry.source_ttl_managed
+            );
+        }
+    }
+    println!(
+        "  totals: active_orphaned={} superseded_orphaned={} evicted={} missing={} \
+         unattributed={} missing_panels={:?}",
+        report.orphaned_records_total,
+        report.superseded_orphaned_records_total,
+        report.orphaned_source_evicted_total,
+        report.orphaned_source_missing_total,
+        report.unattributed_records_total,
+        report.orphaned_source_missing_panels
+    );
     println!();
 
     // ------------------------------------------------------------------

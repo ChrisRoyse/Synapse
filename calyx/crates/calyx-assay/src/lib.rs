@@ -244,8 +244,9 @@ pub use sufficiency::{
     panel_sufficiency_with_context,
 };
 pub use synergy::{
-    CALYX_ASSAY_INVALID_SYNERGY, MIN_SYNERGY_GAIN_BITS, SynergyPair, SynergyReport, synergy_gain,
-    synergy_pair, synergy_report, unmeasured_synergy_pair,
+    CALYX_ASSAY_INVALID_SYNERGY, CALYX_ASSAY_SYNERGY_CROSS_ESTIMATOR, MIN_SYNERGY_GAIN_BITS,
+    SynergyEstimators, SynergyPair, SynergyPairState, SynergyReport, synergy_gain, synergy_pair,
+    synergy_report, unmeasured_synergy_pair,
 };
 pub use total_correlation::{
     CALYX_TC_INSUFFICIENT_SAMPLES, DEFAULT_TC_BOOTSTRAP_RESAMPLES, DEFAULT_TC_K, IIResult, IISign,

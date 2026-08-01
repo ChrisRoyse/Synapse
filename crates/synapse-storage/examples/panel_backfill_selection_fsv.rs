@@ -60,6 +60,11 @@ fn entry(panel_version: u32, records: usize, grounded: usize) -> SynapseCalyxPan
         anchor_kind_records: BTreeMap::new(),
         earliest_created_at_ms: None,
         latest_created_at_ms: None,
+        // These cases are about coverage and backfill selection, not the #1940
+        // orphan probe: no record declares a source key, so nothing is probed
+        // and every orphan count is a measured zero rather than an accident.
+        source_key_hexes: BTreeMap::new(),
+        unattributed_records: 0,
     }
 }
 
@@ -111,6 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             0,
         ),
         &rows,
+        &BTreeMap::new(),
     );
     let transcript = report
         .panels
@@ -197,6 +203,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             0,
         ),
         &rows,
+        &BTreeMap::new(),
     );
     println!(
         "  measured: deficient={:?} unbackfillable={:?} selected={:?}",
@@ -241,6 +248,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let report = build_panel_coverage_report(
             &census(vec![entry(SYN_TIMELINE_PANEL_VERSION, records, 0)], 0),
             &rows,
+            &BTreeMap::new(),
         );
         let panel = report
             .panels
@@ -276,6 +284,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             0,
         ),
         &rows,
+        &BTreeMap::new(),
     );
     println!(
         "  measured: unknown={:?} superseded_total={}",
@@ -318,6 +327,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let report = build_panel_coverage_report(
         &census(vec![entry(SYN_EPISODE_PANEL_VERSION, 100, 100)], 3),
         &rows,
+        &BTreeMap::new(),
     );
     check(
         "decode failures are counted, not dropped",
@@ -340,7 +350,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // And the negative: a census whose rows do NOT add up must be caught.
     let mut broken = census(vec![entry(SYN_EPISODE_PANEL_VERSION, 100, 100)], 0);
     broken.base_cf_rows = 137; // 37 rows vanished with nothing recording it
-    let broken_report = build_panel_coverage_report(&broken, &rows);
+    let broken_report = build_panel_coverage_report(&broken, &rows, &BTreeMap::new());
     check(
         "a census that silently lost 37 rows is caught (137 != 100 + 0)",
         !broken_report.accounting_holds(),

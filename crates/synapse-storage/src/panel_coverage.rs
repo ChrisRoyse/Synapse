@@ -92,7 +92,7 @@
 //! check, so a corpus with unreadable rows cannot masquerade as a smaller clean
 //! one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use synapse_calyx::{SYNAPSE_GROUNDING_COVERAGE_FLOOR, SynapseCalyxPanelCensus};
@@ -221,6 +221,34 @@ pub struct PanelCoverageRow {
     /// answer is "keep, forever" — the growth it implies is bounded by the
     /// source CF's TTL policy, not by deleting the measurement.
     pub orphaned_records: usize,
+    /// Of [`Self::orphaned_records`], those whose source CF is declared
+    /// TTL-managed, so the absence is the retention policy working (#1940).
+    /// Expected, and **not** a finding.
+    pub orphaned_source_evicted: usize,
+    /// Of [`Self::orphaned_records`], those whose source CF has no TTL. A real
+    /// integrity finding: the constellation's provenance points at a row that
+    /// was never written or was destroyed outside the retention path (#1940).
+    pub orphaned_source_missing: usize,
+    /// Active-generation records carrying no source provenance at all, so no
+    /// probe is possible for them. Reported apart from both other classes,
+    /// because "cannot ask" is not "answered no" (#1940).
+    pub unattributed_records: usize,
+    /// The same probe over this panel's **superseded** generations (#1940).
+    ///
+    /// Reported because on this vault it is where every real orphan lives:
+    /// measured 2026-08-01, the active generations held zero and the superseded
+    /// ones held all 227. A census that reported only the active number would
+    /// be correct and useless.
+    ///
+    /// It is also the missing half of the #1927 ask 3 reclaim rule. That rule's
+    /// condition 3 — "its own source row still exists" — was documented as
+    /// unanswerable by a census; it is answerable now, and a superseded record
+    /// counted here is one no re-measure can rebuild, so it is **not**
+    /// reclaimable however ungrounded and closed its generation is.
+    pub superseded_orphaned_records: usize,
+    /// Of those, the ones on a source CF with no TTL — an integrity finding on
+    /// a superseded generation (#1940).
+    pub superseded_orphaned_source_missing: usize,
     /// Active-generation records carrying at least one grounded anchor.
     pub grounded_records: usize,
     pub grounded_fraction: f32,
@@ -339,9 +367,31 @@ pub struct PanelCoverageReport {
     ///
     /// An **upper bound**. Condition 3 above is unproven for every record in it.
     pub superseded_reclaim_candidates: usize,
-    /// Constellations whose source row an audit TTL has expired. Sacred and
-    /// permanent — see [`PanelCoverageRow::orphaned_records`].
+    /// Constellations whose own source row is gone, established by a per-record
+    /// source-key probe rather than a subtraction (#1940). Sacred and permanent
+    /// either way — see [`PanelCoverageRow::orphaned_records`].
     pub orphaned_records_total: usize,
+    /// Of those, the ones whose source CF is declared TTL-managed: expected,
+    /// and not a finding (#1940).
+    pub orphaned_source_evicted_total: usize,
+    /// Of those, the ones whose source CF has no TTL. **Non-zero is a real
+    /// integrity finding** — a constellation whose provenance points at a row
+    /// that was never written or was destroyed outside the retention path
+    /// (#1940).
+    pub orphaned_source_missing_total: usize,
+    /// Active-generation records carrying no source provenance, so the probe
+    /// cannot be attempted. Zero on the live vault 2026-08-01 (#1940).
+    pub unattributed_records_total: usize,
+    /// Records on **superseded** generations whose own source row is gone
+    /// (#1940). On this vault that is where every real orphan lives, and each
+    /// one is a record no re-measure can rebuild — so it fails the #1927 ask 3
+    /// reclaim rule's condition 3 whatever else holds of it.
+    pub superseded_orphaned_records_total: usize,
+    /// Panels with a non-zero [`Self::orphaned_source_missing_total`] — the
+    /// finding, as distinct from [`Self::records_exceed_source_panels`], which
+    /// is an arithmetic observation that is *expected* on a TTL-managed source
+    /// and was therefore permanently red (#1940).
+    pub orphaned_source_missing_panels: Vec<String>,
     /// Superseded generations that are still being WRITTEN TO — the defect case.
     ///
     /// Named `panel@version` so a log line identifies the write path to fix.
@@ -358,10 +408,17 @@ pub struct PanelCoverageReport {
     pub unbackfillable_deficient_panels: Vec<String>,
     /// Outcome-bearing panels below the grounding floor.
     pub grounding_deficient_panels: Vec<String>,
-    /// Panels holding more constellations than their source CF holds rows,
-    /// because an audit TTL expired the source rows while the `Base`
-    /// constellations measured from them are never auto-deleted. Not a
-    /// shortfall — an unbounded-growth condition, reported apart from one.
+    /// Panels holding more constellations at the active generation than their
+    /// source CF holds rows.
+    ///
+    /// **An arithmetic observation, not a finding (#1940).** It is the expected
+    /// steady state of any panel over a TTL-managed source: constellations are
+    /// never auto-deleted, source rows are, so the panel legitimately outgrows
+    /// its own source. Read it for the unbounded-growth question it answers,
+    /// and read [`Self::orphaned_source_missing_panels`] for the integrity
+    /// question. Treating this list as an anomaly is what made it permanently
+    /// red on `syn-action-v1` and `syn-process-v1`, and a permanently-red field
+    /// is a broken instrument.
     pub records_exceed_source_panels: Vec<String>,
     pub measured_at_unix_ms: Option<u64>,
 }
@@ -422,6 +479,58 @@ impl PanelCoverageReport {
     }
 }
 
+/// One generation's orphan probe result: what happened to each record's own
+/// source row (#1940).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OrphanProbe {
+    /// Source row absent, and the source CF is declared TTL-managed. Expected:
+    /// the retention policy working as designed.
+    evicted: usize,
+    /// Source row absent on a source CF with no TTL. A real integrity finding —
+    /// the constellation's provenance points at a row that was never written or
+    /// was destroyed outside the retention path.
+    missing: usize,
+    /// Records carrying no source provenance, so the probe cannot be attempted.
+    unattributed: usize,
+}
+
+/// Probes each of a generation's records against the physical keys its source
+/// CF holds right now.
+///
+/// This is the membership test the old subtraction could not perform. A record
+/// is orphaned iff *its own* declared source key is absent from the source CF —
+/// not iff the generation happens to hold more records than the CF holds rows.
+///
+/// Absent source-CF key sets mean the CF was not read (a subset-fed or derived
+/// panel has no full-CF denominator, so its keys are not loaded). Those records
+/// are neither covered nor orphaned here; they are simply not probed, and
+/// counting them as orphans would invent 30,000 findings on `CF_KV` alone.
+fn probe_orphans(
+    active: Option<&synapse_calyx::SynapseCalyxPanelCensusEntry>,
+    source_cf_keys: &BTreeMap<String, BTreeSet<String>>,
+    source_ttl_managed: bool,
+) -> OrphanProbe {
+    let Some(active) = active else {
+        return OrphanProbe::default();
+    };
+    let mut probe = OrphanProbe {
+        unattributed: active.unattributed_records,
+        ..OrphanProbe::default()
+    };
+    for (source_cf, keys) in &active.source_key_hexes {
+        let Some(present) = source_cf_keys.get(source_cf) else {
+            continue;
+        };
+        let absent = keys.iter().filter(|key| !present.contains(*key)).count();
+        if source_ttl_managed {
+            probe.evicted += absent;
+        } else {
+            probe.missing += absent;
+        }
+    }
+    probe
+}
+
 /// Joins a physical panel census against the declared catalog and the source-CF
 /// row counts the caller measured.
 ///
@@ -439,6 +548,7 @@ impl PanelCoverageReport {
 pub fn build_panel_coverage_report(
     census: &SynapseCalyxPanelCensus,
     source_cf_rows: &BTreeMap<String, u64>,
+    source_cf_keys: &BTreeMap<String, BTreeSet<String>>,
 ) -> PanelCoverageReport {
     let catalog = builtin_panel_catalog();
     let mut panels = Vec::with_capacity(catalog.len());
@@ -447,11 +557,16 @@ pub fn build_panel_coverage_report(
     let mut superseded_grounded_records_total = 0usize;
     let mut superseded_reclaim_candidates_total = 0usize;
     let mut orphaned_records_total = 0usize;
+    let mut orphaned_source_evicted_total = 0usize;
+    let mut orphaned_source_missing_total = 0usize;
+    let mut unattributed_records_total = 0usize;
+    let mut superseded_orphaned_records_total = 0usize;
     let mut open_superseded_generations: Vec<String> = Vec::new();
     let mut coverage_deficient_panels = Vec::new();
     let mut unbackfillable_deficient_panels = Vec::new();
     let mut grounding_deficient_panels = Vec::new();
     let mut records_exceed_source_panels = Vec::new();
+    let mut orphaned_source_missing_panels = Vec::new();
 
     for entry in catalog {
         claimed_versions.push(entry.panel_version);
@@ -538,13 +653,56 @@ pub fn build_panel_coverage_report(
         });
         let records_exceed_source =
             source_cf_row_count.is_some_and(|rows| active_version_records as u64 > rows);
-        // The excess IS the orphan count: on a full-CF panel the active
-        // generation holds one constellation per source row, so anything beyond
-        // the row count is a measurement whose source the GC expired.
-        let orphaned_records = source_cf_row_count.map_or(0, |rows| {
-            (active_version_records as u64).saturating_sub(rows) as usize
-        });
+
+        // #1940: the orphan count is a per-record probe, not a subtraction.
+        //
+        // It used to be `active_version_records - source_cf_rows`, justified by
+        // "on a full-CF panel the active generation holds one constellation per
+        // source row". That premise is false whenever a superseded generation
+        // holds records measured from rows still in the CF, and false again
+        // whenever the CF holds rows nobody has measured yet — so the
+        // difference is taken between two populations that are not the same
+        // set. Measured on the live vault 2026-08-01: it reported 667 orphans
+        // where a per-record source-key probe finds 227.
+        //
+        // Worse than the magnitude, the subtraction could not answer the
+        // question the counter exists to raise. "Was the source row evicted, or
+        // did it never exist?" is a membership test on a specific key, and no
+        // difference of two counts can perform one.
+        let probe = probe_orphans(active, source_cf_keys, entry.source_ttl_managed);
+        // The same probe over every superseded generation. Without it the
+        // census would report zero orphans and be *right about the active
+        // generation while hiding every real one*: measured 2026-08-01, all 227
+        // constellations on this vault whose source row is genuinely gone sit
+        // on superseded generations, and none at an active one. Reporting only
+        // the active number would move #1940's blind spot rather than remove
+        // it.
+        let superseded_probe = entry
+            .superseded_versions
+            .iter()
+            .map(|version| {
+                probe_orphans(
+                    census.entry(*version),
+                    source_cf_keys,
+                    entry.source_ttl_managed,
+                )
+            })
+            .fold(OrphanProbe::default(), |mut total, part| {
+                total.evicted += part.evicted;
+                total.missing += part.missing;
+                total.unattributed += part.unattributed;
+                total
+            });
+        let orphaned_records = probe.evicted + probe.missing;
+        let superseded_orphaned_records = superseded_probe.evicted + superseded_probe.missing;
         orphaned_records_total += orphaned_records;
+        orphaned_source_evicted_total += probe.evicted + superseded_probe.evicted;
+        orphaned_source_missing_total += probe.missing + superseded_probe.missing;
+        unattributed_records_total += probe.unattributed + superseded_probe.unattributed;
+        superseded_orphaned_records_total += superseded_orphaned_records;
+        if probe.missing > 0 || superseded_probe.missing > 0 {
+            orphaned_source_missing_panels.push(entry.panel_name.to_owned());
+        }
         let coverage_below_floor =
             coverage_fraction.is_some_and(|fraction| fraction < SYN_PANEL_COVERAGE_FLOOR);
         let grounding_below_floor =
@@ -604,6 +762,11 @@ pub fn build_panel_coverage_report(
             superseded_grounded_records,
             superseded_reclaim_candidates,
             orphaned_records,
+            orphaned_source_evicted: probe.evicted,
+            orphaned_source_missing: probe.missing,
+            unattributed_records: probe.unattributed,
+            superseded_orphaned_records,
+            superseded_orphaned_source_missing: superseded_probe.missing,
             grounded_records,
             grounded_fraction,
             grounding_below_floor,
@@ -646,6 +809,11 @@ pub fn build_panel_coverage_report(
         superseded_grounded_records_total,
         superseded_reclaim_candidates: superseded_reclaim_candidates_total,
         orphaned_records_total,
+        orphaned_source_evicted_total,
+        orphaned_source_missing_total,
+        unattributed_records_total,
+        superseded_orphaned_records_total,
+        orphaned_source_missing_panels,
         open_superseded_generations,
         coverage_floor: SYN_PANEL_COVERAGE_FLOOR,
         grounding_floor: SYNAPSE_GROUNDING_COVERAGE_FLOOR,

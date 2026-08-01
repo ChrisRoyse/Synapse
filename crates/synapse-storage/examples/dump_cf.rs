@@ -14,6 +14,7 @@
 //! `cargo run -p synapse-storage --example dump_cf -- --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex>`
 //! `cargo run -p synapse-storage --example dump_cf -- --repair-bad-episode-slots <db_path>`
 //! `cargo run -p synapse-storage --example dump_cf -- --check-base-roundtrip <db_path>`
+//! `cargo run -p synapse-storage --example dump_cf -- --slot-kind-census <db_path> <panel_version>`
 //! `cargo run -p synapse-storage --example dump_cf -- --audit-slot-hashes [--repair] <db_path>`
 //! `cargo run -p synapse-storage --example dump_cf -- --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path>`
 
@@ -53,7 +54,7 @@ use synapse_storage::{
     dump_cf_read_only_with_expired, scan_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path>";
+const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path> | dump_cf --slot-kind-census <db_path> <panel_version>";
 /// The episode panel's exclusive global slot block (#1776). The
 /// `--repair-bad-episode-slots` mode exists for episode constellations that
 /// historically wrote slots outside it; under the global allocation that is
@@ -200,6 +201,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
         return panel_slot_audit(PathBuf::from(db_path));
+    }
+    if args.first().is_some_and(|arg| arg == "--slot-kind-census") {
+        args.remove(0);
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        let panel_version = args
+            .next()
+            .ok_or(USAGE)?
+            .parse::<u32>()
+            .map_err(|error| format!("{USAGE}; panel_version must be a u32: {error}"))?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return slot_kind_census(PathBuf::from(db_path), panel_version);
     }
     let include_expired = if args.first().is_some_and(|arg| arg == "--include-expired") {
         args.remove(0);
@@ -703,6 +718,176 @@ fn panel_slot_audit(db_path: PathBuf) -> Result<(), Box<dyn Error>> {
         )?;
     }
     write_stdout_line(&mut stdout, format_args!("collision_slot_ids={collisions}"))?;
+    Ok(())
+}
+
+/// Per-slot vector-kind census for one panel version, hydrated from the
+/// physical per-slot column families (#1939).
+///
+/// This is the instrument behind the #1939 finding. A `Base` row alone cannot
+/// answer it — every slot it decodes to is `SlotVector::Absent` because the
+/// vectors live in `cf/slot_<id>` (#1894) — so the census hydrates each
+/// declared slot from its own column family and classifies the bytes actually
+/// stored there.
+///
+/// For a sparse slot it also reports the **corpus-observed support**: the set of
+/// distinct occupied indices across every scanned record. That number decides
+/// whether the intelligence stack can carry the lens, because densifying a
+/// sparse column over exactly its observed support is a lossless, exact
+/// transformation — every dropped index is zero in every record, so it moves no
+/// dot product, no norm, no Chebyshev distance and no interned identity.
+///
+/// Read-only: it does not take the writer lock, so it can run against the live
+/// vault while the daemon owns it.
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "the census owns its path and prints the whole scan and per-slot tally inline"
+)]
+fn slot_kind_census(db_path: PathBuf, panel_version: u32) -> Result<(), Box<dyn Error>> {
+    let vault = SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        SynapseCalyxConfig::from_vault_dir(db_path.clone()),
+        None,
+    )?;
+    let snapshot = vault.latest_seq();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "slot_kind_census db_path={} mode=read_only vault_id={} snapshot={snapshot} panel_version={panel_version}",
+            db_path.display(),
+            vault.vault_id(),
+        ),
+    )?;
+
+    #[derive(Default)]
+    struct SlotCensus {
+        declared_rows: u64,
+        dense: u64,
+        sparse: u64,
+        multi: u64,
+        absent: u64,
+        missing_cf_row: u64,
+        undecodable: u64,
+        dims: BTreeSet<u32>,
+        /// Distinct occupied indices across the corpus — the width a lossless
+        /// densification would need.
+        observed_support: BTreeSet<u32>,
+        /// Distinct whole-vector identities: what a discrete estimator would
+        /// see as the column's cardinality.
+        distinct_values: BTreeSet<Vec<u8>>,
+        nnz_max: usize,
+    }
+
+    let mut per_slot: BTreeMap<u16, SlotCensus> = BTreeMap::new();
+    let mut panel_rows = 0_u64;
+    let mut scanned = 0_u64;
+    let mut undecodable_base = 0_u64;
+
+    for (_key, value) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
+        scanned += 1;
+        let Ok(constellation) = decode_constellation_base(&value) else {
+            undecodable_base += 1;
+            continue;
+        };
+        if constellation.panel_version != panel_version {
+            continue;
+        }
+        panel_rows += 1;
+        let key = slot_key(constellation.cx_id);
+        for slot_id in constellation.slots.keys() {
+            let census = per_slot.entry(slot_id.get()).or_default();
+            census.declared_rows += 1;
+            let Some(bytes) = vault.read_cf_at(snapshot, ColumnFamily::slot(*slot_id), &key)?
+            else {
+                census.missing_cf_row += 1;
+                continue;
+            };
+            let Ok(vector) = decode_slot_vector(&bytes) else {
+                census.undecodable += 1;
+                continue;
+            };
+            match &vector {
+                SlotVector::Dense { dim, data } => {
+                    census.dense += 1;
+                    census.dims.insert(*dim);
+                    census.nnz_max = census.nnz_max.max(data.len());
+                }
+                SlotVector::Sparse { dim, entries } => {
+                    census.sparse += 1;
+                    census.dims.insert(*dim);
+                    census.nnz_max = census.nnz_max.max(entries.len());
+                    for entry in entries {
+                        census.observed_support.insert(entry.idx);
+                    }
+                }
+                SlotVector::Multi { token_dim, tokens } => {
+                    census.multi += 1;
+                    census.dims.insert(*token_dim);
+                    census.nnz_max = census.nnz_max.max(tokens.len());
+                }
+                SlotVector::Absent { .. } => census.absent += 1,
+            }
+            // Canonical identity of the whole vector, so the reported
+            // cardinality is exactly what an interning estimator would see.
+            census
+                .distinct_values
+                .insert(hash_slot_bytes(&bytes).to_vec());
+        }
+    }
+
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "base_rows_scanned={scanned} panel_rows={panel_rows} undecodable_base={undecodable_base} declared_slots={}",
+            per_slot.len()
+        ),
+    )?;
+    for (slot, census) in &per_slot {
+        let kind = if census.sparse > 0 && census.dense == 0 {
+            "sparse"
+        } else if census.dense > 0 && census.sparse == 0 {
+            "dense"
+        } else if census.multi > 0 {
+            "multi"
+        } else if census.dense > 0 && census.sparse > 0 {
+            "MIXED"
+        } else {
+            "none"
+        };
+        let dims = census
+            .dims
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "slot={slot} kind={kind} declared_rows={} dense={} sparse={} multi={} absent={} missing_cf_row={} undecodable={} dims=[{dims}] nnz_max={} observed_support={} distinct_values={}",
+                census.declared_rows,
+                census.dense,
+                census.sparse,
+                census.multi,
+                census.absent,
+                census.missing_cf_row,
+                census.undecodable,
+                census.nnz_max,
+                census.observed_support.len(),
+                census.distinct_values.len()
+            ),
+        )?;
+    }
+    let sparse_slots = per_slot.values().filter(|census| census.sparse > 0).count();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "summary declared_slots={} sparse_slots={sparse_slots} dense_slots={}",
+            per_slot.len(),
+            per_slot.values().filter(|census| census.dense > 0).count()
+        ),
+    )?;
     Ok(())
 }
 
