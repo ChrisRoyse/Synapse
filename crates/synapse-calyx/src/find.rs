@@ -606,10 +606,26 @@ impl SynapseCalyxVault {
             ));
         }
 
+        // "Consulted" must mean what the FUSION consulted, not what the query
+        // measured. Under `single_slot` the query still measures every
+        // text-queryable lens on the panel, so deriving this from
+        // `query_vectors` alone reported lenses the fusion never asked.
+        //
+        // It is not a cosmetic field: `build_find_hits` derives each hit's
+        // `agree_slots` / `disagree_slots` from it, so an unasked lens was
+        // reported as *dissenting* — evidence of disagreement from a lens that
+        // never voted. Measured on syn-agent-transcript-v1 @ 1921001:
+        // `single_slot=109` returned 5 hits and still reported
+        // `consulted_slots=[107,109]`, and `single_slot=107` returned 0 hits
+        // while reporting the same pair.
         let consulted_slots: Vec<u16> = {
             let mut slots = query_vectors
                 .iter()
                 .map(|(slot, _)| slot.get())
+                .filter(|slot| match params.fusion {
+                    SynapseCalyxFindFusion::SingleSlot { slot: only } => *slot == only,
+                    SynapseCalyxFindFusion::Rrf | SynapseCalyxFindFusion::WeightedRrf => true,
+                })
                 .collect::<Vec<_>>();
             slots.sort_unstable();
             slots.dedup();
