@@ -646,6 +646,34 @@ pub struct SubsystemHealth {
     /// except `process_qos`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_qos: Option<ProcessQosHealth>,
+    /// Structured `usage_writer` verdict (#1936). `None` for every subsystem
+    /// except `usage_writer`.
+    ///
+    /// Typed rather than folded into `detail` because compact health responses
+    /// null `detail` outright, and this is the daemon's evidence backlog:
+    /// every tool call's outcome passes through that queue on the way into the
+    /// corpus. A backlog that is only readable by asking for full health is not
+    /// readable on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_writer: Option<UsageWriterHealth>,
+}
+
+/// Grounded-usage writer state (#1936).
+///
+/// The observation for each tool call is committed off the response path by a
+/// dedicated writer. These three numbers are the whole contract: nothing
+/// waiting, everything that was accepted was written, and nothing failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UsageWriterHealth {
+    /// Observations accepted from callers but not yet durable. Signed: a
+    /// negative value would be an accounting bug, and seeing it beats wrapping.
+    pub queue_depth: i64,
+    /// Observations committed since this daemon started.
+    pub committed: u64,
+    /// Observations that could not be committed. Any non-zero value means the
+    /// corpus is missing outcomes that callers were told had succeeded, which
+    /// is a grounding fault rather than a degraded-service note.
+    pub failed: u64,
 }
 
 /// How the OS is scheduling this daemon process, and whether the daemon

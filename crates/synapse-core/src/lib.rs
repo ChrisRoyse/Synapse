@@ -42,7 +42,7 @@ pub use types::{
     StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession,
     StrokeMotionModel, StrokeTiming, SubscriptionId, SubsystemHealth, SuspectedInjectionAnnotation,
     SuspectedInjectionSpan, TranscriptModelUsage, TranscriptParseStatus, TranscriptRole,
-    TranscriptSource, TranscriptToolCall, TranscriptUsage, Trigger, UiaPattern, VelocityProfile,
-    WebPerceptionPath, WindowEdge, default_hud_confidence_threshold, element_id, entity_id,
-    new_reflex_id, new_session_id, new_subscription_id,
+    TranscriptSource, TranscriptToolCall, TranscriptUsage, Trigger, UiaPattern, UsageWriterHealth,
+    VelocityProfile, WebPerceptionPath, WindowEdge, default_hud_confidence_threshold, element_id,
+    entity_id, new_reflex_id, new_session_id, new_subscription_id,
 };

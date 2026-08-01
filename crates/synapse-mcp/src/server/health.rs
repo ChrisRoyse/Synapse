@@ -1780,6 +1780,13 @@ impl SynapseService {
                 "queue_depth={depth} committed={committed} failed={failed} source_of_truth={}",
                 super::mcp_usage::MCP_USAGE_SOURCE_OF_TRUTH
             )),
+            // Also typed, because compact health nulls `detail` and the
+            // backlog must stay readable in the mode callers actually use.
+            usage_writer: Some(synapse_core::UsageWriterHealth {
+                queue_depth: depth,
+                committed,
+                failed,
+            }),
             ..SubsystemHealth::default()
         }
     }
