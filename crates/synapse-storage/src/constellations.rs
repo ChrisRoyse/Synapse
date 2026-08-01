@@ -2593,6 +2593,9 @@ pub fn syn_active_panel_contract(
         SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version, &mut registry)?,
         SYN_EPISODE_PANEL_VERSION => episode_panel_slots(panel_version, &mut registry)?,
         SYN_MCP_USAGE_PANEL_VERSION => mcp_usage_panel_slots(panel_version, &mut registry)?,
+        SYN_AGENT_TRANSCRIPT_PANEL_VERSION => {
+            agent_transcript_panel_slots(panel_version, &mut registry)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(SynActivePanelContract {
@@ -2731,6 +2734,199 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
         }
     };
     Ok(kind)
+}
+
+/// The built-in contract for the agent-transcript panel (#1668).
+///
+/// Mirrors [`build_agent_transcript_constellation`] one slot at a time, in slot
+/// order. The two must agree on lens name, kind and dimension or the lens ids
+/// will not match what ingest measured with — the contract is a *lookup* of the
+/// same frozen contracts, never a reconstruction from stored rows.
+///
+/// Declared for `SYN_AGENT_TRANSCRIPT_PANEL_VERSION` only. The superseded
+/// generations (`..._PRE_1921` = 1904003, `..._PRE_1904` = 1665002) carry
+/// different slot sets and are deliberately absent: `syn_active_panel_contract`
+/// returns `None` for them rather than validating their rows against this map.
+///
+/// This is the largest corpus on the vault — 26,049 records at 1.0 coverage,
+/// measured 2026-07-31 — and it is not the durable active panel, so before #1668
+/// nothing could build it a search generation or query one.
+///
+/// Note slots 107 and 109: both are `syn_sparse_text_tf`, the term-frequency
+/// lanes BM25 ranks on, which is what makes this panel reachable by
+/// `query_mode=by_text` and not only by example.
+#[allow(
+    clippy::too_many_lines,
+    reason = "agent transcript panel contract is a one-to-one slot-to-frozen-lens map mirroring build_agent_transcript_constellation; splitting would obscure the stable contract"
+)]
+fn agent_transcript_panel_slots(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<Vec<Slot>> {
+    Ok(vec![
+        syn_content_slot(
+            AT_SLOT_ROLE_ONEHOT,
+            "syn.agent_transcript.role_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.agent_transcript.role_onehot.v1",
+                Modality::Structured,
+                8,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_STATUS_ONEHOT,
+            "syn.agent_transcript.status_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.agent_transcript.status_onehot.v1",
+                Modality::Structured,
+                8,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_SOURCE_ONEHOT,
+            "syn.agent_transcript.source_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.agent_transcript.source_onehot.v1",
+                Modality::Structured,
+                16,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_EVENT_KIND_HASH,
+            "syn.agent_transcript.event_kind_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_transcript.event_kind_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_MODEL_HASH,
+            "syn.agent_transcript.model_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_transcript.model_hash.v1",
+                Modality::Structured,
+                1024,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_TEXT_SPARSE,
+            "syn.agent_transcript.text_sparse.v1",
+            RegistryAlgorithmicLens::syn_sparse_text(
+                "syn.agent_transcript.text_sparse.v1",
+                Modality::Structured,
+                4096,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_TOOL_HASH,
+            "syn.agent_transcript.tool_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_transcript.tool_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_LINE_RANK,
+            "syn.agent_transcript.line_rank.v1",
+            RegistryAlgorithmicLens::syn_scalar_rank(
+                "syn.agent_transcript.line_rank.v1",
+                Modality::Structured,
+                0,
+                10_000_000_000,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_INPUT_TOKENS_LOG1P,
+            "syn.agent_transcript.input_tokens_log1p.v1",
+            RegistryAlgorithmicLens::syn_scalar_log1p(
+                "syn.agent_transcript.input_tokens_log1p.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_OUTPUT_TOKENS_LOG1P,
+            "syn.agent_transcript.output_tokens_log1p.v1",
+            RegistryAlgorithmicLens::syn_scalar_log1p(
+                "syn.agent_transcript.output_tokens_log1p.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_CACHE_READ_LOG1P,
+            "syn.agent_transcript.cache_read_log1p.v1",
+            RegistryAlgorithmicLens::syn_scalar_log1p(
+                "syn.agent_transcript.cache_read_log1p.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_CACHE_CREATION_LOG1P,
+            "syn.agent_transcript.cache_creation_log1p.v1",
+            RegistryAlgorithmicLens::syn_scalar_log1p(
+                "syn.agent_transcript.cache_creation_log1p.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_RECORD_VECTOR,
+            "syn.agent_transcript.record_vector.v1",
+            RegistryAlgorithmicLens::syn_record_vector(
+                "syn.agent_transcript.record_vector.v1",
+                Modality::Structured,
+                96,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_TEXT_BM25,
+            "syn.agent_transcript.text_bm25.v1",
+            RegistryAlgorithmicLens::syn_sparse_text_tf(
+                "syn.agent_transcript.text_bm25.v1",
+                Modality::Structured,
+                AT_TEXT_BM25_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AT_SLOT_TEXT_FULL_BM25,
+            "syn.agent_transcript.text_full_bm25.v1",
+            RegistryAlgorithmicLens::syn_sparse_text_tf(
+                "syn.agent_transcript.text_full_bm25.v1",
+                Modality::Structured,
+                AT_TEXT_FULL_BM25_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
+    ])
 }
 
 fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
