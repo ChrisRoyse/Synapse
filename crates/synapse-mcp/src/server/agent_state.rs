@@ -101,7 +101,30 @@ pub(crate) const DEFAULT_RUNAWAY_IDENTICAL_CALLS: u32 = 5;
 
 /// Dead/exited agents older than this are pruned from the in-memory tracker
 /// (their journal rows remain the durable record).
-const DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const DEAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether the in-memory projection is **contractually not required** to hold
+/// this agent (issue #1937).
+///
+/// One definition, used both by the pruner that removes such entries and by
+/// every caller that would otherwise treat their absence as a fault. Keeping
+/// them separate is what produced #1937: the ambient projection checkpoint read
+/// absence from the tracker as a broken projection, recovered the entry from the
+/// journal, and the very next sweep pruned it again — because it was a spawn
+/// that had been `Dead` for far longer than [`DEAD_RETENTION_MS`], which is
+/// exactly the entry `prune_dead` exists to delete. 22 spawns were re-recovered
+/// 238 times each, always `already_current=false`, and could never converge:
+/// recovery and pruning were enforcing contradictory retention policies.
+///
+/// Absence of such an entry is the projection working, not failing.
+pub(crate) const fn beyond_dead_retention(
+    state: AgentLifecycleState,
+    since_unix_ms: u64,
+    now_unix_ms: u64,
+) -> bool {
+    matches!(state, AgentLifecycleState::Dead)
+        && now_unix_ms.saturating_sub(since_unix_ms) > DEAD_RETENTION_MS
+}
 
 /// An UNPROBEABLE agent — one with no OS pid the daemon can liveness-check,
 /// e.g. an observed/ambient session tailed from a transcript on disk — that has
@@ -996,10 +1019,7 @@ impl AgentStateTracker {
         let expired: Vec<String> = self
             .agents
             .values()
-            .filter(|entry| {
-                entry.state == AgentLifecycleState::Dead
-                    && now_unix_ms.saturating_sub(entry.since_unix_ms) > DEAD_RETENTION_MS
-            })
+            .filter(|entry| beyond_dead_retention(entry.state, entry.since_unix_ms, now_unix_ms))
             .map(|entry| entry.anchor.clone())
             .collect();
         for anchor in expired {

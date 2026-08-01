@@ -1493,6 +1493,10 @@ fn reconcile_projection_checkpoint(
     };
     let initial_projection_error = match live_projection {
         Ok(()) => {
+            // Verification passed, so any earlier recovery for this spawn did
+            // converge; the streak that guards against endless retry resets
+            // here rather than accumulating across unrelated incidents (#1937).
+            clear_projection_recovery_streak(&cursor.spawn_id);
             tracing::debug!(
                 code = "AMBIENT_PROJECTION_CHECKPOINT_VERIFIED",
                 spawn_id = %cursor.spawn_id,
@@ -1567,12 +1571,116 @@ fn reconcile_projection_checkpoint(
         already_current = recovery.already_current,
         projected_state = recovery.readback.state.as_str(),
         projected_last_event_unix_ms = recovery.readback.last_event_unix_ms,
+        // The error that TRIGGERED this recovery (#1937 ask 1). It was already
+        // in scope and was surfaced only when the recovery itself failed, so on
+        // the common path — recovery "succeeds" and the loop repeats — the one
+        // field that says which condition fired was the one field not recorded.
+        // 4,947 recoveries across one log file produced zero occurrences of
+        // either AMBIENT_OUTBOX_PROJECTION_MISSING or _STALE, which is why the
+        // issue could not discriminate its own candidate causes.
+        initial_projection_error = %initial_projection_error,
+        consecutive_recoveries = consecutive_projection_recoveries(&cursor.spawn_id),
         "readback=CF_AGENT_EVENTS+AgentStateTracker edge=ambient_projection_checkpoint"
     );
+
+    // The projection legitimately does not retain a long-dead agent
+    // (`agent_state::prune_dead`), so re-creating this entry is work the very
+    // next sweep is guaranteed to undo — which is exactly the loop #1937
+    // recorded: 22 spawns, 238 recoveries each, `already_current=false` every
+    // time. Recovery and pruning were enforcing contradictory retention
+    // policies, so the checkpoint could never converge.
+    //
+    // The durable journal rows remain the record; only the in-memory cache
+    // declines to hold them. That satisfies the checkpoint, so it retires.
+    let now_unix_ms = unix_time_ns_now() / NS_PER_MS;
+    if super::agent_state::beyond_dead_retention(
+        recovery.readback.state,
+        recovery.readback.since_unix_ms,
+        now_unix_ms,
+    ) {
+        cursor.projection_checkpoint = None;
+        cursor.updated_ts_ns = unix_time_ns_now();
+        if let Err(error) = store_cursor(db, &cursor, &mut revision_sha256) {
+            AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+            return Err(format!(
+                "AMBIENT_PROJECTION_CHECKPOINT_RETIRE_RECONCILIATION_REQUIRED: spawn_id={} operation_id={} reason=beyond_projection_dead_retention cursor_error={error}; remediation=stop the daemon and inspect the cursor WAL outcome before retrying retirement",
+                cursor.spawn_id, checkpoint.outbox.operation_id
+            ));
+        }
+        clear_projection_recovery_streak(&cursor.spawn_id);
+        tracing::info!(
+            code = "AMBIENT_PROJECTION_CHECKPOINT_RETIRED_BEYOND_PROJECTION_RETENTION",
+            spawn_id = %cursor.spawn_id,
+            operation_id = %checkpoint.outbox.operation_id,
+            projected_state = recovery.readback.state.as_str(),
+            since_unix_ms = recovery.readback.since_unix_ms,
+            dead_retention_ms = super::agent_state::DEAD_RETENTION_MS,
+            initial_projection_error = %initial_projection_error,
+            "the in-memory projection is not required to retain this agent, so its absence is the projection working; checkpoint retired against the durable journal"
+        );
+        return Ok(AmbientProjectionCheckpointOutcome {
+            cursor,
+            revision_sha256,
+        });
+    }
+
+    // A recovery that has to run again, and again, for the same spawn is a
+    // distinct condition from "needed recovery once", and it must not be
+    // retried forever (#1937 ask 3). Convergence means the next cycle verifies;
+    // if it does not, something the recovery cannot fix is undoing it.
+    let streak = record_projection_recovery(&cursor.spawn_id);
+    if streak > MAX_CONSECUTIVE_PROJECTION_RECOVERIES {
+        AMBIENT_OUTBOX_RECONCILIATION_LATCH.store(true, Ordering::Release);
+        return Err(format!(
+            "AMBIENT_PROJECTION_CHECKPOINT_NOT_CONVERGING: spawn_id={} operation_id={} consecutive_recoveries={streak} limit={MAX_CONSECUTIVE_PROJECTION_RECOVERIES} projected_state={} already_current={} initial_projection_error={initial_projection_error}; the same checkpoint has been recovered repeatedly and the next verification still failed, so recovery is not the repair; remediation=stop the daemon and reconcile the agent-state projection against CF_AGENT_EVENTS before ingestion resumes",
+            cursor.spawn_id,
+            checkpoint.outbox.operation_id,
+            recovery.readback.state.as_str(),
+            recovery.already_current
+        ));
+    }
     Ok(AmbientProjectionCheckpointOutcome {
         cursor,
         revision_sha256,
     })
+}
+
+/// Consecutive recoveries the same spawn's checkpoint may need before the
+/// condition is escalated instead of retried (#1937 ask 3).
+///
+/// A recovery that worked is followed by a verification that passes, which
+/// clears the streak. More than a couple in a row means the recovery is not the
+/// repair — on the live daemon this ran 238 times for each of 22 spawns.
+const MAX_CONSECUTIVE_PROJECTION_RECOVERIES: u32 = 3;
+
+static PROJECTION_RECOVERY_STREAKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+fn record_projection_recovery(spawn_id: &str) -> u32 {
+    let mut guard = match PROJECTION_RECOVERY_STREAKS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let streak = guard.entry(spawn_id.to_owned()).or_insert(0);
+    *streak = streak.saturating_add(1);
+    *streak
+}
+
+fn consecutive_projection_recoveries(spawn_id: &str) -> u32 {
+    let guard = match PROJECTION_RECOVERY_STREAKS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get(spawn_id).copied().unwrap_or(0)
+}
+
+fn clear_projection_recovery_streak(spawn_id: &str) {
+    let mut guard = match PROJECTION_RECOVERY_STREAKS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.remove(spawn_id);
 }
 
 fn relay_pending_event_outbox(
