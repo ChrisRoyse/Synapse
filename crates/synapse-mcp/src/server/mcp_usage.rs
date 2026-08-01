@@ -29,11 +29,21 @@ const STEERING_HINT_SIZE_LIMIT_BYTES: usize = 4 * 1024;
 const PROMOTED_VALUE_SIZE_LIMIT_BYTES: usize = 1024;
 const PROMOTED_VALUE_DEPTH_LIMIT: u32 = 8;
 const STEERING_EVIDENCE_FLOOR: u64 = 1;
-/// Every tool call pays the usage-bookkeeping cost synchronously before its
-/// response is returned, so it is a floor on every caller's latency. Emit the
-/// per-phase split whenever it exceeds this budget, naming which phase spent
-/// the time; a quiet log is the evidence that the floor is back under budget.
-const USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_MS: u128 = 15;
+/// Budget above which the synchronous usage-bookkeeping split is reported, in
+/// **microseconds**.
+///
+/// Every tool call pays this cost before its response is returned, so it is a
+/// floor on every caller's latency. The per-phase split is emitted whenever it
+/// exceeds the budget, naming which phase spent the time.
+///
+/// Held at 15 whole milliseconds against `as_millis()` timings, this stopped
+/// firing entirely once #1936 moved the commit off the response path — which
+/// reads as success but is indistinguishable from an instrument that can no
+/// longer resolve its subject. What is left on the calling thread (steering,
+/// plus serialising 29 rows, the row key, the anchor and the ledger payload
+/// before the hand-off) is sub-millisecond work, so it must be timed in
+/// microseconds to be seen at all (#1945).
+const USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_US: u128 = 1_000;
 const KNOWN_BAD_COST_HINT_ID: &str = "cost_summarize_unbounded_scan";
 const KNOWN_BAD_COST_ROUTE_ID: &str = "cost.summarize";
 const KNOWN_BAD_COST_ERROR_TYPE: &str = "AGENT_COST_FLEET_ROLLUP_UNAVAILABLE";
@@ -318,18 +328,18 @@ pub(crate) fn argument_shape_from_arguments(
 /// Report the per-phase split of the synchronous usage-bookkeeping that every
 /// tool call pays before its response is returned. `route` names the call so a
 /// slow phase can be attributed to the route that provoked it.
-fn log_usage_bookkeeping_split(route: &str, steering_ms: u128, persist_ms: u128) {
-    let total_ms = steering_ms.saturating_add(persist_ms);
-    if total_ms < USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_MS {
+fn log_usage_bookkeeping_split(route: &str, steering_us: u128, persist_us: u128) {
+    let total_us = steering_us.saturating_add(persist_us);
+    if total_us < USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_US {
         return;
     }
     tracing::info!(
         code = "MCP_USAGE_BOOKKEEPING_SLOW",
         route,
-        steering_ms = steering_ms as u64,
-        persist_ms = persist_ms as u64,
-        total_ms = total_ms as u64,
-        threshold_ms = USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_MS as u64,
+        steering_us = steering_us as u64,
+        persist_us = persist_us as u64,
+        total_us = total_us as u64,
+        threshold_us = USAGE_BOOKKEEPING_SLOW_LOG_THRESHOLD_US as u64,
         "synchronous MCP usage bookkeeping exceeded its per-call latency budget"
     );
 }
@@ -348,7 +358,7 @@ pub(crate) fn record_success_and_attach_steering(
         .unwrap_or_else(|| finished.tool.clone());
     let steering_started = Instant::now();
     let steering = steering_for_finished_call(&db, &finished, None, &argument_shape)?;
-    let steering_ms = steering_started.elapsed().as_millis();
+    let steering_us = steering_started.elapsed().as_micros();
     let persist_started = Instant::now();
     persist_finished_call(
         db,
@@ -359,7 +369,7 @@ pub(crate) fn record_success_and_attach_steering(
         response_content_count,
         steering.as_ref().map(|block| block.hint_id.clone()),
     )?;
-    log_usage_bookkeeping_split(&route, steering_ms, persist_started.elapsed().as_millis());
+    log_usage_bookkeeping_split(&route, steering_us, persist_started.elapsed().as_micros());
     if let Some(block) = steering {
         attach_steering_to_success(result, block)?;
     }
@@ -382,7 +392,7 @@ pub(crate) fn record_error_and_attach_steering(
     let steering_started = Instant::now();
     let steering =
         steering_for_finished_call(&db, &finished, error_type.as_deref(), &argument_shape)?;
-    let steering_ms = steering_started.elapsed().as_millis();
+    let steering_us = steering_started.elapsed().as_micros();
     let persist_started = Instant::now();
     persist_finished_call(
         db,
@@ -393,7 +403,7 @@ pub(crate) fn record_error_and_attach_steering(
         response_content_count,
         steering.as_ref().map(|block| block.hint_id.clone()),
     )?;
-    log_usage_bookkeeping_split(&route, steering_ms, persist_started.elapsed().as_millis());
+    log_usage_bookkeeping_split(&route, steering_us, persist_started.elapsed().as_micros());
     if let Some(block) = steering {
         attach_steering_to_error(&mut error, block)?;
     }
@@ -773,7 +783,7 @@ fn persist_finished_call(
         .usage_writer()
         .enqueue(super::usage_writer::UsageObservation {
             db,
-            route: record.route_id.clone(),
+            route: record.route_id,
             row_key,
             encoded,
             record_value,

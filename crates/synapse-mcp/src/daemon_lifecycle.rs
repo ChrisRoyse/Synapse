@@ -260,26 +260,122 @@ struct ExitEvent {
     paths: DaemonLifecyclePaths,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DaemonLifecycleState {
     run: RunRecord,
     paths: DaemonLifecyclePaths,
     in_flight: BTreeMap<u64, ToolEvent>,
     seq: u64,
     last_error: Option<String>,
-    /// Current byte size of the active `daemon-tool-events.jsonl` segment,
-    /// tracked in memory so the append hot path never stats the file. Seeded
-    /// from the existing file size at [`configure`] and updated after each
-    /// append and reset to zero on rotation.
-    tool_events_bytes: u64,
-    /// Current byte size of the active `daemon-exit.jsonl` segment. Exit events
+    /// The most recent tool event this run appended to the ledger.
+    ///
+    /// This used to be a second durable file (`daemon-tool-last.json`) written
+    /// with a temp-create + fsync + rename on **every** tool event, beside the
+    /// append that had already fsync'd the identical record into the ledger.
+    /// That is a dual write of one fact: the two files can disagree across a
+    /// crash between the append and the rename, and the ledger's own last line
+    /// is the same record and is never staler. Measured on the deployment host
+    /// the atomic replace cost 1.295 ms per event, twice per tool call, for
+    /// information already on disk (#1936).
+    ///
+    /// The live readers are all in-process (diagnostic events, exit
+    /// finalization), so they read this field. The one cold reader that
+    /// genuinely survives a crash -- [`configure`] reconstructing the previous
+    /// run -- reads the ledger tail via [`last_tool_event_from_ledger`], which
+    /// is strictly more current than the retired pointer file could be.
+    last_tool_event: Option<ToolEvent>,
+    /// Append state for the active `daemon-tool-events.jsonl` segment: the
+    /// in-memory byte counter (so the hot path never stats the file) plus the
+    /// persistent append handle.
+    tool_events: LedgerAppender,
+    /// Append state for the active `daemon-exit.jsonl` segment. Exit events
     /// share the same bounded JSONL ledger implementation as tool events so
     /// daemon lifecycle diagnostics cannot grow without retention.
-    exit_events_bytes: u64,
+    exit_events: LedgerAppender,
     /// Size cap the active tool-event segment may reach before rotation. Seeded
     /// from [`MAX_LEDGER_SEGMENT_BYTES`]; overridable only in tests via
     /// [`set_max_segment_bytes_for_test`] to force rotation without writing MiB.
     max_segment_bytes: u64,
+}
+
+/// Append state for one bounded JSONL lifecycle ledger.
+///
+/// Holds the active segment's byte counter and a persistent append handle. The
+/// handle is kept open across appends because the daemon appends twice per MCP
+/// tool call and, measured on the deployment host, `open + append + flush +
+/// fsync + close` costs 0.684 ms per record against 0.340 ms for `append +
+/// fsync` on a handle that is already open (#1936). The `create_dir_all` the
+/// old path ran before every open cost a further 0.083 ms and is now paid only
+/// when the handle is actually opened.
+///
+/// The fsync itself is deliberately kept per record. It is what makes a
+/// `started` record with no matching `finished` record trustworthy evidence
+/// that the daemon died mid-call, which is the whole point of the ledger for a
+/// process that drives real input into the operating system.
+#[derive(Debug, Default)]
+struct LedgerAppender {
+    active_bytes: u64,
+    handle: Option<File>,
+}
+
+impl LedgerAppender {
+    fn new(active_bytes: u64) -> Self {
+        Self {
+            active_bytes,
+            handle: None,
+        }
+    }
+
+    /// Release the append handle. Called before rotation so Windows never has
+    /// to rename a file this process still holds open, and so the next append
+    /// reopens against whatever path rotation left in place.
+    fn close(&mut self) {
+        self.handle = None;
+    }
+
+    /// Borrow the append handle, opening it (and its parent directory) first if
+    /// this is the first append since startup or since a rotation.
+    fn handle(&mut self, path: &Path) -> anyhow::Result<&mut File> {
+        match self.handle {
+            Some(ref mut file) => Ok(file),
+            None => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create {}", parent.display()))?;
+                }
+                let file = open_ledger_append(path)
+                    .with_context(|| format!("open append {}", path.display()))?;
+                Ok(self.handle.insert(file))
+            }
+        }
+    }
+}
+
+/// Open a lifecycle ledger for appending.
+///
+/// On Windows the share mode must include `FILE_SHARE_DELETE` in addition to
+/// read and write: without it, holding this handle open would make
+/// [`rotate_ledger`]'s rename of the active segment fail with a sharing
+/// violation, and would block any external reader that opens the ledger for
+/// forensic inspection while the daemon is live. This is the same sharing
+/// contract the durable shell-job status writes already depend on (#1568).
+fn open_ledger_append(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        OpenOptions::new().create(true).append(true).open(path)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -460,7 +556,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         ended_reason: None,
     };
     let max_segment_bytes = configured_max_segment_bytes();
-    let (tool_events_bytes, exit_events_bytes) = with_lifecycle_ledger_lock(
+    let (tool_events, exit_events) = with_lifecycle_ledger_lock(
         &config.db_path,
         "configure daemon lifecycle",
         || {
@@ -475,12 +571,14 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     paths.tool_events_path
                 )
             })?;
-            let mut exit_events_bytes = reconcile_jsonl_ledger(
+            let exit_events_bytes = reconcile_jsonl_ledger(
                 Path::new(&paths.exit_events_path),
                 max_segment_bytes,
                 "exit_events",
             )
             .with_context(|| format!("reconcile daemon exit ledger {}", paths.exit_events_path))?;
+            let mut tool_events = LedgerAppender::new(tool_events_bytes);
+            let mut exit_events = LedgerAppender::new(exit_events_bytes);
             let previous_run = read_optional_json::<RunRecord>(Path::new(&paths.run_current_path))
                 .with_context(|| {
                     format!(
@@ -488,10 +586,20 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                         paths.run_current_path
                     )
                 })?;
-            let previous_last_tool = read_optional_json::<ToolEvent>(Path::new(
-                &paths.tool_last_path,
+            // Derived from the ledger this daemon just reconciled, not from the
+            // retired `daemon-tool-last.json` pointer. The ledger holds the same
+            // records and is never staler: the pointer was written after the
+            // append it duplicated, so a crash between the two left it behind.
+            let previous_last_tool = last_tool_event_from_ledger(Path::new(
+                &paths.tool_events_path,
             ))
-            .with_context(|| format!("read daemon lifecycle last tool {}", paths.tool_last_path))?;
+            .with_context(|| {
+                format!(
+                    "derive previous last tool event from daemon tool-event ledger {}",
+                    paths.tool_events_path
+                )
+            })?;
+            retire_legacy_tool_last_pointer(Path::new(&paths.tool_last_path));
 
             if let Some(previous) = previous_run.as_ref()
                 && previous.ended_at_unix_ms.is_none()
@@ -519,7 +627,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                         .collect(),
                     paths: paths.clone(),
                 },
-                &mut exit_events_bytes,
+                &mut exit_events,
                 max_segment_bytes,
                 "exit_events",
             )
@@ -533,7 +641,12 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
 
             write_json_atomic(Path::new(&paths.run_current_path), &run)
                 .with_context(|| format!("write daemon current run {}", paths.run_current_path))?;
-            Ok((tool_events_bytes, exit_events_bytes))
+            // The reconciliation handles are released here: this daemon's own
+            // appends reopen under the state mutex, after the cross-process
+            // lifecycle-ledger lock this closure holds has been dropped.
+            tool_events.close();
+            exit_events.close();
+            Ok((tool_events, exit_events))
         },
     )?;
     let state = DaemonLifecycleState {
@@ -542,8 +655,9 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         in_flight: BTreeMap::new(),
         seq: 0,
         last_error: None,
-        tool_events_bytes,
-        exit_events_bytes,
+        last_tool_event: None,
+        tool_events,
+        exit_events,
         max_segment_bytes,
     };
     let slot = state_slot();
@@ -1223,8 +1337,7 @@ fn append_diagnostic_event(
         detail,
         recorded_at_unix_ms: now_unix_ms(),
         run: Some(state.run.clone()),
-        last_tool_event: read_optional_json(Path::new(&state.paths.tool_last_path))
-            .with_context(|| format!("read last tool event {}", state.paths.tool_last_path))?,
+        last_tool_event: state.last_tool_event.clone(),
         in_flight_tool_events: state.in_flight.values().cloned().collect(),
         paths: state.paths.clone(),
     };
@@ -1277,8 +1390,7 @@ fn record_exit_for_state_locked(
         detail,
         recorded_at_unix_ms: now_unix_ms(),
         run: Some(run.clone()),
-        last_tool_event: read_optional_json(Path::new(&state.paths.tool_last_path))
-            .with_context(|| format!("read last tool event {}", state.paths.tool_last_path))?,
+        last_tool_event: state.last_tool_event.clone(),
         in_flight_tool_events: state.in_flight.values().cloned().collect(),
         paths: state.paths.clone(),
     };
@@ -1353,9 +1465,11 @@ fn write_tool_event_inner(
     event: &ToolEvent,
 ) -> anyhow::Result<()> {
     append_tool_event(state, event)?;
-    let tool_last_path = state.paths.tool_last_path.clone();
-    write_json_atomic(Path::new(&tool_last_path), event)
-        .with_context(|| format!("write daemon last tool {tool_last_path}"))
+    // The ledger append above already fsync'd this exact record. Recording it
+    // in memory rather than re-publishing it to `daemon-tool-last.json` removes
+    // the dual write described on `DaemonLifecycleState::last_tool_event`.
+    state.last_tool_event = Some(event.clone());
+    Ok(())
 }
 
 fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
@@ -1363,7 +1477,7 @@ fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> any
     append_bounded_json_line(
         Path::new(&tool_events_path),
         event,
-        &mut state.tool_events_bytes,
+        &mut state.tool_events,
         state.max_segment_bytes,
         "tool_events",
     )
@@ -1375,7 +1489,7 @@ fn append_exit_event(state: &mut DaemonLifecycleState, event: &ExitEvent) -> any
     match append_bounded_json_line(
         Path::new(&exit_events_path),
         event,
-        &mut state.exit_events_bytes,
+        &mut state.exit_events,
         state.max_segment_bytes,
         "exit_events",
     ) {
@@ -1415,7 +1529,7 @@ fn append_exit_event(state: &mut DaemonLifecycleState, event: &ExitEvent) -> any
 fn append_bounded_json_line<T: Serialize>(
     path: &Path,
     value: &T,
-    active_bytes: &mut u64,
+    appender: &mut LedgerAppender,
     max_segment_bytes: u64,
     ledger_name: &'static str,
 ) -> anyhow::Result<()> {
@@ -1424,14 +1538,21 @@ fn append_bounded_json_line<T: Serialize>(
     line.push(b'\n');
     let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
 
-    if *active_bytes > 0 && active_bytes.saturating_add(line_len) > max_segment_bytes {
+    if appender.active_bytes > 0
+        && appender.active_bytes.saturating_add(line_len) > max_segment_bytes
+    {
+        // Release the append handle before the rename: rotation must move the
+        // active segment aside, and the reopened handle must land on the new
+        // empty active file rather than following the rotated one.
+        let rotated_from_bytes = appender.active_bytes;
+        appender.close();
         if let Err(error) = rotate_ledger(path, ledger_name) {
             let detail = format!("{error:#}");
             tracing::error!(
                 code = "DAEMON_LEDGER_ROTATE_FAILED",
                 ledger = ledger_name,
                 path = %path.display(),
-                active_bytes = *active_bytes,
+                active_bytes = rotated_from_bytes,
                 next_record_bytes = line_len,
                 max_segment_bytes,
                 detail = %detail,
@@ -1439,7 +1560,7 @@ fn append_bounded_json_line<T: Serialize>(
             );
             return Err(error);
         }
-        *active_bytes = 0;
+        appender.active_bytes = 0;
         tracing::info!(
             code = "MCP_DAEMON_LIFECYCLE_LEDGER_ROTATED",
             ledger = ledger_name,
@@ -1461,21 +1582,24 @@ fn append_bounded_json_line<T: Serialize>(
         );
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    // A failed write must not leave a handle whose file position or validity is
+    // unknown to the next append: drop it so the next call reopens from a known
+    // state, and report the failure rather than retrying silently.
+    let append_result = (|| -> anyhow::Result<()> {
+        let file = appender.handle(path)?;
+        file.write_all(&line)
+            .with_context(|| format!("write daemon lifecycle ledger {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync {}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = append_result {
+        appender.close();
+        return Err(error);
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open append {}", path.display()))?;
-    file.write_all(&line)
-        .with_context(|| format!("write daemon lifecycle ledger {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush {}", path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("sync {}", path.display()))?;
-    *active_bytes = active_bytes.saturating_add(line_len);
+    appender.active_bytes = appender.active_bytes.saturating_add(line_len);
     Ok(())
 }
 
@@ -1916,6 +2040,91 @@ fn discover_ledger_sources(active: &Path) -> anyhow::Result<Vec<LedgerSource>> {
 pub(crate) fn lifecycle_ledger_paths_oldest_first(active: &Path) -> anyhow::Result<Vec<PathBuf>> {
     discover_ledger_sources(active)
         .map(|sources| sources.into_iter().map(|source| source.path).collect())
+}
+
+/// The most recent tool event durably recorded in the tool-event ledger, read
+/// newest segment first.
+///
+/// This replaces reading `daemon-tool-last.json`. The pointer file was written
+/// *after* the ledger append of the identical record, so the ledger is the
+/// earlier and therefore never-staler of the two; deriving from it removes a
+/// dual write rather than trading one source of truth for another.
+///
+/// A line that does not parse as a [`ToolEvent`] is skipped and counted, not
+/// treated as end-of-ledger: a torn tail from a hard kill is exactly the
+/// condition this function exists to survive, and silently reporting "no
+/// previous tool call" for a crashed run would erase the forensic signal.
+fn last_tool_event_from_ledger(active: &Path) -> anyhow::Result<Option<ToolEvent>> {
+    let segments = lifecycle_ledger_paths_oldest_first(active)
+        .with_context(|| format!("discover tool-event ledger segments {}", active.display()))?;
+    let mut unparsable_lines = 0_u64;
+    for path in segments.iter().rev() {
+        let lines = match File::open(path).map(BufReader::new) {
+            Ok(reader) => reader
+                .lines()
+                .collect::<Result<Vec<_>, _>>()
+                .with_context(|| format!("read tool-event ledger segment {}", path.display()))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("open tool-event ledger segment {}", path.display())));
+            }
+        };
+        for line in lines.into_iter().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ToolEvent>(&line) {
+                Ok(event) => {
+                    if unparsable_lines > 0 {
+                        tracing::warn!(
+                            code = "MCP_DAEMON_LIFECYCLE_LEDGER_TAIL_UNPARSABLE",
+                            path = %active.display(),
+                            unparsable_lines,
+                            recovered_seq = event.seq,
+                            "skipped unparsable trailing tool-event ledger lines before recovering the last durable tool event"
+                        );
+                    }
+                    return Ok(Some(event));
+                }
+                Err(_) => unparsable_lines = unparsable_lines.saturating_add(1),
+            }
+        }
+    }
+    if unparsable_lines > 0 {
+        tracing::warn!(
+            code = "MCP_DAEMON_LIFECYCLE_LEDGER_TAIL_UNPARSABLE",
+            path = %active.display(),
+            unparsable_lines,
+            "tool-event ledger held no parsable tool event"
+        );
+    }
+    Ok(None)
+}
+
+/// Delete the retired `daemon-tool-last.json` pointer if a previous build left
+/// one behind.
+///
+/// It is removed rather than ignored: nothing writes it any more, so a file
+/// left on disk is a record frozen at the moment of the upgrade that a future
+/// reader could mistake for current state. Failure to remove it is logged and
+/// not fatal — it is stale bytes nothing reads, so refusing to start the daemon
+/// over it would be a worse outcome than the warning.
+fn retire_legacy_tool_last_pointer(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => tracing::info!(
+            code = "MCP_DAEMON_LIFECYCLE_LEGACY_TOOL_LAST_RETIRED",
+            path = %path.display(),
+            "removed the retired daemon-tool-last.json pointer; the tool-event ledger is now the only record of the last tool event"
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            code = "MCP_DAEMON_LIFECYCLE_LEGACY_TOOL_LAST_RETIRE_FAILED",
+            path = %path.display(),
+            error = %error,
+            "could not remove the retired daemon-tool-last.json pointer; it is no longer written or read, so it holds bytes frozen at the moment of this upgrade"
+        ),
+    }
 }
 
 fn ledger_diagnostic_value(

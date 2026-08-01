@@ -17,7 +17,17 @@ use tokio_util::sync::CancellationToken;
 /// Budget for the four pre-work captures every tool call performs. The
 /// prologue is pure overhead from a caller's perspective: it runs before the
 /// requested tool does anything. A quiet log is the evidence it is in budget.
-const TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_MS: u128 = 10;
+/// Budget above which the per-call prologue split is reported, in
+/// **microseconds**.
+///
+/// This was 10 whole milliseconds against timings taken with
+/// `Duration::as_millis()`. Once #1936 cut per-call overhead from 42 ms to
+/// ~14 ms, every individual prologue capture rounded to `0` and the total never
+/// reached the threshold, so the instrument built to attribute the prologue
+/// reported nothing at all — it could no longer resolve the quantity it exists
+/// to measure (#1945). Microseconds, at a budget of 1 ms, keep it able to see
+/// the thing it is watching.
+const TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_US: u128 = 1_000;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SynapseService {
@@ -532,7 +542,7 @@ impl SynapseService {
             ),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
-        let audit_context_ms = prologue_started.elapsed().as_millis();
+        let audit_context_us = prologue_started.elapsed().as_micros();
         let foreground_started = std::time::Instant::now();
         let (foreground, foreground_read_error) = match self.current_audit_foreground() {
             Ok(foreground) => (
@@ -545,14 +555,14 @@ impl SynapseService {
             ),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
-        let foreground_ms = foreground_started.elapsed().as_millis();
+        let foreground_us = foreground_started.elapsed().as_micros();
         let session_target_started = std::time::Instant::now();
         let (session_target, session_target_read_error) = match self.session_target(mcp_session_id)
         {
             Ok(target) => (target.as_ref().map(session_target_value), None),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
-        let session_target_ms = session_target_started.elapsed().as_millis();
+        let session_target_us = session_target_started.elapsed().as_micros();
         let tool_profile_started = std::time::Instant::now();
         let (profile, tool_surface_sha256, tool_profile_read_error) =
             match self.tool_profile_snapshot(mcp_session_id) {
@@ -563,18 +573,18 @@ impl SynapseService {
                 ),
                 Err(error) => (None, None, Some(error_snapshot(&error))),
             };
-        let tool_profile_ms = tool_profile_started.elapsed().as_millis();
-        let prologue_total_ms = prologue_started.elapsed().as_millis();
-        if prologue_total_ms >= TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_MS {
+        let tool_profile_us = tool_profile_started.elapsed().as_micros();
+        let prologue_total_us = prologue_started.elapsed().as_micros();
+        if prologue_total_us >= TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_US {
             tracing::info!(
                 code = "MCP_TOOL_CALL_PROLOGUE_SLOW",
                 tool = tool_name,
-                audit_context_ms = audit_context_ms as u64,
-                foreground_ms = foreground_ms as u64,
-                session_target_ms = session_target_ms as u64,
-                tool_profile_ms = tool_profile_ms as u64,
-                total_ms = prologue_total_ms as u64,
-                threshold_ms = TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_MS as u64,
+                audit_context_us = audit_context_us as u64,
+                foreground_us = foreground_us as u64,
+                session_target_us = session_target_us as u64,
+                tool_profile_us = tool_profile_us as u64,
+                total_us = prologue_total_us as u64,
+                threshold_us = TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_US as u64,
                 "tool-call prologue captures exceeded their per-call latency budget"
             );
         }
