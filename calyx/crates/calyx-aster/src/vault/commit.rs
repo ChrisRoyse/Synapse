@@ -16,6 +16,75 @@ pub const CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED: &str =
 /// symptoms; the warning below names the exact call site responsible.
 const DURABLE_COMMIT_LOCK_SLOW_BUDGET_MS: u128 = 1_000;
 
+/// Total durable-commit duration above which the per-stage split is logged
+/// (issue #1936).
+///
+/// Every MCP tool call pays exactly one grounded-observation commit before its
+/// response returns, so this is directly on the caller's critical path. A quiet
+/// log is the evidence the commit is in budget; anything slower names which
+/// stage spent the time rather than leaving one opaque `commit_us`.
+const COMMIT_STAGE_SLOW_BUDGET_US: u64 = 3_000;
+
+/// Per-stage split of one durable group commit.
+///
+/// Each field is the time spent in that stage alone, not a cumulative offset,
+/// so the fields sum to `total_us` minus the unattributed remainder — and a
+/// remainder that is not near zero is itself the finding.
+#[derive(Default)]
+struct CommitStageTimings {
+    /// Writeability check plus memtable admission.
+    admission_us: u64,
+    /// Disk-pressure check and Ledger head/checkpoint sidecar derivation.
+    sidecar_us: u64,
+    /// Row sealing, batch encoding, the group-commit handoff and the WAL fsync.
+    wal_us: u64,
+    /// Ledger head/checkpoint anchor file publication.
+    anchor_publish_us: u64,
+    /// The in-memory MVCC row-table and router apply.
+    mvcc_us: u64,
+    /// Staging the batch for the checkpoint publisher.
+    checkpoint_stage_us: u64,
+    /// Start of the stage currently being timed, as an offset from the commit
+    /// start, so each `split` reports one stage rather than a running total.
+    consumed_us: u64,
+}
+
+impl CommitStageTimings {
+    fn split(&mut self, started: &std::time::Instant) -> u64 {
+        let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let stage = elapsed.saturating_sub(self.consumed_us);
+        self.consumed_us = elapsed;
+        stage
+    }
+
+    fn report(&self, row_count: usize, started: &std::time::Instant) {
+        let total_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if total_us < COMMIT_STAGE_SLOW_BUDGET_US {
+            return;
+        }
+        let attributed = self.admission_us
+            + self.sidecar_us
+            + self.wal_us
+            + self.anchor_publish_us
+            + self.mvcc_us
+            + self.checkpoint_stage_us;
+        tracing::info!(
+            code = "CALYX_ASTER_DURABLE_COMMIT_STAGE_TIMINGS",
+            row_count,
+            total_us,
+            admission_us = self.admission_us,
+            sidecar_us = self.sidecar_us,
+            wal_us = self.wal_us,
+            anchor_publish_us = self.anchor_publish_us,
+            mvcc_us = self.mvcc_us,
+            checkpoint_stage_us = self.checkpoint_stage_us,
+            unattributed_us = total_us.saturating_sub(attributed),
+            budget_us = COMMIT_STAGE_SLOW_BUDGET_US,
+            "durable group commit exceeded its per-stage latency budget"
+        );
+    }
+}
+
 /// Waiter accounting for the durable commit lock. Decrements on every exit
 /// path, including the error paths that abandon the acquisition.
 struct CommitLockWaiterTicket<'a> {
@@ -313,6 +382,13 @@ where
     }
 
     fn commit_prepared_rows(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+        // #1936: a durable group commit on the deployment host measures ~6 ms
+        // while its own fsync costs 0.26 ms — ~27x its durable I/O — and the
+        // existing timing splits stop at the commit boundary, so the 6 ms was
+        // one opaque number. These spans are the only fixed points inside it.
+        // Reported only above a budget, so a healthy commit stays silent.
+        let started = std::time::Instant::now();
+        let mut stage = CommitStageTimings::default();
         if !rows.is_empty() {
             self.ensure_writeable("commit")?;
         }
@@ -320,8 +396,12 @@ where
             rows.iter()
                 .map(|row| (row.cf, row.key.as_slice(), row.value.as_slice())),
         )?;
+        stage.admission_us = stage.split(&started);
         let Some(durable) = &self.durable else {
-            return self.commit_rows_to_mvcc(rows);
+            let seq = self.commit_rows_to_mvcc(rows);
+            stage.mvcc_us = stage.split(&started);
+            stage.report(rows.len(), &started);
+            return seq;
         };
 
         durable.ensure_disk_write_allowed(self.rows.resource_counters())?;
@@ -330,7 +410,13 @@ where
         // reconciliation event, never an ordinary retryable write error.
         let head_anchor = crate::ledger_head::newest_anchor_from_rows(rows)?;
         let checkpoint_anchor = crate::ledger_head::newest_checkpoint_from_rows(rows)?;
+        stage.sidecar_us = stage.split(&started);
+        // Seals, encodes and hands the batch to the group-commit thread, then
+        // blocks on its reply. This span therefore covers the WAL fsync AND two
+        // cross-thread handoffs, which on a hybrid CPU with parked E-cores is
+        // not the same cost as the fsync alone.
         let durable_seq = durable.append_batch(rows)?;
+        stage.wal_us = stage.split(&started);
 
         let publish = (|| -> Result<Seq> {
             if let Some(anchor) = &head_anchor {
@@ -339,15 +425,19 @@ where
             if let Some(anchor) = &checkpoint_anchor {
                 crate::ledger_head::write_checkpoint_anchor(durable.root(), anchor)?;
             }
+            stage.anchor_publish_us = stage.split(&started);
             let mvcc_seq = self.commit_rows_to_mvcc(rows)?;
+            stage.mvcc_us = stage.split(&started);
             if mvcc_seq != durable_seq {
                 return Err(CalyxError::aster_corrupt_shard(format!(
                     "durable WAL seq {durable_seq} diverged from MVCC seq {mvcc_seq}"
                 )));
             }
             durable.stage_checkpoint_batch(durable_seq, rows)?;
+            stage.checkpoint_stage_us = stage.split(&started);
             Ok(mvcc_seq)
         })();
+        stage.report(rows.len(), &started);
 
         match publish {
             Ok(seq) => Ok(seq),

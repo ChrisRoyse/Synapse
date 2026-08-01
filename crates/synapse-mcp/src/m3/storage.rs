@@ -1275,6 +1275,27 @@ pub struct StorageIntelligenceSlotBits {
     /// What this slot needs before it can be measured, when it was not.
     /// `None` when `state` is `measured`.
     pub unmeasured_reason: Option<String>,
+    /// Which estimator produced `marginal_bits`: `discrete_plugin` (a
+    /// contingency-table plug-in with a Miller-Madow bias correction) or
+    /// `continuous_ksg` (#1672).
+    ///
+    /// The panel mixes explicit encoders — one-hot, hash, cyclic — with
+    /// continuous ones, and KSG's k-th neighbour radius is zero by construction
+    /// on an explicit column, so it is undefined there rather than imprecise.
+    /// Measured on the live vault before this landed, 7 of the 8 dense lenses on
+    /// `syn-mcp-usage-v1` were refused as degenerate and the panel reported the
+    /// single continuous lens's bits as its total.
+    pub estimator: Option<String>,
+    /// Why that estimator was chosen: `auto_duplicate_saturated_column`,
+    /// `auto_distinct_valued_column`, or a `requested_*` pin.
+    pub estimator_selection: Option<String>,
+    /// The selection rule's own words, carrying the counts it keyed on.
+    pub estimator_reason: Option<String>,
+    /// Distinct exact coordinate tuples observed in this column.
+    pub distinct_values: Option<u64>,
+    /// Largest exact-duplicate class within one outcome label — the quantity
+    /// that drives KSG's k-th radius to zero.
+    pub max_same_label_multiplicity: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2842,6 +2863,13 @@ pub fn run_intelligence_bits(
                 provisional: slot.provisional,
                 state: slot.state.as_str(),
                 unmeasured_reason: slot.unmeasured_reason,
+                estimator: slot.estimator,
+                estimator_selection: slot.estimator_selection,
+                estimator_reason: slot.estimator_reason,
+                distinct_values: slot.distinct_values.map(|value| value as u64),
+                max_same_label_multiplicity: slot
+                    .max_same_label_multiplicity
+                    .map(|value| value as u64),
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,

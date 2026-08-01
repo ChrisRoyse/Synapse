@@ -13,11 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
     AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, Direction,
-    EstimatorKind, InterEventHazardReport, MiEstimate, MmdConfig, PeriodogramConfig, RateShift,
-    SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport, TEResult, TeEstimator,
-    TiedOccurrenceCollapse, TrustTag, autocorrelation, bin_event_counts, bits_report_with_anchor,
-    collapse_tied_occurrences, entropy_bits, inter_event_hazard_with_alpha,
-    ksg_mi_continuous_discrete, lomb_scargle_with_config, mmd_change_point,
+    EstimatorKind, InterEventHazardReport, MiEstimate, MiEstimatorChoice, MiEstimatorPick,
+    MmdConfig, PeriodogramConfig, RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution, SynergyReport,
+    TEResult, TeEstimator, TiedOccurrenceCollapse, TrustTag, autocorrelation, bin_event_counts,
+    bits_report_with_anchor, collapse_tied_occurrences, entropy_bits,
+    inter_event_hazard_with_alpha, lomb_scargle_with_config, mi_about_labels, mmd_change_point,
     panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution,
     recurrence_rate_cusum, stable_rank, synergy_pair, synergy_report, transfer_entropy_sweep,
     unmeasured_synergy_pair,
@@ -1136,6 +1136,24 @@ pub struct SynapseCalyxSlotBits {
     /// What this slot needs before it can be measured, when it was not.
     /// `None` when `state` is `Measured`.
     pub unmeasured_reason: Option<String>,
+    /// Which estimator produced `marginal_bits` — `discrete_plugin` or
+    /// `continuous_ksg` (#1672).
+    ///
+    /// A panel deliberately mixes explicit encoders (one-hot, hash, cyclic)
+    /// with continuous ones (record vectors, rank scalars), and the two need
+    /// different instruments: KSG's k-th neighbour radius is zero by
+    /// construction on a categorical column, so it does not merely lose
+    /// precision there, it is undefined. Naming the instrument on every slot
+    /// keeps a bits number comparable across the panel and auditable.
+    pub estimator: Option<String>,
+    /// Why that estimator was chosen, with the counts the rule keyed on.
+    pub estimator_selection: Option<String>,
+    pub estimator_reason: Option<String>,
+    /// Distinct exact coordinate tuples observed in this column.
+    pub distinct_values: Option<usize>,
+    /// Largest exact-duplicate class within one outcome label — the quantity
+    /// that drives KSG's k-th radius to zero.
+    pub max_same_label_multiplicity: Option<usize>,
 }
 
 /// Result of one Assay bits pass with the physical Assay CF readback.
@@ -1376,6 +1394,37 @@ impl SynapseCalyxVault {
                 continue;
             }
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
+            // #1672: choose the estimator from the column, not from a default.
+            // A panel deliberately mixes explicit encoders (one-hot, hash,
+            // cyclic) with continuous ones, and KSG's k-th neighbour radius is
+            // zero by construction on the explicit ones — measured on the live
+            // vault, 7 of the 8 dense lenses on `syn-mcp-usage-v1` were refused
+            // as degenerate and the whole panel reported the single continuous
+            // lens's bits as its total. Encoding a value explicitly is supposed
+            // to make it *more* measurable, not less; the missing piece was the
+            // discrete instrument to measure it with.
+            let outcome = match mi_about_labels(
+                MiEstimatorChoice::Auto,
+                &samples.x,
+                &samples.labels,
+                k,
+                None,
+            ) {
+                Ok(outcome) => outcome,
+                // The column could not even be validated, so there is no
+                // instrument to name — report the refusal without a pick.
+                Err(error) => {
+                    let state = estimator_refusal_state(&error);
+                    slots.push(unmeasured_slot_bits(
+                        slot.get(),
+                        samples.x.len(),
+                        state,
+                        estimator_refusal_reason(state, &error),
+                    ));
+                    continue;
+                }
+            };
+            let pick = outcome.pick;
             // An estimator refusal is a fact about ONE lens, so it must not end
             // the whole pass (#1915). `assay_redundancy` already degrades
             // per-pair with a named reason and returns everything else; before
@@ -1389,15 +1438,16 @@ impl SynapseCalyxVault {
             // held 4 records against k=4), through the very arm that fix was
             // meant to remove. Classification is total now: no estimator error
             // reaches a `return`.
-            let estimate = match ksg_mi_continuous_discrete(&samples.x, &samples.labels, k) {
+            let estimate = match outcome.estimate {
                 Ok(estimate) => estimate,
                 Err(error) => {
                     let state = estimator_refusal_state(&error);
-                    slots.push(unmeasured_slot_bits(
+                    slots.push(unmeasured_slot_bits_with_pick(
                         slot.get(),
                         samples.x.len(),
                         state,
                         estimator_refusal_reason(state, &error),
+                        &pick,
                     ));
                     continue;
                 }
@@ -1415,7 +1465,7 @@ impl SynapseCalyxVault {
                 "synapse-assay-bits",
                 seq,
             );
-            slots.push(SynapseCalyxSlotBits {
+            let mut measured = SynapseCalyxSlotBits {
                 slot: slot.get(),
                 marginal_bits: estimate.bits,
                 ci_low: estimate.ci_low,
@@ -1425,7 +1475,14 @@ impl SynapseCalyxVault {
                 provisional: false,
                 state: SynapseCalyxSlotBitsState::Measured,
                 unmeasured_reason: None,
-            });
+                estimator: None,
+                estimator_selection: None,
+                estimator_reason: None,
+                distinct_values: None,
+                max_same_label_multiplicity: None,
+            };
+            apply_estimator_pick(&mut measured, &pick);
+            slots.push(measured);
         }
 
         let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
@@ -1517,10 +1574,24 @@ impl SynapseCalyxVault {
                 continue;
             }
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
-            match ksg_mi_continuous_discrete(&samples.x, &samples.labels, k) {
-                Ok(estimate) => slot_bits.push((*slot, estimate.bits)),
-                // Any estimator refusal excludes the slot from the joint and
-                // from the deficit split; none of them ends the pass (#1915).
+            // Same instrument choice as `assay_bits` (#1672): a categorical
+            // lens excluded here is excluded from the joint and from the
+            // deficit split, so measuring it with the wrong estimator did not
+            // merely lose one number — it removed the lens from the sufficiency
+            // verdict entirely and then blamed the deficit on the survivors.
+            match mi_about_labels(
+                MiEstimatorChoice::Auto,
+                &samples.x,
+                &samples.labels,
+                k,
+                None,
+            ) {
+                Ok(outcome) => match outcome.estimate {
+                    Ok(estimate) => slot_bits.push((*slot, estimate.bits)),
+                    // Any estimator refusal excludes the slot from the joint and
+                    // from the deficit split; none of them ends the pass (#1915).
+                    Err(_) => unmeasured_slots += 1,
+                },
                 Err(_) => {
                     unmeasured_slots += 1;
                 }
@@ -1544,13 +1615,16 @@ impl SynapseCalyxVault {
             .fold(0.0_f32, f32::max);
         let (panel_bits, panel_measured) = if joint_records >= SYNAPSE_ASSAY_MIN_SAMPLES {
             let k = ksg_k.min(joint_records.saturating_sub(1)).max(1);
-            match ksg_mi_continuous_discrete(&joint.x, &joint.labels, k) {
-                Ok(estimate) => (estimate.bits, true),
+            match mi_about_labels(MiEstimatorChoice::Auto, &joint.x, &joint.labels, k, None)
+                .ok()
+                .and_then(|outcome| outcome.estimate.ok())
+            {
+                Some(estimate) => (estimate.bits, true),
                 // An unestimable joint is reported as unmeasured, exactly like
                 // an unestimable slot. Returning here would have made the whole
                 // sufficiency verdict unavailable because one panel-shaped
                 // corpus defeated the estimator (#1915).
-                Err(_) => (0.0, false),
+                None => (0.0, false),
             }
         } else {
             (0.0, false)
@@ -2073,9 +2147,24 @@ impl SynapseCalyxVault {
                 continue;
             }
             let k = ksg_k.min(samples.x.len().saturating_sub(1)).max(1);
-            let estimate = ksg_mi_continuous_discrete(&samples.x, &samples.labels, k)
-                .map_err(|error| loom_math_error("estimate KSG lens bits", &error))?;
-            ranked.push((*slot, estimate.bits));
+            // #1672: instrument chosen from the column, and a refusal ranks the
+            // lens out instead of ending the pass. Propagating here meant one
+            // categorical lens aborted the entire synergy report — the same
+            // whole-pass-abort shape #1915 removed from `bits`, still standing
+            // on this path.
+            match mi_about_labels(
+                MiEstimatorChoice::Auto,
+                &samples.x,
+                &samples.labels,
+                k,
+                None,
+            )
+            .ok()
+            .and_then(|outcome| outcome.estimate.ok())
+            {
+                Some(estimate) => ranked.push((*slot, estimate.bits)),
+                None => continue,
+            }
         }
         ranked.sort_by(|left, right| {
             right
@@ -2115,15 +2204,17 @@ impl SynapseCalyxVault {
                     continue;
                 }
                 let k = ksg_k.min(labels.len().saturating_sub(1)).max(1);
-                let pair_bits = ksg_mi_continuous_discrete(&joint, &labels, k)
-                    .map_err(|error| loom_math_error("estimate KSG pair bits", &error))?
-                    .bits;
-                let left_bits = ksg_mi_continuous_discrete(&left, &labels, k)
-                    .map_err(|error| loom_math_error("estimate KSG left lens bits", &error))?
-                    .bits;
-                let right_bits = ksg_mi_continuous_discrete(&right, &labels, k)
-                    .map_err(|error| loom_math_error("estimate KSG right lens bits", &error))?
-                    .bits;
+                // The pair, and each of its halves, gets the instrument its own
+                // column warrants: a concatenated pair of one-hots is still
+                // categorical, while a one-hot concatenated with a record
+                // vector is not. A refusal on any of the three leaves the pair
+                // unmeasured rather than ending the report (#1672, #1915).
+                let Some((pair_bits, left_bits, right_bits)) =
+                    synergy_pair_bits(&joint, &left, &right, &labels, k)
+                else {
+                    pairs.push(unmeasured_synergy_pair(*slot_a, *slot_b, labels.len()));
+                    continue;
+                };
                 let pair = synergy_pair(
                     *slot_a,
                     *slot_b,
@@ -2213,7 +2304,65 @@ fn unmeasured_slot_bits(
         provisional: true,
         state,
         unmeasured_reason: Some(reason),
+        estimator: None,
+        estimator_selection: None,
+        estimator_reason: None,
+        distinct_values: None,
+        max_same_label_multiplicity: None,
     }
+}
+
+/// A slot the estimator did not measure, carrying the estimator-selection facts
+/// that were already established before the refusal.
+///
+/// Selection runs before estimation, so when a column is refused we still know
+/// which instrument was chosen and the column cardinality that chose it. That
+/// is exactly the evidence an operator needs to act on the refusal — dropping
+/// it would make "why did this lens not measure" unanswerable without a rerun.
+fn unmeasured_slot_bits_with_pick(
+    slot: u16,
+    n_samples: usize,
+    state: SynapseCalyxSlotBitsState,
+    reason: String,
+    pick: &MiEstimatorPick,
+) -> SynapseCalyxSlotBits {
+    let mut bits = unmeasured_slot_bits(slot, n_samples, state, reason);
+    apply_estimator_pick(&mut bits, pick);
+    bits
+}
+
+/// Bits for a synergy pair and each of its halves, or `None` when any of the
+/// three columns is refused.
+///
+/// All three must come from the same pass: `gain = pair − max(left, right)` is
+/// only a gain if the three numbers are comparable, and a pair measured while
+/// one half is missing would report the pair's own bits as pure synergy.
+fn synergy_pair_bits(
+    joint: &[Vec<f32>],
+    left: &[Vec<f32>],
+    right: &[Vec<f32>],
+    labels: &[usize],
+    k: usize,
+) -> Option<(f32, f32, f32)> {
+    let measure = |column: &[Vec<f32>]| {
+        mi_about_labels(MiEstimatorChoice::Auto, column, labels, k, None)
+            .ok()
+            .and_then(|outcome| outcome.estimate.ok())
+    };
+    Some((
+        measure(joint)?.bits,
+        measure(left)?.bits,
+        measure(right)?.bits,
+    ))
+}
+
+/// Stamp the resolved estimator and the measured column facts onto a slot row.
+fn apply_estimator_pick(bits: &mut SynapseCalyxSlotBits, pick: &MiEstimatorPick) {
+    bits.estimator = Some(pick.estimator.as_str().to_owned());
+    bits.estimator_selection = Some(pick.selection.as_str().to_owned());
+    bits.estimator_reason = Some(pick.reason.clone());
+    bits.distinct_values = Some(pick.distinct_values);
+    bits.max_same_label_multiplicity = Some(pick.max_same_label_multiplicity);
 }
 
 /// Classify an estimator refusal into a per-slot unmeasured state.

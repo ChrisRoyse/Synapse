@@ -25,6 +25,7 @@ pub mod hsic;
 pub mod ksg;
 pub mod logistic;
 pub mod loom_adapter;
+pub mod mi_estimator;
 pub mod mic;
 pub mod mmd;
 pub mod n_eff;
@@ -170,6 +171,10 @@ pub use logistic::{
     logistic_probe_mi_with_anchor_cuda_strict,
 };
 pub use loom_adapter::AsterAssayMaterializationGate;
+pub use mi_estimator::{
+    MIN_SAMPLES_PER_OCCUPIED_CELL, MiEstimator, MiEstimatorChoice, MiEstimatorPick,
+    MiEstimatorSelection, MiOutcome, mi_about_labels, resolve_mi_estimator,
+};
 pub use mic::{DEFAULT_MIC_ALPHA, MIN_MIC_SAMPLES, MicReport, mic, mic_with_alpha};
 pub use mmd::{
     ChangePointReport, DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,

@@ -21,6 +21,11 @@ pub const PROXY_ANCHOR_SOURCE_PREFIX: &str = "proxy:";
 #[serde(rename_all = "snake_case")]
 pub enum EstimatorKind {
     Ksg,
+    /// Contingency-table plug-in entropy decomposition with a Miller-Madow
+    /// first-order bias correction — the exact instrument for a column that is
+    /// categorical by construction, where KSG's k-th radius is zero
+    /// ([`crate::mi_estimator`]).
+    DiscretePlugin,
     HistogramNmi,
     LogisticProbe,
     Bootstrap,
