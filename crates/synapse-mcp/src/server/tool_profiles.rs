@@ -65,12 +65,106 @@ const CODEX_CLIENT_SURFACE_SCHEMA_STALE_READBACK_COMMAND: &str = "Get-Content .\
 pub(super) struct ImmutableToolSurface {
     tools: Vec<Tool>,
     names: Vec<String>,
+    /// #1936: the profile-derived half of `tool_profile_snapshot`, computed
+    /// once per `(profile, session_scoped)` at construction.
+    ///
+    /// Every field it holds is a pure function of the immutable surface above
+    /// and the profile, but it was being recomputed on *every* tool call --
+    /// deep-cloning all 40 sanitized tools with their schemas, re-fingerprinting
+    /// them, and re-validating the registry and facade contract. Measured at
+    /// 20-22 ms per call on the deployment host, which was the single largest
+    /// component of tool-call latency, larger than searching a 148 MB corpus.
+    ///
+    /// Computing it here rather than lazily keeps the existing contract that a
+    /// daemon which starts is one whose surface already validated: a profile
+    /// that cannot produce a snapshot refuses construction instead of failing
+    /// on the first call that happens to use it.
+    profile_templates: Vec<ProfileSnapshotTemplate>,
     fingerprint: super::health::ToolSurfaceFingerprint,
     /// #1886: the schema-parity verdict computed once, from the exact schemas
     /// cached above, at the moment the daemon refused to start without it.
     /// `health` reports this stored verdict rather than recomputing a second,
     /// possibly different, answer.
     schema_parity: FacadeSchemaParitySnapshot,
+}
+
+/// One memoized `(profile, session_scoped)` snapshot. `snapshot` carries the
+/// profile-derived fields only; the per-session fields (`session_id`, `source`,
+/// `policy_row`, `foreground_route`) are overwritten by every caller.
+#[derive(Debug)]
+struct ProfileSnapshotTemplate {
+    profile: ToolProfileKind,
+    session_scoped: bool,
+    snapshot: ToolProfileSnapshot,
+}
+
+/// Every profile a session can hold, plus the unscoped (stdio-admin) case.
+const PROFILE_TEMPLATE_KEYS: [(ToolProfileKind, bool); 6] = [
+    (ToolProfileKind::NormalAgent, true),
+    (ToolProfileKind::BrowserControl, true),
+    (ToolProfileKind::BrowserDebugger, true),
+    (ToolProfileKind::BreakGlass, true),
+    (ToolProfileKind::FullCapability, true),
+    // No session id: the caller sees the full surface, not a profile-filtered
+    // one, so it is a distinct template rather than a variant of BreakGlass.
+    (ToolProfileKind::BreakGlass, false),
+];
+
+/// Builds the profile-derived half of a `ToolProfileSnapshot`. Mirrors exactly
+/// what `tool_profile_snapshot` used to compute inline on every call.
+fn profile_snapshot_template(
+    tools: &[Tool],
+    names: &[String],
+    schema_parity: &FacadeSchemaParitySnapshot,
+    profile: ToolProfileKind,
+    session_scoped: bool,
+) -> Result<ToolProfileSnapshot, ErrorData> {
+    let full_tool_names = names.to_vec();
+    let implementation_tool_count = full_tool_names.len();
+    let public_tool_registry = public_tool_registry_snapshot_for(&full_tool_names)?;
+    let facade_contract = facade_contract_snapshot_for(
+        &public_tool_registry.public_tool_names,
+        schema_parity.clone(),
+    )?;
+    let visible_tool_names = if session_scoped {
+        visible_tool_names_for_profile(profile, &full_tool_names)
+    } else {
+        full_tool_names
+    };
+    let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
+    let mut visible_tools = tools.to_vec();
+    if session_scoped {
+        visible_tools.retain(|tool| profile.is_visible(tool.name.as_ref()));
+    }
+    let visible_tool_surface = super::health::tool_surface_fingerprint_for_tools(visible_tools);
+    let denied_break_glass_tools = denied_break_glass_tools(&visible_tool_names);
+    let hidden_tool_routes = hidden_tool_capability_routes(&visible_tool_names);
+    let codex_client_surface = codex_client_surface_snapshot(
+        &public_tool_registry.public_tool_names,
+        visible_tool_surface.names.len(),
+        visible_tool_surface.sha256,
+        visible_tool_surface.error,
+    );
+    Ok(ToolProfileSnapshot {
+        source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
+        // Per-session fields. Placeholders: every read path overwrites these.
+        session_id: None,
+        source: String::new(),
+        policy_row: None,
+        foreground_route: foreground_route_readiness(None, profile),
+        profile,
+        profile_label: profile.label(),
+        implementation_tool_count,
+        visible_tool_count: visible_tool_names.len(),
+        visible_tool_sha256,
+        visible_tool_names,
+        denied_break_glass_tools,
+        foreground_capability: foreground_capability_policy(profile),
+        hidden_tool_routes,
+        public_tool_registry,
+        facade_contract,
+        codex_client_surface,
+    })
 }
 
 impl ImmutableToolSurface {
@@ -106,16 +200,34 @@ impl ImmutableToolSurface {
             live_operation_count = schema_parity.live_operation_count,
             "every facade contract agrees with its live tools/list operation enum in both directions"
         );
+        let mut profile_templates = Vec::with_capacity(PROFILE_TEMPLATE_KEYS.len());
+        for (profile, session_scoped) in PROFILE_TEMPLATE_KEYS {
+            let snapshot =
+                profile_snapshot_template(&tools, &names, &schema_parity, profile, session_scoped)
+                    .map_err(|error| {
+                    anyhow::anyhow!(
+                        "MCP_PROFILE_SNAPSHOT_TEMPLATE_BUILD_FAILED: profile={} session_scoped={session_scoped}: {error}",
+                        profile.as_str()
+                    )
+                })?;
+            profile_templates.push(ProfileSnapshotTemplate {
+                profile,
+                session_scoped,
+                snapshot,
+            });
+        }
         tracing::info!(
             code = "MCP_IMMUTABLE_TOOL_SURFACE_CACHED",
             tool_count = names.len(),
             tool_surface_sha256 = %fingerprint.sha256,
+            profile_template_count = profile_templates.len(),
             elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "sanitized immutable MCP registry surface cached at service construction"
+            "sanitized immutable MCP registry surface and per-profile snapshot templates cached at service construction"
         );
         Ok(Self {
             tools,
             names,
+            profile_templates,
             fingerprint,
             schema_parity,
         })
@@ -3867,13 +3979,6 @@ impl SynapseService {
         &self,
         session_id: Option<&str>,
     ) -> Result<ToolProfileSnapshot, ErrorData> {
-        let full_tool_names = self.full_tool_names();
-        let implementation_tool_count = full_tool_names.len();
-        let public_tool_registry = public_tool_registry_snapshot_for(&full_tool_names)?;
-        let facade_contract = facade_contract_snapshot_for(
-            &public_tool_registry.public_tool_names,
-            self.immutable_tool_surface.schema_parity.clone(),
-        )?;
         let (profile, source, policy_row) = match session_id {
             Some(session_id) => {
                 let row = self.ensure_tool_profile_assignment(session_id)?;
@@ -3885,44 +3990,32 @@ impl SynapseService {
                 None,
             ),
         };
-        let visible_tool_names = if session_id.is_some() {
-            visible_tool_names_for_profile(profile, &full_tool_names)
-        } else {
-            full_tool_names
-        };
-        let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
-        let mut visible_tools = self.full_sanitized_tools();
-        if session_id.is_some() {
-            visible_tools.retain(|tool| profile.is_visible(tool.name.as_ref()));
-        }
-        let visible_tool_surface = super::health::tool_surface_fingerprint_for_tools(visible_tools);
-        let denied_break_glass_tools = denied_break_glass_tools(&visible_tool_names);
-        let hidden_tool_routes = hidden_tool_capability_routes(&visible_tool_names);
-        let codex_client_surface = codex_client_surface_snapshot(
-            &public_tool_registry.public_tool_names,
-            visible_tool_surface.names.len(),
-            visible_tool_surface.sha256,
-            visible_tool_surface.error,
-        );
-        Ok(ToolProfileSnapshot {
-            source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
-            session_id: session_id.map(ToOwned::to_owned),
-            profile,
-            profile_label: profile.label(),
-            source,
-            implementation_tool_count,
-            visible_tool_count: visible_tool_names.len(),
-            visible_tool_sha256,
-            visible_tool_names,
-            denied_break_glass_tools,
-            foreground_capability: foreground_capability_policy(profile),
-            hidden_tool_routes,
-            public_tool_registry,
-            facade_contract,
-            codex_client_surface,
-            foreground_route: foreground_route_readiness(session_id, profile),
-            policy_row,
-        })
+        // #1936: the profile-derived fields were recomputed per call at a
+        // measured 20-22 ms. They are memoized at construction; only the
+        // per-session fields below are resolved here.
+        let session_scoped = session_id.is_some();
+        let template = self
+            .immutable_tool_surface
+            .profile_templates
+            .iter()
+            .find(|template| {
+                template.profile == profile && template.session_scoped == session_scoped
+            })
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "MCP_PROFILE_SNAPSHOT_TEMPLATE_MISSING: no memoized tool-profile snapshot for profile={} session_scoped={session_scoped}; remediation=add the profile to PROFILE_TEMPLATE_KEYS so it is built and validated at service construction",
+                        profile.as_str()
+                    ),
+                )
+            })?;
+        let mut snapshot = template.snapshot.clone();
+        snapshot.session_id = session_id.map(ToOwned::to_owned);
+        snapshot.source = source;
+        snapshot.foreground_route = foreground_route_readiness(session_id, profile);
+        snapshot.policy_row = policy_row;
+        Ok(snapshot)
     }
 
     pub(crate) fn public_tool_registry_snapshot(
