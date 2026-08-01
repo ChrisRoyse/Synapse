@@ -14,6 +14,11 @@ use synapse_core::error_codes;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+/// Budget for the four pre-work captures every tool call performs. The
+/// prologue is pure overhead from a caller's perspective: it runs before the
+/// requested tool does anything. A quiet log is the evidence it is in budget.
+const TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_MS: u128 = 10;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SynapseService {
     async fn call_tool(
@@ -510,6 +515,12 @@ impl SynapseService {
         operation: Option<String>,
         mcp_session_id: Option<&str>,
     ) -> Result<crate::daemon_lifecycle::ToolCallGuard, ErrorData> {
+        // Each of the four captures below runs before the tool does any work,
+        // on every call. #1936 measured this prologue at ~27ms -- the single
+        // largest component of tool-call latency -- so the split is reported
+        // rather than inferred. `foreground` in particular is a live Win32/UIA
+        // query, which is cross-process and not bounded by anything we own.
+        let prologue_started = std::time::Instant::now();
         let (audit_context, audit_context_read_error) = match self.current_action_audit_context() {
             Ok(context) => (
                 Some(serde_json::to_value(context).map_err(|error| {
@@ -521,6 +532,8 @@ impl SynapseService {
             ),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
+        let audit_context_ms = prologue_started.elapsed().as_millis();
+        let foreground_started = std::time::Instant::now();
         let (foreground, foreground_read_error) = match self.current_audit_foreground() {
             Ok(foreground) => (
                 Some(serde_json::to_value(foreground).map_err(|error| {
@@ -532,11 +545,15 @@ impl SynapseService {
             ),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
+        let foreground_ms = foreground_started.elapsed().as_millis();
+        let session_target_started = std::time::Instant::now();
         let (session_target, session_target_read_error) = match self.session_target(mcp_session_id)
         {
             Ok(target) => (target.as_ref().map(session_target_value), None),
             Err(error) => (None, Some(error_snapshot(&error))),
         };
+        let session_target_ms = session_target_started.elapsed().as_millis();
+        let tool_profile_started = std::time::Instant::now();
         let (profile, tool_surface_sha256, tool_profile_read_error) =
             match self.tool_profile_snapshot(mcp_session_id) {
                 Ok(snapshot) => (
@@ -546,6 +563,21 @@ impl SynapseService {
                 ),
                 Err(error) => (None, None, Some(error_snapshot(&error))),
             };
+        let tool_profile_ms = tool_profile_started.elapsed().as_millis();
+        let prologue_total_ms = prologue_started.elapsed().as_millis();
+        if prologue_total_ms >= TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_MS {
+            tracing::info!(
+                code = "MCP_TOOL_CALL_PROLOGUE_SLOW",
+                tool = tool_name,
+                audit_context_ms = audit_context_ms as u64,
+                foreground_ms = foreground_ms as u64,
+                session_target_ms = session_target_ms as u64,
+                tool_profile_ms = tool_profile_ms as u64,
+                total_ms = prologue_total_ms as u64,
+                threshold_ms = TOOL_CALL_PROLOGUE_SLOW_LOG_THRESHOLD_MS as u64,
+                "tool-call prologue captures exceeded their per-call latency budget"
+            );
+        }
         let route_id = operation
             .as_deref()
             .map(|operation| format!("{tool_name}.{operation}"))
