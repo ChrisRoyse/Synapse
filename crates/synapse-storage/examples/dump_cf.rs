@@ -79,6 +79,15 @@ const fn slot_in_episode_block(slot: u16) -> bool {
     reason = "example CLI dispatch keeps each mode visible in one small executable entry point"
 )]
 fn main() -> Result<(), Box<dyn Error>> {
+    // Off by default so the row dumps stay machine-readable; set RUST_LOG to
+    // read the engine's own structured log as evidence (e.g. the commit
+    // row-family attribution, #1936).
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "--native-cx") {
         args.remove(0);
@@ -2296,6 +2305,23 @@ fn ensemble_card_report(
             card.park_count,
             card.retire_count,
             card.pairs_monotonicity_floored,
+        ),
+    )?;
+    // The verdict is computed from the sufficiency *basis*, which is the
+    // estimate's CI lower bound rather than its point value, so printing
+    // `panel_bits` alone can show a card that says "not sufficient" beside a
+    // panel_bits equal to the anchor entropy. Print the basis the verdict
+    // actually used.
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "sufficiency basis_bits={:.9} panel_bits={:.9} anchor_entropy_bits={:.9} deficit_bits={:.9} sufficient={} trust={:?}",
+            card.sufficiency.sufficiency_basis_bits,
+            card.sufficiency.panel_bits,
+            card.anchor_entropy_bits,
+            card.sufficiency.deficit_bits,
+            card.sufficiency.sufficient,
+            card.sufficiency.trust,
         ),
     )?;
     write_stdout_line(

@@ -57,20 +57,42 @@ impl CommitStageTimings {
         stage
     }
 
-    fn report(&self, row_count: usize, started: &std::time::Instant) {
+    fn report(&self, rows: &[encode::WriteRow], started: &std::time::Instant) {
         let total_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if total_us < COMMIT_STAGE_SLOW_BUDGET_US {
             return;
         }
+        let row_count = rows.len();
         let attributed = self.admission_us
             + self.sidecar_us
             + self.wal_us
             + self.anchor_publish_us
             + self.mvcc_us
             + self.checkpoint_stage_us;
+        // The row count alone made the batch the obvious lever and gave no way
+        // to pull it: 29 rows on a tool call that was rejected at parameter
+        // validation is a finding only once you can say *which* 29 (#1936 ask
+        // 1). Attribute the batch by column family, collapsing the per-slot
+        // families into one `slot` bucket because their identity is the panel's
+        // and the question here is how many vectors one commit carries.
+        let mut per_cf: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let name = match row.cf {
+                crate::cf::ColumnFamily::Slot { .. } => "slot".to_owned(),
+                ref other => other.name(),
+            };
+            *per_cf.entry(name).or_default() += 1;
+        }
+        let row_families = per_cf
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         tracing::info!(
             code = "CALYX_ASTER_DURABLE_COMMIT_STAGE_TIMINGS",
             row_count,
+            row_families = %row_families,
             total_us,
             admission_us = self.admission_us,
             sidecar_us = self.sidecar_us,
@@ -400,7 +422,7 @@ where
         let Some(durable) = &self.durable else {
             let seq = self.commit_rows_to_mvcc(rows);
             stage.mvcc_us = stage.split(&started);
-            stage.report(rows.len(), &started);
+            stage.report(rows, &started);
             return seq;
         };
 
@@ -437,7 +459,7 @@ where
             stage.checkpoint_stage_us = stage.split(&started);
             Ok(mvcc_seq)
         })();
-        stage.report(rows.len(), &started);
+        stage.report(rows, &started);
 
         match publish {
             Ok(seq) => Ok(seq),

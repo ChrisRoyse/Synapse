@@ -44,6 +44,9 @@ calyx-sextant = { workspace = true }
 # Used only by ensemble_card_known_synergy_fsv, which reads the capability
 # card's own pair rows back to prove no reported gain is a silent clamp (#1942).
 calyx-assay = { workspace = true }
+# Used by the FSV instruments that must read the engine's own structured log as
+# evidence rather than inferring it from return values (#1936 row attribution).
+tracing-subscriber = { workspace = true }
 # Used only by loom_agreement_kernel_fsv, which measures the weave cosine
 # against the scalar loop it replaced so the persisted-value delta is a
 # measurement rather than an assertion (issue #1917).
