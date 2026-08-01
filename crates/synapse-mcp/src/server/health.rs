@@ -724,8 +724,26 @@ impl SynapseService {
                 .filter(|entry| entry.keys_to_bound() == Some(0))
                 .count() as u64
         });
-        let health_status = if sweep_failed > 0 || sweep_unmaintainable > 0 || sweep_lagging > 0 {
+        // The three sweep conditions are NOT the same severity, and collapsing
+        // them was wrong (measured on the live daemon: one stranded generation
+        // pinned `health.ok=false` permanently).
+        //
+        //   failed   — maintenance itself errored. Something that should be
+        //              running is not, and the generation drifts from here on.
+        //   lagging  — a generation is already past its bound, so every query
+        //              against it is failing right now.
+        //   unmaintainable — a generation is published for a panel version with
+        //              no code-declared contract. Permanent, benign, and
+        //              operator-owned: nothing is running that could fix it, no
+        //              live query is degraded by it, and it will never change on
+        //              its own. `error` here is an alarm that can never be
+        //              cleared by the daemon, which is exactly the flag-fatigue
+        //              #1914 fixed for the pre-first-tick case. It is `degraded`,
+        //              reported in its own field with its named action.
+        let health_status = if sweep_failed > 0 || sweep_lagging > 0 {
             "error"
+        } else if state == "built" && sweep_unmaintainable > 0 {
+            "degraded"
         } else if state == "built" {
             "ok"
         } else if never_measured {
