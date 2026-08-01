@@ -54,7 +54,7 @@ use synapse_storage::{
     dump_cf_read_only_with_expired, scan_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path> | dump_cf --slot-kind-census <db_path> <panel_version>";
+const USAGE: &str = "usage: dump_cf --ensemble-card <db_path> <panel_version> <anchor_kind> <max_records> <min_gate_lenses> | dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path> | dump_cf --slot-kind-census <db_path> <panel_version>";
 /// The episode panel's exclusive global slot block (#1776). The
 /// `--repair-bad-episode-slots` mode exists for episode constellations that
 /// historically wrote slots outside it; under the global allocation that is
@@ -215,6 +215,37 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
         return slot_kind_census(PathBuf::from(db_path), panel_version);
+    }
+    if args.first().is_some_and(|arg| arg == "--ensemble-card") {
+        args.remove(0);
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        let panel_version = args
+            .next()
+            .ok_or(USAGE)?
+            .parse::<u32>()
+            .map_err(|error| format!("{USAGE}; panel_version must be a u32: {error}"))?;
+        let anchor_kind = args.next().ok_or(USAGE)?;
+        let max_records = args
+            .next()
+            .ok_or(USAGE)?
+            .parse::<usize>()
+            .map_err(|error| format!("{USAGE}; max_records must be a usize: {error}"))?;
+        let min_gate_lenses = args
+            .next()
+            .ok_or(USAGE)?
+            .parse::<usize>()
+            .map_err(|error| format!("{USAGE}; min_gate_lenses must be a usize: {error}"))?;
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return ensemble_card_report(
+            PathBuf::from(db_path),
+            panel_version,
+            &anchor_kind,
+            max_records,
+            min_gate_lenses,
+        );
     }
     let include_expired = if args.first().is_some_and(|arg| arg == "--include-expired") {
         args.remove(0);
@@ -2183,6 +2214,168 @@ fn canonical_hex(value: &str) -> Result<String, Box<dyn Error>> {
             .map_err(|error| format!("invalid hex byte at offset {index}: {error}"))?;
     }
     Ok(value)
+}
+
+/// Drives the ensemble capability card over a real panel and prints every pair
+/// row's gain evidence: the reported gain, the **unclamped** raw gain, whether
+/// the data-processing-inequality floor moved it, and the instrument behind each
+/// of the three terms (#1942).
+///
+/// Takes the writer lock — the pass persists an `EnsembleCard` Assay row as
+/// durable evidence that it ran — so point it at a vault copy, not the live
+/// vault the daemon owns.
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    reason = "the FSV driver owns its path and prints the whole card inline"
+)]
+fn ensemble_card_report(
+    db_path: PathBuf,
+    panel_version: u32,
+    anchor_kind: &str,
+    max_records: usize,
+    min_gate_lenses: usize,
+) -> Result<(), Box<dyn Error>> {
+    let vault = SynapseCalyxVault::open(SynapseCalyxConfig::from_vault_dir(db_path.clone()))?;
+    let snapshot = vault.latest_seq();
+    let assay_rows_before = vault.scan_cf_at(snapshot, ColumnFamily::Assay)?.len();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "ensemble_card db_path={} vault_id={} snapshot={snapshot} panel_version={panel_version} anchor_kind={anchor_kind} max_records={max_records} min_gate_lenses={min_gate_lenses} assay_rows_before={assay_rows_before}",
+            db_path.display(),
+            vault.vault_id(),
+        ),
+    )?;
+
+    let params =
+        synapse_calyx::SynapseCalyxAssayParams::new(panel_version, anchor_kind.to_string())
+            .with_max_records(max_records)
+            .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
+    let report = vault.assay_ensemble_card(&params, min_gate_lenses)?;
+    let card = &report.card;
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "corpus records_scanned={} anchored_records={} declared_slots={} measured_slots={:?} excluded_lenses={} assay_cf_rows={}",
+            report.records_scanned,
+            report.anchored_records,
+            report.declared_slots,
+            report.measured_slots,
+            report.excluded_lenses.len(),
+            report.assay_cf_rows,
+        ),
+    )?;
+    for lens in &report.excluded_lenses {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "excluded slot={} name={} reason={}",
+                lens.slot, lens.name, lens.reason
+            ),
+        )?;
+    }
+
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "card schema_version={} source={} pid_method={} panel_lens_count={} n_samples={} anchor_entropy_bits={:.6} panel_bits={:.6} n_eff={:.4} sufficient={} deficit_bits={:.6} keep={} park={} retire={} pairs_monotonicity_floored={}",
+            card.schema_version,
+            card.source,
+            card.pid_method,
+            card.panel_lens_count,
+            card.n_samples,
+            card.anchor_entropy_bits,
+            card.panel_bits,
+            card.n_eff,
+            card.sufficient,
+            card.deficit_bits,
+            card.keep_count,
+            card.park_count,
+            card.retire_count,
+            card.pairs_monotonicity_floored,
+        ),
+    )?;
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "a37 status={} families={} n_eff={:.4} floor={:.4} pair_evidence={} redundancy_bound={} no_collapse={}",
+            card.a37_diversity.status,
+            card.a37_diversity.association_family_count,
+            card.a37_diversity.n_eff,
+            card.a37_diversity.n_eff_floor,
+            card.a37_diversity.pair_evidence_pass,
+            card.a37_diversity.redundancy_bound_pass,
+            card.a37_diversity.no_collapse_pass,
+        ),
+    )?;
+    for lens in &card.lenses {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "lens slot={} name={} solo_bits={:.6} panel_without_bits={:.6} marginal_bits={:.6} pid_unique={:.6} pid_redundant={:.6} pid_synergistic={:.6} decision={:?}",
+                lens.slot,
+                lens.name,
+                lens.solo_bits,
+                lens.panel_without_bits,
+                lens.marginal_bits,
+                lens.pid.unique_bits,
+                lens.pid.redundant_bits,
+                lens.pid.synergistic_bits,
+                lens.decision,
+            ),
+        )?;
+    }
+    for pair in &card.pairs {
+        write_stdout_line(
+            &mut stdout,
+            format_args!(
+                "pair slot_a={} slot_b={} pair_bits={:.6} gain_bits={:.6} raw_gain_bits={:.6} monotonicity_floor_applied={} estimators=pair:{:?}/left:{:?}/right:{:?} corr={:.6} nmi={:.6}",
+                pair.slot_a,
+                pair.slot_b,
+                pair.pair_bits,
+                pair.synergy_gain_bits,
+                pair.raw_synergy_gain_bits,
+                pair.synergy_monotonicity_floor_applied,
+                pair.synergy_estimators.pair,
+                pair.synergy_estimators.left,
+                pair.synergy_estimators.right,
+                pair.corr,
+                pair.nmi,
+            ),
+        )?;
+    }
+
+    // Every reported zero must be either a measured zero or a flagged clamp.
+    let silent_zeros = card
+        .pairs
+        .iter()
+        .filter(|pair| {
+            pair.synergy_gain_bits == 0.0
+                && !pair.synergy_monotonicity_floor_applied
+                && pair.raw_synergy_gain_bits != 0.0
+        })
+        .count();
+    let floored = card
+        .pairs
+        .iter()
+        .filter(|pair| pair.synergy_monotonicity_floor_applied)
+        .count();
+    let after_seq = vault.latest_seq();
+    let assay_rows_after = vault.scan_cf_at(after_seq, ColumnFamily::Assay)?.len();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "ensemble_card_summary pairs={} floored={} card_floored_counter={} silent_zero_gains={} assay_rows_before={assay_rows_before} assay_rows_after={assay_rows_after} snapshot_after={after_seq}",
+            card.pairs.len(),
+            floored,
+            card.pairs_monotonicity_floored,
+            silent_zeros,
+        ),
+    )?;
+    Ok(())
 }
 
 fn write_stdout_line(

@@ -41,6 +41,9 @@ calyx-search = { workspace = true }
 # kernels so the host's instruction baseline is chosen from a measurement.
 calyx-forge = { workspace = true }
 calyx-sextant = { workspace = true }
+# Used only by ensemble_card_known_synergy_fsv, which reads the capability
+# card's own pair rows back to prove no reported gain is a silent clamp (#1942).
+calyx-assay = { workspace = true }
 # Used only by loom_agreement_kernel_fsv, which measures the weave cosine
 # against the scalar loop it replaced so the persisted-value delta is a
 # measurement rather than an assertion (issue #1917).

@@ -34,19 +34,12 @@ pub(super) fn logistic_probe_mi_multiseed_with_trust_and_min_samples(
     )
 }
 
-pub(crate) fn logistic_probe_mi_multiseed_blocks(
-    blocks: &[LogisticBlock<'_>],
-    labels: &[bool],
-    groups: Option<&[String]>,
-) -> Result<LogisticProbeReport> {
-    logistic_probe_mi_multiseed_blocks_with_trust_and_min_samples(
-        blocks,
-        labels,
-        groups,
-        TrustTag::Provisional,
-        MIN_ASSAY_SAMPLES,
-    )
-}
+// An *uncalibrated* multi-block entry point deliberately does not exist
+// (#1942). Every multi-block estimate on the ensemble path is differenced
+// against another one, and the calibrated wrapper is the positive control that
+// proves the probe can recover a planted signal at that call's own dimension.
+// A caller that skips it gets a number whose weakness is indistinguishable from
+// an absence of signal, which is exactly the defect #1942 records.
 
 pub(super) fn logistic_probe_mi_multiseed_blocks_with_trust_and_min_samples(
     blocks: &[LogisticBlock<'_>],

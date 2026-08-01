@@ -24,9 +24,7 @@ pub use self::conditioning::{
     LOGISTIC_CONDITIONING_METHOD, LOGISTIC_CONDITIONING_SCHEMA_VERSION, LogisticConditioningBlock,
     LogisticConditioningProvenance, LogisticConditioningScale, LogisticFoldConditioning,
 };
-pub(crate) use self::pipeline::{
-    logistic_probe_mi_multiseed_blocks, logistic_probe_mi_multiseed_calibrated_blocks,
-};
+pub(crate) use self::pipeline::logistic_probe_mi_multiseed_calibrated_blocks;
 use self::pipeline::{
     logistic_probe_mi_multiseed_blocks_with_trust_and_min_samples,
     logistic_probe_mi_multiseed_blocks_with_trust_and_min_samples_cuda_strict,

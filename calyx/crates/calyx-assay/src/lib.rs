@@ -113,7 +113,7 @@ pub use ensemble::{
     LINEAR_CKA_REDUNDANCY_METHOD, LINEAR_CKA_TUPLES_PER_ROW, LinearCkaEstimate, LinearCkaSketch,
     LinearCkaTuplePlan, MAX_LINEAR_CKA_TUPLES, MIN_ENSEMBLE_PANEL_LENSES, MIN_LINEAR_CKA_TUPLES,
     PidBits, a37_association_family, a37_diversity_gate, ensemble_card,
-    ensemble_card_with_redundancy, ensemble_redundancy_from_lenses,
+    ensemble_card_with_redundancy, ensemble_nmi_signature, ensemble_redundancy_from_lenses,
     ensemble_redundancy_from_lenses_cuda_strict, ensemble_redundancy_from_sketches,
     linear_cka_sketch_from_row_fn, linear_cka_sketch_from_rows, linear_cka_tuple_plan,
     validate_ensemble_card_redundancy, validate_redundancy_method_metadata,
@@ -246,7 +246,7 @@ pub use sufficiency::{
 pub use synergy::{
     CALYX_ASSAY_INVALID_SYNERGY, CALYX_ASSAY_SYNERGY_CROSS_ESTIMATOR, MIN_SYNERGY_GAIN_BITS,
     SynergyEstimators, SynergyPair, SynergyPairState, SynergyReport, synergy_gain, synergy_pair,
-    synergy_report, unmeasured_synergy_pair,
+    synergy_report, unmeasured_synergy_pair, whole_minus_max_gain,
 };
 pub use total_correlation::{
     CALYX_TC_INSUFFICIENT_SAMPLES, DEFAULT_TC_BOOTSTRAP_RESAMPLES, DEFAULT_TC_K, IIResult, IISign,

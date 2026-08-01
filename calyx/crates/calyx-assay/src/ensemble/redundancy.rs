@@ -100,11 +100,22 @@ pub fn ensemble_redundancy_from_sketches(
                 &lenses[b].linear_cka,
                 plan.is_exact(),
             )?;
+            // A refusal here used to say only "x" or "y": the operator got a
+            // degenerate-column error with no way to tell *which* of a dozen
+            // lenses caused it, on a path that then aborted the whole card.
+            // Name both sides (#1897's localisation rule, #1943).
             let nmi = partitioned_histogram_nmi(
                 &lenses[a].nmi_signature,
                 &lenses[b].nmi_signature,
                 nmi_bins,
-            )?
+            )
+            .map_err(|error| CalyxError {
+                message: format!(
+                    "NMI redundancy for x={} slot {} vs y={} slot {}: {}",
+                    lenses[a].name, lenses[a].slot, lenses[b].name, lenses[b].slot, error.message
+                ),
+                ..error
+            })?
             .nmi;
             pairs.push(EnsemblePairRedundancyEvidence {
                 a: lenses[a].name.clone(),
@@ -367,16 +378,144 @@ fn redundancy_method(plan: &LinearCkaTuplePlan) -> EnsembleRedundancyMethod {
     }
 }
 
+/// Domain separator for the NMI signature's projection direction. Bumping it
+/// changes every signature, so it is part of the method's identity.
+const NMI_SIGNATURE_PROJECTION_METHOD: &[u8] = b"calyx-ensemble-nmi-signature-projection-v1";
+
+/// Reduces each row of a lens to one scalar for the pairwise NMI redundancy
+/// term, by projecting it onto a **fixed pseudorandom direction**.
+///
+/// # Why not the row mean (#1943)
+///
+/// The signature used to be the row mean — a projection onto the all-ones
+/// direction — and that direction is degenerate for a large and *deliberate*
+/// class of lenses: any encoder whose rows share a sum has an exactly constant
+/// mean. A one-hot, an L1-normalized hash, a densified single-cell categorical
+/// slot are all in that class, and a deterministic-encoder panel is mostly made
+/// of them. A constant column has zero entropy, so the NMI term refused it and
+/// took the entire capability card down with it — a whole-pass abort caused by
+/// the choice of projection, not by the data.
+///
+/// The all-ones direction also discards the only thing a one-hot carries: the
+/// mean of a one-hot is `1/width` no matter *which* index fired, so even where
+/// it did not refuse it measured nothing.
+///
+/// A fixed pseudorandom direction removes both faults. By the
+/// Johnson-Lindenstrauss lemma a random projection preserves pairwise distances
+/// in expectation, so binning it is a coarse but faithful sketch of the
+/// row-to-row structure; and two rows that differ in the vector differ in the
+/// projection except on a measure-zero set. The direction is derived by blake3
+/// from the width alone under a fixed domain separator, so it is reproducible
+/// from the data with no stored state, and identical inputs give identical
+/// signatures on every host.
+///
+/// A signature that is *still* constant now means the lens itself is constant,
+/// which is a real finding about the lens rather than an artefact of the
+/// reduction.
+pub fn ensemble_nmi_signature(rows: &[Vec<f32>]) -> Result<Vec<f32>> {
+    row_signature(rows)
+}
+
 fn row_signature(rows: &[Vec<f32>]) -> Result<Vec<f32>> {
+    let Some(width) = rows.first().map(Vec::len) else {
+        return Ok(Vec::new());
+    };
+    if width == 0 {
+        return Err(CalyxError::assay_degenerate_input(
+            "ensemble NMI signature row 0 is empty",
+        ));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        if row.len() != width {
+            return Err(CalyxError::assay_degenerate_input(format!(
+                "ensemble NMI signature row {index} has width {} but row 0 has width {width}",
+                row.len()
+            )));
+        }
+        if let Some(position) = row.iter().position(|value| !value.is_finite()) {
+            return Err(CalyxError::assay_degenerate_input(format!(
+                "ensemble NMI signature row {index} is non-finite at dimension {position}"
+            )));
+        }
+    }
+
+    // Standardize each dimension before projecting. Without it one large-scale
+    // dimension owns the projection: a record vector carrying an epoch
+    // millisecond field (~1.7e12) alongside unit-scale fields projects to a
+    // value whose f32 mantissa cannot represent the contribution of anything
+    // else, so every row rounds to the *same* scalar and a lens with 31,421
+    // distinct vectors sketches as a constant (#1943). Standardizing is also
+    // what makes a random projection meaningful: Johnson-Lindenstrauss
+    // preserves distances in the space it is applied to, and unstandardized
+    // distances are dominated by whichever field happens to have the largest
+    // units.
+    let count = rows.len() as f64;
+    let mut mean = vec![0.0f64; width];
+    for row in rows {
+        for (accumulator, value) in mean.iter_mut().zip(row) {
+            *accumulator += f64::from(*value);
+        }
+    }
+    for value in &mut mean {
+        *value /= count;
+    }
+    let mut sigma = vec![0.0f64; width];
+    for row in rows {
+        for ((accumulator, value), centre) in sigma.iter_mut().zip(row).zip(&mean) {
+            let delta = f64::from(*value) - centre;
+            *accumulator += delta * delta;
+        }
+    }
+    for value in &mut sigma {
+        *value = (*value / count).sqrt();
+    }
+
+    let direction = projection_direction(width);
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
-            if row.is_empty() || row.iter().any(|value| !value.is_finite()) {
+            let mut projected = 0.0f64;
+            for (((value, centre), scale), weight) in
+                row.iter().zip(&mean).zip(&sigma).zip(&direction)
+            {
+                // A zero-variance dimension carries no row-to-row information
+                // and would divide by zero; it contributes nothing, which is
+                // exactly its information content.
+                if *scale > 0.0 {
+                    projected += (f64::from(*value) - centre) / scale * f64::from(*weight);
+                }
+            }
+            if !projected.is_finite() {
                 return Err(CalyxError::assay_degenerate_input(format!(
-                    "ensemble NMI signature row {index} is empty or non-finite"
+                    "ensemble NMI signature row {index} projected to a non-finite value"
                 )));
             }
-            Ok((row.iter().map(|value| f64::from(*value)).sum::<f64>() / row.len() as f64) as f32)
+            Ok(projected as f32)
+        })
+        .collect()
+}
+
+/// The fixed pseudorandom unit-scale direction for a given width.
+///
+/// Each coordinate is a blake3 draw mapped to `[-1, 1)`, then the whole vector
+/// is scaled by `1/sqrt(width)` so the projection of a standardized row does
+/// not grow with the lens dimension — a 2048-wide lens and a 2-wide lens land
+/// on comparable scales, which matters because the signature is binned over its
+/// own range.
+fn projection_direction(width: usize) -> Vec<f32> {
+    let scale = 1.0 / (width as f64).sqrt();
+    (0..width)
+        .map(|index| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(NMI_SIGNATURE_PROJECTION_METHOD);
+            hasher.update(&(width as u128).to_le_bytes());
+            hasher.update(&(index as u128).to_le_bytes());
+            let bytes = hasher.finalize();
+            let mut draw = [0_u8; 8];
+            draw.copy_from_slice(&bytes.as_bytes()[..8]);
+            // u64 -> [-1, 1): exact in f64, and deterministic on every host.
+            let unit = (u64::from_le_bytes(draw) as f64) / (2.0_f64.powi(64));
+            ((unit * 2.0 - 1.0) * scale) as f32
         })
         .collect()
 }

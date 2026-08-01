@@ -2,11 +2,14 @@ use calyx_core::SlotId;
 use serde::{Deserialize, Serialize};
 
 use crate::LogisticConditioningProvenance;
+use crate::estimate::EstimatorKind;
 use crate::sufficiency::PanelSufficiency;
 
 use super::a37::A37DiversityGate;
 
-pub const ENSEMBLE_CARD_SCHEMA_VERSION: u32 = 3;
+/// Schema 4 (#1942): every pair row carries the unclamped gain, the visible
+/// monotonicity floor, and the instrument behind each of its three terms.
+pub const ENSEMBLE_CARD_SCHEMA_VERSION: u32 = 4;
 pub const ENSEMBLE_CARD_PID_METHOD: &str = "bounded_decision_surrogate_v1";
 pub const MIN_ENSEMBLE_PANEL_LENSES: usize = 3;
 pub const DEFAULT_GATE_PANEL_LENSES: usize = 10;
@@ -96,6 +99,12 @@ pub struct EnsembleCard {
     pub sufficiency: PanelSufficiency,
     pub lenses: Vec<EnsembleLensValue>,
     pub pairs: Vec<EnsemblePairValue>,
+    /// Pairs whose raw gain was negative and got floored at zero (#1942).
+    ///
+    /// Derived from the rows, so the summary can never disagree with them. A
+    /// non-zero count is a statement about the *instrument*, not the panel:
+    /// the joint fit came out below a marginal fit it cannot be below.
+    pub pairs_monotonicity_floored: usize,
     pub keep_count: usize,
     pub park_count: usize,
     pub retire_count: usize,
@@ -132,7 +141,57 @@ pub struct EnsemblePairValue {
     pub redundancy: Option<LinearCkaEstimate>,
     pub pair_bits: f32,
     pub pair_ci: [f32; 2],
+    /// `max(0, raw_synergy_gain_bits)` — the reported gain, floored by the
+    /// data-processing inequality.
+    ///
+    /// It is a difference of two *lower bounds* (the logistic probe reports
+    /// [`crate::EstimateBound::LowerBound`]), and a difference of two lower
+    /// bounds is neither a lower nor an upper bound on the difference — see
+    /// [`EnsemblePairValue::synergy_monotonicity_floor_applied`] for what that
+    /// costs in practice. Read it as the bounded decision surrogate the card's
+    /// `pid_method` names, never as a measured synergy.
     pub synergy_gain_bits: f32,
+    /// `pair_bits - max(left_bits, right_bits)` exactly as measured, before the
+    /// monotonicity floor (#1942).
+    ///
+    /// Negative here is not "the pair adds nothing". Variational MI estimators
+    /// — of which the logistic probe is one — are known to *fail* the
+    /// data-processing self-consistency test (Song & Ermon, *Understanding the
+    /// Limitations of Variational Mutual Information Estimators*, ICLR 2020),
+    /// so a negative raw gain is direct evidence that the joint fit was weaker
+    /// than the marginal fit at the joint's own dimension. Silently clamping it
+    /// destroys that evidence, which is why it is carried.
+    pub raw_synergy_gain_bits: f32,
+    /// True when `raw_synergy_gain_bits` was below zero and the floor moved it.
+    pub synergy_monotonicity_floor_applied: bool,
+    /// The instrument behind each of the three bit terms.
+    ///
+    /// Carried as a triple rather than a "homogeneous" flag so a consumer can
+    /// *see* the three agree instead of taking the producer's word for it
+    /// (#1941 ask 2, #1942 ask 1). Construction fails closed when they do not.
+    pub synergy_estimators: EnsembleSynergyEstimators,
+}
+
+/// The instrument behind each of a pair's three bit terms.
+///
+/// A difference of information quantities is only interpretable when the
+/// estimators' biases cancel, and that cancellation is a property of one
+/// estimator applied at one scale — never of two (Kraskov, Stögbauer &
+/// Grassberger, Phys. Rev. E 69 066138, 2004).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnsembleSynergyEstimators {
+    pub pair: EstimatorKind,
+    pub left: EstimatorKind,
+    pub right: EstimatorKind,
+}
+
+impl EnsembleSynergyEstimators {
+    /// True when all three terms came from the same instrument, which is the
+    /// precondition for their difference to be interpretable at all.
+    #[must_use]
+    pub fn is_homogeneous(&self) -> bool {
+        self.pair == self.left && self.left == self.right
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

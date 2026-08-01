@@ -193,6 +193,53 @@ pub struct SynergyReport {
     pub pairs: Vec<SynergyPair>,
 }
 
+/// The `WholeMinusMax` arithmetic and its data-processing-inequality floor —
+/// the **single** implementation of `pair - max(left, right)` in the engine.
+///
+/// Every path that computes a pair gain calls this one function (#1942 ask 4):
+/// two implementations of the same information-theoretic quantity with
+/// different discipline is exactly how #1941 came to exist on one path and not
+/// the other. The instrument check belongs to the *caller*, because the type of
+/// "instrument" differs by path — [`MiEstimator`] on the [`synergy_gain`] path,
+/// [`crate::EstimatorKind`] on the ensemble path — but the arithmetic, the
+/// validation and the visible floor are shared.
+///
+/// Returns `(gain_bits, raw_gain_bits, monotonicity_floor_applied)`, where
+/// `gain_bits` is `max(0, raw_gain_bits)` and the flag says whether the floor
+/// moved it. A clamped row is always visibly clamped.
+///
+/// # Errors
+///
+/// Returns [`CALYX_ASSAY_INVALID_SYNERGY`] when any term is non-finite or
+/// negative — a mutual information in bits is neither.
+pub fn whole_minus_max_gain(
+    pair_bits: f32,
+    left_bits: f32,
+    right_bits: f32,
+) -> Result<(f32, f32, bool)> {
+    for (name, value) in [
+        ("pair_bits", pair_bits),
+        ("left_bits", left_bits),
+        ("right_bits", right_bits),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CalyxError {
+                code: CALYX_ASSAY_INVALID_SYNERGY,
+                message: format!(
+                    "synergy term {name}={value} must be a finite, non-negative bit measurement"
+                ),
+                remediation: "re-measure the pair and both marginals over the same paired sample set",
+            });
+        }
+    }
+    let raw = pair_bits - left_bits.max(right_bits);
+    // The data-processing inequality is a law: `[a‖b]` determines `a`, so the
+    // pair cannot carry less about the outcome than either half. A negative
+    // raw value is the instrument, not the corpus.
+    let floored = raw < 0.0;
+    Ok((if floored { 0.0 } else { raw }, raw, floored))
+}
+
 /// Computes the `WholeMinusMax` synergy gain for one lens pair, and reports
 /// whether the data-processing-inequality floor had to move it.
 ///
@@ -210,21 +257,7 @@ pub fn synergy_gain(
     right_bits: f32,
     estimators: SynergyEstimators,
 ) -> Result<(f32, f32, bool)> {
-    for (name, value) in [
-        ("pair_bits", pair_bits),
-        ("left_bits", left_bits),
-        ("right_bits", right_bits),
-    ] {
-        if !value.is_finite() || value < 0.0 {
-            return Err(CalyxError {
-                code: CALYX_ASSAY_INVALID_SYNERGY,
-                message: format!(
-                    "synergy term {name}={value} must be a finite, non-negative bit measurement"
-                ),
-                remediation: "re-measure the pair and both marginals over the same paired sample set",
-            });
-        }
-    }
+    let gain = whole_minus_max_gain(pair_bits, left_bits, right_bits)?;
     if !estimators.is_homogeneous() {
         return Err(CalyxError {
             code: CALYX_ASSAY_SYNERGY_CROSS_ESTIMATOR,
@@ -237,12 +270,7 @@ pub fn synergy_gain(
             remediation: "pin all three columns to one estimator (MiEstimatorChoice::DiscretePlugin or ::ContinuousKsg) and re-measure, or report the pair unmeasured",
         });
     }
-    let raw = pair_bits - left_bits.max(right_bits);
-    // The data-processing inequality is a law: `[a‖b]` determines `a`, so the
-    // pair cannot carry less about the outcome than either half. A negative
-    // raw value is the instrument, not the corpus.
-    let floored = raw < 0.0;
-    Ok((if floored { 0.0 } else { raw }, raw, floored))
+    Ok(gain)
 }
 
 /// Builds one measured pair record from its three same-sample-set,

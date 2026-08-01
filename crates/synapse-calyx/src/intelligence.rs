@@ -13,14 +13,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
     AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, Direction,
-    EstimatorKind, InterEventHazardReport, MiEstimate, MiEstimator, MiEstimatorChoice,
-    MiEstimatorPick, MmdConfig, PeriodogramConfig, RateShift, SIGNIFICANT_PEAK_FAP,
-    SlotAttribution, SynergyEstimators, SynergyPairState, SynergyReport, TEResult, TeEstimator,
+    EnsembleCard, EnsembleConfig, EnsembleLensInput, EstimatorKind, InterEventHazardReport,
+    MIN_ENSEMBLE_PANEL_LENSES, MiEstimate, MiEstimator, MiEstimatorChoice, MiEstimatorPick,
+    MmdConfig, PeriodogramConfig, RateShift, SIGNIFICANT_PEAK_FAP, SlotAttribution,
+    SynergyEstimators, SynergyPairState, SynergyReport, TEResult, TeEstimator,
     TiedOccurrenceCollapse, TrustTag, autocorrelation, bin_event_counts, bits_report_with_anchor,
-    collapse_tied_occurrences, entropy_bits, inter_event_hazard_with_alpha,
-    lomb_scargle_with_config, mi_about_labels, mmd_change_point, panel_sufficiency_with_anchor,
-    partitioned_histogram_nmi, per_sensor_attribution, recurrence_rate_cusum, resolve_mi_estimator,
-    stable_rank, synergy_pair, synergy_report, transfer_entropy_sweep, unmeasured_synergy_pair,
+    collapse_tied_occurrences, ensemble_card, ensemble_nmi_signature, entropy_bits,
+    inter_event_hazard_with_alpha, lomb_scargle_with_config, mi_about_labels, mmd_change_point,
+    panel_sufficiency_with_anchor, partitioned_histogram_nmi, per_sensor_attribution,
+    recurrence_rate_cusum, resolve_mi_estimator, stable_rank, synergy_pair, synergy_report,
+    transfer_entropy_sweep, unmeasured_synergy_pair,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
@@ -60,6 +62,17 @@ pub const SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID: &str =
 /// Structured code raised when a synergy pass is asked for an anchor no record
 /// in the panel carries.
 pub const SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS: &str = "SYNAPSE_CALYX_SYNERGY_NO_ANCHORED_RECORDS";
+/// Structured code raised when an ensemble capability-card pass is asked for an
+/// anchor no record in the panel carries.
+pub const SYNAPSE_ENSEMBLE_NO_ANCHORED_RECORDS: &str = "SYNAPSE_CALYX_ENSEMBLE_NO_ANCHORED_RECORDS";
+/// Structured code raised when the requested anchor is not binary. The ensemble
+/// card's decision surrogate is a binary logistic probe; a three-outcome anchor
+/// is refused rather than collapsed to one-versus-rest behind the operator's
+/// back.
+pub const SYNAPSE_ENSEMBLE_ANCHOR_NOT_BINARY: &str = "SYNAPSE_CALYX_ENSEMBLE_ANCHOR_NOT_BINARY";
+/// Structured code raised when too few lenses are present on *every* anchored
+/// record for a panel-level card to mean anything.
+pub const SYNAPSE_ENSEMBLE_NO_COPRESENT_LENSES: &str = "SYNAPSE_CALYX_ENSEMBLE_NO_COPRESENT_LENSES";
 
 const GRAPH_AGREEMENT_PREFIX: &[u8; 5] = b"GAGR1";
 const GRAPH_KNN_PREFIX: &[u8; 5] = b"GKNN1";
@@ -1258,6 +1271,10 @@ pub const SYNAPSE_SYNERGY_MAX_RECORDS: usize = 2_000;
 /// Lens cap for one synergy pass: the lenses with the highest marginal bits are
 /// paired, and the truncation is reported (`n_lenses` vs `lenses_paired`).
 pub const SYNAPSE_SYNERGY_MAX_LENSES: usize = 8;
+/// Record cap for one ensemble capability-card pass. Each of the `C(N,2)` pairs
+/// costs two multi-seed logistic probes (the estimate and its power control),
+/// so the budget is tighter still than the synergy pass.
+pub const SYNAPSE_ENSEMBLE_MAX_RECORDS: usize = 1_000;
 
 const ASSAY_CORPUS_SHARD: &str = "synapse-intelligence";
 
@@ -1294,6 +1311,14 @@ impl SynapseCalyxAssayParams {
             ksg_k: SYNAPSE_KSG_DEFAULT_K,
             lens_names: BTreeMap::new(),
         }
+    }
+
+    /// Caps the records one pass reads. Each pass clamps this to its own
+    /// budget; the clamp is a property of the pass, not of the request.
+    #[must_use]
+    pub fn with_max_records(mut self, max_records: usize) -> Self {
+        self.max_records = max_records;
+        self
     }
 
     /// Attaches the declared slot-to-lens-name catalog used to localise every
@@ -2569,6 +2594,282 @@ impl SynapseCalyxVault {
         ))
     }
 
+    /// Measures the panel's **ensemble capability card**: per-lens marginal
+    /// value, the PID triple, every pairwise gain, the A37 associational
+    /// diversity gate, and the keep/park/retire verdict — the admission gate of
+    /// the handbook's capability card, over the real vault corpus.
+    ///
+    /// This is the first Synapse surface onto `calyx_assay::ensemble_card`; the
+    /// path previously existed with no caller, which is how the defect #1942
+    /// records survived on it (a second, undisciplined implementation of the
+    /// pair gain that nothing ever ran).
+    ///
+    /// Every term is measured by one instrument over one paired sample set, and
+    /// the pass **fails closed** rather than reporting a number the corpus does
+    /// not support: a non-binary anchor is refused, not collapsed; a lens absent
+    /// from any anchored record is excluded from the panel vector rather than
+    /// zero-filled; and a pair whose three terms did not come from one estimator
+    /// aborts the pass.
+    ///
+    /// # Errors
+    ///
+    /// [`SYNAPSE_ENSEMBLE_NO_ANCHORED_RECORDS`] when no record carries the
+    /// anchor, [`SYNAPSE_ENSEMBLE_ANCHOR_NOT_BINARY`] when it is not a
+    /// two-outcome anchor, [`SYNAPSE_ENSEMBLE_NO_COPRESENT_LENSES`] when too few
+    /// lenses are present on every anchored record, and the underlying Calyx
+    /// error for any refusal inside the assay itself.
+    pub fn assay_ensemble_card(
+        &self,
+        params: &SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> Result<SynapseCalyxEnsembleCardReport, SynapseCalyxError> {
+        let max_records = params.max_records.clamp(1, SYNAPSE_ENSEMBLE_MAX_RECORDS);
+        let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
+        let anchor_kind = parse_anchor_kind(&params.anchor_kind);
+
+        // One pass over the corpus: the anchored records, their interned
+        // outcome, and the slots each one carries.
+        let mut interner: BTreeMap<String, usize> = BTreeMap::new();
+        let mut anchored: Vec<(&BTreeMap<SlotId, Vec<f32>>, usize)> = Vec::new();
+        for record in &corpus.records {
+            let Some(anchor) = anchor_of_kind(&record.anchors, &anchor_kind) else {
+                continue;
+            };
+            let Some(label) = discrete_anchor_label(&anchor.value, &mut interner) else {
+                continue;
+            };
+            anchored.push((&record.slots, label));
+        }
+        if anchored.is_empty() {
+            return Err(SynapseCalyxError::new(
+                SYNAPSE_ENSEMBLE_NO_ANCHORED_RECORDS,
+                format!(
+                    "no record in panel_version={} carries a discrete anchor of kind {}; a \
+                     capability card measures lens value *about a grounded outcome* and is \
+                     undefined without one",
+                    params.panel_version, params.anchor_kind
+                ),
+                "write grounded outcome anchors of the requested kind onto the panel's records \
+                 (storage operation=anchors), then re-run the ensemble card",
+            ));
+        }
+        if interner.len() != 2 {
+            let outcomes = interner.keys().cloned().collect::<Vec<_>>().join(", ");
+            return Err(SynapseCalyxError::new(
+                SYNAPSE_ENSEMBLE_ANCHOR_NOT_BINARY,
+                format!(
+                    "anchor kind {} carries {} distinct outcome(s) over {} anchored record(s) \
+                     [{outcomes}]; the ensemble card's decision surrogate is a binary logistic \
+                     probe and a non-binary outcome is refused rather than silently collapsed to \
+                     one-versus-rest",
+                    params.anchor_kind,
+                    interner.len(),
+                    anchored.len()
+                ),
+                "measure a two-outcome anchor, or add a one-versus-rest anchor kind explicitly \
+                 so the collapse is a declared measurement rather than an implicit one",
+            ));
+        }
+
+        // The panel vector is the intersection: a lens missing from an anchored
+        // record cannot be zero-filled, because `Absent` is an explicit absence
+        // and never a zero vector.
+        let mut copresent: Option<BTreeSet<SlotId>> = None;
+        for (slots, _) in &anchored {
+            let present: BTreeSet<SlotId> = slots.keys().copied().collect();
+            copresent = Some(match copresent.take() {
+                Some(current) => current.intersection(&present).copied().collect(),
+                None => present,
+            });
+        }
+        let copresent = copresent.unwrap_or_default();
+
+        // Every declared slot the card will not carry is named with the reason
+        // it cannot be carried. A lens that vanishes from a capability card is
+        // indistinguishable from a lens the card judged worthless, which is the
+        // exact failure #1939 removed from the corpus loader.
+        let mut excluded: Vec<SynapseCalyxExcludedLens> = Vec::new();
+        for (slot, kind) in &corpus.panel_slots {
+            // A slot the loader already declared unusable is reported once,
+            // with the loader's reason. Reporting it again as "not co-present"
+            // would describe the *consequence* of the first exclusion as if it
+            // were a second, independent finding.
+            if copresent.contains(slot) || corpus.unusable_slots.contains_key(slot) {
+                continue;
+            }
+            let carried = anchored
+                .iter()
+                .filter(|(slots, _)| slots.contains_key(slot))
+                .count();
+            excluded.push(SynapseCalyxExcludedLens {
+                slot: slot.get(),
+                name: params.lens_name(slot.get()),
+                reason: format!(
+                    "carried by {carried} of the {} anchored record(s) (kind {kind:?}); a lens \
+                     absent from an anchored record cannot be zero-filled into the panel vector, \
+                     because Absent is an explicit absence and never a zero measurement",
+                    anchored.len()
+                ),
+            });
+        }
+        for (slot, reason) in &corpus.unusable_slots {
+            excluded.push(SynapseCalyxExcludedLens {
+                slot: slot.get(),
+                name: params.lens_name(slot.get()),
+                reason: reason.clone(),
+            });
+        }
+
+        // A lens whose width differs across records cannot form a rectangular
+        // column, and a lens whose every anchored row is the same vector has
+        // zero centered energy — correlation, normalized MI and the logistic
+        // probe are all undefined on it. Both are named, never padded and never
+        // allowed to abort the pass: one degenerate lens must cost its own row,
+        // not the whole card (#1915's discipline, on this path).
+        let mut lenses: Vec<EnsembleLensInput> = Vec::new();
+        for slot in &copresent {
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(anchored.len());
+            let mut widths: BTreeSet<usize> = BTreeSet::new();
+            for (slots, _) in &anchored {
+                if let Some(vector) = slots.get(slot) {
+                    widths.insert(vector.len());
+                    vectors.push(vector.clone());
+                }
+            }
+            if widths.len() != 1 || widths.contains(&0) {
+                excluded.push(SynapseCalyxExcludedLens {
+                    slot: slot.get(),
+                    name: params.lens_name(slot.get()),
+                    reason: format!(
+                        "ragged column: widths {:?} across {} anchored record(s); a capability \
+                         card needs one rectangular column per lens and padding one would \
+                         manufacture measurements the lens never made",
+                        widths.iter().collect::<Vec<_>>(),
+                        vectors.len()
+                    ),
+                });
+                continue;
+            }
+            let energy = centered_energy(&vectors);
+            if !energy.is_finite() || energy <= 0.0 {
+                excluded.push(SynapseCalyxExcludedLens {
+                    slot: slot.get(),
+                    name: params.lens_name(slot.get()),
+                    reason: format!(
+                        "constant column: centered energy {energy} over {} anchored record(s). \
+                         Every row is the same vector, so this lens separates nothing about the \
+                         outcome; linear CKA, normalized MI and the logistic probe are all \
+                         undefined on it. Park or retire the lens",
+                        vectors.len()
+                    ),
+                });
+                continue;
+            }
+            // The redundancy term bins a 1-D sketch of each lens, and a sketch
+            // that collapses to one value has zero entropy. Checked here with
+            // the *same* function the assay uses, so the caller cannot disagree
+            // with the engine about which lenses are measurable, and so one
+            // degenerate lens costs its own row instead of the whole card.
+            let signature = ensemble_nmi_signature(&vectors)
+                .map_err(|error| loom_math_error("sketch the lens for NMI redundancy", &error))?;
+            let distinct = signature
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<BTreeSet<_>>();
+            if distinct.len() < 2 {
+                excluded.push(SynapseCalyxExcludedLens {
+                    slot: slot.get(),
+                    name: params.lens_name(slot.get()),
+                    reason: format!(
+                        "degenerate redundancy sketch: the 1-D NMI signature takes {} distinct \
+                         value(s) over {} anchored record(s), so the pairwise normalized-MI term \
+                         has zero entropy and is undefined. The lens varies too little for the \
+                         binned sketch to separate its rows",
+                        distinct.len(),
+                        vectors.len()
+                    ),
+                });
+                continue;
+            }
+            lenses.push(EnsembleLensInput::new(
+                params.lens_name(slot.get()),
+                *slot,
+                vectors,
+            ));
+        }
+        if lenses.len() < MIN_ENSEMBLE_PANEL_LENSES {
+            let named = excluded
+                .iter()
+                .map(|lens| format!("slot {} ({}): {}", lens.slot, lens.name, lens.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(SynapseCalyxError::new(
+                SYNAPSE_ENSEMBLE_NO_COPRESENT_LENSES,
+                format!(
+                    "panel_version={} has {} measurable lens(es) over the {} anchored record(s); \
+                     a capability card needs at least {MIN_ENSEMBLE_PANEL_LENSES}. Panel declares \
+                     {} slot(s). Excluded: [{named}]",
+                    params.panel_version,
+                    lenses.len(),
+                    anchored.len(),
+                    corpus.panel_slots.len(),
+                ),
+                "backfill the panel so its lenses are co-present on the anchored records, or \
+                 measure a panel version whose records carry the full slot set",
+            ));
+        }
+
+        let labels: Vec<bool> = anchored.iter().map(|(_, label)| *label == 1).collect();
+        let config = EnsembleConfig {
+            source: "synapse-assay-ensemble".to_string(),
+            min_gate_lenses,
+            min_marginal_bits: SYNAPSE_ASSAY_BIT_FLOOR,
+            max_redundancy: SYNAPSE_ASSAY_CORRELATION_CEILING,
+            nmi_bins: SYNAPSE_REDUNDANCY_NMI_BINS,
+        };
+        let measured_slots = lenses
+            .iter()
+            .map(|lens| lens.slot.get())
+            .collect::<Vec<_>>();
+        let card = ensemble_card(&lenses, &labels, None, &config)
+            .map_err(|error| loom_math_error("measure the ensemble capability card", &error))?;
+
+        // Durable evidence that the pass ran, under the subject the Assay store
+        // reserves for it: the panel estimate the card was built from.
+        let mut store = AssayStore::default();
+        store.put(
+            AssayCacheKey::scoped(
+                params.panel_version,
+                ASSAY_CORPUS_SHARD,
+                self.vault_id_value(),
+                anchor_kind,
+            ),
+            AssaySubject::EnsembleCard,
+            MiEstimate::new(
+                card.panel_bits,
+                card.panel_ci[0],
+                card.panel_ci[1],
+                card.n_samples,
+                EstimatorKind::LogisticProbe,
+                TrustTag::Provisional,
+            ),
+            "synapse-assay-ensemble",
+            self.read_snapshot(),
+        );
+        let assay_rows = self.persist_assay_store(&store)?;
+        Ok(SynapseCalyxEnsembleCardReport {
+            card,
+            panel_version: params.panel_version,
+            anchor_kind: params.anchor_kind.clone(),
+            records_scanned: corpus.records_scanned,
+            anchored_records: anchored.len(),
+            declared_slots: corpus.panel_slots.len(),
+            measured_slots,
+            excluded_lenses: excluded,
+            assay_cf_rows: assay_rows,
+        })
+    }
+
     /// Persists an in-memory Assay store to the native Assay CF and returns the
     /// physical Assay CF row count read back afterwards.
     fn persist_assay_store(&self, store: &AssayStore) -> Result<usize, SynapseCalyxError> {
@@ -2579,6 +2880,70 @@ impl SynapseCalyxVault {
         }
         Ok(self.scan_cf_latest(ColumnFamily::Assay)?.len())
     }
+}
+
+/// One ensemble capability-card pass, with every declared lens the card could
+/// not carry named beside the card itself.
+///
+/// The exclusions are part of the result, not a log line: a lens missing from a
+/// capability card is otherwise indistinguishable from a lens the card judged
+/// worthless (#1939's discipline, on this path).
+#[derive(Clone, Debug)]
+pub struct SynapseCalyxEnsembleCardReport {
+    pub card: EnsembleCard,
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    /// Records of this panel version seen by the bounded scan.
+    pub records_scanned: usize,
+    /// Of those, the records carrying the requested anchor — the card's sample.
+    pub anchored_records: usize,
+    /// Slots the corpus declares for this panel.
+    pub declared_slots: usize,
+    /// Slots that entered the card as lenses.
+    pub measured_slots: Vec<u16>,
+    pub excluded_lenses: Vec<SynapseCalyxExcludedLens>,
+    /// Physical Assay CF row count read back after the pass persisted its row.
+    pub assay_cf_rows: usize,
+}
+
+/// A declared lens the capability card could not carry, and why.
+#[derive(Clone, Debug)]
+pub struct SynapseCalyxExcludedLens {
+    pub slot: u16,
+    pub name: String,
+    pub reason: String,
+}
+
+/// Total centered energy `Σ_r ||x_r - mean||²` of a lens column.
+///
+/// Zero means every row is the same vector: the column is constant, and linear
+/// CKA, normalized MI and the logistic probe are all undefined on it. Computed
+/// in `f64` because the sum runs over every row and every dimension.
+fn centered_energy(vectors: &[Vec<f32>]) -> f64 {
+    let Some(width) = vectors.first().map(Vec::len) else {
+        return 0.0;
+    };
+    let rows = vectors.len() as f64;
+    if rows == 0.0 || width == 0 {
+        return 0.0;
+    }
+    let mut mean = vec![0.0f64; width];
+    for vector in vectors {
+        for (accumulator, value) in mean.iter_mut().zip(vector) {
+            *accumulator += f64::from(*value);
+        }
+    }
+    for value in &mut mean {
+        *value /= rows;
+    }
+    let mut energy = 0.0f64;
+    for vector in vectors {
+        for (value, centre) in vector.iter().zip(&mean) {
+            let delta = f64::from(*value) - centre;
+            energy += delta * delta;
+        }
+    }
+    energy
 }
 
 struct GatheredAnchoredSamples {

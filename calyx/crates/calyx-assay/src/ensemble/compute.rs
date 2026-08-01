@@ -6,17 +6,15 @@ use crate::attribution::per_sensor_attribution;
 use crate::estimate::TrustTag;
 use crate::formulas::marginal_value;
 use crate::ksg::MIN_ASSAY_SAMPLES;
-use crate::logistic::{
-    LogisticBlock, logistic_probe_mi_multiseed_blocks,
-    logistic_probe_mi_multiseed_calibrated_blocks,
-};
+use crate::logistic::{LogisticBlock, logistic_probe_mi_multiseed_calibrated_blocks};
 use crate::sufficiency::{PanelSufficiency, entropy_bits, panel_sufficiency_from_estimate};
+use crate::synergy::{CALYX_ASSAY_SYNERGY_CROSS_ESTIMATOR, whole_minus_max_gain};
 
 use super::a37::a37_diversity_gate;
 use super::model::{
     DeficitProposal, ENSEMBLE_CARD_PID_METHOD, ENSEMBLE_CARD_SCHEMA_VERSION, EnsembleCard,
     EnsembleConfig, EnsembleDecision, EnsembleLensInput, EnsembleLensValue, EnsemblePairValue,
-    EnsembleRedundancyEvidence, MIN_ENSEMBLE_PANEL_LENSES, PidBits,
+    EnsembleRedundancyEvidence, EnsembleSynergyEstimators, MIN_ENSEMBLE_PANEL_LENSES, PidBits,
 };
 use super::redundancy::{ensemble_redundancy_from_lenses, validate_evidence};
 
@@ -116,6 +114,10 @@ fn build_card(
         TrustTag::Provisional,
     )?;
     let (keep_count, park_count, retire_count) = decision_counts(&lens_values);
+    let pairs_monotonicity_floored = pairs
+        .iter()
+        .filter(|pair| pair.synergy_monotonicity_floor_applied)
+        .count();
     Ok(EnsembleCard {
         schema_version: ENSEMBLE_CARD_SCHEMA_VERSION,
         source: config.source.clone(),
@@ -135,6 +137,7 @@ fn build_card(
         sufficiency,
         lenses: lens_values,
         pairs,
+        pairs_monotonicity_floored,
         keep_count,
         park_count,
         retire_count,
@@ -305,8 +308,16 @@ fn pair_values(
                 LogisticBlock::new(&lenses[a].name, lenses[a].slot, &lenses[a].vectors),
                 LogisticBlock::new(&lenses[b].name, lenses[b].slot, &lenses[b].vectors),
             ];
-            let pair = logistic_probe_mi_multiseed_blocks(&pair_blocks, labels, groups).map_err(
-                |error| {
+            // The joint term is measured by the *same* wrapper as the two
+            // marginals it is about to be subtracted from (#1942). The
+            // calibrated wrapper is a positive control: it plants a known
+            // signal at this call's own dimension and refuses the estimate when
+            // the probe cannot recover it. The joint sits at the highest
+            // dimension of the three, so it is the term most likely to be
+            // underpowered — and an underpowered joint is exactly what
+            // manufactures a spurious "no synergy" that the floor then hides.
+            let pair = logistic_probe_mi_multiseed_calibrated_blocks(&pair_blocks, labels, groups)
+                .map_err(|error| {
                     assay_context(
                         error,
                         format!(
@@ -314,8 +325,7 @@ fn pair_values(
                             lenses[a].name, lenses[a].slot, lenses[b].name, lenses[b].slot
                         ),
                     )
-                },
-            )?;
+                })?;
             let evidence = redundancy
                 .pairs
                 .iter()
@@ -329,6 +339,32 @@ fn pair_values(
                         lenses[a].slot, lenses[b].slot
                     ))
                 })?;
+            let estimators = EnsembleSynergyEstimators {
+                pair: pair.estimate.estimator,
+                left: solo[a].estimate.estimator,
+                right: solo[b].estimate.estimator,
+            };
+            if !estimators.is_homogeneous() {
+                return Err(CalyxError {
+                    code: CALYX_ASSAY_SYNERGY_CROSS_ESTIMATOR,
+                    message: format!(
+                        "ensemble pair {} slot {} + {} slot {} would subtract estimates produced by different instruments: pair={:?} left={:?} right={:?}",
+                        lenses[a].name,
+                        lenses[a].slot,
+                        lenses[b].name,
+                        lenses[b].slot,
+                        estimators.pair,
+                        estimators.left,
+                        estimators.right
+                    ),
+                    remediation: "measure the joint and both marginals with one estimator over one paired sample set before differencing them",
+                });
+            }
+            let (gain_bits, raw_gain_bits, monotonicity_floor_applied) = whole_minus_max_gain(
+                pair.estimate.bits,
+                solo[a].estimate.bits,
+                solo[b].estimate.bits,
+            )?;
             pairs.push(EnsemblePairValue {
                 a: lenses[a].name.clone(),
                 b: lenses[b].name.clone(),
@@ -339,9 +375,10 @@ fn pair_values(
                 redundancy: Some(evidence.linear_cka.clone()),
                 pair_bits: pair.estimate.bits,
                 pair_ci: [pair.estimate.ci_low, pair.estimate.ci_high],
-                synergy_gain_bits: (pair.estimate.bits
-                    - solo[a].estimate.bits.max(solo[b].estimate.bits))
-                .max(0.0),
+                synergy_gain_bits: gain_bits,
+                raw_synergy_gain_bits: raw_gain_bits,
+                synergy_monotonicity_floor_applied: monotonicity_floor_applied,
+                synergy_estimators: estimators,
             });
         }
     }
