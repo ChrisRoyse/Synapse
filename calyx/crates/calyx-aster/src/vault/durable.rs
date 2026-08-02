@@ -267,6 +267,43 @@ impl DurableVault {
         Ok(durable)
     }
 
+    /// Builds the fail-closed error for a latest-only open of a vault that has
+    /// never published a manifest (issue #1957).
+    ///
+    /// The WAL-only recovery branch has no `CURRENT`, so no published SST set
+    /// vouches for the CF router covering the corpus, and every recovered row
+    /// has to be materialised into the MVCC row table by full WAL replay. That
+    /// is precisely the memory profile `restore_mvcc_rows: false` exists to
+    /// avoid. Answering the open as though the request had been honoured — the
+    /// behaviour before this error existed — left the caller reading through a
+    /// different code path than it believed, with the only tell a value nobody
+    /// had reason to read.
+    fn latest_readback_requires_manifest_error(
+        root: &Path,
+        batch_count: usize,
+        row_count: usize,
+    ) -> CalyxError {
+        tracing::error!(
+            code = "CALYX_ASTER_LATEST_READBACK_REQUIRES_MANIFEST",
+            vault_dir = %root.display(),
+            batch_count,
+            row_count,
+            requested_router_latest_readback = true,
+            "refused a latest-only open of a vault with no published manifest"
+        );
+        CalyxError {
+            code: "CALYX_ASTER_LATEST_READBACK_REQUIRES_MANIFEST",
+            message: format!(
+                "restore_mvcc_rows=false asks for a CF-router-backed latest handle, but {} has no \
+                 published CURRENT manifest, so {row_count} row(s) across {batch_count} batch(es) \
+                 can only be recovered by full WAL replay into the MVCC row table — the opposite \
+                 of what was requested",
+                root.display()
+            ),
+            remediation: "publish a manifest first (AsterVault::checkpoint, or the CLI `compact` command) and reopen, or open with restore_mvcc_rows=true if the MVCC row table is wanted",
+        }
+    }
+
     pub(super) fn recover_batches(
         root: impl AsRef<Path>,
         options: &VaultOptions,
@@ -302,6 +339,13 @@ impl DurableVault {
                     durable_seq = recovery.manifest.durable_seq,
                     last_recovered_seq = recovery.last_recovered_seq,
                     active_panel_version,
+                    // Issue #1957 ask 2: every recovery branch reports the mode
+                    // that was asked for beside the mode it is granting, so a
+                    // divergence is visible in the log rather than only through
+                    // an API readback.
+                    router_latest_readback = true,
+                    requested_router_latest_readback = true,
+                    restore_mvcc_rows = options.restore_mvcc_rows,
                     torn_tail = ?recovery.torn_tail,
                     "planned bounded WAL-tail streaming recovery"
                 );
@@ -381,6 +425,8 @@ impl DurableVault {
                 last_recovered_seq = recovery.last_recovered_seq,
                 wal_replay_floor_seq = recovery.manifest.durable_seq,
                 router_latest_readback,
+                requested_router_latest_readback = !options.restore_mvcc_rows,
+                restore_mvcc_rows = options.restore_mvcc_rows,
                 migrate_derived_content_model,
                 panel_content_watermark_count = recovery.manifest.panel_content_seqs.len(),
                 active_panel_version,
@@ -425,6 +471,27 @@ impl DurableVault {
             .iter()
             .map(|batch: &RecoveredBatch| batch.rows.len())
             .sum::<usize>();
+        // Issue #1957: this branch has no `CURRENT`, so nothing vouches for the
+        // router covering the corpus and every recovered row had to be
+        // materialised into the MVCC row table by full WAL replay. A caller
+        // that asked for `restore_mvcc_rows: false` asked for the opposite of
+        // what just happened. Serving the request is not available here — the
+        // router's coverage is unproven without a manifest — so the request
+        // fails closed rather than being answered as though it was honoured.
+        // A vault with nothing to replay is the one case where the request is
+        // trivially satisfiable: no rows were materialised, so the mode the
+        // handle reports back is the mode it is in.
+        let router_latest_readback = if options.restore_mvcc_rows {
+            false
+        } else if recovered_row_count == 0 {
+            true
+        } else {
+            return Err(Self::latest_readback_requires_manifest_error(
+                root,
+                batches.len(),
+                recovered_row_count,
+            ));
+        };
         tracing::info!(
             code = "CALYX_ASTER_RECOVERY_DONE",
             vault_dir = %root.display(),
@@ -432,7 +499,9 @@ impl DurableVault {
             row_count = recovered_row_count,
             last_recovered_seq,
             wal_replay_floor_seq = 0_u64,
-            router_latest_readback = false,
+            router_latest_readback,
+            requested_router_latest_readback = !options.restore_mvcc_rows,
+            restore_mvcc_rows = options.restore_mvcc_rows,
             migrate_derived_content_model = false,
             torn_tail = ?replay.torn_tail,
             "completed Calyx Aster WAL-only recovery planning"
@@ -449,7 +518,7 @@ impl DurableVault {
             temporal_policy: options.temporal_policy,
             dedup_policy: options.dedup_policy.clone(),
             retention_horizon: options.retention_horizon.clone(),
-            router_latest_readback: false,
+            router_latest_readback,
             wal_tail_stream_floor: None,
         })
     }
