@@ -240,6 +240,36 @@ where
         &self,
         range: Option<Range<u64>>,
     ) -> Result<AsterLedgerChainVerification> {
+        // Fail closed rather than verify nothing (#1956).
+        //
+        // `open.rs` sets `durable: None` for a read-only handle, and
+        // `head_anchor` returns `None` when durable is None. Without this
+        // guard the head height is 0, the verified range is `0..0`, and this
+        // returns `Intact { count: 0 }` -- a pass over an empty chain, on a
+        // vault that may hold any number of entries. Measured: the same vault
+        // reported `Intact { count: 0 }` read-only and
+        // `Intact { count: 125735 }` writable.
+        //
+        // A read-only handle is exactly what one reaches for to verify a
+        // restored backup or a vault one does not trust, so that is the single
+        // case where a false "intact" costs the most, and it was the only case
+        // where it fired.
+        //
+        // `AsterVault` does not retain the vault root when `durable` is None,
+        // so this cannot be answered by reading the head projection directly;
+        // refusing is the honest outcome. Callers that need offline chain
+        // verification should use `verify_restore`, which scans the vault path
+        // itself and derives its head from the ledger rows present.
+        if self.durable.is_none() {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_LEDGER_VERIFY_UNAVAILABLE",
+                message: format!(
+                    "ledger chain verification needs a durable handle; this vault was opened read_only={} and cannot read its head anchor, so any verdict would cover zero entries",
+                    self.read_only
+                ),
+                remediation: "verify through a write-capable handle, or use verify_restore, which reads the vault directory directly and needs no durable handle",
+            });
+        }
         let store = AsterRawLedgerStore { vault: self };
         let head = store.head_anchor()?;
         let head_height = head.as_ref().map_or(0, |anchor| anchor.height);

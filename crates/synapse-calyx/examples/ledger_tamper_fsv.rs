@@ -149,6 +149,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     let salt = std::fs::read(dir.parent().ok_or("no parent")?.join("machine-salt.bin"))?;
 
     println!("ledger_tamper_fsv  (#1679 acceptance clause 2)");
+
+    // --- 0. the read-only handle must REFUSE, not pass vacuously (#1956) ----
+    // Before the fix this returned `Intact { count: 0 }` on a vault holding
+    // 125,735 chain entries. A verification primitive that reports success
+    // having checked nothing is worse than one that errors, and a read-only
+    // handle is precisely what an operator uses to check a restored backup.
+    {
+        let options = VaultOptions {
+            read_only: true,
+            restore_mvcc_rows: false,
+            restore_ledger_hook: false,
+            ..VaultOptions::default()
+        };
+        match AsterVault::open(&dir, vault_id, salt.clone(), options)
+            .and_then(|vault| vault.verify_ledger_chain(None))
+        {
+            Ok(verification) => {
+                println!(
+                    "  read-only verify returned Ok({:?}) head_height={}  <-- FAIL-OPEN",
+                    verification.result, verification.head_height
+                );
+                return Err(
+                    "read-only handle reported a chain verdict instead of refusing (#1956)".into(),
+                );
+            }
+            Err(error) if error.code == "CALYX_ASTER_LEDGER_VERIFY_UNAVAILABLE" => {
+                println!(
+                    "
+=== 0. read-only handle refuses (#1956) ==="
+                );
+                println!("  Err[{}] as required", error.code);
+            }
+            Err(error) => {
+                println!("  read-only verify failed for another reason: {error}");
+                return Err("read-only refusal did not carry the expected code".into());
+            }
+        }
+    }
     println!("vault copy = {}", dir.display());
     println!("vault_id   = {vault_id_hex}");
 
