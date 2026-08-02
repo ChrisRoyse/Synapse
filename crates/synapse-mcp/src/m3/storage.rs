@@ -1423,7 +1423,29 @@ pub struct StorageIntelligenceSufficiencyReport {
     pub domain_provisional: bool,
     pub domain_grounded_fraction: f32,
     pub deficits: Vec<StorageIntelligenceSufficiencyDeficit>,
+    /// Lenses that ARE the anchor rather than evidence about it (#1953).
+    ///
+    /// Non-empty forces `sufficient=false`, so without this field the caller
+    /// sees a refusal with `deficits: []` and `deficit_bits: 0` and no reason
+    /// at all -- "insufficient by nothing", precisely the self-contradicting
+    /// state #1945 was filed over. The verdict and its cause must cross the
+    /// facade together.
+    pub anchor_leakage: Vec<StorageIntelligenceAnchorLeakage>,
     pub assay_cf_rows_after: u64,
+}
+
+/// One lens whose measured bits equal the anchor's own entropy at the anchor's
+/// cardinality -- the signature of a lens that encodes the label itself.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceAnchorLeakage {
+    pub slot: u32,
+    pub lens_bits: f32,
+    pub anchor_entropy_bits: f32,
+    /// The resolution at which those two were judged equal.
+    pub resolution_bits: f32,
+    pub lens_distinct_values: u64,
+    pub anchor_distinct_outcomes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -3029,6 +3051,18 @@ pub fn run_intelligence_sufficiency(
                 deficit_bits: deficit.deficit_bits,
                 suggested_action: deficit.suggested_action,
                 reason: deficit.reason,
+            })
+            .collect(),
+        anchor_leakage: report
+            .anchor_leakage
+            .into_iter()
+            .map(|leak| StorageIntelligenceAnchorLeakage {
+                slot: u32::from(leak.slot),
+                lens_bits: leak.lens_bits,
+                anchor_entropy_bits: leak.anchor_entropy_bits,
+                resolution_bits: leak.resolution_bits,
+                lens_distinct_values: leak.lens_distinct_values as u64,
+                anchor_distinct_outcomes: leak.anchor_distinct_outcomes as u64,
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
