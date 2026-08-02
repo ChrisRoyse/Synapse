@@ -103,7 +103,7 @@ where
         plan_cross_terms_checked(&slots, |a, b| {
             let combined = combine_samples(&samples.slots[&a], &samples.slots[&b]);
             let pair = self.assay.lens_signal(&combined, &samples.labels)?.estimate;
-            Ok(pair_gain_from_estimates(&solo[&a], &solo[&b], &pair).gain_bits)
+            Ok(pair_gain_from_estimates(&solo[&a], &solo[&b], &pair)?.gain_bits)
         })
     }
 
