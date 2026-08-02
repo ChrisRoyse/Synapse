@@ -52,4 +52,15 @@ where
     pub fn flush_all_cfs(&self) -> Result<Vec<SstSummary>> {
         self.rows.flush_all_cfs()
     }
+
+    /// Reports whether this handle serves latest reads from the CF router
+    /// (`restore_mvcc_rows: false`) rather than the in-memory MVCC row table.
+    ///
+    /// See [`VersionedCfStore::router_latest_readback`] — this exists so a
+    /// caller that intends to exercise the router-backed read branch can prove
+    /// it reached it instead of assuming the open mode it asked for is the mode
+    /// it got (#1954).
+    pub fn router_latest_readback(&self) -> bool {
+        self.rows.router_latest_readback()
+    }
 }

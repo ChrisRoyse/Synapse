@@ -103,10 +103,25 @@ where
                                 .take(8)
                                 .map(|byte| format!("{byte:02x}"))
                                 .collect::<String>();
+                            // See the sibling message in
+                            // `mvcc::store::read::scan_cf_range_page_at`: the
+                            // renewing scan re-checks `ensure_latest()` around
+                            // every page, so a changed sequence is reported as
+                            // `stale_derived` and never reaches here. Arriving
+                            // here means the key view and the value view
+                            // disagree at one unchanged sequence, which is a
+                            // deterministic disagreement rather than something
+                            // "disappearing" mid-scan (#1954).
                             E::from(calyx_core::CalyxError::aster_corrupt_shard(format!(
-                                "visible {} key {} disappeared during renewing latest scan",
+                                "{} key {} was selected as visible at unchanged latest seq \
+                                 {snapshot} by the key view (scan_cf_range_keys_at) but the \
+                                 value view (read_batch) resolved no live value at that same \
+                                 sequence; the two latest views disagree about this key's \
+                                 visibility, which is deterministic and not a concurrent \
+                                 mutation — the sequence was re-verified unchanged around \
+                                 this page",
                                 cf.name(),
-                                key_prefix
+                                key_prefix,
                             )))
                         })
                     })

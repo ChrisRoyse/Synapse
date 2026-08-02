@@ -411,10 +411,25 @@ impl VersionedCfStore {
                 .zip(values)
                 .map(|(key, value)| {
                     value.map(|value| (key.clone(), value)).ok_or_else(|| {
+                        // Deliberately does NOT say the key "disappeared". Both
+                        // halves of this read run at one pinned sequence, so
+                        // nothing can vanish between them; the only way to be
+                        // here is that the key-selection view and the
+                        // value-resolution view disagree about visibility at
+                        // that same sequence. Naming a race sent an
+                        // investigation at a deterministic condition after the
+                        // wrong thing (#1954), so the message states the
+                        // disagreement and names both views instead.
                         calyx_core::CalyxError::aster_corrupt_shard(format!(
-                            "visible {} key {} disappeared during pinned page read",
+                            "{} key {} was selected as visible at pinned seq {} by the \
+                             key view (router range keys + MVCC table overlay) but the \
+                             value view (read_batch) resolved no live value at that same \
+                             sequence; the two latest views disagree about this key's \
+                             visibility, which is deterministic at a pinned sequence and \
+                             not a concurrent mutation",
                             cf.name(),
-                            hex_prefix(&key)
+                            hex_prefix(&key),
+                            snapshot.seq()
                         ))
                     })
                 })
@@ -676,9 +691,25 @@ fn latest_rows_from_view(
 ///
 /// It does **not** avoid reading values: tombstone status is only knowable from
 /// the value, so `router.iter_cf` still produces them. The honest description of
-/// the win is "two fewer copies of every value", not "fewer bytes read". A
-/// keys-only router path would be needed for the latter, and would be wrong
-/// here — see #1954, where `range_keys_until` cannot see a flushed tombstone.
+/// the win is "two fewer copies of every value", not "fewer bytes read".
+///
+/// A keys-only router path would be needed for the latter. #1954 asserted such a
+/// path would also be *wrong*, because `range_keys_until` supposedly could not
+/// see a flushed tombstone. **That is false and was corrected by measurement**:
+/// `SstLevel::range_keys_until` carries `is_tombstone` per key and filters
+/// tombstoned keys out before returning, so the `rows.insert(key, false)` in
+/// `CfRouter::range_keys_until` only ever receives keys already known live. The
+/// original reading stopped at the router and did not follow into the level.
+///
+/// `examples/router_latest_tombstone_fsv.rs` proves this on a handle whose
+/// `router_latest_readback` is read back as `true`, across all four merge
+/// states (flushed tombstone, memtable-resident tombstone, resurrection,
+/// tombstone for a never-written key): the key view and the value view agree,
+/// and agree on the independently-known correct answer.
+///
+/// So the reason to keep counting from values is the honest one — it is the
+/// same view `scan_cf_latest` uses, and these counts are evidence that a write
+/// landed — not a tombstone defect in the keys path.
 fn latest_row_count_from_view(
     seq: Seq,
     table: &RowTable,

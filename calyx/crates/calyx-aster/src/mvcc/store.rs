@@ -513,6 +513,21 @@ impl VersionedCfStore {
         Self::new_with_router_and_policy(start_seq, router, true, false)
     }
 
+    /// Reports whether this store serves latest reads from the CF router
+    /// instead of the in-memory MVCC row table.
+    ///
+    /// The mode is chosen once at open from `restore_mvcc_rows` and then
+    /// silently changes which code path several read entry points take
+    /// (`read_latest`, `scan_cf_range_page_at`, `predecessor_cf_at`). A harness
+    /// that means to exercise the router-backed branch previously had no way to
+    /// confirm it did, so a run that quietly took the row-table branch instead
+    /// looked exactly like a passing test of the branch it never reached
+    /// (#1954). Making the mode readable is what lets such a harness fail
+    /// closed rather than report a vacuous pass.
+    pub fn router_latest_readback(&self) -> bool {
+        self.router_latest_readback.load(Ordering::Acquire)
+    }
+
     /// Retires already-proven compaction input SSTs from the served CF levels
     /// and only then deletes them physically.
     ///
