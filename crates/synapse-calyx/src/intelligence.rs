@@ -2733,6 +2733,19 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxAssayParams,
         min_gate_lenses: usize,
     ) -> Result<SynapseCalyxEnsembleCardReport, SynapseCalyxError> {
+        // #1959 ask 2 / #1958: the card's headline is a PANEL-level claim —
+        // `sufficient`, `panel_bits`, and a keep/park/retire count — with no
+        // per-slot breakdown a reader could inspect for a carrier. That is the
+        // same shape as `sufficiency`, and it gets the same structural refusal.
+        // Taken before the corpus scan so a circular configuration costs nothing.
+        let source_provenance = lens_provenance::syn_anchor_source_provenance(
+            &params.anchor_kind,
+            params.panel_version,
+            &params.excluded_slots,
+        );
+        if !source_provenance.carriers.is_empty() {
+            return Err(anchor_source_leakage_error(params, &source_provenance));
+        }
         let max_records = params.max_records.clamp(1, SYNAPSE_ENSEMBLE_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
@@ -2792,7 +2805,16 @@ impl SynapseCalyxVault {
                 None => present,
             });
         }
-        let copresent = copresent.unwrap_or_default();
+        // `excluded_slots` is honoured here, not only by the corpus loader.
+        //
+        // Found by `ensemble_card_facade_fsv`: this path ignored the parameter
+        // entirely, so withheld slots still entered the card. That is worse than
+        // a missing feature — `excluded_slots` is the documented remediation for
+        // the structural anchor-leakage refusal above, so a caller could lift the
+        // refusal and still be measuring the label. The refusal and the way to
+        // satisfy it have to act on the same set.
+        let mut copresent = copresent.unwrap_or_default();
+        copresent.retain(|slot| !params.excluded_slots.contains(&slot.get()));
 
         // Every declared slot the card will not carry is named with the reason
         // it cannot be carried. A lens that vanishes from a capability card is
@@ -2805,6 +2827,18 @@ impl SynapseCalyxVault {
             // would describe the *consequence* of the first exclusion as if it
             // were a second, independent finding.
             if copresent.contains(slot) || corpus.unusable_slots.contains_key(slot) {
+                continue;
+            }
+            // A slot the caller withheld says so in its own words. Describing it
+            // as "not co-present" would attribute a caller's decision to the
+            // corpus, and a withheld label carrier is the one exclusion a reader
+            // most needs to see stated.
+            if params.excluded_slots.contains(&slot.get()) {
+                excluded.push(SynapseCalyxExcludedLens {
+                    slot: slot.get(),
+                    name: params.lens_name(slot.get()),
+                    reason: "withheld by excluded_slots on this request".to_owned(),
+                });
                 continue;
             }
             let carried = anchored
@@ -2976,6 +3010,7 @@ impl SynapseCalyxVault {
             declared_slots: corpus.panel_slots.len(),
             measured_slots,
             excluded_lenses: excluded,
+            anchor_source_declared: source_provenance.anchor_declared,
             assay_cf_rows: assay_rows,
         })
     }
@@ -3012,6 +3047,13 @@ pub struct SynapseCalyxEnsembleCardReport {
     /// Slots that entered the card as lenses.
     pub measured_slots: Vec<u16>,
     pub excluded_lenses: Vec<SynapseCalyxExcludedLens>,
+    /// Whether this (anchor kind, panel version) pair declares which record
+    /// fields determine the anchor, so the structural leakage check could run
+    /// (#1958).
+    ///
+    /// A card can only reach a caller when no carrier was found, so `false`
+    /// means the check did not run rather than that it ran and found nothing.
+    pub anchor_source_declared: bool,
     /// Physical Assay CF row count read back after the pass persisted its row.
     pub assay_cf_rows: usize,
 }

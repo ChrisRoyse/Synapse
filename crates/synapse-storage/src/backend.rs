@@ -24,13 +24,14 @@ use synapse_calyx::{
     SynapseCalyxBackupReport, SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams,
     SynapseCalyxBlindSpotReport, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
     SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
-    SynapseCalyxDriftReport, SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxFindParams,
-    SynapseCalyxFindReport, SynapseCalyxGroundedObservationReadback,
-    SynapseCalyxGroundingGapReport, SynapseCalyxGuardCalibrateParams,
-    SynapseCalyxGuardCalibrateReport, SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport,
-    SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport,
-    SynapseCalyxKernelParams, SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport,
-    SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
+    SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxErasureReport,
+    SynapseCalyxError, SynapseCalyxFindParams, SynapseCalyxFindReport,
+    SynapseCalyxGroundedObservationReadback, SynapseCalyxGroundingGapReport,
+    SynapseCalyxGuardCalibrateParams, SynapseCalyxGuardCalibrateReport,
+    SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport, SynapseCalyxHazardReport,
+    SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport, SynapseCalyxKernelParams,
+    SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport, SynapseCalyxKernelReport,
+    SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
     SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
@@ -800,6 +801,14 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: &SynapseCalyxAssayParams,
     ) -> StorageResult<SynapseCalyxSufficiencyReport>;
+    /// Runs the ensemble capability card: per-lens marginal value, the PID
+    /// triple, the A37 associational-diversity gate and a keep/park/retire
+    /// verdict per lens (#1668 admission gate, wired for #1944 ask 1).
+    fn assay_ensemble_card_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> StorageResult<SynapseCalyxEnsembleCardReport>;
     fn assay_redundancy_intelligence(
         &self,
         params: &SynapseCalyxAssayParams,
@@ -2966,6 +2975,29 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn assay_ensemble_card_intelligence(
+        &self,
+        params: &SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> StorageResult<SynapseCalyxEnsembleCardReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure the native Calyx ensemble capability card",
+            true,
+            |vault| {
+                vault
+                    .assay_ensemble_card(params, min_gate_lenses)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_assay",
+                            "measure the native Calyx ensemble capability card",
+                            &source,
+                        )
+                    })
             },
         )
     }

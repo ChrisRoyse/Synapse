@@ -1069,6 +1069,10 @@ pub enum StorageIntelligenceOperation {
     Hazard,
     Kernel,
     KernelAnswer,
+    /// The ensemble capability card: per-lens marginal value, the PID triple,
+    /// the A37 associational-diversity gate, and a keep/park/retire verdict
+    /// (#1668's admission gate; wired for #1944 ask 1).
+    EnsembleCard,
 }
 
 impl StorageIntelligenceOperation {
@@ -1087,6 +1091,7 @@ impl StorageIntelligenceOperation {
             Self::Hazard => "hazard",
             Self::Kernel => "kernel",
             Self::KernelAnswer => "kernel_answer",
+            Self::EnsembleCard => "ensemble_card",
         }
     }
 
@@ -1126,6 +1131,12 @@ pub struct StorageIntelligenceParams {
     /// inverted window fails closed rather than returning zero records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ts_ns: Option<i64>,
+    /// Minimum lenses the A37 associational-diversity gate needs before it can
+    /// return a verdict (`ensemble_card` only). Below this the card reports the
+    /// gate as not evaluated rather than guessing from too few lenses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 2, max = 64))]
+    pub min_gate_lenses: Option<u32>,
     /// Grounded outcome anchor kind to measure bits about (bits/sufficiency).
     /// Synapse writes outcome anchors as a label string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1845,6 +1856,9 @@ pub struct StorageIntelligenceResponse {
     pub kernel: Option<StorageIntelligenceKernelReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_answer: Option<StorageIntelligenceKernelAnswerReport>,
+    /// Populated by `operation=ensemble_card`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble_card: Option<StorageIntelligenceEnsembleCardReport>,
 }
 
 #[must_use]
@@ -3078,6 +3092,150 @@ pub fn run_intelligence_sufficiency(
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
     })
 }
+
+/// One lens's row on the ensemble capability card.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceEnsembleLens {
+    pub slot: u32,
+    pub name: String,
+    /// Bits this lens carries about the anchor on its own.
+    pub solo_bits: f32,
+    /// Bits the panel loses if this lens is removed -- the lens's actual value.
+    pub marginal_bits: f32,
+    /// Highest correlation with any other lens on the panel.
+    pub max_pairwise_corr: f32,
+    /// Highest normalized MI with any other lens on the panel.
+    pub max_pairwise_nmi: f32,
+    /// `keep` / `park` / `retire`.
+    pub decision: String,
+    /// Why the gate decided that, in its own words.
+    pub decision_reason: String,
+}
+
+/// A declared lens the card could not carry, and why.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceExcludedLens {
+    pub slot: u32,
+    pub name: String,
+    pub reason: String,
+}
+
+/// The ensemble capability card for one (panel, anchor) pair.
+///
+/// ## What its numbers are, and are not
+///
+/// The card's per-lens bits come from a **binary logistic decision surrogate**,
+/// not from the KSG mutual-information estimator that `bits` and `sufficiency`
+/// use. They answer "how much does this lens move a decision about the outcome",
+/// which is the question an admission gate needs, and they are not comparable
+/// digit-for-digit with a `bits` report over the same panel. Reported here
+/// rather than left to be rediscovered.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceEnsembleCardReport {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    pub anchor_kind: String,
+    /// Records of this panel version seen by the bounded scan.
+    pub records_scanned: u64,
+    /// Of those, the ones carrying the requested anchor -- the card's sample.
+    pub anchored_records: u64,
+    /// Slots the corpus declares for this panel.
+    pub declared_slots: u64,
+    /// Slots that entered the card as lenses.
+    pub measured_slots: Vec<u32>,
+    pub anchor_entropy_bits: f32,
+    pub panel_bits: f32,
+    /// Non-redundant lens count implied by the panel's total correlation.
+    pub n_eff: f32,
+    pub sufficient: bool,
+    pub deficit_bits: f32,
+    pub keep_count: u64,
+    pub park_count: u64,
+    pub retire_count: u64,
+    /// Pairs whose raw gain was negative and were floored at zero (#1942). A
+    /// non-zero count is a statement about the instrument, not the panel.
+    pub pairs_monotonicity_floored: u64,
+    /// Whether the structural anchor-leakage check (#1958) could run for this
+    /// (anchor, panel) pair. `false` means it did not run, which is not the
+    /// same as running and finding nothing.
+    pub anchor_source_declared: bool,
+    pub lenses: Vec<StorageIntelligenceEnsembleLens>,
+    pub excluded_lenses: Vec<StorageIntelligenceExcludedLens>,
+    /// Physical Assay CF row count read back after the pass persisted its row.
+    pub assay_cf_rows: u64,
+}
+
+/// Runs the ensemble capability card and persists its Assay row.
+///
+/// # Errors
+///
+/// Propagates the vault's structured error, including the #1958 structural
+/// anchor-leakage refusal when a lens on the panel reads a field that
+/// determines the anchor.
+pub fn run_intelligence_ensemble_card(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceEnsembleCardReport, ErrorData> {
+    let min_gate_lenses = params.min_gate_lenses.unwrap_or(DEFAULT_MIN_GATE_LENSES) as usize;
+    let report = db
+        .assay_ensemble_card_intelligence(&assay_params(params)?, min_gate_lenses)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageIntelligenceEnsembleCardReport {
+        source_of_truth: "Calyx Assay CF rows",
+        panel_version: report.panel_version,
+        anchor_kind: report.anchor_kind,
+        records_scanned: report.records_scanned as u64,
+        anchored_records: report.anchored_records as u64,
+        declared_slots: report.declared_slots as u64,
+        measured_slots: report.measured_slots.into_iter().map(u32::from).collect(),
+        anchor_entropy_bits: report.card.anchor_entropy_bits,
+        panel_bits: report.card.panel_bits,
+        n_eff: report.card.n_eff,
+        sufficient: report.card.sufficient,
+        deficit_bits: report.card.deficit_bits,
+        keep_count: report.card.keep_count as u64,
+        park_count: report.card.park_count as u64,
+        retire_count: report.card.retire_count as u64,
+        pairs_monotonicity_floored: report.card.pairs_monotonicity_floored as u64,
+        anchor_source_declared: report.anchor_source_declared,
+        lenses: report
+            .card
+            .lenses
+            .into_iter()
+            .map(|lens| StorageIntelligenceEnsembleLens {
+                slot: u32::from(lens.slot.get()),
+                name: lens.name,
+                solo_bits: lens.solo_bits,
+                marginal_bits: lens.marginal_bits,
+                max_pairwise_corr: lens.max_pairwise_corr,
+                max_pairwise_nmi: lens.max_pairwise_nmi,
+                decision: format!("{:?}", lens.decision).to_lowercase(),
+                decision_reason: lens.decision_reason,
+            })
+            .collect(),
+        excluded_lenses: report
+            .excluded_lenses
+            .into_iter()
+            .map(|lens| StorageIntelligenceExcludedLens {
+                slot: u32::from(lens.slot),
+                name: lens.name,
+                reason: lens.reason,
+            })
+            .collect(),
+        assay_cf_rows: report.assay_cf_rows as u64,
+    })
+}
+
+/// Default for `min_gate_lenses`.
+///
+/// The A37 gate compares each lens against its pairwise neighbours, so below a
+/// handful of lenses the "most correlated other lens" is barely a sample. Six
+/// is what `ensemble_card_known_synergy_fsv` exercises and what the twelve-slot
+/// built-in panels comfortably clear.
+const DEFAULT_MIN_GATE_LENSES: u32 = 6;
 
 /// Measures pairwise lens redundancy + effective rank and persists redundant
 /// Assay pairs.

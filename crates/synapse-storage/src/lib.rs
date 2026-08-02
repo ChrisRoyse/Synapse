@@ -1290,6 +1290,25 @@ impl Db {
         self.backend.assay_synergy_intelligence(params)
     }
 
+    /// Runs the ensemble capability card over a panel: per-lens marginal value,
+    /// the PID triple, the A37 associational-diversity gate, and a
+    /// keep/park/retire verdict per lens (#1668's admission gate).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when no record carries the requested
+    /// anchor, the corpus cannot be read, or the Assay write/readback fails —
+    /// and the #1958 structural anchor-leakage refusal when a lens on the panel
+    /// reads a record field that determines the anchor.
+    pub fn assay_ensemble_card_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxAssayParams,
+        min_gate_lenses: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxEnsembleCardReport> {
+        self.backend
+            .assay_ensemble_card_intelligence(params, min_gate_lenses)
+    }
+
     /// Measures directed transfer entropy (KSG, lag sweep) between two activity
     /// streams over a panel and persists the dominant directed edge to the native
     /// Graph CF.

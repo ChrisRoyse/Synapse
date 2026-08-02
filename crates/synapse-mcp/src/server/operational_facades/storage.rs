@@ -862,6 +862,7 @@ pub(super) async fn handle(
                     hazard: None,
                     kernel: None,
                     kernel_answer: None,
+                    ensemble_card: None,
                 };
                 match sub_operation {
                     StorageIntelligenceOperation::Weave => {
@@ -956,6 +957,14 @@ pub(super) async fn handle(
                         crate::m3::storage::run_intelligence_kernel_answer(&db, &spec).map(
                             |kernel_answer| StorageIntelligenceResponse {
                                 kernel_answer: Some(kernel_answer),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::EnsembleCard => {
+                        crate::m3::storage::run_intelligence_ensemble_card(&db, &spec).map(
+                            |ensemble_card| StorageIntelligenceResponse {
+                                ensemble_card: Some(ensemble_card),
                                 ..base
                             },
                         )
