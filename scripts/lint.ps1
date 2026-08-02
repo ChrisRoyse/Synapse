@@ -131,7 +131,7 @@ function Get-SharedContract {
     return $lines[($begin + 1)..($end - 1)]
 }
 
-Write-Gate 'Gate 1/6  shared clippy.toml contract agreement (#1928)'
+Write-Gate 'Gate 1/7  shared clippy.toml contract agreement (#1928)'
 $rootClippy = Join-Path $RepoRoot 'clippy.toml'
 $calyxClippy = Join-Path $CalyxRoot 'clippy.toml'
 try {
@@ -179,7 +179,7 @@ function Get-ToolchainChannel {
     return $match.Matches[0].Groups[1].Value
 }
 
-Write-Gate 'Gate 2/6  rust-toolchain pin agreement (#1928)'
+Write-Gate 'Gate 2/7  rust-toolchain pin agreement (#1928)'
 try {
     $rootChannel = Get-ToolchainChannel -Path (Join-Path $RepoRoot 'rust-toolchain.toml')
     $calyxChannel = Get-ToolchainChannel -Path (Join-Path $CalyxRoot 'rust-toolchain.toml')
@@ -280,7 +280,7 @@ else {
 # Gate 3 — the two lock graphs must agree (#1929)
 # ---------------------------------------------------------------------------
 
-Write-Gate 'Gate 3/6  Cargo.lock graph agreement, root vs calyx (#1929)'
+Write-Gate 'Gate 3/7  Cargo.lock graph agreement, root vs calyx (#1929)'
 $lockScript = Join-Path $PSScriptRoot 'calyx-lock.ps1'
 if (-not (Test-Path -LiteralPath $lockScript)) {
     Add-Failure 'SYNAPSE_LINT_LOCK_GATE_MISSING' `
@@ -332,7 +332,7 @@ function Invoke-CargoGate {
 
 $fmtArgs = if ($Fix) { @('fmt', '--all') } else { @('fmt', '--all', '--check') }
 
-Write-Gate 'Gate 4/6  cargo fmt, both workspaces'
+Write-Gate 'Gate 4/7  cargo fmt, both workspaces'
 [void](Invoke-CargoGate -WorkspaceLabel 'root' -WorkingDirectory $RepoRoot -CargoArgs $fmtArgs `
         -Code 'SYNAPSE_LINT_FMT_ROOT_FAILED' -Remediation 'run scripts/lint.ps1 -Fix, then review the diff')
 [void](Invoke-CargoGate -WorkspaceLabel 'calyx' -WorkingDirectory $CalyxRoot -CargoArgs $fmtArgs `
@@ -355,7 +355,7 @@ Write-Gate 'Gate 4/6  cargo fmt, both workspaces'
 
 $DenyMinVersion = [version]'0.20.2'
 
-Write-Gate 'Gate 5/6  cargo deny check, both workspaces (#1930)'
+Write-Gate 'Gate 5/7  cargo deny check, both workspaces (#1930)'
 $denyCmd = Get-Command 'cargo-deny' -ErrorAction SilentlyContinue
 if ($null -eq $denyCmd) {
     Add-Failure 'SYNAPSE_LINT_CARGO_DENY_ABSENT' `
@@ -397,7 +397,7 @@ else {
 }
 
 if (-not $SkipClippy) {
-    Write-Gate 'Gate 6/6  cargo clippy, both workspaces'
+    Write-Gate 'Gate 6/7  cargo clippy, both workspaces'
     $clippyArgs = @('clippy', '--workspace', '--all-targets')
     [void](Invoke-CargoGate -WorkspaceLabel 'root' -WorkingDirectory $RepoRoot -CargoArgs $clippyArgs `
             -Code 'SYNAPSE_LINT_CLIPPY_ROOT_FAILED' -Remediation 'fix the reported lints; the root workspace denies clippy::all')
@@ -408,8 +408,116 @@ if (-not $SkipClippy) {
             -Code 'SYNAPSE_LINT_CLIPPY_CALYX_FAILED' -Remediation 'fix the reported lints; the calyx workspace denies clippy::all')
 }
 else {
-    Write-Gate 'Gate 6/6  cargo clippy — SKIPPED by -SkipClippy'
+    Write-Gate 'Gate 6/7  cargo clippy — SKIPPED by -SkipClippy'
     Write-Host '   NOTE this run proves nothing about lint cleanliness in either workspace.' -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------------------
+# Gate 7 — unreached public calyx API ratchet (#1944)
+# ---------------------------------------------------------------------------
+#
+# `calyx_assay::ensemble_card` had no caller anywhere in Synapse, and that is
+# why three defects (#1942, #1943, and a whole-pass abort on one degenerate
+# lens) accumulated on it unobserved. An unreached code path accumulates
+# defects at full rate and reports none of them. It was found by accident.
+#
+# This is the sweep that finds the rest, run as a ratchet: the count may fall
+# but never rise. Wiring a `pub fn` to a caller lowers it; adding another
+# unreachable one fails the gate. Deliberately NOT a hard zero — there were 375
+# at the time this was written, and failing the whole tree on a pre-existing
+# number nobody can pay down in one change is how a gate gets disabled.
+#
+# Pure PowerShell on purpose: this must not add a ripgrep dependency to the one
+# lint entry point.
+#
+# Known limits, stated so a number from this gate is not over-read: it is
+# lexical, so it cannot see a function reached only through trait-object
+# dispatch, and a few of the counted symbols are legitimate public API with no
+# in-tree consumer. It is conservative in three directions — tests and examples
+# are included in the occurrence count, a name declared in several places must
+# be unreferenced at all of them, and same-name collisions across crates merge
+# — so it under-reports rather than inventing findings.
+
+Write-Gate 'Gate 7/7  unreached public calyx API ratchet (#1944)'
+
+$BaselinePath = Join-Path $PSScriptRoot 'unreached-calyx-api-baseline.txt'
+try {
+    $declRe = [regex]'(?m)^\s*pub\s+(?:const\s+|async\s+|unsafe\s+)*fn\s+([a-z_][a-z0-9_]*)'
+    $anyFnRe = [regex]'\bfn\s+([a-z_][a-z0-9_]*)'
+    $skipRe = '[\\/](?:tests|examples|benches|target)[\\/]'
+
+    $calyxCrates = Join-Path $CalyxRoot 'crates'
+    $rootCrates = Join-Path $RepoRoot 'crates'
+
+    # Candidate set: every `pub fn` a calyx crate declares in non-test code.
+    $candidates = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($file in Get-ChildItem $calyxCrates -Recurse -Filter *.rs -File) {
+        if ($file.FullName -match $skipRe) { continue }
+        foreach ($match in $declRe.Matches([IO.File]::ReadAllText($file.FullName))) {
+            [void]$candidates.Add($match.Groups[1].Value)
+        }
+    }
+
+    # Occurrences and declarations of those names across BOTH trees. `uses` is
+    # occurrences minus declarations, so a symbol that appears only where it is
+    # defined scores 0 and is unreached.
+    $total = @{}
+    $decls = @{}
+    # Note the asymmetry, which is deliberate: candidates come only from
+    # non-test calyx code, but occurrences are counted over EVERYTHING
+    # including tests and examples. A `pub fn` exercised by a test is observed,
+    # so it is not the silent defect reservoir this gate exists to find, and
+    # counting it as one would be a false finding.
+    $scanRoots = @($calyxCrates, $rootCrates) | Where-Object { Test-Path $_ }
+    foreach ($file in Get-ChildItem $scanRoots -Recurse -Filter *.rs -File) {
+        if ($file.FullName -match '[\\/]target[\\/]') { continue }
+        $text = [IO.File]::ReadAllText($file.FullName)
+        foreach ($word in [regex]::Split($text, '[^A-Za-z0-9_]+')) {
+            if ($candidates.Contains($word)) { $total[$word] = 1 + $total[$word] }
+        }
+        foreach ($match in $anyFnRe.Matches($text)) {
+            $name = $match.Groups[1].Value
+            if ($candidates.Contains($name)) { $decls[$name] = 1 + $decls[$name] }
+        }
+    }
+
+    $unreached = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $candidates) {
+        $used = [int]$total[$name] - [int]$decls[$name]
+        if ($used -le 0) { $unreached.Add($name) }
+    }
+    $count = $unreached.Count
+
+    if (-not (Test-Path $BaselinePath)) {
+        Add-Failure 'SYNAPSE_LINT_UNREACHED_API_BASELINE_MISSING' `
+            "no baseline at $BaselinePath; measured $count unreached pub fn" `
+            "write the measured count to that file to adopt it as the baseline, after confirming $count is the real current number"
+    }
+    else {
+        $raw = (Get-Content $BaselinePath -Raw).Trim()
+        $baseline = 0
+        if (-not [int]::TryParse($raw, [ref]$baseline)) {
+            Add-Failure 'SYNAPSE_LINT_UNREACHED_API_BASELINE_UNPARSEABLE' `
+                "baseline file $BaselinePath does not contain an integer (found '$raw')" `
+                'the file must contain only the baseline count'
+        }
+        elseif ($count -gt $baseline) {
+            $added = ($unreached | Sort-Object) -join ', '
+            Add-Failure 'SYNAPSE_LINT_UNREACHED_API_INCREASED' `
+                "$count public calyx fn have no caller anywhere, up from the baseline $baseline" `
+                "a new pub fn was added with nothing calling it. Wire it to a caller, or if it is deliberately unreached for now say so where the code is and raise the baseline in $BaselinePath. Current set: $added"
+        }
+        else {
+            Write-Host "   OK   $count unreached pub fn (baseline $baseline)" -ForegroundColor Green
+            if ($count -lt $baseline) {
+                Write-Host "   NOTE ratchet fell by $($baseline - $count); lower the baseline in $BaselinePath to hold the gain." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+catch {
+    Add-Failure 'SYNAPSE_LINT_UNREACHED_API_SWEEP_FAILED' $_.Exception.Message `
+        'the unreached-API sweep itself failed; this gate fails closed rather than reporting a count it did not compute'
 }
 
 # ---------------------------------------------------------------------------
