@@ -71,6 +71,42 @@ pub(super) fn scalar_rank(bytes: &[u8], min_micros: i64, max_micros: i64) -> Res
     )?])
 }
 
+/// The bounded rank placed on the unit half-circle (#1963).
+///
+/// Byte-identical in behaviour to the registry crate's `scalar_rank_arc`: the
+/// two must agree or the measure path and the panel contract would resolve to
+/// different lens ids for the same declared lens.
+pub(super) fn scalar_rank_arc(
+    bytes: &[u8],
+    min_micros: i64,
+    max_micros: i64,
+) -> Result<SlotVector> {
+    let unit = rank_unit(bytes, min_micros, max_micros, "syn scalar rank arc")?;
+    let angle = std::f64::consts::PI * unit;
+    dense(vec![
+        finite_f32(angle.cos(), "syn scalar rank arc cos")?,
+        finite_f32(angle.sin(), "syn scalar rank arc sin")?,
+    ])
+}
+
+/// Shared, fail-closed rank normalization. See the registry crate's twin.
+fn rank_unit(bytes: &[u8], min_micros: i64, max_micros: i64, label: &str) -> Result<f64> {
+    if min_micros >= max_micros {
+        return Err(numerical(format!(
+            "{label} requires min_micros < max_micros"
+        )));
+    }
+    let value = parse_number(bytes, &format!("{label} input"))?;
+    let min = min_micros as f64 / MICROS;
+    let max = max_micros as f64 / MICROS;
+    if value < min || value > max {
+        return Err(numerical(format!(
+            "{label} input {value} outside frozen range [{min}, {max}]"
+        )));
+    }
+    Ok((value - min) / (max - min))
+}
+
 pub(super) fn one_hot(bytes: &[u8], buckets: u32) -> Result<SlotVector> {
     ensure_positive("syn onehot buckets", buckets)?;
     let mut data = vec![0.0_f32; buckets as usize];

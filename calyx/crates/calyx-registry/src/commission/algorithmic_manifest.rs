@@ -179,7 +179,9 @@ fn syn_output_shape(kind: &str, dim: u32) -> Result<Option<SlotShape>> {
     let normalized = kind.replace('-', "_");
     let parts = normalized.split(':').collect::<Vec<_>>();
     let shape = match parts.as_slice() {
-        ["syn_cyclic_time", _] | ["syn_cyclical_time", _] => checked_dense(kind, dim, 2)?,
+        ["syn_cyclic_time", _] | ["syn_cyclical_time", _] | ["syn_scalar_rank_arc", _, _] => {
+            checked_dense(kind, dim, 2)?
+        }
         ["syn_scalar_raw"]
         | ["syn_scalar_log1p"]
         | ["syn_scalar_zscore", _, _]
@@ -260,6 +262,10 @@ fn syn_encoder_from_kind(kind: &str, shape: SlotShape) -> Result<Option<Algorith
             std_micros: parse_u64_value(kind, std_micros)?,
         },
         ["syn_scalar_rank", min_micros, max_micros] => AlgorithmicEncoder::SynScalarRank {
+            min_micros: parse_i64_value(kind, min_micros)?,
+            max_micros: parse_i64_value(kind, max_micros)?,
+        },
+        ["syn_scalar_rank_arc", min_micros, max_micros] => AlgorithmicEncoder::SynScalarRankArc {
             min_micros: parse_i64_value(kind, min_micros)?,
             max_micros: parse_i64_value(kind, max_micros)?,
         },

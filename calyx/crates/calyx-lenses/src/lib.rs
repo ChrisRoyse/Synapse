@@ -24,6 +24,12 @@ pub enum AlgorithmicEncoder {
     SynScalarZScore { mean_micros: i64, std_micros: u64 },
     /// Frozen bounded rank scalar transform with micro-unit bounds.
     SynScalarRank { min_micros: i64, max_micros: i64 },
+    /// Frozen bounded rank scalar placed on a unit half-circle (#1963).
+    ///
+    /// The graded-cosine sibling of [`Self::SynScalarRank`], whose 1-D image
+    /// makes cosine identically `+1`. See the registry crate's variant for the
+    /// full derivation and the range-sizing rule.
+    SynScalarRankArc { min_micros: i64, max_micros: i64 },
     /// Content-addressed categorical one-hot feature.
     SynOneHot { buckets: u32 },
     /// Signed feature hash in a power-of-two sparse space.
@@ -80,7 +86,7 @@ impl AlgorithmicEncoder {
     /// Returns the primary output dimension.
     pub const fn dim(self) -> u32 {
         match self {
-            Self::SynCyclicTime { .. } => 2,
+            Self::SynCyclicTime { .. } | Self::SynScalarRankArc { .. } => 2,
             Self::SynScalarRaw
             | Self::SynScalarLog1p
             | Self::SynScalarZScore { .. }
@@ -171,6 +177,23 @@ impl AlgorithmicLens {
             name,
             modality,
             AlgorithmicEncoder::SynScalarRank {
+                min_micros,
+                max_micros,
+            },
+        )
+    }
+
+    /// The graded-cosine sibling of [`Self::syn_scalar_rank`] (#1963).
+    pub fn syn_scalar_rank_arc(
+        name: impl Into<String>,
+        modality: Modality,
+        min_micros: i64,
+        max_micros: i64,
+    ) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynScalarRankArc {
                 min_micros,
                 max_micros,
             },
@@ -323,6 +346,10 @@ impl AlgorithmicLens {
                 min_micros,
                 max_micros,
             } => syn::scalar_rank(&input.bytes, min_micros, max_micros)?,
+            AlgorithmicEncoder::SynScalarRankArc {
+                min_micros,
+                max_micros,
+            } => syn::scalar_rank_arc(&input.bytes, min_micros, max_micros)?,
             AlgorithmicEncoder::SynOneHot { buckets } => syn::one_hot(&input.bytes, buckets)?,
             AlgorithmicEncoder::SynHash { dim } => syn::hash(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseText { dim } => syn::sparse_text(&input.bytes, dim)?,
@@ -409,7 +436,11 @@ fn shape_fingerprint(shape: SlotShape) -> String {
 
 fn norm_fingerprint(encoder: AlgorithmicEncoder) -> &'static str {
     match encoder {
-        AlgorithmicEncoder::SynRecordVector { .. } => "unit",
+        // Must stay in lockstep with `calyx_registry::algorithmic_norm_policy`:
+        // the norm fingerprint is part of the lens id, so a disagreement here
+        // silently splits one declared lens into two.
+        AlgorithmicEncoder::SynRecordVector { .. }
+        | AlgorithmicEncoder::SynScalarRankArc { .. } => "unit",
         _ => "finite",
     }
 }

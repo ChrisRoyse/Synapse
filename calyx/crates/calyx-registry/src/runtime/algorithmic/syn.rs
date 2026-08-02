@@ -73,6 +73,46 @@ pub(super) fn scalar_rank(bytes: &[u8], min_micros: i64, max_micros: i64) -> Res
     )?])
 }
 
+/// The bounded rank placed on the unit half-circle (#1963).
+///
+/// Shares `scalar_rank`'s validation exactly — same bounds check, same
+/// fail-closed range refusal — and differs only in the image: `[cos(pi*u),
+/// sin(pi*u)]` instead of `[u]`. Cosine between two outputs is `cos(pi*(u_a -
+/// u_b))`, strictly decreasing in the rank difference over the whole `[0, 1]`
+/// span, where `[u]` gives cosine identically `+1`.
+pub(super) fn scalar_rank_arc(
+    bytes: &[u8],
+    min_micros: i64,
+    max_micros: i64,
+) -> Result<SlotVector> {
+    let unit = rank_unit(bytes, min_micros, max_micros, "syn scalar rank arc")?;
+    let angle = std::f64::consts::PI * unit;
+    dense(vec![
+        finite_f32(angle.cos(), "syn scalar rank arc cos")?,
+        finite_f32(angle.sin(), "syn scalar rank arc sin")?,
+    ])
+}
+
+/// The shared, fail-closed rank normalization behind `scalar_rank` and
+/// `scalar_rank_arc`. Keeping one implementation is what guarantees the two
+/// encoders always agree on which inputs are in range.
+fn rank_unit(bytes: &[u8], min_micros: i64, max_micros: i64, label: &str) -> Result<f64> {
+    if min_micros >= max_micros {
+        return Err(numerical(format!(
+            "{label} requires min_micros < max_micros"
+        )));
+    }
+    let value = parse_number(bytes, &format!("{label} input"))?;
+    let min = min_micros as f64 / MICROS;
+    let max = max_micros as f64 / MICROS;
+    if value < min || value > max {
+        return Err(numerical(format!(
+            "{label} input {value} outside frozen range [{min}, {max}]"
+        )));
+    }
+    Ok((value - min) / (max - min))
+}
+
 pub(super) fn one_hot(bytes: &[u8], buckets: u32) -> Result<SlotVector> {
     ensure_positive("syn onehot buckets", buckets)?;
     let mut data = vec![0.0_f32; buckets as usize];

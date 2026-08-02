@@ -43,7 +43,21 @@ pub const SYN_TIMELINE_PANEL_NAME: &str = "syn-timeline-v1";
 /// qualified slot write into a row that never declared the slot is refused by
 /// design — so a new lens on this panel is a new generation, re-measured from
 /// the authoritative `CF_TIMELINE` rows, exactly as #1776 did.
-pub const SYN_TIMELINE_PANEL_VERSION: u32 = 1_900_001;
+/// #1963 added `TL_SLOT_RECORD_VECTOR`, the panel's first **graded** dense lens.
+/// Before it, all five dense lenses on this panel returned nearest-neighbour
+/// cosine exactly `1.0` for all 924 records: four saturated a finite image
+/// (one-hot over ~12 kinds, cyclic over 24 hours / 7 days) and the fifth
+/// (`event_time_rank`, dense `dim = 1` over `[0, 1]`) could never return
+/// anything but `+1`. The panel therefore had no lens whose "these two records
+/// are alike" was a measurement, so no neighbourhood analysis on it — blind
+/// spots, find-similar ranking, the between-record graph — could resolve
+/// anything. Measured on a frozen copy of the live vault
+/// (`panel_grading_probe_fsv`), the new lens returns 42 distinct
+/// nearest-neighbour values over `[0.953, 1.000]` with a modal share of 0.578.
+pub const SYN_TIMELINE_PANEL_VERSION: u32 = 1_963_001;
+/// The timeline layout #1963 superseded, kept named so an audit can identify
+/// rows written before the graded record-vector lens existed.
+pub const SYN_TIMELINE_PANEL_VERSION_PRE_1963: u32 = 1_900_001;
 /// The timeline layout #1900 superseded, kept named so an audit can identify
 /// rows written before the BM25 lane existed rather than guess at a number.
 pub const SYN_TIMELINE_PANEL_VERSION_PRE_1900: u32 = 1_664_001;
@@ -178,6 +192,28 @@ const TL_SLOT_RECENCY_RANK: SlotId = SlotId::new(7);
 /// declared in `PANEL_SLOT_BLOCKS`. The write-time guard rejected this exact id
 /// on a fresh vault before any row was written, which is what the guard is for.
 const TL_SLOT_TITLE_BM25: SlotId = SlotId::new(103);
+/// The panel's graded dense lens (#1963), in the same second block as 103.
+///
+/// See [`SYN_TIMELINE_PANEL_VERSION`] for why the panel needed one and
+/// [`timeline_numeric_record`] for why every field it measures is placed on a
+/// comparable scale first.
+const TL_SLOT_RECORD_VECTOR: SlotId = SlotId::new(104);
+/// Dimension of the timeline record vector.
+///
+/// `timeline_numeric_record` emits 11 fields, which `syn_record_vector` places
+/// by a signed hash of the field path. 32 buckets keeps the expected collision
+/// count under one while staying the smallest power of two that does so, and a
+/// collision is a merge of two already-normalized components rather than a lost
+/// field.
+const TL_RECORD_VECTOR_DIM: u32 = 32;
+/// Frozen scale for the log-normalized app-name length component.
+const TL_APP_LEN_SCALE: f64 = 64.0;
+/// Frozen scale for the log-normalized title length component.
+const TL_TITLE_LEN_SCALE: f64 = 128.0;
+/// Frozen scale for the log-normalized url-host length component.
+const TL_URL_HOST_LEN_SCALE: f64 = 64.0;
+/// Frozen scale for the log-normalized raw-row-length component.
+const TL_RAW_LEN_SCALE: f64 = 4096.0;
 
 const EP_SLOT_APP_HASH: SlotId = SlotId::new(8);
 const EP_SLOT_DOCUMENT_HASH: SlotId = SlotId::new(9);
@@ -1767,6 +1803,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (TL_SLOT_ACTOR_ONEHOT, "syn.timeline.actor_onehot.v1"),
     (TL_SLOT_RECENCY_RANK, "syn.timeline.event_time_rank.v1"),
     (TL_SLOT_TITLE_BM25, "syn.timeline.title_bm25.v1"),
+    (TL_SLOT_RECORD_VECTOR, "syn.timeline.record_vector.v1"),
     (EP_SLOT_APP_HASH, "syn.episode.app_hash.v1"),
     (EP_SLOT_DOCUMENT_HASH, "syn.episode.document_hash.v1"),
     (EP_SLOT_URL_HOST_HASH, "syn.episode.url_host_hash.v1"),
@@ -2233,7 +2270,10 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_TIMELINE),
             outcome_bearing: false,
             source_ttl_managed: false,
-            superseded_versions: &[SYN_TIMELINE_PANEL_VERSION_PRE_1900],
+            superseded_versions: &[
+                SYN_TIMELINE_PANEL_VERSION_PRE_1963,
+                SYN_TIMELINE_PANEL_VERSION_PRE_1900,
+            ],
             backfill_source_cf: Some(cf::CF_TIMELINE),
         },
         PanelCatalogEntry {
@@ -2498,6 +2538,20 @@ pub fn build_timeline_constellation(
                 2048,
             ),
             timeline_title(record).as_deref().unwrap_or(""),
+        )?,
+    );
+
+    // The panel's graded dense lens (#1963).
+    slots.insert(
+        TL_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_TIMELINE_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector(
+                "syn.timeline.record_vector.v1",
+                Modality::Structured,
+                TL_RECORD_VECTOR_DIM,
+            ),
+            &timeline_numeric_record(record, raw_bytes),
         )?,
     );
 
@@ -2783,6 +2837,9 @@ pub fn syn_active_panel_contract(
         }
         _ => return Ok(None),
     };
+    // #1963 ask 3: a panel that cannot support a neighbourhood analysis says so
+    // at admission, not three analyses later.
+    assert_panel_carries_graded_dense_lens(panel_version, &slots, &registry)?;
     Ok(Some(SynActivePanelContract {
         panel: Panel {
             version: panel_version,
@@ -2795,15 +2852,229 @@ pub fn syn_active_panel_contract(
     }))
 }
 
+/// One panel slot's declared cosine grading (#1963 ask 3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SynSlotCosineGrading {
+    pub slot_id: u16,
+    pub slot_key: String,
+    /// `not_dense` | `constant` | `finite` | `graded`, from
+    /// `calyx_registry::DenseCosineGrading`.
+    pub grading: &'static str,
+    /// Set when the image is a finite set: how many distinct directions the
+    /// encoder can reach. A dense lane saturates its nearest-neighbour cosine
+    /// as soon as the record count comfortably exceeds this.
+    pub finite_directions: Option<u32>,
+    /// Retrieval-only slots are post-retrieval ordinates, not recall lanes, and
+    /// are exempt from the panel's graded-lens requirement.
+    pub retrieval_only: bool,
+}
+
+/// The per-slot cosine-grading table for a built-in panel (#1963 ask 3).
+///
+/// A panel that cannot support a neighbourhood analysis should say so at
+/// admission, not three analyses later. This is the readback half of that: the
+/// refusal in [`assert_panel_carries_graded_dense_lens`] stops the impossible
+/// case, and this names, per slot, *why* the panel's dense view looks the way
+/// it does — including the finite-image sizes that predict saturation.
+///
+/// Read from the persisted `LensSpec`, so it reports the declaration that will
+/// be written to the vault rather than an in-memory object.
+///
+/// Returns `Ok(None)` for panel versions with no built-in contract.
+///
+/// # Errors
+///
+/// Returns an error when the panel contract cannot be built, or when a slot's
+/// persisted runtime kind does not parse back to an encoder.
+pub fn syn_panel_cosine_grading(
+    panel_version: u32,
+) -> StorageResult<Option<Vec<SynSlotCosineGrading>>> {
+    let Some(contract) = syn_active_panel_contract(panel_version, 0)? else {
+        return Ok(None);
+    };
+    let mut rows = Vec::with_capacity(contract.panel.slots.len());
+    for slot in &contract.panel.slots {
+        let spec = contract.registry.lens_spec(slot.lens_id).ok_or_else(|| {
+            panel_lifecycle_error(
+                "CALYX_PANEL_SLOT_GRADING_UNDECLARED",
+                &format!("slot {} has no persisted LensSpec", slot.slot_id),
+                "register every built-in slot through syn_content_slot/syn_retrieval_only_slot",
+            )
+        })?;
+        let grading = match &spec.runtime {
+            LensRuntime::Algorithmic { kind } => {
+                calyx_registry::algorithmic_encoder(kind, spec.output)
+                    .ok_or_else(|| {
+                        panel_lifecycle_error(
+                            "CALYX_PANEL_SLOT_GRADING_UNDECLARED",
+                            &format!("slot {} runtime kind {kind} does not parse", slot.slot_id),
+                            "use a runtime kind persisted_syn_runtime_kind can round-trip",
+                        )
+                    })?
+                    .dense_cosine_grading()
+            }
+            // A model-backed embedder's image is a continuum by construction.
+            _ => calyx_registry::DenseCosineGrading::Graded,
+        };
+        rows.push(SynSlotCosineGrading {
+            slot_id: slot.slot_id.get(),
+            slot_key: slot.slot_key.key().to_owned(),
+            grading: grading.as_str(),
+            finite_directions: match grading {
+                calyx_registry::DenseCosineGrading::Finite(n) => Some(n),
+                _ => None,
+            },
+            retrieval_only: slot.retrieval_only,
+        });
+    }
+    Ok(Some(rows))
+}
+
+/// Refuses a panel that carries no lens capable of a graded similarity (#1963).
+///
+/// Read from the **persisted** `LensSpec` each slot was registered with, not
+/// from an in-memory encoder, so this validates the declaration that will
+/// actually be written to the vault.
+///
+/// The rule is one line: at least one active, non-retrieval-only dense slot
+/// whose encoder's image is a continuum. Without it, every neighbourhood
+/// surface on the panel — find-similar ranking, the agreement cross-term, the
+/// between-record graph, the blind-spot rule — is resolving ties rather than
+/// ranking similarity, and nothing in the returned numbers says so.
+/// `syn-timeline-v1 @ 1900001` was in exactly that state: five dense lenses,
+/// all of them one-hot, periodic, or `dim = 1`, all returning nearest-neighbour
+/// cosine exactly 1.0 for all 924 records.
+///
+/// This is a *possibility* check, deliberately. Whether a graded lens actually
+/// grades over a given corpus is a measurement (`calyx_loom::
+/// SimilarityDiscrimination`) that no compile-time declaration can make; what
+/// this refuses is the case where the answer is no before any data exists.
+///
+/// Public so the gate itself is verifiable: a fail-closed rule that cannot be
+/// driven from a harness is a rule nobody has watched fail.
+pub fn assert_panel_carries_graded_dense_lens(
+    panel_version: u32,
+    slots: &[Slot],
+    registry: &Registry,
+) -> StorageResult<()> {
+    let mut graded = Vec::new();
+    let mut undeclared = Vec::new();
+    let mut summary = Vec::new();
+    for slot in slots {
+        if slot.state != SlotState::Active || slot.retrieval_only {
+            continue;
+        }
+        let Some(spec) = registry.lens_spec(slot.lens_id) else {
+            undeclared.push(format!("{}: no persisted LensSpec", slot.slot_id));
+            continue;
+        };
+        let LensRuntime::Algorithmic { kind } = &spec.runtime else {
+            // A model-backed embedder's image is a continuum by construction;
+            // there is no static declaration to consult and none is needed.
+            graded.push(slot.slot_id.get());
+            continue;
+        };
+        let Some(encoder) = calyx_registry::algorithmic_encoder(kind, spec.output) else {
+            undeclared.push(format!("{}: unparseable runtime kind {kind}", slot.slot_id));
+            continue;
+        };
+        let grading = encoder.dense_cosine_grading();
+        summary.push(format!("{}={}", slot.slot_id, grading.as_str()));
+        if grading.is_graded() {
+            graded.push(slot.slot_id.get());
+        }
+    }
+    if !undeclared.is_empty() {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_SLOT_GRADING_UNDECLARED",
+            &format!(
+                "panel {panel_version} has slots whose cosine grading cannot be read from their \
+                 persisted spec: {undeclared:?}"
+            ),
+            "register every built-in slot through syn_content_slot/syn_retrieval_only_slot so its \
+             runtime kind round-trips",
+        ));
+    }
+    if graded.is_empty() {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_NO_GRADED_DENSE_LENS",
+            &format!(
+                "panel {panel_version} carries no dense content slot whose cosine can grade, so no \
+                 neighbourhood analysis on it can rank: every candidate ties (#1963). \
+                 per-slot grading: {summary:?}"
+            ),
+            "add a graded dense lens (syn_record_vector over scale-normalized fields is the \
+             weightless option) before publishing this panel",
+        ));
+    }
+    Ok(())
+}
+
 /// Builds one `Active`, content (non-retrieval-only) panel slot from the same
 /// frozen lens the ingest path measures with, so the slot's `lens_id`/`shape`/
 /// `modality` are authoritative rather than reconstructed.
-fn syn_content_slot(
+///
+/// **Fail-closed on a constant cosine lane (#1963).** A content slot is, by
+/// definition, offered to every similarity surface: find-similar ranking, the
+/// agreement cross-term, the between-record graph, the blind-spot rule, the
+/// guard's per-slot threshold. All of them read one number — the cosine between
+/// two slot vectors — and for some encoders that number is provably the same
+/// for every pair of records, whatever the corpus. `syn.timeline.
+/// event_time_rank.v1` was one: a dense `dim = 1` lane whose image is `[0, 1]`
+/// has cosine identically `+1`. Such a lane is a legitimate *scalar*, and
+/// nothing here says otherwise — it is only refused as a **content** slot, and
+/// [`syn_retrieval_only_slot`] is the declaration that keeps it.
+///
+/// Public so the refusal is verifiable from a harness.
+pub fn syn_content_slot(
     slot_id: SlotId,
     slot_key: &str,
     lens: RegistryAlgorithmicLens,
     panel_version: u32,
     registry: &mut Registry,
+) -> StorageResult<Slot> {
+    let grading = lens.encoder().dense_cosine_grading();
+    if grading.is_constant() {
+        return Err(panel_lifecycle_error(
+            "CALYX_PANEL_SLOT_COSINE_CONSTANT",
+            &format!(
+                "content slot {slot_id} key {slot_key} uses encoder {:?}, whose dense cosine is \
+                 identically +1 for every pair of records: as a similarity lane it carries zero \
+                 information by construction, not by corpus (#1963)",
+                lens.encoder()
+            ),
+            "declare the slot with syn_retrieval_only_slot if it is a post-retrieval ordinate, \
+             or give it a graded encoding (syn_scalar_rank_arc places a bounded scalar on the \
+             unit half-circle)",
+        ));
+    }
+    syn_slot(slot_id, slot_key, lens, panel_version, registry, false)
+}
+
+/// Builds one `Active`, **retrieval-only** panel slot (#1963).
+///
+/// Calyx's `retrieval_only` means "consumed after retrieval, never a primary
+/// recall lane" — `Slot::measurable_for` excludes it and the dedup signature
+/// skips it. That is the honest classification for a recency ordinate like
+/// `syn.timeline.event_time_rank.v1`: it is an exact, auditable rank that
+/// belongs in a temporal boost, and it is not a similarity measurement.
+fn syn_retrieval_only_slot(
+    slot_id: SlotId,
+    slot_key: &str,
+    lens: RegistryAlgorithmicLens,
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<Slot> {
+    syn_slot(slot_id, slot_key, lens, panel_version, registry, true)
+}
+
+fn syn_slot(
+    slot_id: SlotId,
+    slot_key: &str,
+    lens: RegistryAlgorithmicLens,
+    panel_version: u32,
+    registry: &mut Registry,
+    retrieval_only: bool,
 ) -> StorageResult<Slot> {
     let contract = lens.contract().clone();
     let output = contract.shape();
@@ -2824,8 +3095,8 @@ fn syn_content_slot(
         quant_default: QuantPolicy::None,
         truncate_dim: None,
         recall_delta: default_recall_delta(),
-        retrieval_only: false,
-        excluded_from_dedup: false,
+        retrieval_only,
+        excluded_from_dedup: retrieval_only,
     };
     let lens_id = registry
         .register_frozen_with_spec(lens, contract, spec)
@@ -2846,8 +3117,8 @@ fn syn_content_slot(
         quant: QuantPolicy::None,
         resource: SlotResource::default(),
         axis: None,
-        retrieval_only: false,
-        excluded_from_dedup: false,
+        retrieval_only,
+        excluded_from_dedup: retrieval_only,
         bits_about: BTreeMap::new(),
         state: SlotState::Active,
         added_at_panel_version: panel_version,
@@ -2869,6 +3140,10 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
             min_micros,
             max_micros,
         } => format!("syn_scalar_rank:{min_micros}:{max_micros}"),
+        RegistryAlgorithmicEncoder::SynScalarRankArc {
+            min_micros,
+            max_micros,
+        } => format!("syn_scalar_rank_arc:{min_micros}:{max_micros}"),
         RegistryAlgorithmicEncoder::SynOneHot { buckets } => {
             format!("syn_one_hot:{buckets}")
         }
@@ -3182,7 +3457,10 @@ fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageR
             panel_version,
             registry,
         )?,
-        syn_content_slot(
+        // Retrieval-only since #1963: a dense `dim = 1` rank on `[0, 1]` has
+        // cosine identically +1, so it is a post-retrieval recency ordinate and
+        // never a similarity lane. `syn_content_slot` refuses it structurally.
+        syn_retrieval_only_slot(
             TL_SLOT_RECENCY_RANK,
             "syn.timeline.event_time_rank.v1",
             RegistryAlgorithmicLens::syn_scalar_rank(
@@ -3201,6 +3479,18 @@ fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageR
                 "syn.timeline.title_bm25.v1",
                 Modality::Structured,
                 2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        // The panel's graded dense lens (#1963).
+        syn_content_slot(
+            TL_SLOT_RECORD_VECTOR,
+            "syn.timeline.record_vector.v1",
+            RegistryAlgorithmicLens::syn_record_vector(
+                "syn.timeline.record_vector.v1",
+                Modality::Structured,
+                TL_RECORD_VECTOR_DIM,
             ),
             panel_version,
             registry,
@@ -6231,6 +6521,92 @@ const fn interruption_ratio(record: &EpisodeRecord) -> f64 {
     } else {
         ratio_u64(record.interrupted_ms, duration)
     }
+}
+
+/// The timeline record reduced to comparably-scaled numbers (#1963).
+///
+/// `syn_record_vector` multiplies each field's value by a signed hash of its
+/// **path** and unit-normalizes the sum, so a raw magnitude decides the
+/// resulting direction on its own: feeding `ts_unix_ms` (~1.7e12) beside a byte
+/// count (~200) would make the vector a re-encoding of the timestamp and
+/// nothing else. Every component here is mapped into roughly `[0, 1]` first,
+/// which is what makes the direction a summary of the record rather than of its
+/// largest unit.
+///
+/// Deliberately **not** included: the absolute timestamp. The nearest neighbour
+/// in a dense event stream is always seconds away, so any absolute-time
+/// component saturates the nearest-neighbour cosine at 1.0 — measured, not
+/// assumed: `panel_grading_probe_fsv` shows a half-circle encoding of the same
+/// frozen event-time rank returning `distinct=1` over all 932 rows. Time enters
+/// only as *position within* a day and a week, which is a genuine property of
+/// the activity rather than a serial number.
+///
+/// Every field read here is declared in
+/// `synapse_calyx::lens_provenance::SYN_SLOT_SOURCE_FIELDS` for slot 104.
+fn timeline_numeric_record(record: &TimelineRecord, raw_bytes: &[u8]) -> Value {
+    let secs = record.ts_ns / NS_PER_SEC;
+    let app = record.app.as_deref().unwrap_or("");
+    let title = timeline_title(record).unwrap_or_default();
+    let url_host = payload_string(&record.payload, &["url"])
+        .as_deref()
+        .and_then(url_host)
+        .unwrap_or_default();
+    json!({
+        "kind_ordinal": timeline_kind_ordinal(record.kind),
+        "actor_is_agent": f64::from(u8::from(matches!(record.actor, TimelineActor::Agent { .. }))),
+        "day_fraction": (secs % SECS_PER_DAY) as f64 / SECS_PER_DAY as f64,
+        "week_fraction": (secs % (7 * SECS_PER_DAY)) as f64 / (7 * SECS_PER_DAY) as f64,
+        "has_app": present_fraction(app),
+        "app_len_norm": log_len_norm(app, TL_APP_LEN_SCALE),
+        "has_title": present_fraction(&title),
+        "title_len_norm": log_len_norm(&title, TL_TITLE_LEN_SCALE),
+        "has_url_host": present_fraction(&url_host),
+        "url_host_len_norm": log_len_norm(&url_host, TL_URL_HOST_LEN_SCALE),
+        "raw_len_norm": (1.0 + raw_bytes.len() as f64).ln() / (1.0 + TL_RAW_LEN_SCALE).ln(),
+    })
+}
+
+/// Frozen ordinal position of a timeline kind on `[0, 1]`.
+///
+/// Written as an exhaustive match rather than a lookup over
+/// [`TimelineKind`]'s declaration order so that adding a variant is a
+/// compile error here: a new kind must be given an explicit position, and
+/// appending one must not renumber the existing ones — that would change what
+/// every already-measured record means without changing the lens id.
+const fn timeline_kind_ordinal(kind: TimelineKind) -> f64 {
+    // Denominator frozen at 11 = (12 declared kinds - 1). A thirteenth kind
+    // takes position 12 and this denominator becomes 12, which is a genuine
+    // re-measurement and therefore a new lens version, not an edit here.
+    const LAST: f64 = 11.0;
+    let index = match kind {
+        TimelineKind::FocusChange => 0.0,
+        TimelineKind::TitleChange => 1.0,
+        TimelineKind::IdleStart => 2.0,
+        TimelineKind::IdleEnd => 3.0,
+        TimelineKind::SessionStart => 4.0,
+        TimelineKind::SessionEnd => 5.0,
+        TimelineKind::InteractionSummary => 6.0,
+        TimelineKind::Clipboard => 7.0,
+        TimelineKind::FileActivity => 8.0,
+        TimelineKind::BrowserNav => 9.0,
+        TimelineKind::DemoMarker => 10.0,
+        TimelineKind::Purge => 11.0,
+    };
+    index / LAST
+}
+
+/// `1.0` when the field carries a value, `0.0` when it does not.
+fn present_fraction(value: &str) -> f64 {
+    f64::from(u8::from(!value.is_empty()))
+}
+
+/// A character count mapped into roughly `[0, 1]` by `ln(1+n) / ln(1+scale)`.
+///
+/// Log rather than linear because these lengths are heavy-tailed: a 400-character
+/// title is not four times the record a 100-character one is, and a linear scale
+/// would let one outlier dominate the whole vector's direction.
+fn log_len_norm(value: &str, scale: f64) -> f64 {
+    (1.0 + value.chars().count() as f64).ln() / (1.0 + scale).ln()
 }
 
 fn episode_numeric_record(record: &EpisodeRecord) -> Value {

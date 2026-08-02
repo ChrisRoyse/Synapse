@@ -89,7 +89,7 @@ pub use persistence::{
 pub use persistence_contracts::{
     RegistryContractAudit, RegistryContractDiff, RegistryContractFieldDiff,
     RegistryContractRepairChange, VaultRegistryContractRepairAllWrite,
-    VaultRegistryContractRepairWrite, audit_registry_snapshot_contracts,
+    VaultRegistryContractRepairWrite, algorithmic_encoder, audit_registry_snapshot_contracts,
     audit_vault_registry_contracts, derive_runtime_contract_from_spec,
     lens_spec_with_frozen_contract, repair_vault_registry_contracts_from_specs,
     repair_vault_registry_slot_from_spec, require_vault_registry_contracts,
@@ -118,7 +118,8 @@ pub use runtime::adapters::{
 };
 pub use runtime::algorithmic::{
     AlgorithmicBatchProvider, AlgorithmicBatchStats, AlgorithmicEncoder, AlgorithmicLens,
-    BYTE_FEATURES_CUDA_MIN_INPUT_BYTES, SPARSE_KEYWORDS_CUDA_MIN_TOKENS, TOKEN_HASH_CUDA_MIN_WORDS,
+    BYTE_FEATURES_CUDA_MIN_INPUT_BYTES, DenseCosineGrading, SPARSE_KEYWORDS_CUDA_MIN_TOKENS,
+    TOKEN_HASH_CUDA_MIN_WORDS,
 };
 pub use runtime::candle::{
     CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy,

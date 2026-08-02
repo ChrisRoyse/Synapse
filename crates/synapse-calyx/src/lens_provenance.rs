@@ -56,14 +56,24 @@ use std::collections::BTreeSet;
 /// silent pass on a circular measurement, which is the failure this exists to
 /// stop. When in doubt, list it.
 pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
-    (1, 1900001, "syn.timeline.kind_onehot.v1", &["kind"]),
-    (2, 1900001, "syn.timeline.app_hash.v1", &["app"]),
-    (3, 1900001, "syn.timeline.title_sparse.v1", &["payload"]),
-    (4, 1900001, "syn.timeline.hour_cyclic.v1", &["ts_ns"]),
-    (5, 1900001, "syn.timeline.dow_cyclic.v1", &["ts_ns"]),
-    (6, 1900001, "syn.timeline.actor_onehot.v1", &["actor"]),
-    (7, 1900001, "syn.timeline.event_time_rank.v1", &["ts_ns"]),
-    (103, 1900001, "syn.timeline.title_bm25.v1", &["payload"]),
+    (1, 1963001, "syn.timeline.kind_onehot.v1", &["kind"]),
+    (2, 1963001, "syn.timeline.app_hash.v1", &["app"]),
+    (3, 1963001, "syn.timeline.title_sparse.v1", &["payload"]),
+    (4, 1963001, "syn.timeline.hour_cyclic.v1", &["ts_ns"]),
+    (5, 1963001, "syn.timeline.dow_cyclic.v1", &["ts_ns"]),
+    (6, 1963001, "syn.timeline.actor_onehot.v1", &["actor"]),
+    (7, 1963001, "syn.timeline.event_time_rank.v1", &["ts_ns"]),
+    (103, 1963001, "syn.timeline.title_bm25.v1", &["payload"]),
+    // #1963's graded dense lens. A record_vector declares every field its
+    // numeric-record builder touches, transitively, because the label being one
+    // component of a dense vector is exactly what the statistical leakage
+    // detector cannot see.
+    (
+        104,
+        1963001,
+        "syn.timeline.record_vector.v1",
+        &["kind", "actor", "ts_ns", "app", "payload"],
+    ),
     (8, 1904002, "syn.episode.app_hash.v1", &["app"]),
     (9, 1904002, "syn.episode.document_hash.v1", &["document"]),
     (10, 1904002, "syn.episode.url_host_hash.v1", &["url"]),

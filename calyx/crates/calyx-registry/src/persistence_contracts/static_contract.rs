@@ -128,7 +128,14 @@ fn algorithmic_contract(spec: &LensSpec, kind: &str) -> Result<FrozenLensContrac
         .clone())
 }
 
-fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncoder> {
+/// Parses a persisted algorithmic runtime kind back into its encoder.
+///
+/// Public so a caller holding only a persisted [`LensSpec`] can ask the
+/// encoder-level questions — notably
+/// [`AlgorithmicEncoder::dense_cosine_grading`] (#1963) — about what the
+/// **stored** declaration says, rather than about an in-memory object that may
+/// not be what was written.
+pub fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncoder> {
     let normalized = kind.replace('-', "_");
     let parts = normalized.split(':').collect::<Vec<_>>();
     match parts.as_slice() {
@@ -200,6 +207,12 @@ fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEncode
             min_micros: parse_i64(min_micros)?,
             max_micros: parse_i64(max_micros)?,
         }),
+        ["syn_scalar_rank_arc", min_micros, max_micros] => {
+            Some(AlgorithmicEncoder::SynScalarRankArc {
+                min_micros: parse_i64(min_micros)?,
+                max_micros: parse_i64(max_micros)?,
+            })
+        }
         ["syn_one_hot"] | ["syn_onehot"] => Some(AlgorithmicEncoder::SynOneHot {
             buckets: dense_dim(shape)?,
         }),

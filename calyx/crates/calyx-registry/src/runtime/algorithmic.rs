@@ -85,6 +85,39 @@ pub enum AlgorithmicEncoder {
     SynScalarZScore { mean_micros: i64, std_micros: u64 },
     /// Frozen bounded rank scalar transform with micro-unit bounds.
     SynScalarRank { min_micros: i64, max_micros: i64 },
+    /// Frozen bounded rank scalar placed on a unit half-circle (#1963).
+    ///
+    /// [`Self::SynScalarRank`] emits the rank as a **1-dimensional** dense
+    /// vector. Cosine of two 1-D vectors is `sign(a*b)`, and a rank is confined
+    /// to `[0, 1]`, so every pair of records is at cosine exactly `+1`: as a
+    /// similarity lane the encoding is constant by construction and carries
+    /// zero information, whatever the corpus. That is what
+    /// [`AlgorithmicEncoder::dense_cosine_grading`] now declares and what a
+    /// panel admission check refuses.
+    ///
+    /// This encoder keeps the same frozen bounds and the same exact rank, and
+    /// places it on the unit half-circle instead:
+    ///
+    /// ```text
+    /// u     = (value - min) / (max - min)          in [0, 1]
+    /// phi(u) = [cos(pi * u), sin(pi * u)]
+    /// cos(phi(a), phi(b)) = cos(pi * (u_a - u_b))
+    /// ```
+    ///
+    /// The similarity therefore depends only on the rank *difference* and is
+    /// strictly decreasing in `|u_a - u_b|` over the whole range, spanning
+    /// `[-1, +1]` — the standard construction for making a bounded scalar
+    /// comparable by inner product (the same `alpha * delta_max <= pi` scaling
+    /// rule used for rotary spatio-temporal encodings).
+    ///
+    /// **Sizing is the caller's job and it is not optional.** Resolution is set
+    /// by the frozen range: two values are indistinguishable once
+    /// `cos(pi * du) > 1 - tol`, i.e. once `du < sqrt(2 * tol) / pi`. At the
+    /// `1e-4` tolerance the discrimination measurement uses, that is
+    /// `du < 0.0045`, so a range 130 years wide cannot separate two events a
+    /// week apart. Freeze the range to the analysis window, not to the widest
+    /// representable value.
+    SynScalarRankArc { min_micros: i64, max_micros: i64 },
     /// Content-addressed categorical one-hot feature.
     SynOneHot { buckets: u32 },
     /// Signed feature hash in a power-of-two sparse space.
@@ -132,7 +165,7 @@ impl AlgorithmicEncoder {
         match self {
             Self::ByteFeatures => BYTE_FEATURE_DIM,
             Self::Scalar => 1,
-            Self::SynCyclicTime { .. } => 2,
+            Self::SynCyclicTime { .. } | Self::SynScalarRankArc { .. } => 2,
             Self::SynScalarRaw
             | Self::SynScalarLog1p
             | Self::SynScalarZScore { .. }
@@ -278,6 +311,7 @@ impl AlgorithmicEncoder {
             | Self::SynScalarLog1p
             | Self::SynScalarZScore { .. }
             | Self::SynScalarRank { .. }
+            | Self::SynScalarRankArc { .. }
             | Self::SynRecordVector { .. }
             | Self::SynBin { .. }
             | Self::SynOrdinal { .. }
@@ -331,6 +365,137 @@ impl AlgorithmicEncoder {
             Self::SynTokenSlots { token_dim } => SlotShape::Multi { token_dim },
             Self::SynRecordVector { dim } | Self::SynAggregation { dim } => SlotShape::Dense(dim),
             _ => SlotShape::Dense(self.dim()),
+        }
+    }
+
+    /// What this encoder's **dense cosine** can express, before any corpus is
+    /// consulted (#1963).
+    ///
+    /// Every neighbourhood analysis Calyx runs over a dense slot — find-similar
+    /// ranking, the agreement cross-term, the between-record graph, the
+    /// blind-spot rule, the guard's per-slot threshold — reads one number: the
+    /// cosine between two slot vectors. That number is only a *measurement*
+    /// when the encoder's image is rich enough to produce more than a handful
+    /// of values. For several encoders it provably is not, and no amount of
+    /// data changes that:
+    ///
+    /// * a dense vector of dimension 1 has cosine `sign(a * b)`, so at most two
+    ///   values, and exactly **one** when the encoder's output is confined to
+    ///   one sign — which is the case for every bounded `[0, 1]` transform;
+    /// * a one-hot or bin over `k` buckets returns cosine `1` for a shared
+    ///   bucket and `0` otherwise, whatever `k` is.
+    ///
+    /// #1963 found all five dense lenses on the active operator panel returning
+    /// nearest-neighbour cosine exactly `1.0` for all 924 records. Four of those
+    /// were corpus-driven saturation of a finite image; the fifth
+    /// (`syn_scalar_rank` at `dim = 1`) could never have returned anything else.
+    /// Declaring the distinction is what lets a panel refuse "I carry no graded
+    /// view" at admission rather than three analyses later.
+    ///
+    /// This is deliberately a statement about the **encoder**, not the corpus.
+    /// [`Graded`](DenseCosineGrading::Graded) means "the image is a continuum,
+    /// so grading is *possible*" — whether it is *realised* is a corpus fact
+    /// that only `calyx_loom::SimilarityDiscrimination` can answer.
+    pub const fn dense_cosine_grading(self) -> DenseCosineGrading {
+        match self.shape() {
+            // Sparse and multi-vector lanes are scored by overlap and late
+            // interaction, not by a fixed-dimension cosine: their image is the
+            // token set, which is a corpus property this declaration cannot and
+            // must not pre-judge.
+            SlotShape::Sparse(_) | SlotShape::Multi { .. } => DenseCosineGrading::NotDense,
+            SlotShape::Dense(dim) => match self {
+                // Bounded non-negative scalars: the image is a single ray, so
+                // cosine is identically +1 for every pair of records.
+                Self::SynScalarRank { .. }
+                | Self::SynOrdinal { .. }
+                | Self::SynFrequency { .. } => DenseCosineGrading::Constant,
+                // Signed scalars: the image is two opposite rays, so cosine is
+                // +1 or -1 and nothing between.
+                Self::Scalar
+                | Self::SynScalarRaw
+                | Self::SynScalarLog1p
+                | Self::SynScalarZScore { .. }
+                | Self::SynTargetMean { .. }
+                | Self::SynDelta { .. }
+                | Self::SynRate { .. } => DenseCosineGrading::Finite(2),
+                // Closed vocabularies: cosine is 1 on a shared bucket, 0
+                // otherwise, so the image is `buckets` orthogonal directions.
+                Self::OneHot { buckets } | Self::SynOneHot { buckets } => {
+                    DenseCosineGrading::Finite(if buckets == 0 { 1 } else { buckets })
+                }
+                Self::SynBin { buckets, .. } => {
+                    DenseCosineGrading::Finite(if buckets == 0 { 1 } else { buckets })
+                }
+                // A periodic encoder's declared domain is `period` positions on
+                // a cycle — an hour of the day, a day of the week — and every
+                // built-in caller passes exactly that: an integer position. So
+                // its similarity takes `period` values and saturates as soon as
+                // the record count exceeds them, which is why `hour_cyclic` and
+                // `dow_cyclic` both returned nearest-neighbour cosine 1.0 for
+                // all 924 records of #1963.
+                //
+                // A fractional input would reach more directions, so this is a
+                // bound on the *declared* use rather than on every reachable
+                // one. Under-stating is the safe direction for an admission
+                // gate: it can only make the gate stricter, never let a
+                // panel with no graded view through.
+                Self::SynCyclicTime { period } => {
+                    DenseCosineGrading::Finite(if period == 0 { 1 } else { period })
+                }
+                // Everything else with more than one dimension mixes its input
+                // continuously across components, so the reachable direction
+                // set is a continuum.
+                _ => {
+                    if dim <= 1 {
+                        DenseCosineGrading::Finite(2)
+                    } else {
+                        DenseCosineGrading::Graded
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// What an encoder's dense cosine can express before any corpus is consulted.
+///
+/// See [`AlgorithmicEncoder::dense_cosine_grading`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseCosineGrading {
+    /// Not a dense lane: grading is a corpus property, not an encoder one.
+    NotDense,
+    /// Cosine is identically `+1` for every pair. The lane carries no
+    /// similarity information at all and must never be offered as one.
+    Constant,
+    /// Cosine takes at most this many values, whatever the corpus. Usable, but
+    /// it saturates as soon as the record count exceeds the image size.
+    Finite(u32),
+    /// The image is a continuum, so a graded similarity is possible. Whether it
+    /// is realised over a given corpus is a separate, measured question.
+    Graded,
+}
+
+impl DenseCosineGrading {
+    /// Whether this lane can carry a graded similarity at all.
+    #[must_use]
+    pub const fn is_graded(self) -> bool {
+        matches!(self, Self::Graded)
+    }
+
+    /// Whether this lane provably carries no similarity information.
+    #[must_use]
+    pub const fn is_constant(self) -> bool {
+        matches!(self, Self::Constant)
+    }
+
+    /// A stable, human-readable name for error text and readbacks.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDense => "not_dense",
+            Self::Constant => "constant",
+            Self::Finite(_) => "finite",
+            Self::Graded => "graded",
         }
     }
 }
@@ -474,6 +639,26 @@ impl AlgorithmicLens {
             name,
             modality,
             AlgorithmicEncoder::SynScalarRank {
+                min_micros,
+                max_micros,
+            },
+        )
+    }
+
+    /// The graded-cosine sibling of [`Self::syn_scalar_rank`] (#1963).
+    ///
+    /// Read [`AlgorithmicEncoder::SynScalarRankArc`] before choosing the
+    /// bounds: the range is what sets the resolution.
+    pub fn syn_scalar_rank_arc(
+        name: impl Into<String>,
+        modality: Modality,
+        min_micros: i64,
+        max_micros: i64,
+    ) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynScalarRankArc {
                 min_micros,
                 max_micros,
             },
@@ -678,6 +863,10 @@ impl AlgorithmicLens {
                 min_micros,
                 max_micros,
             } => syn::scalar_rank(&input.bytes, min_micros, max_micros)?,
+            AlgorithmicEncoder::SynScalarRankArc {
+                min_micros,
+                max_micros,
+            } => syn::scalar_rank_arc(&input.bytes, min_micros, max_micros)?,
             AlgorithmicEncoder::SynOneHot { buckets } => syn::one_hot(&input.bytes, buckets)?,
             AlgorithmicEncoder::SynHash { dim } => syn::hash(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseText { dim } => syn::sparse_text(&input.bytes, dim)?,
@@ -768,7 +957,10 @@ fn algorithmic_contract(
 
 fn algorithmic_norm_policy(encoder: AlgorithmicEncoder) -> NormPolicy {
     match encoder {
-        AlgorithmicEncoder::SynRecordVector { .. } => NormPolicy::unit(),
+        // Both emit unit-length vectors by construction: the record vector
+        // normalizes explicitly, the rank arc lands on the unit circle.
+        AlgorithmicEncoder::SynRecordVector { .. }
+        | AlgorithmicEncoder::SynScalarRankArc { .. } => NormPolicy::unit(),
         _ => NormPolicy::None,
     }
 }

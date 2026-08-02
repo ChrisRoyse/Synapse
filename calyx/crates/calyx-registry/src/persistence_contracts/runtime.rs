@@ -170,6 +170,10 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
             min_micros: parse_i64(min_micros)?,
             max_micros: parse_i64(max_micros)?,
         },
+        ["syn_scalar_rank_arc", min_micros, max_micros] => AlgorithmicEncoder::SynScalarRankArc {
+            min_micros: parse_i64(min_micros)?,
+            max_micros: parse_i64(max_micros)?,
+        },
         ["syn_one_hot"] | ["syn_onehot"] => AlgorithmicEncoder::SynOneHot {
             buckets: dense_dim(spec.output)?,
         },
