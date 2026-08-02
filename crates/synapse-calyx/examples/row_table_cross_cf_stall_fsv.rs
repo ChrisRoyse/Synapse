@@ -54,6 +54,9 @@ use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::RowGuardSite;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::VaultId;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// Commits issued per phase. Each is one `write_cf_batch` of two `kv` rows —
 /// deliberately tiny, so any time it takes is wait rather than work. 40 is
@@ -63,7 +66,91 @@ const COMMITS_PER_PHASE: usize = 40;
 /// Rows per commit. #1950's production stall was a 2-18 row batch.
 const ROWS_PER_COMMIT: usize = 2;
 
+/// Per-commit lock-wait totals, scraped from the commit's own tracing event.
+///
+/// The commit path already measures which lock it waited on
+/// (`mvcc_row_lock_wait_us` vs `mvcc_router_lock_wait_us`) and emits both. A
+/// harness that only times the call from outside can say a commit was slow but
+/// not which of the vault's two global locks made it slow — and #1950 turns
+/// entirely on that distinction.
+#[derive(Default)]
+struct LockWaits {
+    row_us: AtomicU64,
+    router_us: AtomicU64,
+    row_max_us: AtomicU64,
+    router_max_us: AtomicU64,
+    commits: AtomicU64,
+}
+
+impl LockWaits {
+    fn reset(&self) {
+        self.row_us.store(0, Ordering::Relaxed);
+        self.router_us.store(0, Ordering::Relaxed);
+        self.row_max_us.store(0, Ordering::Relaxed);
+        self.router_max_us.store(0, Ordering::Relaxed);
+        self.commits.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.row_us.load(Ordering::Relaxed),
+            self.router_us.load(Ordering::Relaxed),
+            self.row_max_us.load(Ordering::Relaxed),
+            self.router_max_us.load(Ordering::Relaxed),
+            self.commits.load(Ordering::Relaxed),
+        )
+    }
+}
+
+static LOCK_WAITS: std::sync::LazyLock<LockWaits> = std::sync::LazyLock::new(LockWaits::default);
+
+#[derive(Default)]
+struct CommitVisitor {
+    row_us: Option<u64>,
+    router_us: Option<u64>,
+}
+
+impl Visit for CommitVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "mvcc_row_lock_wait_us" => self.row_us = Some(value),
+            "mvcc_router_lock_wait_us" => self.router_us = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+struct CommitLayer;
+
+impl<S: tracing::Subscriber> Layer<S> for CommitLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = CommitVisitor::default();
+        event.record(&mut visitor);
+        let (Some(row), Some(router)) = (visitor.row_us, visitor.router_us) else {
+            return;
+        };
+        LOCK_WAITS.row_us.fetch_add(row, Ordering::Relaxed);
+        LOCK_WAITS.router_us.fetch_add(router, Ordering::Relaxed);
+        LOCK_WAITS.row_max_us.fetch_max(row, Ordering::Relaxed);
+        LOCK_WAITS
+            .router_max_us
+            .fetch_max(router, Ordering::Relaxed);
+        LOCK_WAITS.commits.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Which of the vault's two global locks the commits actually waited on.
+fn report_waits(label: &str, waits: (u64, u64, u64, u64, u64)) {
+    let (row, router, row_max, router_max, commits) = waits;
+    println!(
+        "  {label:<12} events={commits:<4} row_lock_wait total={row:<9} us max={row_max:<9} us   router_lock_wait total={router:<9} us max={router_max} us"
+    );
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::registry().with(CommitLayer).init();
     let Some(root) = std::env::args().nth(1).map(PathBuf::from) else {
         return Err("usage: row_table_cross_cf_stall_fsv <vault-copy-dir>".into());
     };
@@ -103,8 +190,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- Phase A: the floor, with nothing else touching the row table ----
     println!("\n=== Phase A: {COMMITS_PER_PHASE} kv commits, no concurrent Base scan");
+    LOCK_WAITS.reset();
     let phase_a = commit_phase(&vault, 0)?;
+    let waits_a = LOCK_WAITS.snapshot();
     report("A baseline", &phase_a);
+    report_waits("A baseline", waits_a);
 
     // ---- Phase B: the same commits, with a Base scanner inside the guard ----
     println!("\n=== Phase B: the same commits, with scan_cf_latest(Base) running concurrently");
@@ -125,13 +215,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
     };
 
+    LOCK_WAITS.reset();
     let phase_b = commit_phase(&vault, COMMITS_PER_PHASE)?;
+    let waits_b = LOCK_WAITS.snapshot();
     stop.store(true, Ordering::Relaxed);
     scanner
         .join()
         .map_err(|_| "scanner thread panicked")?
         .map_err(|error| -> Box<dyn Error> { error.into() })?;
     report("B contended", &phase_b);
+    report_waits("B contended", waits_b);
     println!(
         "  concurrent Base scans completed = {}",
         scans.load(Ordering::Relaxed)

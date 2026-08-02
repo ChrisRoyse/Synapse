@@ -1,4 +1,4 @@
-use super::{RowGuardSite, RowTable, VersionChain, VersionedCfStore};
+use super::{RowGuardSite, VersionChain, VersionedCfStore};
 use crate::cf::ColumnFamily;
 use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotVersionGc};
 use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
@@ -45,11 +45,12 @@ impl VersionedCfStore {
 
 impl SnapshotVersionGc for VersionedCfStore {
     fn reclaim_snapshot_versions(&self, safe_point: Seq, max_versions: usize) -> Result<GcResult> {
-        let mut table = self.rows.write().expect("mvcc row table poisoned");
+        // Whole-table by nature: GC walks every version chain in the vault.
+        let mut table = self.write_rows_all("mvcc row table poisoned")?;
         let mut remaining = max_versions;
         let mut versions_reclaimed = 0usize;
         let mut bytes_freed = 0usize;
-        for versions in table.values_mut().flat_map(BTreeMap::values_mut) {
+        for versions in table.iter_mut().flat_map(|(_, rows)| rows.values_mut()) {
             if remaining == 0 {
                 break;
             }
@@ -58,7 +59,7 @@ impl SnapshotVersionGc for VersionedCfStore {
             versions_reclaimed += chain_reclaimed;
             bytes_freed += chain_bytes;
         }
-        let compaction_debt = snapshot_gc_debt_for_table(&table, safe_point);
+        let compaction_debt = snapshot_gc_debt_for_rows(table.iter(), safe_point);
         let result = GcResult {
             safe_point_seq: safe_point,
             versions_reclaimed,
@@ -71,8 +72,8 @@ impl SnapshotVersionGc for VersionedCfStore {
     }
 
     fn snapshot_gc_debt(&self, safe_point: Seq) -> u64 {
-        let table = self.read_rows(RowGuardSite::SnapshotGcDebt);
-        snapshot_gc_debt_for_table(&table, safe_point)
+        let table = self.read_rows_all(RowGuardSite::SnapshotGcDebt);
+        snapshot_gc_debt_for_rows(table.iter(), safe_point)
     }
 }
 
@@ -100,10 +101,14 @@ fn reclaim_chain(
     (reclaimed, bytes_freed)
 }
 
-fn snapshot_gc_debt_for_table(table: &RowTable, safe_point: Seq) -> u64 {
-    table
-        .values()
-        .flat_map(BTreeMap::values)
+/// Reclaimable versions across whatever set of column families the caller
+/// holds, rather than over one table value — the row table is sharded (#1950),
+/// so "the table" is now an iterator over the shards a guard covers.
+fn snapshot_gc_debt_for_rows<'a>(
+    rows: impl Iterator<Item = (&'a ColumnFamily, &'a BTreeMap<Vec<u8>, VersionChain>)>,
+    safe_point: Seq,
+) -> u64 {
+    rows.flat_map(|(_, cf_rows)| cf_rows.values())
         .map(|versions| reclaimable_versions(versions, safe_point) as u64)
         .sum()
 }

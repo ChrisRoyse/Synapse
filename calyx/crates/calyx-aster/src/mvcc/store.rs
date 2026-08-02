@@ -204,7 +204,80 @@ struct VersionedValue {
 }
 
 type VersionChain = Vec<VersionedValue>;
+/// The rows of every column family routed to **one shard** of the row table.
+///
+/// Before #1950 this was the whole table under one vault-wide lock. It keeps
+/// the same shape so that a call site holding a single shard's guard reads
+/// `table.get(&cf)` exactly as it always did.
 type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
+
+/// One shard per static column family, assigned by position in
+/// [`ColumnFamily::STATIC`].
+///
+/// **Positional, not hashed, and that is the point.** A generic
+/// hash-into-N-shards scheme would put some pair of column families in the same
+/// shard deterministically and forever; if that pair happened to be `Base` and
+/// `Kv`, #1950 would reproduce in full with no way to tell from the outside.
+/// Giving every static family its own shard makes "a `Base` scan cannot block a
+/// `Kv` commit" a property of the construction rather than of the hash.
+const ROW_STATIC_SHARDS: usize = ColumnFamily::STATIC.len();
+
+/// Shards shared by `Slot { .. }` families.
+///
+/// Slot ids are `u16`, so these cannot each get a shard the way the static
+/// families do. They are hashed into a fixed pool instead. Two slot families
+/// colliding is acceptable in a way a `Base`/`Kv` collision is not: slot writes
+/// arrive together in one batch already, and every slot scan is panel-scoped.
+const ROW_SLOT_SHARDS: usize = 16;
+
+/// Total shards. Fixed at construction and never resized, so the shard index is
+/// a pure function of the column family and there is no outer lock to take.
+///
+/// That absence is load-bearing. The obvious alternative — a map of column
+/// family to `Arc<RwLock<_>>` — requires holding an outer read guard while
+/// acquiring an inner one, and `std::sync::RwLock` is task-fair: a reader
+/// blocks when a writer is queued, so the nested acquisition can deadlock.
+const ROW_SHARDS: usize = ROW_STATIC_SHARDS + ROW_SLOT_SHARDS;
+
+/// The row table's shards, allocated once at construction.
+fn new_row_shards() -> Vec<RwLock<RowTable>> {
+    (0..ROW_SHARDS)
+        .map(|_| RwLock::new(BTreeMap::new()))
+        .collect()
+}
+
+/// Which shard owns a column family's rows.
+///
+/// Total and deterministic: every column family maps to exactly one shard, and
+/// the same family always maps to the same one, which is what lets a multi-CF
+/// writer order its acquisitions and lets a reader take exactly one lock.
+fn row_shard_index(cf: ColumnFamily) -> usize {
+    match cf {
+        ColumnFamily::Slot { slot, kind } => {
+            let kind_bit = match kind {
+                crate::cf::SlotFamilyKind::Quantized => 0_usize,
+                crate::cf::SlotFamilyKind::Raw => 1,
+            };
+            // `slot * 2 + kind` is dense and collision-free before the modulo,
+            // so the pool is used evenly without hashing.
+            ROW_STATIC_SHARDS + ((usize::from(slot.get()) * 2 + kind_bit) % ROW_SLOT_SHARDS)
+        }
+        static_cf => ColumnFamily::STATIC
+            .iter()
+            .position(|candidate| *candidate == static_cf)
+            .unwrap_or_else(|| {
+                // Unreachable by construction: `ColumnFamily` is a closed enum
+                // whose only non-STATIC variant is `Slot`, matched above. If a
+                // variant is ever added and left out of STATIC, routing it to a
+                // shared shard silently would reintroduce exactly the coarse
+                // locking #1950 removed, so it is loud instead.
+                panic!(
+                    "column family {} is neither Slot nor a member of ColumnFamily::STATIC; add it to STATIC so it gets its own row-table shard (#1950)",
+                    static_cf.name()
+                )
+            }),
+    }
+}
 
 /// How long a row-table **read** guard may be held before it is reported.
 ///
@@ -505,46 +578,173 @@ impl std::ops::Deref for TimedRowRead<'_> {
 
 impl Drop for TimedRowRead<'_> {
     fn drop(&mut self) {
-        let held_us = elapsed_us(&self.acquired);
-        if held_us < ROW_READ_GUARD_WARN_US {
-            // Still counted. The sub-budget path is the one #1952 ask 3 needed
-            // and could not see; skipping the census here would leave the
-            // instrument exactly as blind as the log it supplements. No second
-            // `thread_cpu_us()` syscall on this path — `starved` is only
-            // meaningful above four scheduler ticks anyway, so the common case
-            // pays one atomic add per counter and nothing else.
-            self.census.record(self.site, held_us, false, false);
-            return;
-        }
-        // CPU time actually burned while holding the guard. The difference
-        // between this and `held_us` is time the thread was not running, so
-        // `starved` distinguishes "this scan is slow" from "this thread was
-        // descheduled" — two conditions with completely different fixes
-        // (#1955).
-        let cpu_us = self
-            .acquired_cpu_us
-            .zip(thread_cpu_us())
-            .map(|(before, after)| after.saturating_sub(before));
-        // Deliberately a ratio rather than a fixed gap: a 30 ms hold that ran
-        // for 5 ms and a 3 s hold that ran for 500 ms are the same pathology.
-        //
-        // Only asserted above 4 scheduler ticks. Below that the quantisation in
-        // `thread_cpu_us` can make a fully-running thread look half-idle purely
-        // by rounding, and a starvation flag that fires on rounding is worse
-        // than none.
-        let starved = held_us >= 4 * WINDOWS_SCHEDULER_TICK_US
-            && cpu_us.is_some_and(|cpu| cpu.saturating_mul(2) < held_us);
-        self.census.record(self.site, held_us, true, starved);
-        tracing::warn!(
-            code = "CALYX_ASTER_ROW_READ_GUARD_SLOW",
-            site = self.site.as_str(),
-            held_us,
-            cpu_us,
-            starved,
-            budget_us = ROW_READ_GUARD_WARN_US,
-            "row-table read guard held long enough to stall every commit waiting for the write lock"
-        );
+        record_row_guard_hold(self.census, self.site, self.acquired, self.acquired_cpu_us);
     }
+}
+
+/// A read guard over **every** shard, for the few call sites whose question
+/// genuinely spans column families (a mixed `read_batch`, the snapshot-GC debt
+/// sweep).
+///
+/// Shards are locked in index order, which is the same order every multi-shard
+/// writer uses, so these cannot deadlock against a commit.
+///
+/// One census hold is recorded for the whole set rather than one per shard: the
+/// thing #1952's census answers is "did this call site run, and for how long",
+/// and a site that takes 52 locks at once ran once.
+struct TimedRowReadAll<'a> {
+    guards: Vec<std::sync::RwLockReadGuard<'a, RowTable>>,
+    site: RowGuardSite,
+    census: &'a RowGuardCensus,
+    acquired: Instant,
+    acquired_cpu_us: Option<u64>,
+}
+
+impl TimedRowReadAll<'_> {
+    /// The rows of one column family, from whichever shard owns it.
+    fn cf(&self, cf: ColumnFamily) -> Option<&BTreeMap<Vec<u8>, VersionChain>> {
+        self.guards
+            .get(row_shard_index(cf))
+            .and_then(|g| g.get(&cf))
+    }
+
+    /// Every column family in the table, across all shards.
+    fn iter(&self) -> impl Iterator<Item = (&ColumnFamily, &BTreeMap<Vec<u8>, VersionChain>)> {
+        self.guards.iter().flat_map(|guard| guard.iter())
+    }
+}
+
+impl Drop for TimedRowReadAll<'_> {
+    fn drop(&mut self) {
+        record_row_guard_hold(self.census, self.site, self.acquired, self.acquired_cpu_us);
+    }
+}
+
+/// A write guard over a chosen set of shards, held in shard-index order.
+///
+/// **The ordering is the deadlock argument.** `ColumnFamily` is `Ord` and
+/// `row_shard_index` is a pure function of it, so every writer that needs
+/// several shards acquires them in the same total order; two commits with
+/// overlapping shard sets therefore cannot each hold what the other wants.
+struct RowWriteSet<'a> {
+    /// `(shard_index, guard)`, ascending by shard index.
+    guards: Vec<(usize, std::sync::RwLockWriteGuard<'a, RowTable>)>,
+}
+
+impl RowWriteSet<'_> {
+    fn slot(&self, shard: usize) -> Option<usize> {
+        self.guards
+            .binary_search_by_key(&shard, |(index, _)| *index)
+            .ok()
+    }
+
+    /// The rows of one column family, or `None` when this writer did not lock
+    /// the shard that owns it.
+    ///
+    /// `None` is deliberately not the same as "the family is empty". A caller
+    /// that reads a family it did not lock is a bug in the lock set, and every
+    /// such read here fails closed rather than reporting an absence.
+    fn cf(&self, cf: ColumnFamily) -> Option<&BTreeMap<Vec<u8>, VersionChain>> {
+        let slot = self.slot(row_shard_index(cf))?;
+        self.guards[slot].1.get(&cf)
+    }
+
+    /// Whether this writer holds the shard owning `cf`.
+    fn holds(&self, cf: ColumnFamily) -> bool {
+        self.slot(row_shard_index(cf)).is_some()
+    }
+
+    /// The mutable rows of one column family, created if absent.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the shard owning `cf` is not in this writer's lock
+    /// set, because writing through a lock that was never taken is a data race
+    /// this type exists to prevent.
+    fn entry_mut(&mut self, cf: ColumnFamily) -> Result<&mut BTreeMap<Vec<u8>, VersionChain>> {
+        let shard = row_shard_index(cf);
+        let slot = self.slot(shard).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "MVCC commit tried to write {} but did not lock row-table shard {shard}; the batch's lock set was computed without this column family (#1950)",
+                cf.name()
+            ))
+        })?;
+        Ok(self.guards[slot].1.entry(cf).or_default())
+    }
+
+    /// Every column family this writer holds.
+    fn iter(&self) -> impl Iterator<Item = (&ColumnFamily, &BTreeMap<Vec<u8>, VersionChain>)> {
+        self.guards.iter().flat_map(|(_, guard)| guard.iter())
+    }
+
+    /// Every column family this writer holds, mutably.
+    fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&ColumnFamily, &mut BTreeMap<Vec<u8>, VersionChain>)> {
+        self.guards
+            .iter_mut()
+            .flat_map(|(_, guard)| guard.iter_mut())
+    }
+}
+
+/// The row-table shards one atomic commit must hold.
+///
+/// Every column family the batch writes, plus `Base` when the batch can reach
+/// `visible_base_panel` — that is, when it carries a `Base` row or a quantized
+/// `Slot` row. `search_panels_affected_by_batch` reads the table for nothing
+/// else, so a batch of `Kv`/`Ledger`/`TimeIndex` rows takes no `Base` lock at
+/// all, and no longer waits behind a `Base` scan (#1950).
+///
+/// Including `Base` unconditionally would be simpler and would silently undo
+/// the fix: the production stall this issue measured was exactly a
+/// `kv`/`raw_commitment`/`time_index` batch waiting on a `Base` reader.
+fn commit_lock_set(rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)]) -> Vec<ColumnFamily> {
+    let mut cfs: Vec<ColumnFamily> = rows.iter().map(|(cf, _, _)| *cf).collect();
+    if cfs.iter().any(|cf| {
+        matches!(
+            cf,
+            ColumnFamily::Base
+                | ColumnFamily::Slot {
+                    kind: crate::cf::SlotFamilyKind::Quantized,
+                    ..
+                }
+        )
+    }) {
+        cfs.push(ColumnFamily::Base);
+    }
+    cfs.sort_unstable();
+    cfs.dedup();
+    cfs
+}
+
+/// The shared tail of every row-guard `Drop`: tally the hold, and report it if
+/// it ran past the budget.
+fn record_row_guard_hold(
+    census: &RowGuardCensus,
+    site: RowGuardSite,
+    acquired: Instant,
+    acquired_cpu_us: Option<u64>,
+) {
+    let held_us = elapsed_us(&acquired);
+    if held_us < ROW_READ_GUARD_WARN_US {
+        census.record(site, held_us, false, false);
+        return;
+    }
+    let cpu_us = acquired_cpu_us
+        .zip(thread_cpu_us())
+        .map(|(before, after)| after.saturating_sub(before));
+    let starved = held_us >= 4 * WINDOWS_SCHEDULER_TICK_US
+        && cpu_us.is_some_and(|cpu| cpu.saturating_mul(2) < held_us);
+    census.record(site, held_us, true, starved);
+    tracing::warn!(
+        code = "CALYX_ASTER_ROW_READ_GUARD_SLOW",
+        site = site.as_str(),
+        held_us,
+        cpu_us,
+        starved,
+        budget_us = ROW_READ_GUARD_WARN_US,
+        "row-table read guard held long enough to stall every commit waiting for the write lock"
+    );
 }
 
 /// One CF/key read requested against a snapshot.
@@ -606,7 +806,11 @@ pub struct VersionedCfStore {
     /// published (#1841).
     panel_content_seqs: RwLock<BTreeMap<u32, Seq>>,
     next_lease_id: AtomicU64,
-    rows: RwLock<RowTable>,
+    /// The row table, split into [`ROW_SHARDS`] independently-locked shards
+    /// routed by [`row_shard_index`] (#1950).
+    ///
+    /// Fixed length, allocated once, never resized.
+    rows: Vec<RwLock<RowTable>>,
     router: RwLock<Option<CfRouter>>,
     router_latest_readback: AtomicBool,
     /// Earliest sequence after which the in-memory MVCC version chains are a
@@ -633,8 +837,10 @@ impl VersionedCfStore {
     /// Every row-table read goes through this or [`Self::try_read_rows`]; a
     /// bare `self.rows.read()` is a hold nothing can attribute, which is the
     /// state #1950 is stuck in.
-    fn read_rows(&self, site: RowGuardSite) -> TimedRowRead<'_> {
-        let guard = self.rows.read().expect("mvcc row table poisoned");
+    fn read_rows(&self, site: RowGuardSite, cf: ColumnFamily) -> TimedRowRead<'_> {
+        let guard = self.rows[row_shard_index(cf)]
+            .read()
+            .expect("mvcc row table poisoned");
         TimedRowRead {
             guard,
             site,
@@ -644,11 +850,75 @@ impl VersionedCfStore {
         }
     }
 
+    /// A read guard over every shard, for the call sites whose question spans
+    /// column families. Shards are taken in index order.
+    fn read_rows_all(&self, site: RowGuardSite) -> TimedRowReadAll<'_> {
+        let guards = self
+            .rows
+            .iter()
+            .map(|shard| shard.read().expect("mvcc row table poisoned"))
+            .collect();
+        TimedRowReadAll {
+            guards,
+            site,
+            census: &self.row_guard_census,
+            acquired: Instant::now(),
+            acquired_cpu_us: thread_cpu_us(),
+        }
+    }
+
+    /// Write guards for exactly the shards owning `cfs`, in shard-index order.
+    ///
+    /// Taking only what the batch touches is the whole of #1950: a commit to
+    /// `Kv` no longer waits behind a scan of `Base`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a corrupt-shard error when any shard's lock is poisoned.
+    fn write_rows_for(
+        &self,
+        cfs: impl IntoIterator<Item = ColumnFamily>,
+        poisoned: &str,
+    ) -> Result<RowWriteSet<'_>> {
+        let mut shards: Vec<usize> = cfs.into_iter().map(row_shard_index).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let mut guards = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let guard = self.rows[shard]
+                .write()
+                .map_err(|_| CalyxError::aster_corrupt_shard(poisoned.to_owned()))?;
+            guards.push((shard, guard));
+        }
+        Ok(RowWriteSet { guards })
+    }
+
+    /// Write guards for every shard, in index order. Used by the recovery and
+    /// GC paths, which are whole-table by nature.
+    ///
+    /// # Errors
+    ///
+    /// Returns a corrupt-shard error when any shard's lock is poisoned.
+    fn write_rows_all(&self, poisoned: &str) -> Result<RowWriteSet<'_>> {
+        let mut guards = Vec::with_capacity(self.rows.len());
+        for (shard, lock) in self.rows.iter().enumerate() {
+            let guard = lock
+                .write()
+                .map_err(|_| CalyxError::aster_corrupt_shard(poisoned.to_owned()))?;
+            guards.push((shard, guard));
+        }
+        Ok(RowWriteSet { guards })
+    }
+
     /// [`Self::read_rows`] for call sites that surface poisoning as an error
     /// rather than panicking.
-    fn try_read_rows(&self, site: RowGuardSite, poisoned: &str) -> Result<TimedRowRead<'_>> {
-        let guard = self
-            .rows
+    fn try_read_rows(
+        &self,
+        site: RowGuardSite,
+        cf: ColumnFamily,
+        poisoned: &str,
+    ) -> Result<TimedRowRead<'_>> {
+        let guard = self.rows[row_shard_index(cf)]
             .read()
             .map_err(|_| CalyxError::aster_corrupt_shard(poisoned.to_owned()))?;
         Ok(TimedRowRead {
@@ -677,7 +947,7 @@ impl VersionedCfStore {
             derived_content_seq: AtomicU64::new(0),
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
-            rows: RwLock::new(BTreeMap::new()),
+            rows: new_row_shards(),
             router: RwLock::new(None),
             router_latest_readback: AtomicBool::new(false),
             changed_key_history_floor: 0,
@@ -707,7 +977,7 @@ impl VersionedCfStore {
             derived_content_seq: AtomicU64::new(0),
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
-            rows: RwLock::new(BTreeMap::new()),
+            rows: new_row_shards(),
             router: RwLock::new(Some(router)),
             router_latest_readback: AtomicBool::new(router_latest_readback),
             changed_key_history_floor: if router_latest_readback { start_seq } else { 0 },
@@ -1037,6 +1307,21 @@ impl VersionedCfStore {
     /// observation with respect to commits. Latest-only recovery is supported:
     /// model-3 manifests provide its exact checkpointed panel baseline and WAL
     /// replay derives every later change.
+    ///
+    /// **Why the `Base` shard specifically (#1950).** The row table is sharded
+    /// per column family, so a read guard no longer excludes every commit — it
+    /// excludes commits that touch the shard it holds. That is exactly the set
+    /// that matters here: `search_panels_affected_by_batch` derives
+    /// `affected_panels` only from `Base` rows and quantized `Slot` rows, and
+    /// `advance_affected_panel_content_seqs` is a no-op on an empty set, so a
+    /// commit can only move a panel watermark if its lock set includes the
+    /// `Base` shard (`commit_lock_set` guarantees it does).
+    ///
+    /// A commit that touches neither — a `Kv`/`Ledger` batch — may now allocate
+    /// a sequence concurrently with this call. That is safe in the direction
+    /// that matters: it can only make the observed `seq` *older* than the true
+    /// latest, never make `panel_content_seq` exceed `seq`, which is the
+    /// invariant a stale index would need in order to pass.
     pub fn pin_snapshot_for_panel(
         &self,
         panel_version: u32,
@@ -1046,6 +1331,7 @@ impl VersionedCfStore {
     ) -> Result<Snapshot> {
         let _table = self.try_read_rows(
             RowGuardSite::PinSnapshotForPanel,
+            ColumnFamily::Base,
             "MVCC row-table lock was poisoned while pinning panel search freshness",
         )?;
         let seq = self.current_seq();
@@ -1071,9 +1357,14 @@ impl VersionedCfStore {
     /// publication clamps these values to its durable sequence before writing
     /// them, so observing a newer concurrent commit can only conservatively
     /// overstate a panel watermark, never accept a stale index (#1841).
+    ///
+    /// Holds the `Base` shard for the same reason [`Self::pin_snapshot_for_panel`]
+    /// does: only a `Base`/`Slot`-bearing commit can move these watermarks, and
+    /// only such a commit locks that shard (#1950).
     pub(crate) fn panel_content_seqs_snapshot(&self) -> Result<BTreeMap<u32, Seq>> {
         let _table = self.try_read_rows(
             RowGuardSite::PanelContentSeqsSnapshot,
+            ColumnFamily::Base,
             "MVCC row-table lock was poisoned while snapshotting panel watermarks",
         )?;
         self.panel_content_seqs
@@ -1112,8 +1403,11 @@ impl VersionedCfStore {
         floor: Seq,
         active_panel_version: Option<u32>,
     ) -> Result<()> {
+        // Reads restored `Base` history and excludes concurrent panel-moving
+        // commits; both are the `Base` shard (#1950).
         let table = self.try_read_rows(
             RowGuardSite::MigratePanelContentSeqsToAtLeast,
+            ColumnFamily::Base,
             "MVCC row-table lock was poisoned while migrating panel watermarks",
         )?;
         let mut panels = self
@@ -1282,9 +1576,10 @@ impl VersionedCfStore {
         timings.rows = u32::try_from(rows.len()).unwrap_or(u32::MAX);
 
         let row_lock_started = Instant::now();
-        let mut table = self.rows.write().map_err(|_| {
-            CalyxError::aster_corrupt_shard("MVCC row-table lock was poisoned during atomic commit")
-        })?;
+        let mut table = self.write_rows_for(
+            commit_lock_set(&rows),
+            "MVCC row-table lock was poisoned during atomic commit",
+        )?;
         timings.row_lock_wait_us = elapsed_us(&row_lock_started);
         let router_lock_started = Instant::now();
         let mut router = self.router.write().map_err(|_| {
@@ -1326,8 +1621,7 @@ impl VersionedCfStore {
         let row_apply_started = Instant::now();
         for (cf, key, value) in &rows {
             table
-                .entry(*cf)
-                .or_default()
+                .entry_mut(*cf)?
                 .entry(key.clone())
                 .or_default()
                 .push(VersionedValue {
@@ -1540,11 +1834,9 @@ impl VersionedCfStore {
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
-        let mut table = self.rows.write().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC row-table lock was poisoned during atomic recovery restore",
-            )
-        })?;
+        // Recovery is whole-table by nature and runs single-threaded at open.
+        let mut table =
+            self.write_rows_all("MVCC row-table lock was poisoned during atomic recovery restore")?;
         let router = self.router.read().map_err(|_| {
             CalyxError::aster_corrupt_shard(
                 "MVCC router lock was poisoned during atomic recovery restore",
@@ -1575,8 +1867,7 @@ impl VersionedCfStore {
         self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
         for (cf, key, value) in rows {
             table
-                .entry(cf)
-                .or_default()
+                .entry_mut(cf)?
                 .entry(key)
                 .or_default()
                 .push(VersionedValue { seq, value });
@@ -1639,11 +1930,9 @@ impl VersionedCfStore {
                 "recovered MVCC batches must have strictly increasing sequences at or below final sequence {final_seq}"
             )));
         }
-        let mut table = self.rows.write().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC row-table lock was poisoned during atomic recovery restore",
-            )
-        })?;
+        // Recovery is whole-table by nature and runs single-threaded at open.
+        let mut table =
+            self.write_rows_all("MVCC row-table lock was poisoned during atomic recovery restore")?;
         let router = self.router.read().map_err(|_| {
             CalyxError::aster_corrupt_shard(
                 "MVCC router lock was poisoned during recovered-batch publication",
@@ -1690,8 +1979,7 @@ impl VersionedCfStore {
             self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
             for (cf, key, value) in rows {
                 table
-                    .entry(cf)
-                    .or_default()
+                    .entry_mut(cf)?
                     .entry(key)
                     .or_default()
                     .push(VersionedValue { seq, value });
@@ -1721,7 +2009,7 @@ impl VersionedCfStore {
     /// row table. Recovery-time physical coverage checks only (issue #1132);
     /// snapshot reads must keep using the seq-visible accessors.
     pub(crate) fn has_any_version(&self, cf: ColumnFamily, key: &[u8]) -> bool {
-        self.rows
+        self.rows[row_shard_index(cf)]
             .read()
             .expect("mvcc row table poisoned")
             .get(&cf)
@@ -1814,7 +2102,7 @@ enum PanelAttribution {
 }
 
 fn search_panels_affected_by_batch(
-    table: &RowTable,
+    table: &RowWriteSet<'_>,
     latest_router: Option<&CfRouter>,
     visible_seq: Seq,
     rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
@@ -1946,13 +2234,21 @@ fn search_panels_affected_by_batch(
 }
 
 fn visible_base_panel(
-    table: &RowTable,
+    table: &RowWriteSet<'_>,
     latest_router: Option<&CfRouter>,
     key: &[u8],
     seq: Seq,
 ) -> Result<Option<u32>> {
+    // Fails closed rather than reading an absence: `commit_lock_set` puts the
+    // `Base` shard in every lock set that can reach here, so a miss means the
+    // lock set was computed wrong, not that the row is gone (#1950).
+    if !table.holds(ColumnFamily::Base) {
+        return Err(CalyxError::aster_corrupt_shard(
+            "panel attribution needs visible Base rows but the commit did not lock the Base row-table shard; the batch's lock set is wrong (#1950)",
+        ));
+    }
     let version = table
-        .get(&ColumnFamily::Base)
+        .cf(ColumnFamily::Base)
         .and_then(|base| base.get(key))
         .and_then(|versions| versions.iter().rev().find(|version| version.seq <= seq));
     if let Some(version) = version {
