@@ -45,6 +45,10 @@ pub enum AlgorithmicEncoder {
     SynMultiHot { dim: u32 },
     /// Unit-normalized structured numeric record vector.
     SynRecordVector { dim: u32 },
+    /// Unit-normalized structured numeric record vector that requires every
+    /// field on a comparable scale in `[-1, 1]` and refuses anything else
+    /// (#1964).
+    SynRecordVectorUnitFields { dim: u32 },
     /// Frozen numeric bin one-hot feature with micro-unit bounds.
     SynBin {
         buckets: u32,
@@ -102,6 +106,7 @@ impl AlgorithmicEncoder {
             | Self::SynSparseTextTf { dim }
             | Self::SynMultiHot { dim }
             | Self::SynRecordVector { dim }
+            | Self::SynRecordVectorUnitFields { dim }
             | Self::SynCross { dim }
             | Self::SynAggregation { dim } => {
                 if dim == 0 {
@@ -124,7 +129,9 @@ impl AlgorithmicEncoder {
             | Self::SynMultiHot { dim }
             | Self::SynCross { dim } => SlotShape::Sparse(if dim == 0 { 1 } else { dim }),
             Self::SynTokenSlots { token_dim } => SlotShape::Multi { token_dim },
-            Self::SynRecordVector { dim } | Self::SynAggregation { dim } => SlotShape::Dense(dim),
+            Self::SynRecordVector { dim }
+            | Self::SynRecordVectorUnitFields { dim }
+            | Self::SynAggregation { dim } => SlotShape::Dense(dim),
             _ => SlotShape::Dense(self.dim()),
         }
     }
@@ -231,6 +238,20 @@ impl AlgorithmicLens {
 
     pub fn syn_record_vector(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::SynRecordVector { dim })
+    }
+
+    /// A record vector that refuses a field handed over in its own raw units
+    /// (#1964).
+    pub fn syn_record_vector_unit_fields(
+        name: impl Into<String>,
+        modality: Modality,
+        dim: u32,
+    ) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynRecordVectorUnitFields { dim },
+        )
     }
 
     pub fn syn_bin(
@@ -359,6 +380,9 @@ impl AlgorithmicLens {
             }
             AlgorithmicEncoder::SynMultiHot { dim } => syn::multi_hot(&input.bytes, dim)?,
             AlgorithmicEncoder::SynRecordVector { dim } => syn::record_vector(&input.bytes, dim)?,
+            AlgorithmicEncoder::SynRecordVectorUnitFields { dim } => {
+                syn::record_vector_unit_fields(&input.bytes, dim)?
+            }
             AlgorithmicEncoder::SynBin {
                 buckets,
                 min_micros,

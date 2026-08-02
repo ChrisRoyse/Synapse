@@ -112,7 +112,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let flush_ssts_written = flush_ssts(&dir);
     println!("  latest_seq after write   = {seq_after_write}");
     println!("  flush-*.sst on disk      = {}", flush_ssts_written.len());
-    println!("  durable-batch/compacted  = {}", commit_domain_ssts(&dir).len());
+    println!(
+        "  durable-batch/compacted  = {}",
+        commit_domain_ssts(&dir).len()
+    );
     println!("  wal segments             = {}", wal_files(&dir).len());
     if flush_ssts_written.is_empty() {
         failures.push(

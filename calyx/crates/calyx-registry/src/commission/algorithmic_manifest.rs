@@ -222,10 +222,12 @@ fn syn_output_shape(kind: &str, dim: u32) -> Result<Option<SlotShape>> {
                 token_dim: checked_power_of_two(kind, parsed)?,
             }
         }
-        ["syn_record_vector"] | ["syn_aggregation"] => {
+        ["syn_record_vector"] | ["syn_record_vector_unit_fields"] | ["syn_aggregation"] => {
             SlotShape::Dense(checked_positive(kind, dim)?)
         }
-        ["syn_record_vector", parsed] | ["syn_aggregation", parsed] => {
+        ["syn_record_vector", parsed]
+        | ["syn_record_vector_unit_fields", parsed]
+        | ["syn_aggregation", parsed] => {
             let parsed = parse_u32_value(kind, parsed)?;
             checked_match(kind, dim, parsed)?;
             SlotShape::Dense(checked_positive(kind, parsed)?)
@@ -309,6 +311,12 @@ fn syn_encoder_from_kind(kind: &str, shape: SlotShape) -> Result<Option<Algorith
             dim: dense_shape_dim(kind, shape)?,
         },
         ["syn_record_vector", dim] => AlgorithmicEncoder::SynRecordVector {
+            dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_record_vector_unit_fields"] => AlgorithmicEncoder::SynRecordVectorUnitFields {
+            dim: dense_shape_dim(kind, shape)?,
+        },
+        ["syn_record_vector_unit_fields", dim] => AlgorithmicEncoder::SynRecordVectorUnitFields {
             dim: parse_u32_value(kind, dim)?,
         },
         ["syn_bin", min_micros, max_micros] => AlgorithmicEncoder::SynBin {

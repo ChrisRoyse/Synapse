@@ -70,7 +70,19 @@ pub const SYN_EPISODE_PANEL_NAME: &str = "syn-episode-v1";
 /// the authoritative `CF_EPISODES` rows. Adding the slot without bumping this
 /// now fails closed with `CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE` (#1903) rather
 /// than being dropped.
-pub const SYN_EPISODE_PANEL_VERSION: u32 = 1_904_002;
+pub const SYN_EPISODE_PANEL_VERSION: u32 = 1_964_001;
+/// The episode generation superseded by #1964.
+///
+/// `syn.episode.record_vector.v1` (slot 22) fed `start_unix_ms` and
+/// `end_unix_ms` — ~1.7e12 — beside counts in `0..1e4`. `syn_record_vector`
+/// weights each field by its raw magnitude and unit-normalizes, so the vector
+/// was a re-encoding of the episode's clock and every other field sat ~1e-9
+/// below it, far under `f32` resolution. Measured over all 171 stored slot-22
+/// vectors on the live vault: nearest-neighbour cosine `1.000000` for every
+/// record, `distinct = 1`. The generation is superseded rather than edited
+/// because a frozen lens never changes meaning: slot 22's rows still decode as
+/// what they were measured as.
+pub const SYN_EPISODE_PANEL_VERSION_PRE_1964: u32 = 1_904_002;
 /// The episode layout #1904 superseded.
 pub const SYN_EPISODE_PANEL_VERSION_PRE_1904: u32 = 1_664_002;
 pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
@@ -163,7 +175,7 @@ const RECENCY_BASIS_EVENT_TIME_RANK: &str = "frozen_event_unix_ms_rank_1970_2100
 /// `u16` and `cf/slot_<id>` directories are named from it, so there is ample
 /// headroom. Raise it when a new panel block needs room; the compile-time
 /// assertion on `PANEL_SLOT_BLOCKS` keeps the two in agreement.
-const CALYX_DURABLE_SLOT_ID_MAX: u16 = 112;
+const CALYX_DURABLE_SLOT_ID_MAX: u16 = 124;
 const MAX_EXACT_F64_INT: u64 = 9_007_199_254_740_991;
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -229,7 +241,19 @@ const EP_SLOT_ROW_COUNT_ZSCORE: SlotId = SlotId::new(18);
 const EP_SLOT_STARTED_BOUNDARY_ONEHOT: SlotId = SlotId::new(19);
 const EP_SLOT_ENDED_BOUNDARY_ONEHOT: SlotId = SlotId::new(20);
 const EP_SLOT_INTERRUPTION_RATIO: SlotId = SlotId::new(21);
-const EP_SLOT_RECORD_VECTOR: SlotId = SlotId::new(22);
+// Slot 22 was `syn.episode.record_vector.v1`, superseded by #1964 — see
+// [`SYN_EPISODE_PANEL_VERSION_PRE_1964`]. Its id stays inside the episode
+// block below so nothing else can claim `cf/slot_22`, and its rows keep
+// decoding as what they were measured as.
+/// The episode panel's graded dense lens (#1964), measured by
+/// `syn_record_vector_unit_fields` over [`episode_numeric_record`], every field
+/// of which is on a comparable scale in `[0, 1]`.
+///
+/// A new id rather than a re-use of 22: a slot id names one physical global
+/// column family, and writing a differently-meaning vector into `cf/slot_22`
+/// would leave one CF holding two incomparable populations that every search
+/// rebuild, cross-term and assay scans as one.
+const EP_SLOT_RECORD_VECTOR: SlotId = SlotId::new(113);
 /// Raw term-frequency lexical lane over the same title text
 /// `EP_SLOT_TITLE_SPARSE` hashes (#1904). The episode panel's `8..=22` is boxed
 /// in by the agent-event panel at 23, so this is a second block.
@@ -521,6 +545,15 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_EPISODE_PANEL_NAME,
         first: 108,
         last: 108,
+    },
+    // The episode panel's third block (#1964). Holds
+    // `EP_SLOT_RECORD_VECTOR` (113). 108 could not be extended because 109
+    // belongs to the agent-transcript panel and a block is contiguous by
+    // construction.
+    PanelSlotBlock {
+        panel: SYN_EPISODE_PANEL_NAME,
+        first: 113,
+        last: 113,
     },
     PanelSlotBlock {
         panel: SYN_AGENT_EVENT_PANEL_NAME,
@@ -1834,7 +1867,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         EP_SLOT_INTERRUPTION_RATIO,
         "syn.episode.interruption_ratio_raw.v1",
     ),
-    (EP_SLOT_RECORD_VECTOR, "syn.episode.record_vector.v1"),
+    (EP_SLOT_RECORD_VECTOR, "syn.episode.record_vector.v2"),
     (AE_SLOT_KIND_ONEHOT, "syn.agent_event.kind_onehot.v1"),
     (
         AE_SLOT_OPERATION_ONEHOT,
@@ -2360,7 +2393,10 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_EPISODES),
             outcome_bearing: true,
             source_ttl_managed: false,
-            superseded_versions: &[SYN_EPISODE_PANEL_VERSION_PRE_1904],
+            superseded_versions: &[
+                SYN_EPISODE_PANEL_VERSION_PRE_1964,
+                SYN_EPISODE_PANEL_VERSION_PRE_1904,
+            ],
             backfill_source_cf: Some(cf::CF_EPISODES),
         },
         PanelCatalogEntry {
@@ -2546,7 +2582,7 @@ pub fn build_timeline_constellation(
         TL_SLOT_RECORD_VECTOR,
         measure_json(
             SYN_TIMELINE_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
+            AlgorithmicLens::syn_record_vector_unit_fields(
                 "syn.timeline.record_vector.v1",
                 Modality::Structured,
                 TL_RECORD_VECTOR_DIM,
@@ -2765,10 +2801,10 @@ pub fn build_episode_constellation(
         EP_SLOT_RECORD_VECTOR,
         measure_json(
             SYN_EPISODE_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.episode.record_vector.v1",
+            AlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.episode.record_vector.v2",
                 Modality::Structured,
-                64,
+                EP_RECORD_VECTOR_DIM,
             ),
             &episode_numeric_record(record),
         )?,
@@ -3033,6 +3069,7 @@ pub fn syn_content_slot(
     panel_version: u32,
     registry: &mut Registry,
 ) -> StorageResult<Slot> {
+    reject_magnitude_weighted_record_vector(slot_id, slot_key, &lens, panel_version)?;
     let grading = lens.encoder().dense_cosine_grading();
     if grading.is_constant() {
         return Err(panel_lifecycle_error(
@@ -3049,6 +3086,97 @@ pub fn syn_content_slot(
         ));
     }
     syn_slot(slot_id, slot_key, lens, panel_version, registry, false)
+}
+
+/// Panel generations that still carry a legacy magnitude-weighted
+/// `syn_record_vector` content slot, each with the row count #1964 measured as
+/// tied at nearest-neighbour cosine `1.000000`.
+///
+/// **This list may only shrink.** It is not a permission to keep writing the
+/// defect; it names the generations that already have rows measured with it and
+/// cannot be re-measured, because their panel declares
+/// `backfill_source_cf: None` — there is no path that can rebuild those
+/// constellations, so bumping the generation would strand every row on a
+/// version nothing reads, permanently. Adding a backfill path is what removes
+/// an entry from here; #1965 tracks that work.
+///
+/// A generation *not* in this list may not use `SynRecordVector` for a content
+/// slot at all, which is what makes the #1964 defect unreachable for anything
+/// new.
+const RECORD_VECTOR_MAGNITUDE_GRANDFATHERED: &[(u32, &str, u64)] = &[
+    (SYN_AGENT_EVENT_PANEL_VERSION, "syn-agent-event-v1", 8_004),
+    (
+        SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        "syn-agent-transcript-v1",
+        84_113,
+    ),
+    (SYN_ACTION_PANEL_VERSION, "syn-action-v1", 1_089),
+    (SYN_REFLEX_PANEL_VERSION, "syn-reflex-v1", 5),
+    (SYN_PROCESS_PANEL_VERSION, "syn-process-v1", 4),
+    (SYN_OBSERVATION_PANEL_VERSION, "syn-observation-v1", 2),
+    (SYN_OUTCOME_PANEL_VERSION, "syn-outcome-v1", 18),
+    (SYN_MCP_USAGE_PANEL_VERSION, "syn-mcp-usage-v1", 9_842),
+];
+
+/// Refuses a content slot whose record vector weights fields by raw magnitude
+/// (#1964).
+///
+/// `syn_record_vector` places each numeric field at `hash(path) % dim`,
+/// multiplies by the field's **raw value**, and unit-normalizes. Whichever field
+/// carries the largest units therefore owns the direction. Nine built-in lanes
+/// fed a unix-millisecond timestamp (~1.7e12) beside counts and flags in
+/// `0..1e5`, which leaves every other field ~1e-9 of the norm — nine orders of
+/// magnitude below `f32::EPSILON`, so those fields are not merely small in the
+/// cosine, they are unrepresentable in it. Measured over the stored slot vectors
+/// on the live vault, all nine returned nearest-neighbour cosine exactly
+/// `1.000000` for every record.
+///
+/// The encoder that replaces it, `syn_record_vector_unit_fields`, refuses any
+/// field outside `[-1, 1]` at measure time. This gate is the second half: it
+/// stops a *panel* from declaring the legacy encoder as a similarity lane in the
+/// first place, so the defect cannot be reintroduced by a new slot that merely
+/// looks like the old one.
+fn reject_magnitude_weighted_record_vector(
+    slot_id: SlotId,
+    slot_key: &str,
+    lens: &RegistryAlgorithmicLens,
+    panel_version: u32,
+) -> StorageResult<()> {
+    if !matches!(
+        lens.encoder(),
+        RegistryAlgorithmicEncoder::SynRecordVector { .. }
+    ) {
+        return Ok(());
+    }
+    if let Some((_, panel, rows)) = RECORD_VECTOR_MAGNITUDE_GRANDFATHERED
+        .iter()
+        .find(|(version, ..)| *version == panel_version)
+    {
+        tracing::warn!(
+            slot_id = slot_id.get(),
+            slot_key,
+            panel,
+            panel_version,
+            tied_rows = rows,
+            "panel carries a magnitude-weighted record vector (#1964): its nearest-neighbour \
+             cosine is 1.000000 for every stored row, so this lane cannot rank. It is \
+             grandfathered only because the panel has no backfill path (#1965)"
+        );
+        return Ok(());
+    }
+    Err(panel_lifecycle_error(
+        "CALYX_PANEL_RECORD_VECTOR_MAGNITUDE_WEIGHTED",
+        &format!(
+            "content slot {slot_id} key {slot_key} on panel {panel_version} uses \
+             syn_record_vector, which weights every numeric field by its raw magnitude and then \
+             unit-normalizes: the field with the largest units owns the direction and the rest \
+             fall below f32 resolution. Measured on the live vault, all nine built-in lanes doing \
+             this returned nearest-neighbour cosine 1.000000 for every record (#1964)"
+        ),
+        "measure with syn_record_vector_unit_fields and place every field on a comparable scale \
+         in [-1, 1] first — a timestamp as a day/week fraction, a count or byte length as \
+         ln(1+n)/ln(1+scale), a part as a ratio of its whole",
+    ))
 }
 
 /// Builds one `Active`, **retrieval-only** panel slot (#1963).
@@ -3160,6 +3288,9 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
         RegistryAlgorithmicEncoder::SynMultiHot { dim } => format!("syn_multi_hot:{dim}"),
         RegistryAlgorithmicEncoder::SynRecordVector { dim } => {
             format!("syn_record_vector:{dim}")
+        }
+        RegistryAlgorithmicEncoder::SynRecordVectorUnitFields { dim } => {
+            format!("syn_record_vector_unit_fields:{dim}")
         }
         RegistryAlgorithmicEncoder::SynBin {
             buckets,
@@ -3487,7 +3618,7 @@ fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageR
         syn_content_slot(
             TL_SLOT_RECORD_VECTOR,
             "syn.timeline.record_vector.v1",
-            RegistryAlgorithmicLens::syn_record_vector(
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
                 "syn.timeline.record_vector.v1",
                 Modality::Structured,
                 TL_RECORD_VECTOR_DIM,
@@ -3673,11 +3804,11 @@ fn episode_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRe
         )?,
         syn_content_slot(
             EP_SLOT_RECORD_VECTOR,
-            "syn.episode.record_vector.v1",
-            RegistryAlgorithmicLens::syn_record_vector(
-                "syn.episode.record_vector.v1",
+            "syn.episode.record_vector.v2",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.episode.record_vector.v2",
                 Modality::Structured,
-                64,
+                EP_RECORD_VECTOR_DIM,
             ),
             panel_version,
             registry,
@@ -6562,7 +6693,10 @@ fn timeline_numeric_record(record: &TimelineRecord, raw_bytes: &[u8]) -> Value {
         "title_len_norm": log_len_norm(&title, TL_TITLE_LEN_SCALE),
         "has_url_host": present_fraction(&url_host),
         "url_host_len_norm": log_len_norm(&url_host, TL_URL_HOST_LEN_SCALE),
-        "raw_len_norm": (1.0 + raw_bytes.len() as f64).ln() / (1.0 + TL_RAW_LEN_SCALE).ln(),
+        "raw_len_norm": count_norm(
+            u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+            TL_RAW_LEN_SCALE,
+        ),
     })
 }
 
@@ -6606,20 +6740,97 @@ fn present_fraction(value: &str) -> f64 {
 /// title is not four times the record a 100-character one is, and a linear scale
 /// would let one outlier dominate the whole vector's direction.
 fn log_len_norm(value: &str, scale: f64) -> f64 {
-    (1.0 + value.chars().count() as f64).ln() / (1.0 + scale).ln()
+    count_norm(
+        u64::try_from(value.chars().count()).unwrap_or(u64::MAX),
+        scale,
+    )
 }
 
+/// A count, byte length or duration mapped into `[0, 1]` by
+/// `ln(1+n) / ln(1+scale)`, clamped at the top.
+///
+/// Log rather than linear because these are heavy-tailed: a 40-minute episode
+/// is not forty times the episode a one-minute one is, and on a linear scale one
+/// outlier would own the whole vector's direction — the #1964 defect in
+/// miniature. Clamping is deliberate winsorization: above `scale` the field
+/// saturates and stops discriminating, which is an explicit, documented loss at
+/// the tail rather than a silent takeover of every other field.
+fn count_norm(value: u64, scale: f64) -> f64 {
+    debug_assert!(scale > 0.0, "count_norm scale must be positive");
+    ((1.0 + value as f64).ln() / (1.0 + scale).ln()).clamp(0.0, 1.0)
+}
+
+/// Position within the day, in `[0, 1)`.
+///
+/// This is how a timestamp enters a record vector. The absolute instant must
+/// not: it is a serial number seven orders of magnitude above every other field,
+/// and #1964 measured what that does. Time-of-day is a genuine property of the
+/// activity; the epoch offset is a property of the clock.
+fn day_fraction_of(ts_ns: u64) -> f64 {
+    ((ts_ns / NS_PER_SEC) % SECS_PER_DAY) as f64 / SECS_PER_DAY as f64
+}
+
+/// Position within the week, in `[0, 1)`. See [`day_fraction_of`].
+fn week_fraction_of(ts_ns: u64) -> f64 {
+    const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
+    ((ts_ns / NS_PER_SEC) % SECS_PER_WEEK) as f64 / SECS_PER_WEEK as f64
+}
+
+/// A part-of-whole ratio clamped into `[0, 1]`, `0.0` when the whole is empty.
+fn ratio_norm(part: f64, whole: f64) -> f64 {
+    if whole <= 0.0 || !part.is_finite() || !whole.is_finite() {
+        0.0
+    } else {
+        (part / whole).clamp(0.0, 1.0)
+    }
+}
+
+/// Frozen scales for [`episode_numeric_record`], one per field.
+///
+/// Each is the order of magnitude at which the field stops discriminating, not
+/// a maximum: a 4-hour episode and an 8-hour episode both read ~1.0 on
+/// `EP_DURATION_SCALE_MS`, and that is the intended statement.
+/// Dimension of the episode record vector.
+///
+/// [`episode_numeric_record`] emits 11 fields, which the encoder places by a
+/// signed hash of the field path. 64 buckets keeps the expected collision count
+/// well under one; a collision merges two already-normalized components rather
+/// than losing a field.
+const EP_RECORD_VECTOR_DIM: u32 = 64;
+const EP_DURATION_SCALE_MS: f64 = 3_600_000.0;
+const EP_ROW_COUNT_SCALE: f64 = 1_000.0;
+const EP_KEYSTROKE_SCALE: f64 = 5_000.0;
+const EP_CLICK_SCALE: f64 = 1_000.0;
+const EP_INTERRUPTION_SCALE: f64 = 50.0;
+const EP_DISTINCT_TITLE_SCALE: f64 = 50.0;
+
+/// Every field an episode's graded dense lens measures, on a comparable scale.
+///
+/// Rebuilt for #1964. The superseded shape fed `start_unix_ms` and
+/// `end_unix_ms` raw; see [`SYN_EPISODE_PANEL_VERSION_PRE_1964`] for what that
+/// cost. `end_ts_ns` is no longer read at all: an episode's extent is already
+/// carried by `duration_norm`, and its end instant adds only a second copy of
+/// the clock.
+///
+/// Every field here is declared in
+/// `synapse_calyx::lens_provenance::SYN_SLOT_SOURCE_FIELDS` for slot 113, and
+/// `syn_record_vector_unit_fields` refuses the record outright if any field
+/// leaves `[-1, 1]` — so a future edit that reintroduces a raw magnitude fails
+/// at measure time instead of quietly flattening the panel.
 fn episode_numeric_record(record: &EpisodeRecord) -> Value {
+    let duration_ms = record.duration_ms();
     json!({
-        "duration_ms": record.duration_ms(),
-        "row_count": record.row_count,
-        "keystroke_count": record.keystroke_count,
-        "click_count": record.click_count,
-        "interruption_count": record.interruption_count,
-        "interrupted_ms": record.interrupted_ms,
-        "distinct_title_count": record.distinct_title_count,
-        "start_unix_ms": record.start_ts_ns / NS_PER_MS,
-        "end_unix_ms": record.end_ts_ns / NS_PER_MS,
+        "duration_norm": count_norm(duration_ms, EP_DURATION_SCALE_MS),
+        "row_count_norm": count_norm(record.row_count, EP_ROW_COUNT_SCALE),
+        "keystroke_norm": count_norm(record.keystroke_count, EP_KEYSTROKE_SCALE),
+        "click_norm": count_norm(record.click_count, EP_CLICK_SCALE),
+        "interruption_count_norm": count_norm(u64::from(record.interruption_count), EP_INTERRUPTION_SCALE),
+        "interrupted_ratio": ratio_norm(record.interrupted_ms as f64, duration_ms as f64),
+        "distinct_title_norm": count_norm(u64::from(record.distinct_title_count), EP_DISTINCT_TITLE_SCALE),
+        "start_day_fraction": day_fraction_of(record.start_ts_ns),
+        "start_week_fraction": week_fraction_of(record.start_ts_ns),
+        "keystrokes_per_row": ratio_norm(record.keystroke_count as f64, record.row_count as f64),
+        "clicks_per_row": ratio_norm(record.click_count as f64, record.row_count as f64),
     })
 }
 

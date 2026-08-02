@@ -255,6 +255,14 @@ pub fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEn
         ["syn_record_vector", dim] => Some(AlgorithmicEncoder::SynRecordVector {
             dim: parse_u32(dim)?,
         }),
+        ["syn_record_vector_unit_fields"] => Some(AlgorithmicEncoder::SynRecordVectorUnitFields {
+            dim: dense_dim(shape)?,
+        }),
+        ["syn_record_vector_unit_fields", dim] => {
+            Some(AlgorithmicEncoder::SynRecordVectorUnitFields {
+                dim: parse_u32(dim)?,
+            })
+        }
         ["syn_bin", buckets, min_micros, max_micros] => Some(AlgorithmicEncoder::SynBin {
             buckets: parse_u32(buckets)?,
             min_micros: parse_i64(min_micros)?,

@@ -233,6 +233,91 @@ pub(super) fn record_vector(bytes: &[u8], dim: u32) -> Result<SlotVector> {
     dense(data)
 }
 
+/// The same placement as [`record_vector`], with the scale precondition that
+/// makes the result a summary of the record instead of a re-encoding of its
+/// largest unit (#1964).
+///
+/// See the sibling implementation in `calyx-registry` for the full rationale:
+/// `record_vector` weights each field by its raw magnitude and unit-normalizes,
+/// so a field handed over in its own units (a unix-millisecond timestamp beside
+/// a click count) owns the direction and leaves every other field below `f32`
+/// resolution. All nine built-in lanes that did this returned nearest-neighbour
+/// cosine exactly `1.000000` for every record.
+///
+/// # Errors
+///
+/// Returns a numerical-invariant error naming the offending field path and its
+/// value when any field falls outside `[-1, 1]`, plus the same shape and field
+/// count errors [`record_vector`] returns.
+pub(super) fn record_vector_unit_fields(bytes: &[u8], dim: u32) -> Result<SlotVector> {
+    ensure_positive("syn record vector unit fields dim", dim)?;
+    let value = parse_json(bytes, "syn record vector unit fields input")?;
+    let mut numbers = Vec::new();
+    collect_numbers("", &value, &mut numbers)?;
+    if numbers.is_empty() {
+        return Err(numerical(
+            "syn record vector unit fields found no numeric fields",
+        ));
+    }
+    if numbers.len() > MAX_RECORD_NUMBERS {
+        return Err(numerical(format!(
+            "syn record vector unit fields has {} numeric fields, max {MAX_RECORD_NUMBERS}",
+            numbers.len()
+        )));
+    }
+    // Report the *whole* scale fault, not the first field that trips it. The
+    // alphabetically-first offender is rarely the informative one: a record
+    // carrying `row_count: 12` beside `start_unix_ms: 1.77e12` fails on
+    // `row_count`, which names a real problem but hides the one that is eleven
+    // orders of magnitude worse. An operator needs the worst offender, and how
+    // many fields are involved, to know whether this is one stray field or a
+    // record that was never scaled at all.
+    let out_of_scale: Vec<&(String, f64)> = numbers
+        .iter()
+        .filter(|(_, number)| !(-1.0..=1.0).contains(number))
+        .collect();
+    if let Some((worst_path, worst)) = out_of_scale
+        .iter()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+    {
+        let also = if out_of_scale.len() == 1 {
+            String::new()
+        } else {
+            format!(
+                " ({} further out-of-scale field(s): {})",
+                out_of_scale.len() - 1,
+                out_of_scale
+                    .iter()
+                    .filter(|(path, _)| path != worst_path)
+                    .map(|(path, value)| format!("{path}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(numerical(format!(
+            "syn record vector unit fields requires every field on a comparable scale in \
+             [-1, 1]; the largest offender is field `{worst_path}` at {worst}{also}. A record \
+             vector weights each field by its raw magnitude and unit-normalizes, so an unscaled \
+             field owns the direction and every other field falls below f32 resolution. Encode \
+             each field first: a timestamp as a position within a cycle (day/week fraction), a \
+             count or byte length as ln(1+n)/ln(1+scale) clamped to 1, a part as a ratio of its \
+             whole."
+        )));
+    }
+    let mut data = vec![0.0_f32; dim as usize];
+    for (path, number) in numbers {
+        let digest = content_address([
+            b"syn-record-vector-unit-fields-v1".as_slice(),
+            path.as_bytes(),
+        ]);
+        let idx = hash_prefix(&digest) % dim;
+        let signed = f64::from(signed_hash_value(&digest));
+        data[idx as usize] += finite_f32(number * signed, "syn record vector unit fields field")?;
+    }
+    normalize_unit(&mut data, "syn record vector unit fields")?;
+    dense(data)
+}
+
 pub(super) fn bin(
     bytes: &[u8],
     buckets: u32,

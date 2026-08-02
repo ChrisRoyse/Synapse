@@ -239,6 +239,114 @@ pub(super) fn record_vector(bytes: &[u8], dim: u32) -> Result<SlotVector> {
     dense(data)
 }
 
+/// The same placement as [`record_vector`], with the scale precondition that
+/// makes the result a summary of the record instead of a re-encoding of its
+/// largest unit (#1964).
+///
+/// # Why a bound, and why this bound
+///
+/// `record_vector` places each field at `hash(path) % dim`, multiplies by the
+/// field's **raw value**, and unit-normalizes. The direction is therefore owned
+/// by whichever field carries the largest units. Feeding a unix-millisecond
+/// timestamp (~1.7e12) beside a click count (0..1e2) leaves the other fields at
+/// a relative magnitude of ~1e-10, which is nine orders of magnitude below
+/// `f32::EPSILON`: their contribution to a cosine is not small, it is **not
+/// representable**. Measured on the live vault, all nine built-in
+/// `record_vector` lanes fed a raw magnitude returned nearest-neighbour cosine
+/// exactly `1.000000` for every record — `distinct = 1` over 84,113 rows on the
+/// largest of them.
+///
+/// A record vector unit-normalizes, so it is by construction a *comparable
+/// scale* instrument: it can only mean "a summary of this record" if its fields
+/// were already placed on one scale. This encoder therefore requires exactly
+/// that and refuses anything else: every field must be finite and lie in
+/// `[-1, 1]`.
+///
+/// # Why not a ratio between fields
+///
+/// The tempting alternative — refuse when `max|v| / min|v|` exceeds some ratio —
+/// is wrong, and would make the encoder reject correct input. A legitimately
+/// near-zero field is a *measurement*, not a scale error: `day_fraction` is
+/// `0.0002` for an event just after midnight, and refusing that record because
+/// another field reads `0.9` would be refusing the truth. The defect is never
+/// "two fields differ a lot"; it is "a field was handed over in its own raw
+/// units". Bounding the units is what catches that, and a frozen data-oblivious
+/// encoder can check it against a declared bound without knowing the corpus.
+///
+/// # Errors
+///
+/// Returns a numerical-invariant error naming the offending field path and its
+/// value when any field falls outside `[-1, 1]`, plus the same shape and field
+/// count errors [`record_vector`] returns.
+pub(super) fn record_vector_unit_fields(bytes: &[u8], dim: u32) -> Result<SlotVector> {
+    ensure_positive("syn record vector unit fields dim", dim)?;
+    let value = parse_json(bytes, "syn record vector unit fields input")?;
+    let mut numbers = Vec::new();
+    collect_numbers("", &value, &mut numbers)?;
+    if numbers.is_empty() {
+        return Err(numerical(
+            "syn record vector unit fields found no numeric fields",
+        ));
+    }
+    if numbers.len() > MAX_RECORD_NUMBERS {
+        return Err(numerical(format!(
+            "syn record vector unit fields has {} numeric fields, max {MAX_RECORD_NUMBERS}",
+            numbers.len()
+        )));
+    }
+    // Report the *whole* scale fault, not the first field that trips it. The
+    // alphabetically-first offender is rarely the informative one: a record
+    // carrying `row_count: 12` beside `start_unix_ms: 1.77e12` fails on
+    // `row_count`, which names a real problem but hides the one that is eleven
+    // orders of magnitude worse. An operator needs the worst offender, and how
+    // many fields are involved, to know whether this is one stray field or a
+    // record that was never scaled at all.
+    let out_of_scale: Vec<&(String, f64)> = numbers
+        .iter()
+        .filter(|(_, number)| !(-1.0..=1.0).contains(number))
+        .collect();
+    if let Some((worst_path, worst)) = out_of_scale
+        .iter()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+    {
+        let also = if out_of_scale.len() == 1 {
+            String::new()
+        } else {
+            format!(
+                " ({} further out-of-scale field(s): {})",
+                out_of_scale.len() - 1,
+                out_of_scale
+                    .iter()
+                    .filter(|(path, _)| path != worst_path)
+                    .map(|(path, value)| format!("{path}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(numerical(format!(
+            "syn record vector unit fields requires every field on a comparable scale in \
+             [-1, 1]; the largest offender is field `{worst_path}` at {worst}{also}. A record \
+             vector weights each field by its raw magnitude and unit-normalizes, so an unscaled \
+             field owns the direction and every other field falls below f32 resolution. Encode \
+             each field first: a timestamp as a position within a cycle (day/week fraction), a \
+             count or byte length as ln(1+n)/ln(1+scale) clamped to 1, a part as a ratio of its \
+             whole."
+        )));
+    }
+    let mut data = vec![0.0_f32; dim as usize];
+    for (path, number) in numbers {
+        let digest = content_address([
+            b"syn-record-vector-unit-fields-v1".as_slice(),
+            path.as_bytes(),
+        ]);
+        let idx = hash_prefix(&digest) % dim;
+        let signed = f64::from(signed_hash_value(&digest));
+        data[idx as usize] += finite_f32(number * signed, "syn record vector unit fields field")?;
+    }
+    normalize_unit(&mut data, "syn record vector unit fields")?;
+    dense(data)
+}
+
 pub(super) fn bin(
     bytes: &[u8],
     buckets: u32,

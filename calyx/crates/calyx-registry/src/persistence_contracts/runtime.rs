@@ -216,6 +216,12 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
         ["syn_record_vector", dim] => AlgorithmicEncoder::SynRecordVector {
             dim: parse_u32(dim)?,
         },
+        ["syn_record_vector_unit_fields"] => AlgorithmicEncoder::SynRecordVectorUnitFields {
+            dim: dense_dim(spec.output)?,
+        },
+        ["syn_record_vector_unit_fields", dim] => AlgorithmicEncoder::SynRecordVectorUnitFields {
+            dim: parse_u32(dim)?,
+        },
         ["syn_bin", min_micros, max_micros] => AlgorithmicEncoder::SynBin {
             buckets: dense_dim(spec.output)?,
             min_micros: parse_i64(min_micros)?,
