@@ -12,7 +12,7 @@ impl VersionedCfStore {
     /// latest-only recovered routers, which intentionally cannot serve a
     /// sequence that becomes historical between two separate calls.
     pub fn read_latest(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.with_latest_view("read_latest", |seq, table, router, barriers| {
+        self.with_latest_view(RowGuardSite::ReadLatest, |seq, table, router, barriers| {
             ensure_view_key_unbarriered(barriers, cf, key)?;
             latest_value_from_view(seq, table, router, cf, key)
         })
@@ -23,7 +23,7 @@ impl VersionedCfStore {
         if reads.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_latest_view("read_batch_latest", |seq, table, router, barriers| {
+        self.with_latest_view(RowGuardSite::ReadBatchLatest, |seq, table, router, barriers| {
             reads
                 .iter()
                 .map(|read| {
@@ -36,7 +36,7 @@ impl VersionedCfStore {
 
     /// Scans one CF from one atomic view of the latest committed state.
     pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.with_latest_view("scan_cf_latest", |seq, table, router, barriers| {
+        self.with_latest_view(RowGuardSite::ScanCfLatest, |seq, table, router, barriers| {
             latest_rows_from_view(seq, table, router, cf, None, barriers)
         })
     }
@@ -49,7 +49,7 @@ impl VersionedCfStore {
     /// callers depend on, because they use the count as physical evidence that
     /// a write landed.
     pub fn count_cf_latest(&self, cf: ColumnFamily) -> Result<usize> {
-        self.with_latest_view("count_cf_latest", |seq, table, router, barriers| {
+        self.with_latest_view(RowGuardSite::CountCfLatest, |seq, table, router, barriers| {
             latest_row_count_from_view(seq, table, router, cf, barriers)
         })
     }
@@ -60,7 +60,7 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.with_latest_view("scan_cf_range_latest", |seq, table, router, barriers| {
+        self.with_latest_view(RowGuardSite::ScanCfRangeLatest, |seq, table, router, barriers| {
             latest_rows_from_view(seq, table, router, cf, Some(range), barriers)
         })
     }
@@ -89,7 +89,7 @@ impl VersionedCfStore {
             });
         }
         self.with_latest_view(
-            "scan_cf_range_page_latest",
+            RowGuardSite::ScanCfRangePageLatest,
             |seq, table, router, barriers| {
                 latest_range_page_from_view(
                     seq,
@@ -118,7 +118,7 @@ impl VersionedCfStore {
         self.ensure_snapshot_live(snapshot, clock)?;
         self.ensure_unbarriered(cf, key)?;
         {
-            let table = self.read_rows("read_at");
+            let table = self.read_rows(RowGuardSite::ReadAt);
             if let Some(value) = table
                 .get(&cf)
                 .and_then(|rows| rows.get(key))
@@ -140,7 +140,7 @@ impl VersionedCfStore {
     ) -> Result<Option<Seq>> {
         self.ensure_snapshot_live(snapshot, clock)?;
         self.ensure_unbarriered(cf, key)?;
-        let table = self.read_rows("seq_for_key_at");
+        let table = self.read_rows(RowGuardSite::SeqForKeyAt);
         let seq = table
             .get(&cf)
             .and_then(|rows| rows.get(key))
@@ -185,7 +185,7 @@ impl VersionedCfStore {
         let mut values = vec![None; reads.len()];
         let mut router_misses = Vec::new();
         {
-            let table = self.read_rows("read_batch");
+            let table = self.read_rows(RowGuardSite::ReadBatch);
             for (index, read) in reads.iter().enumerate() {
                 let visible = table
                     .get(&read.cf)
@@ -263,7 +263,7 @@ impl VersionedCfStore {
                 self.changed_key_history_floor
             )));
         }
-        let table = self.read_rows("changed_keys_after_at");
+        let table = self.read_rows(RowGuardSite::ChangedKeysAfterAt);
         let keys = table
             .get(&cf)
             .into_iter()
@@ -316,7 +316,7 @@ impl VersionedCfStore {
         let keys =
             self.changed_keys_after_at(snapshot, ColumnFamily::Base, after_exclusive, clock)?;
         let scanned = keys.len();
-        let table = self.read_rows("changed_base_keys_after_at_for_panel");
+        let table = self.read_rows(RowGuardSite::ChangedBaseKeysAfterAtForPanel);
         let mut scoped = Vec::new();
         let mut other_panels = 0_usize;
         let mut unattributed = 0_usize;
@@ -440,7 +440,7 @@ impl VersionedCfStore {
         } else {
             Bound::Included(range.start.as_slice())
         };
-        let table = self.read_rows("scan_cf_range_page_at");
+        let table = self.read_rows(RowGuardSite::ScanCfRangePageAt);
         let mut rows = Vec::with_capacity(limit);
         let Some(cf_rows) = table.get(&cf) else {
             return Ok(rows);
@@ -477,7 +477,7 @@ impl VersionedCfStore {
             .read_barriers
             .read()
             .expect("mvcc read barriers poisoned");
-        let table = self.read_rows("predecessor_cf_at");
+        let table = self.read_rows(RowGuardSite::PredecessorCfAt);
         let router = self.router.read().expect("mvcc router poisoned");
         if self.router_latest_readback.load(Ordering::Acquire) {
             self.ensure_router_latest_snapshot(snapshot)?;
@@ -553,7 +553,7 @@ impl VersionedCfStore {
     /// search by one level and then stopped).
     fn with_latest_view<T>(
         &self,
-        site: &'static str,
+        site: RowGuardSite,
         read: impl FnOnce(Seq, &RowTable, Option<&CfRouter>, &[ReadBarrier]) -> Result<T>,
     ) -> Result<T> {
         // Lock order is deliberately identical to every multi-layer reader:

@@ -7,7 +7,8 @@ use sha2::{Digest as _, Sha256};
 use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{
-    Backend, CalyxMathProbeTopKEntry, CalyxTuningKnobEnforcement, CalyxTuningKnobStatus,
+    Backend, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus, CalyxTuningKnobEnforcement,
+    CalyxTuningKnobStatus,
     ChromeBridgeDetail,
 };
 
@@ -1166,6 +1167,32 @@ impl SynapseService {
             })
             .collect::<Vec<_>>()
             .join(" ");
+        let row_guard_sites = status
+            .row_guard_census
+            .iter()
+            .map(|entry| CalyxRowGuardSiteStatus {
+                site: entry.site.clone(),
+                holds: entry.holds,
+                total_held_us: entry.total_held_us,
+                max_held_us: entry.max_held_us,
+                mean_held_us: entry.mean_held_us,
+                over_budget_holds: entry.over_budget_holds,
+                starved_holds: entry.starved_holds,
+            })
+            .collect::<Vec<_>>();
+        let row_guard_sites_exercised = row_guard_sites
+            .iter()
+            .filter(|entry| entry.holds > 0)
+            .count();
+        let row_guard_holds_total = row_guard_sites.iter().map(|entry| entry.holds).sum::<u64>();
+        let row_guard_over_budget_total = row_guard_sites
+            .iter()
+            .map(|entry| entry.over_budget_holds)
+            .sum::<u64>();
+        let row_guard_starved_total = row_guard_sites
+            .iter()
+            .map(|entry| entry.starved_holds)
+            .sum::<u64>();
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
@@ -1215,6 +1242,11 @@ impl SynapseService {
             calyx_correlation_ceiling: tuning.map(|config| config.correlation_ceiling),
             calyx_tuning_knobs: tuning_knobs,
             calyx_inert_tuning_knob_count: Some(inert_tuning_knob_count),
+            calyx_row_guard_sites: row_guard_sites,
+            calyx_row_guard_sites_exercised: Some(row_guard_sites_exercised),
+            calyx_row_guard_holds_total: Some(row_guard_holds_total),
+            calyx_row_guard_over_budget_total: Some(row_guard_over_budget_total),
+            calyx_row_guard_starved_total: Some(row_guard_starved_total),
             calyx_vram_budget_bytes: tuning.map(|config| config.vram_budget_bytes),
             calyx_vram_budget_enforced: math_backend
                 .as_ref()

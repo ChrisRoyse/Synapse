@@ -83,7 +83,7 @@ impl VersionedCfStore {
         range: Option<&KeyRange>,
         rows: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     ) {
-        let table = self.read_rows("overlay_table_rows");
+        let table = self.read_rows(RowGuardSite::OverlayTableRows);
         let Some(cf_rows) = table.get(&cf) else {
             return;
         };
@@ -110,7 +110,7 @@ impl VersionedCfStore {
         range: &KeyRange,
         keys: &mut BTreeMap<Vec<u8>, ()>,
     ) {
-        let table = self.read_rows("overlay_table_keys");
+        let table = self.read_rows(RowGuardSite::OverlayTableKeys);
         let Some(cf_rows) = table.get(&cf) else {
             return;
         };

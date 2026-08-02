@@ -577,6 +577,14 @@ where
         &self.recovery_report
     }
 
+    /// Per-site row-table read-guard tallies since this vault was opened.
+    ///
+    /// See [`crate::mvcc::VersionedCfStore::row_guard_census`]. Exposed on the
+    /// vault so the daemon can report it without reaching into the MVCC store.
+    pub fn row_guard_census(&self) -> Vec<crate::mvcc::RowGuardSiteCensus> {
+        self.rows.row_guard_census()
+    }
+
     pub fn vault_id(&self) -> VaultId {
         self.vault_id
     }

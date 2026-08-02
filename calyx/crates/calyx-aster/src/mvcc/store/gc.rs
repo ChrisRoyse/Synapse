@@ -1,4 +1,4 @@
-use super::{RowTable, VersionChain, VersionedCfStore};
+use super::{RowGuardSite, RowTable, VersionChain, VersionedCfStore};
 use crate::cf::ColumnFamily;
 use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotVersionGc};
 use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
@@ -71,7 +71,7 @@ impl SnapshotVersionGc for VersionedCfStore {
     }
 
     fn snapshot_gc_debt(&self, safe_point: Seq) -> u64 {
-        let table = self.read_rows("snapshot_gc_debt");
+        let table = self.read_rows(RowGuardSite::SnapshotGcDebt);
         snapshot_gc_debt_for_table(&table, safe_point)
     }
 }

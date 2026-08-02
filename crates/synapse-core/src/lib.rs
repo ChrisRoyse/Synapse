@@ -17,7 +17,7 @@ pub use types::{
     AgentEventKind, AgentEventRecord, AgentTranscriptRecord, AimCurve, AimNaturalParams, AimStyle,
     AimTarget, AudioContext, AudioCue, AudioEvent, Backend, BillableUsage, ButtonAction,
     CalyxHotPathBoundaryHealth, CalyxMathProbeTopKEntry, CalyxTuningKnobEnforcement,
-    CalyxTuningKnobStatus, CaptureRuntimeReadback, CdpCapability, CdpDiagnostics, CdpStatus,
+    CalyxRowGuardSiteStatus, CalyxTuningKnobStatus, CaptureRuntimeReadback, CdpCapability, CdpDiagnostics, CdpStatus,
     ChromeBridgeDetail, ClipboardSummary, ComboInput, ComboStep, CostBreakdown, CostOutcome,
     DEFAULT_HUD_CONFIDENCE_THRESHOLD, DataPredicate, DetectedEntity, Detection, DetectionBatch,
     DirectionEstimate, EVENT_FILTER_MAX_DEPTH, ElementId, ElementIdParseError, ElementIdParts,

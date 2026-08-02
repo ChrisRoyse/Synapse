@@ -217,11 +217,198 @@ type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
 /// 25 ms is well above any point read (the stalled commits do 52-139 us of
 /// actual work) and far below the 125 ms - 1.4 s holds being hunted, so a
 /// report here is a real finding rather than noise.
-const ROW_READ_GUARD_WARN_US: u64 = 25_000;
+pub const ROW_READ_GUARD_WARN_US: u64 = 25_000;
 
 /// Granularity of `GetThreadTimes` on this host, measured rather than assumed.
 /// See [`thread_cpu_us`].
 const WINDOWS_SCHEDULER_TICK_US: u64 = 15_625;
+
+/// Every call site that takes the vault-wide row-table read guard.
+///
+/// This replaced a `&'static str`. The string was fine for a log line but
+/// useless as a key: it cannot be indexed without hashing, it cannot be
+/// enumerated (so a site with zero holds is indistinguishable from a site that
+/// does not exist), and a typo produces a plausible-looking new site rather
+/// than a compile error.
+///
+/// Enumerability is the property #1952 ask 3 turned out to need. That ask could
+/// not be answered because `count_cf_latest` produced **no** guard events after
+/// its conversion, and two readings fit equally: the converted sites never ran
+/// in the window, or they now complete under the 25 ms budget. An
+/// exception-only instrument cannot separate those, by construction — the
+/// absence of an event is the same absence in both cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowGuardSite {
+    ReadLatest,
+    ReadBatchLatest,
+    ScanCfLatest,
+    CountCfLatest,
+    ScanCfRangeLatest,
+    ScanCfRangePageLatest,
+    ReadAt,
+    ReadBatch,
+    SeqForKeyAt,
+    ChangedKeysAfterAt,
+    ChangedBaseKeysAfterAtForPanel,
+    ScanCfRangePageAt,
+    PredecessorCfAt,
+    OverlayTableRows,
+    OverlayTableKeys,
+    SnapshotGcDebt,
+    PinSnapshotForPanel,
+    PanelContentSeqsSnapshot,
+    MigratePanelContentSeqsToAtLeast,
+}
+
+impl RowGuardSite {
+    /// Every site, in declaration order. The census is indexed by position
+    /// here, so this array is the contract that makes a zero-hold site
+    /// reportable rather than invisible.
+    pub const ALL: [Self; 19] = [
+        Self::ReadLatest,
+        Self::ReadBatchLatest,
+        Self::ScanCfLatest,
+        Self::CountCfLatest,
+        Self::ScanCfRangeLatest,
+        Self::ScanCfRangePageLatest,
+        Self::ReadAt,
+        Self::ReadBatch,
+        Self::SeqForKeyAt,
+        Self::ChangedKeysAfterAt,
+        Self::ChangedBaseKeysAfterAtForPanel,
+        Self::ScanCfRangePageAt,
+        Self::PredecessorCfAt,
+        Self::OverlayTableRows,
+        Self::OverlayTableKeys,
+        Self::SnapshotGcDebt,
+        Self::PinSnapshotForPanel,
+        Self::PanelContentSeqsSnapshot,
+        Self::MigratePanelContentSeqsToAtLeast,
+    ];
+
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// The name used in `CALYX_ASTER_ROW_READ_GUARD_SLOW`. Unchanged from the
+    /// previous string literals, so windows collected before and after this
+    /// change remain directly comparable.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadLatest => "read_latest",
+            Self::ReadBatchLatest => "read_batch_latest",
+            Self::ScanCfLatest => "scan_cf_latest",
+            Self::CountCfLatest => "count_cf_latest",
+            Self::ScanCfRangeLatest => "scan_cf_range_latest",
+            Self::ScanCfRangePageLatest => "scan_cf_range_page_latest",
+            Self::ReadAt => "read_at",
+            Self::ReadBatch => "read_batch",
+            Self::SeqForKeyAt => "seq_for_key_at",
+            Self::ChangedKeysAfterAt => "changed_keys_after_at",
+            Self::ChangedBaseKeysAfterAtForPanel => "changed_base_keys_after_at_for_panel",
+            Self::ScanCfRangePageAt => "scan_cf_range_page_at",
+            Self::PredecessorCfAt => "predecessor_cf_at",
+            Self::OverlayTableRows => "overlay_table_rows",
+            Self::OverlayTableKeys => "overlay_table_keys",
+            Self::SnapshotGcDebt => "snapshot_gc_debt",
+            Self::PinSnapshotForPanel => "pin_snapshot_for_panel",
+            Self::PanelContentSeqsSnapshot => "panel_content_seqs_snapshot",
+            Self::MigratePanelContentSeqsToAtLeast => "migrate_panel_content_seqs_to_at_least",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Live counters for one [`RowGuardSite`].
+///
+/// Recorded on **every** hold, not only over-budget ones. That is the whole
+/// point: `over_budget_holds == 0` with `holds == 0` means the path never ran,
+/// and `over_budget_holds == 0` with `holds == 4_812` means it ran 4,812 times
+/// and stayed inside the budget every time. Those are the two readings #1952
+/// ask 3 could not separate.
+#[derive(Debug, Default)]
+struct RowGuardSiteCounters {
+    holds: AtomicU64,
+    total_held_us: AtomicU64,
+    max_held_us: AtomicU64,
+    over_budget_holds: AtomicU64,
+    starved_holds: AtomicU64,
+}
+
+/// One site's counters, read back at an instant.
+#[derive(Clone, Copy, Debug)]
+pub struct RowGuardSiteCensus {
+    pub site: RowGuardSite,
+    pub holds: u64,
+    pub total_held_us: u64,
+    pub max_held_us: u64,
+    pub over_budget_holds: u64,
+    pub starved_holds: u64,
+}
+
+impl RowGuardSiteCensus {
+    /// Mean hold in microseconds, or `None` when the site never ran.
+    ///
+    /// Deliberately `None` rather than `0.0`: a site that never ran has no mean
+    /// hold, and reporting one as zero is the same category error as
+    /// `Intact { count: 0 }` (#1956).
+    pub fn mean_held_us(&self) -> Option<f64> {
+        (self.holds > 0).then(|| self.total_held_us as f64 / self.holds as f64)
+    }
+}
+
+/// Per-site row-guard counters for the whole vault.
+#[derive(Debug)]
+struct RowGuardCensus {
+    sites: [RowGuardSiteCounters; RowGuardSite::COUNT],
+}
+
+impl Default for RowGuardCensus {
+    fn default() -> Self {
+        Self {
+            sites: std::array::from_fn(|_| RowGuardSiteCounters::default()),
+        }
+    }
+}
+
+impl RowGuardCensus {
+    fn record(&self, site: RowGuardSite, held_us: u64, over_budget: bool, starved: bool) {
+        let counters = &self.sites[site.index()];
+        // Relaxed throughout: these are independent monotonic tallies read for
+        // diagnosis, never to make a decision, so no ordering between them is
+        // load-bearing. Anything stronger would put a fence on the hottest read
+        // path in the vault to buy nothing.
+        counters.holds.fetch_add(1, Ordering::Relaxed);
+        counters
+            .total_held_us
+            .fetch_add(held_us, Ordering::Relaxed);
+        counters.max_held_us.fetch_max(held_us, Ordering::Relaxed);
+        if over_budget {
+            counters.over_budget_holds.fetch_add(1, Ordering::Relaxed);
+        }
+        if starved {
+            counters.starved_holds.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<RowGuardSiteCensus> {
+        RowGuardSite::ALL
+            .iter()
+            .map(|&site| {
+                let counters = &self.sites[site.index()];
+                RowGuardSiteCensus {
+                    site,
+                    holds: counters.holds.load(Ordering::Relaxed),
+                    total_held_us: counters.total_held_us.load(Ordering::Relaxed),
+                    max_held_us: counters.max_held_us.load(Ordering::Relaxed),
+                    over_budget_holds: counters.over_budget_holds.load(Ordering::Relaxed),
+                    starved_holds: counters.starved_holds.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+}
 
 /// A row-table read guard that reports its own hold duration and call site.
 ///
@@ -237,7 +424,9 @@ const WINDOWS_SCHEDULER_TICK_US: u64 = 15_625;
 /// name every stall's victim as its cause.
 struct TimedRowRead<'a> {
     guard: std::sync::RwLockReadGuard<'a, RowTable>,
-    site: &'static str,
+    site: RowGuardSite,
+    /// Where every hold is tallied, not just the over-budget ones.
+    census: &'a RowGuardCensus,
     acquired: Instant,
     /// Calling thread's kernel+user CPU time when the guard was taken.
     ///
@@ -320,6 +509,13 @@ impl Drop for TimedRowRead<'_> {
     fn drop(&mut self) {
         let held_us = elapsed_us(&self.acquired);
         if held_us < ROW_READ_GUARD_WARN_US {
+            // Still counted. The sub-budget path is the one #1952 ask 3 needed
+            // and could not see; skipping the census here would leave the
+            // instrument exactly as blind as the log it supplements. No second
+            // `thread_cpu_us()` syscall on this path — `starved` is only
+            // meaningful above four scheduler ticks anyway, so the common case
+            // pays one atomic add per counter and nothing else.
+            self.census.record(self.site, held_us, false, false);
             return;
         }
         // CPU time actually burned while holding the guard. The difference
@@ -340,9 +536,10 @@ impl Drop for TimedRowRead<'_> {
         // than none.
         let starved = held_us >= 4 * WINDOWS_SCHEDULER_TICK_US
             && cpu_us.is_some_and(|cpu| cpu.saturating_mul(2) < held_us);
+        self.census.record(self.site, held_us, true, starved);
         tracing::warn!(
             code = "CALYX_ASTER_ROW_READ_GUARD_SLOW",
-            site = self.site,
+            site = self.site.as_str(),
             held_us,
             cpu_us,
             starved,
@@ -426,6 +623,8 @@ pub struct VersionedCfStore {
     resource_counters: Arc<ResourceCounters>,
     snapshot_gc: SnapshotGcReclaimer,
     snapshot_gc_counters: SnapshotGcCounters,
+    /// Per-site tallies for every row-table read guard taken on this vault.
+    row_guard_census: RowGuardCensus,
 }
 
 impl VersionedCfStore {
@@ -436,11 +635,12 @@ impl VersionedCfStore {
     /// Every row-table read goes through this or [`Self::try_read_rows`]; a
     /// bare `self.rows.read()` is a hold nothing can attribute, which is the
     /// state #1950 is stuck in.
-    fn read_rows(&self, site: &'static str) -> TimedRowRead<'_> {
+    fn read_rows(&self, site: RowGuardSite) -> TimedRowRead<'_> {
         let guard = self.rows.read().expect("mvcc row table poisoned");
         TimedRowRead {
             guard,
             site,
+            census: &self.row_guard_census,
             acquired: Instant::now(),
             acquired_cpu_us: thread_cpu_us(),
         }
@@ -448,7 +648,7 @@ impl VersionedCfStore {
 
     /// [`Self::read_rows`] for call sites that surface poisoning as an error
     /// rather than panicking.
-    fn try_read_rows(&self, site: &'static str, poisoned: &str) -> Result<TimedRowRead<'_>> {
+    fn try_read_rows(&self, site: RowGuardSite, poisoned: &str) -> Result<TimedRowRead<'_>> {
         let guard = self
             .rows
             .read()
@@ -456,9 +656,21 @@ impl VersionedCfStore {
         Ok(TimedRowRead {
             guard,
             site,
+            census: &self.row_guard_census,
             acquired: Instant::now(),
             acquired_cpu_us: thread_cpu_us(),
         })
+    }
+
+    /// Per-site row-guard counters, read back at this instant.
+    ///
+    /// Answers "did this read path run, and how often" directly, instead of
+    /// inferring it from the presence or absence of an over-budget log event.
+    /// Every site in [`RowGuardSite::ALL`] is present in the result even when it
+    /// has never been taken, so a zero is an observation rather than a gap
+    /// (#1952 ask 3).
+    pub fn row_guard_census(&self) -> Vec<RowGuardSiteCensus> {
+        self.row_guard_census.snapshot()
     }
 
     pub fn new(start_seq: Seq) -> Self {
@@ -477,6 +689,7 @@ impl VersionedCfStore {
             resource_counters: Arc::new(ResourceCounters::default()),
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
+            row_guard_census: RowGuardCensus::default(),
         }
     }
 
@@ -506,6 +719,7 @@ impl VersionedCfStore {
             resource_counters,
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
+            row_guard_census: RowGuardCensus::default(),
         }
     }
 
@@ -833,7 +1047,7 @@ impl VersionedCfStore {
         max_age_ms: u64,
     ) -> Result<Snapshot> {
         let _table = self.try_read_rows(
-            "pin_snapshot_for_panel",
+            RowGuardSite::PinSnapshotForPanel,
             "MVCC row-table lock was poisoned while pinning panel search freshness",
         )?;
         let seq = self.current_seq();
@@ -861,7 +1075,7 @@ impl VersionedCfStore {
     /// overstate a panel watermark, never accept a stale index (#1841).
     pub(crate) fn panel_content_seqs_snapshot(&self) -> Result<BTreeMap<u32, Seq>> {
         let _table = self.try_read_rows(
-            "panel_content_seqs_snapshot",
+            RowGuardSite::PanelContentSeqsSnapshot,
             "MVCC row-table lock was poisoned while snapshotting panel watermarks",
         )?;
         self.panel_content_seqs
@@ -901,7 +1115,7 @@ impl VersionedCfStore {
         active_panel_version: Option<u32>,
     ) -> Result<()> {
         let table = self.try_read_rows(
-            "migrate_panel_content_seqs_to_at_least",
+            RowGuardSite::MigratePanelContentSeqsToAtLeast,
             "MVCC row-table lock was poisoned while migrating panel watermarks",
         )?;
         let mut panels = self

@@ -91,6 +91,31 @@ pub struct CalyxTuningKnobStatus {
     pub effect_of_tuning: String,
 }
 
+/// One row-table read-guard call site's tallies (#1952 ask 3).
+///
+/// `holds` counts every acquisition. `over_budget_holds` counts only the subset
+/// that exceeded the 25 ms budget and emitted a slow-guard event. The pair is
+/// the point: `holds=0` means the path did not run, `holds=4812,
+/// over_budget_holds=0` means it ran 4,812 times and stayed inside the budget.
+/// The log alone renders both as silence.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxRowGuardSiteStatus {
+    /// Call site name, matching the `site` field of
+    /// `CALYX_ASTER_ROW_READ_GUARD_SLOW` so log and census join directly.
+    pub site: String,
+    pub holds: u64,
+    pub total_held_us: u64,
+    pub max_held_us: u64,
+    /// Mean hold in microseconds, absent when the site never ran. Deliberately
+    /// not `0.0` — a site with no holds has no mean, and zero reads as "fast".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_held_us: Option<f64>,
+    pub over_budget_holds: u64,
+    /// Over-budget holds whose thread was descheduled for most of the hold.
+    pub starved_holds: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubsystemHealth {
@@ -239,6 +264,32 @@ pub struct SubsystemHealth {
     /// decorative and the subsystem must not report a clean `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_inert_tuning_knob_count: Option<usize>,
+
+    // --- row-table read-guard census (issue #1952 ask 3, #1950 ask 2) ---
+    // `CALYX_ASTER_ROW_READ_GUARD_SLOW` only fires above a 25 ms budget, so a
+    // path that runs constantly and stays inside it is indistinguishable from a
+    // path that never runs: both are silence. That ambiguity is what left #1952
+    // ask 3 unanswerable after its conversion produced zero events. These
+    // counters tally EVERY hold, so a zero is an observation.
+    /// Per-call-site row-guard tallies. Every declared site is present, whether
+    /// or not it has ever been taken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calyx_row_guard_sites: Vec<CalyxRowGuardSiteStatus>,
+    /// Sites with at least one hold. Below the count of declared sites means
+    /// some read path has not executed since open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_row_guard_sites_exercised: Option<usize>,
+    /// Total holds across every site since open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_row_guard_holds_total: Option<u64>,
+    /// Total holds that exceeded the budget and emitted a slow-guard event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_row_guard_over_budget_total: Option<u64>,
+    /// Over-budget holds whose thread was not running for most of the hold
+    /// (#1955). Non-zero means latency numbers from this window measure machine
+    /// load, not the vault, and must not be tuned against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_row_guard_starved_total: Option<u64>,
 
     // --- persisted search generation (issue #1891) ---
     // Every recall path depends on this generation. Before these fields, an

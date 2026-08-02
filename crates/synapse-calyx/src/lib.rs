@@ -2209,6 +2209,34 @@ pub struct SynapseCalyxVaultStatus {
     pub remediation: Option<String>,
     pub tuning: Option<SynapseCalyxTuningConfig>,
     pub math_backend: Option<SynapseCalyxMathBackendStatus>,
+    /// Per-site row-table read-guard tallies since this vault was opened.
+    ///
+    /// Empty when the vault is not open. Every declared site appears when it
+    /// is, including sites with zero holds — that zero is the observation
+    /// #1952 ask 3 needed and could not get from an exception-only log.
+    pub row_guard_census: Vec<SynapseCalyxRowGuardSiteCensus>,
+}
+
+/// One row-guard call site's counters, as reported by `health`.
+///
+/// `holds` counts **every** acquisition; `over_budget_holds` counts only the
+/// subset that also emitted `CALYX_ASTER_ROW_READ_GUARD_SLOW`. The pair is what
+/// separates "this path never ran" from "this path ran and stayed inside the
+/// 25 ms budget", which the log alone cannot do because both look like silence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxRowGuardSiteCensus {
+    pub site: String,
+    pub holds: u64,
+    pub total_held_us: u64,
+    pub max_held_us: u64,
+    /// Mean hold in microseconds. `None` when the site never ran — a site with
+    /// no holds has no mean, and reporting `0.0` would read as "instant".
+    pub mean_held_us: Option<f64>,
+    pub over_budget_holds: u64,
+    /// Over-budget holds whose thread was not running for most of the hold
+    /// (#1955). A non-zero count here means the window was load-contaminated
+    /// and its latencies are not a measure of work.
+    pub starved_holds: u64,
 }
 
 impl SynapseCalyxVaultStatus {
@@ -5891,6 +5919,19 @@ fn status_from_vault(
     };
     status.apply_paths(config);
     status.math_backend = Some(math_backend.clone());
+    status.row_guard_census = vault
+        .row_guard_census()
+        .into_iter()
+        .map(|entry| SynapseCalyxRowGuardSiteCensus {
+            site: entry.site.as_str().to_owned(),
+            holds: entry.holds,
+            total_held_us: entry.total_held_us,
+            max_held_us: entry.max_held_us,
+            mean_held_us: entry.mean_held_us(),
+            over_budget_holds: entry.over_budget_holds,
+            starved_holds: entry.starved_holds,
+        })
+        .collect();
     status
 }
 
