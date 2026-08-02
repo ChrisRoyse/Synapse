@@ -12,7 +12,7 @@ impl VersionedCfStore {
     /// latest-only recovered routers, which intentionally cannot serve a
     /// sequence that becomes historical between two separate calls.
     pub fn read_latest(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.with_latest_view(|seq, table, router, barriers| {
+        self.with_latest_view("read_latest", |seq, table, router, barriers| {
             ensure_view_key_unbarriered(barriers, cf, key)?;
             latest_value_from_view(seq, table, router, cf, key)
         })
@@ -23,7 +23,7 @@ impl VersionedCfStore {
         if reads.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_latest_view(|seq, table, router, barriers| {
+        self.with_latest_view("read_batch_latest", |seq, table, router, barriers| {
             reads
                 .iter()
                 .map(|read| {
@@ -36,7 +36,7 @@ impl VersionedCfStore {
 
     /// Scans one CF from one atomic view of the latest committed state.
     pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.with_latest_view(|seq, table, router, barriers| {
+        self.with_latest_view("scan_cf_latest", |seq, table, router, barriers| {
             latest_rows_from_view(seq, table, router, cf, None, barriers)
         })
     }
@@ -47,7 +47,7 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.with_latest_view(|seq, table, router, barriers| {
+        self.with_latest_view("scan_cf_range_latest", |seq, table, router, barriers| {
             latest_rows_from_view(seq, table, router, cf, Some(range), barriers)
         })
     }
@@ -75,20 +75,23 @@ impl VersionedCfStore {
                 examined_rows: 0,
             });
         }
-        self.with_latest_view(|seq, table, router, barriers| {
-            latest_range_page_from_view(
-                seq,
-                table,
-                router,
-                barriers,
-                LatestRangePageRequest {
-                    cf,
-                    range,
-                    after_key,
-                    limit,
-                },
-            )
-        })
+        self.with_latest_view(
+            "scan_cf_range_page_latest",
+            |seq, table, router, barriers| {
+                latest_range_page_from_view(
+                    seq,
+                    table,
+                    router,
+                    barriers,
+                    LatestRangePageRequest {
+                        cf,
+                        range,
+                        after_key,
+                        limit,
+                    },
+                )
+            },
+        )
     }
 
     /// Reads one CF/key at the pinned sequence.
@@ -510,8 +513,19 @@ impl VersionedCfStore {
         Ok(())
     }
 
+    /// `site` is the **caller's** name, not this helper's.
+    ///
+    /// Five entry points share this body — `read_latest`, `read_batch_latest`,
+    /// `scan_cf_latest`, `scan_cf_range_latest`, `scan_cf_range_page_latest` —
+    /// and they differ enormously: two are point reads and one is an unbounded
+    /// full-CF scan. Reporting `with_latest_view` for all of them named the
+    /// helper and left the actual holder still unidentified, which is the exact
+    /// failure #1950 ask 1 exists to end (the first live run of this instrument
+    /// reported 189 of 191 holds as `with_latest_view`, which narrowed the
+    /// search by one level and then stopped).
     fn with_latest_view<T>(
         &self,
+        site: &'static str,
         read: impl FnOnce(Seq, &RowTable, Option<&CfRouter>, &[ReadBarrier]) -> Result<T>,
     ) -> Result<T> {
         // Lock order is deliberately identical to every multi-layer reader:
@@ -523,7 +537,7 @@ impl VersionedCfStore {
             .read_barriers
             .read()
             .expect("mvcc read barriers poisoned");
-        let table = self.read_rows("with_latest_view");
+        let table = self.read_rows(site);
         let router = self.router.read().expect("mvcc router poisoned");
         let seq = self.current_seq();
         read(seq, &table, router.as_ref(), &barriers)
