@@ -394,6 +394,12 @@ impl CommitStageTimings {
             // and the gap between it and `mvcc_us` is the change's whole effect.
             mvcc_sst_write_unlocked_us = self.mvcc.sst_write_us,
             mvcc_locked_us = self.mvcc.locked_us(),
+            // #1955 on the write side: `mvcc_locked_us` is wall clock, so a
+            // committer descheduled while holding both write locks looks
+            // identical to one doing heavy work — and it blocks every other
+            // writer either way. `mvcc_locked_starved` says which.
+            mvcc_locked_cpu_us = self.mvcc.locked_cpu_us,
+            mvcc_locked_starved = self.mvcc.locked_starved(),
             mvcc_unattributed_us = self.mvcc.unattributed_us(),
             // Time inside the `mvcc` stage that the timed inner call did not
             // observe: the owned row batch and the sealed memtables are dropped

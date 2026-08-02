@@ -43,6 +43,21 @@ pub struct MvccCommitTimings {
     pub materialize_us: u64,
     /// Waiting for the row-table write lock.
     pub row_lock_wait_us: u64,
+    /// CPU the committing thread actually burned inside the locked region.
+    ///
+    /// `locked_us` is wall clock, so it conflates "this commit did a lot of
+    /// work under the locks" with "this commit was descheduled while holding
+    /// them" — and the second blocks every other writer for no reason at all.
+    /// The read-guard side of this was #1955; this is the same blind spot on
+    /// the write side.
+    ///
+    /// Deliberately NOT measured across the lock *wait*: a blocked thread
+    /// consumes no CPU by definition, so a CPU figure there would be ~0
+    /// regardless and would assert starvation unconditionally. Only regions
+    /// where the thread is supposed to be running are informative.
+    ///
+    /// `None` when the platform cannot report thread CPU time.
+    pub locked_cpu_us: Option<u64>,
     /// Waiting for the router write lock, with the row lock already held.
     pub router_lock_wait_us: u64,
     /// Search-panel attribution, which may read the router's latest view.
@@ -142,6 +157,21 @@ impl MvccCommitTimings {
     /// Teardown is not subtracted because it falls outside `total_us`
     /// altogether: the owned batch and the sealed memtables drop as the frame
     /// unwinds, after the last measurement.
+    /// Whether the locked region spent most of its wall clock not running.
+    ///
+    /// Same rule and same quantisation caveat as the read-guard `starved` flag
+    /// (#1955): only asserted once the region is long enough that the
+    /// scheduler-tick granularity of thread CPU time cannot produce the verdict
+    /// by rounding alone.
+    #[must_use]
+    pub fn locked_starved(&self) -> bool {
+        let locked_us = self.locked_us();
+        locked_us >= 4 * WINDOWS_SCHEDULER_TICK_US
+            && self
+                .locked_cpu_us
+                .is_some_and(|cpu| cpu.saturating_mul(2) < locked_us)
+    }
+
     #[must_use]
     pub fn locked_us(&self) -> u64 {
         self.total_us
@@ -1034,6 +1064,8 @@ impl VersionedCfStore {
             CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
         })?;
         timings.router_lock_wait_us = elapsed_us(&router_lock_started);
+        // Both write locks are held from here; see `locked_cpu_us`.
+        let locked_cpu_started = thread_cpu_us();
         let attribution_started = Instant::now();
         let latest_router = if self.router_latest_readback.load(Ordering::Acquire) {
             router.as_ref()
@@ -1148,6 +1180,9 @@ impl VersionedCfStore {
         // sees is complete at every instant across this boundary. What is no
         // longer true is that a multi-hundred-millisecond AEAD-and-write holds
         // the whole vault shut.
+        timings.locked_cpu_us = locked_cpu_started
+            .zip(thread_cpu_us())
+            .map(|(before, after)| after.saturating_sub(before));
         drop(router);
         drop(table);
         if !sealed.is_empty() {
