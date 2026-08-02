@@ -120,15 +120,35 @@ impl MvccCommitTimings {
             .saturating_sub(self.sst_write_us)
     }
 
-    /// How long this commit held the vault's row-table and router write locks.
+    /// How long this commit **held** the vault's row-table and router write
+    /// locks — the number that matters for everyone who is not the committing
+    /// thread.
     ///
-    /// This is the number that matters for everyone who is *not* the
-    /// committing thread, and separating it from `total_us` is the whole point
-    /// of #1949: the SST write still costs what it costs, but it no longer
-    /// costs it while holding the vault shut.
+    /// Every term outside the guarded region is subtracted, and each one is
+    /// load-bearing:
+    ///
+    /// * `materialize` — the batch is copied *before* either lock is taken.
+    /// * `row_lock_wait` / `router_lock_wait` — **waiting** for a lock is not
+    ///   holding it. This is the correction that matters: these terms reach
+    ///   1.0 s on a 3-row commit stalled behind some other holder (#1950), and
+    ///   the first version of this method subtracted only `sst_write_us`, so
+    ///   such a commit reported having held the vault shut for 1,010,561 us
+    ///   when its true hold was ~60 us. A metric that names the *victim* of a
+    ///   stall as its *cause* is worse than no metric, because #1950 is
+    ///   actively looking for the holder.
+    /// * `sst_write` — the point of #1949; the SST write runs with both guards
+    ///   released.
+    ///
+    /// Teardown is not subtracted because it falls outside `total_us`
+    /// altogether: the owned batch and the sealed memtables drop as the frame
+    /// unwinds, after the last measurement.
     #[must_use]
     pub fn locked_us(&self) -> u64 {
-        self.total_us.saturating_sub(self.sst_write_us)
+        self.total_us
+            .saturating_sub(self.materialize_us)
+            .saturating_sub(self.row_lock_wait_us)
+            .saturating_sub(self.router_lock_wait_us)
+            .saturating_sub(self.sst_write_us)
     }
 }
 
