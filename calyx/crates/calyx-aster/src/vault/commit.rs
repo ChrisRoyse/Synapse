@@ -1,6 +1,6 @@
 use super::{AsterVault, encode, raw_commitment};
 use calyx_core::{CalyxError, Clock, Result, Seq};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// The WAL append is durable, but the live MVCC/router apply failed and the
 /// caller must reconcile the reported sequence before retrying.
@@ -16,14 +16,193 @@ pub const CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED: &str =
 /// symptoms; the warning below names the exact call site responsible.
 const DURABLE_COMMIT_LOCK_SLOW_BUDGET_MS: u128 = 1_000;
 
-/// Total durable-commit duration above which the per-stage split is logged
-/// (issue #1936).
+/// Absolute floor below which one commit is never reported as slow (#1936).
 ///
 /// Every MCP tool call pays exactly one grounded-observation commit before its
-/// response returns, so this is directly on the caller's critical path. A quiet
-/// log is the evidence the commit is in budget; anything slower names which
-/// stage spent the time rather than leaving one opaque `commit_us`.
-const COMMIT_STAGE_SLOW_BUDGET_US: u64 = 3_000;
+/// response returns, so this is directly on the caller's critical path. This
+/// constant alone is *not* the gate — see [`CommitStageObserver`] for why a
+/// fixed budget could not be one.
+const COMMIT_STAGE_SLOW_FLOOR_US: u64 = 3_000;
+
+/// Multiple of the recent typical commit above which a commit is an outlier.
+///
+/// The gate is `total >= FLOOR && total >= FACTOR * ewma`. The second term is
+/// what carries the information: it is relative to what this vault is actually
+/// doing right now, so it cannot be invalidated by the workload changing or by
+/// the commit path itself getting faster or slower.
+const COMMIT_STAGE_OUTLIER_FACTOR: u64 = 4;
+
+/// Commits between periodic distribution summaries.
+const COMMIT_STAGE_SUMMARY_INTERVAL: u64 = 512;
+
+/// Smoothing shift for the commit-duration EWMA (alpha = 1/8).
+const COMMIT_STAGE_EWMA_SHIFT: u32 = 3;
+
+/// Self-calibrating outlier gate and running census for durable commits
+/// (issue #1946).
+///
+/// The gate this replaces was a bare `total_us < 3_000 { return }`. Measured on
+/// the deployment host it fired on **1,105 of 1,105 commits** in one 23.6-minute
+/// run — 23.9% of the daemon log by bytes — with `min = 3,020 us` against a
+/// 3,000 us budget. A threshold exceeded by 100% of the population it measures
+/// cannot distinguish a slow commit from an ordinary one, which is the only
+/// thing it exists to do. Every one of those 1,105 lines cost bytes and carried
+/// no signal.
+///
+/// Raising the constant would only move the threshold, and would rot again the
+/// moment the workload or the commit path changed — which is precisely what had
+/// happened here. So the gate is relative instead of absolute: a commit is
+/// reported when it is both above an absolute floor *and* several times the
+/// recent typical commit for this vault. That is self-calibrating by
+/// construction; it can neither go silent nor flood, whatever the base cost is.
+///
+/// The ordinary cost does not stop being worth knowing just because it is
+/// ordinary — losing it is how the 46% `anchor_publish` term went unnoticed. So
+/// the base rate is emitted separately as a bounded periodic census rather than
+/// as one line per commit.
+#[derive(Debug, Default)]
+pub(super) struct CommitStageObserver {
+    /// EWMA of total commit duration, in microseconds. Zero until seeded.
+    ewma_us: AtomicU64,
+    /// Commits observed since the last summary.
+    commits: AtomicU64,
+    /// Sum of total commit duration since the last summary.
+    total_us: AtomicU64,
+    /// Largest total commit duration since the last summary.
+    max_us: AtomicU64,
+    /// Commits above the absolute floor since the last summary.
+    over_floor: AtomicU64,
+    /// Commits reported as outliers since the last summary.
+    reported: AtomicU64,
+    /// Per-stage sums since the last summary.
+    ///
+    /// The census carries the stage split, not just the total, and that is the
+    /// load-bearing part of this whole structure. #1946 exists because
+    /// `anchor_publish` was 46% of commit cost — a fact that is invisible in a
+    /// total. Replacing a per-commit stage event with a total-only summary
+    /// would have quieted the log while destroying the exact observation that
+    /// found the defect, which is the trade ask 3 of that issue forbids. These
+    /// sums are what let the next such term be found without re-instrumenting.
+    stage_sums: [AtomicU64; STAGE_COUNT],
+}
+
+/// Stage names, in the order of [`CommitStageObserver::stage_sums`].
+const STAGE_NAMES: [&str; STAGE_COUNT] = [
+    "admission",
+    "sidecar",
+    "wal",
+    "anchor_publish",
+    "mvcc",
+    "checkpoint_stage",
+];
+const STAGE_COUNT: usize = 6;
+
+/// What one commit's duration means relative to this vault's recent behaviour.
+struct CommitStageVerdict {
+    report: bool,
+    ewma_us: u64,
+    summary: Option<CommitStageSummary>,
+}
+
+/// One bounded census of commit durations.
+struct CommitStageSummary {
+    commits: u64,
+    mean_us: u64,
+    max_us: u64,
+    over_floor: u64,
+    reported: u64,
+    /// Total microseconds spent in each stage over the census window, in
+    /// [`STAGE_NAMES`] order. Rendered as `stage=sum_us` pairs so one line
+    /// carries the whole split.
+    stage_sums: [u64; STAGE_COUNT],
+}
+
+impl CommitStageSummary {
+    /// `admission=12 sidecar=8 wal=4108000 anchor_publish=1790000 ...`
+    fn stage_split(&self) -> String {
+        STAGE_NAMES
+            .iter()
+            .zip(self.stage_sums.iter())
+            .map(|(name, sum)| format!("{name}={sum}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The largest stage as `name` and its percentage share, so the dominant
+    /// term is stated outright rather than left to be derived by whoever reads
+    /// the line. #1946 went unnoticed for as long as it did because nobody had
+    /// summed the column.
+    fn dominant(&self) -> (&'static str, u64) {
+        let total: u64 = self.stage_sums.iter().sum();
+        let (index, sum) = self
+            .stage_sums
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, sum)| **sum)
+            .map_or((0, &0), |(index, sum)| (index, sum));
+        let share = sum.saturating_mul(100).checked_div(total).unwrap_or(0);
+        (STAGE_NAMES[index], share)
+    }
+}
+
+impl CommitStageObserver {
+    fn observe(&self, stage: &CommitStageTimings, total_us: u64) -> CommitStageVerdict {
+        // Seed on the first commit so the very first sample is not compared
+        // against a zero baseline and reported as a 4x outlier.
+        let previous = self.ewma_us.load(Ordering::Relaxed);
+        let ewma_us = if previous == 0 {
+            self.ewma_us.store(total_us, Ordering::Relaxed);
+            total_us
+        } else {
+            let next = previous - (previous >> COMMIT_STAGE_EWMA_SHIFT)
+                + (total_us >> COMMIT_STAGE_EWMA_SHIFT);
+            self.ewma_us.store(next, Ordering::Relaxed);
+            previous
+        };
+
+        let over_floor = total_us >= COMMIT_STAGE_SLOW_FLOOR_US;
+        let report =
+            over_floor && total_us >= ewma_us.saturating_mul(COMMIT_STAGE_OUTLIER_FACTOR).max(1);
+
+        self.total_us.fetch_add(total_us, Ordering::Relaxed);
+        self.max_us.fetch_max(total_us, Ordering::Relaxed);
+        for (slot, value) in self.stage_sums.iter().zip(stage.stage_values()) {
+            slot.fetch_add(value, Ordering::Relaxed);
+        }
+        if over_floor {
+            self.over_floor.fetch_add(1, Ordering::Relaxed);
+        }
+        if report {
+            self.reported.fetch_add(1, Ordering::Relaxed);
+        }
+        let commits = self.commits.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // `==`, not `>=`: exactly one observer can see the boundary sample, so
+        // a concurrent non-durable commit cannot emit a duplicate census.
+        let summary = (commits == COMMIT_STAGE_SUMMARY_INTERVAL).then(|| {
+            let commits = self.commits.swap(0, Ordering::Relaxed);
+            let total = self.total_us.swap(0, Ordering::Relaxed);
+            let mut stage_sums = [0_u64; STAGE_COUNT];
+            for (out, slot) in stage_sums.iter_mut().zip(self.stage_sums.iter()) {
+                *out = slot.swap(0, Ordering::Relaxed);
+            }
+            CommitStageSummary {
+                commits,
+                mean_us: total.checked_div(commits).unwrap_or(0),
+                max_us: self.max_us.swap(0, Ordering::Relaxed),
+                over_floor: self.over_floor.swap(0, Ordering::Relaxed),
+                reported: self.reported.swap(0, Ordering::Relaxed),
+                stage_sums,
+            }
+        });
+
+        CommitStageVerdict {
+            report,
+            ewma_us,
+            summary,
+        }
+    }
+}
 
 /// Per-stage split of one durable group commit.
 ///
@@ -50,6 +229,18 @@ struct CommitStageTimings {
 }
 
 impl CommitStageTimings {
+    /// This commit's stages in [`STAGE_NAMES`] order.
+    fn stage_values(&self) -> [u64; STAGE_COUNT] {
+        [
+            self.admission_us,
+            self.sidecar_us,
+            self.wal_us,
+            self.anchor_publish_us,
+            self.mvcc_us,
+            self.checkpoint_stage_us,
+        ]
+    }
+
     fn split(&mut self, started: &std::time::Instant) -> u64 {
         let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let stage = elapsed.saturating_sub(self.consumed_us);
@@ -57,9 +248,33 @@ impl CommitStageTimings {
         stage
     }
 
-    fn report(&self, rows: &[encode::WriteRow], started: &std::time::Instant) {
+    fn report(
+        &self,
+        rows: &[encode::WriteRow],
+        started: &std::time::Instant,
+        observer: &CommitStageObserver,
+    ) {
         let total_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if total_us < COMMIT_STAGE_SLOW_BUDGET_US {
+        let verdict = observer.observe(self, total_us);
+        if let Some(summary) = &verdict.summary {
+            let (dominant_stage, dominant_share_pct) = summary.dominant();
+            tracing::info!(
+                code = "CALYX_ASTER_DURABLE_COMMIT_STAGE_CENSUS",
+                commits = summary.commits,
+                mean_us = summary.mean_us,
+                max_us = summary.max_us,
+                ewma_us = verdict.ewma_us,
+                over_floor = summary.over_floor,
+                reported_outliers = summary.reported,
+                floor_us = COMMIT_STAGE_SLOW_FLOOR_US,
+                outlier_factor = COMMIT_STAGE_OUTLIER_FACTOR,
+                stage_sum_us = %summary.stage_split(),
+                dominant_stage,
+                dominant_share_pct,
+                "durable group commit duration census"
+            );
+        }
+        if !verdict.report {
             return;
         }
         let row_count = rows.len();
@@ -101,8 +316,12 @@ impl CommitStageTimings {
             mvcc_us = self.mvcc_us,
             checkpoint_stage_us = self.checkpoint_stage_us,
             unattributed_us = total_us.saturating_sub(attributed),
-            budget_us = COMMIT_STAGE_SLOW_BUDGET_US,
-            "durable group commit exceeded its per-stage latency budget"
+            floor_us = COMMIT_STAGE_SLOW_FLOOR_US,
+            // The baseline this commit was judged against, so the line carries
+            // its own evidence of being an outlier rather than asserting it.
+            typical_us = verdict.ewma_us,
+            outlier_factor = COMMIT_STAGE_OUTLIER_FACTOR,
+            "durable group commit is an outlier against this vault's recent commit duration"
         );
     }
 }
@@ -422,7 +641,7 @@ where
         let Some(durable) = &self.durable else {
             let seq = self.commit_rows_to_mvcc(rows);
             stage.mvcc_us = stage.split(&started);
-            stage.report(rows, &started);
+            stage.report(rows, &started, &self.commit_stage_observer);
             return seq;
         };
 
@@ -459,7 +678,7 @@ where
             stage.checkpoint_stage_us = stage.split(&started);
             Ok(mvcc_seq)
         })();
-        stage.report(rows, &started);
+        stage.report(rows, &started, &self.commit_stage_observer);
 
         match publish {
             Ok(seq) => Ok(seq),

@@ -136,6 +136,10 @@ pub struct AsterVault<C = SystemClock> {
     post_commit_error_seq: AtomicU64,
     recovery_report: VaultRecoveryReport,
     residency: Option<crate::residency::Residency>,
+    /// Self-calibrating gate and running census for durable-commit duration
+    /// (issue #1946). Per-vault rather than process-global so an isolated
+    /// vault's commits cannot shift the live daemon's baseline.
+    commit_stage_observer: commit::CommitStageObserver,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +473,7 @@ where
             recurrence_write_lock: Mutex::new(()),
             ledger_state_reconciliation_required: AtomicBool::new(false),
             post_commit_error_seq: AtomicU64::new(0),
+            commit_stage_observer: Default::default(),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,

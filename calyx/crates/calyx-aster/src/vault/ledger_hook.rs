@@ -134,7 +134,11 @@ fn physical_ledger_store(
         elapsed_ms = lock_started_at.elapsed().as_millis(),
         "ledger hook recovery commit lock ready"
     );
-    if let Some(anchor) = crate::ledger_head::read_head_anchor(vault_dir)? {
+    // Rebuildable read: an unreadable projection falls through to the physical
+    // row probe below, which is the same path taken when the projection is
+    // absent, and is reported with its decode error before being discarded
+    // (#1946).
+    if let Some(anchor) = crate::ledger_head::read_head_anchor_rebuildable(vault_dir)? {
         tracing::info!(
             code = "CALYX_ASTER_LEDGER_HOOK_HEAD_ANCHOR_FOUND",
             vault_dir = %vault_dir.display(),
@@ -408,7 +412,10 @@ fn checkpoint_hydration_start_from_pointer(
     tiering_policy: Option<&TieringPolicy>,
 ) -> Result<Option<u64>> {
     let started_at = Instant::now();
-    let Some(anchor) = crate::ledger_head::read_checkpoint_anchor(vault_dir)? else {
+    // Rebuildable: the `None` arm below is already the repair path ("bounded
+    // legacy scan will repair it"), which is exactly where a torn projection
+    // belongs (#1946).
+    let Some(anchor) = crate::ledger_head::read_checkpoint_anchor_rebuildable(vault_dir)? else {
         tracing::info!(
             code = "CALYX_ASTER_LEDGER_HOOK_CHECKPOINT_POINTER_MISSING",
             vault_dir = %vault_dir.display(),
@@ -700,7 +707,10 @@ pub(super) fn ensure_recovered_ledger_sidecars(
             newest_checkpoint = Some(anchor);
         }
     }
-    let current_head = crate::ledger_head::read_head_anchor(vault_dir)?;
+    // An unreadable projection reads as `None` here, which compares unequal to
+    // any recovered head and so routes into exactly the same repair (or the
+    // same read-only reconciliation error) as a divergent one (#1946).
+    let current_head = crate::ledger_head::read_head_anchor_rebuildable(vault_dir)?;
     if current_head != newest_head {
         let current_height = current_head
             .as_ref()
@@ -725,7 +735,7 @@ pub(super) fn ensure_recovered_ledger_sidecars(
             "replaced divergent Ledger head sidecar with exact recovered physical truth"
         );
     }
-    let current_checkpoint = crate::ledger_head::read_checkpoint_anchor(vault_dir)?;
+    let current_checkpoint = crate::ledger_head::read_checkpoint_anchor_rebuildable(vault_dir)?;
     if current_checkpoint != newest_checkpoint {
         let current_seq = current_checkpoint
             .as_ref()
