@@ -17,7 +17,8 @@ pub use abundance::{
 pub use agreement_graph::{AgreementEdge, LoomStore};
 pub use blind_spot::{
     BlindSpotAlert, BlindSpotCalibration, BlindSpotCalibrationEvidence, BlindSpotCalibrationParams,
-    Severity, detect_blind_spot, detect_blind_spot_calibrated,
+    MAX_DISCRIMINATIVE_MODAL_SHARE, MIN_DISCRIMINATIVE_DISTINCT, SIMILARITY_DISTINCT_TOLERANCE,
+    Severity, SimilarityDiscrimination, detect_blind_spot, detect_blind_spot_calibrated,
 };
 pub use cross_term::{
     CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag, agreement_batch_cpu,

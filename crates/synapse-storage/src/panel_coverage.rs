@@ -408,6 +408,21 @@ pub struct PanelCoverageReport {
     pub unbackfillable_deficient_panels: Vec<String>,
     /// Outcome-bearing panels below the grounding floor.
     pub grounding_deficient_panels: Vec<String>,
+    /// **#1962.** Outcome-bearing panels holding records but carrying **zero**
+    /// anchor kinds — a strict subset of `grounding_deficient_panels`, and a
+    /// categorically different state from the rest of it.
+    ///
+    /// A panel at 0.30 coverage has an outcome axis and not enough of it; a
+    /// panel at 0.00 with no kinds has no outcome axis at all, so results over
+    /// it are undefined rather than provisional. A single deficient count could
+    /// not distinguish them, which is how the *active* panel sat with zero
+    /// anchors of any kind while health reported a two-panel deficiency that
+    /// read as thin coverage.
+    ///
+    /// Named `panel@version`, and the active generation is marked, because "one
+    /// of the deficient panels is the one every operator-facing surface reads"
+    /// is the operationally load-bearing half of the fact.
+    pub no_outcome_axis_panels: Vec<String>,
     /// Panels holding more constellations at the active generation than their
     /// source CF holds rows.
     ///
@@ -565,6 +580,7 @@ pub fn build_panel_coverage_report(
     let mut coverage_deficient_panels = Vec::new();
     let mut unbackfillable_deficient_panels = Vec::new();
     let mut grounding_deficient_panels = Vec::new();
+    let mut no_outcome_axis_panels = Vec::new();
     let mut records_exceed_source_panels = Vec::new();
     let mut orphaned_source_missing_panels = Vec::new();
 
@@ -741,6 +757,16 @@ pub fn build_panel_coverage_report(
         }
         if grounding_below_floor {
             grounding_deficient_panels.push(entry.panel_name.to_owned());
+            // #1962: zero kinds is not thin coverage. `active_version_records > 0`
+            // matters — a panel with no records has not demonstrated anything
+            // about its outcome axis, and calling that "no outcome axis" would
+            // turn an empty generation into a finding.
+            if active_version_records > 0 && anchor_kind_records.is_empty() {
+                no_outcome_axis_panels.push(format!(
+                    "{}@{} (active, {} records, 0 anchor kinds)",
+                    entry.panel_name, entry.panel_version, active_version_records
+                ));
+            }
         }
         if records_exceed_source {
             records_exceed_source_panels.push(entry.panel_name.to_owned());
@@ -820,6 +846,7 @@ pub fn build_panel_coverage_report(
         coverage_deficient_panels,
         unbackfillable_deficient_panels,
         grounding_deficient_panels,
+        no_outcome_axis_panels,
         records_exceed_source_panels,
         measured_at_unix_ms: census.measured_at_unix_ms,
     }

@@ -993,7 +993,8 @@ impl SynapseService {
             status: status.to_owned(),
             detail: Some(format!(
                 "{}base_cf_rows={} records_total={} superseded_records={} \
-                 grounding_deficient_panels={:?} records_exceed_source_panels={:?} \
+                 grounding_deficient_panels={:?} no_outcome_axis_panels={:?} \
+                 records_exceed_source_panels={:?} \
                  backfill={} panel={} pages={} inserted={} \
                  anchored={} elapsed_ms={} panels=[{}]",
                 if reasons.is_empty() {
@@ -1005,6 +1006,7 @@ impl SynapseService {
                 report.records_total,
                 report.superseded_records_total,
                 report.grounding_deficient_panels,
+                report.no_outcome_axis_panels,
                 report.records_exceed_source_panels,
                 readback.last_backfill_action.as_deref().unwrap_or("<none>"),
                 readback.last_backfill_panel.as_deref().unwrap_or("<none>"),
@@ -1024,6 +1026,8 @@ impl SynapseService {
             calyx_panel_grounding_deficient_panels: Some(
                 report.grounding_deficient_panels.len() as u64
             ),
+            calyx_panel_no_outcome_axis_panels: Some(report.no_outcome_axis_panels.len() as u64),
+            calyx_panel_no_outcome_axis_panel_names: Some(report.no_outcome_axis_panels.clone()),
             calyx_panel_coverage_min_fraction: min_fraction,
             calyx_panel_coverage_floor: Some(report.coverage_floor),
             calyx_panel_superseded_records: Some(report.superseded_records_total as u64),

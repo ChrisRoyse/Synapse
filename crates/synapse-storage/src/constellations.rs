@@ -2035,11 +2035,38 @@ pub fn assert_syn_lens_provenance_complete() -> StorageResult<()> {
         .filter(|(_, version, _)| !known_versions.contains(version))
         .map(|(kind, version, _)| format!("{kind}@{version}"))
         .collect();
+
+    // #1962. An anchor declaration on a panel the catalog declares
+    // observation-shaped is a contradiction between two declarations, and the
+    // failure mode is silent in the worst direction: `outcome_bearing: false`
+    // says 0.0 grounded coverage is *correct*, while the anchor declaration says
+    // an outcome is expected here and simply is not being written. Nothing
+    // reconciled the two, so `syn-timeline-v1 @ 1900001` sat with a declared
+    // `synapse:mcp_tool_call_outcome` that no code path could ever produce — an
+    // intent that read as a defect on every grounding readback.
+    //
+    // Refused at startup rather than reported, because the two declarations are
+    // both compile-time constants: if they disagree, one of them is wrong now,
+    // and no amount of runtime evidence will settle it.
+    let observation_shaped: BTreeSet<u32> = builtin_panel_catalog()
+        .into_iter()
+        .filter(|entry| !entry.outcome_bearing)
+        .flat_map(|entry| {
+            std::iter::once(entry.panel_version).chain(entry.superseded_versions.iter().copied())
+        })
+        .collect();
+    let anchors_on_observation_panels: Vec<String> = lens_provenance::SYN_ANCHOR_DETERMINING_FIELDS
+        .iter()
+        .filter(|(_, version, _)| observation_shaped.contains(version))
+        .map(|(kind, version, _)| format!("{kind}@{version}"))
+        .collect();
+
     if undeclared.is_empty()
         && orphaned.is_empty()
         && duplicates.is_empty()
         && renamed.is_empty()
         && stale_anchor_versions.is_empty()
+        && anchors_on_observation_panels.is_empty()
     {
         return Ok(());
     }
@@ -2050,9 +2077,13 @@ pub fn assert_syn_lens_provenance_complete() -> StorageResult<()> {
              record fields it measures so anchor leakage can be refused structurally (#1958). \
              undeclared_slots={undeclared:?} orphaned_declarations={orphaned:?} \
              duplicate_declarations={duplicates:?} lens_name_mismatches={renamed:?} \
-             anchor_declarations_on_unknown_panel_versions={stale_anchor_versions:?}. Fix \
-             synapse_calyx::lens_provenance, listing every record field the slot's \
-             construction site in this file reads transitively."
+             anchor_declarations_on_unknown_panel_versions={stale_anchor_versions:?} \
+             anchor_declarations_on_observation_shaped_panels={anchors_on_observation_panels:?}. \
+             Fix synapse_calyx::lens_provenance, listing every record field the slot's \
+             construction site in this file reads transitively. An anchor declared on a panel \
+             this file's builtin_panel_catalog marks outcome_bearing=false contradicts that \
+             catalog entry (#1962): either the panel does receive that outcome and the catalog \
+             entry is wrong, or it does not and the anchor declaration must go — never both."
         ),
     })
 }

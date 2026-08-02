@@ -114,6 +114,17 @@ pub struct SynapseCalyxGroundingGapReport {
     pub provisional: bool,
     /// Human-readable reason the domain is provisional, when it is.
     pub provisional_reason: Option<String>,
+    /// **#1962.** True when the domain carries no anchor of *any* kind, as
+    /// distinct from carrying some and falling under the coverage floor.
+    ///
+    /// These are categorically different operational states and only one of them
+    /// is "provisional". With zero anchor kinds there is no outcome axis at all:
+    /// bits, sufficiency, synergy and the ensemble card have nothing to measure
+    /// *about*, the grounding kernel's `0.20 * groundedness` selection term is
+    /// zero for every candidate, and guard calibration cannot find an adjudicated
+    /// exemplar. Those results are not degraded — they are undefined. A single
+    /// `provisional` flag could not say which of the two a caller was holding.
+    pub no_outcome_axis: bool,
     pub distinct_anchor_kinds: usize,
     pub anchor_kind_coverage: Vec<SynapseCalyxAnchorKindCoverage>,
     pub slot_coverage: Vec<SynapseCalyxSlotGroundingCoverage>,
@@ -131,6 +142,9 @@ pub struct SynapseCalyxDomainGroundingVerdict {
     pub grounded_fraction: f32,
     pub coverage_floor: f32,
     pub provisional: bool,
+    /// The domain carries no anchor of any kind, so results over it are
+    /// undefined rather than provisional (#1962).
+    pub no_outcome_axis: bool,
 }
 
 /// Mutable accumulator for one lens's grounded/present counts.
@@ -242,11 +256,26 @@ impl SynapseCalyxVault {
         };
         let coverage_floor = SYNAPSE_GROUNDING_COVERAGE_FLOOR;
         let provisional = grounded_fraction < coverage_floor;
+        // Computed before the reason so the reason can name which of the two
+        // conditions holds (#1962). `records_measured == 0` is neither: an empty
+        // pass has not established anything about the domain's outcome axis.
+        let no_outcome_axis = records_measured > 0 && kind_records.is_empty();
         let provisional_reason = provisional.then(|| {
-            format!(
-                "grounded coverage {grounded_fraction:.4} is below the {coverage_floor:.4} floor; \
-                 results over this domain must be tagged provisional"
-            )
+            if no_outcome_axis {
+                format!(
+                    "this domain carries no anchor of any kind over its {records_measured} \
+                     measured record(s), so it has no outcome axis: every bits/sufficiency/ \
+                     synergy/kernel-groundedness result over it is undefined rather than \
+                     provisional, and guard calibration has no adjudicated exemplar to find. \
+                     Check whether the panel is observation-shaped by design (the panel catalog's \
+                     outcome_bearing declaration) before treating this as a missing write"
+                )
+            } else {
+                format!(
+                    "grounded coverage {grounded_fraction:.4} is below the {coverage_floor:.4} \
+                     floor; results over this domain must be tagged provisional"
+                )
+            }
         });
 
         let anchor_kind_coverage = kind_records
@@ -304,6 +333,7 @@ impl SynapseCalyxVault {
             coverage_floor,
             provisional,
             provisional_reason,
+            no_outcome_axis,
             distinct_anchor_kinds,
             anchor_kind_coverage,
             slot_coverage,
@@ -332,6 +362,7 @@ impl SynapseCalyxVault {
             grounded_fraction: report.grounded_fraction,
             coverage_floor: report.coverage_floor,
             provisional: report.provisional,
+            no_outcome_axis: report.no_outcome_axis,
         })
     }
 }

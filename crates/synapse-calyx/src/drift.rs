@@ -11,6 +11,19 @@
 //!   lens_b_neighbor_mean` is scored against a per-slot-pair empirical
 //!   calibration so a healthy corpus yields a bounded, `alpha`-controlled
 //!   false-positive rate.
+//!
+//!   **The gate that makes that a finding rather than an artifact (#1961).**
+//!   The neighbor is chosen to *maximize* similarity under lens A, so
+//!   `lens_a_similarity` is an argmax: "lens A is confident" is true by
+//!   selection, not by observation, for any lens whose neighbor-similarity
+//!   distribution is degenerate. A one-hot lens returns cosine exactly `1.0` for
+//!   any two records sharing a category and can return nothing else, and on the
+//!   live timeline panel *every* dense lens returned exactly `1.0` for every
+//!   record — so the rule reduced to "lens B's similarity is low, offset by a
+//!   constant". Each ordered `(A, B)` direction therefore measures A's
+//!   distribution first ([`calyx_loom::SimilarityDiscrimination`]) and is
+//!   **refused with its evidence** when A cannot discriminate. Both orderings of
+//!   every pair are candidates, because the rule is directional.
 //! * **MMD drift** — per-lens maximum-mean-discrepancy two-sample test between a
 //!   reference (older) window and a recent window of the lens's feature vectors,
 //!   consuming the `calyx-assay` Gaussian-kernel MMD estimator. Drift findings
@@ -35,7 +48,8 @@ use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{CxId, SlotId, SlotVector};
 use calyx_forge::{Backend, KnnMetric};
 use calyx_loom::{
-    BlindSpotCalibration, BlindSpotCalibrationParams, Severity, detect_blind_spot_calibrated,
+    BlindSpotCalibration, BlindSpotCalibrationParams, SIMILARITY_DISTINCT_TOLERANCE, Severity,
+    SimilarityDiscrimination, detect_blind_spot_calibrated,
 };
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +114,40 @@ pub struct SynapseCalyxBlindSpotAlert {
     pub calibration_p_value: f32,
     pub calibration_percentile: f32,
     pub threshold_delta: f32,
+    /// Distinct delta values behind this pair's calibration (#1961 ask 2).
+    pub calibration_distinct_deltas: usize,
+    /// Whether that calibration can resolve `alpha` at all. When false the
+    /// certificate proves only that the observation sits at the top of a nearly
+    /// constant variable, and the severity is capped at `low`.
+    pub calibration_resolves_alpha: bool,
+    /// The lowest similarity lens B actually reached over this pair's records.
+    pub lens_b_observed_min: f32,
+    /// The highest similarity lens B actually reached over this pair's records.
+    pub lens_b_observed_max: f32,
+    /// Where `lens_b_neighbor_mean` sits inside lens B's own reached range:
+    /// `0.0` at B's maximum, `1.0` at B's minimum (#1961 ask 3).
+    ///
+    /// A cyclic encoding reaches cosine `-1.0` for any two timestamps half a
+    /// period apart, so an absolute `-1.0` says nothing on its own. Read against
+    /// the range the encoding actually reached, it says how unusual the
+    /// disagreement is *for that encoding*.
+    pub lens_b_dissent_fraction: f32,
+}
+
+/// One slot-pair direction that was refused rather than evaluated, with the
+/// measured evidence for the refusal (#1961 ask 1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxBlindSpotPairDiagnostic {
+    pub slot_a: u16,
+    pub slot_b: u16,
+    pub code: String,
+    pub detail: String,
+    pub records: usize,
+    pub lens_a_distinct_values: usize,
+    pub lens_a_modal_value: f32,
+    pub lens_a_modal_share: f32,
+    pub lens_a_observed_min: f32,
+    pub lens_a_observed_max: f32,
 }
 
 /// Result of one blind-spot scan (read-only).
@@ -109,8 +157,22 @@ pub struct SynapseCalyxBlindSpotReport {
     pub records_scanned: usize,
     pub records_measured: usize,
     pub n_lenses: usize,
+    /// Ordered `(A, B)` directions evaluated. Both directions of every unordered
+    /// pair are candidates: "lens 4 is confident where lens 1 disagrees" is a
+    /// different claim from its reverse, and only testing one of them silently
+    /// dropped half the detector's reach.
     pub slot_pairs_evaluated: usize,
     pub slot_pairs_uncalibrated: usize,
+    /// Directions refused because lens A's confidence is definitional.
+    pub slot_pairs_nondiscriminative: usize,
+    pub nondiscriminative_pairs: Vec<SynapseCalyxBlindSpotPairDiagnostic>,
+    /// Distinct `(lens_a_similarity, lens_b_neighbor_mean)` tuples across every
+    /// emitted alert. An alert set with few distinct signatures is enumerating
+    /// its encoding, not its corpus, and a caller should not have to derive that
+    /// by hand (#1961 ask 2).
+    pub alert_distinct_signatures: usize,
+    /// Distinct delta values across every emitted alert.
+    pub alert_distinct_deltas: usize,
     pub alerts_total: usize,
     pub alerts: Vec<SynapseCalyxBlindSpotAlert>,
 }
@@ -234,87 +296,55 @@ impl SynapseCalyxVault {
         lens_ids.sort_unstable();
 
         let mut alerts: Vec<SynapseCalyxBlindSpotAlert> = Vec::new();
+        let mut nondiscriminative_pairs: Vec<SynapseCalyxBlindSpotPairDiagnostic> = Vec::new();
         let mut slot_pairs_evaluated = 0usize;
         let mut slot_pairs_uncalibrated = 0usize;
 
-        for (i, &slot_a) in lens_ids.iter().enumerate() {
-            for &slot_b in lens_ids.iter().skip(i + 1) {
+        for (i, &slot_one) in lens_ids.iter().enumerate() {
+            for &slot_two in lens_ids.iter().skip(i + 1) {
                 // Records carrying both lenses, restricted to the modal (dim_a,
                 // dim_b) shape so cosine kNN on A and cosine on B are defined.
-                let members = paired_dense_members(&corpus.records, slot_a, slot_b);
+                let members = paired_dense_members(&corpus.records, slot_one, slot_two);
                 let Some(group) = modal_shape_group(&members) else {
                     continue;
                 };
                 if group.len() < min_samples {
-                    slot_pairs_uncalibrated += 1;
+                    // Both directions of this pair are unevaluable.
+                    slot_pairs_uncalibrated += 2;
                     continue;
                 }
-                let dim_a = group[0].1.len();
-                let nearest = nearest_neighbor_indices(backend, &group, dim_a)?;
 
-                // delta_i = a_sim_i − b_sim_i for every record with a neighbor.
-                let mut deltas: Vec<f32> = Vec::with_capacity(group.len());
-                let mut per_record: Vec<(usize, f32, f32)> = Vec::with_capacity(group.len());
-                for (index, neighbor) in nearest.iter().enumerate() {
-                    let Some((neighbor_index, a_sim)) = *neighbor else {
-                        continue;
+                // "Lens A is confident where lens B disagrees" is directional:
+                // it is a claim about A's neighborhood judged through B, and its
+                // reverse is a different claim about a different neighborhood.
+                // Evaluate both orderings.
+                for forward in [true, false] {
+                    let (slot_a, slot_b) = if forward {
+                        (slot_one, slot_two)
+                    } else {
+                        (slot_two, slot_one)
                     };
-                    let b_sim = cosine_similarity(group[index].2, group[neighbor_index].2);
-                    let delta = a_sim - b_sim;
-                    if !delta.is_finite() {
-                        continue;
-                    }
-                    deltas.push(delta);
-                    per_record.push((index, a_sim, b_sim));
-                }
-                if deltas.len() < min_samples {
-                    slot_pairs_uncalibrated += 1;
-                    continue;
-                }
-
-                let calibration = match BlindSpotCalibration::from_deltas(
-                    deltas.iter().copied(),
-                    BlindSpotCalibrationParams {
-                        min_samples,
-                        alpha: params.alpha,
-                    },
-                ) {
-                    Ok(calibration) => calibration,
-                    Err(error) => {
-                        // Uncalibratable pair (e.g. below the sample floor) is a
-                        // data condition, not a fault: report it, keep scanning.
-                        tracing::debug!(
-                            code = "SYNAPSE_BLIND_SPOT_UNCALIBRATED",
-                            slot_a = slot_a.get(),
-                            slot_b = slot_b.get(),
-                            error = %error.message,
-                            "blind-spot pair could not be calibrated"
-                        );
-                        slot_pairs_uncalibrated += 1;
-                        continue;
-                    }
-                };
-                slot_pairs_evaluated += 1;
-
-                for (index, a_sim, b_sim) in per_record {
-                    let cx_id = group[index].0;
-                    let alert = detect_blind_spot_calibrated(
-                        cx_id,
+                    match self.evaluate_blind_spot_direction(
+                        backend,
+                        &group,
+                        forward,
                         slot_a,
                         slot_b,
-                        a_sim,
-                        b_sim,
-                        &calibration,
-                    )
-                    .map_err(|error| {
-                        SynapseCalyxError::from_calyx("evaluate calibrated blind spot", &error)
-                    })?;
-                    if let Some(alert) = alert {
-                        alerts.push(blind_spot_alert(&alert, a_sim, b_sim));
+                        min_samples,
+                        params.alpha,
+                        &mut alerts,
+                    )? {
+                        DirectionOutcome::Evaluated => slot_pairs_evaluated += 1,
+                        DirectionOutcome::Uncalibrated => slot_pairs_uncalibrated += 1,
+                        DirectionOutcome::NonDiscriminative(diagnostic) => {
+                            nondiscriminative_pairs.push(diagnostic);
+                        }
                     }
                 }
             }
         }
+
+        let slot_pairs_nondiscriminative = nondiscriminative_pairs.len();
 
         // Deterministic, most-severe-first ordering, then cap.
         alerts.sort_by(|a, b| {
@@ -325,6 +355,12 @@ impl SynapseCalyxVault {
                 .then(a.slot_b.cmp(&b.slot_b))
         });
         let alerts_total = alerts.len();
+        let alert_distinct_signatures = distinct_f32_tuples(
+            alerts
+                .iter()
+                .map(|alert| (alert.lens_a_similarity, alert.lens_b_neighbor_mean)),
+        );
+        let alert_distinct_deltas = distinct_f32_values(alerts.iter().map(|alert| alert.delta));
         alerts.truncate(params.max_alerts.max(1));
 
         Ok(SynapseCalyxBlindSpotReport {
@@ -334,9 +370,134 @@ impl SynapseCalyxVault {
             n_lenses: lens_ids.len(),
             slot_pairs_evaluated,
             slot_pairs_uncalibrated,
+            slot_pairs_nondiscriminative,
+            nondiscriminative_pairs,
+            alert_distinct_signatures,
+            alert_distinct_deltas,
             alerts_total,
             alerts,
         })
+    }
+
+    /// Evaluates one ordered `(A, B)` direction of a lens pair, appending any
+    /// alerts it certifies.
+    ///
+    /// The gate this applies before certifying anything is the whole point: the
+    /// neighbor is chosen to *maximise* similarity under A, so "lens A is
+    /// confident" is true by selection for every record whose A-similarity
+    /// distribution is degenerate. A one-hot lens returns cosine exactly `1.0`
+    /// for any two records sharing a category and can return nothing else, so
+    /// on such a lens the rule reduces to "B's similarity is low" with a
+    /// constant offset — a lens-B outlier detector wearing a cross-lens label.
+    /// Measuring A's distribution first and refusing the direction when it
+    /// cannot discriminate is what keeps an alert a finding (#1961).
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_blind_spot_direction(
+        &self,
+        backend: &dyn Backend,
+        group: &[PairedMember<'_>],
+        forward: bool,
+        slot_a: SlotId,
+        slot_b: SlotId,
+        min_samples: usize,
+        alpha: f32,
+        alerts: &mut Vec<SynapseCalyxBlindSpotAlert>,
+    ) -> Result<DirectionOutcome, SynapseCalyxError> {
+        let dim_a = role_vector(&group[0], forward).len();
+        let nearest = nearest_neighbor_indices(backend, group, dim_a, forward)?;
+
+        let mut deltas: Vec<f32> = Vec::with_capacity(group.len());
+        let mut a_sims: Vec<f32> = Vec::with_capacity(group.len());
+        let mut b_sims: Vec<f32> = Vec::with_capacity(group.len());
+        let mut per_record: Vec<(usize, f32, f32)> = Vec::with_capacity(group.len());
+        for (index, neighbor) in nearest.iter().enumerate() {
+            let Some((neighbor_index, a_sim)) = *neighbor else {
+                continue;
+            };
+            let b_sim = cosine_similarity(
+                role_vector(&group[index], !forward),
+                role_vector(&group[neighbor_index], !forward),
+            );
+            let delta = a_sim - b_sim;
+            if !delta.is_finite() {
+                continue;
+            }
+            deltas.push(delta);
+            a_sims.push(a_sim);
+            b_sims.push(b_sim);
+            per_record.push((index, a_sim, b_sim));
+        }
+        if deltas.len() < min_samples {
+            return Ok(DirectionOutcome::Uncalibrated);
+        }
+
+        let a_discrimination = SimilarityDiscrimination::measure(&a_sims).map_err(|error| {
+            SynapseCalyxError::from_calyx("measure lens-A similarity discrimination", &error)
+        })?;
+        if a_discrimination.is_definitional() {
+            return Ok(DirectionOutcome::NonDiscriminative(
+                SynapseCalyxBlindSpotPairDiagnostic {
+                    slot_a: slot_a.get(),
+                    slot_b: slot_b.get(),
+                    code: "SYNAPSE_BLIND_SPOT_LENS_A_DEFINITIONAL".to_owned(),
+                    detail: format!(
+                        "lens {} produces {} distinct nearest-neighbour similarities over {} records \
+                         with {:.4} of them at {:.6}; its confidence is a property of the encoding, \
+                         so \"lens {} is confident while lens {} disagrees\" is true by construction \
+                         and cannot be evidence about any record",
+                        slot_a.get(),
+                        a_discrimination.distinct_values,
+                        a_discrimination.n,
+                        a_discrimination.modal_share,
+                        a_discrimination.modal_value,
+                        slot_a.get(),
+                        slot_b.get(),
+                    ),
+                    records: a_discrimination.n,
+                    lens_a_distinct_values: a_discrimination.distinct_values,
+                    lens_a_modal_value: a_discrimination.modal_value,
+                    lens_a_modal_share: a_discrimination.modal_share,
+                    lens_a_observed_min: a_discrimination.min,
+                    lens_a_observed_max: a_discrimination.max,
+                },
+            ));
+        }
+
+        let b_discrimination = SimilarityDiscrimination::measure(&b_sims).map_err(|error| {
+            SynapseCalyxError::from_calyx("measure lens-B similarity discrimination", &error)
+        })?;
+
+        let calibration = match BlindSpotCalibration::from_deltas(
+            deltas.iter().copied(),
+            BlindSpotCalibrationParams { min_samples, alpha },
+        ) {
+            Ok(calibration) => calibration,
+            Err(error) => {
+                // Uncalibratable pair (e.g. below the sample floor) is a
+                // data condition, not a fault: report it, keep scanning.
+                tracing::debug!(
+                    code = "SYNAPSE_BLIND_SPOT_UNCALIBRATED",
+                    slot_a = slot_a.get(),
+                    slot_b = slot_b.get(),
+                    error = %error.message,
+                    "blind-spot pair could not be calibrated"
+                );
+                return Ok(DirectionOutcome::Uncalibrated);
+            }
+        };
+
+        for (index, a_sim, b_sim) in per_record {
+            let cx_id = group[index].0;
+            let alert =
+                detect_blind_spot_calibrated(cx_id, slot_a, slot_b, a_sim, b_sim, &calibration)
+                    .map_err(|error| {
+                        SynapseCalyxError::from_calyx("evaluate calibrated blind spot", &error)
+                    })?;
+            if let Some(alert) = alert {
+                alerts.push(blind_spot_alert(&alert, a_sim, b_sim, b_discrimination));
+            }
+        }
+        Ok(DirectionOutcome::Evaluated)
     }
 
     /// Measures per-lens distribution drift by a Gaussian-kernel MMD two-sample
@@ -530,6 +691,12 @@ impl SynapseCalyxVault {
 /// One record's shared presence on a lens pair: `(cx_id, vector_a, vector_b)`.
 type PairedMember<'a> = (CxId, &'a Vec<f32>, &'a Vec<f32>);
 
+/// Selects a paired member's first or second lens vector, so one code path can
+/// evaluate both `(A, B)` orderings of a pair without cloning the group.
+const fn role_vector<'a>(member: &PairedMember<'a>, first: bool) -> &'a Vec<f32> {
+    if first { member.1 } else { member.2 }
+}
+
 /// Records carrying both dense lenses, as `(cx_id, vector_a, vector_b)`.
 fn paired_dense_members(
     records: &[DriftRecord],
@@ -572,11 +739,12 @@ fn nearest_neighbor_indices(
     backend: &dyn Backend,
     group: &[PairedMember<'_>],
     dim_a: usize,
+    forward: bool,
 ) -> Result<Vec<Option<(usize, f32)>>, SynapseCalyxError> {
     let count = group.len();
     let mut flat = Vec::with_capacity(count * dim_a);
-    for (_, a, _) in group {
-        flat.extend_from_slice(a);
+    for member in group {
+        flat.extend_from_slice(if forward { member.1 } else { member.2 });
     }
     let k = 2.min(count).max(1);
     let batch = backend
@@ -601,19 +769,18 @@ fn blind_spot_alert(
     alert: &calyx_loom::BlindSpotAlert,
     lens_a_similarity: f32,
     lens_b_neighbor_mean: f32,
+    lens_b: SimilarityDiscrimination,
 ) -> SynapseCalyxBlindSpotAlert {
-    let (sample_count, alpha, p_value, percentile, threshold_delta) = alert
-        .calibration
-        .as_ref()
-        .map_or((0, 0.0, 0.0, 0.0, 0.0), |evidence| {
-            (
-                evidence.sample_count,
-                evidence.alpha,
-                evidence.p_value,
-                evidence.percentile,
-                evidence.threshold_delta,
-            )
-        });
+    let evidence = alert.calibration.as_ref();
+    let range = lens_b.observed_range();
+    // Zero range means lens B is constant over this direction's records; the
+    // disagreement then carries no information about position, so report 0.0
+    // rather than dividing by zero and emitting a NaN that reads as a value.
+    let dissent_fraction = if range > 0.0 {
+        ((lens_b.max - lens_b_neighbor_mean) / range).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     SynapseCalyxBlindSpotAlert {
         cx_id: alert.cx_id.to_string(),
         slot_a: alert.a.get(),
@@ -622,12 +789,67 @@ fn blind_spot_alert(
         lens_b_neighbor_mean,
         delta: alert.delta,
         severity: severity_label(alert.severity).to_owned(),
-        calibration_sample_count: sample_count,
-        calibration_alpha: alpha,
-        calibration_p_value: p_value,
-        calibration_percentile: percentile,
-        threshold_delta,
+        calibration_sample_count: evidence.map_or(0, |e| e.sample_count),
+        calibration_alpha: evidence.map_or(0.0, |e| e.alpha),
+        calibration_p_value: evidence.map_or(0.0, |e| e.p_value),
+        calibration_percentile: evidence.map_or(0.0, |e| e.percentile),
+        threshold_delta: evidence.map_or(0.0, |e| e.threshold_delta),
+        calibration_distinct_deltas: evidence.map_or(0, |e| e.distinct_deltas),
+        calibration_resolves_alpha: evidence.is_some_and(|e| e.resolves_alpha),
+        lens_b_observed_min: lens_b.min,
+        lens_b_observed_max: lens_b.max,
+        lens_b_dissent_fraction: dissent_fraction,
     }
+}
+
+/// Outcome of evaluating one ordered `(A, B)` direction of a lens pair.
+enum DirectionOutcome {
+    Evaluated,
+    Uncalibrated,
+    NonDiscriminative(SynapseCalyxBlindSpotPairDiagnostic),
+}
+
+/// Counts distinct `f32` values at [`SIMILARITY_DISTINCT_TOLERANCE`], using the
+/// same run-based rule the discrimination measurement uses so the two numbers
+/// in one report are always computed the same way.
+fn distinct_f32_values(values: impl IntoIterator<Item = f32>) -> usize {
+    let mut sorted: Vec<f32> = values
+        .into_iter()
+        .filter(|value| value.is_finite())
+        .collect();
+    sorted.sort_by(f32::total_cmp);
+    let mut distinct = 0usize;
+    let mut run_start = f32::NAN;
+    for value in sorted {
+        if distinct > 0 && (value - run_start).abs() <= SIMILARITY_DISTINCT_TOLERANCE {
+            continue;
+        }
+        distinct += 1;
+        run_start = value;
+    }
+    distinct
+}
+
+/// Counts distinct `(a, b)` similarity signatures at the same tolerance.
+fn distinct_f32_tuples(values: impl IntoIterator<Item = (f32, f32)>) -> usize {
+    let mut sorted: Vec<(f32, f32)> = values
+        .into_iter()
+        .filter(|(a, b)| a.is_finite() && b.is_finite())
+        .collect();
+    sorted.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
+    let mut distinct = 0usize;
+    let mut run_start = (f32::NAN, f32::NAN);
+    for value in sorted {
+        if distinct > 0
+            && (value.0 - run_start.0).abs() <= SIMILARITY_DISTINCT_TOLERANCE
+            && (value.1 - run_start.1).abs() <= SIMILARITY_DISTINCT_TOLERANCE
+        {
+            continue;
+        }
+        distinct += 1;
+        run_start = value;
+    }
+    distinct
 }
 
 const fn severity_label(severity: Severity) -> &'static str {

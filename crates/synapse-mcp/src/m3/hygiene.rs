@@ -473,6 +473,11 @@ pub struct HygieneGroundingGapResponse {
     /// provisional (may advise, never control).
     pub provisional: bool,
     pub provisional_reason: Option<String>,
+    /// **#1962.** The domain carries no anchor of any kind, as distinct from
+    /// carrying some and falling under the floor. With no outcome axis every
+    /// bits/sufficiency/synergy/kernel-groundedness result over the domain is
+    /// undefined rather than provisional.
+    pub no_outcome_axis: bool,
     pub distinct_anchor_kinds: u64,
     pub anchor_kind_coverage: Vec<HygieneAnchorKindCoverage>,
     pub slot_coverage: Vec<HygieneSlotGroundingCoverage>,
@@ -529,6 +534,7 @@ pub fn run_grounding_gap(
         coverage_floor: report.coverage_floor,
         provisional: report.provisional,
         provisional_reason: report.provisional_reason,
+        no_outcome_axis: report.no_outcome_axis,
         distinct_anchor_kinds: report.distinct_anchor_kinds as u64,
         anchor_kind_coverage: report
             .anchor_kind_coverage
@@ -585,6 +591,34 @@ pub struct HygieneBlindSpotAlert {
     pub calibration_p_value: f32,
     pub calibration_percentile: f32,
     pub threshold_delta: f32,
+    /// Distinct delta values behind this pair's calibration (#1961 ask 2).
+    pub calibration_distinct_deltas: u64,
+    /// Whether that calibration resolves `alpha`. When false, the certificate
+    /// proves only that the observation sits at the top of a nearly constant
+    /// variable and the severity is capped at `low`.
+    pub calibration_resolves_alpha: bool,
+    pub lens_b_observed_min: f32,
+    pub lens_b_observed_max: f32,
+    /// Where `lens_b_neighbor_mean` sits inside lens B's own reached range:
+    /// `0.0` at B's maximum, `1.0` at B's minimum (#1961 ask 3).
+    pub lens_b_dissent_fraction: f32,
+}
+
+/// One slot-pair direction refused rather than evaluated, with the measured
+/// evidence for the refusal (#1961 ask 1).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneBlindSpotPairDiagnostic {
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub code: String,
+    pub detail: String,
+    pub records: u64,
+    pub lens_a_distinct_values: u64,
+    pub lens_a_modal_value: f32,
+    pub lens_a_modal_share: f32,
+    pub lens_a_observed_min: f32,
+    pub lens_a_observed_max: f32,
 }
 
 /// Blind-spot scan report over one panel.
@@ -596,8 +630,17 @@ pub struct HygieneBlindSpotResponse {
     pub records_scanned: u64,
     pub records_measured: u64,
     pub n_lenses: u64,
+    /// Ordered `(A, B)` directions evaluated; both directions of a pair are
+    /// candidates because the rule is directional.
     pub slot_pairs_evaluated: u64,
     pub slot_pairs_uncalibrated: u64,
+    /// Directions refused because lens A's confidence is definitional.
+    pub slot_pairs_nondiscriminative: u64,
+    pub nondiscriminative_pairs: Vec<HygieneBlindSpotPairDiagnostic>,
+    /// Distinct `(lens_a_similarity, lens_b_neighbor_mean)` tuples across every
+    /// emitted alert — the alert set's own discriminative power (#1961 ask 2).
+    pub alert_distinct_signatures: u64,
+    pub alert_distinct_deltas: u64,
     pub alerts_total: u64,
     pub alerts: Vec<HygieneBlindSpotAlert>,
 }
@@ -1172,6 +1215,25 @@ pub fn run_blind_spot(
         n_lenses: report.n_lenses as u64,
         slot_pairs_evaluated: report.slot_pairs_evaluated as u64,
         slot_pairs_uncalibrated: report.slot_pairs_uncalibrated as u64,
+        slot_pairs_nondiscriminative: report.slot_pairs_nondiscriminative as u64,
+        nondiscriminative_pairs: report
+            .nondiscriminative_pairs
+            .into_iter()
+            .map(|pair| HygieneBlindSpotPairDiagnostic {
+                slot_a: u32::from(pair.slot_a),
+                slot_b: u32::from(pair.slot_b),
+                code: pair.code,
+                detail: pair.detail,
+                records: pair.records as u64,
+                lens_a_distinct_values: pair.lens_a_distinct_values as u64,
+                lens_a_modal_value: pair.lens_a_modal_value,
+                lens_a_modal_share: pair.lens_a_modal_share,
+                lens_a_observed_min: pair.lens_a_observed_min,
+                lens_a_observed_max: pair.lens_a_observed_max,
+            })
+            .collect(),
+        alert_distinct_signatures: report.alert_distinct_signatures as u64,
+        alert_distinct_deltas: report.alert_distinct_deltas as u64,
         alerts_total: report.alerts_total as u64,
         alerts: report
             .alerts
@@ -1189,6 +1251,11 @@ pub fn run_blind_spot(
                 calibration_p_value: alert.calibration_p_value,
                 calibration_percentile: alert.calibration_percentile,
                 threshold_delta: alert.threshold_delta,
+                calibration_distinct_deltas: alert.calibration_distinct_deltas as u64,
+                calibration_resolves_alpha: alert.calibration_resolves_alpha,
+                lens_b_observed_min: alert.lens_b_observed_min,
+                lens_b_observed_max: alert.lens_b_observed_max,
+                lens_b_dissent_fraction: alert.lens_b_dissent_fraction,
             })
             .collect(),
     })

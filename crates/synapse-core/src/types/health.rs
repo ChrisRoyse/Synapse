@@ -471,6 +471,23 @@ pub struct SubsystemHealth {
     /// panels are excluded by declaration, not by threshold (#1920 ask 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_panel_grounding_deficient_panels: Option<u64>,
+    /// **#1962.** Outcome-bearing panels holding records but carrying zero
+    /// anchor kinds — a strict subset of
+    /// [`Self::calyx_panel_grounding_deficient_panels`], and a categorically
+    /// different state from the rest of it.
+    ///
+    /// Thin coverage is provisional; no outcome axis at all is *undefined*.
+    /// A single deficient count could not tell an operator which one they had,
+    /// which is how the active panel sat with zero anchors of any kind behind a
+    /// count that read as thin coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_no_outcome_axis_panels: Option<u64>,
+    /// The `panel@version` names behind
+    /// [`Self::calyx_panel_no_outcome_axis_panels`], so the fact that one of
+    /// them is the panel every operator-facing surface reads is legible without
+    /// a second call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_no_outcome_axis_panel_names: Option<Vec<String>>,
     /// Lowest active-generation coverage fraction across every full-CF panel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_panel_coverage_min_fraction: Option<f32>,

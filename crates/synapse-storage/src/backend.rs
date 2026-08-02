@@ -2985,6 +2985,7 @@ impl StorageBackend for CalyxBackend {
         &self,
         params: &SynapseCalyxAssayParams,
     ) -> StorageResult<SynapseCalyxBitsReport> {
+        refuse_outcome_query_on_observation_panel("bits", params)?;
         self.with_vault(
             "calyx_assay",
             "measure native Calyx lens bits",
@@ -3001,6 +3002,7 @@ impl StorageBackend for CalyxBackend {
         &self,
         params: &SynapseCalyxAssayParams,
     ) -> StorageResult<SynapseCalyxSufficiencyReport> {
+        refuse_outcome_query_on_observation_panel("sufficiency", params)?;
         self.with_vault(
             "calyx_assay",
             "measure native Calyx panel sufficiency",
@@ -6095,6 +6097,59 @@ fn grounded_observation_as_anchor_readback(
         ledger_hash: readback.ledger_hash.clone(),
         latest_seq: readback.latest_seq,
     }
+}
+
+/// Refuses an outcome-axis measurement over a panel the catalog declares
+/// observation-shaped (#1962 ask 3).
+///
+/// `bits` and `sufficiency` measure *about an anchor*. On an observation-shaped
+/// panel there is no anchor and there never will be one — a timeline row records
+/// that something was seen, not how it turned out — so the question has no
+/// answer rather than an unmeasured one.
+///
+/// Returning `measurable=false` was the right answer to a *data* gap (#1897):
+/// an outcome-bearing panel that has not received its anchors yet will receive
+/// them, and a zeroed report that says so is honest. This is a different
+/// condition. Here the caller has asked a question the panel's own declaration
+/// says is meaningless, and answering it with a zeroed report invites the reader
+/// to conclude "this panel's lenses carry no signal about the outcome" from a
+/// number that was never about an outcome at all. That is the same shape as the
+/// #1953/#1958 failures: a value structurally determined by configuration,
+/// presented as a measurement about the data.
+///
+/// Keyed on the catalog declaration rather than on the observed anchor count, so
+/// the verdict is a pure function of `panel_version` and cannot switch on with
+/// traffic.
+fn refuse_outcome_query_on_observation_panel(
+    operation: &str,
+    params: &SynapseCalyxAssayParams,
+) -> StorageResult<()> {
+    let Some(entry) = constellations::panel_catalog_entry_for_version(params.panel_version) else {
+        // An unknown panel version is not this check's business; the assay's own
+        // panel resolution fails closed on it with a better message.
+        return Ok(());
+    };
+    if entry.outcome_bearing {
+        return Ok(());
+    }
+    let outcome_bearing: Vec<String> = constellations::builtin_panel_catalog()
+        .into_iter()
+        .filter(|candidate| candidate.outcome_bearing)
+        .map(|candidate| format!("{}@{}", candidate.panel_name, candidate.panel_version))
+        .collect();
+    Err(StorageError::WriteFailed {
+        cf_name: cf::CF_KV.to_owned(),
+        detail: format!(
+            "SYNAPSE_ASSAY_PANEL_HAS_NO_OUTCOME_AXIS: {operation} measures bits *about* a grounded \
+             outcome, and panel {}@{} is declared outcome_bearing=false — its rows record that \
+             something was observed, not how it turned out, so it carries no anchor of any kind \
+             and never will. A zeroed report over this panel would read as 'these lenses carry no \
+             signal about {}' when nothing was ever measured about an outcome. Ask this on a panel \
+             that receives outcomes: {outcome_bearing:?}. To confirm the panel's state directly, \
+             read `hygiene operation=grounding_gap` — its no_outcome_axis flag is the same fact.",
+            entry.panel_name, entry.panel_version, params.anchor_kind
+        ),
+    })
 }
 
 fn grounding_anchor_to_calyx(anchor: GroundingAnchor) -> StorageResult<Anchor> {

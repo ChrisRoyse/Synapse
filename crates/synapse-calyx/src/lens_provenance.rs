@@ -686,8 +686,16 @@ pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
         1776006,
         &["status", "error_type"],
     ),
-    // Grounded on a timeline row, whose fields do not determine the outcome.
-    ("synapse:mcp_tool_call_outcome", 1900001, &[]),
+    // NOTE (#1962): there is deliberately no entry for panel 1900001
+    // (`syn-timeline-v1`). It used to carry
+    // `("synapse:mcp_tool_call_outcome", 1900001, &[])`, which contradicted the
+    // panel catalog's own `outcome_bearing: false` declaration for that panel —
+    // a timeline row records that something was *seen*, not how it turned out,
+    // and an MCP tool call's outcome is not a property of a focus change. The
+    // declaration was an unfulfilled intent that made a correctly unanchored
+    // panel look like a panel with a missing write. `validate_panel_slot_
+    // declarations` now refuses any anchor declared on a panel the catalog
+    // declares observation-shaped, so this cannot silently reappear.
     // `policy.enabled` on a policy snapshot row. No mcp-usage lens reads it.
     ("synapse:mcp_steering_enabled", 1776006, &[]),
     // `state` on a promotion-ledger row. No mcp-usage lens reads it.

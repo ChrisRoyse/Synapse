@@ -801,6 +801,10 @@ pub struct StoragePanelCoverageResponse {
     /// Deficient panels the maintainer has no re-measure path for.
     pub unbackfillable_deficient_panels: Vec<String>,
     pub grounding_deficient_panels: Vec<String>,
+    /// **#1962.** Outcome-bearing panels with records but zero anchor kinds: a
+    /// strict subset of `grounding_deficient_panels` whose results are undefined
+    /// rather than provisional.
+    pub no_outcome_axis_panels: Vec<String>,
     /// Panels whose constellations outlive their TTL-expiring source rows.
     pub records_exceed_source_panels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2643,6 +2647,7 @@ pub fn inspect_panel_coverage(
         coverage_deficient_panels: report.coverage_deficient_panels.clone(),
         unbackfillable_deficient_panels: report.unbackfillable_deficient_panels.clone(),
         grounding_deficient_panels: report.grounding_deficient_panels.clone(),
+        no_outcome_axis_panels: report.no_outcome_axis_panels.clone(),
         records_exceed_source_panels: report.records_exceed_source_panels.clone(),
         measured_at_unix_ms: report.measured_at_unix_ms,
     })
