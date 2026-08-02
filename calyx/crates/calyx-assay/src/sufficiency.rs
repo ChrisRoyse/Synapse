@@ -604,3 +604,96 @@ fn invalid_scope(message: impl Into<String>) -> CalyxError {
         remediation: "provide unique observation scopes with observed <= total",
     }
 }
+
+/// A lens that **is** the anchor, rather than one that predicts it.
+///
+/// Returned by [`detect_anchor_leakage`]; see that function for what the fields
+/// mean and why each is part of the signature.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnchorLeakage {
+    /// Panel slot carrying the leaking lens.
+    pub slot: u16,
+    /// The lens's measured marginal information about the anchor.
+    pub lens_bits: f32,
+    /// The anchor's own entropy. Leakage is `lens_bits == anchor_entropy_bits`.
+    pub anchor_entropy_bits: f32,
+    /// The resolution at which those two were judged equal.
+    pub resolution_bits: f32,
+    /// Distinct values the lens takes over the measured corpus.
+    pub lens_distinct_values: usize,
+    /// Distinct outcome labels the anchor takes over the same corpus.
+    pub anchor_distinct_outcomes: usize,
+}
+
+/// Detects a lens that carries the anchor itself rather than evidence about it.
+///
+/// ## Why this exists
+///
+/// Measured 2026-08-02 on `syn-mcp-usage-v1 @ 1776006` — the corpus chosen
+/// *because* it clears every grounding floor. `sufficiency` reported
+/// `sufficient = true, deficit_bits = 0`, with `panel_bits` equal to
+/// `anchor_entropy_bits` to every digit (0.969319224357605). The carrier was
+/// slot 86, `syn.mcp_usage.status_onehot.v1`.
+///
+/// The anchor `synapse:mcp_tool_call_outcome` is built from `&record.status`;
+/// slot 86 is a one-hot of `record["status"]`. The same field. The panel
+/// "predicted" the outcome because it contained the outcome (#1953).
+///
+/// Nothing in the estimator was wrong — it correctly reported the bits in the
+/// column it was handed. The defect is that a circular result was indis-
+/// tinguishable from a real one, and only a human noticing an implausibly exact
+/// equality caught it. That is what this turns into a check.
+///
+/// ## The signature, and why each clause is required
+///
+/// All must hold:
+///
+/// 1. **`lens_bits == anchor_entropy_bits` within estimator resolution.** A
+///    lens cannot carry more about the anchor than the anchor carries about
+///    itself, so equality is the ceiling — reaching it exactly means the column
+///    determines the label.
+/// 2. **Matching cardinality.** A lens can legitimately reach the ceiling by
+///    being a perfect *predictor* with different structure (many values mapping
+///    onto few outcomes). Requiring `lens_distinct_values ==
+///    anchor_distinct_outcomes` separates "is the label" from "predicts the
+///    label perfectly", and only the first is leakage.
+/// 3. **A non-degenerate anchor.** With `anchor_entropy_bits == 0` every lens
+///    trivially measures 0 bits and clause 1 would match everything. A
+///    single-valued anchor is its own problem and is not this one.
+///
+/// Deliberately reports rather than decides: a caller may have a legitimate
+/// reason to measure a panel that includes its own label (auditing the encoder,
+/// for instance). What it must not do is report `sufficient` from it silently.
+#[must_use]
+pub fn detect_anchor_leakage(
+    slot: u16,
+    lens_bits: f32,
+    lens_distinct_values: usize,
+    anchor_entropy_bits: f32,
+    anchor_distinct_outcomes: usize,
+) -> Option<AnchorLeakage> {
+    if !lens_bits.is_finite() || !anchor_entropy_bits.is_finite() {
+        return None;
+    }
+    // Clause 3: a degenerate anchor makes every lens look like a leak.
+    if anchor_entropy_bits <= 0.0 || anchor_distinct_outcomes < 2 {
+        return None;
+    }
+    // Clause 2: same shape, not merely the same score.
+    if lens_distinct_values != anchor_distinct_outcomes {
+        return None;
+    }
+    // Clause 1: at the ceiling, within the resolution those two f32s share.
+    let resolution_bits = estimator_resolution_bits(lens_bits, anchor_entropy_bits);
+    if (anchor_entropy_bits - lens_bits).abs() > resolution_bits {
+        return None;
+    }
+    Some(AnchorLeakage {
+        slot,
+        lens_bits,
+        anchor_entropy_bits,
+        resolution_bits,
+        lens_distinct_values,
+        anchor_distinct_outcomes,
+    })
+}

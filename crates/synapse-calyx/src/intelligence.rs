@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use calyx_assay::sufficiency::{AnchorLeakage, detect_anchor_leakage};
 use calyx_assay::{
     AssayCacheKey, AssayStore, AssaySubject, ChangePointReport, CusumReport, Direction,
     EnsembleCard, EnsembleConfig, EnsembleLensInput, EstimatorKind, InterEventHazardReport,
@@ -1499,8 +1500,19 @@ pub struct SynapseCalyxSufficiencyReport {
     /// Slots excluded from the attribution because they could not be measured.
     pub unmeasured_slots: usize,
     pub anchor_entropy_bits: f32,
+    /// `false` whenever [`Self::anchor_leakage`] is non-empty, regardless of
+    /// the bits: a panel that contains its own label has not been shown to
+    /// predict anything (#1953).
     pub sufficient: bool,
     pub deficit_bits: f32,
+    /// Lenses that ARE the anchor rather than evidence about it.
+    ///
+    /// Non-empty means the sufficiency verdict above is circular and must not
+    /// be read as a capability claim. Reported rather than fatal, because
+    /// measuring a panel that includes its own label is a legitimate thing to
+    /// do deliberately — what must not happen is doing it silently.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anchor_leakage: Vec<AnchorLeakage>,
     /// Assay trust tag for this measurement's sample count.
     pub grounded: bool,
     /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
@@ -1844,6 +1856,8 @@ impl SynapseCalyxVault {
         // the sufficiency numerator.
         let ksg_k = params.ksg_k.max(1);
         let mut slot_bits: Vec<(SlotId, f32)> = Vec::new();
+        // (slot, bits, distinct_values) for the #1953 leakage check.
+        let mut slot_shapes: Vec<(SlotId, f32, usize)> = Vec::new();
         // Slots the estimator could not measure are EXCLUDED, not pushed as
         // zero (#1915). A placeholder zero here became a concrete
         // `deficit_bits` and a `ProposeLens` recommendation against a lens
@@ -1868,7 +1882,13 @@ impl SynapseCalyxVault {
                 None,
             ) {
                 Ok(outcome) => match outcome.estimate {
-                    Ok(estimate) => slot_bits.push((*slot, estimate.bits)),
+                    Ok(estimate) => {
+                        slot_bits.push((*slot, estimate.bits));
+                        // Kept alongside the bits for the leakage check below
+                        // (#1953): a lens that IS the anchor is identified by
+                        // its cardinality as well as its score.
+                        slot_shapes.push((*slot, estimate.bits, outcome.pick.distinct_values));
+                    }
                     // Any estimator refusal excludes the slot from the joint and
                     // from the deficit split; none of them ends the pass (#1915).
                     Err(_) => unmeasured_slots += 1,
@@ -1884,6 +1904,24 @@ impl SynapseCalyxVault {
         let joint = build_joint_samples(&corpus, &anchor_kind, &usable_slots);
         let anchor_entropy_bits = entropy_bits(&joint.labels);
         let joint_records = joint.labels.len();
+        // #1953: a lens whose marginal bits sit exactly at H(anchor), with the
+        // anchor's own cardinality, is the anchor re-encoded rather than
+        // evidence about it. On syn-mcp-usage-v1 that was slot 86
+        // (`status_onehot`), built from the same `record.status` field the
+        // anchor is built from, and it made `sufficient=true, deficit_bits=0`
+        // circular on the one corpus chosen for being well grounded.
+        let anchor_leakage: Vec<AnchorLeakage> = slot_shapes
+            .iter()
+            .filter_map(|(slot, bits, distinct_values)| {
+                detect_anchor_leakage(
+                    slot.get(),
+                    *bits,
+                    *distinct_values,
+                    anchor_entropy_bits,
+                    gathered.distinct_outcomes,
+                )
+            })
+            .collect();
         // `panel_measured` is the load-bearing distinction (#1915): below the
         // floor there is no joint estimate, and `panel_bits = 0.0` is a
         // placeholder. Subtracting a placeholder from a genuinely computed
@@ -2033,12 +2071,13 @@ impl SynapseCalyxVault {
                 panel_floor_applied,
                 unmeasured_slots,
                 anchor_entropy_bits,
-                sufficient: panel_measured && sufficiency.sufficient,
+                sufficient: panel_measured && sufficiency.sufficient && anchor_leakage.is_empty(),
                 deficit_bits: if panel_measured {
                     sufficiency.deficit_bits
                 } else {
                     0.0
                 },
+                anchor_leakage,
                 grounded: matches!(trust, TrustTag::Trusted),
                 domain_provisional: verdict.provisional,
                 domain_grounded_fraction: verdict.grounded_fraction,
@@ -2056,12 +2095,15 @@ impl SynapseCalyxVault {
             panel_floor_applied,
             unmeasured_slots,
             anchor_entropy_bits,
-            sufficient: panel_measured && panel_bits >= anchor_entropy_bits,
+            sufficient: panel_measured
+                && panel_bits >= anchor_entropy_bits
+                && anchor_leakage.is_empty(),
             deficit_bits: if panel_measured {
                 (anchor_entropy_bits - panel_bits).max(0.0)
             } else {
                 0.0
             },
+            anchor_leakage,
             grounded: false,
             domain_provisional: verdict.provisional,
             domain_grounded_fraction: verdict.grounded_fraction,
