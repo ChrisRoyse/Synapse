@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_calyx::SynapseCalyxPutDisposition;
+use synapse_calyx::lens_provenance;
 use synapse_core::types::{
     AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord, EpisodeBoundary,
     EpisodeRecord, GenAiOperationName, SensorStatus, StoredObservation, StoredReflexAudit,
@@ -1947,6 +1948,115 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (PH_SLOT_PATH_HASH, "syn.path_hierarchy.path_hash.v1"),
 ];
 
+/// Fails closed when the measurement-provenance declaration has drifted from the
+/// slot/lens catalog it must mirror (#1958 ask 4).
+///
+/// ## What it enforces
+///
+/// `synapse_calyx::lens_provenance::SYN_SLOT_SOURCE_FIELDS` declares, per slot,
+/// the record fields that slot's construction site reads. That declaration is
+/// what lets an assay refuse a circular measurement **structurally**, instead of
+/// hoping a statistical detector notices — which it provably cannot for a lens
+/// that merely *contains* the label (#1958).
+///
+/// A declaration nobody enforces is a declaration that drifts, and #1953's own
+/// facade gap is what that looks like: `anchor_leakage` existed internally,
+/// serialised correctly, and simply did not exist on the wire. So this checks
+/// three things rather than one:
+///
+/// 1. every catalogued slot is declared — a new lens cannot be silently unaudited;
+/// 2. no declaration names a slot the catalog does not have — a deleted or
+///    renumbered slot cannot leave a stale entry behind that matches nothing;
+/// 3. the lens **name** each declaration carries equals the catalogued name —
+///    so a slot reassigned to a different lens invalidates its field list
+///    instead of inheriting it.
+///
+/// It also checks that every panel version named by an anchor declaration is a
+/// live panel version, so a version bump cannot silently detach the anchor's
+/// determining-field set and turn a refusal into a clean pass.
+///
+/// Called from [`syn_active_panel_contract`], which is on the daemon's startup
+/// path: a drifted declaration stops the process rather than publishing a panel
+/// whose slots cannot be adjudicated.
+///
+/// # Errors
+///
+/// Returns an error naming every undeclared slot, every orphaned declaration,
+/// every duplicate, every lens-name mismatch, and every unknown panel version.
+pub fn assert_syn_lens_provenance_complete() -> StorageResult<()> {
+    let mut declared: BTreeMap<u16, &'static str> = BTreeMap::new();
+    let mut duplicates = Vec::new();
+    for (slot, _, lens, _) in lens_provenance::SYN_SLOT_SOURCE_FIELDS {
+        if declared.insert(*slot, lens).is_some() {
+            duplicates.push(*slot);
+        }
+    }
+    let catalog: BTreeMap<u16, &'static str> = SYN_SLOT_LENS_NAMES
+        .iter()
+        .map(|(slot, name)| (slot.get(), *name))
+        .collect();
+    let undeclared: Vec<u16> = catalog
+        .keys()
+        .filter(|slot| !declared.contains_key(*slot))
+        .copied()
+        .collect();
+    let orphaned: Vec<u16> = declared
+        .keys()
+        .filter(|slot| !catalog.contains_key(*slot))
+        .copied()
+        .collect();
+    let renamed: Vec<String> = catalog
+        .iter()
+        .filter_map(|(slot, name)| {
+            let found = declared.get(slot)?;
+            (found != name).then(|| format!("{slot}: catalog={name} declared={found}"))
+        })
+        .collect();
+    let known_versions: BTreeSet<u32> = [
+        SYN_TIMELINE_PANEL_VERSION,
+        SYN_EPISODE_PANEL_VERSION,
+        SYN_AGENT_EVENT_PANEL_VERSION,
+        SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        SYN_ACTION_PANEL_VERSION,
+        SYN_REFLEX_PANEL_VERSION,
+        SYN_PROCESS_PANEL_VERSION,
+        SYN_OBSERVATION_PANEL_VERSION,
+        SYN_OUTCOME_PANEL_VERSION,
+        SYN_MCP_USAGE_PANEL_VERSION,
+        SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
+        SYN_GRAPHPOS_APP_PANEL_VERSION,
+        SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
+        SYN_PATH_HIERARCHY_PANEL_VERSION,
+    ]
+    .into_iter()
+    .collect();
+    let stale_anchor_versions: Vec<String> = lens_provenance::SYN_ANCHOR_DETERMINING_FIELDS
+        .iter()
+        .filter(|(_, version, _)| !known_versions.contains(version))
+        .map(|(kind, version, _)| format!("{kind}@{version}"))
+        .collect();
+    if undeclared.is_empty()
+        && orphaned.is_empty()
+        && duplicates.is_empty()
+        && renamed.is_empty()
+        && stale_anchor_versions.is_empty()
+    {
+        return Ok(());
+    }
+    Err(StorageError::WriteFailed {
+        cf_name: cf::CF_KV.to_owned(),
+        detail: format!(
+            "CALYX_LENS_SOURCE_FIELDS_INCOMPLETE: every built-in panel slot must declare the \
+             record fields it measures so anchor leakage can be refused structurally (#1958). \
+             undeclared_slots={undeclared:?} orphaned_declarations={orphaned:?} \
+             duplicate_declarations={duplicates:?} lens_name_mismatches={renamed:?} \
+             anchor_declarations_on_unknown_panel_versions={stale_anchor_versions:?}. Fix \
+             synapse_calyx::lens_provenance, listing every record field the slot's \
+             construction site in this file reads transitively."
+        ),
+    })
+}
+
 /// Returns the declared lens name for one physical slot id, or `None` when the
 /// slot is not one of the built-in `syn-*` panel slots.
 #[must_use]
@@ -2627,6 +2737,11 @@ pub fn syn_active_panel_contract(
     panel_version: u32,
     created_at_ms: u64,
 ) -> StorageResult<Option<SynActivePanelContract>> {
+    // #1958 ask 4: no panel contract is built while a built-in lens has no
+    // declared source-field set. This runs on the daemon's startup path, so an
+    // undeclared lens stops the process rather than becoming a silently
+    // unaudited slot in a published panel.
+    assert_syn_lens_provenance_complete()?;
     let mut registry = Registry::new();
     let slots = match panel_version {
         SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version, &mut registry)?,

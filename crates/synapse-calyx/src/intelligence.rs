@@ -46,6 +46,7 @@ use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::lens_provenance;
 use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault};
 
 /// Hard cap on records scanned per weave pass to bound one bounded,
@@ -63,6 +64,14 @@ pub const SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID: &str =
 /// Structured code raised when a synergy pass is asked for an anchor no record
 /// in the panel carries.
 pub const SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS: &str = "SYNAPSE_CALYX_SYNERGY_NO_ANCHORED_RECORDS";
+/// Structured code raised when a sufficiency assay is adjudicated by an anchor
+/// whose determining record fields are read by a lens in the same panel (#1958).
+///
+/// This is the *structural* leakage refusal. It is deliberately distinct from
+/// the statistical `AnchorLeakage` report, which fires only for a lens that IS
+/// the label; this one fires for a lens that merely *contains* it, which no
+/// statistical test can reach.
+pub const SYNAPSE_ASSAY_ANCHOR_SOURCE_LEAKAGE: &str = "SYNAPSE_CALYX_ASSAY_ANCHOR_SOURCE_LEAKAGE";
 /// Structured code raised when an ensemble capability-card pass is asked for an
 /// anchor no record in the panel carries.
 pub const SYNAPSE_ENSEMBLE_NO_ANCHORED_RECORDS: &str = "SYNAPSE_CALYX_ENSEMBLE_NO_ANCHORED_RECORDS";
@@ -1535,6 +1544,18 @@ pub struct SynapseCalyxSufficiencyReport {
     /// do deliberately — what must not happen is doing it silently.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchor_leakage: Vec<AnchorLeakage>,
+    /// Whether this (anchor kind, panel version) pair has a **declared** set of
+    /// determining record fields, so the structural leakage check (#1958) could
+    /// run at all.
+    ///
+    /// A report can only reach a caller when the structural check found no
+    /// carrier — a carrier is a refusal, not a field. So this is the difference
+    /// between "checked and clean" and "not checked", and without it those two
+    /// are the same empty result. That confusion is the exact shape of #1953's
+    /// original defect, where a circular measurement was indistinguishable from
+    /// a sound one.
+    #[serde(default)]
+    pub anchor_source_declared: bool,
     /// Assay trust tag for this measurement's sample count.
     pub grounded: bool,
     /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
@@ -1874,6 +1895,29 @@ impl SynapseCalyxVault {
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
         let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
 
+        // #1958: refuse a circular measurement STRUCTURALLY, before spending a
+        // single estimator call on it. `detect_anchor_leakage` below is a
+        // statistical check and can only reach the degenerate case where a lens
+        // IS the label; a lens that merely *contains* it passes cleanly. This
+        // one is a set intersection between what each lens reads and what
+        // determines the anchor, so it is exact, deterministic, and independent
+        // of sample size.
+        //
+        // It is asked about the PANEL's slots, not the slots this corpus
+        // happened to yield samples for. Deriving it from the gathered samples
+        // made the verdict a function of traffic: `syn-outcome-v1` came back
+        // clean on three anchors purely because those slots had no anchored rows
+        // yet, and would have started refusing once rows arrived. A leakage
+        // check that switches on with traffic is not a check.
+        let source_provenance = lens_provenance::syn_anchor_source_provenance(
+            &params.anchor_kind,
+            params.panel_version,
+            &params.excluded_slots,
+        );
+        if !source_provenance.carriers.is_empty() {
+            return Err(anchor_source_leakage_error(params, &source_provenance));
+        }
+
         // Per-slot attributions feed the deficit split; the joint panel bits are
         // the sufficiency numerator.
         let ksg_k = params.ksg_k.max(1);
@@ -2100,6 +2144,7 @@ impl SynapseCalyxVault {
                     0.0
                 },
                 anchor_leakage,
+                anchor_source_declared: source_provenance.anchor_declared,
                 grounded: matches!(trust, TrustTag::Trusted),
                 domain_provisional: verdict.provisional,
                 domain_grounded_fraction: verdict.grounded_fraction,
@@ -2126,6 +2171,7 @@ impl SynapseCalyxVault {
                 0.0
             },
             anchor_leakage,
+            anchor_source_declared: source_provenance.anchor_declared,
             grounded: false,
             domain_provisional: verdict.provisional,
             domain_grounded_fraction: verdict.grounded_fraction,
@@ -4636,6 +4682,57 @@ fn temporal_error(
     remediation: &'static str,
 ) -> SynapseCalyxError {
     SynapseCalyxError::new(code, message.to_owned(), remediation)
+}
+
+/// Builds the fail-closed refusal for a panel that contains the anchor it is
+/// being adjudicated by (#1958 ask 3).
+///
+/// It names the slot, the lens, and the **shared field** — the last of which is
+/// the part that makes the refusal actionable rather than an accusation. A
+/// reader can go to the construction site, see that the lens reads that field,
+/// see that the field determines the anchor, and either exclude the slot or
+/// decide the declaration is wrong. Neither is possible from a bits number.
+fn anchor_source_leakage_error(
+    params: &SynapseCalyxAssayParams,
+    provenance: &lens_provenance::AnchorSourceProvenance,
+) -> SynapseCalyxError {
+    let carriers = provenance
+        .carriers
+        .iter()
+        .map(|carrier| {
+            format!(
+                "slot {} ({}) reads [{}]",
+                carrier.slot,
+                carrier.lens,
+                carrier.shared_fields.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let slots = provenance
+        .carriers
+        .iter()
+        .map(|carrier| carrier.slot.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    SynapseCalyxError::new(
+        SYNAPSE_ASSAY_ANCHOR_SOURCE_LEAKAGE,
+        format!(
+            "panel_version={} contains {} lens(es) whose declared source fields are among the \
+             fields that determine anchor {} ([{}]), so any sufficiency verdict over this panel \
+             would be measuring the anchor against itself: {}. Remediation set: \
+             excluded_slots=[{}]",
+            params.panel_version,
+            provenance.carriers.len(),
+            params.anchor_kind,
+            provenance.anchor_fields.join(", "),
+            carriers,
+            slots
+        ),
+        "re-run with excluded_slots covering every named slot to measure the panel's genuinely \
+         predictive lenses, or correct the declaration in synapse_calyx::lens_provenance if a \
+         named lens does not in fact read that field",
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -1431,6 +1431,15 @@ pub struct StorageIntelligenceSufficiencyReport {
     /// state #1945 was filed over. The verdict and its cause must cross the
     /// facade together.
     pub anchor_leakage: Vec<StorageIntelligenceAnchorLeakage>,
+    /// Whether the structural anchor-leakage check (#1958) could run: `true`
+    /// means this (anchor kind, panel version) pair declares which record
+    /// fields determine the anchor, so a lens reading one of them would have
+    /// been refused before any bits were measured.
+    ///
+    /// `false` means the check did **not** run. A clean report and an unchecked
+    /// one are otherwise identical on the wire, and #1953's whole defect was a
+    /// circular measurement that looked exactly like a sound one.
+    pub anchor_source_declared: bool,
     pub assay_cf_rows_after: u64,
 }
 
@@ -3065,6 +3074,7 @@ pub fn run_intelligence_sufficiency(
                 anchor_distinct_outcomes: leak.anchor_distinct_outcomes as u64,
             })
             .collect(),
+        anchor_source_declared: report.anchor_source_declared,
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
     })
 }

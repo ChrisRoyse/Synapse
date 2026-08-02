@@ -106,12 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- setup: a vault with real rows and deliberately no manifest ----------
     {
-        let vault = AsterVault::open(
-            &populated,
-            vault_id,
-            SALT.to_vec(),
-            VaultOptions::default(),
-        )?;
+        let vault = AsterVault::open(&populated, vault_id, SALT.to_vec(), VaultOptions::default())?;
         let rows = (0..ROWS)
             .map(|tag| (CF, key_of(tag), format!("value-{tag}").into_bytes()))
             .collect::<Vec<_>>();
@@ -124,9 +119,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         manifest_published(&populated)
     );
     if manifest_published(&populated) {
-        return Err("setup published a manifest; phase A would not reach the WAL-only \
+        return Err(
+            "setup published a manifest; phase A would not reach the WAL-only \
                     branch and would prove nothing"
-            .into());
+                .into(),
+        );
     }
 
     // --- phase A: the regression --------------------------------------------
@@ -154,14 +151,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into());
             }
             if !error.message.contains("CURRENT") {
-                return Err("the refusal does not name the missing manifest, so it does \
+                return Err(
+                    "the refusal does not name the missing manifest, so it does \
                             not say what is wrong"
-                    .into());
+                        .into(),
+                );
             }
             if !error.remediation.contains("checkpoint") {
-                return Err("the refusal does not name checkpoint() as the remediation, \
+                return Err(
+                    "the refusal does not name checkpoint() as the remediation, \
                             so it does not say how to fix it"
-                    .into());
+                        .into(),
+                );
             }
         }
     }
@@ -169,12 +170,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // --- phase B: the same vault, asking for the mode it can serve ----------
     println!("\n=== B. same vault, full-MVCC open (the mode the branch can serve)");
     {
-        let vault = AsterVault::open(
-            &populated,
-            vault_id,
-            SALT.to_vec(),
-            VaultOptions::default(),
-        )?;
+        let vault = AsterVault::open(&populated, vault_id, SALT.to_vec(), VaultOptions::default())?;
         assert_mode(&vault, "B", false)?;
         let live = vault.scan_cf_latest(CF)?;
         let mine = live
@@ -193,9 +189,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         manifest_published(&populated)
     );
     if !manifest_published(&populated) {
-        return Err("checkpoint() did not publish CURRENT; phase C would re-enter the \
+        return Err(
+            "checkpoint() did not publish CURRENT; phase C would re-enter the \
                     WAL-only branch and would be testing phase A again"
-            .into());
+                .into(),
+        );
     }
 
     // --- phase C: the remediation the refusal named actually works ----------
@@ -221,10 +219,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         String::from_utf8_lossy(&expected)
     );
     if mine != ROWS as usize {
-        return Err(format!(
-            "the latest-only handle lost rows: expected {ROWS}, got {mine}"
-        )
-        .into());
+        return Err(
+            format!("the latest-only handle lost rows: expected {ROWS}, got {mine}").into(),
+        );
     }
     if point.as_deref() != Some(expected.as_slice()) {
         return Err("the latest-only handle did not serve the point read".into());
