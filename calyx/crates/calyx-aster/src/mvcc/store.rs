@@ -189,6 +189,10 @@ type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
 /// report here is a real finding rather than noise.
 const ROW_READ_GUARD_WARN_US: u64 = 25_000;
 
+/// Granularity of `GetThreadTimes` on this host, measured rather than assumed.
+/// See [`thread_cpu_us`].
+const WINDOWS_SCHEDULER_TICK_US: u64 = 15_625;
+
 /// A row-table read guard that reports its own hold duration and call site.
 ///
 /// #1950 ask 1: the commit path can already attribute its wait, but a wait
@@ -205,6 +209,73 @@ struct TimedRowRead<'a> {
     guard: std::sync::RwLockReadGuard<'a, RowTable>,
     site: &'static str,
     acquired: Instant,
+    /// Calling thread's kernel+user CPU time when the guard was taken.
+    ///
+    /// `held_us` alone cannot tell a slow scan from a descheduled thread, and
+    /// on this host that is not a corner case: a `read_latest` — a point read
+    /// of ONE key — was measured holding the guard for 743 ms while the machine
+    /// was saturated by a compile (#1955). Every fix #1950 ask 2 considers
+    /// (page the scan, snapshot it, shard the table) addresses *work*, so an
+    /// instrument that cannot separate work from starvation can point at the
+    /// wrong one with full confidence.
+    ///
+    /// `None` when the platform cannot report it; the event then omits the
+    /// CPU fields rather than reporting a fabricated zero.
+    acquired_cpu_us: Option<u64>,
+}
+
+/// Kernel+user CPU time consumed by the calling thread so far, in microseconds.
+///
+/// **Quantised to the scheduler tick.** `GetThreadTimes` accrues in 15.625 ms
+/// units on this host — measured, not assumed: a 39,278 us guard hold reported
+/// exactly 31,250 us of CPU and a 69,767 us hold reported exactly 62,500 us,
+/// which are 2 and 4 ticks. So `cpu_us` is only meaningful for holds well above
+/// ~50 ms, and cannot resolve anything near the 25 ms budget.
+///
+/// That is acceptable for what it is for. The holds this exists to explain are
+/// the 743 ms `read_latest` and the 1.4 s `scan_cf_latest` of #1955/#1950,
+/// where a tick is 2% of the measurement. A finer answer would need
+/// `QueryThreadCycleTime`, which returns cycles rather than time and would need
+/// a frequency calibration to interpret on a hybrid P/E-core part — more
+/// machinery than the question currently justifies.
+#[cfg(windows)]
+fn thread_cpu_us() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: all four out-pointers address live, aligned `FILETIME`s owned by
+    // this frame for the whole call, and `GetCurrentThread` returns a
+    // pseudo-handle that is valid for the current thread and must not be
+    // closed. The call only writes through those pointers.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    // FILETIME counts 100-nanosecond intervals.
+    let micros = |time: FILETIME| {
+        ((u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)) / 10
+    };
+    Some(micros(kernel) + micros(user))
+}
+
+#[cfg(not(windows))]
+const fn thread_cpu_us() -> Option<u64> {
+    None
 }
 
 impl std::ops::Deref for TimedRowRead<'_> {
@@ -218,15 +289,36 @@ impl std::ops::Deref for TimedRowRead<'_> {
 impl Drop for TimedRowRead<'_> {
     fn drop(&mut self) {
         let held_us = elapsed_us(&self.acquired);
-        if held_us >= ROW_READ_GUARD_WARN_US {
-            tracing::warn!(
-                code = "CALYX_ASTER_ROW_READ_GUARD_SLOW",
-                site = self.site,
-                held_us,
-                budget_us = ROW_READ_GUARD_WARN_US,
-                "row-table read guard held long enough to stall every commit waiting for the write lock"
-            );
+        if held_us < ROW_READ_GUARD_WARN_US {
+            return;
         }
+        // CPU time actually burned while holding the guard. The difference
+        // between this and `held_us` is time the thread was not running, so
+        // `starved` distinguishes "this scan is slow" from "this thread was
+        // descheduled" — two conditions with completely different fixes
+        // (#1955).
+        let cpu_us = self
+            .acquired_cpu_us
+            .zip(thread_cpu_us())
+            .map(|(before, after)| after.saturating_sub(before));
+        // Deliberately a ratio rather than a fixed gap: a 30 ms hold that ran
+        // for 5 ms and a 3 s hold that ran for 500 ms are the same pathology.
+        //
+        // Only asserted above 4 scheduler ticks. Below that the quantisation in
+        // `thread_cpu_us` can make a fully-running thread look half-idle purely
+        // by rounding, and a starvation flag that fires on rounding is worse
+        // than none.
+        let starved = held_us >= 4 * WINDOWS_SCHEDULER_TICK_US
+            && cpu_us.is_some_and(|cpu| cpu.saturating_mul(2) < held_us);
+        tracing::warn!(
+            code = "CALYX_ASTER_ROW_READ_GUARD_SLOW",
+            site = self.site,
+            held_us,
+            cpu_us,
+            starved,
+            budget_us = ROW_READ_GUARD_WARN_US,
+            "row-table read guard held long enough to stall every commit waiting for the write lock"
+        );
     }
 }
 
@@ -320,6 +412,7 @@ impl VersionedCfStore {
             guard,
             site,
             acquired: Instant::now(),
+            acquired_cpu_us: thread_cpu_us(),
         }
     }
 
@@ -334,6 +427,7 @@ impl VersionedCfStore {
             guard,
             site,
             acquired: Instant::now(),
+            acquired_cpu_us: thread_cpu_us(),
         })
     }
 

@@ -56,6 +56,8 @@ const BUDGET_US: u64 = 25_000;
 struct GuardEvent {
     site: String,
     held_us: u64,
+    cpu_us: u64,
+    starved: bool,
 }
 
 #[derive(Default)]
@@ -79,12 +81,22 @@ struct Fields {
     code: String,
     site: String,
     held_us: u64,
+    cpu_us: u64,
+    starved: bool,
 }
 
 impl Visit for Fields {
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == "held_us" {
-            self.held_us = value;
+        match field.name() {
+            "held_us" => self.held_us = value,
+            "cpu_us" => self.cpu_us = value,
+            _ => {}
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == "starved" {
+            self.starved = value;
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -118,6 +130,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Sink {
                 .push(GuardEvent {
                     site: fields.site,
                     held_us: fields.held_us,
+                    cpu_us: fields.cpu_us,
+                    starved: fields.starved,
                 });
         }
     }
@@ -233,7 +247,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("  guard events captured = {}", events.len());
     for event in &events {
-        println!("    site={:<40} held_us={}", event.site, event.held_us);
+        println!(
+            "    site={:<28} held_us={:<9} cpu_us={:<9} starved={}",
+            event.site, event.held_us, event.cpu_us, event.starved
+        );
     }
 
     let expected_site = "scan_cf_range_page_at";
@@ -261,16 +278,86 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let negative_ok = noise.is_empty() && found;
 
+    // --- starvation: the SAME scan, with the machine saturated --------------
+    // #1955: `held_us` alone cannot distinguish a slow scan from a descheduled
+    // thread, and on this host that mattered -- a `read_latest` (a point read
+    // of ONE key) reported holding the guard for 743 ms while a compile ran.
+    // `cpu_us` is what separates them, and the only way to prove it separates
+    // them is to produce both conditions and check the verdict flips.
+    //
+    // Same scan, same data, same code. The only change is that every core is
+    // busy.
+    println!(
+        "
+=== starvation control: identical scan, machine saturated ==="
+    );
+    let stop_load = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
+    let mut load = Vec::new();
+    for _ in 0..cores * 2 {
+        let stop = Arc::clone(&stop_load);
+        load.push(std::thread::spawn(move || {
+            // Memory-thrashing rather than pure ALU. The production starvation
+            // came from a compile, which evicts the scanning thread's working
+            // set and stalls it on memory rather than merely competing for ALU
+            // slots. A spin loop shares cores politely and does not reproduce
+            // it -- measured: with 24 pure-ALU spinners the scan still got
+            // 62,500 us of CPU for a 69,767 us hold.
+            let mut buffer = vec![0_u8; 32 << 20];
+            let mut cursor = 0_usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for _ in 0..4096 {
+                    cursor = cursor.wrapping_add(4099) % buffer.len();
+                    buffer[cursor] = buffer[cursor].wrapping_add(1);
+                }
+                std::hint::black_box(&buffer);
+            }
+        }));
+    }
+    println!("  {} busy threads on {cores} logical cores", cores * 2);
+
+    let mut scanned_loaded = 0_usize;
+    vault.scan_cf_pages_at::<_, calyx_core::CalyxError>(
+        vault.snapshot(),
+        ColumnFamily::Base,
+        usize::try_from(ROWS)? + 1,
+        |page| {
+            scanned_loaded += page.len();
+            Ok(())
+        },
+    )?;
+    stop_load.store(true, std::sync::atomic::Ordering::Relaxed);
+    for thread in load {
+        thread.join().map_err(|_| "load thread panicked")?;
+    }
+    let loaded_events = collector.drain();
+    println!("  scan returned {scanned_loaded} rows");
+    for event in &loaded_events {
+        println!(
+            "    site={:<28} held_us={:<9} cpu_us={:<9} starved={}",
+            event.site, event.held_us, event.cpu_us, event.starved
+        );
+    }
+    let starved_seen = loaded_events.iter().any(|event| event.starved);
+    let quiet_starved = events.iter().any(|event| event.starved);
+    println!("  quiet scan  starved = {quiet_starved} (expected false)");
+    println!("  loaded scan starved = {starved_seen} (expected true)");
+    let starvation_ok = !quiet_starved && starved_seen && !loaded_events.is_empty();
+
     println!("\n--- VERDICT ---");
     println!(
         "  positive (slow scan reports, names its site) : {}",
         if positive_ok { "PASS" } else { "FAIL" }
     );
     println!(
+        "  starvation (cpu_us separates the two)        : {}",
+        if starvation_ok { "PASS" } else { "FAIL" }
+    );
+    println!(
         "  negative (fast point read stays silent)      : {}",
         if negative_ok { "PASS" } else { "FAIL" }
     );
-    if positive_ok && negative_ok {
+    if positive_ok && negative_ok && starvation_ok {
         println!("  the row-read guard instrument fires, and only when it should");
         Ok(())
     } else {
