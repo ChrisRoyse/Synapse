@@ -1003,7 +1003,9 @@ impl VersionedCfStore {
                     }
                 }
             }
-            if outcome.is_ok() && let Some(error) = write_failure {
+            if outcome.is_ok()
+                && let Some(error) = write_failure
+            {
                 outcome = Err(error);
             }
             if let Err(error) = outcome.as_ref() {

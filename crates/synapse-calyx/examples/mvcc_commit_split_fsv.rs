@@ -59,8 +59,8 @@ use std::sync::{Arc, Mutex};
 
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{
-    Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality, SlotId, SlotVector, VaultId,
-    VaultStore as _,
+    Anchor, AnchorKind, AnchorValue, Constellation, CxFlags, CxId, InputRef, LedgerRef, Modality,
+    SlotId, SlotVector, VaultId, VaultStore as _,
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer as _;
@@ -254,6 +254,12 @@ fn report(phase: &str, events: &[Event]) -> u64 {
         "  {:<6} {:>8} {:>8} {:>10} {:>10} {:>6}  dominant sub-stage",
         "rows", "total_us", "mvcc_us", "LOCKED_us", "sst_write", "seals"
     );
+    // The worst commit's seal count is the thundering-herd measure: 12 slot
+    // CFs filling at identical rates all seal on ONE commit, so that caller
+    // pays every SST write at once (#1949). Staggering the per-CF caps should
+    // drive this toward 1.
+    let mut worst_seals = 0_u64;
+    let mut commits_with_seals = 0_u64;
     let mut flushes = 0;
     for event in events {
         let mvcc = field(event, "mvcc_us");
@@ -267,7 +273,12 @@ fn report(phase: &str, events: &[Event]) -> u64 {
             .saturating_mul(100)
             .checked_div(mvcc.max(1))
             .unwrap_or(0);
-        flushes += field(event, "mvcc_router_seals");
+        let seals = field(event, "mvcc_router_seals");
+        flushes += seals;
+        if seals > 0 {
+            commits_with_seals += 1;
+            worst_seals = worst_seals.max(seals);
+        }
         println!(
             "  {:<6} {:>8} {:>8} {:>10} {:>10} {:>6}  {} = {} us ({}% of mvcc)",
             field(event, "row_count"),
@@ -310,6 +321,11 @@ fn report(phase: &str, events: &[Event]) -> u64 {
             parts,
             mvcc,
             i64::try_from(mvcc).unwrap_or(0) - i64::try_from(parts).unwrap_or(0)
+        );
+    }
+    if worst_seals > 0 {
+        println!(
+            "    SEAL BURST: worst single commit sealed {worst_seals} memtable(s); {commits_with_seals} reported commit(s) sealed anything"
         );
     }
     flushes
@@ -411,19 +427,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         flush_ssts(&dir).len() - before_c
     );
 
-    // --- phase D: the read path must never miss a sealed memtable ----------
-    // #1949 moves the SST write outside the locks, which means there is now a
-    // window in which a memtable's rows live *only* in the sealed queue -- not
-    // in the active memtable, not yet in any SST. If any read path forgot to
-    // consult that queue, rows would silently vanish for the duration of a
-    // flush. This is the failure that change could cause, so it is the one
-    // measured directly.
+    // --- phase D: concurrent reads across the new unlocked window ----------
+    // #1949 drops both write locks mid-commit, so readers can now run *inside*
+    // a commit for the first time. This phase runs readers against a writer
+    // that is filling memtables, which exercises that interleaving: it is a
+    // check for deadlock, poisoned locks, and torn reads across the new lock
+    // boundary.
     //
-    // A writer fills memtables (forcing seals) while readers continuously
-    // re-read every key written so far. Known input, known expected output:
-    // every key ever written must be readable, with its exact value, at every
-    // instant. A single miss is a hard failure.
-    println!("\n=== phase D: read-your-writes across seals ===");
+    // What it deliberately does NOT prove is that the sealed-memtable read
+    // path is correct. `VersionedCfStore::read_at` consults the MVCC row table
+    // first and only falls through to the router on a miss, and snapshot GC
+    // always retains each chain's boundary version, so every key's latest
+    // value stays in the row table for the life of the process. An in-process
+    // read is therefore answered by the row table and would look identical
+    // even if the router dropped every sealed memtable on the floor. The
+    // router only becomes the source of truth after a reopen, which is what
+    // phase E is for. Reporting this phase as read-path coverage would be
+    // reporting a masked result as a verified one.
+    println!("\n=== phase D: concurrent reads across the unlocked window ===");
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let highest = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let misses = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -505,9 +526,177 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "  VERDICT: {}",
         if verdict_d {
-            "no read ever missed a row across a seal"
+            "concurrent reads across the unlocked window never failed or deadlocked (row-table-masked; see phase E)"
         } else {
-            "FAILED - the sealed-memtable read path loses rows"
+            "FAILED - a concurrent read across the unlocked window did not resolve"
+        }
+    );
+
+    // --- phase E: the router as source of truth, across a reopen -----------
+    // This is the phase that can actually fail if #1949 is wrong.
+    //
+    // Each key is written TWICE, with enough bytes between the two writes that
+    // the revisions land in different memtables and therefore different SSTs.
+    // Then the vault is dropped and reopened, which discards the in-memory row
+    // table that masked the router in phase D and forces every read to be
+    // answered from what is physically on disk.
+    //
+    // Known input, known expected output: every key must come back with
+    // rev=2. The two ways this change could break that are distinguished:
+    //   * ABSENT  -> a sealed memtable was lost (never written or installed).
+    //   * STALE   -> rev=1 came back, meaning an SST was installed out of seal
+    //                order and inverted recency. This is the specific hazard
+    //                of deferring installs, and it is invisible to a
+    //                presence-only check.
+    //
+    // The rev=2 writes are asserted in-process BEFORE the reopen, so if dedup
+    // or anything else silently drops the second write, this phase fails at
+    // that assertion instead of blaming the reopen for a stale value.
+    println!("\n=== phase E: reopen readback (router is the source of truth) ===");
+    const E_LO: u64 = 30_000;
+    const E_HI: u64 = 30_120;
+
+    // The second write is an anchor. `AsterVault::anchor` re-reads the
+    // constellation and commits a NEW Base row under the SAME key, which is a
+    // genuine same-key overwrite in the router. A plain `put` of changed
+    // content would not do: duplicate puts keep the first write's scalars
+    // authoritative by design, so it would not produce a second version at
+    // all.
+    let anchored = |tag: u64| Anchor {
+        kind: AnchorKind::Label("fsv-1949".to_owned()),
+        value: AnchorValue::Number(tag as f64),
+        source: "mvcc_commit_split_fsv".to_owned(),
+        observed_at: 1_785_000_100_000 + tag,
+        confidence: 1.0,
+    };
+
+    let before_e = flush_ssts(&dir).len();
+    for tag in E_LO..E_HI {
+        vault.put(row(vault_id, tag, 8192))?;
+    }
+    // Force the first revision out to its own SST BEFORE the second is
+    // written. Without this both revisions land in the same memtable, which
+    // dedups them by key, and the second revision would simply overwrite the
+    // first in memory -- so the reopen would compare one SST against nothing
+    // and the recency claim would be unearned. Flushing here is what puts the
+    // two revisions in DIFFERENT SSTs, which is the only arrangement in which
+    // an out-of-order install can actually shadow a newer row.
+    let v1_ssts = vault.flush_all_cfs()?.len();
+    for tag in E_LO..E_HI {
+        let cx = row(vault_id, tag, 1).cx_id;
+        vault.anchor(cx, anchored(tag))?;
+    }
+    println!("  first revision forced into {v1_ssts} SST(s) before the second was written");
+    let reported_e = report("E overwrite across memtables", &collector.drain());
+    let after_e = flush_ssts(&dir).len();
+    println!(
+        "  flush-*.sst delta across E = {}  (seals reported {reported_e})",
+        after_e - before_e
+    );
+
+    // Pre-reopen assertion: the rev=2 writes must be live in-process. If this
+    // fails the phase is invalid and says so, rather than mislabelling a
+    // dropped write as an ordering bug after the reopen.
+    let mut pre_stale = 0_u64;
+    for tag in E_LO..E_HI {
+        let cx = row(vault_id, tag, 1).cx_id;
+        match vault.get(cx, vault.snapshot()) {
+            Ok(found) if found.anchors.len() == 1 => {}
+            _ => pre_stale += 1,
+        }
+    }
+    println!(
+        "  pre-reopen in-process check: {} of {} keys carry the anchor {}",
+        (E_HI - E_LO) - pre_stale,
+        E_HI - E_LO,
+        if pre_stale == 0 {
+            "(phase is valid)"
+        } else {
+            "<-- PHASE INVALID, the second write did not take"
+        }
+    );
+
+    // Push whatever is still in a memtable out to an SST, then close the vault
+    // so nothing in memory can answer a read.
+    let flushed = vault.flush_all_cfs()?;
+    println!("  flush_all_cfs wrote {} SST(s)", flushed.len());
+    let seq_before_reopen = vault.latest_seq();
+
+    // `drop` on an Arc only decrements a refcount. If any reader clone were
+    // still alive the vault would stay open and the "reopen" would be reading
+    // a live in-memory row table -- exactly the masking phase E exists to
+    // escape. `into_inner` returns the vault only if this is the last
+    // reference, so the close is proven rather than assumed.
+    let owned = Arc::into_inner(vault)
+        .ok_or("vault still had other live references; the reopen would not have been a reopen")?;
+    drop(owned);
+
+    let ssts_on_disk = flush_ssts(&dir).len();
+    let reopened = AsterVault::open(
+        &dir,
+        vault_id,
+        b"mvcc-commit-split-fsv".to_vec(),
+        VaultOptions::default(),
+    )?;
+    println!("  reopened; flush-*.sst on disk = {ssts_on_disk}");
+
+    let mut absent_e = Vec::new();
+    let mut stale_e = Vec::new();
+    for tag in E_LO..E_HI {
+        let cx = row(vault_id, tag, 1).cx_id;
+        match reopened.get(cx, reopened.snapshot()) {
+            // The anchored revision is the newer of the two Base rows for this
+            // key. Getting the un-anchored one back means an older SST is
+            // shadowing a newer one.
+            Ok(found) if found.anchors.len() == 1 => {}
+            Ok(found) => stale_e.push((tag, found.anchors.len())),
+            Err(_) => absent_e.push(tag),
+        }
+    }
+    println!(
+        "  post-reopen readback of {} keys: absent = {}  stale = {}",
+        E_HI - E_LO,
+        absent_e.len(),
+        stale_e.len()
+    );
+    if !absent_e.is_empty() {
+        println!("    first absent: {:?}", &absent_e[..absent_e.len().min(8)]);
+    }
+    if !stale_e.is_empty() {
+        println!("    first stale : {:?}", &stale_e[..stale_e.len().min(8)]);
+    }
+
+    // The earlier phases' keys must also survive the reopen. Phases A-D wrote
+    // 200 + 400 + 320 + 260 distinct keys through the same sealed-flush path.
+    let mut survivors = 0_u64;
+    let mut lost = Vec::new();
+    let earlier = (0..200_u64)
+        .chain(1_000..1_400)
+        .chain((0..8).flat_map(|w| (0..40).map(move |t| 10_000 + w * 1_000 + t)))
+        .chain(20_000..20_260);
+    for tag in earlier {
+        let cx = row(vault_id, tag, 1).cx_id;
+        if reopened.get(cx, reopened.snapshot()).is_ok() {
+            survivors += 1;
+        } else {
+            lost.push(tag);
+        }
+    }
+    println!(
+        "  post-reopen readback of phases A-D: {survivors} present, {} lost",
+        lost.len()
+    );
+    if !lost.is_empty() {
+        println!("    first lost: {:?}", &lost[..lost.len().min(8)]);
+    }
+
+    let verdict_e = pre_stale == 0 && absent_e.is_empty() && stale_e.is_empty() && lost.is_empty();
+    println!(
+        "  VERDICT: {}",
+        if verdict_e {
+            "every key survived the reopen at its newest revision - no sealed memtable lost, no install out of order"
+        } else {
+            "FAILED - deferred flush lost rows or inverted recency on disk"
         }
     );
 
@@ -517,9 +706,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         "  flush-*.sst total on disk        : {}",
         flush_ssts(&dir).len()
     );
+    println!("  vault latest_seq before reopen   : {seq_before_reopen}");
     println!(
-        "  vault latest_seq                 : {}",
-        vault.latest_seq()
+        "  vault latest_seq after  reopen   : {}",
+        reopened.latest_seq()
     );
     Ok(())
 }

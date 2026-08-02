@@ -66,6 +66,28 @@ impl RouterPutCost {
 /// the same purpose.
 const MAX_SEALED_MEMTABLES_PER_CF: usize = 8;
 
+/// How far below the configured cap a column family's own seal point may sit,
+/// as a percentage. See [`CfRouter::cf_memtable_cap`].
+const MEMTABLE_CAP_STAGGER_PCT: usize = 25;
+
+/// FNV-1a over the CF name.
+///
+/// Deliberately not `DefaultHasher`: `RandomState` is seeded per process, so a
+/// CF's seal point would move every restart and the stagger would not be
+/// reproducible from one run to the next. This is fixed for a given CF name
+/// forever.
+const fn cf_name_hash(name: &str) -> u64 {
+    let bytes = name.as_bytes();
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
+
 /// A memtable that has been sealed and is awaiting its SST.
 ///
 /// It stays in the router's read path for its whole life: the rows are still
@@ -469,13 +491,18 @@ impl CfRouter {
         for (cf, key, value) in rows {
             self.ensure_cf_write_fanout_admitted(cf)?;
             let row_bytes = Memtable::entry_size(key.as_ref(), value.as_ref());
-            if row_bytes > self.memtable_byte_cap {
+            // Checked against this CF's own staggered cap, not the configured
+            // one. The stagger only ever lowers a CF's cap, so screening
+            // against the global value would admit a row that the CF's
+            // memtable then refuses — turning a pre-WAL fail-closed check into
+            // a mid-commit failure, which is the opposite of what this
+            // function exists to do.
+            let cap = self.cf_memtable_cap(cf);
+            if row_bytes > cap {
                 self.resource_counters.record_memtable_rejected();
                 return Err(CalyxError::backpressure(format!(
-                    "memtable byte cap {} cannot fit {} row of {} bytes",
-                    self.memtable_byte_cap,
-                    cf.name(),
-                    row_bytes
+                    "memtable byte cap {cap} for {} cannot fit row of {row_bytes} bytes",
+                    cf.name()
                 )));
             }
         }
@@ -584,7 +611,7 @@ impl CfRouter {
         let path = self
             .cf_dir(cf)
             .join(flush_sst_file_name(commit_watermark, ordinal));
-        let fresh = Memtable::new(self.memtable_byte_cap);
+        let fresh = Memtable::new(self.cf_memtable_cap(cf));
         let table = Arc::new(std::mem::replace(self.memtable_mut(cf), fresh));
         self.next_seal_id += 1;
         let id = self.next_seal_id;
@@ -746,12 +773,40 @@ impl CfRouter {
                 .map_err(|error| CalyxError::disk_pressure(format!("create CF dir: {error}")))?;
             self.ensured_cfs.insert(cf);
         }
+        let cap = self.cf_memtable_cap(cf);
         self.memtables
             .entry(cf)
-            .or_insert_with(|| Memtable::new(self.memtable_byte_cap));
+            .or_insert_with(|| Memtable::new(cap));
         self.levels.entry(cf).or_default();
         self.next_file.entry(cf).or_insert(1);
         Ok(())
+    }
+
+    /// This column family's own memtable seal point, staggered below the
+    /// configured cap so that sibling CFs do not all seal on the same write.
+    ///
+    /// Measured motivation (#1949): one constellation writes 12 equal-sized
+    /// slot vectors to 12 slot CFs, so those CFs fill at identical rates and
+    /// cross a single shared cap on the *same* commit. The FSV harness caught
+    /// exactly that — 12 seals charged to one 27-row commit, 731 ms of SST
+    /// writing paid by whichever caller happened to be holding the pen. The
+    /// per-CF cost was never the problem; their synchronisation was.
+    ///
+    /// Spreading the seal points decorrelates them, so that burst becomes ~12
+    /// separate commits paying one flush each. This is the same reasoning
+    /// behind RocksDB's refusal to re-switch a CF that already has an
+    /// immutable memtable pending (facebook/rocksdb#6364): the fix for a
+    /// synchronised flush storm is to break the synchronisation, not to make
+    /// each flush cheaper.
+    ///
+    /// Deterministic per CF name, so a given CF seals at the same fill level
+    /// on every run and across restarts. Only ever *reduces* the cap, so the
+    /// configured value stays a true upper bound and the
+    /// `ensure_batch_admitted` single-row check below stays the binding one.
+    fn cf_memtable_cap(&self, cf: ColumnFamily) -> usize {
+        let stagger = (cf_name_hash(&cf.name()) as usize) % (MEMTABLE_CAP_STAGGER_PCT + 1);
+        let reduction = self.memtable_byte_cap / 100 * stagger;
+        self.memtable_byte_cap.saturating_sub(reduction).max(1)
     }
 
     /// Every in-memory read source for `cf`, **newest first**: the active
@@ -792,9 +847,10 @@ impl CfRouter {
     }
 
     fn memtable_mut(&mut self, cf: ColumnFamily) -> &mut Memtable {
+        let cap = self.cf_memtable_cap(cf);
         self.memtables
             .entry(cf)
-            .or_insert_with(|| Memtable::new(self.memtable_byte_cap))
+            .or_insert_with(|| Memtable::new(cap))
     }
 
     pub(super) fn next_sequence(&mut self, cf: ColumnFamily) -> u64 {
