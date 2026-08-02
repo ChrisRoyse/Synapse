@@ -84,6 +84,15 @@ pub(super) struct CommitStageObserver {
     /// found the defect, which is the trade ask 3 of that issue forbids. These
     /// sums are what let the next such term be found without re-instrumenting.
     stage_sums: [AtomicU64; STAGE_COUNT],
+    /// Per-sub-stage sums of the `mvcc` term since the last summary (#1948).
+    ///
+    /// The census already reported `dominant_stage=mvcc` at 66% of all commit
+    /// time, which named the stage and stopped there. Carrying the sub-split in
+    /// the same line is what turns that from a restatement of the problem into
+    /// an answer, and it does so continuously rather than only on the commits
+    /// that happen to trip the outlier gate — an outlier is by construction the
+    /// least representative sample of ordinary cost.
+    mvcc_sums: [AtomicU64; MVCC_STAGE_COUNT],
 }
 
 /// Stage names, in the order of [`CommitStageObserver::stage_sums`].
@@ -96,6 +105,8 @@ const STAGE_NAMES: [&str; STAGE_COUNT] = [
     "checkpoint_stage",
 ];
 const STAGE_COUNT: usize = 6;
+
+use crate::mvcc::{MVCC_STAGE_COUNT, MVCC_STAGE_NAMES};
 
 /// What one commit's duration means relative to this vault's recent behaviour.
 struct CommitStageVerdict {
@@ -115,6 +126,8 @@ struct CommitStageSummary {
     /// [`STAGE_NAMES`] order. Rendered as `stage=sum_us` pairs so one line
     /// carries the whole split.
     stage_sums: [u64; STAGE_COUNT],
+    /// The same, for the `mvcc` term's sub-stages, in [`MVCC_STAGE_NAMES`] order.
+    mvcc_sums: [u64; MVCC_STAGE_COUNT],
 }
 
 impl CommitStageSummary {
@@ -126,6 +139,31 @@ impl CommitStageSummary {
             .map(|(name, sum)| format!("{name}={sum}"))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// `row_lock_wait=… router_lock_wait=… row_apply=… router_flush=… …`
+    fn mvcc_split(&self) -> String {
+        MVCC_STAGE_NAMES
+            .iter()
+            .zip(self.mvcc_sums.iter())
+            .map(|(name, sum)| format!("{name}={sum}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The largest `mvcc` sub-stage and its share of the `mvcc` total, so the
+    /// census answers "which part of mvcc" in the line rather than requiring
+    /// the reader to sum nine numbers.
+    fn dominant_mvcc(&self) -> (&'static str, u64) {
+        let total: u64 = self.mvcc_sums.iter().sum();
+        let (index, sum) = self
+            .mvcc_sums
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, sum)| **sum)
+            .map_or((0, &0), |(index, sum)| (index, sum));
+        let share = sum.saturating_mul(100).checked_div(total).unwrap_or(0);
+        (MVCC_STAGE_NAMES[index], share)
     }
 
     /// The largest stage as `name` and its percentage share, so the dominant
@@ -169,6 +207,9 @@ impl CommitStageObserver {
         for (slot, value) in self.stage_sums.iter().zip(stage.stage_values()) {
             slot.fetch_add(value, Ordering::Relaxed);
         }
+        for (slot, value) in self.mvcc_sums.iter().zip(stage.mvcc.stage_values()) {
+            slot.fetch_add(value, Ordering::Relaxed);
+        }
         if over_floor {
             self.over_floor.fetch_add(1, Ordering::Relaxed);
         }
@@ -186,6 +227,10 @@ impl CommitStageObserver {
             for (out, slot) in stage_sums.iter_mut().zip(self.stage_sums.iter()) {
                 *out = slot.swap(0, Ordering::Relaxed);
             }
+            let mut mvcc_sums = [0_u64; MVCC_STAGE_COUNT];
+            for (out, slot) in mvcc_sums.iter_mut().zip(self.mvcc_sums.iter()) {
+                *out = slot.swap(0, Ordering::Relaxed);
+            }
             CommitStageSummary {
                 commits,
                 mean_us: total.checked_div(commits).unwrap_or(0),
@@ -193,6 +238,7 @@ impl CommitStageObserver {
                 over_floor: self.over_floor.swap(0, Ordering::Relaxed),
                 reported: self.reported.swap(0, Ordering::Relaxed),
                 stage_sums,
+                mvcc_sums,
             }
         });
 
@@ -221,6 +267,10 @@ struct CommitStageTimings {
     anchor_publish_us: u64,
     /// The in-memory MVCC row-table and router apply.
     mvcc_us: u64,
+    /// `mvcc_us` broken into its own fixed points (#1948). Kept beside the
+    /// total rather than replacing it so the split can be checked against the
+    /// number this issue was filed about.
+    mvcc: crate::mvcc::MvccCommitTimings,
     /// Staging the batch for the checkpoint publisher.
     checkpoint_stage_us: u64,
     /// Start of the stage currently being timed, as an offset from the commit
@@ -258,6 +308,7 @@ impl CommitStageTimings {
         let verdict = observer.observe(self, total_us);
         if let Some(summary) = &verdict.summary {
             let (dominant_stage, dominant_share_pct) = summary.dominant();
+            let (dominant_mvcc_stage, dominant_mvcc_share_pct) = summary.dominant_mvcc();
             tracing::info!(
                 code = "CALYX_ASTER_DURABLE_COMMIT_STAGE_CENSUS",
                 commits = summary.commits,
@@ -271,6 +322,9 @@ impl CommitStageTimings {
                 stage_sum_us = %summary.stage_split(),
                 dominant_stage,
                 dominant_share_pct,
+                mvcc_sum_us = %summary.mvcc_split(),
+                dominant_mvcc_stage,
+                dominant_mvcc_share_pct,
                 "durable group commit duration census"
             );
         }
@@ -314,6 +368,22 @@ impl CommitStageTimings {
             wal_us = self.wal_us,
             anchor_publish_us = self.anchor_publish_us,
             mvcc_us = self.mvcc_us,
+            // #1948: `mvcc_us` alone was 91-99% of these commits and could not
+            // say why. Each term below is one candidate cause, and they carry
+            // different fixes: lock waits mean a concurrent vault operation is
+            // blocking the commit, a non-zero flush means this commit
+            // synchronously wrote an SST under both global write locks, and
+            // row_apply is the key/value copying that must NOT be optimised on
+            // the strength of being the visible allocation.
+            mvcc_row_lock_wait_us = self.mvcc.row_lock_wait_us,
+            mvcc_router_lock_wait_us = self.mvcc.router_lock_wait_us,
+            mvcc_panel_attribution_us = self.mvcc.panel_attribution_us,
+            mvcc_row_apply_us = self.mvcc.row_apply_us,
+            mvcc_router_apply_us = self.mvcc.router_apply_excluding_flush_us(),
+            mvcc_router_ensure_cf_us = self.mvcc.put.ensure_cf_us,
+            mvcc_router_flush_us = self.mvcc.put.flush_us,
+            mvcc_router_flushes = self.mvcc.put.flushes,
+            mvcc_unattributed_us = self.mvcc.unattributed_us(),
             checkpoint_stage_us = self.checkpoint_stage_us,
             unattributed_us = total_us.saturating_sub(attributed),
             floor_us = COMMIT_STAGE_SLOW_FLOOR_US,
@@ -692,7 +762,7 @@ where
         )?;
         stage.admission_us = stage.split(&started);
         let Some(durable) = &self.durable else {
-            let seq = self.commit_rows_to_mvcc(rows);
+            let seq = self.commit_rows_to_mvcc(rows, &mut stage.mvcc);
             stage.mvcc_us = stage.split(&started);
             stage.report(rows, &started, &self.commit_stage_observer);
             return seq;
@@ -730,7 +800,7 @@ where
                 }
             }
             stage.anchor_publish_us = stage.split(&started);
-            let mvcc_seq = self.commit_rows_to_mvcc(rows)?;
+            let mvcc_seq = self.commit_rows_to_mvcc(rows, &mut stage.mvcc)?;
             stage.mvcc_us = stage.split(&started);
             if mvcc_seq != durable_seq {
                 return Err(CalyxError::aster_corrupt_shard(format!(
@@ -790,10 +860,15 @@ where
         }
     }
 
-    fn commit_rows_to_mvcc(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
-        self.rows.commit_batch(
+    fn commit_rows_to_mvcc(
+        &self,
+        rows: &[encode::WriteRow],
+        timings: &mut crate::mvcc::MvccCommitTimings,
+    ) -> Result<Seq> {
+        self.rows.commit_batch_timed(
             rows.iter()
                 .map(|row| (row.cf, row.key.clone(), row.value.clone())),
+            timings,
         )
     }
 

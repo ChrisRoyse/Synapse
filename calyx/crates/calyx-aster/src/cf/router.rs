@@ -9,14 +9,52 @@ use crate::sst::level::SstLevel;
 use crate::sst::{SstEntry, SstSummary};
 use crate::storage_names::flush_sst_file_name;
 use calyx_core::{CalyxError, Result, SlotId};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 mod queries;
 
 const DEFAULT_MEMTABLE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whole microseconds since `started`, saturating rather than wrapping.
+fn elapsed_us(started: &Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// What one [`CfRouter::put_at`] did besides insert into the memtable.
+///
+/// A router write looks like an in-memory operation and is charged to the
+/// caller as one, but it can synchronously seal, encrypt and write an entire
+/// SST, and it runs `create_dir_all` on every call. Both costs are paid under
+/// the vault's global write locks, so they are reported per commit rather than
+/// left inside an opaque total (#1948).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RouterPutCost {
+    /// Time in the `ensure_cf` / write-fanout admission prologue, which
+    /// includes a `create_dir_all` syscall on every single write.
+    pub ensure_cf_us: u64,
+    /// Time in synchronous memtable-to-SST flushes triggered by this write.
+    pub flush_us: u64,
+    /// How many flushes this one write triggered.
+    pub flushes: u32,
+}
+
+impl RouterPutCost {
+    fn record_flush(&mut self, flush_us: u64) {
+        self.flush_us = self.flush_us.saturating_add(flush_us);
+        self.flushes = self.flushes.saturating_add(1);
+    }
+
+    /// Folds another write's outcome into this one, for per-batch totals.
+    pub fn absorb(&mut self, other: Self) {
+        self.ensure_cf_us = self.ensure_cf_us.saturating_add(other.ensure_cf_us);
+        self.flush_us = self.flush_us.saturating_add(other.flush_us);
+        self.flushes = self.flushes.saturating_add(other.flushes);
+    }
+}
 
 /// Commit watermark for router writes that have no commit domain (raw
 /// `CfRouter` users such as drills and standalone stores). Flushes at this
@@ -35,6 +73,14 @@ pub struct CfRouter {
     memtable_byte_cap: usize,
     resource_counters: Arc<ResourceCounters>,
     value_crypto: Option<SharedVaultContext>,
+    /// CFs whose directory this router has already created, so the per-write
+    /// `ensure_cf` repeats neither the syscall nor the path construction.
+    ///
+    /// Keyed by CF rather than by path because `cf_dir` is a pure function of
+    /// `vault_dir`, `tiering_policy` and the CF, all of which are fixed when
+    /// the router is constructed — so a hit here proves the same directory was
+    /// created, and the hot path needs no `PathBuf`. See [`Self::ensure_cf`].
+    ensured_cfs: HashSet<ColumnFamily>,
 }
 
 impl CfRouter {
@@ -194,27 +240,38 @@ impl CfRouter {
             memtable_byte_cap,
             resource_counters: Arc::new(ResourceCounters::default()),
             value_crypto,
+            ensured_cfs: HashSet::new(),
         })
     }
 
     /// Raw write with no commit domain; see [`Self::put_at`].
     pub fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_at(cf, key, value, NO_COMMIT_DOMAIN)
+        self.put_at(cf, key, value, NO_COMMIT_DOMAIN).map(|_| ())
     }
 
     /// Writes one row; any memtable flush this write triggers is stamped with
     /// `commit_watermark` (the highest commit seq whose rows can be in the
     /// flushed memtable), so the flush SST orders exactly against durable
     /// batches in the commit domain (issue #1138).
+    ///
+    /// Returns what the write did *beyond* landing bytes in the memtable. A
+    /// `put_at` can synchronously seal and write an entire SST, and its caller
+    /// holds the vault's row-table and router write locks for the whole of it,
+    /// so a commit that reported one opaque "router apply" number could not say
+    /// whether it had spent its time on a memtable insert or on a multi-megabyte
+    /// flush (#1948).
     pub fn put_at(
         &mut self,
         cf: ColumnFamily,
         key: &[u8],
         value: &[u8],
         commit_watermark: u64,
-    ) -> Result<()> {
+    ) -> Result<RouterPutCost> {
+        let mut outcome = RouterPutCost::default();
+        let ensure_started = Instant::now();
         self.ensure_cf(cf)?;
         self.ensure_cf_write_fanout_admitted(cf)?;
+        outcome.ensure_cf_us = elapsed_us(&ensure_started);
         let mut counted_backpressure = false;
         let ack = match self.memtable_mut(cf).write(key, value, 0) {
             Ok(ack) => ack,
@@ -222,7 +279,7 @@ impl CfRouter {
                 if error.code != "CALYX_BACKPRESSURE" {
                     return Err(error);
                 }
-                self.flush_cf_at(cf, commit_watermark)?;
+                outcome.record_flush(self.timed_flush_cf_at(cf, commit_watermark)?);
                 match self.memtable_mut(cf).write(key, value, 0) {
                     Ok(ack) => {
                         self.resource_counters.record_memtable_absorbed();
@@ -242,9 +299,16 @@ impl CfRouter {
             if !counted_backpressure {
                 self.resource_counters.record_memtable_absorbed();
             }
-            self.flush_cf_at(cf, commit_watermark)?;
+            outcome.record_flush(self.timed_flush_cf_at(cf, commit_watermark)?);
         }
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// [`Self::flush_cf_at`] with the wall-clock cost of the flush attached.
+    fn timed_flush_cf_at(&mut self, cf: ColumnFamily, commit_watermark: u64) -> Result<u64> {
+        let started = Instant::now();
+        self.flush_cf_at(cf, commit_watermark)?;
+        Ok(elapsed_us(&started))
     }
 
     /// Fails closed before WAL append when a row can never fit in one memtable.
@@ -404,9 +468,30 @@ impl CfRouter {
         Ok(())
     }
 
+    /// Ensures the CF has a directory on disk and an entry in every in-memory
+    /// map, creating the directory only the first time this router sees it.
+    ///
+    /// This runs on **every** `put_at`, so the `create_dir_all` it used to make
+    /// unconditionally was one syscall per row written. Measured on a 27-row
+    /// commit on the deployment host that was 3.0-4.3 ms, 92% of all non-flush
+    /// router apply time and paid on every commit rather than only on the rare
+    /// ones that flush (#1948). A directory this process already created does
+    /// not need re-creating; the path is keyed rather than the CF so that a
+    /// tiering policy moving a CF to another tier still creates the new
+    /// directory.
+    ///
+    /// Deliberately not a fallback: if the directory is removed underneath a
+    /// running vault, the next SST write fails loudly with the real filesystem
+    /// error instead of being silently papered over by a re-create.
     pub(super) fn ensure_cf(&mut self, cf: ColumnFamily) -> Result<()> {
-        fs::create_dir_all(self.cf_dir(cf))
-            .map_err(|error| CalyxError::disk_pressure(format!("create CF dir: {error}")))?;
+        // Recorded only after the directory exists: a failed create must leave
+        // the CF unensured so the next write retries it rather than assuming a
+        // directory that was never made.
+        if !self.ensured_cfs.contains(&cf) {
+            fs::create_dir_all(self.cf_dir(cf))
+                .map_err(|error| CalyxError::disk_pressure(format!("create CF dir: {error}")))?;
+            self.ensured_cfs.insert(cf);
+        }
         self.memtables
             .entry(cf)
             .or_insert_with(|| Memtable::new(self.memtable_byte_cap));

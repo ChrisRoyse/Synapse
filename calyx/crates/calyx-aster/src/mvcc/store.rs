@@ -3,7 +3,7 @@
 mod gc;
 mod read;
 mod scan_pages;
-use crate::cf::{CfRouter, ColumnFamily, KeyRange, RetiredCfPhysical};
+use crate::cf::{CfRouter, ColumnFamily, KeyRange, RetiredCfPhysical, RouterPutCost};
 use crate::gc::{SnapshotGcCounters, SnapshotGcReclaimer, SnapshotGcTick};
 use crate::mvcc::{
     Freshness, ReadBarrier, ReaderLease, SeqAllocator, Snapshot, read_barrier::first_blocking,
@@ -21,6 +21,103 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
+
+/// Whole microseconds since `started`, saturating rather than wrapping.
+fn elapsed_us(started: &Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Fixed points inside one [`VersionedCfStore::commit_batch_timed`].
+///
+/// The vault's commit stage split stopped at this method's boundary, so an
+/// MVCC apply that took 180 ms — 98.9% of its commit, against 2 ms of durable
+/// WAL I/O on the same commit — reported one number and no way to choose among
+/// its candidate causes (#1948). Each field below is one candidate, timed
+/// independently, and [`Self::unattributed_us`] is the explicit remainder: "the
+/// cost is in none of these" has to be a reportable outcome rather than an
+/// absence of data, which is the lesson #1947 recorded when a 20 ms stage
+/// turned out not to be the write everyone could see.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MvccCommitTimings {
+    /// Draining the caller's iterator into owned rows.
+    pub materialize_us: u64,
+    /// Waiting for the row-table write lock.
+    pub row_lock_wait_us: u64,
+    /// Waiting for the router write lock, with the row lock already held.
+    pub router_lock_wait_us: u64,
+    /// Search-panel attribution, which may read the router's latest view.
+    pub panel_attribution_us: u64,
+    /// Content-watermark advance and sequence allocation.
+    pub watermark_us: u64,
+    /// Row-table version-chain apply, including every key and value copy.
+    pub row_apply_us: u64,
+    /// Router projection apply, inclusive of `put` prologue and flush costs.
+    pub router_apply_us: u64,
+    /// What the router writes did beyond inserting into a memtable.
+    pub put: RouterPutCost,
+    /// Rows in the batch, so per-row cost is derivable from the event alone.
+    pub rows: u32,
+    /// The whole method, against which the parts are checked.
+    pub total_us: u64,
+}
+
+/// Sub-stage names for the `mvcc` commit term, in [`MvccCommitTimings::stage_values`] order.
+pub const MVCC_STAGE_NAMES: [&str; MVCC_STAGE_COUNT] = [
+    "materialize",
+    "row_lock_wait",
+    "router_lock_wait",
+    "panel_attribution",
+    "watermark",
+    "row_apply",
+    "router_apply",
+    "router_flush",
+    "unattributed",
+];
+/// Number of sub-stages in [`MVCC_STAGE_NAMES`].
+pub const MVCC_STAGE_COUNT: usize = 9;
+
+impl MvccCommitTimings {
+    /// This commit's MVCC sub-stages in [`MVCC_STAGE_NAMES`] order.
+    ///
+    /// Partitions `total_us` exactly: `router_apply` excludes the flushes it
+    /// triggered so that adding `router_flush` alongside it cannot double-count,
+    /// and `unattributed` absorbs whatever is left.
+    #[must_use]
+    pub fn stage_values(&self) -> [u64; MVCC_STAGE_COUNT] {
+        [
+            self.materialize_us,
+            self.row_lock_wait_us,
+            self.router_lock_wait_us,
+            self.panel_attribution_us,
+            self.watermark_us,
+            self.row_apply_us,
+            self.router_apply_excluding_flush_us(),
+            self.put.flush_us,
+            self.unattributed_us(),
+        ]
+    }
+
+    /// Time inside the commit that no field above claims.
+    #[must_use]
+    pub fn unattributed_us(&self) -> u64 {
+        self.total_us
+            .saturating_sub(self.materialize_us)
+            .saturating_sub(self.row_lock_wait_us)
+            .saturating_sub(self.router_lock_wait_us)
+            .saturating_sub(self.panel_attribution_us)
+            .saturating_sub(self.watermark_us)
+            .saturating_sub(self.row_apply_us)
+            .saturating_sub(self.router_apply_us)
+    }
+
+    /// Router apply time excluding the synchronous flushes it triggered, so
+    /// "the memtable insert is slow" and "this commit wrote an SST" cannot be
+    /// mistaken for each other.
+    #[must_use]
+    pub fn router_apply_excluding_flush_us(&self) -> u64 {
+        self.router_apply_us.saturating_sub(self.put.flush_us)
+    }
+}
 
 /// Structured-warning budget for how long the exclusive CF-router write lock may
 /// be held during a compaction reclaim+refresh swap. The streaming compaction
@@ -685,20 +782,51 @@ impl VersionedCfStore {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
+        self.commit_batch_timed(rows, &mut MvccCommitTimings::default())
+    }
+
+    /// [`Self::commit_batch`] with its internal fixed points attributed.
+    ///
+    /// The caller's stage split reported this whole method as one `mvcc`
+    /// number, which measured 91-99% of commit cost without being able to say
+    /// why (#1948). The candidate causes have materially different fixes —
+    /// waiting for a lock held by a concurrent compaction is not the same
+    /// defect as synchronously writing a 6.8 MB SST, and neither is the same as
+    /// copying every key and value — so each is timed separately and anything
+    /// left over is reported as an explicit remainder rather than vanishing.
+    pub fn commit_batch_timed<I, K, V>(
+        &self,
+        rows: I,
+        timings: &mut MvccCommitTimings,
+    ) -> Result<Seq>
+    where
+        I: IntoIterator<Item = (ColumnFamily, K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let started = Instant::now();
         let rows: Vec<_> = rows
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
+        timings.materialize_us = elapsed_us(&started);
         if rows.is_empty() {
+            timings.total_us = elapsed_us(&started);
             return Ok(self.current_seq());
         }
+        timings.rows = u32::try_from(rows.len()).unwrap_or(u32::MAX);
 
+        let row_lock_started = Instant::now();
         let mut table = self.rows.write().map_err(|_| {
             CalyxError::aster_corrupt_shard("MVCC row-table lock was poisoned during atomic commit")
         })?;
+        timings.row_lock_wait_us = elapsed_us(&row_lock_started);
+        let router_lock_started = Instant::now();
         let mut router = self.router.write().map_err(|_| {
             CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
         })?;
+        timings.router_lock_wait_us = elapsed_us(&router_lock_started);
+        let attribution_started = Instant::now();
         let latest_router = if self.router_latest_readback.load(Ordering::Acquire) {
             router.as_ref()
         } else {
@@ -711,6 +839,7 @@ impl VersionedCfStore {
             &rows,
             PanelAttribution::Strict,
         )?;
+        timings.panel_attribution_us = elapsed_us(&attribution_started);
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
         // this commit's seq must already observe its watermark (issue #1100).
@@ -726,6 +855,8 @@ impl VersionedCfStore {
         }
         self.advance_affected_panel_content_seqs(&affected_panels, self.current_seq() + 1)?;
         let seq = self.seqs.allocate();
+        timings.watermark_us = elapsed_us(&attribution_started) - timings.panel_attribution_us;
+        let row_apply_started = Instant::now();
         for (cf, key, value) in &rows {
             table
                 .entry(*cf)
@@ -737,7 +868,9 @@ impl VersionedCfStore {
                     value: value.clone(),
                 });
         }
+        timings.row_apply_us = elapsed_us(&row_apply_started);
 
+        let router_apply_started = Instant::now();
         if let Some(router) = router.as_mut() {
             // Publish the authoritative version chains and their sequence
             // before attempting the fallible router projection. Both write
@@ -746,32 +879,37 @@ impl VersionedCfStore {
             // batch, every logical row already exists at `seq` and masks any
             // partial router state as soon as the guards are released.
             for (cf, key, value) in &rows {
-                if let Err(error) = router.put_at(*cf, key, value, seq) {
-                    tracing::error!(
-                        code = "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
-                        committed_seq = seq,
-                        cf = cf.name(),
-                        key_len = key.len(),
-                        value_len = value.len(),
-                        router_error_code = error.code,
-                        router_error = %error,
-                        "MVCC rows committed atomically but the router projection failed; the committed sequence must be reconciled before retry"
-                    );
-                    return Err(CalyxError {
-                        code: "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
-                        message: format!(
-                            "MVCC batch is committed at seq {seq}, but router publication failed at {} key_len={} value_len={}: error[{}]: {}",
-                            cf.name(),
-                            key.len(),
-                            value.len(),
-                            error.code,
-                            error.message
-                        ),
-                        remediation: "treat committed_seq as applied; reconcile from the authoritative WAL/row-table state before retrying, and inspect the router disk/crypto error",
-                    });
+                match router.put_at(*cf, key, value, seq) {
+                    Ok(outcome) => timings.put.absorb(outcome),
+                    Err(error) => {
+                        tracing::error!(
+                            code = "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
+                            committed_seq = seq,
+                            cf = cf.name(),
+                            key_len = key.len(),
+                            value_len = value.len(),
+                            router_error_code = error.code,
+                            router_error = %error,
+                            "MVCC rows committed atomically but the router projection failed; the committed sequence must be reconciled before retry"
+                        );
+                        return Err(CalyxError {
+                            code: "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
+                            message: format!(
+                                "MVCC batch is committed at seq {seq}, but router publication failed at {} key_len={} value_len={}: error[{}]: {}",
+                                cf.name(),
+                                key.len(),
+                                value.len(),
+                                error.code,
+                                error.message
+                            ),
+                            remediation: "treat committed_seq as applied; reconcile from the authoritative WAL/row-table state before retrying, and inspect the router disk/crypto error",
+                        });
+                    }
                 }
             }
         }
+        timings.router_apply_us = elapsed_us(&router_apply_started);
+        timings.total_us = elapsed_us(&started);
         Ok(seq)
     }
 
