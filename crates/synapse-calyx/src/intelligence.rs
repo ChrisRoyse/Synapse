@@ -1300,17 +1300,39 @@ pub struct SynapseCalyxAssayParams {
     /// localisation failure #1897 was filed about. An empty map is honest: every
     /// slot is then reported as unnamed rather than guessed at.
     pub lens_names: BTreeMap<u16, String>,
+    /// Physical slot ids withheld from this measurement (issue #1953).
+    ///
+    /// A panel that contains its own label reports `sufficient=true` circularly:
+    /// on `syn-mcp-usage-v1` the anchor is `record.status` and slot 86 is a
+    /// one-hot of `record.status`, so the panel was measured as explaining an
+    /// outcome it literally contained. The detector added for #1953 ask 2 makes
+    /// that visible and refuses the verdict, but refusing is not measuring —
+    /// the question the panel exists to answer ("how much do the *observable*
+    /// features say about the outcome") stayed unmeasured because there was no
+    /// way to withhold a lens.
+    ///
+    /// This is that way. Withholding is deliberately explicit and per-request
+    /// rather than a permanent property of the slot: measuring a panel that
+    /// contains its own label is legitimate when done knowingly, and which
+    /// lenses leak depends on which anchor is adjudicating.
+    ///
+    /// Applied at sample-gathering time, so an excluded slot is absent from the
+    /// per-lens bits, from the joint panel estimate, from the deficit split, and
+    /// from the leakage detector alike. Excluding it from only some of those
+    /// would produce a report whose parts describe different panels.
+    pub excluded_slots: BTreeSet<u16>,
 }
 
 impl SynapseCalyxAssayParams {
     #[must_use]
-    pub const fn new(panel_version: u32, anchor_kind: String) -> Self {
+    pub fn new(panel_version: u32, anchor_kind: String) -> Self {
         Self {
             panel_version,
             anchor_kind,
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             ksg_k: SYNAPSE_KSG_DEFAULT_K,
             lens_names: BTreeMap::new(),
+            excluded_slots: BTreeSet::new(),
         }
     }
 
@@ -1665,7 +1687,7 @@ impl SynapseCalyxVault {
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
-        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind);
+        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
 
         let mut store = AssayStore::default();
         let vault_id = self.vault_id_value();
@@ -1850,7 +1872,7 @@ impl SynapseCalyxVault {
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
-        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind);
+        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
 
         // Per-slot attributions feed the deficit split; the joint panel bits are
         // the sufficiency numerator.
@@ -2478,7 +2500,7 @@ impl SynapseCalyxVault {
         let max_records = params.max_records.clamp(1, SYNAPSE_SYNERGY_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
-        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind);
+        let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
         if gathered.anchored_records == 0 {
             return Err(SynapseCalyxError::new(
                 SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS,
@@ -3264,6 +3286,7 @@ fn estimator_refusal_reason(
 fn gather_anchored_slot_samples(
     corpus: &DenseCorpus,
     anchor_kind: &AnchorKind,
+    excluded_slots: &BTreeSet<u16>,
 ) -> GatheredAnchoredSamples {
     let mut by_slot: BTreeMap<SlotId, AnchoredSlotSamples> = BTreeMap::new();
     let mut interner: BTreeMap<String, usize> = BTreeMap::new();
@@ -3281,6 +3304,12 @@ fn gather_anchored_slot_samples(
         }
         anchored_records += 1;
         for (slot, vector) in &record.slots {
+            // Withheld before the sample exists, so an excluded slot cannot
+            // reach the per-lens bits, the joint estimate, the deficit split or
+            // the leakage detector by any path (#1953).
+            if excluded_slots.contains(&slot.get()) {
+                continue;
+            }
             let entry = by_slot.entry(*slot).or_insert_with(|| AnchoredSlotSamples {
                 x: Vec::new(),
                 labels: Vec::new(),
