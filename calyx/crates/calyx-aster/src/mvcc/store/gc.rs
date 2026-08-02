@@ -71,7 +71,7 @@ impl SnapshotVersionGc for VersionedCfStore {
     }
 
     fn snapshot_gc_debt(&self, safe_point: Seq) -> u64 {
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("snapshot_gc_debt");
         snapshot_gc_debt_for_table(&table, safe_point)
     }
 }

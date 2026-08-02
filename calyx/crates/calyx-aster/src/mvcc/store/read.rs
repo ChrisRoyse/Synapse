@@ -102,7 +102,7 @@ impl VersionedCfStore {
         self.ensure_snapshot_live(snapshot, clock)?;
         self.ensure_unbarriered(cf, key)?;
         {
-            let table = self.rows.read().expect("mvcc row table poisoned");
+            let table = self.read_rows("read_at");
             if let Some(value) = table
                 .get(&cf)
                 .and_then(|rows| rows.get(key))
@@ -124,7 +124,7 @@ impl VersionedCfStore {
     ) -> Result<Option<Seq>> {
         self.ensure_snapshot_live(snapshot, clock)?;
         self.ensure_unbarriered(cf, key)?;
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("seq_for_key_at");
         let seq = table
             .get(&cf)
             .and_then(|rows| rows.get(key))
@@ -169,7 +169,7 @@ impl VersionedCfStore {
         let mut values = vec![None; reads.len()];
         let mut router_misses = Vec::new();
         {
-            let table = self.rows.read().expect("mvcc row table poisoned");
+            let table = self.read_rows("read_batch");
             for (index, read) in reads.iter().enumerate() {
                 let visible = table
                     .get(&read.cf)
@@ -247,7 +247,7 @@ impl VersionedCfStore {
                 self.changed_key_history_floor
             )));
         }
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("changed_keys_after_at");
         let keys = table
             .get(&cf)
             .into_iter()
@@ -300,7 +300,7 @@ impl VersionedCfStore {
         let keys =
             self.changed_keys_after_at(snapshot, ColumnFamily::Base, after_exclusive, clock)?;
         let scanned = keys.len();
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("changed_base_keys_after_at_for_panel");
         let mut scoped = Vec::new();
         let mut other_panels = 0_usize;
         let mut unattributed = 0_usize;
@@ -409,7 +409,7 @@ impl VersionedCfStore {
         } else {
             Bound::Included(range.start.as_slice())
         };
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("scan_cf_range_page_at");
         let mut rows = Vec::with_capacity(limit);
         let Some(cf_rows) = table.get(&cf) else {
             return Ok(rows);
@@ -446,7 +446,7 @@ impl VersionedCfStore {
             .read_barriers
             .read()
             .expect("mvcc read barriers poisoned");
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("predecessor_cf_at");
         let router = self.router.read().expect("mvcc router poisoned");
         if self.router_latest_readback.load(Ordering::Acquire) {
             self.ensure_router_latest_snapshot(snapshot)?;
@@ -523,7 +523,7 @@ impl VersionedCfStore {
             .read_barriers
             .read()
             .expect("mvcc read barriers poisoned");
-        let table = self.rows.read().expect("mvcc row table poisoned");
+        let table = self.read_rows("with_latest_view");
         let router = self.router.read().expect("mvcc router poisoned");
         let seq = self.current_seq();
         read(seq, &table, router.as_ref(), &barriers)

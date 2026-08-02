@@ -176,6 +176,60 @@ struct VersionedValue {
 type VersionChain = Vec<VersionedValue>;
 type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
 
+/// How long a row-table **read** guard may be held before it is reported.
+///
+/// `VersionedCfStore::rows` is one vault-wide `RwLock<RowTable>`, so a commit
+/// taking it for write must wait for every in-flight reader to drain. #1950
+/// measured commits waiting **1.0 s** for it on 2-18 row batches, and the
+/// write side could say "I waited 1,010,497 us" while nothing anywhere could
+/// say who held it.
+///
+/// 25 ms is well above any point read (the stalled commits do 52-139 us of
+/// actual work) and far below the 125 ms - 1.4 s holds being hunted, so a
+/// report here is a real finding rather than noise.
+const ROW_READ_GUARD_WARN_US: u64 = 25_000;
+
+/// A row-table read guard that reports its own hold duration and call site.
+///
+/// #1950 ask 1: the commit path can already attribute its wait, but a wait
+/// names the waiter, never the holder. This closes that gap from the other
+/// side — every long read guard says which call site held it and for how
+/// long, so the holder is *named* rather than inferred from the set of
+/// plausible scan sites.
+///
+/// The timer starts when the guard is acquired, not when it is requested, so
+/// a reader that itself waited behind a writer is not charged for that wait.
+/// Charging it would reproduce exactly the defect that made `mvcc_locked_us`
+/// name every stall's victim as its cause.
+struct TimedRowRead<'a> {
+    guard: std::sync::RwLockReadGuard<'a, RowTable>,
+    site: &'static str,
+    acquired: Instant,
+}
+
+impl std::ops::Deref for TimedRowRead<'_> {
+    type Target = RowTable;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl Drop for TimedRowRead<'_> {
+    fn drop(&mut self) {
+        let held_us = elapsed_us(&self.acquired);
+        if held_us >= ROW_READ_GUARD_WARN_US {
+            tracing::warn!(
+                code = "CALYX_ASTER_ROW_READ_GUARD_SLOW",
+                site = self.site,
+                held_us,
+                budget_us = ROW_READ_GUARD_WARN_US,
+                "row-table read guard held long enough to stall every commit waiting for the write lock"
+            );
+        }
+    }
+}
+
 /// One CF/key read requested against a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CfRead {
@@ -253,6 +307,36 @@ pub struct VersionedCfStore {
 }
 
 impl VersionedCfStore {
+    /// Row-table read guard that reports itself if held past
+    /// [`ROW_READ_GUARD_WARN_US`] (#1950). Panicking variant, matching the
+    /// `.expect("mvcc row table poisoned")` these call sites already used.
+    ///
+    /// Every row-table read goes through this or [`Self::try_read_rows`]; a
+    /// bare `self.rows.read()` is a hold nothing can attribute, which is the
+    /// state #1950 is stuck in.
+    fn read_rows(&self, site: &'static str) -> TimedRowRead<'_> {
+        let guard = self.rows.read().expect("mvcc row table poisoned");
+        TimedRowRead {
+            guard,
+            site,
+            acquired: Instant::now(),
+        }
+    }
+
+    /// [`Self::read_rows`] for call sites that surface poisoning as an error
+    /// rather than panicking.
+    fn try_read_rows(&self, site: &'static str, poisoned: &str) -> Result<TimedRowRead<'_>> {
+        let guard = self
+            .rows
+            .read()
+            .map_err(|_| CalyxError::aster_corrupt_shard(poisoned.to_owned()))?;
+        Ok(TimedRowRead {
+            guard,
+            site,
+            acquired: Instant::now(),
+        })
+    }
+
     pub fn new(start_seq: Seq) -> Self {
         Self {
             seqs: SeqAllocator::new(start_seq),
@@ -609,11 +693,10 @@ impl VersionedCfStore {
         clock: &dyn Clock,
         max_age_ms: u64,
     ) -> Result<Snapshot> {
-        let _table = self.rows.read().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC row-table lock was poisoned while pinning panel search freshness",
-            )
-        })?;
+        let _table = self.try_read_rows(
+            "pin_snapshot_for_panel",
+            "MVCC row-table lock was poisoned while pinning panel search freshness",
+        )?;
         let seq = self.current_seq();
         let panel_content_seq = self
             .panel_content_seqs
@@ -638,11 +721,10 @@ impl VersionedCfStore {
     /// them, so observing a newer concurrent commit can only conservatively
     /// overstate a panel watermark, never accept a stale index (#1841).
     pub(crate) fn panel_content_seqs_snapshot(&self) -> Result<BTreeMap<u32, Seq>> {
-        let _table = self.rows.read().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC row-table lock was poisoned while snapshotting panel watermarks",
-            )
-        })?;
+        let _table = self.try_read_rows(
+            "panel_content_seqs_snapshot",
+            "MVCC row-table lock was poisoned while snapshotting panel watermarks",
+        )?;
         self.panel_content_seqs
             .read()
             .map_err(|_| {
@@ -679,11 +761,10 @@ impl VersionedCfStore {
         floor: Seq,
         active_panel_version: Option<u32>,
     ) -> Result<()> {
-        let table = self.rows.read().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC row-table lock was poisoned while migrating panel watermarks",
-            )
-        })?;
+        let table = self.try_read_rows(
+            "migrate_panel_content_seqs_to_at_least",
+            "MVCC row-table lock was poisoned while migrating panel watermarks",
+        )?;
         let mut panels = self
             .panel_content_seqs
             .read()
