@@ -108,9 +108,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             vault.router_latest_readback()
         );
         if vault.router_latest_readback() {
-            return Err("the default open already armed the gated path; the two-mode \
+            return Err(
+                "the default open already armed the gated path; the two-mode \
                         comparison below would not be comparing two modes"
-                .into());
+                    .into(),
+            );
         }
 
         let rows = (0..ROWS)
@@ -170,10 +172,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\n=== B. reopened with restore_mvcc_rows=false");
     println!("   router_latest_readback = {armed} (expected true)");
     if !armed {
-        return Err("the gated branch is NOT armed on this handle: every result below \
+        return Err(
+            "the gated branch is NOT armed on this handle: every result below \
                     would come from the row-table branch, so this run would prove \
                     nothing about the path #1954 is about"
-            .into());
+                .into(),
+        );
     }
 
     // Control on the *same* handle, so both paths see one identical vault.
@@ -198,8 +202,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\n=== D. scan_cf_range_page_snapshot (gated key-based path)");
     let snapshot = vault.pin_reader(Freshness::FreshDerived, 30_000);
     println!("   pinned snapshot seq = {}", snapshot.seq());
-    let outcome =
-        vault.scan_cf_range_page_snapshot(snapshot, CF, &range, None, ROWS as usize + 8);
+    let outcome = vault.scan_cf_range_page_snapshot(snapshot, CF, &range, None, ROWS as usize + 8);
 
     let verdict = match &outcome {
         Ok(rows) => {
@@ -241,12 +244,30 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let cases: [(&str, bool, bool, u64, usize); 3] = [
         // (name, flush_after_write, expect_victim_live, extra_key, expected_own_rows)
-        ("E1 tombstone memtable-resident, never flushed", false, false, VICTIM, ROWS as usize - 1),
-        ("E2 tombstoned key re-written (resurrection)", true, true, VICTIM, ROWS as usize),
+        (
+            "E1 tombstone memtable-resident, never flushed",
+            false,
+            false,
+            VICTIM,
+            ROWS as usize - 1,
+        ),
+        (
+            "E2 tombstoned key re-written (resurrection)",
+            true,
+            true,
+            VICTIM,
+            ROWS as usize,
+        ),
         // E3 runs after E2, which resurrected the victim, so the live count is
         // back to ROWS. Tombstoning a key that was never written must leave it
         // exactly there — the underflow a count-by-subtraction would hit.
-        ("E3 tombstone for a key that never existed", true, false, 9_999, ROWS as usize),
+        (
+            "E3 tombstone for a key that never existed",
+            true,
+            false,
+            9_999,
+            ROWS as usize,
+        ),
     ];
 
     for (name, flush_after, expect_live, target, expected_rows) in cases {
@@ -347,13 +368,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
         "AGREES" => {
             println!("  #1954 does NOT reproduce, on the gated path either.");
-            println!("  Both latest views agree at {} rows with the tombstoned key", ROWS - 1);
+            println!(
+                "  Both latest views agree at {} rows with the tombstoned key",
+                ROWS - 1
+            );
             println!("  absent, on a handle proven to have router_latest_readback = true.");
             Ok(())
         }
-        "VACUOUS" => Err("the gated page read returned 0 rows: this is the row-table \
+        "VACUOUS" => Err(
+            "the gated page read returned 0 rows: this is the row-table \
                           branch signature and the run proves nothing"
-            .into()),
+                .into(),
+        ),
         "WRONG-COUNT" => Err(
             "the gated page returned neither the expected live count nor the victim: \
              the disagreement is real but is not the one this harness characterises"

@@ -93,7 +93,12 @@ const PAIRS: &[PanelAnchorPair] = &[
         "synapse:mcp_tool_call_outcome",
         &[86, 87, 93],
     ),
-    ("syn-mcp-usage-v1", 1_776_006, "synapse:mcp_steering_enabled", &[]),
+    (
+        "syn-mcp-usage-v1",
+        1_776_006,
+        "synapse:mcp_steering_enabled",
+        &[],
+    ),
     (
         "syn-mcp-usage-v1",
         1_776_006,
@@ -106,7 +111,12 @@ const PAIRS: &[PanelAnchorPair] = &[
         "synapse:agent_tool_call_success",
         &[],
     ),
-    ("syn-agent-event-v1", 1_665_001, "synapse:agent_end_state", &[]),
+    (
+        "syn-agent-event-v1",
+        1_665_001,
+        "synapse:agent_end_state",
+        &[],
+    ),
     (
         "syn-agent-transcript-v1",
         1_921_001,
@@ -119,11 +129,31 @@ const PAIRS: &[PanelAnchorPair] = &[
         "synapse:episode_segmentation_outcome",
         &[],
     ),
-    ("syn-outcome-v1", 1_776_005, "synapse:verification_outcome", &[]),
-    ("syn-outcome-v1", 1_776_005, "synapse:approval_decision", &[]),
+    (
+        "syn-outcome-v1",
+        1_776_005,
+        "synapse:verification_outcome",
+        &[],
+    ),
+    (
+        "syn-outcome-v1",
+        1_776_005,
+        "synapse:approval_decision",
+        &[],
+    ),
     ("syn-outcome-v1", 1_776_005, "synapse:escalation_event", &[]),
-    ("syn-reflex-v1", 1_776_002, "synapse:routine_transition", &[]),
-    ("syn-timeline-v1", 1_900_001, "synapse:mcp_tool_call_outcome", &[]),
+    (
+        "syn-reflex-v1",
+        1_776_002,
+        "synapse:routine_transition",
+        &[],
+    ),
+    (
+        "syn-timeline-v1",
+        1_900_001,
+        "synapse:mcp_tool_call_outcome",
+        &[],
+    ),
 ];
 
 const MAX_RECORDS: usize = 4_000;
@@ -161,11 +191,7 @@ fn run_pass(
         joint_records: report.joint_records,
         panel_floor_applied: report.panel_floor_applied,
         unmeasured_slots: report.unmeasured_slots,
-        leaking_slots: report
-            .anchor_leakage
-            .iter()
-            .map(|leak| leak.slot)
-            .collect(),
+        leaking_slots: report.anchor_leakage.iter().map(|leak| leak.slot).collect(),
     })
 }
 
@@ -205,7 +231,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(result) => result,
             Err(error) => {
                 println!("   pass 1 ERROR: {error}");
-                unresolved.push(format!("{panel_name}/{anchor_kind}: pass 1 errored: {error}"));
+                unresolved.push(format!(
+                    "{panel_name}/{anchor_kind}: pass 1 errored: {error}"
+                ));
                 continue;
             }
         };
@@ -250,7 +278,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(result) => result,
             Err(error) => {
                 println!("   pass 2 ERROR: {error}");
-                unresolved.push(format!("{panel_name}/{anchor_kind}: pass 2 errored: {error}"));
+                unresolved.push(format!(
+                    "{panel_name}/{anchor_kind}: pass 2 errored: {error}"
+                ));
                 continue;
             }
         };
@@ -335,8 +365,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Ok(result) => result,
                 Err(error) => {
                     println!("   pass 3 ERROR: {error}");
-                    unresolved
-                        .push(format!("{panel_name}/{anchor_kind}: pass 3 errored: {error}"));
+                    unresolved.push(format!(
+                        "{panel_name}/{anchor_kind}: pass 3 errored: {error}"
+                    ));
                     continue;
                 }
             };
@@ -352,9 +383,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 third.deficit_bits
             );
             println!(
-            "          joint_records={} floor_applied={} unmeasured_slots={}",
-            third.joint_records, third.panel_floor_applied, third.unmeasured_slots
-        );
+                "          joint_records={} floor_applied={} unmeasured_slots={}",
+                third.joint_records, third.panel_floor_applied, third.unmeasured_slots
+            );
             if third.anchored_records != first.anchored_records {
                 unresolved.push(format!(
                     "{panel_name}/{anchor_kind}: anchored records moved between pass 1 and \
@@ -436,7 +467,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  unresolved                       = {}", unresolved.len());
 
     if unresolved.is_empty() {
-        println!("\n--- VERDICT: every leaking pair resolved to a clean observable-feature number.");
+        println!(
+            "\n--- VERDICT: every leaking pair resolved to a clean observable-feature number."
+        );
         Ok(())
     } else {
         println!();

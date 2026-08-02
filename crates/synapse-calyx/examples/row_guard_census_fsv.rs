@@ -65,7 +65,9 @@ fn key_of(tag: u64) -> Vec<u8> {
     format!("census/{tag:06}").into_bytes()
 }
 
-fn census_map(vault: &AsterVault<calyx_core::SystemClock>) -> BTreeMap<&'static str, (u64, u64, u64, Option<f64>)> {
+fn census_map(
+    vault: &AsterVault<calyx_core::SystemClock>,
+) -> BTreeMap<&'static str, (u64, u64, u64, Option<f64>)> {
     vault
         .row_guard_census()
         .into_iter()
@@ -113,7 +115,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    println!("   sites declared = {}   sites reported = {}", RowGuardSite::COUNT, before.len());
+    println!(
+        "   sites declared = {}   sites reported = {}",
+        RowGuardSite::COUNT,
+        before.len()
+    );
     // Note: the open path itself takes some guards (recovery, watermarks), so
     // only the sites this harness drives are asserted zero. Asserting ALL zero
     // would be asserting something false and would have to be relaxed later,
@@ -127,7 +133,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let (holds, _, _, mean) = before[site.as_str()];
         println!("   {:<26} holds={holds} mean={mean:?}", site.as_str());
         if holds != 0 {
-            return Err(format!("{} already ran before the harness drove it", site.as_str()).into());
+            return Err(
+                format!("{} already ran before the harness drove it", site.as_str()).into(),
+            );
         }
         if mean.is_some() {
             return Err(format!(
@@ -203,7 +211,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             failures.push(format!("{name}: issued {issued}, counted {delta}"));
         }
         if mean.is_none() {
-            failures.push(format!("{name}: ran {delta} times but reports no mean hold"));
+            failures.push(format!(
+                "{name}: ran {delta} times but reports no mean hold"
+            ));
         }
     }
 
@@ -248,7 +258,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         over
     );
     if over == 0 && holds > 0 {
-        println!("   => 'ran {holds} times, every one inside the {ROW_READ_GUARD_WARN_US} us budget'");
+        println!(
+            "   => 'ran {holds} times, every one inside the {ROW_READ_GUARD_WARN_US} us budget'"
+        );
         println!("      Previously indistinguishable from 'never ran'.");
     } else if over > 0 {
         println!("   => ran {holds} times, {over} exceeded the budget");

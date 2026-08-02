@@ -161,3 +161,54 @@ Classify these helpers from the process table before cleanup:
 Never kill broad `cmd.exe`, terminal, IDE, WSL, Codex, or Claude process sets to
 clean MCP helpers. If ownership cannot be proven, print the process Source of
 Truth and leave the process running.
+
+## Never Measure Latency While A Build Is Running
+
+This is a single-machine project, and the agent's own compiler is the heaviest
+process on the box. Any latency number collected while `cargo build`,
+`cargo check`, `cargo clippy` or `scripts/lint.ps1` is running is measuring the
+compiler, not the daemon.
+
+The host is a 2 P-core + 8 E-core i7-1355U. On a hybrid part under load the
+scheduler can park a thread on an E-core, or off-core entirely, for a long time.
+The effect is not marginal:
+
+- A `read_latest` — a point read of **one key** — was measured holding the
+  vault-wide row-table read guard for **743 ms** (#1955). It cannot do 743 ms of
+  work. It was descheduled.
+- The same scan, same code, same 200,000 rows, measured quiet and loaded:
+  `held_us=39,278 cpu_us=31,250` versus `held_us=284,392 cpu_us=125,000` — a
+  284 ms hold of which 159 ms was not running.
+- Worst commit stall moved **5.6x** and guard-event rate **14x** on one
+  unchanged binary, purely from build load (#1950).
+
+That is larger than most changes being measured, and it moves in the direction
+that flatters a change: a loaded "before" against a quiet "after" attributes the
+machine's idle CPU to the diff. #1952 ask 3 was abandoned for exactly this
+reason — there was no clean pre-deploy baseline and no way to recover one.
+
+### What to do instead
+
+1. **Batch every code change, then deploy once, then measure.** A deploy after
+   touching `synapse-calyx` is a full release rebuild; interleaving builds with
+   measurement windows costs more than it saves.
+2. **Read the self-identifying fields rather than trusting the wall clock.**
+   `CALYX_ASTER_ROW_READ_GUARD_SLOW` carries `cpu_us` and `starved`, and
+   `health` carries `calyx_row_guard_starved_total`. A window with a non-zero
+   starved count measured the machine; discard it rather than reasoning about
+   it. This is why those fields exist — a contaminated sample now says so
+   instead of relying on a reader noticing that a point read took 743 ms.
+3. **Distinguish "descheduled" from "blocked".** A thread waiting on a lock
+   consumes no CPU by definition, so a `cpu_us` near zero across a *wait* means
+   nothing and a starvation flag derived from it would be true unconditionally.
+   Only a region where a thread is supposed to be *running* — a scan holding a
+   guard, or a commit's locked region — can be checked this way.
+
+### Related standing rules
+
+- Never measure latency within **2 minutes of a daemon restart**; the vault is
+  still recovering and the numbers describe recovery, not steady state.
+- Prefer a **frozen vault copy** for any before/after that compares *values*
+  rather than structure. The live vault is a moving corpus, so a before/after
+  taken minutes apart measures drift plus the change with no way to separate
+  them. Structural counts are the exception and stay valid live.

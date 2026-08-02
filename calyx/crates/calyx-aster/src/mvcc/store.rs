@@ -380,9 +380,7 @@ impl RowGuardCensus {
         // load-bearing. Anything stronger would put a fence on the hottest read
         // path in the vault to buy nothing.
         counters.holds.fetch_add(1, Ordering::Relaxed);
-        counters
-            .total_held_us
-            .fetch_add(held_us, Ordering::Relaxed);
+        counters.total_held_us.fetch_add(held_us, Ordering::Relaxed);
         counters.max_held_us.fetch_max(held_us, Ordering::Relaxed);
         if over_budget {
             counters.over_budget_holds.fetch_add(1, Ordering::Relaxed);

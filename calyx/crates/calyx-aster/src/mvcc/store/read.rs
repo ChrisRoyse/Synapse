@@ -23,22 +23,28 @@ impl VersionedCfStore {
         if reads.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_latest_view(RowGuardSite::ReadBatchLatest, |seq, table, router, barriers| {
-            reads
-                .iter()
-                .map(|read| {
-                    ensure_view_key_unbarriered(barriers, read.cf, &read.key)?;
-                    latest_value_from_view(seq, table, router, read.cf, &read.key)
-                })
-                .collect()
-        })
+        self.with_latest_view(
+            RowGuardSite::ReadBatchLatest,
+            |seq, table, router, barriers| {
+                reads
+                    .iter()
+                    .map(|read| {
+                        ensure_view_key_unbarriered(barriers, read.cf, &read.key)?;
+                        latest_value_from_view(seq, table, router, read.cf, &read.key)
+                    })
+                    .collect()
+            },
+        )
     }
 
     /// Scans one CF from one atomic view of the latest committed state.
     pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.with_latest_view(RowGuardSite::ScanCfLatest, |seq, table, router, barriers| {
-            latest_rows_from_view(seq, table, router, cf, None, barriers)
-        })
+        self.with_latest_view(
+            RowGuardSite::ScanCfLatest,
+            |seq, table, router, barriers| {
+                latest_rows_from_view(seq, table, router, cf, None, barriers)
+            },
+        )
     }
 
     /// Counts the visible rows of one CF from one atomic view of the latest
@@ -49,9 +55,12 @@ impl VersionedCfStore {
     /// callers depend on, because they use the count as physical evidence that
     /// a write landed.
     pub fn count_cf_latest(&self, cf: ColumnFamily) -> Result<usize> {
-        self.with_latest_view(RowGuardSite::CountCfLatest, |seq, table, router, barriers| {
-            latest_row_count_from_view(seq, table, router, cf, barriers)
-        })
+        self.with_latest_view(
+            RowGuardSite::CountCfLatest,
+            |seq, table, router, barriers| {
+                latest_row_count_from_view(seq, table, router, cf, barriers)
+            },
+        )
     }
 
     /// Scans one CF range from one atomic view of the latest committed state.
@@ -60,9 +69,12 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.with_latest_view(RowGuardSite::ScanCfRangeLatest, |seq, table, router, barriers| {
-            latest_rows_from_view(seq, table, router, cf, Some(range), barriers)
-        })
+        self.with_latest_view(
+            RowGuardSite::ScanCfRangeLatest,
+            |seq, table, router, barriers| {
+                latest_rows_from_view(seq, table, router, cf, Some(range), barriers)
+            },
+        )
     }
 
     /// Reads one candidate-bounded page from an atomic latest committed view.

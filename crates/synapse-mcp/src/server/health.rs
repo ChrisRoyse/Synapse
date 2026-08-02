@@ -8,8 +8,7 @@ use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{
     Backend, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus, CalyxTuningKnobEnforcement,
-    CalyxTuningKnobStatus,
-    ChromeBridgeDetail,
+    CalyxTuningKnobStatus, ChromeBridgeDetail,
 };
 
 /// Verbosity control for the `health` tool response.
