@@ -2,8 +2,12 @@ use super::*;
 
 impl CfRouter {
     pub fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(value) = self.memtables.get(&cf).and_then(|table| table.get(key)) {
-            return Ok(Some(value));
+        // Newest source first, first hit wins: active memtable, then each
+        // sealed memtable awaiting its SST, then the SST levels (#1949).
+        for table in self.read_tables(cf) {
+            if let Some(value) = table.get(key) {
+                return Ok(Some(value));
+            }
         }
         self.levels.get(&cf).map_or(Ok(None), |level| {
             level
@@ -20,7 +24,8 @@ impl CfRouter {
                 rows.insert(entry.key, entry.value);
             }
         }
-        if let Some(table) = self.memtables.get(&cf) {
+        // Oldest in-memory source first so a newer one overwrites it.
+        for table in self.read_tables_oldest_first(cf) {
             for (key, value) in table.range(start, end) {
                 rows.insert(key, value);
             }
@@ -48,11 +53,16 @@ impl CfRouter {
                 .map(|level| level.predecessor(start, &upper, inclusive))
                 .transpose()?
                 .flatten();
-            let memtable = self
-                .memtables
-                .get(&cf)
-                .and_then(|table| table.predecessor(start, &upper, inclusive))
-                .map(|(key, value)| SstEntry { key, value });
+            // The greatest key across every in-memory source; on a tie the
+            // newest source wins, so scan newest first and keep strict `>`.
+            let mut memtable: Option<SstEntry> = None;
+            for table in self.read_tables(cf) {
+                if let Some((key, value)) = table.predecessor(start, &upper, inclusive)
+                    && memtable.as_ref().is_none_or(|current| key > current.key)
+                {
+                    memtable = Some(SstEntry { key, value });
+                }
+            }
             let candidate = match (level, memtable) {
                 (None, None) => return Ok(None),
                 (Some(entry), None) | (None, Some(entry)) => entry,
@@ -86,17 +96,16 @@ impl CfRouter {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let overlay = self
-            .memtables
-            .get(&cf)
-            .map(|table| {
-                table
-                    .range_until(start, end)
-                    .into_iter()
-                    .map(|(key, value)| SstEntry { key, value })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut merged = BTreeMap::new();
+        for table in self.read_tables_oldest_first(cf) {
+            for (key, value) in table.range_until(start, end) {
+                merged.insert(key, value);
+            }
+        }
+        let overlay = merged
+            .into_iter()
+            .map(|(key, value)| SstEntry { key, value })
+            .collect::<Vec<_>>();
         let rows = self
             .levels
             .get(&cf)
@@ -133,17 +142,20 @@ impl CfRouter {
         // may be sealed. Open only the immutable source before merging so an
         // encrypted vault never tries to decrypt a plaintext memtable winner.
         let immutable = self.open_entries(cf, immutable)?;
-        let mutable = self
-            .memtables
-            .get(&cf)
-            .map(|table| {
-                table
-                    .range_candidate_page_until(start, end, after_key, limit)
-                    .into_iter()
-                    .map(|(key, value)| SstEntry { key, value })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Each in-memory source contributes at most `limit` rows; merging them
+        // oldest-first into an ordered map keeps newest-wins precedence, and
+        // taking `limit` afterwards preserves the bounded-page contract.
+        let mut merged = BTreeMap::new();
+        for table in self.read_tables_oldest_first(cf) {
+            for (key, value) in table.range_candidate_page_until(start, end, after_key, limit) {
+                merged.insert(key, value);
+            }
+        }
+        let mutable = merged
+            .into_iter()
+            .take(limit)
+            .map(|(key, value)| SstEntry { key, value })
+            .collect::<Vec<_>>();
 
         let mut immutable_index = 0;
         let mut mutable_index = 0;
@@ -198,7 +210,7 @@ impl CfRouter {
                 rows.insert(key, false);
             }
         }
-        if let Some(table) = self.memtables.get(&cf) {
+        for table in self.read_tables_oldest_first(cf) {
             for (key, value) in table.range_until(start, end) {
                 rows.insert(key, crate::mvcc::is_tombstone_value(&value));
             }
@@ -216,7 +228,7 @@ impl CfRouter {
                 rows.insert(entry.key, entry.value);
             }
         }
-        if let Some(table) = self.memtables.get(&cf) {
+        for table in self.read_tables_oldest_first(cf) {
             for (key, value) in table.iter() {
                 rows.insert(key, value);
             }

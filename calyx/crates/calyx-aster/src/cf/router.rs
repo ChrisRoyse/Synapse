@@ -1,15 +1,15 @@
 use super::ColumnFamily;
 use crate::compaction::TieringPolicy;
-use crate::memtable::{FrozenMemtable, Memtable, MemtableUsage};
+use crate::memtable::{Memtable, MemtableUsage};
 use crate::resource::ResourceCounters;
 use crate::security::value_crypto::{
     SharedVaultContext, open_value as open_encrypted_value, seal_value,
 };
-use crate::sst::level::SstLevel;
+use crate::sst::level::{PreparedLevelFile, SstLevel};
 use crate::sst::{SstEntry, SstSummary};
 use crate::storage_names::flush_sst_file_name;
 use calyx_core::{CalyxError, Result, SlotId};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,32 +27,134 @@ fn elapsed_us(started: &Instant) -> u64 {
 /// What one [`CfRouter::put_at`] did besides insert into the memtable.
 ///
 /// A router write looks like an in-memory operation and is charged to the
-/// caller as one, but it can synchronously seal, encrypt and write an entire
-/// SST, and it runs `create_dir_all` on every call. Both costs are paid under
-/// the vault's global write locks, so they are reported per commit rather than
-/// left inside an opaque total (#1948).
+/// caller as one, but it can seal a full memtable, and it runs `create_dir_all`
+/// on every call. Both costs are paid under the vault's global write locks, so
+/// they are reported per commit rather than left inside an opaque total
+/// (#1948).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RouterPutCost {
     /// Time in the `ensure_cf` / write-fanout admission prologue, which
-    /// includes a `create_dir_all` syscall on every single write.
+    /// includes a `create_dir_all` syscall on the first write to each CF.
     pub ensure_cf_us: u64,
-    /// Time in synchronous memtable-to-SST flushes triggered by this write.
-    pub flush_us: u64,
-    /// How many flushes this one write triggered.
-    pub flushes: u32,
+    /// Time spent sealing full memtables. This is the pointer swap only; the
+    /// SST write it defers is timed by the caller, outside the locks (#1949).
+    pub seal_us: u64,
+    /// How many memtables this one write sealed.
+    pub seals: u32,
 }
 
 impl RouterPutCost {
-    fn record_flush(&mut self, flush_us: u64) {
-        self.flush_us = self.flush_us.saturating_add(flush_us);
-        self.flushes = self.flushes.saturating_add(1);
+    fn record_seal(&mut self, seal_us: u64) {
+        self.seal_us = self.seal_us.saturating_add(seal_us);
+        self.seals = self.seals.saturating_add(1);
     }
 
     /// Folds another write's outcome into this one, for per-batch totals.
     pub fn absorb(&mut self, other: Self) {
         self.ensure_cf_us = self.ensure_cf_us.saturating_add(other.ensure_cf_us);
-        self.flush_us = self.flush_us.saturating_add(other.flush_us);
-        self.flushes = self.flushes.saturating_add(other.flushes);
+        self.seal_us = self.seal_us.saturating_add(other.seal_us);
+        self.seals = self.seals.saturating_add(other.seals);
+    }
+}
+
+/// Upper bound on memtables sealed but not yet installed, per column family.
+///
+/// Under the commit path a seal is written and installed before the next one
+/// can be taken, so this queue is normally 0 or 1 deep. The bound exists so an
+/// unnoticed failure to drain becomes a loud, bounded error instead of
+/// unbounded memory growth — RocksDB's `max_write_buffer_number` stall serves
+/// the same purpose.
+const MAX_SEALED_MEMTABLES_PER_CF: usize = 8;
+
+/// A memtable that has been sealed and is awaiting its SST.
+///
+/// It stays in the router's read path for its whole life: the rows are still
+/// the newest state for their keys until the SST is installed, and dropping
+/// them from reads for the duration of the write would be a correctness bug,
+/// not an optimisation.
+#[derive(Debug)]
+struct PendingFlush {
+    id: u64,
+    table: Arc<Memtable>,
+    path: PathBuf,
+    /// Set once the SST is on disk and its lookup index has been read. Installs
+    /// drain in seal order, so a written entry still waits behind an unwritten
+    /// older sibling.
+    prepared: Option<PreparedLevelFile>,
+}
+
+/// A sealed memtable that has reached disk, with its level entry prepared.
+#[derive(Debug)]
+pub struct WrittenFlush {
+    summary: SstSummary,
+    prepared: PreparedLevelFile,
+}
+
+impl WrittenFlush {
+    /// The written SST.
+    #[must_use]
+    pub const fn summary(&self) -> &SstSummary {
+        &self.summary
+    }
+}
+
+/// A sealed memtable handed back to the caller so the SST can be written with
+/// the vault's row-table and router locks released (#1949).
+///
+/// Carries everything the write needs — rows, target path, and a clone of the
+/// value-crypto handle — precisely so that it does **not** borrow the router.
+#[derive(Debug, Clone)]
+pub struct SealedFlush {
+    cf: ColumnFamily,
+    id: u64,
+    path: PathBuf,
+    table: Arc<Memtable>,
+    value_crypto: Option<SharedVaultContext>,
+}
+
+impl SealedFlush {
+    /// The column family whose memtable this is.
+    #[must_use]
+    pub const fn cf(&self) -> ColumnFamily {
+        self.cf
+    }
+
+    /// Rows carried by the sealed memtable.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Writes the sealed memtable to its SST **with no router lock held**.
+    ///
+    /// This is the whole point of the split: sealing is a pointer swap taken
+    /// under the vault's global write locks, and this — the AEAD seal of every
+    /// value plus the file write, measured at 652 ms for one commit's worth of
+    /// memtables (#1948) — runs with those locks released.
+    /// Also reads back the new SST's lookup index, because that read is I/O
+    /// too and belongs on this side of the lock boundary rather than inside
+    /// the install.
+    pub fn write_sst(&self) -> Result<WrittenFlush> {
+        let summary = match &self.value_crypto {
+            Some(context) => {
+                let entries = self
+                    .table
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((key.clone(), seal_value(context, self.cf, &key, &value)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                crate::sst::write_sst(
+                    &self.path,
+                    entries
+                        .iter()
+                        .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                )?
+            }
+            None => self.table.flush_to_sst(&self.path)?,
+        };
+        let prepared = SstLevel::prepare_with_lookup(summary.path.clone())?;
+        Ok(WrittenFlush { summary, prepared })
     }
 }
 
@@ -73,6 +175,15 @@ pub struct CfRouter {
     memtable_byte_cap: usize,
     resource_counters: Arc<ResourceCounters>,
     value_crypto: Option<SharedVaultContext>,
+    /// Memtables sealed but not yet installed as SSTs, oldest first (#1949).
+    ///
+    /// These are still served by every read path in `queries.rs`: a sealed
+    /// memtable holds the newest state for its keys until its SST lands, so
+    /// omitting it from reads would serve stale rows.
+    sealed: HashMap<ColumnFamily, VecDeque<PendingFlush>>,
+    /// Monotonic seal identifier, so an install matches the exact memtable it
+    /// wrote rather than "the one at the front".
+    next_seal_id: u64,
     /// CFs whose directory this router has already created, so the per-write
     /// `ensure_cf` repeats neither the syscall nor the path construction.
     ///
@@ -240,13 +351,40 @@ impl CfRouter {
             memtable_byte_cap,
             resource_counters: Arc::new(ResourceCounters::default()),
             value_crypto,
+            sealed: HashMap::new(),
+            next_seal_id: 0,
             ensured_cfs: HashSet::new(),
         })
     }
 
     /// Raw write with no commit domain; see [`Self::put_at`].
+    ///
+    /// Writes and installs any SST the write seals inline, because a standalone
+    /// caller has no lock to release and therefore nothing to gain from
+    /// deferring it.
     pub fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_at(cf, key, value, NO_COMMIT_DOMAIN).map(|_| ())
+        let mut sealed = Vec::new();
+        let result = self.put_at(cf, key, value, NO_COMMIT_DOMAIN, &mut sealed);
+        self.write_and_install_sealed(&sealed)?;
+        result.map(|_| ())
+    }
+
+    /// Writes and installs sealed memtables, in seal order.
+    ///
+    /// Callers on the commit path invoke this **after** releasing the vault's
+    /// row-table and router write locks (#1949); callers with no lock to
+    /// release use it inline.
+    pub fn write_and_install_sealed(&mut self, sealed: &[SealedFlush]) -> Result<()> {
+        for handle in sealed {
+            match handle.write_sst() {
+                Ok(written) => self.install_sealed(handle, written)?,
+                Err(write_error) => {
+                    self.abandon_sealed(handle, &write_error)?;
+                    return Err(write_error);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Writes one row; any memtable flush this write triggers is stamped with
@@ -266,6 +404,7 @@ impl CfRouter {
         key: &[u8],
         value: &[u8],
         commit_watermark: u64,
+        sealed: &mut Vec<SealedFlush>,
     ) -> Result<RouterPutCost> {
         let mut outcome = RouterPutCost::default();
         let ensure_started = Instant::now();
@@ -279,7 +418,10 @@ impl CfRouter {
                 if error.code != "CALYX_BACKPRESSURE" {
                     return Err(error);
                 }
-                outcome.record_flush(self.timed_flush_cf_at(cf, commit_watermark)?);
+                // Sealing alone relieves the backpressure: the active memtable
+                // is empty again once its contents move to the pending queue,
+                // so the retry does not need the SST to have been written.
+                outcome.record_seal(self.timed_seal_cf_at(cf, commit_watermark, sealed)?);
                 match self.memtable_mut(cf).write(key, value, 0) {
                     Ok(ack) => {
                         self.resource_counters.record_memtable_absorbed();
@@ -299,15 +441,21 @@ impl CfRouter {
             if !counted_backpressure {
                 self.resource_counters.record_memtable_absorbed();
             }
-            outcome.record_flush(self.timed_flush_cf_at(cf, commit_watermark)?);
+            outcome.record_seal(self.timed_seal_cf_at(cf, commit_watermark, sealed)?);
         }
         Ok(outcome)
     }
 
-    /// [`Self::flush_cf_at`] with the wall-clock cost of the flush attached.
-    fn timed_flush_cf_at(&mut self, cf: ColumnFamily, commit_watermark: u64) -> Result<u64> {
+    /// [`Self::seal_cf_at`] with its wall-clock cost, collecting the handle.
+    fn timed_seal_cf_at(
+        &mut self,
+        cf: ColumnFamily,
+        commit_watermark: u64,
+        sealed: &mut Vec<SealedFlush>,
+    ) -> Result<u64> {
         let started = Instant::now();
-        self.flush_cf_at(cf, commit_watermark)?;
+        let handle = self.seal_cf_at(cf, commit_watermark)?;
+        sealed.push(handle);
         Ok(elapsed_us(&started))
     }
 
@@ -379,9 +527,53 @@ impl CfRouter {
     /// it is safe (the file sorts earlier and committed rows keep their
     /// durable-batch home), overstating it can shadow newer durable batches.
     pub fn flush_cf_at(&mut self, cf: ColumnFamily, commit_watermark: u64) -> Result<SstSummary> {
+        // Seals unconditionally, including an empty memtable: the pre-#1949
+        // path wrote an empty SST in that case and `flush_cf` has callers
+        // outside this crate that may hit it, so the observable behaviour of
+        // this entry point is unchanged.
+        let sealed = self.seal_cf_at(cf, commit_watermark)?;
+        match sealed.write_sst() {
+            Ok(written) => {
+                let summary = written.summary().clone();
+                self.install_sealed(&sealed, written)?;
+                Ok(summary)
+            }
+            Err(write_error) => {
+                self.abandon_sealed(&sealed, &write_error)?;
+                Err(write_error)
+            }
+        }
+    }
+
+    /// Seals `cf`'s active memtable and installs a fresh empty one.
+    ///
+    /// This is the "switch" half of switch-then-flush (#1949). It is a pointer
+    /// swap plus a queue push — no encryption, no file I/O — so it is safe to
+    /// perform while the vault's row-table and router write locks are held. The
+    /// returned handle owns everything the SST write needs, and the caller is
+    /// expected to release those locks before calling
+    /// [`SealedFlush::write_sst`] and then [`Self::install_sealed`].
+    ///
+    /// The sealed memtable stays in this router's read path until it is
+    /// installed, so no reader can miss its rows during the write.
+    ///
+    /// Seals unconditionally, empty memtable included, so that
+    /// [`Self::flush_cf_at`] keeps its pre-#1949 behaviour for callers that
+    /// flush a CF without knowing whether it has rows.
+    pub fn seal_cf_at(&mut self, cf: ColumnFamily, commit_watermark: u64) -> Result<SealedFlush> {
         self.ensure_cf(cf)?;
-        let fresh = Memtable::new(self.memtable_byte_cap);
-        let frozen = std::mem::replace(self.memtable_mut(cf), fresh).freeze();
+        let depth = self.sealed.get(&cf).map_or(0, VecDeque::len);
+        if depth >= MAX_SEALED_MEMTABLES_PER_CF {
+            self.resource_counters.record_memtable_rejected();
+            return Err(CalyxError {
+                code: "CALYX_ASTER_ROUTER_SEALED_MEMTABLE_BACKLOG",
+                message: format!(
+                    "{} already holds {depth} sealed memtables awaiting their SST (cap {MAX_SEALED_MEMTABLES_PER_CF}); refusing to seal another",
+                    cf.name()
+                ),
+                remediation: "a sealed memtable is not being written or installed; inspect CALYX_ASTER_ROUTER_FLUSH_* telemetry and the vault volume for write failures",
+            });
+        }
         let ordinal = self.next_sequence(cf);
         let ordinal = usize::try_from(ordinal).map_err(|_| {
             CalyxError::aster_corrupt_shard(format!(
@@ -392,79 +584,141 @@ impl CfRouter {
         let path = self
             .cf_dir(cf)
             .join(flush_sst_file_name(commit_watermark, ordinal));
-        let publish = (|| -> Result<SstSummary> {
-            let summary = match &self.value_crypto {
-                Some(context) => {
-                    let entries = frozen
-                        .iter()
-                        .map(|(key, value)| {
-                            Ok((key.to_vec(), seal_value(context, cf, key, value)?))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    crate::sst::write_sst(
-                        &path,
-                        entries
-                            .iter()
-                            .map(|(key, value)| (key.as_slice(), value.as_slice())),
-                    )?
-                }
-                None => frozen.flush_to_sst(&path)?,
-            };
-            self.levels
-                .entry(cf)
-                .or_default()
-                .push_with_lookup(summary.path.clone())?;
-            Ok(summary)
-        })();
+        let fresh = Memtable::new(self.memtable_byte_cap);
+        let table = Arc::new(std::mem::replace(self.memtable_mut(cf), fresh));
+        self.next_seal_id += 1;
+        let id = self.next_seal_id;
+        self.sealed.entry(cf).or_default().push_back(PendingFlush {
+            id,
+            table: Arc::clone(&table),
+            path: path.clone(),
+            prepared: None,
+        });
+        Ok(SealedFlush {
+            cf,
+            id,
+            path,
+            table,
+            value_crypto: self.value_crypto.clone(),
+        })
+    }
 
-        match publish {
-            Ok(summary) => Ok(summary),
-            Err(publish_error) => {
-                // Rotation happens before encryption and durable SST
-                // publication. Restore the exact frozen rows into the fresh
-                // memtable before returning any failure; otherwise an error
-                // would silently remove previously accepted rows from the
-                // router's serving view. A target SST that did reach disk is
-                // intentionally retained as an idempotent physical projection.
-                if let Err(restore_error) = self.restore_frozen_memtable(cf, &frozen) {
-                    tracing::error!(
-                        code = "CALYX_ASTER_ROUTER_FLUSH_RESTORE_FAILED",
-                        cf = cf.name(),
-                        commit_watermark,
-                        path = %path.display(),
-                        publish_error_code = publish_error.code,
-                        publish_error = %publish_error,
-                        restore_error_code = restore_error.code,
-                        restore_error = %restore_error,
-                        "router flush failed and the rotated memtable could not be restored"
-                    );
-                    return Err(CalyxError::aster_corrupt_shard(format!(
-                        "router flush for {} at watermark {commit_watermark} failed and the rotated memtable could not be restored: publish=error[{}]: {}; restore=error[{}]: {}",
-                        cf.name(),
-                        publish_error.code,
-                        publish_error.message,
-                        restore_error.code,
-                        restore_error.message
-                    )));
+    /// Publishes a written SST into its level and retires the sealed memtable.
+    ///
+    /// Installs drain the per-CF queue **in seal order**: a newer SST whose
+    /// write finished first still waits behind an older sibling, because
+    /// `push_with_lookup` encodes recency by position and installing out of
+    /// order would invert read precedence and serve stale rows.
+    pub fn install_sealed(&mut self, sealed: &SealedFlush, written: WrittenFlush) -> Result<()> {
+        let queue = self.sealed.get_mut(&sealed.cf).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "install of {} seal {} found no sealed-memtable queue",
+                sealed.cf.name(),
+                sealed.id
+            ))
+        })?;
+        let pending = queue
+            .iter_mut()
+            .find(|pending| pending.id == sealed.id)
+            .ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "install of {} seal {} found no matching sealed memtable",
+                    sealed.cf.name(),
+                    sealed.id
+                ))
+            })?;
+        // The file the writer actually produced must be the one this queue
+        // entry planned, so an install can never publish a name the write did
+        // not create. Checked against the queue entry rather than the caller's
+        // handle so the authority is the router's own record of the seal.
+        if written.summary.path != pending.path {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "router flush for {} wrote {} but seal {} planned {}",
+                sealed.cf.name(),
+                written.summary.path.display(),
+                sealed.id,
+                pending.path.display()
+            )));
+        }
+        pending.prepared = Some(written.prepared);
+        self.drain_installable(sealed.cf);
+        Ok(())
+    }
+
+    /// Publishes every written sealed memtable at the front of `cf`'s queue.
+    fn drain_installable(&mut self, cf: ColumnFamily) {
+        loop {
+            let Some(queue) = self.sealed.get_mut(&cf) else {
+                return;
+            };
+            if !queue
+                .front()
+                .is_some_and(|pending| pending.prepared.is_some())
+            {
+                if queue.is_empty() {
+                    self.sealed.remove(&cf);
                 }
-                tracing::error!(
-                    code = publish_error.code,
-                    cf = cf.name(),
-                    commit_watermark,
-                    path = %path.display(),
-                    error = %publish_error,
-                    "router flush failed; restored the complete rotated memtable before returning the error"
-                );
-                Err(publish_error)
+                return;
             }
+            let Some(mut pending) = queue.pop_front() else {
+                return;
+            };
+            let Some(prepared) = pending.prepared.take() else {
+                return;
+            };
+            self.levels.entry(cf).or_default().push_prepared(prepared);
         }
     }
 
-    fn restore_frozen_memtable(&mut self, cf: ColumnFamily, frozen: &FrozenMemtable) -> Result<()> {
-        let memtable = self.memtable_mut(cf);
-        for (key, value) in frozen.iter() {
-            memtable.write(key, value, 0)?;
+    /// Returns a failed seal's rows to the active memtable.
+    ///
+    /// Without this the rows would sit in the pending queue forever, blocking
+    /// every later install for the CF and eventually tripping the backlog cap.
+    /// A target SST that did reach disk is intentionally retained as an
+    /// idempotent physical projection, exactly as the pre-#1949 path did.
+    pub fn abandon_sealed(&mut self, sealed: &SealedFlush, write_error: &CalyxError) -> Result<()> {
+        if let Some(queue) = self.sealed.get_mut(&sealed.cf) {
+            queue.retain(|pending| pending.id != sealed.id);
+            if queue.is_empty() {
+                self.sealed.remove(&sealed.cf);
+            }
         }
+        let rows = sealed.table.iter().collect::<Vec<_>>();
+        let memtable = self.memtable_mut(sealed.cf);
+        let mut restored = Ok(());
+        for (key, value) in rows {
+            if let Err(error) = memtable.write(&key, &value, 0) {
+                restored = Err(error);
+                break;
+            }
+        }
+        if let Err(restore_error) = restored {
+            tracing::error!(
+                code = "CALYX_ASTER_ROUTER_FLUSH_RESTORE_FAILED",
+                cf = sealed.cf.name(),
+                path = %sealed.path.display(),
+                write_error_code = write_error.code,
+                write_error = %write_error,
+                restore_error_code = restore_error.code,
+                restore_error = %restore_error,
+                "router flush failed and the sealed memtable could not be restored"
+            );
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "router flush for {} failed and the sealed memtable could not be restored: write=error[{}]: {}; restore=error[{}]: {}",
+                sealed.cf.name(),
+                write_error.code,
+                write_error.message,
+                restore_error.code,
+                restore_error.message
+            )));
+        }
+        tracing::error!(
+            code = write_error.code,
+            cf = sealed.cf.name(),
+            path = %sealed.path.display(),
+            error = %write_error,
+            "router flush failed; restored the complete sealed memtable before returning the error"
+        );
         Ok(())
     }
 
@@ -498,6 +752,43 @@ impl CfRouter {
         self.levels.entry(cf).or_default();
         self.next_file.entry(cf).or_insert(1);
         Ok(())
+    }
+
+    /// Every in-memory read source for `cf`, **newest first**: the active
+    /// memtable, then each sealed-but-not-yet-installed memtable from newest to
+    /// oldest.
+    ///
+    /// Every read path must merge across all of these. A sealed memtable holds
+    /// the newest state for its keys until its SST is installed, so consulting
+    /// only the active memtable would serve stale rows for the whole duration
+    /// of a flush — which is precisely the window #1949 widened by moving the
+    /// SST write out from under the locks.
+    pub(super) fn read_tables(&self, cf: ColumnFamily) -> impl Iterator<Item = &Memtable> {
+        self.memtables.get(&cf).into_iter().chain(
+            self.sealed
+                .get(&cf)
+                .into_iter()
+                .flat_map(|queue| queue.iter().rev().map(|pending| pending.table.as_ref())),
+        )
+    }
+
+    /// The same sources **oldest first**, for callers that fold into a map and
+    /// rely on a later insert overwriting an earlier one.
+    pub(super) fn read_tables_oldest_first(
+        &self,
+        cf: ColumnFamily,
+    ) -> impl Iterator<Item = &Memtable> {
+        self.sealed
+            .get(&cf)
+            .into_iter()
+            .flat_map(|queue| queue.iter().map(|pending| pending.table.as_ref()))
+            .chain(self.memtables.get(&cf))
+    }
+
+    /// Sealed memtables awaiting their SST, for health readback and tests.
+    #[must_use]
+    pub fn sealed_memtable_count(&self) -> usize {
+        self.sealed.values().map(VecDeque::len).sum()
     }
 
     fn memtable_mut(&mut self, cf: ColumnFamily) -> &mut Memtable {

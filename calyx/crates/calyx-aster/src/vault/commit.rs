@@ -375,15 +375,34 @@ impl CommitStageTimings {
             // synchronously wrote an SST under both global write locks, and
             // row_apply is the key/value copying that must NOT be optimised on
             // the strength of being the visible allocation.
+            // Emitted even though they are usually small: `materialize` is a
+            // full copy of every key and value in the batch and measured 13 ms
+            // on a dense-vector commit, which was invisible while it was only
+            // ever folded into the remainder.
+            mvcc_materialize_us = self.mvcc.materialize_us,
+            mvcc_watermark_us = self.mvcc.watermark_us,
             mvcc_row_lock_wait_us = self.mvcc.row_lock_wait_us,
             mvcc_router_lock_wait_us = self.mvcc.router_lock_wait_us,
             mvcc_panel_attribution_us = self.mvcc.panel_attribution_us,
             mvcc_row_apply_us = self.mvcc.row_apply_us,
-            mvcc_router_apply_us = self.mvcc.router_apply_excluding_flush_us(),
+            mvcc_router_apply_us = self.mvcc.router_apply_us,
             mvcc_router_ensure_cf_us = self.mvcc.put.ensure_cf_us,
-            mvcc_router_flush_us = self.mvcc.put.flush_us,
-            mvcc_router_flushes = self.mvcc.put.flushes,
+            mvcc_router_seal_us = self.mvcc.put.seal_us,
+            mvcc_router_seals = self.mvcc.put.seals,
+            // #1949: the SST write, measured with both write locks released.
+            // `mvcc_locked_us` is what every other thread actually waits for,
+            // and the gap between it and `mvcc_us` is the change's whole effect.
+            mvcc_sst_write_unlocked_us = self.mvcc.sst_write_us,
+            mvcc_locked_us = self.mvcc.locked_us(),
             mvcc_unattributed_us = self.mvcc.unattributed_us(),
+            // Time inside the `mvcc` stage that the timed inner call did not
+            // observe: the owned row batch and the sealed memtables are dropped
+            // as the frame unwinds, after the last measurement. On a
+            // dense-vector commit that is ~10 MB of deallocation and measured
+            // 12-32 ms, so it is named rather than left as a silent difference
+            // between `mvcc_us` and the parts. It runs with both write locks
+            // already released.
+            mvcc_teardown_us = self.mvcc_us.saturating_sub(self.mvcc.total_us),
             checkpoint_stage_us = self.checkpoint_stage_us,
             unattributed_us = total_us.saturating_sub(attributed),
             floor_us = COMMIT_STAGE_SLOW_FLOOR_US,

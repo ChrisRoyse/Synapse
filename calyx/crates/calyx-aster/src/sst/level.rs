@@ -23,6 +23,11 @@ pub(super) struct LevelFile {
     lookup_retained: bool,
 }
 
+/// A level entry whose lookup index has already been read from disk, so that
+/// installing it into a level costs no I/O. See [`SstLevel::prepare_with_lookup`].
+#[derive(Debug)]
+pub struct PreparedLevelFile(LevelFile);
+
 #[derive(Debug)]
 struct RankedRangeEntry {
     source_index: usize,
@@ -181,6 +186,24 @@ impl SstLevel {
     pub fn push_with_lookup(&mut self, path: PathBuf) -> Result<()> {
         self.files.insert(0, LevelFile::with_lookup(path)?);
         Ok(())
+    }
+
+    /// Reads a written SST's lookup index so the entry can later be inserted
+    /// with no I/O.
+    ///
+    /// `push_with_lookup` opens and parses the SST inline, which is fine for a
+    /// caller holding no lock but was 108 ms per commit under the router write
+    /// lock once #1949 moved the SST write itself out (twelve files, each
+    /// re-read immediately after being written). Splitting the read from the
+    /// insert lets the caller pay it unlocked.
+    pub fn prepare_with_lookup(path: PathBuf) -> Result<PreparedLevelFile> {
+        Ok(PreparedLevelFile(LevelFile::with_lookup(path)?))
+    }
+
+    /// Inserts an entry prepared by [`Self::prepare_with_lookup`]. Pointer move
+    /// only — no filesystem access.
+    pub fn push_prepared(&mut self, prepared: PreparedLevelFile) {
+        self.files.insert(0, prepared.0);
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {

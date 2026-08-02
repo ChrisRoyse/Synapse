@@ -226,15 +226,18 @@ fn field(event: &Event, name: &str) -> u64 {
     event.get(name).copied().unwrap_or(0)
 }
 
-/// The sub-stages, in the order the split reports them.
-const SUB: [&str; 8] = [
+/// The sub-stages, in the order the split reports them. Complete: these must
+/// sum to `mvcc_us`, and a gap is the finding rather than a rounding nuisance.
+const SUB: [&str; 10] = [
+    "mvcc_teardown_us",
+    "mvcc_materialize_us",
     "mvcc_row_lock_wait_us",
     "mvcc_router_lock_wait_us",
     "mvcc_panel_attribution_us",
+    "mvcc_watermark_us",
     "mvcc_row_apply_us",
     "mvcc_router_apply_us",
-    "mvcc_router_ensure_cf_us",
-    "mvcc_router_flush_us",
+    "mvcc_sst_write_unlocked_us",
     "mvcc_unattributed_us",
 ];
 
@@ -248,8 +251,8 @@ fn report(phase: &str, events: &[Event]) -> u64 {
         return 0;
     }
     println!(
-        "  {:<7} {:>8} {:>8} {:>7}  dominant sub-stage",
-        "rows", "total_us", "mvcc_us", "flushes"
+        "  {:<6} {:>8} {:>8} {:>10} {:>10} {:>6}  dominant sub-stage",
+        "rows", "total_us", "mvcc_us", "LOCKED_us", "sst_write", "seals"
     );
     let mut flushes = 0;
     for event in events {
@@ -264,13 +267,15 @@ fn report(phase: &str, events: &[Event]) -> u64 {
             .saturating_mul(100)
             .checked_div(mvcc.max(1))
             .unwrap_or(0);
-        flushes += field(event, "mvcc_router_flushes");
+        flushes += field(event, "mvcc_router_seals");
         println!(
-            "  {:<7} {:>8} {:>8} {:>7}  {} = {} us ({}% of mvcc)",
+            "  {:<6} {:>8} {:>8} {:>10} {:>10} {:>6}  {} = {} us ({}% of mvcc)",
             field(event, "row_count"),
             field(event, "total_us"),
             mvcc,
-            field(event, "mvcc_router_flushes"),
+            field(event, "mvcc_locked_us"),
+            field(event, "mvcc_sst_write_unlocked_us"),
+            field(event, "mvcc_router_seals"),
             dominant
                 .0
                 .trim_start_matches("mvcc_")
@@ -290,13 +295,21 @@ fn report(phase: &str, events: &[Event]) -> u64 {
                 field(worst, name)
             );
         }
-        let parts: u64 = SUB.iter().map(|n| field(worst, n)).sum();
         println!(
-            "    {:<28} {:>9} us   (parts {} vs mvcc_us {})",
+            "    {:<28} {:>9} us   (nested inside router_apply)",
+            "of which ensure_cf",
+            field(worst, "mvcc_router_ensure_cf_us")
+        );
+        // SUB is the exact partition of mvcc_us, so this must reconcile. A gap
+        // means a stage exists that nothing names, which is the finding.
+        let parts: u64 = SUB.iter().map(|n| field(worst, n)).sum();
+        let mvcc = field(worst, "mvcc_us");
+        println!(
+            "    {:<28} {:>9} us   vs mvcc_us {} -> gap {}",
             "SUM OF PARTS",
             parts,
-            parts,
-            field(worst, "mvcc_us")
+            mvcc,
+            i64::try_from(mvcc).unwrap_or(0) - i64::try_from(parts).unwrap_or(0)
         );
     }
     flushes
@@ -396,6 +409,106 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "  flush-*.sst delta across C = {}  (reported {reported_c})",
         flush_ssts(&dir).len() - before_c
+    );
+
+    // --- phase D: the read path must never miss a sealed memtable ----------
+    // #1949 moves the SST write outside the locks, which means there is now a
+    // window in which a memtable's rows live *only* in the sealed queue -- not
+    // in the active memtable, not yet in any SST. If any read path forgot to
+    // consult that queue, rows would silently vanish for the duration of a
+    // flush. This is the failure that change could cause, so it is the one
+    // measured directly.
+    //
+    // A writer fills memtables (forcing seals) while readers continuously
+    // re-read every key written so far. Known input, known expected output:
+    // every key ever written must be readable, with its exact value, at every
+    // instant. A single miss is a hard failure.
+    println!("\n=== phase D: read-your-writes across seals ===");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let highest = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let misses = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let mut readers = Vec::new();
+    for _ in 0..3 {
+        let (vault, stop, highest, misses, reads) = (
+            Arc::clone(&vault),
+            Arc::clone(&stop),
+            Arc::clone(&highest),
+            Arc::clone(&misses),
+            Arc::clone(&reads),
+        );
+        readers.push(std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let top = highest.load(std::sync::atomic::Ordering::Acquire);
+                if top == 0 {
+                    continue;
+                }
+                // Re-read a spread of already-committed keys, including the
+                // oldest, which is the one most likely to be sitting in a
+                // sealed memtable or a just-installed SST.
+                for tag in [20_000, top / 2 + 10_000, top - 1, top] {
+                    if tag < 20_000 {
+                        continue;
+                    }
+                    let cx = row(vault_id, tag, 1).cx_id;
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // A row absent from every source surfaces as an error, so
+                    // any failure here is a miss.
+                    if vault.get(cx, vault.snapshot()).is_err() {
+                        misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+
+    let before_d = flush_ssts(&dir).len();
+    for tag in 20_000..20_260_u64 {
+        vault.put(row(vault_id, tag, 8192))?;
+        highest.store(tag, std::sync::atomic::Ordering::Release);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for reader in readers {
+        reader.join().map_err(|_| "reader thread panicked")?;
+    }
+    let after_d = flush_ssts(&dir).len();
+    let reported_d = report("D concurrent read-your-writes", &collector.drain());
+    println!(
+        "  reads performed = {}   MISSES = {}",
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        misses.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    println!(
+        "  flush-*.sst delta = {}  (seals reported {reported_d})",
+        after_d - before_d
+    );
+
+    // Exhaustive readback: every key written in phase D, after the fact.
+    let mut absent = Vec::new();
+    for tag in 20_000..20_260_u64 {
+        let cx = row(vault_id, tag, 1).cx_id;
+        if vault.get(cx, vault.snapshot()).is_err() {
+            absent.push(tag);
+        }
+    }
+    println!(
+        "  exhaustive readback of 260 keys: absent = {} {}",
+        absent.len(),
+        if absent.is_empty() {
+            "(all present)".to_owned()
+        } else {
+            format!("{:?}", &absent[..absent.len().min(8)])
+        }
+    );
+    let verdict_d = misses.load(std::sync::atomic::Ordering::Relaxed) == 0 && absent.is_empty();
+    println!(
+        "  VERDICT: {}",
+        if verdict_d {
+            "no read ever missed a row across a seal"
+        } else {
+            "FAILED - the sealed-memtable read path loses rows"
+        }
     );
 
     println!("\n--- totals ---");

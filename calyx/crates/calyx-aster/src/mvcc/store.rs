@@ -51,10 +51,19 @@ pub struct MvccCommitTimings {
     pub watermark_us: u64,
     /// Row-table version-chain apply, including every key and value copy.
     pub row_apply_us: u64,
-    /// Router projection apply, inclusive of `put` prologue and flush costs.
+    /// Router projection apply, inclusive of the `put` prologue and memtable
+    /// seals, but **not** the SST writes, which happen after the locks are
+    /// released (#1949).
     pub router_apply_us: u64,
     /// What the router writes did beyond inserting into a memtable.
     pub put: RouterPutCost,
+    /// Writing and installing sealed memtables as SSTs, measured with the
+    /// row-table and router write locks **released** (#1949).
+    ///
+    /// Reported separately from `total_us` precisely because it is no longer
+    /// inside the locked region: it is still the committing thread's wall
+    /// clock, but no other reader or writer is blocked by it.
+    pub sst_write_us: u64,
     /// Rows in the batch, so per-row cost is derivable from the event alone.
     pub rows: u32,
     /// The whole method, against which the parts are checked.
@@ -70,7 +79,7 @@ pub const MVCC_STAGE_NAMES: [&str; MVCC_STAGE_COUNT] = [
     "watermark",
     "row_apply",
     "router_apply",
-    "router_flush",
+    "sst_write_unlocked",
     "unattributed",
 ];
 /// Number of sub-stages in [`MVCC_STAGE_NAMES`].
@@ -91,8 +100,8 @@ impl MvccCommitTimings {
             self.panel_attribution_us,
             self.watermark_us,
             self.row_apply_us,
-            self.router_apply_excluding_flush_us(),
-            self.put.flush_us,
+            self.router_apply_us,
+            self.sst_write_us,
             self.unattributed_us(),
         ]
     }
@@ -108,14 +117,18 @@ impl MvccCommitTimings {
             .saturating_sub(self.watermark_us)
             .saturating_sub(self.row_apply_us)
             .saturating_sub(self.router_apply_us)
+            .saturating_sub(self.sst_write_us)
     }
 
-    /// Router apply time excluding the synchronous flushes it triggered, so
-    /// "the memtable insert is slow" and "this commit wrote an SST" cannot be
-    /// mistaken for each other.
+    /// How long this commit held the vault's row-table and router write locks.
+    ///
+    /// This is the number that matters for everyone who is *not* the
+    /// committing thread, and separating it from `total_us` is the whole point
+    /// of #1949: the SST write still costs what it costs, but it no longer
+    /// costs it while holding the vault shut.
     #[must_use]
-    pub fn router_apply_excluding_flush_us(&self) -> u64 {
-        self.router_apply_us.saturating_sub(self.put.flush_us)
+    pub fn locked_us(&self) -> u64 {
+        self.total_us.saturating_sub(self.sst_write_us)
     }
 }
 
@@ -871,6 +884,7 @@ impl VersionedCfStore {
         timings.row_apply_us = elapsed_us(&row_apply_started);
 
         let router_apply_started = Instant::now();
+        let mut sealed: Vec<crate::cf::SealedFlush> = Vec::new();
         if let Some(router) = router.as_mut() {
             // Publish the authoritative version chains and their sequence
             // before attempting the fallible router projection. Both write
@@ -879,7 +893,7 @@ impl VersionedCfStore {
             // batch, every logical row already exists at `seq` and masks any
             // partial router state as soon as the guards are released.
             for (cf, key, value) in &rows {
-                match router.put_at(*cf, key, value, seq) {
+                match router.put_at(*cf, key, value, seq, &mut sealed) {
                     Ok(outcome) => timings.put.absorb(outcome),
                     Err(error) => {
                         tracing::error!(
@@ -890,8 +904,28 @@ impl VersionedCfStore {
                             value_len = value.len(),
                             router_error_code = error.code,
                             router_error = %error,
+                            sealed_to_abandon = sealed.len(),
                             "MVCC rows committed atomically but the router projection failed; the committed sequence must be reconciled before retry"
                         );
+                        // Anything this batch already sealed is still sitting in
+                        // the router's pending queue holding the only in-memory
+                        // copy of its rows. Leaving it there would wedge the CF:
+                        // the queue head never becomes installable, so no later
+                        // seal for that CF could ever publish its SST, until the
+                        // backlog cap failed the CF outright. Return the rows to
+                        // their active memtables before the error escapes.
+                        for handle in &sealed {
+                            if let Err(abandon_error) = router.abandon_sealed(handle, &error) {
+                                tracing::error!(
+                                    code = abandon_error.code,
+                                    committed_seq = seq,
+                                    cf = handle.cf().name(),
+                                    rows = handle.row_count(),
+                                    error = %abandon_error,
+                                    "sealed memtable could not be returned to its active memtable after a failed router projection"
+                                );
+                            }
+                        }
                         return Err(CalyxError {
                             code: "CALYX_MVCC_ROUTER_PUBLICATION_RECONCILIATION_REQUIRED",
                             message: format!(
@@ -909,6 +943,92 @@ impl VersionedCfStore {
             }
         }
         timings.router_apply_us = elapsed_us(&router_apply_started);
+
+        // ---- switch-then-flush: everything above ran under both write locks,
+        // everything below must not (#1949). ------------------------------
+        //
+        // Dropping the guards here is the change. The rows are already in the
+        // authoritative row table AND in the sealed memtables, which stay in
+        // the router's read path until their SSTs install, so the view a reader
+        // sees is complete at every instant across this boundary. What is no
+        // longer true is that a multi-hundred-millisecond AEAD-and-write holds
+        // the whole vault shut.
+        drop(router);
+        drop(table);
+        if !sealed.is_empty() {
+            let sst_write_started = Instant::now();
+            // NO LOCK IS HELD HERE. This is the AEAD seal plus the file write
+            // that measured 652 ms in one commit (#1948). Writing before
+            // re-acquiring the router lock is the entire fix; doing it through
+            // a `&mut CfRouter` would put it straight back under the lock.
+            let mut written = Vec::with_capacity(sealed.len());
+            let mut write_failure = None;
+            for handle in &sealed {
+                match handle.write_sst() {
+                    Ok(entry) => written.push(entry),
+                    Err(error) => {
+                        write_failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            timings.sst_write_us = elapsed_us(&sst_write_started);
+
+            let mut router = self.router.write().map_err(|_| {
+                CalyxError::aster_corrupt_shard(
+                    "MVCC router lock was poisoned during sealed-SST install",
+                )
+            })?;
+            // Fails closed: the seals exist, so the router existed moments ago
+            // under the same lock. If it is gone, the rows are in the pending
+            // queue of a router nobody will ever install into, and reporting
+            // this commit as successful would claim a durable SST home that
+            // does not exist.
+            let Some(router) = router.as_mut() else {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "{} sealed memtable(s) from committed seq {seq} cannot be installed: the router was torn down between the seal and its SST install",
+                    sealed.len()
+                )));
+            };
+            // Exclusive hold covers the metadata swap only: the bytes are
+            // already on disk.
+            let mut installed = 0_usize;
+            let mut outcome = Ok(());
+            for (handle, entry) in sealed.iter().zip(written) {
+                match router.install_sealed(handle, entry) {
+                    Ok(()) => installed += 1,
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            if outcome.is_ok() && let Some(error) = write_failure {
+                outcome = Err(error);
+            }
+            if let Err(error) = outcome.as_ref() {
+                // Every seal that did not install — whether its SST write
+                // failed or its install did — still holds the only in-memory
+                // copy of its rows and still occupies the pending queue. Each
+                // must go back into its active memtable before the error
+                // escapes, or the CF is wedged for the life of the process.
+                for handle in sealed.iter().skip(installed) {
+                    if let Err(abandon_error) = router.abandon_sealed(handle, error) {
+                        tracing::error!(
+                            code = abandon_error.code,
+                            committed_seq = seq,
+                            cf = handle.cf().name(),
+                            rows = handle.row_count(),
+                            error = %abandon_error,
+                            "sealed memtable could not be returned to its active memtable after a failed SST write or install"
+                        );
+                    }
+                }
+            }
+            outcome?;
+            timings.total_us = elapsed_us(&started);
+            return Ok(seq);
+        }
         timings.total_us = elapsed_us(&started);
         Ok(seq)
     }
