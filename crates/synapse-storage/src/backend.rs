@@ -402,6 +402,14 @@ pub struct SynapseSynergyPair {
     /// `cross_estimator_unpinnable`.
     pub state: String,
     pub unmeasured_reason: Option<String>,
+    /// The halves of this pair that are declared anchor source carriers, in
+    /// slot order (#1959).
+    ///
+    /// Non-empty means the concatenated column this pair's `pair_bits` was
+    /// measured over **contains the label**, so `gain_bits` is not a statement
+    /// about prediction. Unlike a bits report there is no per-slot row here for
+    /// a reader to notice that in, which is why the pair carries it itself.
+    pub anchor_source_carrier_slots: Vec<u16>,
 }
 
 /// Result of one Assay synergy pass, with the physical Assay CF readback and
@@ -426,11 +434,41 @@ pub struct SynapseSynergyReport {
     pub pairs_monotonicity_floored: usize,
     pub synergistic_pairs: usize,
     pub max_gain_bits: f32,
+    /// [`Self::max_gain_bits`] over the pairs containing no declared anchor
+    /// source carrier (#1959) — the headline that is a claim about prediction.
+    pub max_gain_bits_carrier_free: f32,
+    /// Whether this (anchor kind, panel version) pair declares its determining
+    /// record fields, so the structural carrier check could run at all.
+    /// `false` means it did not run, not that it ran and found nothing.
+    pub anchor_source_declared: bool,
+    /// Panel slots whose declared source fields intersect the anchor's.
+    pub anchor_source_carriers: Vec<SynapseAnchorSourceCarrier>,
+    /// Evaluated pairs with at least one carrier half.
+    pub pairs_with_anchor_source_carrier: usize,
     /// Control-doctrine marker (#1670): domain anchor coverage below the floor.
     pub domain_provisional: bool,
     pub domain_grounded_fraction: f32,
     pub pairs: Vec<SynapseSynergyPair>,
     pub assay_cf_rows_after: usize,
+}
+
+/// One lens whose declared source fields intersect the anchor's determining
+/// fields — it reads the label rather than evidence about it (#1958, #1959).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseAnchorSourceCarrier {
+    pub slot: u16,
+    pub lens: String,
+    pub shared_fields: Vec<String>,
+}
+
+impl From<synapse_calyx::SynapseCalyxAnchorSourceCarrier> for SynapseAnchorSourceCarrier {
+    fn from(carrier: synapse_calyx::SynapseCalyxAnchorSourceCarrier) -> Self {
+        Self {
+            slot: carrier.slot,
+            lens: carrier.lens,
+            shared_fields: carrier.shared_fields,
+        }
+    }
 }
 
 pub trait StorageBackend: Send + Sync {
@@ -3031,7 +3069,7 @@ impl StorageBackend for CalyxBackend {
             "measure native Calyx lens synergy",
             true,
             |vault| {
-                let report = vault.assay_synergy(params).map_err(|source| {
+                let annotated = vault.assay_synergy(params).map_err(|source| {
                     calyx_write_failed("calyx_assay", "measure native Calyx lens synergy", &source)
                 })?;
                 // #1670: every assay result over an under-anchored domain is
@@ -3057,6 +3095,7 @@ impl StorageBackend for CalyxBackend {
                         )
                     })?
                     .len();
+                let report = &annotated.report;
                 Ok(SynapseSynergyReport {
                     panel_version: report.panel_version,
                     anchor_kind: params.anchor_kind.clone(),
@@ -3069,14 +3108,26 @@ impl StorageBackend for CalyxBackend {
                     pairs_monotonicity_floored: report.pairs_monotonicity_floored,
                     synergistic_pairs: report.synergistic_pairs,
                     max_gain_bits: report.max_gain_bits,
+                    max_gain_bits_carrier_free: annotated.max_gain_bits_carrier_free,
+                    anchor_source_declared: annotated.anchor_source_declared,
+                    anchor_source_carriers: annotated
+                        .anchor_source_carriers
+                        .iter()
+                        .cloned()
+                        .map(SynapseAnchorSourceCarrier::from)
+                        .collect(),
+                    pairs_with_anchor_source_carrier: annotated.pairs_with_anchor_source_carrier,
                     domain_provisional: verdict.provisional,
                     domain_grounded_fraction: verdict.grounded_fraction,
                     pairs: report
                         .pairs
-                        .into_iter()
+                        .iter()
+                        .cloned()
                         .map(|pair| SynapseSynergyPair {
                             slot_a: pair.a.get(),
                             slot_b: pair.b.get(),
+                            anchor_source_carrier_slots: annotated
+                                .carrier_slots_in_pair(pair.a.get(), pair.b.get()),
                             pair_bits: pair.pair_bits,
                             left_bits: pair.left_bits,
                             right_bits: pair.right_bits,

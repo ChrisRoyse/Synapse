@@ -1425,6 +1425,85 @@ impl SynapseCalyxSlotBitsState {
     }
 }
 
+/// One lens whose declared source fields intersect the anchor's determining
+/// fields — the lens is reading (part of) the label rather than evidence about
+/// it (#1958, #1959).
+///
+/// This is the *structural* verdict from [`lens_provenance::syn_anchor_source_provenance`],
+/// so it is a pure function of `(anchor kind, panel version, excluded slots)`:
+/// it says the same thing on an empty vault and a full one, and no estimator or
+/// sample count can change it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxAnchorSourceCarrier {
+    /// Physical panel slot.
+    pub slot: u16,
+    /// The slot's declared lens name.
+    pub lens: String,
+    /// The record fields it shares with the anchor. Never empty.
+    pub shared_fields: Vec<String>,
+}
+
+/// Renders the structural verdict as the report-facing carrier list.
+fn anchor_source_carriers(
+    provenance: &lens_provenance::AnchorSourceProvenance,
+) -> Vec<SynapseCalyxAnchorSourceCarrier> {
+    provenance
+        .carriers
+        .iter()
+        .map(|carrier| SynapseCalyxAnchorSourceCarrier {
+            slot: carrier.slot,
+            lens: carrier.lens.to_owned(),
+            shared_fields: carrier
+                .shared_fields
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
+        })
+        .collect()
+}
+
+/// A synergy pass together with the structural anchor-source verdict it has to
+/// be read under (#1959 ask 1).
+///
+/// `synergy` is the surface this matters most on after `sufficiency`: a pair
+/// that includes a carrier reports interaction bits over a concatenated column
+/// that *contains the label*, and unlike `bits` there is no per-slot row for a
+/// reader to notice it in. So the verdict travels with the report, the pairs
+/// that contain a carrier are counted, and the headline `max_gain_bits` gets a
+/// carrier-free twin that is a claim about prediction rather than about reading
+/// the outcome back.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxSynergyReport {
+    /// The measured pairs exactly as `calyx_assay` produced them.
+    pub report: SynergyReport,
+    /// Whether this (anchor kind, panel version) pair declares its determining
+    /// fields at all, so the check could run. `false` means it did not run.
+    pub anchor_source_declared: bool,
+    /// Panel slots whose declared source fields intersect the anchor's.
+    pub anchor_source_carriers: Vec<SynapseCalyxAnchorSourceCarrier>,
+    /// Evaluated pairs with at least one carrier half.
+    pub pairs_with_anchor_source_carrier: usize,
+    /// Largest measured gain over the pairs containing **no** carrier; `0.0`
+    /// when no such pair was measurable. Equal to `report.max_gain_bits` when
+    /// [`Self::anchor_source_carriers`] is empty.
+    pub max_gain_bits_carrier_free: f32,
+}
+
+impl SynapseCalyxSynergyReport {
+    /// The declared carriers among a pair's two halves, in slot order.
+    #[must_use]
+    pub fn carrier_slots_in_pair(&self, slot_a: u16, slot_b: u16) -> Vec<u16> {
+        let mut slots: Vec<u16> = self
+            .anchor_source_carriers
+            .iter()
+            .map(|carrier| carrier.slot)
+            .filter(|slot| *slot == slot_a || *slot == slot_b)
+            .collect();
+        slots.sort_unstable();
+        slots
+    }
+}
+
 /// Per-lens grounded bits about the requested anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxSlotBits {
@@ -1461,6 +1540,17 @@ pub struct SynapseCalyxSlotBits {
     /// Largest exact-duplicate class within one outcome label — the quantity
     /// that drives KSG's k-th radius to zero.
     pub max_same_label_multiplicity: Option<usize>,
+    /// This lens's declared source fields intersect the anchor's determining
+    /// fields, so `marginal_bits` here is the label reading itself (#1959).
+    ///
+    /// `bits` annotates rather than refuses, because a per-lens report is the
+    /// legitimate way to *inspect* a carrier — but an unmarked carrier row is
+    /// how #1958's circular measurement went unnoticed, and "a human can spot
+    /// the implausibly exact number" is the standard that already failed.
+    pub anchor_source_carrier: bool,
+    /// The record fields this lens shares with the anchor. Empty unless
+    /// [`Self::anchor_source_carrier`].
+    pub anchor_source_shared_fields: Vec<String>,
 }
 
 /// Result of one Assay bits pass with the physical Assay CF readback.
@@ -1471,6 +1561,28 @@ pub struct SynapseCalyxBitsReport {
     pub anchored_records: usize,
     pub distinct_outcomes: usize,
     pub total_bits: f32,
+    /// [`Self::total_bits`] over the slots that are **not** declared anchor
+    /// source carriers (#1959).
+    ///
+    /// Equal to `total_bits` when [`Self::anchor_source_carriers`] is empty.
+    /// When it is not, this is the only one of the two that is a statement
+    /// about prediction rather than about reading the label back.
+    pub total_bits_carrier_free: f32,
+    /// Whether this (anchor kind, panel version) pair has a **declared** set of
+    /// determining record fields, so the structural carrier check could run.
+    ///
+    /// `false` means the check did not run — not that it ran and found nothing.
+    /// Without this, "checked and clean" and "never checked" are the same empty
+    /// list, which is the exact shape of #1953's original defect.
+    pub anchor_source_declared: bool,
+    /// Every slot in the panel whose declared source fields intersect the
+    /// anchor's determining fields, whether or not this corpus yielded samples
+    /// for it — the check is structural, not a function of traffic (#1958).
+    ///
+    /// Non-empty means at least one row below is the label reading itself, and
+    /// [`Self::total_bits`] sums it in. `bits` reports rather than refuses,
+    /// because inspecting a carrier is a legitimate reason to run it.
+    pub anchor_source_carriers: Vec<SynapseCalyxAnchorSourceCarrier>,
     /// Whether the corpus could support a bits measurement at all (#1897).
     ///
     /// `false` means the zeros in this report are the absence of a measurement,
@@ -1710,6 +1822,23 @@ impl SynapseCalyxVault {
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
         let gathered = gather_anchored_slot_samples(&corpus, &anchor_kind, &params.excluded_slots);
 
+        // #1959 ask 1: `bits` ANNOTATES where `sufficiency` refuses. A per-lens
+        // report is the legitimate way to inspect a carrier — refusing it would
+        // remove the very tool you use to understand one — but an unmarked
+        // carrier row is how a circular number gets read as a capability claim.
+        // Structural, so it is a pure function of (anchor, panel, excluded) and
+        // returns the same verdict on an empty corpus as on a full one.
+        let source_provenance = lens_provenance::syn_anchor_source_provenance(
+            &params.anchor_kind,
+            params.panel_version,
+            &params.excluded_slots,
+        );
+        let carrier_slots: BTreeSet<u16> = source_provenance
+            .carriers
+            .iter()
+            .map(|carrier| carrier.slot)
+            .collect();
+
         let mut store = AssayStore::default();
         let vault_id = self.vault_id_value();
         let seq = self.latest_seq();
@@ -1816,6 +1945,8 @@ impl SynapseCalyxVault {
                 estimator_reason: None,
                 distinct_values: None,
                 max_same_label_multiplicity: None,
+                anchor_source_carrier: false,
+                anchor_source_shared_fields: Vec::new(),
             };
             apply_estimator_pick(&mut measured, &pick);
             slots.push(measured);
@@ -1823,6 +1954,21 @@ impl SynapseCalyxVault {
 
         let attributions = per_sensor_attribution(&slot_bits, SYNAPSE_ASSAY_BIT_FLOOR);
         mark_sole_carriers(&mut slots, &attributions);
+        for slot in &mut slots {
+            let Some(carrier) = source_provenance
+                .carriers
+                .iter()
+                .find(|carrier| carrier.slot == slot.slot)
+            else {
+                continue;
+            };
+            slot.anchor_source_carrier = true;
+            slot.anchor_source_shared_fields = carrier
+                .shared_fields
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect();
+        }
         let grounded = gathered.representative.as_ref().is_some_and(|anchor| {
             matches!(
                 bits_report_with_anchor(attributions.clone(), anchor).trust,
@@ -1834,6 +1980,19 @@ impl SynapseCalyxVault {
         // absence of one (#1897). Normalize the sign; the magnitude is untouched.
         let total_bits: f32 = slot_bits.iter().map(|(_, bits)| *bits).sum();
         let total_bits = if total_bits == 0.0 { 0.0 } else { total_bits };
+        // The same sum with every declared carrier dropped (#1959). When a
+        // carrier is present these two differ, and only this one is a claim
+        // about predicting the outcome rather than about reading it back.
+        let total_bits_carrier_free: f32 = slot_bits
+            .iter()
+            .filter(|(slot, _)| !carrier_slots.contains(&slot.get()))
+            .map(|(_, bits)| *bits)
+            .sum();
+        let total_bits_carrier_free = if total_bits_carrier_free == 0.0 {
+            0.0
+        } else {
+            total_bits_carrier_free
+        };
         // #1670: a result over an under-anchored domain may only advise. This is
         // a different property from `grounded` above, which is the assay's own
         // sample-count trust tag.
@@ -1863,6 +2022,9 @@ impl SynapseCalyxVault {
             anchored_records: gathered.anchored_records,
             distinct_outcomes: gathered.distinct_outcomes,
             total_bits,
+            total_bits_carrier_free,
+            anchor_source_declared: source_provenance.anchor_declared,
+            anchor_source_carriers: anchor_source_carriers(&source_provenance),
             measurable: unmeasurable_reason.is_none(),
             unmeasurable_reason,
             grounded,
@@ -2542,7 +2704,7 @@ impl SynapseCalyxVault {
     pub fn assay_synergy(
         &self,
         params: &SynapseCalyxAssayParams,
-    ) -> Result<SynergyReport, SynapseCalyxError> {
+    ) -> Result<SynapseCalyxSynergyReport, SynapseCalyxError> {
         let max_records = params.max_records.clamp(1, SYNAPSE_SYNERGY_MAX_RECORDS);
         let corpus = self.load_panel_dense_corpus(params.panel_version, max_records)?;
         let anchor_kind = parse_anchor_kind(&params.anchor_kind);
@@ -2695,13 +2857,49 @@ impl SynapseCalyxVault {
             }
         }
         self.persist_assay_store(&store)?;
-        Ok(synergy_report(
+        let report = synergy_report(
             params.panel_version,
             n_lenses,
             paired_slots.len(),
             gathered.anchored_records,
             pairs,
-        ))
+        );
+
+        // #1959 ask 1: annotate, do not refuse. Structural and independent of
+        // the corpus, so it is computed from the panel declaration rather than
+        // from which slots this pass happened to pair.
+        let source_provenance = lens_provenance::syn_anchor_source_provenance(
+            &params.anchor_kind,
+            params.panel_version,
+            &params.excluded_slots,
+        );
+        let carrier_slots: BTreeSet<u16> = source_provenance
+            .carriers
+            .iter()
+            .map(|carrier| carrier.slot)
+            .collect();
+        let contains_carrier = |pair: &calyx_assay::SynergyPair| {
+            carrier_slots.contains(&pair.a.get()) || carrier_slots.contains(&pair.b.get())
+        };
+        let pairs_with_anchor_source_carrier = report
+            .pairs
+            .iter()
+            .filter(|pair| contains_carrier(pair))
+            .count();
+        let max_gain_bits_carrier_free = report
+            .pairs
+            .iter()
+            .filter(|pair| pair.state == SynergyPairState::Measured && !contains_carrier(pair))
+            .map(|pair| pair.gain_bits)
+            .fold(0.0_f32, f32::max);
+
+        Ok(SynapseCalyxSynergyReport {
+            report,
+            anchor_source_declared: source_provenance.anchor_declared,
+            anchor_source_carriers: anchor_source_carriers(&source_provenance),
+            pairs_with_anchor_source_carrier,
+            max_gain_bits_carrier_free,
+        })
     }
 
     /// Measures the panel's **ensemble capability card**: per-lens marginal
@@ -3134,6 +3332,8 @@ fn unmeasured_slot_bits(
         estimator_reason: None,
         distinct_values: None,
         max_same_label_multiplicity: None,
+        anchor_source_carrier: false,
+        anchor_source_shared_fields: Vec::new(),
     }
 }
 

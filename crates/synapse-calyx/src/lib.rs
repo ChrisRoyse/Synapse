@@ -127,17 +127,18 @@ pub use intelligence::{
     SYNAPSE_KNN_MAX_EDGES, SYNAPSE_KSG_DEFAULT_K, SYNAPSE_LENS_BLIND_SPOT_CEILING,
     SYNAPSE_SYNERGY_MAX_LENSES, SYNAPSE_SYNERGY_MAX_RECORDS, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS,
     SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG, SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS,
-    SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxAssayParams,
-    SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport, SynapseCalyxCausalityLag,
-    SynapseCalyxCausalityReport, SynapseCalyxCorpusSlotState, SynapseCalyxDriftReport,
-    SynapseCalyxEnsembleCardReport, SynapseCalyxExcludedLens, SynapseCalyxHazardReport,
-    SynapseCalyxKernelAnswerHop, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelParams,
-    SynapseCalyxKernelReport, SynapseCalyxLensCoverageStatus, SynapseCalyxLowSignalLens,
-    SynapseCalyxNeffEstimate, SynapseCalyxPanelLensCoverage, SynapseCalyxPeriodicityReport,
-    SynapseCalyxPeriodogramPeak, SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport,
-    SynapseCalyxRedundancySkip, SynapseCalyxSlotBits, SynapseCalyxSlotKind,
-    SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalParams,
-    SynapseCalyxWeaveBlindSpotPair, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxAnchorSourceCarrier,
+    SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport,
+    SynapseCalyxCausalityLag, SynapseCalyxCausalityReport, SynapseCalyxCorpusSlotState,
+    SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxExcludedLens,
+    SynapseCalyxHazardReport, SynapseCalyxKernelAnswerHop, SynapseCalyxKernelAnswerReport,
+    SynapseCalyxKernelParams, SynapseCalyxKernelReport, SynapseCalyxLensCoverageStatus,
+    SynapseCalyxLowSignalLens, SynapseCalyxNeffEstimate, SynapseCalyxPanelLensCoverage,
+    SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak, SynapseCalyxRedundancyPair,
+    SynapseCalyxRedundancyReport, SynapseCalyxRedundancySkip, SynapseCalyxSlotBits,
+    SynapseCalyxSlotKind, SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport,
+    SynapseCalyxSynergyReport, SynapseCalyxTemporalParams, SynapseCalyxWeaveBlindSpotPair,
+    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
@@ -5418,6 +5419,29 @@ impl SynapseCalyxVault {
         self.vault
             .count_cf_latest(cf)
             .map_err(|error| SynapseCalyxError::from_calyx("count latest Calyx CF", &error))
+    }
+
+    /// Per-site row-table read-guard counters, read at this instant.
+    ///
+    /// The same census `health` publishes, on the vault handle, so an in-process
+    /// harness can bracket a call and read the hold it actually cost (#1960).
+    /// Counting *every* hold rather than only the over-budget ones is what makes
+    /// a sub-budget path distinguishable from one that never ran.
+    #[must_use]
+    pub fn row_guard_census(&self) -> Vec<SynapseCalyxRowGuardSiteCensus> {
+        self.vault
+            .row_guard_census()
+            .into_iter()
+            .map(|entry| SynapseCalyxRowGuardSiteCensus {
+                site: entry.site.as_str().to_owned(),
+                holds: entry.holds,
+                total_held_us: entry.total_held_us,
+                max_held_us: entry.max_held_us,
+                mean_held_us: entry.mean_held_us(),
+                over_budget_holds: entry.over_budget_holds,
+                starved_holds: entry.starved_holds,
+            })
+            .collect()
     }
 
     /// Scans visible raw CF rows in a key range at a numeric snapshot.

@@ -23,9 +23,9 @@ pub use backend::{
     CalyxAnchorWriteReport, CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect,
     CalyxVaultInspect, GroundingAnchor, GroundingAnchorSource, GroundingAnchorValue,
     McpUsageGroundedPublicationReport, STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind,
-    StorageCfDump, StorageDumpRow, SynapseSynergyPair, SynapseSynergyReport, dump_cf_read_only,
-    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
-    scan_cf_read_only_with_expired,
+    StorageCfDump, StorageDumpRow, SynapseAnchorSourceCarrier, SynapseSynergyPair,
+    SynapseSynergyReport, dump_cf_read_only, dump_cf_read_only_with_expired,
+    inspect_calyx_vault_read_only, scan_cf_read_only, scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{

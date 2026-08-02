@@ -1366,6 +1366,20 @@ pub struct StorageIntelligenceSlotBits {
     /// Largest exact-duplicate class within one outcome label — the quantity
     /// that drives KSG's k-th radius to zero.
     pub max_same_label_multiplicity: Option<u64>,
+    /// This lens is declared to read the anchor's own determining record
+    /// fields, so `marginal_bits` on this row is the label reading itself
+    /// (#1959).
+    ///
+    /// `bits` marks rather than refuses — a per-lens report is how you
+    /// *inspect* a carrier, and refusing it would remove that tool. What must
+    /// not happen is the row arriving unmarked: on
+    /// `syn-mcp-usage-v1 @ 1776006` / `synapse:mcp_tool_call_outcome`, slot 86
+    /// ranks top at near `H(anchor)` and nothing else in the response says
+    /// that number is circular.
+    pub anchor_source_carrier: bool,
+    /// The record fields this lens shares with the anchor; empty unless
+    /// `anchor_source_carrier`.
+    pub anchor_source_shared_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1377,6 +1391,18 @@ pub struct StorageIntelligenceBitsReport {
     pub anchored_records: u64,
     pub distinct_outcomes: u64,
     pub total_bits: f32,
+    /// `total_bits` over the slots that are **not** declared anchor source
+    /// carriers (#1959); equal to `total_bits` when `anchor_source_carriers`
+    /// is empty, and the only one of the two that is a claim about prediction.
+    pub total_bits_carrier_free: f32,
+    /// Whether this (anchor kind, panel version) pair declares its determining
+    /// record fields, so the structural carrier check could run at all.
+    /// `false` means it did not run, not that it ran and found nothing.
+    pub anchor_source_declared: bool,
+    /// Panel slots whose declared source fields intersect the anchor's — the
+    /// lenses that ARE the label. Structural, so it is the same on an empty
+    /// corpus and a full one.
+    pub anchor_source_carriers: Vec<StorageIntelligenceAnchorSourceCarrier>,
     /// False when the zeros in this report are the absence of a measurement
     /// rather than a measured zero (#1897).
     pub measurable: bool,
@@ -1607,6 +1633,28 @@ pub struct StorageIntelligenceSynergyPair {
     /// Why this pair carries no measured gain; present exactly when `state` is
     /// not `measured`.
     pub unmeasured_reason: Option<String>,
+    /// The halves of this pair declared to read the anchor's own determining
+    /// record fields, in slot order (#1959).
+    ///
+    /// Non-empty means the concatenated column behind `pair_bits` **contains
+    /// the label**, so `gain_bits` on this row is not a claim about
+    /// prediction. `synergy` marks rather than refuses, because inspecting a
+    /// carrier is a legitimate reason to run it — but a synergy pair has no
+    /// per-slot breakdown for a reader to notice a carrier in, so the row says
+    /// it.
+    pub anchor_source_carrier_slots: Vec<u32>,
+}
+
+/// One lens declared to read an anchor's own determining record fields
+/// (#1958, #1959) — it *is* (part of) the label, not evidence about it.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceAnchorSourceCarrier {
+    pub slot: u32,
+    /// The slot's declared lens name.
+    pub lens: String,
+    /// The record fields shared with the anchor. Never empty.
+    pub shared_fields: Vec<String>,
 }
 
 /// Result of one Assay synergy pass with the physical Assay CF readback.
@@ -1631,6 +1679,25 @@ pub struct StorageIntelligenceSynergyReport {
     pub pairs_monotonicity_floored: u64,
     pub synergistic_pairs: u64,
     pub max_gain_bits: f32,
+    /// `max_gain_bits` over the pairs containing **no** declared anchor source
+    /// carrier (#1959).
+    ///
+    /// `max_gain_bits` is one number over the whole pass, so a carrier pair
+    /// producing the maximum is invisible in it. This is the twin that is a
+    /// claim about prediction; the two are equal when
+    /// `anchor_source_carriers` is empty.
+    pub max_gain_bits_carrier_free: f32,
+    /// Whether this (anchor kind, panel version) pair declares its determining
+    /// record fields, so the structural carrier check could run at all (#1959).
+    ///
+    /// `false` means the check did **not** run — not that it ran and found
+    /// nothing. Without this, "checked and clean" and "never checked" are the
+    /// same empty list, which is #1953's original defect exactly.
+    pub anchor_source_declared: bool,
+    /// Panel slots whose declared source fields intersect the anchor's.
+    pub anchor_source_carriers: Vec<StorageIntelligenceAnchorSourceCarrier>,
+    /// Evaluated pairs with at least one carrier half.
+    pub pairs_with_anchor_source_carrier: u64,
     /// #1670 control-doctrine marker: domain anchor coverage below the floor.
     pub domain_provisional: bool,
     pub domain_grounded_fraction: f32,
@@ -3036,6 +3103,17 @@ pub fn run_intelligence_bits(
         anchored_records: report.anchored_records as u64,
         distinct_outcomes: report.distinct_outcomes as u64,
         total_bits: report.total_bits,
+        total_bits_carrier_free: report.total_bits_carrier_free,
+        anchor_source_declared: report.anchor_source_declared,
+        anchor_source_carriers: report
+            .anchor_source_carriers
+            .into_iter()
+            .map(|carrier| StorageIntelligenceAnchorSourceCarrier {
+                slot: u32::from(carrier.slot),
+                lens: carrier.lens,
+                shared_fields: carrier.shared_fields,
+            })
+            .collect(),
         measurable: report.measurable,
         unmeasurable_reason: report.unmeasurable_reason,
         grounded: report.grounded,
@@ -3061,6 +3139,8 @@ pub fn run_intelligence_bits(
                 max_same_label_multiplicity: slot
                     .max_same_label_multiplicity
                     .map(|value| value as u64),
+                anchor_source_carrier: slot.anchor_source_carrier,
+                anchor_source_shared_fields: slot.anchor_source_shared_fields,
             })
             .collect(),
         assay_cf_rows_after: report.assay_cf_rows_after as u64,
@@ -3357,6 +3437,18 @@ pub fn run_intelligence_synergy(
         pairs_monotonicity_floored: report.pairs_monotonicity_floored as u64,
         synergistic_pairs: report.synergistic_pairs as u64,
         max_gain_bits: report.max_gain_bits,
+        max_gain_bits_carrier_free: report.max_gain_bits_carrier_free,
+        anchor_source_declared: report.anchor_source_declared,
+        anchor_source_carriers: report
+            .anchor_source_carriers
+            .into_iter()
+            .map(|carrier| StorageIntelligenceAnchorSourceCarrier {
+                slot: u32::from(carrier.slot),
+                lens: carrier.lens,
+                shared_fields: carrier.shared_fields,
+            })
+            .collect(),
+        pairs_with_anchor_source_carrier: report.pairs_with_anchor_source_carrier as u64,
         domain_provisional: report.domain_provisional,
         domain_grounded_fraction: report.domain_grounded_fraction,
         pairs: report
@@ -3365,6 +3457,11 @@ pub fn run_intelligence_synergy(
             .map(|pair| StorageIntelligenceSynergyPair {
                 slot_a: u32::from(pair.slot_a),
                 slot_b: u32::from(pair.slot_b),
+                anchor_source_carrier_slots: pair
+                    .anchor_source_carrier_slots
+                    .into_iter()
+                    .map(u32::from)
+                    .collect(),
                 pair_bits: pair.pair_bits,
                 left_bits: pair.left_bits,
                 right_bits: pair.right_bits,
