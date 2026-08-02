@@ -12,6 +12,7 @@ pub mod gc;
 pub mod index;
 pub mod layers;
 pub mod ledger_head;
+mod ledger_projection;
 pub mod ledger_view;
 pub mod manifest;
 pub mod media_artifact;

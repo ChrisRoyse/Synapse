@@ -326,6 +326,59 @@ impl CommitStageTimings {
     }
 }
 
+/// Budget above which one commit's derived-projection publish is attributed.
+///
+/// The in-place publish measures 0.130-0.208 ms on this host's vault volume
+/// (#1947), so a millisecond is roughly 5x the expected cost: high enough that
+/// an ordinary publish stays silent, low enough that the 15-20 ms outliers
+/// #1947 ask 2 could not explain cannot hide under it.
+const LEDGER_PROJECTION_PUBLISH_SLOW_BUDGET_US: u64 = 1_000;
+
+/// Attributes one commit's derived-projection publish when it exceeds budget
+/// (#1947 ask 2).
+///
+/// #1947 measured a 147-byte publish costing 15-20 ms on large-batch commits
+/// and could not reproduce it from outside the daemon, so the cost had no
+/// owner. The publish now performs no namespace metadata work at all — the
+/// file is pre-allocated and the handle is held — which makes these splits
+/// decisive rather than merely informative: if the outlier survives, it is
+/// either the open or the write, and `reopened` says whether the handle was
+/// being reacquired. An outlier that is in neither is not in this code, and
+/// that is a finding about the commit around it rather than about the publish.
+fn report_projection_publish(
+    head: Option<crate::ledger_projection::PublishTimings>,
+    checkpoint: Option<crate::ledger_projection::PublishTimings>,
+    stage_us: u64,
+    row_count: usize,
+) {
+    if stage_us < LEDGER_PROJECTION_PUBLISH_SLOW_BUDGET_US {
+        return;
+    }
+    let attributed = head.map_or(0, |timings| {
+        timings.open_us + timings.write_us + timings.sync_us
+    }) + checkpoint.map_or(0, |timings| {
+        timings.open_us + timings.write_us + timings.sync_us
+    });
+    tracing::info!(
+        code = "CALYX_ASTER_LEDGER_PROJECTION_PUBLISH_SLOW",
+        row_count,
+        stage_us,
+        budget_us = LEDGER_PROJECTION_PUBLISH_SLOW_BUDGET_US,
+        head_published = head.is_some(),
+        head_open_us = head.map_or(0, |timings| timings.open_us),
+        head_write_us = head.map_or(0, |timings| timings.write_us),
+        head_reopened = head.is_some_and(|timings| timings.reopened),
+        checkpoint_published = checkpoint.is_some(),
+        checkpoint_open_us = checkpoint.map_or(0, |timings| timings.open_us),
+        checkpoint_write_us = checkpoint.map_or(0, |timings| timings.write_us),
+        checkpoint_reopened = checkpoint.is_some_and(|timings| timings.reopened),
+        // A large remainder is the whole point of publishing this line: it
+        // says the stage's cost is not in the syscalls this stage performs.
+        unattributed_us = stage_us.saturating_sub(attributed),
+        "derived Ledger projection publish exceeded its budget"
+    );
+}
+
 /// Waiter accounting for the durable commit lock. Decrements on every exit
 /// path, including the error paths that abandon the acquisition.
 struct CommitLockWaiterTicket<'a> {
@@ -659,12 +712,22 @@ where
         let durable_seq = durable.append_batch(rows)?;
         stage.wal_us = stage.split(&started);
 
+        let mut head_publish = None;
+        let mut checkpoint_publish = None;
         let publish = (|| -> Result<Seq> {
-            if let Some(anchor) = &head_anchor {
-                crate::ledger_head::write_head_anchor(durable.root(), anchor)?;
-            }
-            if let Some(anchor) = &checkpoint_anchor {
-                crate::ledger_head::write_checkpoint_anchor(durable.root(), anchor)?;
+            if head_anchor.is_some() || checkpoint_anchor.is_some() {
+                let mut guard = self.ledger_projections.lock().map_err(|_| {
+                    CalyxError::backpressure("Ledger projection writer mutex poisoned")
+                })?;
+                let projections = guard.get_or_insert_with(|| {
+                    crate::ledger_head::LedgerProjections::new(durable.root())
+                });
+                if let Some(anchor) = &head_anchor {
+                    head_publish = Some(projections.publish_head(anchor)?);
+                }
+                if let Some(anchor) = &checkpoint_anchor {
+                    checkpoint_publish = projections.publish_checkpoint(anchor)?;
+                }
             }
             stage.anchor_publish_us = stage.split(&started);
             let mvcc_seq = self.commit_rows_to_mvcc(rows)?;
@@ -679,6 +742,12 @@ where
             Ok(mvcc_seq)
         })();
         stage.report(rows, &started, &self.commit_stage_observer);
+        report_projection_publish(
+            head_publish,
+            checkpoint_publish,
+            stage.anchor_publish_us,
+            rows.len(),
+        );
 
         match publish {
             Ok(seq) => Ok(seq),

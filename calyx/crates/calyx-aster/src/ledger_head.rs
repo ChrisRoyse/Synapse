@@ -6,6 +6,7 @@ use calyx_ledger::{CheckpointPayload, EntryKind, LedgerHeadAnchor, LedgerRow, de
 use serde::{Deserialize, Serialize};
 
 use crate::cf::ColumnFamily;
+use crate::ledger_projection::{ProjectionKind, ProjectionRecord, ProjectionSlot};
 use crate::ledger_view::parse_aster_ledger_seq;
 use crate::vault::encode::WriteRow;
 
@@ -86,19 +87,77 @@ pub(crate) fn checkpoint_anchor_path(vault: &Path) -> PathBuf {
     vault.join(LEDGER_HEAD_DIR).join(LEDGER_CHECKPOINT_FILE)
 }
 
-pub fn read_head_anchor(vault: &Path) -> Result<Option<LedgerHeadAnchor>> {
-    let path = head_anchor_path(vault);
-    if !path.exists() {
-        return Ok(None);
+/// Reads one derived projection's payload bytes, or `None` when no anchor is
+/// published.
+///
+/// `None` covers two physically distinct states that are semantically one: the
+/// file does not exist, and the file holds a validly-published *vacant* record.
+/// Recovery produces the second when the durable Ledger rows carry no anchor,
+/// so that publishing an absence never has to unlink a file (#1947).
+///
+/// A file that predates the fixed-size record format is the bare JSON payload.
+/// That is decoded as such, once, and logged — an explicit versioned format
+/// transition, not a silent acceptance of unknown bytes. The next publish
+/// rewrites it as a record.
+fn read_projection_payload(kind: ProjectionKind, path: &Path) -> Result<Option<Vec<u8>>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CalyxError::disk_pressure(format!(
+                "read {kind:?} projection {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    match crate::ledger_projection::classify_projection_bytes(&bytes) {
+        crate::ledger_projection::ProjectionShape::Record => {}
+        crate::ledger_projection::ProjectionShape::LegacyBareJson => {
+            tracing::info!(
+                code = "CALYX_ASTER_LEDGER_PROJECTION_LEGACY_FORMAT_READ",
+                path = %path.display(),
+                bytes = bytes.len(),
+                projection = ?kind,
+                "read a derived Ledger projection in the pre-record bare-JSON format; the next publish rewrites it as a fixed-size record"
+            );
+            return Ok(Some(bytes));
+        }
+        crate::ledger_projection::ProjectionShape::Unrecognized => {
+            // Not a record and not the format that preceded it. Say exactly
+            // that, with the leading bytes, rather than attempting either
+            // decode and reporting whichever one fails first.
+            return Err(derived_projection_unreadable(format!(
+                "{kind:?} projection {} is in no recognized format: {} bytes beginning {:02x?}; \
+                 expected either a fixed-size record magic or a bare JSON object",
+                path.display(),
+                bytes.len(),
+                &bytes[..bytes.len().min(8)]
+            )));
+        }
     }
-    let bytes = fs::read(&path)
-        .map_err(|error| CalyxError::disk_pressure(format!("read Aster ledger head: {error}")))?;
     // Not `ledger_corrupt`: this file is published without a durability
     // barrier because it is derived from Ledger rows the WAL already fsync'd
-    // (#1946). A crash can therefore leave the rename applied over unflushed
-    // blocks, i.e. a torn or zero-filled projection. That says nothing about
-    // the ledger — it says this projection must be rebuilt from it.
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+    // (#1946), and in place rather than via rename (#1947). Either shape can
+    // leave a torn or partially-applied record after a crash. That says
+    // nothing about the ledger — it says this projection must be rebuilt from
+    // it, which is exactly what the CRC in the record exists to detect.
+    match crate::ledger_projection::decode_record(kind, &bytes).map_err(|reason| {
+        derived_projection_unreadable(format!(
+            "decode {kind:?} projection record {}: {reason}",
+            path.display()
+        ))
+    })? {
+        ProjectionRecord::Vacant => Ok(None),
+        ProjectionRecord::Present(payload) => Ok(Some(payload)),
+    }
+}
+
+pub fn read_head_anchor(vault: &Path) -> Result<Option<LedgerHeadAnchor>> {
+    let path = head_anchor_path(vault);
+    let Some(payload) = read_projection_payload(ProjectionKind::LedgerHead, &path)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&payload).map(Some).map_err(|error| {
         derived_projection_unreadable(format!(
             "decode Aster ledger head projection {}: {error}",
             path.display()
@@ -147,25 +206,39 @@ pub(crate) fn read_checkpoint_anchor_rebuildable(
     }
 }
 
-pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Result<()> {
-    if let Some(current) = read_head_anchor(vault)? {
-        if anchor.height < current.height {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "Aster ledger head regressed from {} to {}",
-                current.height, anchor.height
-            )));
-        }
-        if anchor.height == current.height && anchor.tip_hash != current.tip_hash {
-            return Err(CalyxError::ledger_append_only_violation(
-                "Aster ledger head changed hash at the same height",
-            ));
-        }
+/// The append-only rule for the head projection, shared by every writer so the
+/// cold path and the cached commit path cannot enforce different invariants.
+fn guard_head_monotonic(
+    current: Option<&LedgerHeadAnchor>,
+    anchor: &LedgerHeadAnchor,
+) -> Result<()> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if anchor.height < current.height {
+        return Err(CalyxError::ledger_append_only_violation(format!(
+            "Aster ledger head regressed from {} to {}",
+            current.height, anchor.height
+        )));
     }
-    let path = head_anchor_path(vault);
-    let bytes = serde_json::to_vec(anchor).map_err(|error| {
-        CalyxError::ledger_corrupt(format!("encode Aster ledger head: {error}"))
-    })?;
-    // Published WITHOUT a durability barrier, on purpose (#1946).
+    if anchor.height == current.height && anchor.tip_hash != current.tip_hash {
+        return Err(CalyxError::ledger_append_only_violation(
+            "Aster ledger head changed hash at the same height",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_head_anchor(anchor: &LedgerHeadAnchor) -> Result<Vec<u8>> {
+    serde_json::to_vec(anchor)
+        .map_err(|error| CalyxError::ledger_corrupt(format!("encode Aster ledger head: {error}")))
+}
+
+pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Result<()> {
+    guard_head_monotonic(read_head_anchor(vault)?.as_ref(), anchor)?;
+    let bytes = encode_head_anchor(anchor)?;
+    // Published WITHOUT a durability barrier, on purpose (#1946), and in place
+    // into a pre-allocated record rather than via create+rename (#1947).
     //
     // This runs on the commit path immediately after `durable.append_batch`
     // has already fsync'd the Ledger rows this anchor is computed from, so the
@@ -174,13 +247,16 @@ pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Resu
     // can only make the commit slower, and it did: measured on the deployment
     // host this publish was 45.9% of all durable-commit cost (7,598 ms of
     // 16,542 ms across 1,105 commits) while performing no I/O the WAL had not
-    // already performed.
+    // already performed. #1947 then measured that what remained was namespace
+    // metadata: create+rename cost 1.344 ms against 0.130 ms in place.
     //
     // The projection can therefore be stale or torn after a crash. Both are
     // handled by `ensure_recovered_ledger_sidecars`, which re-derives the head
     // from physical WAL truth at open — the path that already existed, and
     // whose own comment states that "recovery is the authority".
-    crate::fsync::write_atomic_replace_derived(&path, &bytes, "Aster ledger head")
+    ProjectionSlot::new(ProjectionKind::LedgerHead, head_anchor_path(vault))
+        .publish(Some(&bytes), false)?;
+    Ok(())
 }
 
 /// Replaces the derived head sidecar with exact recovered physical truth.
@@ -193,34 +269,33 @@ pub(crate) fn write_head_anchor(vault: &Path, anchor: &LedgerHeadAnchor) -> Resu
 /// leaving the repaired projection durable means the next crash starts from a
 /// projection that is known-good on disk rather than one that has yet to be
 /// flushed (#1946).
+///
+/// A recovered *absence* is published as a vacant record rather than by
+/// unlinking the file (#1947). Both read back as `None`, and not unlinking
+/// keeps the guarantee that no publish after the first mutates the namespace —
+/// which also means this can no longer pull a file out from under a writer's
+/// open handle.
 pub(crate) fn replace_head_anchor_from_recovery(
     vault: &Path,
     anchor: Option<&LedgerHeadAnchor>,
 ) -> Result<()> {
-    let path = head_anchor_path(vault);
-    let Some(anchor) = anchor else {
-        return crate::fsync::remove_file_durable(&path, "Aster recovered ledger head");
-    };
-    let bytes = serde_json::to_vec(anchor).map_err(|error| {
-        CalyxError::ledger_corrupt(format!("encode recovered Aster ledger head: {error}"))
-    })?;
-    crate::fsync::write_atomic_replace(&path, &bytes, "Aster recovered ledger head")
+    let bytes = anchor.map(encode_head_anchor).transpose()?;
+    ProjectionSlot::new(ProjectionKind::LedgerHead, head_anchor_path(vault))
+        .publish(bytes.as_deref(), true)?;
+    Ok(())
 }
 
 pub(crate) fn read_checkpoint_anchor(vault: &Path) -> Result<Option<LedgerCheckpointAnchor>> {
     let path = checkpoint_anchor_path(vault);
-    if !path.exists() {
+    let Some(payload) = read_projection_payload(ProjectionKind::LedgerCheckpoint, &path)? else {
         return Ok(None);
-    }
-    let bytes = fs::read(&path).map_err(|error| {
-        CalyxError::disk_pressure(format!("read Aster ledger checkpoint pointer: {error}"))
-    })?;
+    };
     // Same reasoning as `read_head_anchor`: this is a derived projection, so a
     // decode failure means "rebuild me from the WAL", not "the ledger is
     // damaged" (#1946). `validate()` is routed the same way because a torn
     // write can also produce structurally-decodable but internally
     // inconsistent bytes.
-    let anchor = serde_json::from_slice::<LedgerCheckpointAnchor>(&bytes).map_err(|error| {
+    let anchor = serde_json::from_slice::<LedgerCheckpointAnchor>(&payload).map_err(|error| {
         derived_projection_unreadable(format!(
             "decode Aster ledger checkpoint projection {}: {error}",
             path.display()
@@ -236,52 +311,201 @@ pub(crate) fn read_checkpoint_anchor(vault: &Path) -> Result<Option<LedgerCheckp
     Ok(Some(anchor))
 }
 
+/// The append-only rule for the checkpoint projection.
+///
+/// `Ok(false)` means the requested pointer is already published and the write
+/// must be skipped, which is distinct from "publish it" and is why this
+/// returns a verdict rather than just validating.
+fn guard_checkpoint_monotonic(
+    current: Option<&LedgerCheckpointAnchor>,
+    anchor: &LedgerCheckpointAnchor,
+) -> Result<bool> {
+    let Some(current) = current else {
+        return Ok(true);
+    };
+    if anchor.seq < current.seq {
+        return Err(CalyxError::ledger_append_only_violation(format!(
+            "Aster ledger checkpoint pointer regressed from {} to {}",
+            current.seq, anchor.seq
+        )));
+    }
+    if anchor.seq == current.seq {
+        if anchor != current {
+            return Err(CalyxError::ledger_append_only_violation(
+                "Aster ledger checkpoint pointer changed at the same seq",
+            ));
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn encode_checkpoint_anchor(anchor: &LedgerCheckpointAnchor) -> Result<Vec<u8>> {
+    serde_json::to_vec(anchor).map_err(|error| {
+        CalyxError::ledger_corrupt(format!("encode Aster ledger checkpoint pointer: {error}"))
+    })
+}
+
 pub(crate) fn write_checkpoint_anchor(vault: &Path, anchor: &LedgerCheckpointAnchor) -> Result<()> {
     anchor.validate()?;
-    if let Some(current) = read_checkpoint_anchor(vault)? {
-        if anchor.seq < current.seq {
-            return Err(CalyxError::ledger_append_only_violation(format!(
-                "Aster ledger checkpoint pointer regressed from {} to {}",
-                current.seq, anchor.seq
-            )));
-        }
-        if anchor.seq == current.seq {
-            if anchor != &current {
-                return Err(CalyxError::ledger_append_only_violation(
-                    "Aster ledger checkpoint pointer changed at the same seq",
-                ));
-            }
-            return Ok(());
-        }
+    if !guard_checkpoint_monotonic(read_checkpoint_anchor(vault)?.as_ref(), anchor)? {
+        return Ok(());
     }
-    let path = checkpoint_anchor_path(vault);
-    let bytes = serde_json::to_vec(anchor).map_err(|error| {
-        CalyxError::ledger_corrupt(format!("encode Aster ledger checkpoint pointer: {error}"))
-    })?;
-    // Derived projection, same contract as the head anchor above (#1946).
-    crate::fsync::write_atomic_replace_derived(&path, &bytes, "Aster ledger checkpoint pointer")
+    let bytes = encode_checkpoint_anchor(anchor)?;
+    // Derived projection, same contract as the head anchor above (#1946,
+    // #1947).
+    ProjectionSlot::new(
+        ProjectionKind::LedgerCheckpoint,
+        checkpoint_anchor_path(vault),
+    )
+    .publish(Some(&bytes), false)?;
+    Ok(())
 }
 
 /// Replaces the derived checkpoint sidecar with exact recovered physical
-/// truth, including removal when no physical checkpoint exists.
+/// truth, publishing a vacant record when no physical checkpoint exists.
 pub(crate) fn replace_checkpoint_anchor_from_recovery(
     vault: &Path,
     anchor: Option<&LedgerCheckpointAnchor>,
 ) -> Result<()> {
-    let path = checkpoint_anchor_path(vault);
-    let Some(anchor) = anchor else {
-        return crate::fsync::remove_file_durable(
-            &path,
-            "Aster recovered ledger checkpoint pointer",
-        );
-    };
-    anchor.validate()?;
-    let bytes = serde_json::to_vec(anchor).map_err(|error| {
-        CalyxError::ledger_corrupt(format!(
-            "encode recovered Aster ledger checkpoint pointer: {error}"
-        ))
-    })?;
-    crate::fsync::write_atomic_replace(&path, &bytes, "Aster recovered ledger checkpoint pointer")
+    let bytes = anchor
+        .map(|anchor| {
+            anchor.validate()?;
+            encode_checkpoint_anchor(anchor)
+        })
+        .transpose()?;
+    ProjectionSlot::new(
+        ProjectionKind::LedgerCheckpoint,
+        checkpoint_anchor_path(vault),
+    )
+    .publish(bytes.as_deref(), true)?;
+    Ok(())
+}
+
+/// The commit path's owner of both derived Ledger projections (#1947).
+///
+/// Two costs the free functions above pay per call are structural rather than
+/// incidental, and this type removes both:
+///
+/// 1. **An open per publish.** The backing file is pre-allocated once and the
+///    handle is held, so a steady-state publish is one positional write and
+///    nothing else.
+/// 2. **A read per publish.** The append-only guards needed the currently
+///    published anchor, and read it back off disk every time — an open, a
+///    read, and a JSON parse to validate a value this process itself wrote.
+///    The last published anchor is cached instead.
+///
+/// The cache is an accelerator for a guard, never the guard itself. A cached
+/// value can only ever *skip* a disk read; it can never be the sole reason a
+/// commit is rejected, because any violation judged against the cache is
+/// re-judged against physical truth before it is returned.
+#[derive(Debug)]
+pub(crate) struct LedgerProjections {
+    vault: PathBuf,
+    head: ProjectionSlot,
+    /// `None` = not yet loaded from disk. `Some(None)` = loaded, no anchor
+    /// published. The two are different states and collapsing them would make
+    /// an unloaded cache read as a published absence.
+    head_cache: Option<Option<LedgerHeadAnchor>>,
+    checkpoint: ProjectionSlot,
+    checkpoint_cache: Option<Option<LedgerCheckpointAnchor>>,
+}
+
+impl LedgerProjections {
+    pub(crate) fn new(vault: &Path) -> Self {
+        Self {
+            vault: vault.to_path_buf(),
+            head: ProjectionSlot::new(ProjectionKind::LedgerHead, head_anchor_path(vault)),
+            head_cache: None,
+            checkpoint: ProjectionSlot::new(
+                ProjectionKind::LedgerCheckpoint,
+                checkpoint_anchor_path(vault),
+            ),
+            checkpoint_cache: None,
+        }
+    }
+
+    /// Drops both handles and both caches.
+    ///
+    /// Runtime Ledger reconciliation republishes these files from recovered
+    /// physical truth through the free functions, which do not go through this
+    /// type. After that happens the cache describes a superseded state and the
+    /// handles may refer to a file that was rewritten underneath them, so both
+    /// are discarded at that boundary rather than being trusted across it.
+    pub(crate) fn reset(&mut self) {
+        self.head.reset();
+        self.head_cache = None;
+        self.checkpoint.reset();
+        self.checkpoint_cache = None;
+    }
+
+    pub(crate) fn publish_head(
+        &mut self,
+        anchor: &LedgerHeadAnchor,
+    ) -> Result<crate::ledger_projection::PublishTimings> {
+        if self.head_cache.is_none() {
+            self.head_cache = Some(read_head_anchor(&self.vault)?);
+        }
+        let cached = self.head_cache.as_ref().and_then(Option::as_ref);
+        if guard_head_monotonic(cached, anchor).is_err() {
+            // Judge the violation against the disk, not against the cache. If
+            // physical truth accepts the write, the cache was stale and the
+            // commit proceeds; if it rejects, the real violation is returned
+            // carrying the real published value.
+            let physical = read_head_anchor(&self.vault)?;
+            guard_head_monotonic(physical.as_ref(), anchor)?;
+            tracing::warn!(
+                code = "CALYX_ASTER_LEDGER_HEAD_PROJECTION_CACHE_RESYNCED",
+                path = %self.head.path().display(),
+                cached_height = cached.map(|anchor| anchor.height),
+                physical_height = physical.as_ref().map(|anchor| anchor.height),
+                requested_height = anchor.height,
+                "cached Ledger head projection disagreed with disk; resynced from physical truth before publishing"
+            );
+            self.head_cache = Some(physical);
+        }
+        let bytes = encode_head_anchor(anchor)?;
+        let timings = self.head.publish(Some(&bytes), false)?;
+        self.head_cache = Some(Some(anchor.clone()));
+        Ok(timings)
+    }
+
+    /// Publishes the checkpoint pointer, or `Ok(None)` when the requested
+    /// pointer is already the published one.
+    pub(crate) fn publish_checkpoint(
+        &mut self,
+        anchor: &LedgerCheckpointAnchor,
+    ) -> Result<Option<crate::ledger_projection::PublishTimings>> {
+        anchor.validate()?;
+        if self.checkpoint_cache.is_none() {
+            self.checkpoint_cache = Some(read_checkpoint_anchor(&self.vault)?);
+        }
+        let cached = self.checkpoint_cache.as_ref().and_then(Option::as_ref);
+        let publish = match guard_checkpoint_monotonic(cached, anchor) {
+            Ok(publish) => publish,
+            Err(_) => {
+                let physical = read_checkpoint_anchor(&self.vault)?;
+                let verdict = guard_checkpoint_monotonic(physical.as_ref(), anchor)?;
+                tracing::warn!(
+                    code = "CALYX_ASTER_LEDGER_CHECKPOINT_PROJECTION_CACHE_RESYNCED",
+                    path = %self.checkpoint.path().display(),
+                    cached_seq = cached.map(|anchor| anchor.seq),
+                    physical_seq = physical.as_ref().map(|anchor| anchor.seq),
+                    requested_seq = anchor.seq,
+                    "cached Ledger checkpoint projection disagreed with disk; resynced from physical truth before publishing"
+                );
+                self.checkpoint_cache = Some(physical);
+                verdict
+            }
+        };
+        if !publish {
+            return Ok(None);
+        }
+        let bytes = encode_checkpoint_anchor(anchor)?;
+        let timings = self.checkpoint.publish(Some(&bytes), false)?;
+        self.checkpoint_cache = Some(Some(anchor.clone()));
+        Ok(Some(timings))
+    }
 }
 
 pub(crate) fn newest_anchor_from_rows(rows: &[WriteRow]) -> Result<Option<LedgerHeadAnchor>> {

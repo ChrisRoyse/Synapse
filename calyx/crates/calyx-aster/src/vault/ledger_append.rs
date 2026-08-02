@@ -663,6 +663,20 @@ where
                 "Ledger state reconciliation requires a durable vault",
             ));
         };
+        // The repair below republishes both derived projections from recovered
+        // physical truth through the free functions, which do not go through
+        // the commit path's cached writers. Drop those handles and cached
+        // anchors first, so the next commit reloads what recovery actually
+        // wrote instead of trusting what it remembered across a boundary that
+        // exists precisely because memory and disk may have diverged (#1947).
+        if let Some(projections) = self
+            .ledger_projections
+            .lock()
+            .map_err(|_| CalyxError::backpressure("Ledger projection writer mutex poisoned"))?
+            .as_mut()
+        {
+            projections.reset();
+        }
         // A prior process may have failed after WAL durability but before
         // updating these derived sidecars. Repair them before optimized
         // physical hook hydration trusts the head boundary.

@@ -32,6 +32,7 @@ where
             ledger_state_reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             post_commit_error_seq: std::sync::atomic::AtomicU64::new(0),
             commit_stage_observer: Default::default(),
+            ledger_projections: Default::default(),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,

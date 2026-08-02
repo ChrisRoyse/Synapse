@@ -140,6 +140,14 @@ pub struct AsterVault<C = SystemClock> {
     /// (issue #1946). Per-vault rather than process-global so an isolated
     /// vault's commits cannot shift the live daemon's baseline.
     commit_stage_observer: commit::CommitStageObserver,
+    /// Held-open, pre-allocated writers for the two derived Ledger
+    /// projections (issue #1947).
+    ///
+    /// Lazily created on the first commit that publishes one, because the
+    /// vault root is only known once a durable vault exists. Per-vault, so an
+    /// isolated vault's handles and cached anchors can never be confused with
+    /// the live daemon's.
+    ledger_projections: Mutex<Option<crate::ledger_head::LedgerProjections>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,6 +482,7 @@ where
             ledger_state_reconciliation_required: AtomicBool::new(false),
             post_commit_error_seq: AtomicU64::new(0),
             commit_stage_observer: Default::default(),
+            ledger_projections: Default::default(),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,

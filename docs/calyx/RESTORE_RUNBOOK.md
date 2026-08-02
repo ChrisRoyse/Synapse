@@ -53,11 +53,56 @@ are canonicalised before comparison so `..` and symlinks cannot defeat the check
 │   ├── cf/<CF_NAME>/*.sst      # per-column-family sorted tables (sacred rows)
 │   ├── wal/*.wal              # write-ahead log segments
 │   ├── locks/                 # present but EMPTY (lock tokens are not copied)
-│   └── ledger_head/current.json, latest_checkpoint.json
+│   └── ledger_head/current.json, latest_checkpoint.json   # fixed-size records
 ├── vault_lineage.json         # sidecar copy of the vault lineage journal (§7)
 └── backup_manifest.json       # per-file SHA-256 + durable_seq + verify report
                                # + lineage identity + excluded_runtime list
 ```
+
+#### The two `ledger_head/` files are fixed-size binary records, not JSON
+
+Despite the `.json` names, both are **4096-byte records** as of #1947, not bare
+JSON documents. They are derived projections of the durable Ledger rows, and
+they are published *in place* into a pre-allocated page so that a publish never
+touches parent-directory metadata — which is what made them 46% of all
+durable-commit cost when they were published by create-temp-and-rename.
+
+```
+ 0..8    magic           "CLXLHEAD" (current.json) | "CLXLCKPT" (latest_checkpoint.json)
+ 8..12   format_version  u32 LE, currently 1
+12..16   payload_len     u32 LE
+16..20   crc32           u32 LE (CRC-32/ISO-HDLC) over bytes[0..16] ++ payload
+20..4096 payload         the JSON anchor, then zero padding
+```
+
+`payload_len = 0` is a **vacant** record: a validly-published *absence*, which
+reads back identically to the file not existing. Recovery writes one when the
+durable Ledger rows carry no anchor, so publishing an absence never has to
+unlink the file.
+
+**Reading one live.** The daemon holds a write handle on both files open across
+publishes, so a reader must permit that access. Openers that work: Win32
+`CopyFile` (so `Copy-Item`, `robocopy`, and `storage operation=backup` are all
+fine), and PowerShell `Get-Content`. An opener that requests `FileShare.Read`
+only — which is .NET's `[IO.File]::ReadAllBytes` default — fails with a sharing
+violation. Use `FileShare.ReadWrite`:
+
+```powershell
+$fs = [System.IO.FileStream]::new($path, 'Open', 'Read',
+        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+```
+
+**Neither file is an authority, and a bad one is never a reason to restore.** A
+failed magic, version, length or CRC check is reported as
+`CALYX_LEDGER_DERIVED_PROJECTION_UNREADABLE` and repaired at the next
+write-capable open from the WAL, which logs
+`CALYX_ASTER_LEDGER_HEAD_SIDECAR_REPAIRED` /
+`CALYX_ASTER_LEDGER_CHECKPOINT_SIDECAR_REPAIRED` with the recovered height. If
+you want to assess the ledger itself, run `hygiene operation=vault_verify`.
+
+Vaults written before #1947 hold the pre-record bare-JSON form. Those are read,
+accepted, logged once as `CALYX_ASTER_LEDGER_PROJECTION_LEGACY_FORMAT_READ`, and
+rewritten as records on the next publish. No migration step is required.
 
 `backup_manifest.json` is `schema_version=2`: version 1 recorded only bytes,
 version 2 also asserts the vault identity (`lineage`) and lists what was

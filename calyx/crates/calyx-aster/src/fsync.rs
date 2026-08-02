@@ -15,83 +15,37 @@ pub(crate) enum PublishMode {
     ReplaceExisting,
 }
 
-/// Whether a publication must survive power loss on its own bytes.
+pub(crate) fn write_atomic_create_new(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    write_atomic(path, bytes, label, PublishMode::CreateNew)
+}
+
+pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    write_atomic(path, bytes, label, PublishMode::ReplaceExisting)
+}
+
+/// Publishes bytes so that they survive power loss on their own.
 ///
-/// `Durable` is the only correct setting for anything that is its own
-/// authority — the manifest, an SST, a backup file. It pays three barriers:
-/// `fsync` of the staged temp file, a write-through rename, and an `fsync` of
-/// the parent directory. All three are required, and the third is the one most
-/// often missed: `rename` is atomic in the namespace but the *name* is parent
+/// This is the correct shape for anything that is its own authority — the
+/// manifest, an SST, a backup file. It pays three barriers: `fsync` of the
+/// staged temp file, a write-through rename, and an `fsync` of the parent
+/// directory. All three are required, and the third is the one most often
+/// missed: `rename` is atomic in the namespace but the *name* is parent
 /// directory metadata, so without `sync_parent` a crash can leave the target
 /// still pointing at the previous inode (LWN, "Ensuring data reaches disk";
 /// LevelDB's `SyncDirIfManifest` exists for exactly this).
 ///
-/// `DerivedProjection` is for a file whose content is *already* durable
-/// somewhere else and is recomputed from that authority during recovery. It
-/// keeps the atomic rename — a concurrent reader must never observe a partial
-/// file — and drops all three durability barriers, because they can only make
-/// a regenerable projection durable, which buys nothing a rebuild does not
-/// already give (#1946).
-///
-/// The cost difference is not marginal. Measured on the deployment host's
-/// vault volume over 200 iterations of the real 147-byte head-anchor payload:
-///
-/// ```text
-/// Durable (fsync + WRITE_THROUGH rename + sync_parent)   1.7752 ms
-/// DerivedProjection (create + write + plain rename)      0.3929 ms
-/// ```
-///
-/// **Choosing `DerivedProjection` is a claim that recovery rebuilds this file
-/// from durable truth.** A caller that cannot make that claim must use
-/// `Durable`, and a reader of a derived projection must treat unreadable
-/// content as "rebuild me", never as corruption of the authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublishDurability {
-    Durable,
-    DerivedProjection,
-}
-
-pub(crate) fn write_atomic_create_new(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
-    write_atomic(
-        path,
-        bytes,
-        label,
-        PublishMode::CreateNew,
-        PublishDurability::Durable,
-    )
-}
-
-pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
-    write_atomic(
-        path,
-        bytes,
-        label,
-        PublishMode::ReplaceExisting,
-        PublishDurability::Durable,
-    )
-}
-
-/// Atomically replaces a *derived projection* without any durability barrier.
-///
-/// See [`PublishDurability::DerivedProjection`] for the contract this asserts.
-pub(crate) fn write_atomic_replace_derived(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
-    write_atomic(
-        path,
-        bytes,
-        label,
-        PublishMode::ReplaceExisting,
-        PublishDurability::DerivedProjection,
-    )
-}
-
+/// A file whose content is *already* durable somewhere else and is recomputed
+/// from that authority during recovery must not be published this way. Those
+/// files cost 1.7752 ms here against 0.130 ms published in place, and the
+/// barriers buy nothing a rebuild does not already give (#1946, #1947). They
+/// go through `ledger_projection` instead, which pre-allocates a fixed-size
+/// record and validates it with a CRC on read.
 pub(crate) fn write_atomic(
     path: &Path,
     bytes: &[u8],
     label: &str,
     mode: PublishMode,
-    durability: PublishDurability,
 ) -> Result<()> {
-    let durable = durability == PublishDurability::Durable;
     let parent = path
         .parent()
         .ok_or_else(|| durable_error(label, "resolve parent", path, None, 0))?;
@@ -110,13 +64,10 @@ pub(crate) fn write_atomic(
         let mut file = open_create_new(&temp, label, "create atomic temp")?;
         file.write_all(bytes)
             .map_err(|error| durable_error(label, "write atomic temp", &temp, Some(error), 0))?;
-        if durable {
-            file.sync_all().map_err(|error| {
-                durable_error(label, "fsync atomic temp", &temp, Some(error), 0)
-            })?;
-        }
+        file.sync_all()
+            .map_err(|error| durable_error(label, "fsync atomic temp", &temp, Some(error), 0))?;
         drop(file);
-        match publish_path_with_durability(&temp, path, label, mode, durability) {
+        match publish_path(&temp, path, label, mode) {
             Ok(()) => {}
             Err(error) if mode == PublishMode::CreateNew => {
                 match create_new_target_state(path, bytes, label, "post-publish")? {
@@ -138,9 +89,7 @@ pub(crate) fn write_atomic(
             }
             Err(error) => return Err(error),
         }
-        if durable {
-            sync_parent(path, label)?;
-        }
+        sync_parent(path, label)?;
         Ok(())
     })();
     if result.is_err() {
@@ -159,23 +108,12 @@ pub(crate) fn publish_path(
     label: &str,
     mode: PublishMode,
 ) -> Result<()> {
-    publish_path_with_durability(source, target, label, mode, PublishDurability::Durable)
-}
-
-pub(crate) fn publish_path_with_durability(
-    source: &Path,
-    target: &Path,
-    label: &str,
-    mode: PublishMode,
-    durability: PublishDurability,
-) -> Result<()> {
     #[cfg(windows)]
     {
-        publish_path_windows(source, target, label, mode, durability)
+        publish_path_windows(source, target, label, mode)
     }
     #[cfg(not(windows))]
     {
-        let _ = durability;
         publish_path_portable(source, target, label, mode)
     }
 }
@@ -291,7 +229,6 @@ fn publish_path_windows(
     target: &Path,
     label: &str,
     mode: PublishMode,
-    durability: PublishDurability,
 ) -> Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -299,14 +236,8 @@ fn publish_path_windows(
 
     let source_wide = win32_path(source, label, "prepare source path")?;
     let target_wide = win32_path(target, label, "prepare target path")?;
-    // The rename stays atomic for concurrent readers in both modes; only
-    // MOVEFILE_WRITE_THROUGH (block until the move reaches the disk) is
-    // conditional, because a derived projection is rebuilt from its authority
-    // rather than recovered from its own bytes (#1946).
-    let mut flags = match durability {
-        PublishDurability::Durable => MOVEFILE_WRITE_THROUGH,
-        PublishDurability::DerivedProjection => 0,
-    };
+    // MOVEFILE_WRITE_THROUGH blocks until the move reaches the disk.
+    let mut flags = MOVEFILE_WRITE_THROUGH;
     if mode == PublishMode::ReplaceExisting {
         flags |= MOVEFILE_REPLACE_EXISTING;
     }
