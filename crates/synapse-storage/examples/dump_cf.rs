@@ -54,7 +54,7 @@ use synapse_storage::{
     dump_cf_read_only_with_expired, scan_cf_read_only_with_expired,
 };
 
-const USAGE: &str = "usage: dump_cf --ensemble-card <db_path> <panel_version> <anchor_kind> <max_records> <min_gate_lenses> | dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path> | dump_cf --slot-kind-census <db_path> <panel_version>";
+const USAGE: &str = "usage: dump_cf --count-key-prefix <db_path> <cf_name> <key_prefix> [key_substring] | dump_cf --ensemble-card <db_path> <panel_version> <anchor_kind> <max_records> <min_gate_lenses> | dump_cf [--include-expired] <db_path> <cf_name> | dump_cf --native-cx [--reveal-metadata] <db_path> <cx_id> | dump_cf --native-source [--reveal-metadata] <db_path> <source_cf> <source_key_hex> | dump_cf --repair-bad-episode-slots <db_path> | dump_cf --panel-slot-audit <db_path> | dump_cf --migrate-pre-1776-slots [--resume] [--skip-unreproducible] <db_path> | dump_cf --check-base-roundtrip <db_path> | dump_cf --audit-slot-hashes [--repair] <db_path> | dump_cf --audit-source-coverage <db_path> | dump_cf --slot-kind-census <db_path> <panel_version>";
 /// The episode panel's exclusive global slot block (#1776). The
 /// `--repair-bad-episode-slots` mode exists for episode constellations that
 /// historically wrote slots outside it; under the global allocation that is
@@ -125,6 +125,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             &source_cf,
             &source_key_hex,
             reveal_metadata,
+        );
+    }
+    if args.first().is_some_and(|arg| arg == "--count-key-prefix") {
+        args.remove(0);
+        let mut args = args.into_iter();
+        let db_path = args.next().ok_or(USAGE)?;
+        let cf_name = args.next().ok_or(USAGE)?;
+        let prefix = args.next().ok_or(USAGE)?;
+        let contains = args.next();
+        if let Some(extra) = args.next() {
+            return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
+        }
+        return count_key_prefix(
+            PathBuf::from(db_path),
+            &cf_name,
+            &prefix,
+            contains.as_deref(),
         );
     }
     if args
@@ -308,6 +325,62 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
     }
+    Ok(())
+}
+
+/// Counts the physically present rows of one logical CF whose key starts with
+/// `prefix`, optionally also containing `contains`.
+///
+/// Exists because a counter maintained by the process under test is not
+/// evidence about that process. #1936's drain reports `committed=N`; this reads
+/// the rows off disk with the daemon stopped and says whether N of them are
+/// actually there. Keys are matched as UTF-8 because every Synapse logical key
+/// is a printable path-shaped string; a key that is not valid UTF-8 is counted
+/// as a non-match and reported, never silently skipped.
+///
+/// Expired rows are included: a row past its TTL is still physically present,
+/// and for a "did the write land" question that is the honest answer.
+fn count_key_prefix(
+    db_path: PathBuf,
+    cf_name: &str,
+    prefix: &str,
+    contains: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let rows = scan_cf_read_only_with_expired(
+        &db_path,
+        synapse_core::SCHEMA_VERSION,
+        StorageBackendKind::Calyx,
+        cf_name,
+        true,
+    )?;
+    let mut matched = 0usize;
+    let mut prefix_only = 0usize;
+    let mut non_utf8 = 0usize;
+    for (key, _) in &rows {
+        let Ok(text) = std::str::from_utf8(key) else {
+            non_utf8 = non_utf8.saturating_add(1);
+            continue;
+        };
+        if !text.starts_with(prefix) {
+            continue;
+        }
+        prefix_only = prefix_only.saturating_add(1);
+        if contains.is_none_or(|needle| text.contains(needle)) {
+            matched = matched.saturating_add(1);
+        }
+    }
+    let mut stdout = io::stdout().lock();
+    write_stdout_line(
+        &mut stdout,
+        format_args!(
+            "count_key_prefix db={} cf={cf_name} rows_in_cf={} prefix={prefix:?} \
+             rows_with_prefix={prefix_only} contains={contains:?} rows_matched={matched} \
+             keys_not_utf8={non_utf8}",
+            db_path.display(),
+            rows.len()
+        ),
+    )?;
+    stdout.flush()?;
     Ok(())
 }
 
