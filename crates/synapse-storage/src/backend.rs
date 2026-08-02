@@ -3441,15 +3441,25 @@ impl StorageBackend for CalyxBackend {
         after_physical: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<constellations::TemporalMetadataBackfillReport> {
+        // Every panel whose constellation can be rebuilt from one authoritative
+        // source row. `builtin_panel_catalog`'s `backfill_source_cf` must name
+        // exactly this set: a panel that declares a path this match rejects
+        // would report a backfill as available and then fail every attempt
+        // (#1965).
         if !matches!(
             source_cf,
-            cf::CF_TIMELINE | cf::CF_EPISODES | cf::CF_AGENT_TRANSCRIPTS
+            cf::CF_TIMELINE
+                | cf::CF_EPISODES
+                | cf::CF_AGENT_TRANSCRIPTS
+                | cf::CF_AGENT_EVENTS
+                | cf::CF_ACTION_LOG
+                | cf::CF_REFLEX_AUDIT
+                | cf::CF_PROCESS_HISTORY
         ) {
             return Err(StorageError::BackendInvalidConfig {
                 value: source_cf.to_owned(),
-                detail:
-                    "temporal metadata backfill accepts only CF_TIMELINE, CF_EPISODES, or CF_AGENT_TRANSCRIPTS"
-                        .to_owned(),
+                detail: "temporal metadata backfill accepts only CF_TIMELINE, CF_EPISODES,                          CF_AGENT_TRANSCRIPTS, CF_AGENT_EVENTS, CF_ACTION_LOG, CF_REFLEX_AUDIT                          or CF_PROCESS_HISTORY"
+                    .to_owned(),
             });
         }
         if source_key.is_some() && after_physical.is_some() {
@@ -3490,11 +3500,7 @@ impl StorageBackend for CalyxBackend {
                         vault_id: vault.vault_id_value(),
                         cx_id: vault.cx_id_for_input(
                             &raw,
-                            match source_cf {
-                                cf::CF_TIMELINE => SYN_TIMELINE_PANEL_VERSION,
-                                cf::CF_EPISODES => SYN_EPISODE_PANEL_VERSION,
-                                _ => SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
-                            },
+                            backfill_panel_version(source_cf)?,
                         ),
                         created_at_ms: calyx_clock_now_for_write(vault, source_cf)?,
                         next_ledger_seq: vault.latest_seq().saturating_add(1),
@@ -3526,10 +3532,39 @@ impl StorageBackend for CalyxBackend {
                         // timeline panel used. The panel is spawn-keyed and by
                         // far the largest on the vault, so it is only ever
                         // reached through the paginated cursor.
-                        _ => {
+                        cf::CF_AGENT_TRANSCRIPTS => {
                             let record: AgentTranscriptRecord = serde_json::from_slice(&raw)
                                 .map_err(|error| decode_failed(&error, "agent transcript"))?;
                             constellations::build_agent_transcript_constellation(
+                                context, &key, &raw, &record,
+                            )?
+                        }
+                        cf::CF_AGENT_EVENTS => {
+                            let record: AgentEventRecord = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "agent event"))?;
+                            constellations::build_agent_event_constellation(
+                                context, &key, &raw, &record,
+                            )?
+                        }
+                        cf::CF_ACTION_LOG => {
+                            let record: Value = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "action"))?;
+                            constellations::build_action_constellation(context, &key, &raw, &record)?
+                        }
+                        cf::CF_REFLEX_AUDIT => {
+                            let record: StoredReflexAudit = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "reflex audit"))?;
+                            constellations::build_reflex_audit_constellation(
+                                context, &key, &raw, &record,
+                            )?
+                        }
+                        // Exhaustive over the guard above, so a CF added there
+                        // without a builder here is a compile-visible omission
+                        // rather than a silent mis-measurement.
+                        _ => {
+                            let record: Value = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "process"))?;
+                            constellations::build_process_constellation(
                                 context, &key, &raw, &record,
                             )?
                         }
@@ -9693,5 +9728,28 @@ fn open_failed_detail_with_backend(
     StorageError::OpenFailed {
         path: path.to_path_buf(),
         detail,
+    }
+}
+
+/// The active panel generation a source CF's constellations are measured at.
+///
+/// Kept as one fail-closed lookup rather than an inline `match` with a `_`
+/// fallback: a wrong panel version here computes a different `cx_id` for the
+/// same row, so the backfill would write a *second* constellation instead of
+/// re-measuring the existing one, and the coverage readback would climb while
+/// the old rows stayed stranded (#1965).
+fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {
+    match source_cf {
+        cf::CF_TIMELINE => Ok(SYN_TIMELINE_PANEL_VERSION),
+        cf::CF_EPISODES => Ok(SYN_EPISODE_PANEL_VERSION),
+        cf::CF_AGENT_TRANSCRIPTS => Ok(SYN_AGENT_TRANSCRIPT_PANEL_VERSION),
+        cf::CF_AGENT_EVENTS => Ok(SYN_AGENT_EVENT_PANEL_VERSION),
+        cf::CF_ACTION_LOG => Ok(SYN_ACTION_PANEL_VERSION),
+        cf::CF_REFLEX_AUDIT => Ok(SYN_REFLEX_PANEL_VERSION),
+        cf::CF_PROCESS_HISTORY => Ok(SYN_PROCESS_PANEL_VERSION),
+        other => Err(StorageError::BackendInvalidConfig {
+            value: other.to_owned(),
+            detail: "no active panel generation is declared for this backfill source CF".to_owned(),
+        }),
     }
 }
