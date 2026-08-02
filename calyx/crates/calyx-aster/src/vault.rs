@@ -1013,6 +1013,17 @@ where
         self.rows.scan_cf_latest(cf)
     }
 
+    /// Counts visible rows in one CF at the latest committed state.
+    ///
+    /// Equal to `scan_cf_latest(cf)?.len()` without materialising any value
+    /// (#1952). Prefer this wherever only the count is wanted: `scan_cf_latest`
+    /// holds the vault-wide row-table read guard for the whole scan, and #1950
+    /// measured that hold reaching 1.4 s on this CF set, which stalls every
+    /// committing writer for the duration.
+    pub fn count_cf_latest(&self, cf: ColumnFamily) -> Result<usize> {
+        self.rows.count_cf_latest(cf)
+    }
+
     /// Scans visible raw CF rows in a key range at `snapshot`.
     pub fn scan_cf_range_at(
         &self,

@@ -41,6 +41,19 @@ impl VersionedCfStore {
         })
     }
 
+    /// Counts the visible rows of one CF from one atomic view of the latest
+    /// committed state, without materialising the rows (#1952).
+    ///
+    /// Equal by construction to `scan_cf_latest(cf)?.len()` — same view, same
+    /// merge, same tombstone handling — and that equality is the contract these
+    /// callers depend on, because they use the count as physical evidence that
+    /// a write landed.
+    pub fn count_cf_latest(&self, cf: ColumnFamily) -> Result<usize> {
+        self.with_latest_view("count_cf_latest", |seq, table, router, barriers| {
+            latest_row_count_from_view(seq, table, router, cf, barriers)
+        })
+    }
+
     /// Scans one CF range from one atomic view of the latest committed state.
     pub fn scan_cf_range_latest(
         &self,
@@ -642,6 +655,62 @@ fn latest_rows_from_view(
         ensure_view_key_unbarriered(barriers, cf, key)?;
     }
     Ok(rows.into_iter().collect())
+}
+
+/// Counts the visible rows of one CF from an atomic latest view, without
+/// materialising a single value into the result.
+///
+/// Line-for-line the same merge as [`latest_rows_from_view`] — same router
+/// source, same `is_tombstone_value` filter, same table overlay with
+/// `Live` inserting and `Tombstone` removing, same barrier check over the
+/// surviving keys. The only difference is that it accumulates a
+/// `BTreeSet<Vec<u8>>` of keys instead of a `BTreeMap<Vec<u8>, Vec<u8>>` and
+/// returns the length.
+///
+/// That difference is the point (#1952). Fourteen call sites were written as
+/// `scan_cf_latest(cf)?.len()`, which builds a full key/value map and then a
+/// `Vec<(Vec<u8>, Vec<u8>)>` of every row in the CF purely to read `.len()`.
+/// The values are the expensive part — these are panels of dense slot vectors —
+/// and every one of them was cloned twice and dropped. On the live vault `Base`
+/// holds ~96,845 rows.
+///
+/// It does **not** avoid reading values: tombstone status is only knowable from
+/// the value, so `router.iter_cf` still produces them. The honest description of
+/// the win is "two fewer copies of every value", not "fewer bytes read". A
+/// keys-only router path would be needed for the latter, and would be wrong
+/// here — see #1954, where `range_keys_until` cannot see a flushed tombstone.
+fn latest_row_count_from_view(
+    seq: Seq,
+    table: &RowTable,
+    router: Option<&CfRouter>,
+    cf: ColumnFamily,
+    barriers: &[ReadBarrier],
+) -> Result<usize> {
+    let mut keys = router
+        .map(|router| router.iter_cf(cf))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| (!is_tombstone_value(&row.value)).then_some(row.key))
+        .collect::<BTreeSet<_>>();
+
+    if let Some(cf_rows) = table.get(&cf) {
+        for (key, versions) in cf_rows {
+            match visible_value_state(versions, seq) {
+                Some(VisibleValue::Live(_)) => {
+                    keys.insert(key.clone());
+                }
+                Some(VisibleValue::Tombstone) => {
+                    keys.remove(key);
+                }
+                None => {}
+            }
+        }
+    }
+    for key in &keys {
+        ensure_view_key_unbarriered(barriers, cf, key)?;
+    }
+    Ok(keys.len())
 }
 
 struct LatestRangePageRequest<'a> {

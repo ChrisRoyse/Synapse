@@ -467,7 +467,7 @@ impl SynapseCalyxVault {
             self.write_cf_batch(writes)?;
             self.flush()?;
         }
-        let reactive_cf_rows_after = self.scan_cf_latest(ColumnFamily::Reactive)?.len();
+        let reactive_cf_rows_after = self.count_cf_latest(ColumnFamily::Reactive)?;
 
         Ok(SynapseCalyxPanelDriftReport {
             panel_version: params.panel_version,

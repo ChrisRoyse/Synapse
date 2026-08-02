@@ -5373,6 +5373,24 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("scan latest Calyx CF", &error))
     }
 
+    /// Counts visible raw CF rows from one atomic latest committed view.
+    ///
+    /// Equal to `scan_cf_latest(cf)?.len()` without materialising any value
+    /// (#1952). Use this for the readback counts that prove a write landed:
+    /// `scan_cf_latest` holds the vault-wide row-table read guard for its whole
+    /// scan, and #1950 measured that hold reaching 1.4 s, which stalls every
+    /// committing writer for the duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if a row is blocked by a read
+    /// barrier or the latest physical serving view cannot be read.
+    pub fn count_cf_latest(&self, cf: ColumnFamily) -> Result<usize, SynapseCalyxError> {
+        self.vault
+            .count_cf_latest(cf)
+            .map_err(|error| SynapseCalyxError::from_calyx("count latest Calyx CF", &error))
+    }
+
     /// Scans visible raw CF rows in a key range at a numeric snapshot.
     ///
     /// # Errors

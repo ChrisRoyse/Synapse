@@ -654,7 +654,7 @@ impl SynapseCalyxVault {
         } else {
             (0, false)
         };
-        let guard_cf_rows_after = self.scan_cf_latest(ColumnFamily::Guard)?.len();
+        let guard_cf_rows_after = self.count_cf_latest(ColumnFamily::Guard)?;
 
         Ok(SynapseCalyxGuardCalibrateReport {
             panel_version: params.panel_version,
