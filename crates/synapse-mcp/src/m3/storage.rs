@@ -1131,6 +1131,17 @@ pub struct StorageIntelligenceParams {
     /// inverted window fails closed rather than returning zero records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ts_ns: Option<i64>,
+    /// Panel slots to withhold from the measurement.
+    ///
+    /// This is the remediation the #1958 structural anchor-leakage refusal
+    /// names: a lens whose declared source fields are among the fields that
+    /// determine the anchor makes the measurement circular, and `sufficiency`
+    /// and `ensemble_card` fail closed until it is withheld. Without this knob
+    /// the refusal would be unliftable from the facade — a permanently
+    /// unmeasurable panel, which is the failure #1958 explicitly warns is worse
+    /// than the leak.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_slots: Vec<u32>,
     /// Minimum lenses the A37 associational-diversity gate needs before it can
     /// return a verdict (`ensemble_card` only). Below this the card reports the
     /// gate as not evaluated rather than guessing from too few lenses.
@@ -2991,6 +3002,20 @@ fn assay_params(
     assay.max_records = clamp_intelligence_records(params.max_records);
     if let Some(ksg_k) = params.ksg_k {
         assay.ksg_k = ksg_k as usize;
+    }
+    // #1958's refusal names `excluded_slots` as its remediation, so the facade
+    // has to be able to express it. A refusal a caller cannot lift is not a
+    // guard, it is an outage.
+    for slot in &params.excluded_slots {
+        let slot = u16::try_from(*slot).map_err(|_| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "excluded_slots entry {slot} exceeds the u16 panel slot range; a slot id                      that cannot exist would silently withhold nothing"
+                ),
+            )
+        })?;
+        assay.excluded_slots.insert(slot);
     }
     Ok(assay)
 }
