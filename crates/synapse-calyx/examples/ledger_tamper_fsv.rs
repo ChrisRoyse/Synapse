@@ -60,7 +60,13 @@ fn open_readonly(
     salt: Vec<u8>,
 ) -> Result<AsterVault, Box<dyn Error>> {
     let options = VaultOptions {
-        read_only: true,
+        // NOT read_only. `open.rs` sets `durable: None` for a read-only
+        // handle, and `head_anchor()` returns None when durable is None -- so
+        // `verify_ledger_chain` on a read-only vault verifies an EMPTY chain
+        // and returns `Intact { count: 0 }`. That is a fail-open in a
+        // verification primitive and is filed separately; this harness opens
+        // the disposable backup writable so the chain is actually there.
+        read_only: false,
         restore_mvcc_rows: true,
         restore_ledger_hook: true,
         eager_router_lookup_on_open: false,
