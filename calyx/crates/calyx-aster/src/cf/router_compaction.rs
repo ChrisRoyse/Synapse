@@ -9,12 +9,12 @@ use std::fs;
 impl CfRouter {
     /// Collapses each listed CF to one newest router-domain SST and removes
     /// tombstone rows after the replacement is durable.
-    pub fn compact_tombstoned_cfs(&mut self, cfs: &[ColumnFamily]) -> Result<()> {
+    pub fn compact_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
         self.compact_tombstoned_cfs_at(cfs, NO_COMMIT_DOMAIN)
     }
 
     pub(crate) fn compact_tombstoned_cfs_at(
-        &mut self,
+        &self,
         cfs: &[ColumnFamily],
         commit_watermark: u64,
     ) -> Result<()> {
@@ -31,8 +31,14 @@ impl CfRouter {
         Ok(())
     }
 
-    fn compact_tombstoned_cf(&mut self, cf: ColumnFamily, commit_watermark: u64) -> Result<()> {
-        let Some(level) = self.levels.get(&cf) else {
+    fn compact_tombstoned_cf(&self, cf: ColumnFamily, commit_watermark: u64) -> Result<()> {
+        // One shard's write guard, held across the rewrite. The SST write here
+        // is genuinely exclusive: it replaces this CF's whole level, so a
+        // concurrent seal installing into the old level would be discarded by
+        // the swap. Only this column family's shard is held, so every other CF
+        // keeps both reading and committing throughout (#1950).
+        let mut shard = self.write_shard(cf)?;
+        let Some(level) = shard.levels.get(&cf) else {
             return Ok(());
         };
         let input_paths = level.file_paths_newest_first();
@@ -44,7 +50,7 @@ impl CfRouter {
             .into_iter()
             .filter(|entry| !is_tombstone_value(&entry.value))
             .collect::<Vec<_>>();
-        let ordinal = usize::try_from(self.next_sequence(cf)).map_err(|_| {
+        let ordinal = usize::try_from(shard.next_sequence(cf)).map_err(|_| {
             CalyxError::aster_corrupt_shard(format!(
                 "router compaction ordinal for {} exceeds the platform usize range",
                 cf.name()
@@ -60,7 +66,7 @@ impl CfRouter {
                 .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
         )?;
         let replacement = SstLevel::from_oldest_first_with_lookup([output.clone()])?;
-        self.levels.insert(cf, replacement);
+        shard.levels.insert(cf, replacement);
 
         for input in input_paths {
             if input == output {

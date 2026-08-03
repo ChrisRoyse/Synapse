@@ -31,8 +31,7 @@ impl VersionedCfStore {
     }
 
     pub fn compact_router_tombstoned_cfs(&self, cfs: &[ColumnFamily]) -> Result<()> {
-        let mut router = self.router.write().expect("mvcc router poisoned");
-        let Some(router) = router.as_mut() else {
+        let Some(router) = self.router.as_ref() else {
             return Err(CalyxError {
                 code: "CALYX_ASTER_COMPACTION_UNAVAILABLE",
                 message: "tombstone compaction requires a physical CF router".to_string(),

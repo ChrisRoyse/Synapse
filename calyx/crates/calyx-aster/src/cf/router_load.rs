@@ -3,7 +3,7 @@
 //! flush-ordinal counter.
 
 use super::ColumnFamily;
-use super::router::CfRouter;
+use super::router::{CfRouter, RouterShard};
 use crate::sst::level::SstLevel;
 use crate::storage_names::{
     SstName, classify_sst, ensure_unambiguous_sst_order, parse_cf_dir_name, sst_order_key,
@@ -18,7 +18,7 @@ const ROUTER_LOAD_PROGRESS_FILE_INTERVAL: usize = 10_000;
 
 impl CfRouter {
     pub(super) fn load_existing_with_lookup_policy(
-        &mut self,
+        &self,
         eager_lookup_on_open: bool,
     ) -> Result<()> {
         let started_at = Instant::now();
@@ -73,11 +73,18 @@ impl CfRouter {
                 by_cf.entry(cf).or_default().extend(files);
             }
         }
+        // A cold open discovers its column families from the filesystem, so
+        // the lock set is not known until here — every shard, in index order.
+        // This runs single-threaded at open; the exclusivity costs nothing and
+        // keeps the "one writer installs a level" invariant total (#1950).
+        let mut guards = self.write_all_shards()?;
         let mut cfs_loaded = 0_usize;
         let mut sst_files_loaded = 0_usize;
         for (cf, files) in by_cf {
             let file_count = files.len();
+            let shard = guards.shard_mut(cf)?;
             self.load_cf_level(
+                shard,
                 cf,
                 files,
                 should_build_eager_lookup_on_open(cf, eager_lookup_on_open),
@@ -111,7 +118,7 @@ impl CfRouter {
     }
 
     pub(crate) fn load_existing_cfs_with_lookup_policy(
-        &mut self,
+        &self,
         cfs: &[ColumnFamily],
         eager_lookup_on_open: bool,
     ) -> Result<()> {
@@ -127,7 +134,7 @@ impl CfRouter {
     /// physical `remove_file` calls can run after the exclusive router lock is
     /// released instead of inside it (issue #1806).
     pub(crate) fn load_existing_cfs_excluding(
-        &mut self,
+        &self,
         cfs: &[ColumnFamily],
         eager_lookup_on_open: bool,
         excluded: &BTreeSet<PathBuf>,
@@ -184,6 +191,11 @@ impl CfRouter {
                 }
             }
         }
+        // Exactly the named families' shards, held for the whole load. This
+        // is what `retire_then_purge_cf_inputs` needs in order to drain every
+        // in-flight SST mapping for the CFs whose files it is about to unlink;
+        // readers of any other family are untouched (#1806, #1950).
+        let mut guards = self.write_shards_for(cfs.iter().copied())?;
         let mut cfs_loaded = 0_usize;
         let mut sst_files_loaded = 0_usize;
         for cf in cfs {
@@ -193,7 +205,8 @@ impl CfRouter {
             // every selected surface be pageable. The full-vault policy below
             // remains selective to avoid retaining every low-volume index.
             let retain_lookup = *cf == ColumnFamily::Kv || eager_lookup_on_open;
-            self.load_cf_level(*cf, files, retain_lookup)?;
+            let shard = guards.shard_mut(*cf)?;
+            self.load_cf_level(shard, *cf, files, retain_lookup)?;
             cfs_loaded += 1;
             sst_files_loaded = sst_files_loaded.saturating_add(file_count);
             tracing::debug!(
@@ -224,8 +237,14 @@ impl CfRouter {
         Ok(())
     }
 
+    /// Installs one CF's level through a shard guard the caller already holds.
+    ///
+    /// Takes the guard rather than acquiring one so the whole selected-CF load
+    /// is a single exclusive window per shard, which is what makes the
+    /// retire-then-purge ordering safe.
     fn load_cf_level(
-        &mut self,
+        &self,
+        shard: &mut RouterShard,
         cf: ColumnFamily,
         mut files: Vec<PathBuf>,
         retain_lookup: bool,
@@ -245,16 +264,14 @@ impl CfRouter {
             .max()
             .unwrap_or(0)
             + 1;
-        self.ensure_cf(cf)?;
-        self.levels.insert(
-            cf,
-            if retain_lookup {
-                SstLevel::from_oldest_first_with_lookup(files)?
-            } else {
-                SstLevel::from_oldest_first(files)
-            },
-        );
-        self.next_file.insert(cf, next);
+        let level = if retain_lookup {
+            SstLevel::from_oldest_first_with_lookup(files)?
+        } else {
+            SstLevel::from_oldest_first(files)
+        };
+        shard.ensure_cf(&self.config, cf)?;
+        shard.levels.insert(cf, level);
+        shard.next_file.insert(cf, next);
         Ok(())
     }
 }

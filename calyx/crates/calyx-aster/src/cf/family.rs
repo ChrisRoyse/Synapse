@@ -285,6 +285,74 @@ impl ColumnFamily {
         matches!(self, Self::Slot { .. })
     }
 
+    /// Which lock shard owns this family's state, in `0..`[`SHARDS`].
+    ///
+    /// Total and deterministic: every column family maps to exactly one shard,
+    /// and the same family always maps to the same one. That is what lets a
+    /// reader take exactly one lock and a multi-family writer order its
+    /// acquisitions so two writers can never deadlock (#1950).
+    ///
+    /// **Positional for the static families, not hashed, and that is the
+    /// point.** A generic hash-into-N-shards scheme would put some pair of
+    /// column families in the same shard deterministically and forever; if that
+    /// pair happened to be [`Self::Base`] and [`Self::Kv`], the cross-family
+    /// stall this exists to remove would reproduce in full with no way to tell
+    /// from the outside. Giving every static family its own shard makes "a
+    /// `Base` scan cannot block a `Kv` commit" a property of the construction
+    /// rather than of the hash.
+    ///
+    /// Slot ids are `u16`, so those cannot each get a shard and are hashed into
+    /// a fixed pool instead. Two slot families colliding is acceptable in a way
+    /// a `Base`/`Kv` collision is not: slot writes arrive together in one batch
+    /// already, and every slot scan is panel-scoped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-`Slot` variant is missing from [`Self::STATIC`].
+    /// Unreachable by construction — `ColumnFamily` is a closed enum whose only
+    /// non-`STATIC` variant is `Slot`, matched here — but routing an unknown
+    /// variant to a shared shard silently would reintroduce exactly the coarse
+    /// locking this removed, so it is loud instead.
+    #[must_use]
+    pub fn shard_index(self) -> usize {
+        match self {
+            Self::Slot { slot, kind } => {
+                let kind_bit = match kind {
+                    SlotFamilyKind::Quantized => 0_usize,
+                    SlotFamilyKind::Raw => 1,
+                };
+                // `slot * 2 + kind` is dense and collision-free before the
+                // modulo, so the pool is used evenly without hashing.
+                Self::STATIC_SHARDS + ((usize::from(slot.get()) * 2 + kind_bit) % Self::SLOT_SHARDS)
+            }
+            static_cf => Self::STATIC
+                .iter()
+                .position(|candidate| *candidate == static_cf)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "column family {} is neither Slot nor a member of ColumnFamily::STATIC; add it to STATIC so it gets its own lock shard (#1950)",
+                        static_cf.name()
+                    )
+                }),
+        }
+    }
+
+    /// One shard per static column family, assigned by position in
+    /// [`Self::STATIC`]. See [`Self::shard_index`].
+    pub const STATIC_SHARDS: usize = Self::STATIC.len();
+
+    /// Shards shared by `Slot { .. }` families. See [`Self::shard_index`].
+    pub const SLOT_SHARDS: usize = 16;
+
+    /// Total lock shards. Fixed at compile time, so a shard index is a pure
+    /// function of the column family and there is no outer lock to take.
+    ///
+    /// That absence is load-bearing. The obvious alternative — a map of column
+    /// family to `Arc<RwLock<_>>` — requires holding an outer read guard while
+    /// acquiring an inner one, and `std::sync::RwLock` is task-fair: a reader
+    /// blocks when a writer is queued, so the nested acquisition can deadlock.
+    pub const SHARDS: usize = Self::STATIC_SHARDS + Self::SLOT_SHARDS;
+
     /// Returns true for raw f32 sidecar slot CFs.
     pub const fn is_raw_slot(&self) -> bool {
         matches!(

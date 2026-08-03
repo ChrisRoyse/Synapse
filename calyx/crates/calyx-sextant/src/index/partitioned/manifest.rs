@@ -115,7 +115,7 @@ pub(super) fn default_rng_factor() -> f32 {
 
 pub(super) fn write_manifest_db(root: &Path, manifest: &PartitionedManifest) -> Result<()> {
     let value = encode_manifest(manifest)?;
-    let mut router = CfRouter::open(root, CF_MEMTABLE_CAP)?;
+    let router = CfRouter::open(root, CF_MEMTABLE_CAP)?;
     router.put(ColumnFamily::Graph, MANIFEST_DB_KEY, &value)?;
     router.flush_cf(ColumnFamily::Graph)?;
     drop(router);

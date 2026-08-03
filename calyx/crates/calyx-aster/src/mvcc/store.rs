@@ -58,7 +58,12 @@ pub struct MvccCommitTimings {
     ///
     /// `None` when the platform cannot report thread CPU time.
     pub locked_cpu_us: Option<u64>,
-    /// Waiting for the router write lock, with the row lock already held.
+    /// Waiting for router **shard** write guards, summed over the batch's rows.
+    ///
+    /// Was the wait for one vault-wide router `RwLock`; the router is sharded
+    /// per column family now, so this is the sum of the per-row shard waits
+    /// inside the apply loop rather than one acquisition before it (#1950).
+    /// Subtracted out of `router_apply_us` so the stage partition stays exact.
     pub router_lock_wait_us: u64,
     /// Search-panel attribution, which may read the router's latest view.
     pub panel_attribution_us: u64,
@@ -211,33 +216,13 @@ type VersionChain = Vec<VersionedValue>;
 /// `table.get(&cf)` exactly as it always did.
 type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
 
-/// One shard per static column family, assigned by position in
-/// [`ColumnFamily::STATIC`].
+/// Row-table shards, one per [`ColumnFamily::shard_index`].
 ///
-/// **Positional, not hashed, and that is the point.** A generic
-/// hash-into-N-shards scheme would put some pair of column families in the same
-/// shard deterministically and forever; if that pair happened to be `Base` and
-/// `Kv`, #1950 would reproduce in full with no way to tell from the outside.
-/// Giving every static family its own shard makes "a `Base` scan cannot block a
-/// `Kv` commit" a property of the construction rather than of the hash.
-const ROW_STATIC_SHARDS: usize = ColumnFamily::STATIC.len();
-
-/// Shards shared by `Slot { .. }` families.
-///
-/// Slot ids are `u16`, so these cannot each get a shard the way the static
-/// families do. They are hashed into a fixed pool instead. Two slot families
-/// colliding is acceptable in a way a `Base`/`Kv` collision is not: slot writes
-/// arrive together in one batch already, and every slot scan is panel-scoped.
-const ROW_SLOT_SHARDS: usize = 16;
-
-/// Total shards. Fixed at construction and never resized, so the shard index is
-/// a pure function of the column family and there is no outer lock to take.
-///
-/// That absence is load-bearing. The obvious alternative — a map of column
-/// family to `Arc<RwLock<_>>` — requires holding an outer read guard while
-/// acquiring an inner one, and `std::sync::RwLock` is task-fair: a reader
-/// blocks when a writer is queued, so the nested acquisition can deadlock.
-const ROW_SHARDS: usize = ROW_STATIC_SHARDS + ROW_SLOT_SHARDS;
+/// The same shard map the CF router uses, deliberately: a commit takes the row
+/// shard and then the router shard for the same column family, so sharing one
+/// map means a commit to `Kv` contends with a reader of `Kv` at both layers and
+/// with a reader of `Base` at neither (#1950).
+const ROW_SHARDS: usize = ColumnFamily::SHARDS;
 
 /// The row table's shards, allocated once at construction.
 fn new_row_shards() -> Vec<RwLock<RowTable>> {
@@ -247,36 +232,8 @@ fn new_row_shards() -> Vec<RwLock<RowTable>> {
 }
 
 /// Which shard owns a column family's rows.
-///
-/// Total and deterministic: every column family maps to exactly one shard, and
-/// the same family always maps to the same one, which is what lets a multi-CF
-/// writer order its acquisitions and lets a reader take exactly one lock.
 fn row_shard_index(cf: ColumnFamily) -> usize {
-    match cf {
-        ColumnFamily::Slot { slot, kind } => {
-            let kind_bit = match kind {
-                crate::cf::SlotFamilyKind::Quantized => 0_usize,
-                crate::cf::SlotFamilyKind::Raw => 1,
-            };
-            // `slot * 2 + kind` is dense and collision-free before the modulo,
-            // so the pool is used evenly without hashing.
-            ROW_STATIC_SHARDS + ((usize::from(slot.get()) * 2 + kind_bit) % ROW_SLOT_SHARDS)
-        }
-        static_cf => ColumnFamily::STATIC
-            .iter()
-            .position(|candidate| *candidate == static_cf)
-            .unwrap_or_else(|| {
-                // Unreachable by construction: `ColumnFamily` is a closed enum
-                // whose only non-STATIC variant is `Slot`, matched above. If a
-                // variant is ever added and left out of STATIC, routing it to a
-                // shared shard silently would reintroduce exactly the coarse
-                // locking #1950 removed, so it is loud instead.
-                panic!(
-                    "column family {} is neither Slot nor a member of ColumnFamily::STATIC; add it to STATIC so it gets its own row-table shard (#1950)",
-                    static_cf.name()
-                )
-            }),
-    }
+    cf.shard_index()
 }
 
 /// How long a row-table **read** guard may be held before it is reported.
@@ -811,7 +768,15 @@ pub struct VersionedCfStore {
     ///
     /// Fixed length, allocated once, never resized.
     rows: Vec<RwLock<RowTable>>,
-    router: RwLock<Option<CfRouter>>,
+    /// The CF router, or `None` for a store with no physical projection.
+    ///
+    /// Behind **no lock**. It was `RwLock<Option<CfRouter>>`, and that lock was
+    /// never guarding the `Option` — nothing replaces it after construction —
+    /// it existed only because every `CfRouter` method took `&mut self`. The
+    /// router shards its own state per column family now, so the outer lock was
+    /// pure contention: it serialised a `Kv` commit against a `Base` scan that
+    /// shared nothing with it (#1950).
+    router: Option<CfRouter>,
     router_latest_readback: AtomicBool,
     /// Earliest sequence after which the in-memory MVCC version chains are a
     /// complete changed-key journal. Latest-only recovery serves older
@@ -948,7 +913,7 @@ impl VersionedCfStore {
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: new_row_shards(),
-            router: RwLock::new(None),
+            router: None,
             router_latest_readback: AtomicBool::new(false),
             changed_key_history_floor: 0,
             router_eager_lookup_on_refresh: AtomicBool::new(true),
@@ -978,7 +943,7 @@ impl VersionedCfStore {
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: new_row_shards(),
-            router: RwLock::new(Some(router)),
+            router: Some(router),
             router_latest_readback: AtomicBool::new(router_latest_readback),
             changed_key_history_floor: if router_latest_readback { start_seq } else { 0 },
             router_eager_lookup_on_refresh: AtomicBool::new(eager_lookup_on_refresh),
@@ -1026,8 +991,13 @@ impl VersionedCfStore {
     /// then purge the now-unreferenced files with no lock held.
     ///
     /// Safety of the ordering rests on two facts:
-    /// 1. Readers hold the router **read** lock across their SST reads, so
-    ///    taking the write lock drains every in-flight mapping.
+    /// 1. Readers hold the router **shard** read lock across their SST reads,
+    ///    so taking that shard for write drains every in-flight mapping. The
+    ///    router is sharded per column family now (#1950), and this argument
+    ///    survives it only because the refresh below takes the write guard for
+    ///    exactly the CFs being reclaimed, and because every read path holds
+    ///    its shard guard across the reads rather than snapshotting the level
+    ///    and releasing early.
     /// 2. After the swap the retired paths are absent from every level, so no
     ///    reader can newly open them.
     ///
@@ -1056,10 +1026,9 @@ impl VersionedCfStore {
         // the router lock released, which is the entire point of the split.
         let lock_wait_started = Instant::now();
         let (lock_wait_ms, held_ms) = {
-            let mut guard = self.router.write().expect("mvcc router poisoned");
             let lock_wait_ms = lock_wait_started.elapsed().as_millis();
             let held_started = Instant::now();
-            let Some(router) = guard.as_mut() else {
+            let Some(router) = self.router.as_ref() else {
                 return Err(CalyxError::aster_corrupt_shard(format!(
                     "{operation}: physical SST reclaim requires a live CF router; cfs={cf_names}"
                 )));
@@ -1132,8 +1101,7 @@ impl VersionedCfStore {
             .collect::<Vec<_>>()
             .join(",");
         let started_at = std::time::Instant::now();
-        let mut router = self.router.write().expect("mvcc router poisoned");
-        let Some(router) = router.as_mut() else {
+        let Some(router) = self.router.as_ref() else {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "{operation}: physical SST reclaim requires a live CF router; cfs={cf_names}"
             )));
@@ -1217,8 +1185,7 @@ impl VersionedCfStore {
 
     /// Lists the physical `SlotId`s present as `cf/slot_*` directories.
     pub(crate) fn present_slot_cf_ids(&self) -> Result<BTreeSet<SlotId>> {
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
+        let Some(router) = self.router.as_ref() else {
             return Err(CalyxError::aster_corrupt_shard(
                 "slot CF enumeration requires a live CF router",
             ));
@@ -1236,8 +1203,7 @@ impl VersionedCfStore {
         operation: &'static str,
     ) -> Result<RetiredCfPhysical> {
         let started_at = Instant::now();
-        let mut router = self.router.write().expect("mvcc router poisoned");
-        let Some(router) = router.as_mut() else {
+        let Some(router) = self.router.as_ref() else {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "{operation}: physical CF retire requires a live CF router"
             )));
@@ -1496,8 +1462,7 @@ impl VersionedCfStore {
 
     /// Live memtable byte-cap status shared with resource readback.
     pub fn memtable_status(&self) -> MemtableStatus {
-        let router = self.router.read().expect("mvcc router poisoned");
-        let Some(router) = router.as_ref() else {
+        let Some(router) = self.router.as_ref() else {
             return MemtableStatus::default();
         };
         let per_cf = router
@@ -1528,8 +1493,6 @@ impl VersionedCfStore {
         V: AsRef<[u8]>,
     {
         self.router
-            .read()
-            .expect("mvcc router poisoned")
             .as_ref()
             .map_or(Ok(()), |router| router.ensure_batch_admitted(rows))
     }
@@ -1581,16 +1544,20 @@ impl VersionedCfStore {
             "MVCC row-table lock was poisoned during atomic commit",
         )?;
         timings.row_lock_wait_us = elapsed_us(&row_lock_started);
-        let router_lock_started = Instant::now();
-        let mut router = self.router.write().map_err(|_| {
-            CalyxError::aster_corrupt_shard("MVCC router lock was poisoned during atomic commit")
-        })?;
-        timings.router_lock_wait_us = elapsed_us(&router_lock_started);
-        // Both write locks are held from here; see `locked_cpu_us`.
+        // No router lock is taken here any more. The router is sharded per
+        // column family and every one of its methods takes `&self`, so the
+        // commit reaches a shard only inside `put_at` below, and only the shard
+        // of the family it is writing (#1950).
+        //
+        // Atomicity is unchanged, and the row lock is what carries it: this
+        // commit holds the row-table write shard for **every** family it will
+        // project into the router (`commit_lock_set`, enforced by `entry_mut`),
+        // and every reader takes the row shard before the router shard. So no
+        // reader can observe the row applied without the router projection.
         let locked_cpu_started = thread_cpu_us();
         let attribution_started = Instant::now();
         let latest_router = if self.router_latest_readback.load(Ordering::Acquire) {
-            router.as_ref()
+            self.router.as_ref()
         } else {
             None
         };
@@ -1633,13 +1600,14 @@ impl VersionedCfStore {
 
         let router_apply_started = Instant::now();
         let mut sealed: Vec<crate::cf::SealedFlush> = Vec::new();
-        if let Some(router) = router.as_mut() {
+        if let Some(router) = self.router.as_ref() {
             // Publish the authoritative version chains and their sequence
-            // before attempting the fallible router projection. Both write
-            // guards remain held, so readers still observe one atomic latest
-            // transition. If a put or flush fails part-way through the router
-            // batch, every logical row already exists at `seq` and masks any
-            // partial router state as soon as the guards are released.
+            // before attempting the fallible router projection. The row-table
+            // write shards are still held for every family below, so readers
+            // still observe one atomic latest transition. If a put or flush
+            // fails part-way through the router batch, every logical row
+            // already exists at `seq` and masks any partial router state as
+            // soon as the guards are released.
             for (cf, key, value) in &rows {
                 match router.put_at(*cf, key, value, seq, &mut sealed) {
                     Ok(outcome) => timings.put.absorb(outcome),
@@ -1690,7 +1658,13 @@ impl VersionedCfStore {
                 }
             }
         }
-        timings.router_apply_us = elapsed_us(&router_apply_started);
+        // The per-row shard waits are inside the loop just measured, so they
+        // are lifted out of `router_apply` rather than added beside it: the
+        // stage values must still partition `total_us` exactly, and a commit
+        // that waited must not be reported as a commit that worked (#1950).
+        timings.router_lock_wait_us = timings.put.lock_wait_us;
+        timings.router_apply_us =
+            elapsed_us(&router_apply_started).saturating_sub(timings.router_lock_wait_us);
 
         // ---- switch-then-flush: everything above ran under both write locks,
         // everything below must not (#1949). ------------------------------
@@ -1704,14 +1678,13 @@ impl VersionedCfStore {
         timings.locked_cpu_us = locked_cpu_started
             .zip(thread_cpu_us())
             .map(|(before, after)| after.saturating_sub(before));
-        drop(router);
         drop(table);
         if !sealed.is_empty() {
             let sst_write_started = Instant::now();
             // NO LOCK IS HELD HERE. This is the AEAD seal plus the file write
             // that measured 652 ms in one commit (#1948). Writing before
-            // re-acquiring the router lock is the entire fix; doing it through
-            // a `&mut CfRouter` would put it straight back under the lock.
+            // touching the router again is the entire fix; `install_sealed`
+            // below takes only the one shard it publishes into.
             let mut written = Vec::with_capacity(sealed.len());
             let mut write_failure = None;
             for handle in &sealed {
@@ -1725,24 +1698,12 @@ impl VersionedCfStore {
             }
             timings.sst_write_us = elapsed_us(&sst_write_started);
 
-            let mut router = self.router.write().map_err(|_| {
-                CalyxError::aster_corrupt_shard(
-                    "MVCC router lock was poisoned during sealed-SST install",
-                )
+            let router = self.router.as_ref().ok_or_else(|| {
+                CalyxError::aster_corrupt_shard("sealed-SST install requires a live CF router")
             })?;
-            // Fails closed: the seals exist, so the router existed moments ago
-            // under the same lock. If it is gone, the rows are in the pending
-            // queue of a router nobody will ever install into, and reporting
-            // this commit as successful would claim a durable SST home that
-            // does not exist.
-            let Some(router) = router.as_mut() else {
-                return Err(CalyxError::aster_corrupt_shard(format!(
-                    "{} sealed memtable(s) from committed seq {seq} cannot be installed: the router was torn down between the seal and its SST install",
-                    sealed.len()
-                )));
-            };
-            // Exclusive hold covers the metadata swap only: the bytes are
-            // already on disk.
+            // Each install takes only the shard of the family it publishes
+            // into, and only for the metadata swap: the bytes are already on
+            // disk.
             let mut installed = 0_usize;
             let mut outcome = Ok(());
             for (handle, entry) in sealed.iter().zip(written) {
@@ -1837,17 +1798,12 @@ impl VersionedCfStore {
         // Recovery is whole-table by nature and runs single-threaded at open.
         let mut table =
             self.write_rows_all("MVCC row-table lock was poisoned during atomic recovery restore")?;
-        let router = self.router.read().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC router lock was poisoned during atomic recovery restore",
-            )
-        })?;
         let latest_router = if matches!(
             attribution,
             PanelAttribution::Strict | PanelAttribution::ReplayedCommit
         ) && self.router_latest_readback.load(Ordering::Acquire)
         {
-            router.as_ref()
+            self.router.as_ref()
         } else {
             None
         };
@@ -1933,11 +1889,7 @@ impl VersionedCfStore {
         // Recovery is whole-table by nature and runs single-threaded at open.
         let mut table =
             self.write_rows_all("MVCC row-table lock was poisoned during atomic recovery restore")?;
-        let router = self.router.read().map_err(|_| {
-            CalyxError::aster_corrupt_shard(
-                "MVCC router lock was poisoned during recovered-batch publication",
-            )
-        })?;
+        let router = self.router.as_ref();
         let published_seq = self.current_seq();
         if final_seq < published_seq {
             return Err(CalyxError::aster_corrupt_shard(format!(
@@ -1962,7 +1914,7 @@ impl VersionedCfStore {
                 if attribution == PanelAttribution::Strict
                     && self.router_latest_readback.load(Ordering::Acquire)
                 {
-                    router.as_ref()
+                    router
                 } else {
                     None
                 },
@@ -2017,8 +1969,7 @@ impl VersionedCfStore {
     }
 
     pub fn flush_all_cfs(&self) -> Result<Vec<SstSummary>> {
-        let mut router = self.router.write().expect("mvcc router poisoned");
-        let Some(router) = router.as_mut() else {
+        let Some(router) = self.router.as_ref() else {
             return Ok(Vec::new());
         };
         // Read the watermark while holding the router lock. Commits acquire
@@ -2039,8 +1990,7 @@ impl VersionedCfStore {
         &self,
         cfs: &[ColumnFamily],
     ) -> Result<(Seq, Vec<SstSummary>)> {
-        let mut router = self.router.write().expect("mvcc router poisoned");
-        let Some(router) = router.as_mut() else {
+        let Some(router) = self.router.as_ref() else {
             return Ok((self.current_seq(), Vec::new()));
         };
         // Keep this read under the router lock for the same reason as

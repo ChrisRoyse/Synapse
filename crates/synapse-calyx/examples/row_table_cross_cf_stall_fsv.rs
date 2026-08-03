@@ -230,6 +230,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         scans.load(Ordering::Relaxed)
     );
 
+    // ---- Phase C: the control. Commit into the CF the scanner is scanning --
+    //
+    // Phase B alone cannot tell "the shard map works" from "the lock was
+    // removed". If sharding is real, a commit to the *same* family as the scan
+    // must still wait, because that is genuine contention over one shard rather
+    // than the vault-wide lock #1950 removed. A phase C that came back as fast
+    // as phase A would mean commits and scans of one column family no longer
+    // exclude each other at all, which is a correctness bug wearing a
+    // performance win's clothes.
+    println!(
+        "\n=== Phase C (control): {COMMITS_PER_PHASE} commits into Kv, with scan_cf_latest(Kv) concurrent"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let same_cf_scans = Arc::new(AtomicU64::new(0));
+    let scanner = {
+        let vault = Arc::clone(&vault);
+        let stop = Arc::clone(&stop);
+        let scans = Arc::clone(&same_cf_scans);
+        std::thread::spawn(move || -> Result<(), String> {
+            while !stop.load(Ordering::Relaxed) {
+                vault
+                    .scan_cf_latest(ColumnFamily::Kv)
+                    .map_err(|error| format!("same-CF scanner failed: {error}"))?;
+                scans.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        })
+    };
+    LOCK_WAITS.reset();
+    let phase_c = commit_phase_into(&vault, ColumnFamily::Kv, COMMITS_PER_PHASE * 2)?;
+    let waits_c = LOCK_WAITS.snapshot();
+    stop.store(true, Ordering::Relaxed);
+    scanner
+        .join()
+        .map_err(|_| "same-CF scanner thread panicked")?
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    report("C same-CF", &phase_c);
+    report_waits("C same-CF", waits_c);
+    println!(
+        "  concurrent Kv scans completed = {}",
+        same_cf_scans.load(Ordering::Relaxed)
+    );
+
     // ---- The holder, named from the census rather than inferred ----
     println!("\n=== row-guard census delta (every hold, not only over-budget ones)");
     let census_after = census(&vault);
@@ -253,11 +296,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ---- Source of truth: every committed key, read back off the vault ----
     println!("\n=== readback: every key the writer claims it committed");
     let kv_after = vault.scan_cf_latest(ColumnFamily::Kv)?;
-    let expected = COMMITS_PER_PHASE * ROWS_PER_COMMIT * 2;
+    let expected = COMMITS_PER_PHASE * ROWS_PER_COMMIT * 3;
     let present = phase_a
         .keys
         .iter()
         .chain(phase_b.keys.iter())
+        .chain(phase_c.keys.iter())
         .filter(|key| kv_after.iter().any(|(k, _)| k == *key))
         .count();
     println!(
@@ -274,15 +318,49 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // ---- The verdict ----
     println!("\n=== verdict");
-    let ratio = phase_b.p50_us as f64 / phase_a.p50_us.max(1) as f64;
+    let cross_ratio = phase_b.p50_us as f64 / phase_a.p50_us.max(1) as f64;
+    let same_ratio = phase_c.p50_us as f64 / phase_a.p50_us.max(1) as f64;
     println!(
-        "  p50 A={} us  p50 B={} us  ratio={ratio:.1}x     max A={} us  max B={} us",
-        phase_a.p50_us, phase_b.p50_us, phase_a.max_us, phase_b.max_us
+        "  p50 A={} us   p50 B={} us (cross-CF, {cross_ratio:.1}x)   p50 C={} us (same-CF, {same_ratio:.1}x)",
+        phase_a.p50_us, phase_b.p50_us, phase_c.p50_us
     );
     println!(
-        "\n  A commit to `kv` and a scan of `Base` share no key and no invariant. Any ratio\n  \
-         above ~1 is the vault-wide row-table lock, not the work."
+        "  max A={} us   max B={} us                     max C={} us",
+        phase_a.max_us, phase_b.max_us, phase_c.max_us
     );
+    let (row_b, router_b, row_max_b, router_max_b, _) = waits_b;
+    let (row_c, router_c, row_max_c, router_max_c, _) = waits_c;
+    println!(
+        "\n  cross-CF (B) lock wait: row total={row_b} us max={row_max_b} us   router total={router_b} us max={router_max_b} us"
+    );
+    println!(
+        "  same-CF  (C) lock wait: row total={row_c} us max={row_max_c} us   router total={router_c} us max={router_max_c} us"
+    );
+
+    // Two claims, each falsifiable, and the second is what stops the first from
+    // being satisfiable by simply not locking.
+    let cross_ok = cross_ratio < 2.0;
+    let same_contends = phase_c.max_us > phase_a.max_us;
+    println!(
+        "\n  [{}] B: a commit to `kv` and a scan of `Base` share no key and no invariant, so\n       \
+         the cross-CF ratio must be ~1. Measured {cross_ratio:.2}x.",
+        if cross_ok { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  [{}] C: a commit to `kv` and a scan of `kv` share one shard, so they MUST still\n       \
+         exclude each other. A phase C as fast as phase A would mean the lock was removed\n       \
+         rather than split. Measured max C={} us against max A={} us.",
+        if same_contends { "PASS" } else { "FAIL" },
+        phase_c.max_us,
+        phase_a.max_us
+    );
+    if !cross_ok || !same_contends {
+        return Err(format!(
+            "sharding verdict failed: cross_cf_ratio={cross_ratio:.2} (want <2.0), \
+             same_cf_contends={same_contends} (want true)"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -303,12 +381,20 @@ fn report(label: &str, phase: &Phase) {
     );
 }
 
-/// Issues `COMMITS_PER_PHASE` tiny `kv` batches and times each one.
+/// Issues `COMMITS_PER_PHASE` tiny batches into `cf` and times each one.
 ///
-/// `tag_base` keeps phase A's and phase B's keys disjoint so the readback can
-/// account for every one of them.
+/// `tag_base` keeps each phase's keys disjoint so the readback can account for
+/// every one of them.
 fn commit_phase(
     vault: &AsterVault<calyx_core::SystemClock>,
+    tag_base: usize,
+) -> Result<Phase, Box<dyn Error>> {
+    commit_phase_into(vault, ColumnFamily::Kv, tag_base)
+}
+
+fn commit_phase_into(
+    vault: &AsterVault<calyx_core::SystemClock>,
+    cf: ColumnFamily,
     tag_base: usize,
 ) -> Result<Phase, Box<dyn Error>> {
     let mut samples = Vec::with_capacity(COMMITS_PER_PHASE);
@@ -318,7 +404,7 @@ fn commit_phase(
             .map(|row| {
                 let key = stall_key(tag_base + commit, row);
                 keys.push(key.clone());
-                (ColumnFamily::Kv, key, b"1950".to_vec())
+                (cf, key, b"1950".to_vec())
             })
             .collect();
         let started = Instant::now();
