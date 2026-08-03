@@ -585,6 +585,28 @@ where
         self.rows.row_guard_census()
     }
 
+    /// What the background SST flusher has written, failed, and waited on.
+    ///
+    /// `written` is the number that has to agree with the growth in
+    /// `flush-*.sst` files on disk: two independent counters, one from the
+    /// process and one from the filesystem, and a disagreement is a deferred
+    /// write that was actually dropped (#1951).
+    pub fn flush_status(&self) -> crate::mvcc::FlushStatus {
+        self.rows.flush_status()
+    }
+
+    /// Waits until every sealed memtable has been written and installed,
+    /// surfacing the first background failure. See
+    /// [`crate::mvcc::VersionedCfStore::drain_pending_flushes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first background write failure, or an error when the queue
+    /// does not drain inside its budget.
+    pub fn drain_pending_flushes(&self) -> Result<()> {
+        self.rows.drain_pending_flushes()
+    }
+
     pub fn vault_id(&self) -> VaultId {
         self.vault_id
     }
@@ -1372,7 +1394,22 @@ where
     /// separate prevents a caller requesting durability from creating one
     /// tiny router SST per logical flush.
     pub fn checkpoint(&self) -> Result<()> {
-        self.drain_checkpoints_paced("periodic checkpoint")
+        self.drain_checkpoints_paced("periodic checkpoint")?;
+        // The background flusher's barrier (#1951).
+        //
+        // Router-flush SSTs are not the recovery authority — the WAL is, and
+        // `router_flush_durability_window_fsv` proved it by deleting every one
+        // of them and still recovering 460/460 keys. So this is not a
+        // durability requirement; it is an honesty one. A checkpoint is the
+        // moment the vault asserts its physical projection is materialized, and
+        // returning `Ok` here while an SST write is still outstanding — or has
+        // *failed* and been logged to nobody who checks — would make that
+        // assertion false.
+        //
+        // `drain` surfaces the first background failure rather than swallowing
+        // it, so a write that failed after its commit returned fails the next
+        // checkpoint instead of disappearing.
+        self.rows.drain_pending_flushes()
     }
 
     /// Waits until every submitted group-commit WAL append has reached its

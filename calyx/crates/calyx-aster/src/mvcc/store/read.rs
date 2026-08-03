@@ -223,7 +223,7 @@ impl VersionedCfStore {
             return Ok(values);
         }
 
-        let router = self.router.as_ref();
+        let router = self.router.as_deref();
         self.ensure_router_latest_snapshot(snapshot)?;
         if let Some(router) = router.as_ref() {
             for index in router_misses {
@@ -501,7 +501,7 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned");
         let table = self.read_rows(RowGuardSite::PredecessorCfAt, cf);
-        let router = self.router.as_ref();
+        let router = self.router.as_deref();
         if self.router_latest_readback.load(Ordering::Acquire) {
             self.ensure_router_latest_snapshot(snapshot)?;
         }
@@ -590,7 +590,7 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned");
         let table = self.read_rows(site, cf);
-        let router = self.router.as_ref();
+        let router = self.router.as_deref();
         let seq = self.current_seq();
         read(seq, &table, router, &barriers)
     }
@@ -607,7 +607,7 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned");
         let table = self.read_rows_all(site);
-        let router = self.router.as_ref();
+        let router = self.router.as_deref();
         let seq = self.current_seq();
         read(seq, &table, router, &barriers)
     }

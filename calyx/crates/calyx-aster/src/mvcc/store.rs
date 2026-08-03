@@ -1,5 +1,6 @@
 //! In-memory MVCC row table used to define the cross-CF snapshot contract.
 
+mod flusher;
 mod gc;
 mod read;
 mod scan_pages;
@@ -13,11 +14,13 @@ use crate::resource::{
 };
 use crate::sst::SstSummary;
 use calyx_core::{CalyxError, Clock, Result, Seq, SlotId, Ts};
+pub use flusher::FlushStatus;
+use flusher::RouterFlusher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
@@ -215,6 +218,16 @@ type VersionChain = Vec<VersionedValue>;
 /// the same shape so that a call site holding a single shard's guard reads
 /// `table.get(&cf)` exactly as it always did.
 type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
+
+/// Sealed memtables that may be outstanding with the background flusher before
+/// a commit waits for capacity (#1951).
+///
+/// Deliberately a **router-wide** bound rather than the per-CF
+/// `MAX_SEALED_MEMTABLES_PER_CF`: the queue has one consumer, so a single CF
+/// that cannot drain would otherwise let every other CF pile work behind it
+/// until memory rather than a counter became the limit. Set equal to the per-CF
+/// cap so the pre-existing per-CF error stays reachable as the inner guard.
+const MAX_OUTSTANDING_FLUSHES: usize = 8;
 
 /// Row-table shards, one per [`ColumnFamily::shard_index`].
 ///
@@ -768,6 +781,17 @@ pub struct VersionedCfStore {
     ///
     /// Fixed length, allocated once, never resized.
     rows: Vec<RwLock<RowTable>>,
+    /// Background SST writer for sealed memtables (#1951).
+    ///
+    /// Declared **before** `router` so it is dropped first: dropping it stops
+    /// and joins the flush thread, and that thread holds its own `Arc` on the
+    /// router, so joining before releasing this store's handle keeps the router
+    /// alive for exactly as long as something can still be writing into it.
+    ///
+    /// Started lazily on the first seal rather than at construction, because
+    /// spawning a thread can fail and every constructor here is infallible. A
+    /// vault that never seals never starts it.
+    flusher: OnceLock<RouterFlusher>,
     /// The CF router, or `None` for a store with no physical projection.
     ///
     /// Behind **no lock**. It was `RwLock<Option<CfRouter>>`, and that lock was
@@ -776,7 +800,7 @@ pub struct VersionedCfStore {
     /// router shards its own state per column family now, so the outer lock was
     /// pure contention: it serialised a `Kv` commit against a `Base` scan that
     /// shared nothing with it (#1950).
-    router: Option<CfRouter>,
+    router: Option<Arc<CfRouter>>,
     router_latest_readback: AtomicBool,
     /// Earliest sequence after which the in-memory MVCC version chains are a
     /// complete changed-key journal. Latest-only recovery serves older
@@ -906,6 +930,67 @@ impl VersionedCfStore {
         self.row_guard_census.snapshot()
     }
 
+    /// The background SST writer, started on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this store has no router, or when the OS refuses
+    /// the flush thread. Fails closed rather than writing inline: a vault that
+    /// silently kept paying the SST write on the committing thread would look
+    /// exactly like this change working.
+    fn flusher(&self) -> Result<&RouterFlusher> {
+        if let Some(started) = self.flusher.get() {
+            return Ok(started);
+        }
+        let router = self.router.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "a sealed memtable needs the background flusher, but this store has no CF router"
+                    .to_owned(),
+            )
+        })?;
+        // A racing caller may win `set`; the loser's flusher drops here, which
+        // stops and joins the thread it just started. It can never have been
+        // submitted to, so nothing is lost — only a thread spawn is wasted, and
+        // only on the first seal of a vault's life.
+        let started = RouterFlusher::start(Arc::clone(router))?;
+        let _ = self.flusher.set(started);
+        self.flusher.get().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "the background flusher was set and immediately read back absent".to_owned(),
+            )
+        })
+    }
+
+    /// Waits until every sealed memtable has been written and installed.
+    ///
+    /// The durability contract this exists for: router-flush SSTs are not the
+    /// recovery authority (the WAL is), but a checkpoint that reported success
+    /// while an SST write was outstanding — or had **failed** — would be
+    /// claiming a physical projection it cannot show. Surfaces the flusher's
+    /// first failure rather than swallowing it (#1951).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first background write failure, or an error when the queue
+    /// does not drain inside its budget.
+    pub fn drain_pending_flushes(&self) -> Result<()> {
+        match self.flusher.get() {
+            Some(flusher) => flusher.drain(),
+            None => Ok(()),
+        }
+    }
+
+    /// What the background flusher has written, failed, and waited on (#1951).
+    ///
+    /// All zeroes before the first seal, which is the truth: the thread is
+    /// started lazily and a vault that never sealed never had one.
+    #[must_use]
+    pub fn flush_status(&self) -> FlushStatus {
+        self.flusher
+            .get()
+            .map_or_else(FlushStatus::default, RouterFlusher::status)
+    }
+
     pub fn new(start_seq: Seq) -> Self {
         Self {
             seqs: SeqAllocator::new(start_seq),
@@ -913,6 +998,7 @@ impl VersionedCfStore {
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: new_row_shards(),
+            flusher: OnceLock::new(),
             router: None,
             router_latest_readback: AtomicBool::new(false),
             changed_key_history_floor: 0,
@@ -943,7 +1029,8 @@ impl VersionedCfStore {
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: new_row_shards(),
-            router: Some(router),
+            flusher: OnceLock::new(),
+            router: Some(Arc::new(router)),
             router_latest_readback: AtomicBool::new(router_latest_readback),
             changed_key_history_floor: if router_latest_readback { start_seq } else { 0 },
             router_eager_lookup_on_refresh: AtomicBool::new(eager_lookup_on_refresh),
@@ -1538,6 +1625,24 @@ impl VersionedCfStore {
         }
         timings.rows = u32::try_from(rows.len()).unwrap_or(u32::MAX);
 
+        // Back-pressure, taken **before any lock** (#1951 ask 3).
+        //
+        // `MAX_SEALED_MEMTABLES_PER_CF` used to be a safety net that should
+        // never fire, because the commit wrote its own SST before returning. It
+        // is the throttle now, so hitting it must be a deliberate wait rather
+        // than a failed user-facing commit — RocksDB stalls writers at
+        // `max_write_buffer_number` for the same reason, and keeps an explicit
+        // escape (`no_slowdown` -> `Status::Incomplete`) for callers that would
+        // rather fail; the wait budget is that escape here.
+        //
+        // The ordering is not incidental. Waiting while holding a row shard or
+        // a router shard would block the flusher's own install, so the waiter
+        // would be waiting on progress it is itself preventing. Nothing is held
+        // at this point.
+        if let Some(flusher) = self.flusher.get() {
+            flusher.await_capacity(MAX_OUTSTANDING_FLUSHES)?;
+        }
+
         let row_lock_started = Instant::now();
         let mut table = self.write_rows_for(
             commit_lock_set(&rows),
@@ -1557,7 +1662,7 @@ impl VersionedCfStore {
         let locked_cpu_started = thread_cpu_us();
         let attribution_started = Instant::now();
         let latest_router = if self.router_latest_readback.load(Ordering::Acquire) {
-            self.router.as_ref()
+            self.router.as_deref()
         } else {
             None
         };
@@ -1681,65 +1786,34 @@ impl VersionedCfStore {
         drop(table);
         if !sealed.is_empty() {
             let sst_write_started = Instant::now();
-            // NO LOCK IS HELD HERE. This is the AEAD seal plus the file write
-            // that measured 652 ms in one commit (#1948). Writing before
-            // touching the router again is the entire fix; `install_sealed`
-            // below takes only the one shard it publishes into.
-            let mut written = Vec::with_capacity(sealed.len());
-            let mut write_failure = None;
-            for handle in &sealed {
-                match handle.write_sst() {
-                    Ok(entry) => written.push(entry),
-                    Err(error) => {
-                        write_failure = Some(error);
-                        break;
-                    }
-                }
-            }
+            // NO LOCK IS HELD HERE, AND NEITHER IS THIS THREAD ANY MORE. The
+            // AEAD seal plus the file write measured 20-67 ms per commit and
+            // was 89-98% of the whole `mvcc` stage once #1950 removed the lock
+            // terms. #1949 took it off the locks; this takes it off the
+            // caller (#1951).
+            //
+            // The rows are durable before this point regardless: the WAL
+            // record is fsynced by the group commit above, and recovery never
+            // restores a row from a router-flush SST. What the handoff defers
+            // is the *projection*, and a sealed memtable stays in the router's
+            // read path until its SST installs, so no reader can miss its rows
+            // while it waits.
+            //
+            // A background write that fails is not swallowed: it returns its
+            // rows to the active memtable, is logged against
+            // CALYX_ASTER_ROUTER_BACKGROUND_FLUSH_FAILED, and fails the next
+            // `drain_pending_flushes` — which `checkpoint` calls, so no
+            // checkpoint can report a projection that was never written.
+            let flush_count = sealed.len();
+            self.flusher()?.submit(sealed)?;
             timings.sst_write_us = elapsed_us(&sst_write_started);
-
-            let router = self.router.as_ref().ok_or_else(|| {
-                CalyxError::aster_corrupt_shard("sealed-SST install requires a live CF router")
-            })?;
-            // Each install takes only the shard of the family it publishes
-            // into, and only for the metadata swap: the bytes are already on
-            // disk.
-            let mut installed = 0_usize;
-            let mut outcome = Ok(());
-            for (handle, entry) in sealed.iter().zip(written) {
-                match router.install_sealed(handle, entry) {
-                    Ok(()) => installed += 1,
-                    Err(error) => {
-                        outcome = Err(error);
-                        break;
-                    }
-                }
-            }
-            if outcome.is_ok()
-                && let Some(error) = write_failure
-            {
-                outcome = Err(error);
-            }
-            if let Err(error) = outcome.as_ref() {
-                // Every seal that did not install — whether its SST write
-                // failed or its install did — still holds the only in-memory
-                // copy of its rows and still occupies the pending queue. Each
-                // must go back into its active memtable before the error
-                // escapes, or the CF is wedged for the life of the process.
-                for handle in sealed.iter().skip(installed) {
-                    if let Err(abandon_error) = router.abandon_sealed(handle, error) {
-                        tracing::error!(
-                            code = abandon_error.code,
-                            committed_seq = seq,
-                            cf = handle.cf().name(),
-                            rows = handle.row_count(),
-                            error = %abandon_error,
-                            "sealed memtable could not be returned to its active memtable after a failed SST write or install"
-                        );
-                    }
-                }
-            }
-            outcome?;
+            tracing::debug!(
+                code = "CALYX_ASTER_ROUTER_FLUSH_DEFERRED",
+                committed_seq = seq,
+                sealed = flush_count,
+                enqueue_us = timings.sst_write_us,
+                "handed sealed memtables to the background flusher"
+            );
             timings.total_us = elapsed_us(&started);
             return Ok(seq);
         }
@@ -1803,7 +1877,7 @@ impl VersionedCfStore {
             PanelAttribution::Strict | PanelAttribution::ReplayedCommit
         ) && self.router_latest_readback.load(Ordering::Acquire)
         {
-            self.router.as_ref()
+            self.router.as_deref()
         } else {
             None
         };
@@ -1914,7 +1988,7 @@ impl VersionedCfStore {
                 if attribution == PanelAttribution::Strict
                     && self.router_latest_readback.load(Ordering::Acquire)
                 {
-                    router
+                    router.map(std::convert::AsRef::as_ref)
                 } else {
                     None
                 },

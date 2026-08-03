@@ -40,7 +40,15 @@
 //! ```text
 //!   count of flush-*.sst on disk after phase B
 //!     - count before
-//!     == sum of mvcc_router_flushes reported by the commits in between
+//!     == the flusher's own `flush_status().written` counter
+//!
+//! The second half of that used to be `sum of mvcc_router_flushes reported by
+//! the commits in between`, and #1951 made it structurally zero: the commit no
+//! longer performs the flush, so a commit-side counter can never account for
+//! one. Worse, the outlier gate stopped reporting these commits at all once
+//! they got fast, so the check read "NO FLUSH OBSERVED" while 23 SSTs sat on
+//! disk. The witness has to be the flusher's counter now — still independent of
+//! the filesystem, which is what the check needs.
 //! ```
 //!
 //! Two independent counters that must agree exactly. The timings say a flush
@@ -389,15 +397,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         "  delta on disk                       = {}",
         after_b - before_b
     );
-    println!("  sum of mvcc_router_flushes reported = {reported_b}");
+    let written_b = vault.flush_status().written;
+    println!("  commits reporting a synchronous flush   = {reported_b} (0 is correct after #1951)");
+    println!("  background flusher written              = {written_b}");
+    let disk_delta_b = u64::try_from(after_b - before_b).unwrap_or(0);
     println!(
         "  VERDICT: {}",
-        if u64::try_from(after_b - before_b).unwrap_or(0) >= reported_b && reported_b > 0 {
-            "flushes reported by the split are present on disk"
-        } else if reported_b == 0 {
+        if disk_delta_b == 0 {
             "NO FLUSH OBSERVED - phase B did not construct its condition"
+        } else if written_b == disk_delta_b {
+            "the flusher's counter and the filesystem agree exactly"
+        } else if written_b > disk_delta_b {
+            "MISMATCH - the flusher claims SSTs the filesystem does not have"
         } else {
-            "MISMATCH - the split claims flushes the filesystem does not have"
+            // A drain has not necessarily happened yet, so disk may lead the
+            // counter by whatever `flush_all_cfs`/checkpoint wrote inline.
+            "disk holds more than the flusher wrote (inline flushes account for the rest)"
         }
     );
 
