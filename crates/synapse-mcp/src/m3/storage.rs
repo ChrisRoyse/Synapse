@@ -452,6 +452,7 @@ pub struct StorageBackupStatusResponse {
     pub state: String,
     pub final_exists: bool,
     pub manifest_exists: bool,
+    pub marker_exists: bool,
     pub staging_dirs: Vec<String>,
 }
 
@@ -4092,6 +4093,18 @@ pub fn run_storage_restore_verify(
             ),
         ));
     }
+    if vault_path
+        .parent()
+        .is_some_and(|parent| parent.join("backup_in_progress.json").is_file())
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_BACKUP_IN_PROGRESS,
+            format!(
+                "restore_verify refuses vault {} because its backup root still carries backup_in_progress.json",
+                vault_path.display()
+            ),
+        ));
+    }
     let report = db
         .verify_calyx_restore(&vault_path)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -4148,10 +4161,16 @@ pub fn run_storage_backup_status(
     staging_dirs.sort();
     let final_exists = target.exists();
     let manifest_exists = target.join("backup_manifest.json").is_file();
-    let state = match (final_exists, manifest_exists, staging_dirs.is_empty()) {
-        (true, true, true) => "completed",
-        (false, false, false) => "working",
-        (false, false, true) => "absent",
+    let marker_exists = target.join("backup_in_progress.json").is_file();
+    let state = match (
+        final_exists,
+        manifest_exists,
+        marker_exists,
+        staging_dirs.is_empty(),
+    ) {
+        (true, true, false, true) => "completed",
+        (true, _, true, true) | (false, false, false, false) => "working",
+        (false, false, false, true) => "absent",
         _ => "invalid",
     };
     Ok(StorageBackupStatusResponse {
@@ -4159,6 +4178,7 @@ pub fn run_storage_backup_status(
         state: state.to_owned(),
         final_exists,
         manifest_exists,
+        marker_exists,
         staging_dirs,
     })
 }

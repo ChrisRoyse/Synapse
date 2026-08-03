@@ -858,11 +858,12 @@ pub(super) async fn handle(
             Ok(Json(storage_response(
                 operation,
                 format!(
-                    "backup target={} state={} final_exists={} manifest_exists={} staging_dirs={:?}",
+                    "backup target={} state={} final_exists={} manifest_exists={} marker_exists={} staging_dirs={:?}",
                     source_id,
                     response.state,
                     response.final_exists,
                     response.manifest_exists,
+                    response.marker_exists,
                     response.staging_dirs,
                 ),
                 |out| out.backup_status = Some(response),

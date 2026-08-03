@@ -5091,7 +5091,7 @@ impl SynapseCalyxVault {
                 "provide an absolute fresh backup target beneath an existing directory",
             )
         })?;
-        let name = target_root.file_name().ok_or_else(|| {
+        target_root.file_name().ok_or_else(|| {
             SynapseCalyxError::new(
                 "SYNAPSE_CALYX_BACKUP_TARGET_INVALID",
                 format!(
@@ -5111,32 +5111,46 @@ impl SynapseCalyxVault {
                 "choose a fresh nonexistent target path; inspect or remove the existing artifact explicitly",
             ));
         }
-        let staging_root = parent.join(format!(
-            ".{}.synapse-backup-in-progress-{}",
-            name.to_string_lossy(),
-            std::process::id()
-        ));
-        if staging_root.exists() {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_BACKUP_STAGING_EXISTS",
-                format!(
-                    "backup staging directory {} already exists, indicating an interrupted or live publication",
-                    staging_root.display()
-                ),
-                "inspect the named staging directory and daemon logs; remove it only after proving no backup owns it, then retry",
-            ));
-        }
-        let result =
-            self.backup_to_staging(target_root, &staging_root, parent, include_regenerable);
+        std::fs::create_dir(target_root).map_err(|error| {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_BACKUP_TARGET_CREATE_FAILED",
+                "create fresh backup target",
+                target_root,
+                &error,
+                "ensure the target parent exists and permits directory creation, then retry with a fresh target",
+            )
+        })?;
+        let marker_path = target_root.join(backup::BACKUP_IN_PROGRESS_FILE);
+        let marker = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "synapse_backup_in_progress/v1",
+            "pid": std::process::id(),
+            "target": target_root,
+        }))
+        .map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_MARKER_ENCODE_FAILED",
+                format!("encode backup in-progress marker: {error}"),
+                "repair marker serialization before retrying the backup",
+            )
+        })?;
+        calyx_aster::durable_fs::write_atomic_replace(
+            &marker_path,
+            &marker,
+            "backup in-progress marker",
+        )
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx("write backup in-progress marker", &error)
+        })?;
+        let result = self.backup_to_staging(target_root, target_root, parent, include_regenerable);
         if let Err(original) = &result
-            && staging_root.exists()
-            && let Err(cleanup) = std::fs::remove_dir_all(&staging_root)
+            && target_root.exists()
+            && let Err(cleanup) = std::fs::remove_dir_all(target_root)
         {
             return Err(SynapseCalyxError::new(
                 "SYNAPSE_CALYX_BACKUP_STAGING_CLEANUP_FAILED",
                 format!(
-                    "backup failed with [{original}], then cleanup of staging directory {} also failed: {cleanup}",
-                    staging_root.display()
+                    "backup failed with [{original}], then cleanup of in-progress target {} also failed: {cleanup}",
+                    target_root.display()
                 ),
                 "stop any process holding the named staging path, remove it explicitly, and retry the backup",
             ));
@@ -5206,7 +5220,16 @@ impl SynapseCalyxVault {
         let (_, manifest_sha256) = backup::write_manifest(staging_root, &report)?;
         report.manifest_path = target_root.join(backup::BACKUP_MANIFEST_FILE);
         report.manifest_sha256 = manifest_sha256;
-        publish_backup_directory(staging_root, target_root)?;
+        let marker_path = staging_root.join(backup::BACKUP_IN_PROGRESS_FILE);
+        std::fs::remove_file(&marker_path).map_err(|error| {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_BACKUP_PUBLISH_FAILED",
+                "remove backup in-progress marker after manifest verification",
+                &marker_path,
+                &error,
+                "remove the marker only after independently verifying backup_manifest.json and the vault; until then the target remains in progress",
+            )
+        })?;
         sync_dir(
             publication_parent,
             "backup publication",
@@ -6852,65 +6875,6 @@ fn write_pid_sidecar(path: &Path) -> Result<(), SynapseCalyxError> {
         "SYNAPSE_CALYX_PID_SIDECAR_PARENT_SYNC_FAILED",
         LOCK_REMEDIATION,
     )
-}
-
-fn publish_backup_directory(staging: &Path, target: &Path) -> Result<(), SynapseCalyxError> {
-    const MAX_ATTEMPTS: u32 = 60;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match std::fs::rename(staging, target) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if is_retryable_backup_publish_error(&error)
-                    && attempt < MAX_ATTEMPTS
-                    && !target.exists() =>
-            {
-                tracing::warn!(
-                    code = "SYNAPSE_CALYX_BACKUP_PUBLISH_RETRY",
-                    staging = %staging.display(),
-                    target = %target.display(),
-                    attempt,
-                    max_attempts = MAX_ATTEMPTS,
-                    raw_os_error = error.raw_os_error(),
-                    retry_after_ms = 500,
-                    "verified backup directory rename was transiently blocked"
-                );
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(error) => {
-                return Err(SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_BACKUP_PUBLISH_FAILED",
-                    format!(
-                        "atomically publish verified backup from {} to {} attempts={attempt} target_exists={} kind={:?} raw_os_error={:?}: {error}",
-                        staging.display(),
-                        target.display(),
-                        target.exists(),
-                        error.kind(),
-                        error.raw_os_error(),
-                    ),
-                    "ensure the staging and final paths share one volume, the final path is absent, and no process holds the staging tree; inspect SYNAPSE_CALYX_BACKUP_PUBLISH_RETRY logs for transient handle ownership",
-                ));
-            }
-        }
-    }
-    unreachable!("backup publication loop returns on every terminal attempt")
-}
-
-#[cfg(windows)]
-fn is_retryable_backup_publish_error(error: &io::Error) -> bool {
-    use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
-    };
-
-    error.raw_os_error().is_some_and(|code| {
-        code == ERROR_ACCESS_DENIED.cast_signed()
-            || code == ERROR_SHARING_VIOLATION.cast_signed()
-            || code == ERROR_LOCK_VIOLATION.cast_signed()
-    })
-}
-
-#[cfg(not(windows))]
-fn is_retryable_backup_publish_error(_error: &io::Error) -> bool {
-    false
 }
 
 fn retry_io<T>(

@@ -34,6 +34,8 @@ use crate::SynapseCalyxError;
 pub const BACKUP_VAULT_SUBDIR: &str = "vault";
 /// Sidecar manifest file name written at the backup target root.
 pub const BACKUP_MANIFEST_FILE: &str = "backup_manifest.json";
+/// Durable marker proving a target is still under construction.
+pub const BACKUP_IN_PROGRESS_FILE: &str = "backup_in_progress.json";
 /// Sidecar copy of the vault lineage journal, written at the backup target root.
 ///
 /// The live journal is deliberately a *sibling* of the vault directory (#1875)
