@@ -5206,15 +5206,7 @@ impl SynapseCalyxVault {
         let (_, manifest_sha256) = backup::write_manifest(staging_root, &report)?;
         report.manifest_path = target_root.join(backup::BACKUP_MANIFEST_FILE);
         report.manifest_sha256 = manifest_sha256;
-        std::fs::rename(staging_root, target_root).map_err(|error| {
-            SynapseCalyxError::with_io(
-                "SYNAPSE_CALYX_BACKUP_PUBLISH_FAILED",
-                &format!("atomically publish verified backup from {} to", staging_root.display()),
-                target_root,
-                &error,
-                "ensure the staging and final paths share one volume, the final path is absent, and the parent permits directory rename",
-            )
-        })?;
+        publish_backup_directory(staging_root, target_root)?;
         sync_dir(
             publication_parent,
             "backup publication",
@@ -6860,6 +6852,65 @@ fn write_pid_sidecar(path: &Path) -> Result<(), SynapseCalyxError> {
         "SYNAPSE_CALYX_PID_SIDECAR_PARENT_SYNC_FAILED",
         LOCK_REMEDIATION,
     )
+}
+
+fn publish_backup_directory(staging: &Path, target: &Path) -> Result<(), SynapseCalyxError> {
+    const MAX_ATTEMPTS: u32 = 60;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match std::fs::rename(staging, target) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_retryable_backup_publish_error(&error)
+                    && attempt < MAX_ATTEMPTS
+                    && !target.exists() =>
+            {
+                tracing::warn!(
+                    code = "SYNAPSE_CALYX_BACKUP_PUBLISH_RETRY",
+                    staging = %staging.display(),
+                    target = %target.display(),
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    raw_os_error = error.raw_os_error(),
+                    retry_after_ms = 500,
+                    "verified backup directory rename was transiently blocked"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_BACKUP_PUBLISH_FAILED",
+                    format!(
+                        "atomically publish verified backup from {} to {} attempts={attempt} target_exists={} kind={:?} raw_os_error={:?}: {error}",
+                        staging.display(),
+                        target.display(),
+                        target.exists(),
+                        error.kind(),
+                        error.raw_os_error(),
+                    ),
+                    "ensure the staging and final paths share one volume, the final path is absent, and no process holds the staging tree; inspect SYNAPSE_CALYX_BACKUP_PUBLISH_RETRY logs for transient handle ownership",
+                ));
+            }
+        }
+    }
+    unreachable!("backup publication loop returns on every terminal attempt")
+}
+
+#[cfg(windows)]
+fn is_retryable_backup_publish_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+
+    error.raw_os_error().is_some_and(|code| {
+        code == ERROR_ACCESS_DENIED.cast_signed()
+            || code == ERROR_SHARING_VIOLATION.cast_signed()
+            || code == ERROR_LOCK_VIOLATION.cast_signed()
+    })
+}
+
+#[cfg(not(windows))]
+fn is_retryable_backup_publish_error(_error: &io::Error) -> bool {
+    false
 }
 
 fn retry_io<T>(
