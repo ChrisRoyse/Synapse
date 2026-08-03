@@ -18,6 +18,7 @@ pub use batch::GroupCommitBatcher;
 pub(crate) use point_read::WalWriteRowPointReader;
 pub use replay::replay_dir;
 pub use replay::replay_dir_after;
+pub use replay::replay_dir_read_only;
 pub(crate) use stream_replay::{
     for_each_record_payload_after, for_each_record_payload_reverse, stream_records_after,
 };

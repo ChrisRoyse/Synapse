@@ -20,17 +20,26 @@ pub fn replay_dir(dir: impl AsRef<Path>) -> Result<ReplayOutcome> {
 pub fn replay_dir_after(dir: impl AsRef<Path>, replay_floor_seq: u64) -> Result<ReplayOutcome> {
     let dir = dir.as_ref();
     let _lock = crate::file_lock::FileLockGuard::acquire(&dir.join(".append.lock"))?;
-    replay_dir_locked_after(dir, replay_floor_seq)
+    replay_dir_inner(dir, replay_floor_seq, true)
 }
 
-pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Result<ReplayOutcome> {
+/// Scans an immutable WAL snapshot without creating a lock file or repairing bytes.
+pub fn replay_dir_read_only(dir: impl AsRef<Path>) -> Result<ReplayOutcome> {
+    replay_dir_inner(dir.as_ref(), 0, false)
+}
+
+fn replay_dir_inner(
+    dir: &Path,
+    replay_floor_seq: u64,
+    repair_torn_tail: bool,
+) -> Result<ReplayOutcome> {
     let segments = segment::list_segments(dir)?;
     let mut records = Vec::new();
 
     for (position, (_, path)) in segments.iter().enumerate() {
         let has_later_segments = position + 1 < segments.len();
         let file = super::sequential_read_options()
-            .write(true)
+            .write(repair_torn_tail)
             .open(path)
             .map_err(|error| storage_error("open WAL segment for replay", error))?;
         let mut reader = BufReader::with_capacity(REPLAY_BUFFER_BYTES, file);
@@ -50,6 +59,7 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                         message,
                         records,
                         has_later_segments,
+                        repair_torn_tail,
                     );
                 }
             };
@@ -66,6 +76,7 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                             message,
                             records,
                             has_later_segments,
+                            repair_torn_tail,
                         );
                     }
                 }
@@ -93,6 +104,7 @@ pub(super) fn replay_dir_locked_after(dir: &Path, replay_floor_seq: u64) -> Resu
                         message,
                         records,
                         has_later_segments,
+                        repair_torn_tail,
                     );
                 }
             }
@@ -112,6 +124,7 @@ fn resolve_torn_tail(
     message: String,
     records: Vec<ReplayRecord>,
     has_later_segments: bool,
+    repair_torn_tail: bool,
 ) -> Result<ReplayOutcome> {
     let torn_tail = TornTail {
         segment_path: segment_path.to_path_buf(),
@@ -119,7 +132,7 @@ fn resolve_torn_tail(
         code: CalyxErrorCode::AsterTornWal.code(),
         message,
     };
-    if has_later_segments {
+    if has_later_segments || !repair_torn_tail {
         return Err(torn_tail.error());
     }
 

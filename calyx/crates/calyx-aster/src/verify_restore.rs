@@ -15,7 +15,7 @@ use crate::security::value_crypto::{SharedVaultContext, open_rows, open_value};
 use crate::sst::SstEntry;
 use crate::sst::level::SstLevel;
 use crate::vault::encode::{decode_constellation_base, decode_slot_vector, decode_write_batch};
-use crate::wal::replay_dir;
+use crate::wal::replay_dir_read_only;
 use calyx_core::{CalyxError, Result};
 use calyx_ledger::{
     LedgerCfStore, LedgerHeadAnchor, LedgerRow, VerifyResult, decode as decode_ledger_entry,
@@ -221,7 +221,7 @@ fn read_wal_overlay(vault: &Path, value_crypto: Option<&SharedVaultContext>) -> 
     if !wal_dir.is_dir() {
         return Ok(overlay);
     }
-    let replay = replay_dir(&wal_dir)?;
+    let replay = replay_dir_read_only(&wal_dir)?;
     if let Some(torn) = replay.torn_tail {
         return Err(torn.error());
     }
