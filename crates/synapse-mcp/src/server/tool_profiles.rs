@@ -2212,6 +2212,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "switch to an explicit maintenance profile before running a backup",
             ),
             op(
+                "backup_status",
+                false,
+                false,
+                "the requested final backup path, its manifest, and same-parent in-progress staging directories",
+                None,
+                "SYNAPSE_STORAGE_BACKUP_STATUS_READ_FAILED",
+                "point backup_status at an absolute target whose parent directory is readable",
+            ),
+            op(
                 "restore_verify",
                 false,
                 false,
@@ -6201,7 +6210,7 @@ mod facade_schema_parity_tests {
         // catch an *unlisted* operation had itself been failing, and every new
         // operation since then went unverified. A count that restates the
         // length of the list above it cannot drift from it.
-        const EXPECTED_OPERATIONS: [&str; 16] = [
+        const EXPECTED_OPERATIONS: [&str; 17] = [
             "inspect",
             "summary",
             "gc_once",
@@ -6216,6 +6225,7 @@ mod facade_schema_parity_tests {
             "retire_orphan_slot_cfs",
             "retire_search_generation",
             "backup",
+            "backup_status",
             "restore_verify",
             "intelligence",
         ];
