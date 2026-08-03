@@ -31,7 +31,7 @@ bounded sample do not establish population absence.
 
 1. Live typed source CF rows through `storage operation=corpus_histogram`.
 2. Physical Calyx Base and slot CFs in the consistent backup at
-   `%LOCALAPPDATA%\synapse\fsv\issue-1983-final-20260803T2000Z\vault`.
+   `%LOCALAPPDATA%\synapse\fsv\issue-1965-agent-transcript-20260803T2115Z\vault`.
 3. The backup's `CURRENT` and `manifest-*.json` bytes for non-mutation proof.
 4. Live panel coverage and registry CF readbacks after backfill completion.
 
@@ -69,6 +69,15 @@ contained 921 values and three distinct vectors. It therefore reported
 `CALYX_LENS_NEAR_ZERO_VARIANCE_BY_CORPUS`, frequency ratio 305.333, percent
 unique 0.3257%, and `lifecycle_action_allowed=false`. The former panel had one
 distinct vector for the same three source categories.
+
+The original #1983 backup above was later superseded to avoid retaining two
+multi-gigabyte copies. The replacement backup independently passed restore
+verification with an intact 296,193-entry ledger and re-ran this same probe at
+sequence 463,273. It reproduced the old panel's one vector across 920 present
+rows and measured panel 1983001 exactly: 9,093/9,093 Base rows, 922 slot-30
+values, three distinct vectors, frequency ratio 305.667, percent unique 0.32538,
+and `lifecycle_action_allowed=false`. Panel 1921001 remained explicitly
+`CALYX_LENS_CONSTANT_BY_SAMPLE` at 20,000/50,973.
 
 ## Live migration readback
 

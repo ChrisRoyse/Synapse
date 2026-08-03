@@ -9,6 +9,8 @@
 use std::error::Error;
 use std::path::PathBuf;
 
+use calyx_aster::cf::ColumnFamily;
+use calyx_aster::vault::encode::{decode_constellation_base, decode_slot_vector};
 use calyx_core::{Constellation, SlotId, SlotVector};
 use synapse_core::types::AgentTranscriptRecord;
 use synapse_storage::Db;
@@ -18,6 +20,9 @@ use synapse_storage::constellations::{
 
 const SCHEMA_VERSION: u32 = 1;
 const SLOT_NEW: u16 = 110;
+const AGENT_PANEL: u32 = 1_965_001;
+const TRANSCRIPT_PANEL: u32 = 1_965_002;
+const AGENT_OLD_SLOT: u16 = 34;
 const SAMPLE_CEILING: usize = 3_000;
 const DISTINCT_TOLERANCE: f32 = 1.0e-6;
 
@@ -29,7 +34,100 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !vault_dir.is_dir() {
         return Err(format!("{} is not a directory", vault_dir.display()).into());
     }
-    let db = Db::open(&vault_dir, SCHEMA_VERSION)?;
+    let mode = std::env::args().nth(2);
+    if mode
+        .as_deref()
+        .is_some_and(|mode| mode != "--physical-only")
+    {
+        return Err(format!(
+            "unknown mode `{}`; accepted mode is --physical-only",
+            mode.as_deref().unwrap_or_default()
+        )
+        .into());
+    }
+    let physical_only = mode.is_some();
+    if !physical_only {
+        verify_candidate(&vault_dir)?;
+    }
+
+    println!("\n== committed physical state ==");
+    let config = synapse_calyx::SynapseCalyxConfig {
+        machine_salt_path: vault_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .ok_or("backup vault path has no synapse data root ancestor")?
+            .join("machine-salt.bin"),
+        vault_dir: vault_dir.clone(),
+        tuning: synapse_calyx::SynapseCalyxTuningConfig::default().validate()?,
+    };
+    let slot_cf = ColumnFamily::slot(SlotId::new(SLOT_NEW));
+    let vault = synapse_calyx::SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        config,
+        Some(vec![ColumnFamily::Base, slot_cf]),
+    )?;
+    let mut agent_rows = 0usize;
+    let mut agent_rows_with_old_slot = 0usize;
+    let mut transcript_rows = 0usize;
+    let mut transcript_rows_with_new_slot = 0usize;
+    for (_, raw) in vault.scan_cf_latest(ColumnFamily::Base)? {
+        let base = decode_constellation_base(&raw)?;
+        match base.panel_version {
+            AGENT_PANEL => {
+                agent_rows += 1;
+                agent_rows_with_old_slot +=
+                    usize::from(base.slots.contains_key(&SlotId::new(AGENT_OLD_SLOT)));
+            }
+            TRANSCRIPT_PANEL => {
+                transcript_rows += 1;
+                transcript_rows_with_new_slot +=
+                    usize::from(base.slots.contains_key(&SlotId::new(SLOT_NEW)));
+            }
+            _ => {}
+        }
+    }
+    let stored_rows = vault.scan_cf_latest(slot_cf)?;
+    let total_stored_rows = stored_rows.len();
+    let stored_stride = total_stored_rows.div_ceil(SAMPLE_CEILING).max(1);
+    let stored_vectors: Vec<Vec<f32>> = stored_rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % stored_stride == 0)
+        .map(|(_, (_, raw))| decode_slot_vector(raw))
+        .map(|decoded| match decoded? {
+            SlotVector::Dense { data, .. } => Ok(data),
+            other => Err(format!("slot 110 stored non-dense value: {other:?}").into()),
+        })
+        .collect::<Result<_, Box<dyn Error>>>()?;
+    let stored_sims = nearest_neighbour_sims(&stored_vectors);
+    let (stored_distinct, stored_modal_share, stored_min, stored_max) =
+        discrimination(&stored_sims)?;
+    println!(
+        "agent panel={AGENT_PANEL} base_rows={agent_rows} rows_declaring_retired_slot_34={agent_rows_with_old_slot}"
+    );
+    println!(
+        "transcript panel={TRANSCRIPT_PANEL} base_rows={transcript_rows} rows_declaring_slot_110={transcript_rows_with_new_slot} slot_110_cf_rows={total_stored_rows}"
+    );
+    println!(
+        "stored_slot_110_nearest_neighbor_cosine sampled={} distinct={stored_distinct} modal_share={stored_modal_share:.6} range=[{stored_min:.6},{stored_max:.6}]",
+        stored_vectors.len()
+    );
+    if agent_rows == 0
+        || agent_rows_with_old_slot != 0
+        || transcript_rows == 0
+        || transcript_rows_with_new_slot != transcript_rows
+        || total_stored_rows != transcript_rows
+        || stored_distinct <= 1
+        || stored_modal_share >= 1.0
+    {
+        return Err("committed Base/slot CF state does not prove the migration".into());
+    }
+    println!("verdict=PASS committed Base and slot CF bytes prove the migration");
+    Ok(())
+}
+
+fn verify_candidate(vault_dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let db = Db::open(vault_dir, SCHEMA_VERSION)?;
     let rows = db.scan_cf(synapse_storage::cf::CF_AGENT_TRANSCRIPTS)?;
     if rows.len() < 2 {
         return Err(format!(
@@ -73,7 +171,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if decode_failures != 0 || measurement_failures != 0 {
         return Err("not every authoritative transcript row measured successfully".into());
     }
-
     let sims = nearest_neighbour_sims(&vectors);
     let (distinct, modal_share, min, max) = discrimination(&sims)?;
     println!(
