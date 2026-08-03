@@ -139,6 +139,9 @@ fn synthetic_census(
         decode_failures: 0,
         first_decode_failure: None,
         measured_at_unix_ms: Some(1_785_000_000_000),
+        // Hand-assembled to exercise the retention selection downstream of the
+        // fold; no `Base` walk ran, and this says so rather than inventing one.
+        walk: synapse_calyx::SynapseCalyxCfWalk::not_walked("base"),
     }
 }
 

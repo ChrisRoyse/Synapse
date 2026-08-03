@@ -406,25 +406,35 @@ impl SynapseCalyxVault {
         let max_records = max_records.clamp(1, crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut scanned = 0usize;
-        for (_, value) in self.scan_cf_latest(ColumnFamily::Base)? {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
-                SynapseCalyxError::from_calyx("decode Base constellation", &error)
-            })?;
-            if constellation.panel_version != panel_version {
-                continue;
-            }
-            scanned += 1;
-            for anchor in &constellation.anchors {
-                if anchor.confidence > 0.0 {
-                    *counts
-                        .entry(crate::grounding::anchor_kind_label(&anchor.kind))
-                        .or_default() += 1;
+        // #1968: paged rather than materialized. This fold tallies anchor kinds
+        // and stops at `max_records`, so it never needed a whole-`Base` `Vec`
+        // held under the row-guard that constellation commits contend for. The
+        // early stop is carried through as `SynapseCalyxWalkStep::Stop`, so a
+        // bounded sweep still reads only the pages it needs.
+        self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let constellation = decode_constellation_base(value).map_err(|error| {
+                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                })?;
+                if constellation.panel_version != panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
                 }
-            }
-            if scanned >= max_records {
-                break;
-            }
-        }
+                scanned += 1;
+                for anchor in &constellation.anchors {
+                    if anchor.confidence > 0.0 {
+                        *counts
+                            .entry(crate::grounding::anchor_kind_label(&anchor.kind))
+                            .or_default() += 1;
+                    }
+                }
+                if scanned >= max_records {
+                    return Ok(crate::SynapseCalyxWalkStep::Stop);
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
         let mut domains: Vec<(String, usize)> = counts.into_iter().collect();
         domains.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         Ok(domains)

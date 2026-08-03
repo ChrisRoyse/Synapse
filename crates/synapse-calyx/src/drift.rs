@@ -156,6 +156,9 @@ pub struct SynapseCalyxBlindSpotReport {
     pub panel_version: u32,
     pub records_scanned: usize,
     pub records_measured: usize,
+    /// Provenance of the bounded-hold `Base` walk the corpus was folded from
+    /// (#1968); `walk.atomic()` false means `records_scanned` counts an interval.
+    pub walk: crate::SynapseCalyxCfWalk,
     pub n_lenses: usize,
     /// Ordered `(A, B)` directions evaluated. Both directions of every unordered
     /// pair are candidates: "lens 4 is confident where lens 1 disagrees" is a
@@ -224,6 +227,9 @@ pub struct SynapseCalyxPanelDriftReport {
     pub panel_version: u32,
     pub records_scanned: usize,
     pub records_measured: usize,
+    /// Provenance of the bounded-hold `Base` walk the corpus was folded from
+    /// (#1968); `walk.atomic()` false means `records_scanned` counts an interval.
+    pub walk: crate::SynapseCalyxCfWalk,
     pub recent_fraction: f32,
     pub permutations: usize,
     pub lenses_evaluated: usize,
@@ -258,6 +264,10 @@ struct DriftRecord {
 struct DriftCorpus {
     records: Vec<DriftRecord>,
     records_scanned: usize,
+    /// Provenance of the bounded-hold `Base` walk this corpus was folded from
+    /// (#1968). Kept on the corpus so both callers can report the window their
+    /// numbers were accumulated over rather than inferring it.
+    walk: crate::SynapseCalyxCfWalk,
 }
 
 impl SynapseCalyxVault {
@@ -367,6 +377,7 @@ impl SynapseCalyxVault {
             panel_version: params.panel_version,
             records_scanned: corpus.records_scanned,
             records_measured: corpus.records.len(),
+            walk: corpus.walk,
             n_lenses: lens_ids.len(),
             slot_pairs_evaluated,
             slot_pairs_uncalibrated,
@@ -634,6 +645,7 @@ impl SynapseCalyxVault {
             panel_version: params.panel_version,
             records_scanned: corpus.records_scanned,
             records_measured: corpus.records.len(),
+            walk: corpus.walk,
             recent_fraction,
             permutations,
             lenses_evaluated: lens_drift.len(),
@@ -652,38 +664,50 @@ impl SynapseCalyxVault {
         panel_version: u32,
         max_records: usize,
     ) -> Result<DriftCorpus, SynapseCalyxError> {
-        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
         let snapshot = self.read_snapshot();
         let mut records = Vec::new();
         let mut records_scanned = 0usize;
-        for (_, value) in rows {
-            let base = decode_constellation_base(&value).map_err(|error| {
-                SynapseCalyxError::from_calyx("decode Base constellation", &error)
-            })?;
-            if base.panel_version != panel_version {
-                continue;
-            }
-            records_scanned += 1;
-            if records.len() >= max_records {
-                continue;
-            }
-            // Slot vectors live in the per-slot CFs; a Base row decodes to
-            // `Absent` for every slot, so reading them from it produced an empty
-            // drift corpus that measured nothing (issue #1894).
-            let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
-            let slots = constellation
-                .slots
-                .iter()
-                .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
-                .collect();
-            records.push(DriftRecord {
-                cx_id: constellation.cx_id,
-                slots,
-            });
-        }
+        // #1968: paged rather than materialized. The corpus this builds is
+        // bounded by `max_records`, but the old form built a
+        // whole-`Base` `Vec` first — under the row-guard the constellation
+        // writers need — purely to walk it once.
+        let walk = self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let base = decode_constellation_base(value).map_err(|error| {
+                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                })?;
+                if base.panel_version != panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                records_scanned += 1;
+                if records.len() >= max_records {
+                    // Deliberately not `Stop`: `records_scanned` is the
+                    // whole-panel denominator the drift report divides by, so
+                    // the walk must still reach the end of the CF.
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                // Slot vectors live in the per-slot CFs; a Base row decodes to
+                // `Absent` for every slot, so reading them from it produced an
+                // empty drift corpus that measured nothing (issue #1894).
+                let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
+                let slots = constellation
+                    .slots
+                    .iter()
+                    .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
+                    .collect();
+                records.push(DriftRecord {
+                    cx_id: constellation.cx_id,
+                    slots,
+                });
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
         Ok(DriftCorpus {
             records,
             records_scanned,
+            walk,
         })
     }
 }

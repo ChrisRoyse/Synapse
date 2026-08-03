@@ -80,6 +80,9 @@ fn census(
         first_decode_failure: (decode_failures > 0)
             .then(|| "key_hex=deadbeef error=synthetic truncated Base row".to_owned()),
         measured_at_unix_ms: Some(0),
+        // Hand-assembled to exercise the selection logic downstream of the
+        // fold; no `Base` walk ran, and this says so rather than inventing one.
+        walk: synapse_calyx::SynapseCalyxCfWalk::not_walked("base"),
     }
 }
 

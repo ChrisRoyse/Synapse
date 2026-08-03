@@ -132,6 +132,12 @@ pub struct SynapseCalyxGroundingGapReport {
     pub largest_ungrounded_slots: Vec<SynapseCalyxSlotGroundingCoverage>,
     /// Physical `Base` CF row count read back at call time.
     pub base_cf_rows: usize,
+    /// Provenance of the bounded-hold walk this report was folded from (#1968).
+    ///
+    /// `walk.atomic()` false means the coverage numbers were accumulated across
+    /// an interval rather than at one instant, so two reports taken on a live
+    /// vault are not directly diffable.
+    pub walk: crate::SynapseCalyxCfWalk,
 }
 
 /// Compact provisional verdict for one domain, the reusable mechanism read paths
@@ -178,9 +184,6 @@ impl SynapseCalyxVault {
         crate::lowering::hot_context::assert_cold_calyx("grounding_gap_report");
         let max_records = max_records.clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
 
-        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
-        let base_cf_rows = rows.len();
-
         let mut records_scanned = 0usize;
         let mut records_measured = 0usize;
         let mut grounded_records = 0usize;
@@ -189,64 +192,79 @@ impl SynapseCalyxVault {
         let mut slots: BTreeMap<u16, SlotAccumulator> = BTreeMap::new();
 
         let snapshot = self.read_snapshot();
-        for (_, value) in rows {
-            let base = decode_constellation_base(&value).map_err(|error| {
-                SynapseCalyxError::from_calyx("decode Base constellation", &error)
-            })?;
-            if base.panel_version != panel_version {
-                continue;
-            }
-            records_scanned += 1;
-            if records_measured >= max_records {
-                continue;
-            }
-            records_measured += 1;
-            // Per-slot presence is measured from hydrated vectors: a Base row
-            // decodes every slot to `Absent`, so the `is_absent` skip below
-            // discarded every slot on every record and the grounding report
-            // described zero lenses (issue #1894).
-            let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
+        // #1968: paged rather than materialized. This fold accumulates per-slot
+        // and per-anchor-kind totals; it never needed the whole `Base` CF
+        // resident, and holding the `Base` row-guard across the materialization
+        // stalled every constellation writer for the duration.
+        let walk = self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let base = decode_constellation_base(value).map_err(|error| {
+                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                })?;
+                if base.panel_version != panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                records_scanned += 1;
+                if records_measured >= max_records {
+                    // Deliberately not `Stop`: `records_scanned` is a count over
+                    // the whole panel and `max_records` bounds only the
+                    // *measured* subset, so the walk must reach the end of the
+                    // CF for that denominator to mean what it says.
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                records_measured += 1;
+                // Per-slot presence is measured from hydrated vectors: a Base row
+                // decodes every slot to `Absent`, so the `is_absent` skip below
+                // discarded every slot on every record and the grounding report
+                // described zero lenses (issue #1894).
+                let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
 
-            let grounded_kinds = grounded_anchor_kinds(&constellation.anchors);
-            let record_is_grounded = !grounded_kinds.is_empty();
-            if record_is_grounded {
-                grounded_records += 1;
-            }
-            for kind in &grounded_kinds {
-                *kind_records.entry(kind.clone()).or_default() += 1;
-            }
-            for (slot, vector) in &constellation.slots {
-                if is_absent(vector) {
-                    // A lens refusal is an absence with a reason, and it is the
-                    // only absence worth counting: it means this row *had*
-                    // something to measure and the lens declined it (#1924).
-                    if let SlotVector::Absent {
-                        reason: AbsentReason::Error(detail),
-                    } = vector
-                    {
-                        slots.entry(slot.get()).or_default().records_slot_refused += 1;
-                        tracing::debug!(
-                            code = "CALYX_SLOT_REFUSAL_OBSERVED",
-                            panel_version,
-                            slot = slot.get(),
-                            cx_id = %base.cx_id,
-                            detail = %detail,
-                            "grounding coverage counted a per-slot lens refusal"
-                        );
-                    }
-                    continue;
-                }
-                let entry = slots.entry(slot.get()).or_default();
-                if is_empty_measurement(vector) {
-                    entry.records_empty_measurement += 1;
-                    continue;
-                }
-                entry.records_present += 1;
+                let grounded_kinds = grounded_anchor_kinds(&constellation.anchors);
+                let record_is_grounded = !grounded_kinds.is_empty();
                 if record_is_grounded {
-                    entry.grounded_records += 1;
+                    grounded_records += 1;
                 }
-            }
-        }
+                for kind in &grounded_kinds {
+                    *kind_records.entry(kind.clone()).or_default() += 1;
+                }
+                for (slot, vector) in &constellation.slots {
+                    if is_absent(vector) {
+                        // A lens refusal is an absence with a reason, and it is
+                        // the only absence worth counting: it means this row
+                        // *had* something to measure and the lens declined it
+                        // (#1924).
+                        if let SlotVector::Absent {
+                            reason: AbsentReason::Error(detail),
+                        } = vector
+                        {
+                            slots.entry(slot.get()).or_default().records_slot_refused += 1;
+                            tracing::debug!(
+                                code = "CALYX_SLOT_REFUSAL_OBSERVED",
+                                panel_version,
+                                slot = slot.get(),
+                                cx_id = %base.cx_id,
+                                detail = %detail,
+                                "grounding coverage counted a per-slot lens refusal"
+                            );
+                        }
+                        continue;
+                    }
+                    let entry = slots.entry(slot.get()).or_default();
+                    if is_empty_measurement(vector) {
+                        entry.records_empty_measurement += 1;
+                        continue;
+                    }
+                    entry.records_present += 1;
+                    if record_is_grounded {
+                        entry.grounded_records += 1;
+                    }
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
+        let base_cf_rows = walk.rows_visited;
 
         let ungrounded_records = records_measured.saturating_sub(grounded_records);
         let grounded_fraction = if records_measured == 0 {
@@ -339,6 +357,7 @@ impl SynapseCalyxVault {
             slot_coverage,
             largest_ungrounded_slots,
             base_cf_rows,
+            walk,
         })
     }
 
@@ -468,6 +487,16 @@ pub struct SynapseCalyxPanelCensus {
     /// rather than merely alarming.
     pub first_decode_failure: Option<String>,
     pub measured_at_unix_ms: Option<u64>,
+    /// Provenance of the bounded-hold walk this census was folded from (#1968).
+    ///
+    /// `base_cf_rows` used to be the length of a whole-`Base` materialization
+    /// taken under one row-guard hold, so it was an exact count at one instant
+    /// by construction. It is now folded page by page, and whether the pages
+    /// shared one committed sequence is a property of the run rather than of
+    /// the code — so it is reported. `walk.atomic()` false means this census
+    /// describes an interval, not an instant, and must not be diffed against
+    /// another census as though both were snapshots.
+    pub walk: crate::SynapseCalyxCfWalk,
 }
 
 impl SynapseCalyxPanelCensus {
@@ -514,77 +543,86 @@ impl SynapseCalyxVault {
         // maintenance work and must never be driven from a tagged reflex tick.
         crate::lowering::hot_context::assert_cold_calyx("panel_census");
 
-        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
-        let base_cf_rows = rows.len();
-
         let mut by_version: BTreeMap<u32, SynapseCalyxPanelCensusEntry> = BTreeMap::new();
         let mut decode_failures = 0usize;
         let mut first_decode_failure: Option<String> = None;
 
-        for (key, value) in rows {
-            let base = match decode_constellation_base(&value) {
-                Ok(base) => base,
-                Err(error) => {
-                    decode_failures += 1;
-                    if first_decode_failure.is_none() {
-                        first_decode_failure =
-                            Some(format!("key_hex={} error={error}", hex_lower(&key)));
+        // #1968: paged rather than materialized. This fold never needed every
+        // `Base` row at once — it counts per panel version — and collecting
+        // 106k dense-slot rows to walk them once held the `Base` row-guard for
+        // 290 ms on average and 2.65 s at worst, stalling the constellation
+        // writers that land in the same family.
+        let walk = self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |key, value| {
+                let base = match decode_constellation_base(value) {
+                    Ok(base) => base,
+                    Err(error) => {
+                        decode_failures += 1;
+                        if first_decode_failure.is_none() {
+                            first_decode_failure =
+                                Some(format!("key_hex={} error={error}", hex_lower(key)));
+                        }
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
                     }
-                    continue;
+                };
+                let entry = by_version.entry(base.panel_version).or_insert_with(|| {
+                    SynapseCalyxPanelCensusEntry {
+                        panel_version: base.panel_version,
+                        records: 0,
+                        grounded_records: 0,
+                        anchor_kind_records: BTreeMap::new(),
+                        earliest_created_at_ms: None,
+                        latest_created_at_ms: None,
+                        source_key_hexes: BTreeMap::new(),
+                        unattributed_records: 0,
+                    }
+                });
+                entry.records += 1;
+                // #1940: the declared provenance of each record, kept so the
+                // orphan count can be a per-record probe against the source CF
+                // rather than a subtraction of two counts taken over different
+                // populations.
+                match (
+                    base.metadata.get(METADATA_SOURCE_CF),
+                    base.metadata.get(METADATA_SOURCE_KEY_HEX),
+                ) {
+                    (Some(source_cf), Some(source_key_hex)) => {
+                        entry
+                            .source_key_hexes
+                            .entry(source_cf.clone())
+                            .or_default()
+                            .insert(source_key_hex.clone());
+                    }
+                    _ => entry.unattributed_records += 1,
                 }
-            };
-            let entry = by_version.entry(base.panel_version).or_insert_with(|| {
-                SynapseCalyxPanelCensusEntry {
-                    panel_version: base.panel_version,
-                    records: 0,
-                    grounded_records: 0,
-                    anchor_kind_records: BTreeMap::new(),
-                    earliest_created_at_ms: None,
-                    latest_created_at_ms: None,
-                    source_key_hexes: BTreeMap::new(),
-                    unattributed_records: 0,
-                }
-            });
-            entry.records += 1;
-            // #1940: the declared provenance of each record, kept so the
-            // orphan count can be a per-record probe against the source CF
-            // rather than a subtraction of two counts taken over different
-            // populations.
-            match (
-                base.metadata.get(METADATA_SOURCE_CF),
-                base.metadata.get(METADATA_SOURCE_KEY_HEX),
-            ) {
-                (Some(source_cf), Some(source_key_hex)) => {
+                entry.earliest_created_at_ms = Some(
                     entry
-                        .source_key_hexes
-                        .entry(source_cf.clone())
-                        .or_default()
-                        .insert(source_key_hex.clone());
+                        .earliest_created_at_ms
+                        .map_or(base.created_at, |seen| seen.min(base.created_at)),
+                );
+                entry.latest_created_at_ms = Some(
+                    entry
+                        .latest_created_at_ms
+                        .map_or(base.created_at, |seen| seen.max(base.created_at)),
+                );
+                // Anchors are carried on the Base row itself (they are encoded
+                // into it alongside the scalars), which is precisely why this
+                // pass does not need to hydrate. Slot *vectors* are the thing
+                // that lives in the per-slot CFs (#1894), and this census reads
+                // no slot vector.
+                let grounded_kinds = grounded_anchor_kinds(&base.anchors);
+                if !grounded_kinds.is_empty() {
+                    entry.grounded_records += 1;
                 }
-                _ => entry.unattributed_records += 1,
-            }
-            entry.earliest_created_at_ms = Some(
-                entry
-                    .earliest_created_at_ms
-                    .map_or(base.created_at, |seen| seen.min(base.created_at)),
-            );
-            entry.latest_created_at_ms = Some(
-                entry
-                    .latest_created_at_ms
-                    .map_or(base.created_at, |seen| seen.max(base.created_at)),
-            );
-            // Anchors are carried on the Base row itself (they are encoded into
-            // it alongside the scalars), which is precisely why this pass does
-            // not need to hydrate. Slot *vectors* are the thing that lives in
-            // the per-slot CFs (#1894), and this census reads no slot vector.
-            let grounded_kinds = grounded_anchor_kinds(&base.anchors);
-            if !grounded_kinds.is_empty() {
-                entry.grounded_records += 1;
-            }
-            for kind in grounded_kinds {
-                *entry.anchor_kind_records.entry(kind).or_default() += 1;
-            }
-        }
+                for kind in grounded_kinds {
+                    *entry.anchor_kind_records.entry(kind).or_default() += 1;
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
+        let base_cf_rows = walk.rows_visited;
 
         if decode_failures > 0 {
             tracing::error!(
@@ -603,6 +641,7 @@ impl SynapseCalyxVault {
             base_cf_rows,
             decode_failures,
             first_decode_failure,
+            walk,
             measured_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
