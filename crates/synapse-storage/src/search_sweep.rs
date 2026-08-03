@@ -65,9 +65,30 @@ pub enum GenerationDisposition {
     /// actions ran and what the on-disk state was afterwards.
     Maintained(Box<SearchGenerationMaintenanceReport>),
     /// A generation is published for a panel version that has no code-declared
-    /// slot contract, so no rebuild can reconstruct it and no query can measure
-    /// through it. A declared terminal state, not a transient one.
+    /// slot contract **and no place in any live panel's lineage**, so nothing
+    /// can rebuild it, no query can measure through it, and nobody can say what
+    /// it is. A declared terminal state, not a transient one — and the one that
+    /// must be investigated before anything is deleted.
     UnmaintainableNoContract,
+    /// A generation is published for a **closed superseded version of a panel
+    /// that is still live** (#1972). It has no contract for the same reason
+    /// every superseded version has none — the code declares the live layout —
+    /// but unlike [`Self::UnmaintainableNoContract`] its disposition is known:
+    /// the live generation of the same panel carries the corpus, so this
+    /// directory is reclaimable through `storage operation=retire_search_generation`.
+    ///
+    /// Split out because the two used to share a bucket, and that bucket was a
+    /// *permanent* floor under `calyx_search_generation`: the live vault has
+    /// carried `unmaintainable=1` continuously for a superseded timeline
+    /// generation, so an operator reading `degraded` learned nothing and the
+    /// next genuinely-unknown generation would have been invisible against that
+    /// background.
+    RetirableSupersededGeneration {
+        /// The live panel this version is a superseded generation of.
+        panel_name: &'static str,
+        /// The generation that superseded it and is maintained today.
+        live_panel_version: u32,
+    },
     /// Maintaining this one generation failed. Recorded per generation so a
     /// single bad generation cannot starve every other generation of
     /// maintenance, while still failing the pass as a whole.
@@ -80,6 +101,7 @@ impl GenerationDisposition {
         match self {
             Self::Maintained(_) => "maintained",
             Self::UnmaintainableNoContract => "unmaintainable_no_contract",
+            Self::RetirableSupersededGeneration { .. } => "retirable_superseded_generation",
             Self::Failed { .. } => "failed",
         }
     }
@@ -87,6 +109,12 @@ impl GenerationDisposition {
     #[must_use]
     pub const fn is_failure(&self) -> bool {
         matches!(self, Self::Failed { .. })
+    }
+
+    /// Whether this generation is a known-reclaimable superseded one (#1972).
+    #[must_use]
+    pub const fn is_retirable(&self) -> bool {
+        matches!(self, Self::RetirableSupersededGeneration { .. })
     }
 }
 
@@ -170,9 +198,21 @@ impl PanelGenerationMaintenance {
             }
             GenerationDisposition::UnmaintainableNoContract => format!(
                 "panel {}{active} {disposition}: a search generation is published for a panel \
-                 version with no code-declared slot contract, so no rebuild can reconstruct it \
-                 and no query can measure through it; action=retire the generation directory \
-                 idx/search/panel_{:010} or declare the panel's contract",
+                 version with no code-declared slot contract and no place in any live panel's \
+                 declared lineage, so no rebuild can reconstruct it, no query can measure \
+                 through it, and nothing establishes what it is; action=investigate what wrote \
+                 idx/search/panel_{:010} and declare the panel's contract before deleting \
+                 anything",
+                self.panel_version, self.panel_version,
+            ),
+            GenerationDisposition::RetirableSupersededGeneration {
+                panel_name,
+                live_panel_version,
+            } => format!(
+                "panel {}{active} {disposition}: a search generation is published for a closed \
+                 superseded version of {panel_name}, whose live generation {live_panel_version} \
+                 carries the corpus; no query can reach this one and no rebuild can reconstruct \
+                 it; action=storage operation=retire_search_generation panel_version={}",
                 self.panel_version, self.panel_version,
             ),
             GenerationDisposition::Failed { code, detail } => {

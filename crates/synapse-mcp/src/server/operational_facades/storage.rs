@@ -681,6 +681,87 @@ pub(super) async fn handle(
                 |out| out.retire_orphan_slot_cfs = Some(response),
             )))
         }
+        StorageOperation::RetireSearchGeneration => {
+            let spec = params
+                .0
+                .retire_search_generation
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "retire_search_generation"))?;
+            let source_id = format!("panel:{}", spec.panel_version);
+            require_maintenance_profile(
+                service,
+                &request_context,
+                STORAGE_TOOL,
+                operation.as_str(),
+                &source_id,
+                STORAGE_SOT,
+            )?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_retire_search_generation(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            let panel_version = spec.panel_version;
+            // A directory removal plus two index-root enumerations is blocking
+            // filesystem work, so it is offloaded exactly like the other
+            // maintenance-gated storage operations rather than run on a Tokio
+            // runtime worker.
+            let (report, lineage) = tokio::task::spawn_blocking(move || {
+                db.retire_search_generation(panel_version)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("search-generation retirement blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs; the search-generation retirement task terminated abnormally",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    error.remediation().unwrap_or(
+                        "read health.calyx_search_generations_retirable_panel_versions for the \
+                         versions this operation accepts",
+                    ),
+                )
+            })?;
+            let response = crate::m3::storage::StorageRetireSearchGenerationResponse {
+                source_of_truth: "calyx idx/search index root, re-enumerated after removal",
+                panel_version: report.panel_version,
+                panel_name: lineage.panel_name.to_owned(),
+                live_panel_version: lineage.live_panel_version,
+                directory: report.directory.clone(),
+                files_removed: report.files_removed,
+                bytes_reclaimed: report.bytes_reclaimed,
+                published_before: report.published_before.clone(),
+                published_after: report.published_after.clone(),
+                active_panel_version: report.active_panel_version,
+            };
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "retired superseded search generation panel={} ({} superseded by {}) files={} bytes={} published_before={:?} published_after={:?}",
+                    response.panel_version,
+                    response.panel_name,
+                    response.live_panel_version,
+                    response.files_removed,
+                    response.bytes_reclaimed,
+                    response.published_before,
+                    response.published_after,
+                ),
+                |out| out.retire_search_generation = Some(response),
+            )))
+        }
         StorageOperation::Backup => {
             let spec = params
                 .0

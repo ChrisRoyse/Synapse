@@ -719,6 +719,20 @@ impl SynapseService {
                 })
                 .count() as u64
         });
+        // #1972: a closed superseded version of a live panel is *reclaimable*,
+        // not unknown. Counting it as unmaintainable put a permanent floor under
+        // this subsystem — the live vault carried `unmaintainable=1` for a
+        // superseded timeline generation continuously, so `degraded` taught an
+        // operator nothing and the next genuinely-unknown generation would have
+        // been invisible against that background. It is still reported, in its
+        // own field, with the exact op that clears it.
+        let sweep_retirable = sweep.map_or(0, |sweep| {
+            sweep
+                .generations
+                .iter()
+                .filter(|entry| entry.disposition.is_retirable())
+                .count() as u64
+        });
         let sweep_failed = sweep.map_or(0, |sweep| {
             sweep
                 .generations
@@ -793,6 +807,15 @@ impl SynapseService {
                     .count() as u64
             }),
             calyx_search_generations_unmaintainable: sweep.map(|_| sweep_unmaintainable),
+            calyx_search_generations_retirable: sweep.map(|_| sweep_retirable),
+            calyx_search_generations_retirable_panel_versions: sweep.map(|sweep| {
+                sweep
+                    .generations
+                    .iter()
+                    .filter(|entry| entry.disposition.is_retirable())
+                    .map(|entry| entry.panel_version)
+                    .collect()
+            }),
             calyx_search_generations_failed: sweep.map(|_| sweep_failed),
             calyx_search_generations_closest_panel_version: closest.map(|(panel, _)| panel),
             calyx_search_generations_closest_keys_to_bound: closest.map(|(_, keys)| keys),

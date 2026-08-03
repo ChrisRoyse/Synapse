@@ -2181,6 +2181,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "hold an explicit maintenance profile, wait for any in-flight retirement pass to finish, then retry",
             ),
             op(
+                "retire_search_generation",
+                true,
+                false,
+                "the idx/search index root, re-enumerated after the directory removal",
+                Some(
+                    "the exact directory removed + files/bytes it held + the published generation set BEFORE and AFTER the removal, so the retirement is proven by the index root rather than by the return code",
+                ),
+                "STORAGE_SEARCH_GENERATION_UNKNOWN_PANEL",
+                "hold an explicit maintenance profile and name a panel version from health.calyx_search_generations_retirable_panel_versions; a version with a code-declared contract is maintainable (use search_rebuild) and a version with no declared lineage must be investigated, not deleted",
+            ),
+            op(
                 "intelligence",
                 true,
                 false,
@@ -6184,7 +6195,13 @@ mod facade_schema_parity_tests {
         };
 
         assert_eq!(schema_name.as_deref(), Some("StorageOperation"));
-        for expected in [
+        // The count is derived from this list, never written out separately.
+        // It used to be a hand-maintained literal, and it had silently drifted
+        // to 13 against 15 live operations — so the check that was supposed to
+        // catch an *unlisted* operation had itself been failing, and every new
+        // operation since then went unverified. A count that restates the
+        // length of the list above it cannot drift from it.
+        const EXPECTED_OPERATIONS: [&str; 16] = [
             "inspect",
             "summary",
             "gc_once",
@@ -6197,16 +6214,22 @@ mod facade_schema_parity_tests {
             "search_rebuild",
             "find_similar",
             "retire_orphan_slot_cfs",
+            "retire_search_generation",
             "backup",
             "restore_verify",
             "intelligence",
-        ] {
+        ];
+        for expected in EXPECTED_OPERATIONS {
             assert!(
                 operations.contains(expected),
                 "live storage operation enum is missing {expected}: {operations:?}"
             );
         }
-        assert_eq!(operations.len(), 13, "resolved operations: {operations:?}");
+        assert_eq!(
+            operations.len(),
+            EXPECTED_OPERATIONS.len(),
+            "resolved operations: {operations:?}"
+        );
     }
 
     /// A flat facade must be recognised by the ABSENCE of an `operation`

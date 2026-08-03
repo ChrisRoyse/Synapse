@@ -295,7 +295,18 @@ pub enum RowGuardSite {
     ChangedBaseKeysAfterAtForPanel,
     ScanCfRangePageAt,
     PredecessorCfAt,
-    OverlayTableRows,
+    /// The overlay half of a whole-family `scan_cf_at`.
+    ///
+    /// Split out of the single `overlay_table_rows` site because that site was
+    /// shared by `scan_cf_at` and `scan_cf_range_at`, and #1973's first
+    /// question — *which caller is holding the guard for 452 ms* — was
+    /// unanswerable from the census as a result. A whole-family scan and a
+    /// narrow prefix read have completely different remedies, so they are
+    /// counted separately rather than adjudicated by inspection afterwards.
+    ScanCfAtOverlay,
+    /// The overlay half of a range-bounded `scan_cf_range_at`. See
+    /// [`Self::ScanCfAtOverlay`].
+    ScanCfRangeAtOverlay,
     OverlayTableKeys,
     SnapshotGcDebt,
     PinSnapshotForPanel,
@@ -307,7 +318,7 @@ impl RowGuardSite {
     /// Every site, in declaration order. The census is indexed by position
     /// here, so this array is the contract that makes a zero-hold site
     /// reportable rather than invisible.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ReadLatest,
         Self::ReadBatchLatest,
         Self::ScanCfLatest,
@@ -321,7 +332,8 @@ impl RowGuardSite {
         Self::ChangedBaseKeysAfterAtForPanel,
         Self::ScanCfRangePageAt,
         Self::PredecessorCfAt,
-        Self::OverlayTableRows,
+        Self::ScanCfAtOverlay,
+        Self::ScanCfRangeAtOverlay,
         Self::OverlayTableKeys,
         Self::SnapshotGcDebt,
         Self::PinSnapshotForPanel,
@@ -349,7 +361,8 @@ impl RowGuardSite {
             Self::ChangedBaseKeysAfterAtForPanel => "changed_base_keys_after_at_for_panel",
             Self::ScanCfRangePageAt => "scan_cf_range_page_at",
             Self::PredecessorCfAt => "predecessor_cf_at",
-            Self::OverlayTableRows => "overlay_table_rows",
+            Self::ScanCfAtOverlay => "scan_cf_at_overlay",
+            Self::ScanCfRangeAtOverlay => "scan_cf_range_at_overlay",
             Self::OverlayTableKeys => "overlay_table_keys",
             Self::SnapshotGcDebt => "snapshot_gc_debt",
             Self::PinSnapshotForPanel => "pin_snapshot_for_panel",

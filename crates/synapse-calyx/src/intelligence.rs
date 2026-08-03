@@ -416,8 +416,12 @@ impl SynapseCalyxVault {
             self.flush()?;
         }
 
-        let xterm_cf_rows_after = self.count_cf_latest(ColumnFamily::XTerm)?;
-        let graph_cf_rows_after = self.count_cf_latest(ColumnFamily::Graph)?;
+        let xterm_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::XTerm)?
+            .rows_visited;
+        let graph_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::Graph)?
+            .rows_visited;
 
         let mut abundance = self.build_abundance_report(
             params.panel_version,
@@ -572,8 +576,12 @@ impl SynapseCalyxVault {
             }
             measured_slot_instances += record.slots.len();
         }
-        let xterm_cf_rows = self.count_cf_latest(ColumnFamily::XTerm)?;
-        let graph_cf_rows = self.count_cf_latest(ColumnFamily::Graph)?;
+        let xterm_cf_rows = self
+            .count_cf_latest_bounded(ColumnFamily::XTerm)?
+            .rows_visited;
+        let graph_cf_rows = self
+            .count_cf_latest_bounded(ColumnFamily::Graph)?
+            .rows_visited;
         // `N` is the panel contract, not the subset one loader accepted: the
         // DDA yield `n·(N + C(N,2) + 1)` is a statement about the panel, and
         // shrinking `N` to the carried subset understates the association
@@ -3364,7 +3372,9 @@ impl SynapseCalyxVault {
                 .persist_to_vault(&self.vault)
                 .map_err(|error| loom_math_error("persist Assay CF rows", &error))?;
         }
-        self.count_cf_latest(ColumnFamily::Assay)
+        Ok(self
+            .count_cf_latest_bounded(ColumnFamily::Assay)?
+            .rows_visited)
     }
 }
 
@@ -4394,7 +4404,9 @@ impl SynapseCalyxVault {
             "estimator": estimator,
         });
         self.persist_temporal_row(ColumnFamily::Graph, key, &out_edge)?;
-        let graph_cf_rows_after = self.count_cf_latest(ColumnFamily::Graph)?;
+        let graph_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::Graph)?
+            .rows_visited;
 
         Ok(SynapseCalyxCausalityReport {
             panel_version: params.panel_version,
@@ -4477,7 +4489,9 @@ impl SynapseCalyxVault {
             params.filter_value.as_deref(),
         );
         self.persist_temporal_row(ColumnFamily::TemporalXTerm, key, &out)?;
-        let temporal_xterm_cf_rows_after = self.count_cf_latest(ColumnFamily::TemporalXTerm)?;
+        let temporal_xterm_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::TemporalXTerm)?
+            .rows_visited;
 
         Ok(SynapseCalyxPeriodicityReport {
             panel_version: params.panel_version,
@@ -4545,7 +4559,9 @@ impl SynapseCalyxVault {
             params.filter_value.as_deref(),
         );
         self.persist_temporal_row(ColumnFamily::TemporalXTerm, key, &out)?;
-        let temporal_xterm_cf_rows_after = self.count_cf_latest(ColumnFamily::TemporalXTerm)?;
+        let temporal_xterm_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::TemporalXTerm)?
+            .rows_visited;
 
         Ok(SynapseCalyxDriftReport {
             panel_version: params.panel_version,
@@ -4620,7 +4636,9 @@ impl SynapseCalyxVault {
             params.filter_value.as_deref(),
         );
         self.persist_temporal_row(ColumnFamily::TemporalXTerm, key, &out)?;
-        let temporal_xterm_cf_rows_after = self.count_cf_latest(ColumnFamily::TemporalXTerm)?;
+        let temporal_xterm_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::TemporalXTerm)?
+            .rows_visited;
 
         Ok(SynapseCalyxHazardReport {
             panel_version: params.panel_version,
@@ -5349,7 +5367,9 @@ impl SynapseCalyxVault {
             &crate::kernel_maintenance::VaultKernelArtifactStore::new(self),
         )
         .map_err(|error| kernel_math_error("persist the Kernel artifact", &error))?;
-        let kernel_cf_rows_after = self.count_cf_latest(ColumnFamily::Kernel)?;
+        let kernel_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::Kernel)?
+            .rows_visited;
 
         Ok(SynapseCalyxKernelReport {
             panel_version: params.panel_version,

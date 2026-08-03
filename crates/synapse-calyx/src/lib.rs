@@ -700,6 +700,52 @@ pub struct PublishedSearchGenerations {
     pub unrecognized: Vec<String>,
 }
 
+/// Evidence that one published search generation was retired (#1972).
+///
+/// Carries the index root's published set from **before and after** the
+/// removal, not just a success flag: "the directory is gone" is the claim, and
+/// the two enumerations are the proof.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SynapseCalyxRetiredSearchGeneration {
+    pub panel_version: u32,
+    /// The exact directory removed.
+    pub directory: String,
+    /// Files it held, counted before removal.
+    pub files_removed: u64,
+    /// Bytes it held, counted before removal.
+    pub bytes_reclaimed: u64,
+    /// Published panel versions before the removal.
+    pub published_before: Vec<u32>,
+    /// Published panel versions re-enumerated after the removal.
+    pub published_after: Vec<u32>,
+    /// The vault's active panel, which is never retirable.
+    pub active_panel_version: Option<u32>,
+}
+
+/// Total bytes of the files directly inside `directory`, or zero when it cannot
+/// be listed. Used only to report what a retirement reclaimed, so an unreadable
+/// directory reports nothing reclaimed rather than failing the retirement.
+fn directory_bytes(directory: &std::path::Path) -> u64 {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+/// Count of the files directly inside `directory`. See [`directory_bytes`].
+fn directory_file_count(directory: &std::path::Path) -> u64 {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.metadata().is_ok_and(|metadata| metadata.is_file()))
+        .count() as u64
+}
+
 /// One unattended search-generation maintenance pass, with the state read back
 /// from disk after the work rather than assumed from the return of the build.
 #[derive(Clone, Debug)]
@@ -3695,6 +3741,101 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Retires one published search generation by removing its directory, and
+    /// **proves** the removal by re-enumerating the index root afterwards
+    /// (#1972).
+    ///
+    /// The caller has already established that this generation *should* be
+    /// retired — that judgement needs the panel catalog, which lives above this
+    /// crate. What is enforced here is everything that makes the removal
+    /// physically safe, because these are facts about the vault:
+    ///
+    /// * the generation must actually be published (a directory with a
+    ///   `manifest.json`), so a typo removes nothing;
+    /// * it must **not** be the panel the vault manifest publishes as active,
+    ///   because that generation is what every default query reads.
+    ///
+    /// This is deliberately not something the unattended maintainer does.
+    /// Deleting an index directory is destructive and irreversible from inside
+    /// the process, so it is an explicit, operator-owned act — the same shape as
+    /// Lucene's `IndexDeletionPolicy`, where retention is a declared policy
+    /// decision rather than an implicit side effect of a background merge. The
+    /// sweep's job is to *name* the condition; this is the named action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the generation is not published, when it
+    /// is the active panel, when the directory cannot be removed, or when the
+    /// post-removal readback still finds it published — the last of which means
+    /// the filesystem accepted a removal that did not take effect, and is
+    /// reported rather than assumed away.
+    pub fn retire_search_generation(
+        &self,
+        panel_version: u32,
+    ) -> Result<SynapseCalyxRetiredSearchGeneration, SynapseCalyxError> {
+        let before = self.published_search_generations()?;
+        if !before.panels.contains(&panel_version) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_GENERATION_NOT_PUBLISHED",
+                format!(
+                    "no search generation is published for panel version {panel_version} under {}; published generations are {:?}",
+                    before.index_root.display(),
+                    before.panels
+                ),
+                "name a panel version that appears in health.calyx_search_generations_retirable_panel_versions",
+            ));
+        }
+        let active = self.active_panel_version()?;
+        if active == Some(panel_version) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_GENERATION_ACTIVE",
+                format!(
+                    "panel version {panel_version} is the vault's active panel, so its search generation is what every default query reads"
+                ),
+                "retire a superseded generation, or publish a different active panel first",
+            ));
+        }
+        let directory = before.index_root.join(format!("panel_{panel_version:010}"));
+        let bytes_before = directory_bytes(&directory);
+        let files_before = directory_file_count(&directory);
+        std::fs::remove_dir_all(&directory).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_GENERATION_RETIRE_FAILED",
+                format!(
+                    "remove the search generation directory {}: {error}",
+                    directory.display()
+                ),
+                "check the vault directory's permissions and that no process holds a file in that \
+                 directory open",
+            )
+        })?;
+        // The return value of `remove_dir_all` is a claim; the source of truth
+        // is the index root. Re-enumerating it is the same read the sweep does,
+        // so a retirement that did not take effect is caught here rather than
+        // discovered as a generation that keeps reappearing every tick.
+        let after = self.published_search_generations()?;
+        if after.panels.contains(&panel_version) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_GENERATION_STILL_PUBLISHED",
+                format!(
+                    "the search generation directory for panel {panel_version} was removed without error, but re-enumerating {} still reports it published",
+                    after.index_root.display()
+                ),
+                "inspect the index root directly; the filesystem accepted a removal that did not \
+                 take effect",
+            ));
+        }
+        Ok(SynapseCalyxRetiredSearchGeneration {
+            panel_version,
+            directory: directory.display().to_string(),
+            files_removed: files_before,
+            bytes_reclaimed: bytes_before,
+            published_before: before.panels,
+            published_after: after.panels,
+            active_panel_version: active,
+        })
+    }
+
     /// Keeps **one named** persisted search generation inside its freshness
     /// budget, unattended (issue #1891 ask 2; extended to any panel by #1938).
     ///
@@ -5686,6 +5827,34 @@ impl SynapseCalyxVault {
             }
             cursor = Some(resume);
         }
+    }
+
+    /// Counts the visible rows of one column family with a **bounded** row-guard
+    /// hold, by folding [`Self::walk_cf_latest`] pages (#1973).
+    ///
+    /// [`Self::count_cf_latest`] reads as `O(1)` and is not: it is identical to
+    /// `scan_cf_latest().len()` in time, walking every row of the family under a
+    /// single hold of the vault-wide row-table read guard. On the live vault
+    /// that measured a **127 ms** hold counting `Graph` (81,236 rows) against a
+    /// 25 ms budget, which is the same defect #1968 removed from `Base`, on a
+    /// different column family.
+    ///
+    /// The trade is the one #1968 already made and is stated rather than
+    /// hidden: many short holds instead of one long one, so the count describes
+    /// an *interval* unless [`SynapseCalyxCfWalk::atomic`] holds. Callers that
+    /// use the count as physical evidence a write landed get the walk back and
+    /// must report that flag rather than assume it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any page-read failure from [`Self::walk_cf_latest`].
+    pub fn count_cf_latest_bounded(
+        &self,
+        cf: ColumnFamily,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError> {
+        self.walk_cf_latest(cf, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, |_key, _value| {
+            Ok(SynapseCalyxWalkStep::Continue)
+        })
     }
 
     /// Per-site row-table read-guard counters, read at this instant.

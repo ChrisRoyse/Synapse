@@ -375,6 +375,55 @@ pub struct StorageRetireOrphanSlotCfsResponse {
     pub skipped_live: Vec<StorageSkippedLiveSlotCf>,
 }
 
+// ---------------------------------------------------------------------------
+// Superseded search-generation retirement (#1972), gated exactly like
+// retire_orphan_slot_cfs (maintenance profile + single admission).
+//
+// The sweep names the condition; nothing carried it out. A superseded
+// generation's directory therefore sat under the index root forever, pinning
+// `calyx_search_generation` at `degraded` permanently and costing the
+// derived-state maintainer a contract resolution on every five-minute tick.
+//
+// It is an explicit operator-owned operation rather than something the
+// maintainer does on its own, because deleting an index directory is
+// destructive and irreversible. That is the same division Lucene draws with
+// `IndexDeletionPolicy`: retention is a declared decision, not an implicit side
+// effect of a background pass.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRetireSearchGenerationParams {
+    /// The exact superseded panel version whose published search generation is
+    /// to be retired.
+    ///
+    /// Named explicitly, never inferred: an operation that picked its own
+    /// targets could widen silently, and the whole point of this op is that a
+    /// destructive act is deliberate. `health` reports the eligible versions in
+    /// `calyx_search_generations_retirable_panel_versions`.
+    pub panel_version: u32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageRetireSearchGenerationResponse {
+    pub source_of_truth: &'static str,
+    pub panel_version: u32,
+    /// The live panel this version is a superseded generation of.
+    pub panel_name: String,
+    /// The generation that superseded it and is maintained today.
+    pub live_panel_version: u32,
+    /// The exact directory removed.
+    pub directory: String,
+    pub files_removed: u64,
+    pub bytes_reclaimed: u64,
+    /// Published panel versions before the removal.
+    pub published_before: Vec<u32>,
+    /// Published panel versions re-enumerated from the index root afterwards.
+    /// This is the evidence, not the return code.
+    pub published_after: Vec<u32>,
+    pub active_panel_version: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageBackupParams {
@@ -2000,6 +2049,13 @@ pub fn required_permissions_find_similar(
 #[must_use]
 pub fn required_permissions_retire_orphan_slot_cfs(
     _params: &StorageRetireOrphanSlotCfsParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_retire_search_generation(
+    _params: &StorageRetireSearchGenerationParams,
 ) -> RequiredPermissions {
     required([Permission::ReadStorage, Permission::WriteStorage])
 }

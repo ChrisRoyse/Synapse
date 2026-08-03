@@ -414,11 +414,27 @@ pub struct SubsystemHealth {
     /// Generations swept without a failure and inside their bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generations_maintained: Option<u64>,
-    /// Generations whose panel version has no code-declared slot contract, so
-    /// no rebuild can ever return them to their bound. A declared terminal
-    /// state, not a transient one.
+    /// Generations whose panel version has no code-declared slot contract **and
+    /// no place in any live panel's declared lineage**, so no rebuild can ever
+    /// return them to their bound and nothing establishes what they are. A
+    /// declared terminal state, not a transient one — investigate before
+    /// deleting anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generations_unmaintainable: Option<u64>,
+    /// Generations published for a **closed superseded version of a live
+    /// panel** (#1972). Reclaimable rather than unknown: the live generation of
+    /// the same panel carries the corpus, so `storage
+    /// operation=retire_search_generation` clears each one.
+    ///
+    /// Counted apart from `unmaintainable` because sharing that field put a
+    /// permanent floor under this subsystem's status, which made the next
+    /// genuinely-unknown generation invisible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_retirable: Option<u64>,
+    /// The exact panel versions behind `calyx_search_generations_retirable`, so
+    /// remediation needs no log dive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_retirable_panel_versions: Option<Vec<u32>>,
     /// Generations whose maintenance failed on the last sweep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generations_failed: Option<u64>,

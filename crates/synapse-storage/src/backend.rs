@@ -36,11 +36,12 @@ use synapse_calyx::{
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
     SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
-    SynapseCalyxReproduceReport, SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport,
-    SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
-    SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
-    SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport, SynapseCalyxVerifyReport,
-    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
+    SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration, SynapseCalyxRevisionGuard,
+    SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
+    SynapseCalyxTemporalParams, SynapseCalyxTemporalRerankReadback, SynapseCalyxVault,
+    SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport,
+    SynapseCalyxVerifyReport, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -60,8 +61,8 @@ use crate::constellations::{
     SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION,
     SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
     SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, assert_syn_lens_provenance_complete,
-    syn_active_panel_contract,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, SupersededPanelLineage,
+    assert_syn_lens_provenance_complete, superseded_panel_lineage, syn_active_panel_contract,
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
@@ -590,6 +591,10 @@ pub trait StorageBackend: Send + Sync {
         params: &SynapseCalyxFindParams,
     ) -> StorageResult<SynapseCalyxFindReport>;
     fn retire_orphan_slot_cfs(&self) -> StorageResult<AsterOrphanSlotGcReport>;
+    fn retire_search_generation(
+        &self,
+        panel_version: u32,
+    ) -> StorageResult<(SynapseCalyxRetiredSearchGeneration, SupersededPanelLineage)>;
     fn close_calyx_vault(
         &self,
         reason: &'static str,
@@ -1514,6 +1519,76 @@ fn retire_orphan_slot_cfs_on_vault(
     )
 }
 
+/// Retires one superseded panel's published search generation (#1972).
+///
+/// The physical safety checks (published, not active, removal proven by
+/// re-enumeration) belong to the vault. The two checks here are the ones that
+/// need the **panel catalog**, and both are refusals rather than warnings:
+///
+/// 1. A version with a code-declared slot contract is *maintainable*. Its
+///    generation can be rebuilt, so retiring it destroys an index that the
+///    sweep would have kept current — the remedy for a lagging maintainable
+///    generation is `search_rebuild`, never this.
+/// 2. A version with no place in any live panel's declared lineage is not
+///    known to be superseded; it is simply **unknown**. #1972 ask 2 is exactly
+///    this distinction, and collapsing it would let a typo'd or
+///    genuinely-unexplained version authorise its own deletion.
+///
+/// So an operator cannot retire anything except a generation the code already
+/// declares to be a closed superseded ancestor of a live panel.
+fn retire_search_generation_on_vault(
+    vault: &CalyxVaultRuntime,
+    panel_version: u32,
+) -> StorageResult<(SynapseCalyxRetiredSearchGeneration, SupersededPanelLineage)> {
+    let source = format!("panel:{panel_version}");
+    vault.with_vault(
+        &source,
+        "retire a superseded published search generation",
+        true,
+        |vault| {
+            let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+            if syn_active_panel_contract(panel_version, created_at_ms)?.is_some() {
+                return Err(StorageError::CalyxWriteFailed {
+                    cf_name: source.clone(),
+                    code: "STORAGE_SEARCH_GENERATION_NOT_RETIRABLE",
+                    detail: format!(
+                        "panel version {panel_version} has a code-declared slot contract, so its \
+                         published search generation is maintainable and can be rebuilt; retiring \
+                         it would destroy an index the sweep keeps current"
+                    ),
+                    remediation:
+                        "run storage operation=search_rebuild for this panel instead; retirement is \
+                         only for a closed superseded generation",
+                    committed_seq: None,
+                });
+            }
+            let Some(lineage) = superseded_panel_lineage(panel_version) else {
+                return Err(StorageError::CalyxWriteFailed {
+                    cf_name: source.clone(),
+                    code: "STORAGE_SEARCH_GENERATION_UNKNOWN_PANEL",
+                    detail: format!(
+                        "panel version {panel_version} has no code-declared slot contract and no \
+                         place in any live panel's declared lineage, so nothing establishes that \
+                         it is a superseded generation and it must not be deleted"
+                    ),
+                    remediation:
+                        "investigate what published this generation directory, then declare the \
+                         panel's contract or its lineage in builtin_panel_catalog before retiring it",
+                    committed_seq: None,
+                });
+            };
+            let report = vault.retire_search_generation(panel_version).map_err(|source| {
+                calyx_write_failed(
+                    &format!("panel:{panel_version}"),
+                    "retire a superseded published search generation",
+                    &source,
+                )
+            })?;
+            Ok((report, lineage))
+        },
+    )
+}
+
 fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> StorageResult<()> {
     let reservations = [
         (SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION),
@@ -2185,19 +2260,48 @@ impl StorageBackend for CalyxBackend {
                         }
                     };
                     if supplied.is_none() && !is_active_panel {
-                        tracing::warn!(
-                            code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
-                            panel_version,
-                            index_root = %published.index_root.display(),
-                            "a search generation is published for a panel version with no \
-                             code-declared slot contract; nothing can rebuild it and no query can \
-                             measure through it, so it will never re-enter its reconciliation \
-                             bound. Retire the generation directory or declare the panel contract"
-                        );
+                        // #1972 ask 2: "no contract" collapsed two situations
+                        // with opposite remedies. A closed superseded version of
+                        // a live panel is reclaimable and its removal is safe;
+                        // a version nothing declares must be investigated before
+                        // anything is deleted. The catalog already knows which
+                        // is which, so this is a lookup rather than a judgement.
+                        let disposition = match superseded_panel_lineage(panel_version) {
+                            Some(lineage) => {
+                                tracing::info!(
+                                    code = "STORAGE_SEARCH_GENERATION_RETIRABLE_SUPERSEDED",
+                                    panel_version,
+                                    panel_name = lineage.panel_name,
+                                    live_panel_version = lineage.live_panel_version,
+                                    index_root = %published.index_root.display(),
+                                    "a search generation is published for a closed superseded \
+                                     version of a live panel; the live generation carries the \
+                                     corpus, so this directory is reclaimable through storage \
+                                     operation=retire_search_generation"
+                                );
+                                GenerationDisposition::RetirableSupersededGeneration {
+                                    panel_name: lineage.panel_name,
+                                    live_panel_version: lineage.live_panel_version,
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
+                                    panel_version,
+                                    index_root = %published.index_root.display(),
+                                    "a search generation is published for a panel version with \
+                                     no code-declared slot contract and no place in any live \
+                                     panel's declared lineage; nothing can rebuild it, no query \
+                                     can measure through it, and nothing establishes what it is. \
+                                     Investigate before deleting anything"
+                                );
+                                GenerationDisposition::UnmaintainableNoContract
+                            }
+                        };
                         generations.push(PanelGenerationMaintenance {
                             panel_version,
                             is_active_panel,
-                            disposition: GenerationDisposition::UnmaintainableNoContract,
+                            disposition,
                         });
                         continue;
                     }
@@ -2651,6 +2755,13 @@ impl StorageBackend for CalyxBackend {
                     })
             },
         )
+    }
+
+    fn retire_search_generation(
+        &self,
+        panel_version: u32,
+    ) -> StorageResult<(SynapseCalyxRetiredSearchGeneration, SupersededPanelLineage)> {
+        retire_search_generation_on_vault(&self.vault, panel_version)
     }
 
     fn retire_orphan_slot_cfs(&self) -> StorageResult<AsterOrphanSlotGcReport> {

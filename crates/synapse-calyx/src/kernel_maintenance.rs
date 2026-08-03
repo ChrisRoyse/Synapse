@@ -290,7 +290,9 @@ impl SynapseCalyxVault {
             ));
         }
 
-        let kernel_cf_rows_after = self.count_cf_latest(ColumnFamily::Kernel)?;
+        let kernel_cf_rows_after = self
+            .count_cf_latest_bounded(ColumnFamily::Kernel)?
+            .rows_visited;
         Ok(SynapseCalyxKernelRebuildReport {
             panel_version: params.panel_version,
             content_slot: params.content_slot,
@@ -367,7 +369,9 @@ impl SynapseCalyxVault {
             crate::intelligence::kernel_math_error("read the persisted Kernel artifact", &error)
         })?;
         let health: KernelHealth = kernel_health_from_kernel(&kernel);
-        let kernel_cf_rows = self.count_cf_latest(ColumnFamily::Kernel)?;
+        let kernel_cf_rows = self
+            .count_cf_latest_bounded(ColumnFamily::Kernel)?
+            .rows_visited;
 
         Ok(SynapseCalyxKernelHealthReport {
             panel_version,

@@ -1198,6 +1198,27 @@ impl Db {
         self.backend.retire_orphan_slot_cfs()
     }
 
+    /// Retires one closed superseded panel's published search generation
+    /// (#1972), returning the removal evidence and the lineage that authorised
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the panel version is
+    /// maintainable (it has a code-declared contract), when it has no place in
+    /// any live panel's declared lineage, when no generation is published for
+    /// it, when it is the active panel, or when the removal or its readback
+    /// fails.
+    pub fn retire_search_generation(
+        &self,
+        panel_version: u32,
+    ) -> StorageResult<(
+        synapse_calyx::SynapseCalyxRetiredSearchGeneration,
+        crate::constellations::SupersededPanelLineage,
+    )> {
+        self.backend.retire_search_generation(panel_version)
+    }
+
     /// Weaves the native Loom base associations for one panel: within-record
     /// cross-terms, the slot-pair agreement graph, and the between-record
     /// nearest-neighbor graph, persisted to the native `XTerm`/`Graph` CFs and

@@ -29,7 +29,8 @@ use crate::m3::{
         StorageInspectParams, StorageInspectResponse, StorageIntelligenceParams,
         StorageIntelligenceResponse, StoragePanelCoverageParams, StoragePanelCoverageResponse,
         StorageRestoreVerifyParams, StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
-        StorageRetireOrphanSlotCfsResponse, StorageSearchRebuildParams,
+        StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
+        StorageRetireSearchGenerationResponse, StorageSearchRebuildParams,
         StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
         StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
         StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
@@ -50,6 +51,7 @@ pub enum StorageOperation {
     SearchRebuild,
     FindSimilar,
     RetireOrphanSlotCfs,
+    RetireSearchGeneration,
     Backup,
     RestoreVerify,
     Intelligence,
@@ -70,6 +72,7 @@ impl StorageOperation {
             Self::SearchRebuild => "search_rebuild",
             Self::FindSimilar => "find_similar",
             Self::RetireOrphanSlotCfs => "retire_orphan_slot_cfs",
+            Self::RetireSearchGeneration => "retire_search_generation",
             Self::Backup => "backup",
             Self::RestoreVerify => "restore_verify",
             Self::Intelligence => "intelligence",
@@ -105,6 +108,8 @@ pub struct StorageParams {
     pub find_similar: Option<StorageFindSimilarParams>,
     #[serde(default)]
     pub retire_orphan_slot_cfs: Option<StorageRetireOrphanSlotCfsParams>,
+    #[serde(default)]
+    pub retire_search_generation: Option<StorageRetireSearchGenerationParams>,
     #[serde(default)]
     pub backup: Option<StorageBackupParams>,
     #[serde(default)]
@@ -143,6 +148,8 @@ pub struct StorageResponse {
     pub find_similar: Option<StorageFindSimilarResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retire_orphan_slot_cfs: Option<StorageRetireOrphanSlotCfsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_search_generation: Option<StorageRetireSearchGenerationResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<StorageBackupResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

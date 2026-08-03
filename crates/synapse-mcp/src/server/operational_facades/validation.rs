@@ -31,6 +31,10 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
                 "retire_orphan_slot_cfs",
                 params.retire_orphan_slot_cfs.is_some(),
             ),
+            (
+                "retire_search_generation",
+                params.retire_search_generation.is_some(),
+            ),
             ("backup", params.backup.is_some()),
             ("restore_verify", params.restore_verify.is_some()),
             ("intelligence", params.intelligence.is_some()),

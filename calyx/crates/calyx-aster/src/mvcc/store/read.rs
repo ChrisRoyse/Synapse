@@ -245,7 +245,7 @@ impl VersionedCfStore {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut rows = self.router_latest_rows(snapshot, cf, None)?;
-        self.overlay_table_rows(snapshot, cf, None, &mut rows);
+        self.overlay_table_rows(RowGuardSite::ScanCfAtOverlay, snapshot, cf, None, &mut rows)?;
         for key in rows.keys() {
             self.ensure_unbarriered(cf, key)?;
         }
@@ -376,7 +376,13 @@ impl VersionedCfStore {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut rows = self.router_latest_rows(snapshot, cf, Some(range))?;
-        self.overlay_table_rows(snapshot, cf, Some(range), &mut rows);
+        self.overlay_table_rows(
+            RowGuardSite::ScanCfRangeAtOverlay,
+            snapshot,
+            cf,
+            Some(range),
+            &mut rows,
+        )?;
         for key in rows.keys() {
             self.ensure_unbarriered(cf, key)?;
         }
@@ -393,7 +399,7 @@ impl VersionedCfStore {
     ) -> Result<Vec<Vec<u8>>> {
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut keys = self.router_latest_keys(snapshot, cf, range)?;
-        self.overlay_table_keys(snapshot, cf, range, &mut keys);
+        self.overlay_table_keys(snapshot, cf, range, &mut keys)?;
         for key in keys.keys() {
             self.ensure_unbarriered(cf, key)?;
         }

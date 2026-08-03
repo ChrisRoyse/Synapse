@@ -2297,6 +2297,45 @@ pub struct PanelCatalogEntry {
     pub backfill_source_cf: Option<&'static str>,
 }
 
+/// One panel version's place in a live panel's declared lineage (#1972).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupersededPanelLineage {
+    /// The panel whose lineage this version belongs to.
+    pub panel_name: &'static str,
+    /// The generation that superseded it and is live today.
+    pub live_panel_version: u32,
+}
+
+/// Resolves a panel version that has **no** code-declared slot contract into
+/// its place in a live panel's lineage, when it has one (#1972 ask 2).
+///
+/// The search-generation sweep collapsed two situations with opposite remedies
+/// into one `unmaintainable_no_contract` bucket:
+///
+/// * *this is a closed superseded version of a panel that is still live* —
+///   retiring its published search generation is safe and correct, because the
+///   live generation of the same panel carries the corpus; and
+/// * *this panel version is entirely unknown to the code* — nothing may be
+///   deleted until someone establishes what it is.
+///
+/// Nothing new is declared to tell them apart: [`builtin_panel_catalog`]
+/// already carries `superseded_versions` per panel, and this reads it. That
+/// matters because a *second* declaration of the same fact could drift from the
+/// first, and a lineage table that disagrees with the catalog would authorise
+/// deleting an index for a panel the catalog still considers live.
+#[must_use]
+pub fn superseded_panel_lineage(panel_version: u32) -> Option<SupersededPanelLineage> {
+    builtin_panel_catalog().into_iter().find_map(|entry| {
+        entry
+            .superseded_versions
+            .contains(&panel_version)
+            .then_some(SupersededPanelLineage {
+                panel_name: entry.panel_name,
+                live_panel_version: entry.panel_version,
+            })
+    })
+}
+
 /// The built-in panel catalog: every `syn-*` panel, its active generation, and
 /// the declarations #1920 ask 3 and #1927 asks 1/3 require.
 ///

@@ -78,19 +78,17 @@ impl VersionedCfStore {
 
     pub(super) fn overlay_table_rows(
         &self,
+        site: RowGuardSite,
         snapshot: Snapshot,
         cf: ColumnFamily,
         range: Option<&KeyRange>,
         rows: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-    ) {
-        let table = self.read_rows(RowGuardSite::OverlayTableRows, cf);
+    ) -> Result<()> {
+        let table = self.read_rows(site, cf);
         let Some(cf_rows) = table.get(&cf) else {
-            return;
+            return Ok(());
         };
-        for (key, versions) in cf_rows {
-            if range.is_some_and(|range| !range.contains(key)) {
-                continue;
-            }
+        for (key, versions) in overlay_range(cf_rows, cf, range)? {
             match visible_value_state(versions, snapshot.seq()) {
                 Some(VisibleValue::Live(value)) => {
                     rows.insert(key.clone(), value);
@@ -101,6 +99,7 @@ impl VersionedCfStore {
                 None => {}
             }
         }
+        Ok(())
     }
 
     pub(super) fn overlay_table_keys(
@@ -109,15 +108,12 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         range: &KeyRange,
         keys: &mut BTreeMap<Vec<u8>, ()>,
-    ) {
+    ) -> Result<()> {
         let table = self.read_rows(RowGuardSite::OverlayTableKeys, cf);
         let Some(cf_rows) = table.get(&cf) else {
-            return;
+            return Ok(());
         };
-        for (key, versions) in cf_rows {
-            if !range.contains(key) {
-                continue;
-            }
+        for (key, versions) in overlay_range(cf_rows, cf, Some(range))? {
             match visible_value_state(versions, snapshot.seq()) {
                 Some(VisibleValue::Live(_)) => {
                     keys.insert(key.clone(), ());
@@ -128,6 +124,7 @@ impl VersionedCfStore {
                 None => {}
             }
         }
+        Ok(())
     }
 
     pub(in crate::mvcc::store) fn ensure_router_latest_snapshot(
@@ -157,4 +154,53 @@ impl VersionedCfStore {
         }
         lease.ensure_live_at(now)
     }
+}
+
+/// The overlay rows a scan must examine, **seeking** to the requested range
+/// instead of walking the whole column family and discarding what falls
+/// outside it.
+///
+/// The row overlay is a `BTreeMap`, so the range is already sorted and the
+/// bounds are a `O(log n)` descent plus one walk of the matched span. The
+/// previous shape iterated every key in the family and applied
+/// [`KeyRange::contains`] as a filter, which made a narrow-range read cost the
+/// whole family — and it paid that cost *while holding the row-table read
+/// guard* that every constellation writer needs (#1950). On the live vault a
+/// prefix read of `Graph` (81,236 rows) held the guard for **452 ms** against a
+/// 25 ms budget (#1973). The bounds do not change which keys are visited: a
+/// `BTreeMap` range over `[start, end)` yields exactly the keys for which
+/// `KeyRange::contains` is true.
+///
+/// # Errors
+///
+/// Fails closed when `end < start`. `BTreeMap::range` panics on an inverted
+/// range, and the filter shape this replaces silently returned nothing — so an
+/// inverted range read as "this family is empty" instead of "this request is
+/// malformed". Neither is acceptable; an empty-but-ordered range (`end ==
+/// start`) is legal and yields nothing, as it did before.
+fn overlay_range<'a>(
+    cf_rows: &'a BTreeMap<Vec<u8>, VersionChain>,
+    cf: ColumnFamily,
+    range: Option<&KeyRange>,
+) -> Result<std::collections::btree_map::Range<'a, Vec<u8>, VersionChain>> {
+    let Some(range) = range else {
+        return Ok(cf_rows.range::<[u8], _>((Bound::Unbounded, Bound::Unbounded)));
+    };
+    let end = match range.end.as_deref() {
+        Some(end) if end < range.start.as_slice() => {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_OVERLAY_RANGE_INVERTED",
+                message: format!(
+                    "overlay range read of {} requires end >= start; start={} end={}",
+                    cf.name(),
+                    super::hex_prefix(&range.start),
+                    super::hex_prefix(end)
+                ),
+                remediation: "supply an ordered KeyRange; an inverted range is a caller bug, not an empty column family",
+            });
+        }
+        Some(end) => Bound::Excluded(end),
+        None => Bound::Unbounded,
+    };
+    Ok(cf_rows.range::<[u8], _>((Bound::Included(range.start.as_slice()), end)))
 }
