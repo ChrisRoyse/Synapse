@@ -285,6 +285,56 @@ impl ColumnFamily {
         matches!(self, Self::Slot { .. })
     }
 
+    /// Whether candidate-bounded SST paging is supported for this family
+    /// (#1973).
+    ///
+    /// **This is the single declaration of that fact.** Paging an SST needs a
+    /// retained, validated key/offset lookup index, and retaining one costs
+    /// open time proportional to the family's SST footprint. So which families
+    /// may be paged and which families retain a lookup are the *same question*,
+    /// and they must be answered in one place.
+    ///
+    /// They were not. `should_build_eager_lookup_on_open` retained a lookup for
+    /// `Kv`, `Base` and the slot CFs, while `scan_cf_range_page_latest` accepted
+    /// any family — so the paging API's contract silently held for three
+    /// families and failed closed on the rest with
+    /// `CALYX_ASTER_SST_PAGE_INDEX_MISSING`. #1968 bounded walks over `Base`
+    /// only and never met it; the moment #1973 bounded the `XTerm` and `Graph`
+    /// readbacks, the abundance report broke on a 1.8 MB column family.
+    ///
+    /// The set is deliberately not "every family". That was measured on a real
+    /// 1.25 GB vault and rejected: retaining every lookup took vault open from
+    /// **5.0 s to 36.6 s**, and the cost sat almost entirely in large families
+    /// that nothing pages (`scalars` 111 MB, `ledger` 68 MB, `time_index`
+    /// 17 MB, `raw_commitment` 15 MB). Paying 31 s of startup to make those
+    /// pageable would buy nothing.
+    ///
+    /// # Adding a family
+    ///
+    /// If a bounded walk needs a family that is not here, add it here — the
+    /// retention policy reads this predicate, so one edit does both. The paged
+    /// read path names this method in its refusal, so the error points at the
+    /// declaration to change rather than at an SST path.
+    pub const fn supports_paged_scan(&self) -> bool {
+        matches!(
+            self,
+            // The shared Synapse KV namespace: paging is a hard contract here
+            // and is retained even when eager lookup is off.
+            Self::Kv
+            // Every constellation write lands in Base, and the slot CFs are the
+            // high-volume point-read surfaces (#1968).
+            | Self::Base
+            // The derived-association and maintenance readbacks #1973 bounded.
+            | Self::XTerm
+            | Self::Graph
+            | Self::Assay
+            | Self::Kernel
+            | Self::TemporalXTerm
+            | Self::Reactive
+            | Self::Guard
+        ) || self.is_slot()
+    }
+
     /// Which lock shard owns this family's state, in `0..`[`SHARDS`].
     ///
     /// Total and deterministic: every column family maps to exactly one shard,

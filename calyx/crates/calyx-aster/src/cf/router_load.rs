@@ -286,10 +286,10 @@ fn should_build_eager_lookup_on_open(cf: ColumnFamily, eager_lookup_on_open: boo
     if !eager_lookup_on_open {
         return false;
     }
-    // Base and slot CFs are the high-volume point-read surfaces. Retain their
-    // exact validated key/offset indexes once so Bloom candidates never
-    // reopen and whole-file validate large immutable SSTs per requested row.
-    matches!(cf, ColumnFamily::Base) || cf.is_slot()
+    // The single declaration of "which families may be paged" (#1973). Retaining
+    // a lookup is exactly what makes paging possible, so this policy must not
+    // hold an independent opinion about the set — it reads it.
+    cf.supports_paged_scan()
 }
 
 /// Lists SST files in a CF directory, failing closed on any `*.sst` file
