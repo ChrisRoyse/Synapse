@@ -147,6 +147,48 @@ impl VersionedCfStore {
         )
     }
 
+    /// Counts the visible rows of one CF in the **MVCC row table alone**, with
+    /// the CF router excluded whether or not this vault would consult it.
+    ///
+    /// This exists to make the full-restore invariant *checkable* rather than
+    /// assumed. [`Self::latest_router_source`] gates the router off whenever
+    /// `router_latest_readback` is `false`, on the stated ground that a
+    /// `restore_mvcc_rows: true` open materialises the whole corpus into the row
+    /// table. That ground is load-bearing — if it were false, gating would drop
+    /// rows — and the only honest way to hold it is to compare this count
+    /// against the same family read through a second handle opened
+    /// `restore_mvcc_rows: false`, whose view is the router alone. Equal counts
+    /// and equal key/value digests are what proves the two sources agree.
+    ///
+    /// Deliberately *not* gated on `router_latest_readback`: on a latest-only
+    /// handle this reports the row table's own (near-empty) contents, which is
+    /// exactly what makes a harness that opened the wrong mode fail loudly
+    /// instead of reporting a vacuous match (#1954).
+    ///
+    /// **Diagnostic only.** It is `O(family)` under a single hold of the
+    /// row-table read guard — measured at 28.5 ms over a 112,559-row `Base`,
+    /// against a 25 ms budget — which is the very shape #1977 exists to remove
+    /// from serving paths. It is counted under its own
+    /// [`RowGuardSite::CountCfLatestTableOnly`] so such a hold can never be
+    /// mistaken in the census for one a reader actually served from. Do not
+    /// wire it into health, a maintenance tick, or any per-request path; use
+    /// `count_cf_latest_bounded` for those.
+    pub fn latest_row_count_table_only(&self, cf: ColumnFamily) -> usize {
+        let seq = self.current_seq();
+        let table = self.read_rows(RowGuardSite::CountCfLatestTableOnly, cf);
+        table.get(&cf).map_or(0, |cf_rows| {
+            cf_rows
+                .values()
+                .filter(|versions| {
+                    matches!(
+                        visible_value_state(versions, seq),
+                        Some(VisibleValue::Live(_))
+                    )
+                })
+                .count()
+        })
+    }
+
     /// Reads one CF/key at the pinned sequence.
     pub fn read_at(
         &self,
@@ -616,9 +658,44 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned");
         let table = self.read_rows(site, cf);
-        let router = self.router.as_deref();
+        let router = self.latest_router_source();
         let seq = self.current_seq();
         read(seq, &table, router, &barriers)
+    }
+
+    /// The physical source a **latest**-view read may consult beside the MVCC
+    /// row table, or `None` when the row table is the whole authority.
+    ///
+    /// `router_latest_readback` is `false` exactly when the vault was opened
+    /// with `restore_mvcc_rows: true`, which materialises every manifested SST
+    /// batch plus the WAL tail into the row table (`durable.rs`
+    /// `read_manifested_batches` + `replay_records_into`). The row table then
+    /// holds the complete corpus, and every *snapshot* reader already says so
+    /// by construction: [`Self::router_latest_value`],
+    /// [`Self::router_latest_rows`] and [`Self::router_latest_keys`] all return
+    /// empty in that mode, and [`Self::predecessor_cf_at`] skips the router
+    /// candidate outright.
+    ///
+    /// The six latest-view entry points did not, and that gap is #1978. They
+    /// read the router unconditionally, so on the live daemon — which opens
+    /// `full_mvcc_restore` — every bounded page of a `Base` walk re-opened the
+    /// family's SSTs and re-read a page of values off disk **while holding the
+    /// vault-wide row-table read guard every constellation writer needs**
+    /// (#1950), only to discard the result: the merge gives the row table
+    /// precedence on every key both sources hold, and in this mode there is no
+    /// key only the router holds. That measured 32,982 holds and 151 s of guard
+    /// occupancy from one site in 28 minutes, 95% of every over-budget hold.
+    ///
+    /// This is a gate, not a fallback: when the flag is `true` the router is
+    /// still required and still consulted. Nothing here degrades to a
+    /// best-effort answer, and no caller gets a partial view — the two modes
+    /// have disjoint, individually complete sources.
+    fn latest_router_source(&self) -> Option<&CfRouter> {
+        if self.router_latest_readback.load(Ordering::Acquire) {
+            self.router.as_deref()
+        } else {
+            None
+        }
     }
 
     /// [`Self::with_latest_view`] for the one entry point whose reads may name
@@ -633,7 +710,7 @@ impl VersionedCfStore {
             .read()
             .expect("mvcc read barriers poisoned");
         let table = self.read_rows_all(site);
-        let router = self.router.as_deref();
+        let router = self.latest_router_source();
         let seq = self.current_seq();
         read(seq, &table, router, &barriers)
     }

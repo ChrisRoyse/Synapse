@@ -1,5 +1,5 @@
 use super::{AsterVault, DEFAULT_LEASE_MS, VaultRecoveryReport};
-use crate::cf::CfRouter;
+use crate::cf::{CfRouter, ColumnFamily};
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{Freshness, Snapshot, VersionedCfStore};
 use crate::sst::SstSummary;
@@ -65,5 +65,14 @@ where
     /// it got (#1954).
     pub fn router_latest_readback(&self) -> bool {
         self.rows.router_latest_readback()
+    }
+
+    /// Visible rows of `cf` held by the MVCC row table alone, router excluded.
+    ///
+    /// See [`VersionedCfStore::latest_row_count_table_only`]. This is the
+    /// readback that lets a harness prove the full-restore invariant the #1978
+    /// router gate rests on, instead of taking it on the recovery code's word.
+    pub fn latest_row_count_table_only(&self, cf: ColumnFamily) -> usize {
+        self.rows.latest_row_count_table_only(cf)
     }
 }

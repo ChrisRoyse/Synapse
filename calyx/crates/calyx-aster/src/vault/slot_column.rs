@@ -119,24 +119,35 @@ where
     ) -> Result<Vec<SlotColumnRow>> {
         let snapshot = self.snapshot_handle(snapshot);
         let mut expected_ids = Vec::new();
-        for (key, value) in
-            self.rows
-                .scan_cf_at(snapshot.snapshot(), ColumnFamily::Base, &self.clock)?
-        {
-            let cx_id = cx_id_from_key(&key)?;
-            let constellation = encode::decode_constellation_base(&value)?;
-            if constellation.cx_id != cx_id {
-                return Err(CalyxError::aster_corrupt_shard(format!(
-                    "Base row key {cx_id} contains constellation {} while materializing {panel_slot}",
-                    constellation.cx_id
-                )));
-            }
-            if constellation.panel_version == panel_slot.panel_version()
-                && constellation.slots.contains_key(&panel_slot.slot_id())
-            {
-                expected_ids.push(cx_id);
-            }
-        }
+        // Paged at the already-pinned snapshot rather than materialized whole
+        // (#1977). Every page resolves at the same sequence this caller pinned,
+        // so the membership set is identical to the one the whole-family scan
+        // produced — only the guard hold changes, from one hold proportional to
+        // `Base` to one hold per 256 rows (#1950, #1968).
+        self.rows.scan_cf_pages_at(
+            snapshot.snapshot(),
+            ColumnFamily::Base,
+            super::ORPHAN_SLOT_GC_PAGE_ROWS,
+            &self.clock,
+            |page| -> Result<()> {
+                for (key, value) in page {
+                    let cx_id = cx_id_from_key(&key)?;
+                    let constellation = encode::decode_constellation_base(&value)?;
+                    if constellation.cx_id != cx_id {
+                        return Err(CalyxError::aster_corrupt_shard(format!(
+                            "Base row key {cx_id} contains constellation {} while materializing {panel_slot}",
+                            constellation.cx_id
+                        )));
+                    }
+                    if constellation.panel_version == panel_slot.panel_version()
+                        && constellation.slots.contains_key(&panel_slot.slot_id())
+                    {
+                        expected_ids.push(cx_id);
+                    }
+                }
+                Ok(())
+            },
+        )?;
         if expected_ids.is_empty() {
             return Err(CalyxError::stale_derived(format!(
                 "{panel_slot} has no Base memberships to materialize"

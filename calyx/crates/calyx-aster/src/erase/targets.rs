@@ -40,16 +40,50 @@ where
     C: Clock,
 {
     let mut targets = EraseTargets::default();
+    // Every static family, including the ones `supports_paged_scan` refuses.
+    //
+    // #1977 asked whether this loop could be migrated at all, because
+    // `Scalars`, `TimeIndex` and `RawCommitment` are deliberately *not*
+    // declared pageable — retaining their lookup indexes at open costs 31 s of
+    // vault-open time to buy paging nothing uses (#1976). It can, and without
+    // reopening that trade: `scan_cf_pages_at` pins a snapshot and pages
+    // through `scan_cf_range_page_at` / `read_batch`, neither of which needs an
+    // SST lookup index. The `supports_paged_scan` declaration gates
+    // `scan_cf_range_page_latest` — the *latest*-view candidate pager — not
+    // this one. So the loop is bounded per family with no per-family split and
+    // no change to the open-time policy.
     for cf in ColumnFamily::STATIC {
         if cf == ColumnFamily::Ledger {
             continue;
         }
-        for (key, _) in vault.scan_cf_at(snapshot, cf)? {
-            push_unique(&mut targets.rows, cf, key);
-        }
+        vault.scan_cf_pages_at(
+            snapshot,
+            cf,
+            crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+            |page| -> Result<()> {
+                for (key, _) in page {
+                    push_unique(&mut targets.rows, cf, key);
+                }
+                Ok(())
+            },
+        )?;
     }
-    for (_, base) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let cx = encode::decode_constellation_base(&base)?;
+    // Pinned paging, not the fail-closed atomic walk: a privacy erasure must
+    // complete. Refusing on any concurrent commit would leave the subject's
+    // data in place on a busy daemon, which is the worse failure (#1977 ask 2).
+    let mut slot_work = Vec::new();
+    vault.scan_cf_pages_at(
+        snapshot,
+        ColumnFamily::Base,
+        crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+        |page| -> Result<()> {
+            for (_, base) in page {
+                slot_work.push(encode::decode_constellation_base(&base)?);
+            }
+            Ok(())
+        },
+    )?;
+    for cx in slot_work {
         targets.records_deleted += 1;
         collect_slot_targets(vault, snapshot, &cx, &mut targets.rows)?;
     }
@@ -66,11 +100,29 @@ where
 {
     let expected = subject_metadata_value(subject);
     let mut targets = EraseTargets::default();
-    for (_, base) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let cx = encode::decode_constellation_base(&base)?;
-        if cx.metadata_value(METADATA_SUBJECT_ID) != Some(expected.as_str()) {
-            continue;
-        }
+    // Selected under bounded holds, then resolved outside them: the per-record
+    // `collect_cx_targets` below issues its own reads, and nesting those inside
+    // the page callback would keep the outer walk's guard cadence coupled to
+    // them. Pinned paging for the same reason as `collect_vault_targets` — a
+    // privacy erasure must complete rather than fail closed under write load
+    // (#1977 ask 2).
+    let mut matched = Vec::new();
+    vault.scan_cf_pages_at(
+        snapshot,
+        ColumnFamily::Base,
+        crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+        |page| -> Result<()> {
+            for (_, base) in page {
+                let cx = encode::decode_constellation_base(&base)?;
+                if cx.metadata_value(METADATA_SUBJECT_ID) != Some(expected.as_str()) {
+                    continue;
+                }
+                matched.push(cx);
+            }
+            Ok(())
+        },
+    )?;
+    for cx in matched {
         let cx_targets = collect_cx_targets(vault, snapshot, cx.cx_id, Some(cx))?;
         targets.records_deleted += cx_targets.records_deleted;
         for target in cx_targets.rows {

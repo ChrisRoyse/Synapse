@@ -7,24 +7,35 @@ impl<C> OrphanGcTarget for VaultOrphanGcTarget<'_, C>
 where
     C: Clock,
 {
+    /// Both halves of the reconciler's input are walked in bounded pages and
+    /// **atomically** (#1977): the difference between these two sets is what
+    /// decides which slot rows get tombstoned, so it must be taken against one
+    /// instant. A `Base` row committed between the two scans would otherwise
+    /// make its own slot rows look orphaned.
+    ///
+    /// The shape this replaces materialised each whole family under a single
+    /// hold of the vault-wide row-table read guard — 164 ms on a 112,674-row
+    /// `Base` against a 25 ms budget, and once per slot family besides (#1950).
     fn base_entries(&self) -> Result<Vec<OrphanBaseEntry>> {
         let mut entries = Vec::new();
-        for (key, bytes) in self
-            .vault
-            .scan_cf_at(self.vault.latest_seq(), ColumnFamily::Base)?
-        {
-            let cx_id = key_to_cx(&key)?;
-            let cx = decode_constellation_base(&bytes)?;
-            entries.push(OrphanBaseEntry {
-                cx_id,
-                expected_slots: cx.slots.keys().copied().collect(),
-                repair_queued: cx.flags.degraded
-                    && cx
-                        .metadata
-                        .get(REBUILD_METADATA_KEY)
-                        .is_some_and(|state| state == REBUILD_METADATA_VALUE),
-            });
-        }
+        self.vault.walk_base_pages_atomic(
+            "orphan reconciler Base entries",
+            crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+            |key, bytes| {
+                let cx_id = key_to_cx(key)?;
+                let cx = decode_constellation_base(bytes)?;
+                entries.push(OrphanBaseEntry {
+                    cx_id,
+                    expected_slots: cx.slots.keys().copied().collect(),
+                    repair_queued: cx.flags.degraded
+                        && cx
+                            .metadata
+                            .get(REBUILD_METADATA_KEY)
+                            .is_some_and(|state| state == REBUILD_METADATA_VALUE),
+                });
+                Ok(())
+            },
+        )?;
         entries.sort_by_key(|entry| entry.cx_id);
         Ok(entries)
     }
@@ -32,15 +43,18 @@ where
     fn slot_index_entries(&self) -> Result<Vec<OrphanIndexEntry>> {
         let mut entries = Vec::new();
         for slot in &self.slots {
-            for (key, _) in self
-                .vault
-                .scan_cf_at(self.vault.latest_seq(), ColumnFamily::slot(*slot))?
-            {
-                entries.push(OrphanIndexEntry {
-                    cx_id: key_to_cx(&key)?,
-                    slot: *slot,
-                });
-            }
+            self.vault.walk_cf_pages_atomic(
+                "orphan reconciler slot index entries",
+                ColumnFamily::slot(*slot),
+                crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+                |key, _value| {
+                    entries.push(OrphanIndexEntry {
+                        cx_id: key_to_cx(key)?,
+                        slot: *slot,
+                    });
+                    Ok(())
+                },
+            )?;
         }
         entries.sort_unstable();
         Ok(entries)

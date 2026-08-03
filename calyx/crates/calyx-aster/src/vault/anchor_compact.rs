@@ -31,37 +31,54 @@ where
             let snapshot = self.snapshot();
             let mut report = AnchorCompactionReport::default();
             let mut rows = Vec::new();
-            for (_, bytes) in self.scan_cf_at(snapshot, ColumnFamily::Base)? {
-                report.scanned += 1;
-                // Carries the stored slot hashes through the rewrite (#1888).
-                let mut rewrite = super::base_rewrite::BaseRowRewrite::decode(&bytes)?;
-                let (deduped, conflicts) = dedup_anchors(rewrite.constellation());
-                if !conflicts.is_empty() {
-                    report.conflicts.extend(conflicts);
-                    continue;
-                }
-                if deduped.len() == rewrite.constellation().anchors.len() {
-                    continue;
-                }
-                report.compacted += 1;
-                report.removed_duplicates += rewrite.constellation().anchors.len() - deduped.len();
-                let constellation = rewrite.constellation_mut();
-                constellation.anchors = deduped;
-                constellation.flags.ungrounded = constellation.anchors.is_empty();
-                let constellation = rewrite.constellation().clone();
-                rows.push(encode::WriteRow {
-                    cf: ColumnFamily::Base,
-                    key: base_key(constellation.cx_id),
-                    value: rewrite.encode()?,
-                });
-                for anchor in &constellation.anchors {
-                    rows.push(encode::WriteRow {
-                        cf: ColumnFamily::Anchors,
-                        key: anchor_key(constellation.cx_id, &anchor.kind),
-                        value: encode::encode_anchor(anchor)?,
-                    });
-                }
-            }
+            // Paged at the pinned snapshot rather than materialized whole
+            // (#1977). This runs inside `with_durable_commit_lock`, so no
+            // writer can advance the vault between pages and the interval a
+            // paged walk normally describes collapses to an instant — which is
+            // why the cheaper pinned pager is correct here and the fail-closed
+            // atomic walk is not needed. The shape it replaces held the
+            // vault-wide row-table read guard across the whole of `Base`
+            // (112,674 rows, 164 ms against a 25 ms budget) (#1950, #1968).
+            self.scan_cf_pages_at(
+                snapshot,
+                ColumnFamily::Base,
+                super::ORPHAN_SLOT_GC_PAGE_ROWS,
+                |page| -> Result<()> {
+                    for (_, bytes) in page {
+                        report.scanned += 1;
+                        // Carries the stored slot hashes through the rewrite (#1888).
+                        let mut rewrite = super::base_rewrite::BaseRowRewrite::decode(&bytes)?;
+                        let (deduped, conflicts) = dedup_anchors(rewrite.constellation());
+                        if !conflicts.is_empty() {
+                            report.conflicts.extend(conflicts);
+                            continue;
+                        }
+                        if deduped.len() == rewrite.constellation().anchors.len() {
+                            continue;
+                        }
+                        report.compacted += 1;
+                        report.removed_duplicates +=
+                            rewrite.constellation().anchors.len() - deduped.len();
+                        let constellation = rewrite.constellation_mut();
+                        constellation.anchors = deduped;
+                        constellation.flags.ungrounded = constellation.anchors.is_empty();
+                        let constellation = rewrite.constellation().clone();
+                        rows.push(encode::WriteRow {
+                            cf: ColumnFamily::Base,
+                            key: base_key(constellation.cx_id),
+                            value: rewrite.encode()?,
+                        });
+                        for anchor in &constellation.anchors {
+                            rows.push(encode::WriteRow {
+                                cf: ColumnFamily::Anchors,
+                                key: anchor_key(constellation.cx_id, &anchor.kind),
+                                value: encode::encode_anchor(anchor)?,
+                            });
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
             if !rows.is_empty() {
                 self.commit_rows_locked(&rows)?;
             }

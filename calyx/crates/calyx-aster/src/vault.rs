@@ -88,6 +88,13 @@ pub use ledger_anchor_batch::MultiCxAnchorBatchOutcome;
 pub use ledger_append::{
     AsterLedgerChainVerification, AsterProvenanceReproduction, AsterRawCommitmentVerification,
 };
+/// The one page size every bounded maintenance walk over a whole family uses.
+///
+/// Declared in one place for #1977: seven callers were migrated off whole-family
+/// materialization at once, and a per-caller constant would have made the
+/// row-guard census impossible to reason about across them. See
+/// [`orphan_slot_gc::ORPHAN_SLOT_GC_PAGE_ROWS`] for how 256 was chosen.
+pub(crate) use orphan_slot_gc::ORPHAN_SLOT_GC_PAGE_ROWS;
 pub use orphan_slot_gc::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
 };

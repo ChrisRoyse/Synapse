@@ -8892,12 +8892,86 @@ fn calyx_gc_budget(
 ///
 /// Built once per GC tick and shared across every CF budget, so the Base scan
 /// is paid once rather than per column family.
+/// Attempts before a GC tick gives up on getting an atomic view of `Base`.
+///
+/// The walk is bounded per page, so a commit landing mid-walk is a lost race
+/// rather than a failure of the vault, and re-running it costs ~78 ms. Three
+/// attempts, then a structured refusal — never a partial reference set, because
+/// a source row missing from that set is one GC is free to delete forever.
+const DERIVED_SOURCE_SCAN_ATTEMPTS: usize = 3;
+
+/// Source column family -> the source row keys a live derived constellation
+/// still points at. The GC tick's protection set (#1882).
+type DerivedSourceReferences = BTreeMap<String, BTreeSet<Vec<u8>>>;
+
 fn collect_derived_source_references(
     vault: &SynapseCalyxVault,
-) -> StorageResult<BTreeMap<String, BTreeSet<Vec<u8>>>> {
-    let snapshot = vault.latest_seq();
-    let rows = vault
-        .scan_cf_at(snapshot, ColumnFamily::Base)
+) -> StorageResult<DerivedSourceReferences> {
+    // The last walk's own report is what the refusal below quotes, so it is
+    // seeded from a real first attempt rather than kept as an `Option` the
+    // compiler cannot prove was filled.
+    let (referenced, mut walk) = collect_derived_source_references_once(vault)?;
+    if walk.atomic() {
+        return Ok(referenced);
+    }
+    for attempt in 1..DERIVED_SOURCE_SCAN_ATTEMPTS {
+        tracing::warn!(
+            code = "SYNAPSE_CALYX_GC_SOURCE_SCAN_RACED",
+            attempt,
+            attempts = DERIVED_SOURCE_SCAN_ATTEMPTS,
+            snapshot_seq_first = walk.snapshot_seq_first,
+            snapshot_seq_last = walk.snapshot_seq_last,
+            pages = walk.pages,
+            rows_visited = walk.rows_visited,
+            "a commit landed while indexing derived source references; retrying rather than \
+             deciding deletions from a moving window"
+        );
+        let (referenced, next) = collect_derived_source_references_once(vault)?;
+        if next.atomic() {
+            return Ok(referenced);
+        }
+        walk = next;
+    }
+    Err(calyx_write_failed_detail(
+        CALYX_GC_CF,
+        format!(
+            "could not index derived source references from one atomic view of Base in \
+             {DERIVED_SOURCE_SCAN_ATTEMPTS} attempts: the last walk opened at committed sequence \
+             {} and closed at {} over {} page(s). GC is skipped this tick rather than run against \
+             a partial reference set — a source row missing from that set is one GC would delete, \
+             and its bytes are content-addressed by the constellation that pointed at it, so they \
+             exist nowhere else (#1882). It will run on the next tick.",
+            walk.snapshot_seq_first, walk.snapshot_seq_last, walk.pages
+        ),
+    ))
+}
+
+/// One bounded pass over `Base`, with the atomicity flag the caller adjudicates.
+///
+/// Paged rather than materialized (#1977). `scan_cf_at` folded the whole family
+/// — 112,674 rows on the live vault — under a single hold of the vault-wide
+/// row-table read guard that every constellation writer must acquire (#1950),
+/// measured at 164 ms against a 25 ms budget with every hold over budget. This
+/// runs once per GC tick, and it was the caller actually producing those holds:
+/// #1977 enumerated calyx-aster's own GC and retention passes and did not reach
+/// this one, in a different crate.
+///
+/// The window also *narrows*: the bounded walk completes in ~78 ms against the
+/// whole-family scan's ~164 ms, so there is strictly less time in which a
+/// derivation can land unseen.
+fn collect_derived_source_references_once(
+    vault: &SynapseCalyxVault,
+) -> StorageResult<(DerivedSourceReferences, synapse_calyx::SynapseCalyxCfWalk)> {
+    let mut referenced = DerivedSourceReferences::new();
+    let walk = vault
+        .walk_cf_latest(
+            ColumnFamily::Base,
+            synapse_calyx::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                collect_derived_source_reference(value, &mut referenced)
+                    .map(|()| synapse_calyx::SynapseCalyxWalkStep::Continue)
+            },
+        )
         .map_err(|source| {
             calyx_write_failed(
                 CALYX_GC_CF,
@@ -8905,14 +8979,28 @@ fn collect_derived_source_references(
                 &source,
             )
         })?;
-    let mut referenced: BTreeMap<String, BTreeSet<Vec<u8>>> = BTreeMap::new();
-    for (_, value) in rows {
+    Ok((referenced, walk))
+}
+
+/// Indexes one `Base` row's source reference, if it names one.
+fn collect_derived_source_reference(
+    value: &[u8],
+    referenced: &mut DerivedSourceReferences,
+) -> Result<(), synapse_calyx::SynapseCalyxError> {
+    let to_error = |detail: String| {
+        synapse_calyx::SynapseCalyxError::new(
+            "SYNAPSE_CALYX_GC_SOURCE_REFERENCE_UNDECODABLE",
+            detail,
+            "repair or remove the derived constellation naming an undecodable source key; GC must \
+             not treat a corrupt reference as an absent one",
+        )
+    };
+    {
         let constellation =
-            calyx_aster::vault::encode::decode_constellation_base(&value).map_err(|source| {
-                calyx_write_failed_detail(
-                    CALYX_GC_CF,
-                    format!("decode Base row while indexing derived source references: {source}"),
-                )
+            calyx_aster::vault::encode::decode_constellation_base(value).map_err(|source| {
+                to_error(format!(
+                    "decode Base row while indexing derived source references: {source}"
+                ))
             })?;
         let (Some(source_cf), Some(source_key_hex)) = (
             constellation
@@ -8922,27 +9010,24 @@ fn collect_derived_source_references(
                 .metadata
                 .get(crate::constellations::META_SOURCE_KEY_HEX),
         ) else {
-            continue;
+            return Ok(());
         };
         // A derived row that records an undecodable source key is a corrupt
         // reference, not an absent one. Fail closed rather than let GC treat it
         // as "nothing points here" and delete the source.
         let source_key = decode_source_key_hex(source_key_hex).map_err(|detail| {
-            calyx_write_failed_detail(
-                CALYX_GC_CF,
-                format!(
-                    "derived constellation {} records an undecodable {} for source CF {source_cf}: {detail}",
-                    constellation.cx_id,
-                    crate::constellations::META_SOURCE_KEY_HEX
-                ),
-            )
+            to_error(format!(
+                "derived constellation {} records an undecodable {} for source CF {source_cf}: {detail}",
+                constellation.cx_id,
+                crate::constellations::META_SOURCE_KEY_HEX
+            ))
         })?;
         referenced
             .entry(source_cf.clone())
             .or_default()
             .insert(source_key);
     }
-    Ok(referenced)
+    Ok(())
 }
 
 /// Decodes a `synapse_source_key_hex` metadata value back to the raw source

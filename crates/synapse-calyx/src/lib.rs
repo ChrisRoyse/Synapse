@@ -5688,6 +5688,25 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("count latest Calyx CF", &error))
     }
 
+    /// Visible rows of one column family in the MVCC row table alone, with the
+    /// CF router excluded.
+    ///
+    /// The physical evidence behind #1978's router gate: on a `full_mvcc_restore`
+    /// vault this must equal the same family read through a second handle opened
+    /// latest-only, whose only source *is* the router. See
+    /// `examples/page_walk_router_parity_fsv.rs`.
+    #[must_use]
+    pub fn count_cf_latest_table_only(&self, cf: ColumnFamily) -> usize {
+        self.vault.latest_row_count_table_only(cf)
+    }
+
+    /// Reports whether this handle serves latest reads from the CF router
+    /// rather than the in-memory MVCC row table (`restore_mvcc_rows: false`).
+    #[must_use]
+    pub fn router_latest_readback(&self) -> bool {
+        self.vault.router_latest_readback()
+    }
+
     /// Folds over every visible row of one column family with a **bounded**
     /// row-table read-guard hold (#1968).
     ///

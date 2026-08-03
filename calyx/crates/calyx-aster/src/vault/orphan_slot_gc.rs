@@ -61,7 +61,7 @@ pub struct AsterOrphanSlotCfSkip {
 /// so a smaller page buys a shorter hold almost for free, and the 25 ms
 /// row-guard budget has a cliff between 2,048 and 4,096. 256 lands the worst
 /// single hold at roughly 16% of budget.
-const ORPHAN_SLOT_GC_PAGE_ROWS: usize = 256;
+pub(crate) const ORPHAN_SLOT_GC_PAGE_ROWS: usize = 256;
 
 impl<C> AsterVault<C>
 where
@@ -75,9 +75,30 @@ where
     /// walk normally describes an *interval*, which is fine for a census and
     /// wrong for anything destructive; this makes the difference explicit
     /// instead of leaving it to a comment.
-    fn walk_base_pages_atomic<F>(
+    pub(crate) fn walk_base_pages_atomic<F>(
         &self,
         operation: &'static str,
+        page_rows: usize,
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        self.walk_cf_pages_atomic(operation, ColumnFamily::Base, page_rows, visit)
+    }
+
+    /// [`Self::walk_base_pages_atomic`] over any pageable column family.
+    ///
+    /// Generalised for #1977: the orphan reconciler decides slot-CF liveness
+    /// from the slot families as well as from `Base`, and the retired-lens GC
+    /// decides panel-version liveness from `Base` — all three are destructive
+    /// decisions that were each reading their whole family under one hold of
+    /// the vault-wide row-table read guard (#1950). They need the same
+    /// primitive, and the only thing that differed was the family.
+    pub(crate) fn walk_cf_pages_atomic<F>(
+        &self,
+        operation: &'static str,
+        cf: ColumnFamily,
         page_rows: usize,
         mut visit: F,
     ) -> Result<()>
@@ -94,19 +115,15 @@ where
         let mut cursor: Option<Vec<u8>> = None;
         let mut first_seq: Option<u64> = None;
         loop {
-            let page = self.scan_cf_range_page_latest(
-                ColumnFamily::Base,
-                &range,
-                cursor.as_deref(),
-                page_rows,
-            )?;
+            let page = self.scan_cf_range_page_latest(cf, &range, cursor.as_deref(), page_rows)?;
             let opened_at = *first_seq.get_or_insert(page.snapshot_seq);
             if page.snapshot_seq != opened_at {
                 return Err(CalyxError::aster_corrupt_shard(format!(
-                    "{operation} requires an atomic view of Base: the walk opened at committed \
+                    "{operation} requires an atomic view of {}: the walk opened at committed \
                      sequence {opened_at} but a later page served sequence {}, so a row committed \
                      mid-walk may be missing from the derived live set. Retry when the vault is \
                      quiescent; this decision must not be taken from a moving window",
+                    cf.name(),
                     page.snapshot_seq
                 )));
             }
@@ -118,14 +135,16 @@ where
             }
             let Some(resume) = page.resume_after.clone() else {
                 return Err(CalyxError::aster_corrupt_shard(format!(
-                    "{operation} paged Base reported more rows but returned no resume cursor, so \
-                     the walk cannot advance"
+                    "{operation} paged {} reported more rows but returned no resume cursor, so \
+                     the walk cannot advance",
+                    cf.name()
                 )));
             };
             if cursor.as_ref().is_some_and(|previous| *previous >= resume) {
                 return Err(CalyxError::aster_corrupt_shard(format!(
-                    "{operation} paged Base returned a resume cursor that does not advance, which \
-                     would re-read the same page forever"
+                    "{operation} paged {} returned a resume cursor that does not advance, which \
+                     would re-read the same page forever",
+                    cf.name()
                 )));
             }
             cursor = Some(resume);

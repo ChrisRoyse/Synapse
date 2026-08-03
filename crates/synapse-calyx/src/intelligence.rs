@@ -1084,6 +1084,59 @@ fn dense_vector(vector: &SlotVector) -> Option<Vec<f32>> {
     }
 }
 
+/// The stored kind of one slot vector, for a refusal that can name what it saw.
+///
+/// [`dense_vector`] collapses `Sparse`, `Multi` and `Absent` into one `None`,
+/// and a caller that reads `None` as "this record is not a concept" cannot tell
+/// "the record has no measurement here" from "this whole lane is the wrong kind
+/// to be a kernel content slot" (#1979). Those need different answers: the first
+/// is a legitimate exclusion, the second is a caller error that must fail
+/// closed.
+const fn slot_vector_kind(vector: &SlotVector) -> &'static str {
+    match vector {
+        SlotVector::Dense { .. } => "dense",
+        SlotVector::Sparse { .. } => "sparse",
+        SlotVector::Multi { .. } => "multi",
+        SlotVector::Absent { .. } => "absent",
+    }
+}
+
+/// What the kernel corpus loader saw on the requested content slot for records
+/// it could not use.
+///
+/// Counted rather than discarded so that "0 embedded concepts" is never a bare
+/// number. The same class as #1894: a decode path that returns nothing and a
+/// caller that reads nothing as "there is nothing here".
+#[derive(Debug, Default)]
+struct ContentSlotRejects {
+    sparse: usize,
+    multi: usize,
+    absent: usize,
+}
+
+impl ContentSlotRejects {
+    fn record(&mut self, kind: &str) {
+        match kind {
+            "sparse" => self.sparse += 1,
+            "multi" => self.multi += 1,
+            _ => self.absent += 1,
+        }
+    }
+
+    /// Vectors of a kind that can never be a kernel content slot, as opposed to
+    /// records that simply carry no measurement there.
+    const fn wrong_kind(&self) -> usize {
+        self.sparse + self.multi
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{} sparse, {} multi, {} absent",
+            self.sparse, self.multi, self.absent
+        )
+    }
+}
+
 fn append_slot_knn_edges(
     backend: &dyn Backend,
     slot: SlotId,
@@ -5672,6 +5725,7 @@ impl SynapseCalyxVault {
         let mut rows: Vec<RecallQuery> = Vec::new();
         let mut anchors: Vec<CxId> = Vec::new();
         let mut vault_corpus_size = 0usize;
+        let mut rejects = ContentSlotRejects::default();
         let snapshot = self.read_snapshot();
         // #1968: paged rather than materialized. Each row is decoded once and
         // then either hydrated or discarded, so the whole-CF `Vec` bought
@@ -5697,13 +5751,13 @@ impl SynapseCalyxVault {
                     return Ok(crate::SynapseCalyxWalkStep::Continue);
                 }
                 let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
-                let Some(vector) = constellation
-                    .slots
-                    .get(&content_slot.slot_id())
-                    .and_then(dense_vector)
-                else {
+                let stored = constellation.slots.get(&content_slot.slot_id());
+                let Some(vector) = stored.and_then(dense_vector) else {
                     // A record without the dense content-slot embedding is simply not
                     // a grounded concept in this domain; it is excluded, never faked.
+                    // What kind it *was* is counted, so an empty corpus can say why
+                    // it is empty instead of only that it is (#1979).
+                    rejects.record(stored.map_or("absent", slot_vector_kind));
                     return Ok(crate::SynapseCalyxWalkStep::Continue);
                 };
                 // Domain scope: with `anchor_kind` set only that outcome axis
@@ -5730,16 +5784,42 @@ impl SynapseCalyxVault {
                 Ok(crate::SynapseCalyxWalkStep::Continue)
             },
         )?;
+        // #1979 ask 1. The kernel is dense-only: `dense_vector` returns `None`
+        // for a `Sparse` or `Multi` slot, so naming the BM25 lexical lane (or
+        // any other sparse lane) as `content_slot` used to contribute exactly
+        // zero concepts and then surface as a recall failure or an empty
+        // kernel — a diagnosis pointing at the corpus for a fault that is in
+        // the request. Refusing here names the slot, the kind actually stored,
+        // and how many records carry it, so the answer is the request rather
+        // than the data. Checked before the "needs at least two" arm because a
+        // wrong-kind lane is a caller error at any corpus size, including one
+        // that happens to have two usable dense records from some other source.
+        if rejects.wrong_kind() > 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_NOT_DENSE",
+                format!(
+                    "panel {} slot {} stores a non-dense vector on {} of the {} record(s) that declare it ({}); a grounding kernel is built from cosine kNN over dense vectors and cannot consume a sparse or multi lane",
+                    params.panel_version,
+                    params.content_slot,
+                    rejects.wrong_kind(),
+                    rejects.wrong_kind() + rejects.absent + rows.len(),
+                    rejects.describe()
+                ),
+                "name a dense encoder lens as the kernel content_slot; a sparse lexical lane (BM25) is queryable through find by_text but is not a kernel content slot, and densifying it is a deliberate design change, not a fallback",
+            ));
+        }
         if rows.len() < 2 {
             return Err(SynapseCalyxError::new(
                 LodestarError::KernelEmptyResult.code(),
                 format!(
-                    "panel {} slot {} has {} embedded concept(s); a kernel needs at least two",
+                    "panel {} slot {} has {} embedded concept(s) out of {} record(s) in the panel; a kernel needs at least two (excluded: {})",
                     params.panel_version,
                     params.content_slot,
-                    rows.len()
+                    rows.len(),
+                    vault_corpus_size,
+                    rejects.describe()
                 ),
-                "capture more grounded concepts with the content-slot embedding for this domain",
+                "capture more grounded concepts with the content-slot embedding for this domain; if every record is 'absent' the slot CF rows were never hydrated (see #1894) rather than never measured",
             ));
         }
         if anchors.is_empty() {

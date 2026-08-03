@@ -340,14 +340,28 @@ where
         Ok(records)
     }
 
+    /// The panel versions at least one live `Base` row still belongs to.
+    ///
+    /// Walked in bounded pages and **atomically** (#1977). This set decides
+    /// which panel/codebook versions may be moved to cold storage or deleted,
+    /// so it is a destructive decision and must be taken against one instant —
+    /// a version that gains its first row mid-walk must not be GC'd as unused.
+    /// `walk_cf_pages_atomic` fails closed if the committed sequence moves.
+    ///
+    /// The shape it replaces materialised the whole of `Base` (112,674 rows on
+    /// the live vault) under a single hold of the vault-wide row-table read
+    /// guard, measured at 164 ms against a 25 ms budget with every hold over
+    /// budget, stalling every constellation writer behind it (#1950, #1968).
     fn live_panel_versions(&self) -> Result<BTreeSet<PanelVersionId>> {
         let mut live = BTreeSet::new();
-        for (_, bytes) in self
-            .vault
-            .scan_cf_at(self.vault.latest_seq(), crate::cf::ColumnFamily::Base)?
-        {
-            live.insert(decode_constellation_base(&bytes)?.panel_version);
-        }
+        self.vault.walk_base_pages_atomic(
+            "retired panel-version GC live set",
+            crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+            |_key, bytes| {
+                live.insert(decode_constellation_base(bytes)?.panel_version);
+                Ok(())
+            },
+        )?;
         Ok(live)
     }
 

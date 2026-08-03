@@ -312,13 +312,20 @@ pub enum RowGuardSite {
     PinSnapshotForPanel,
     PanelContentSeqsSnapshot,
     MigratePanelContentSeqsToAtLeast,
+    /// The router-excluded row-table census that proves the #1978 gate is safe.
+    ///
+    /// Counted as its own site rather than folded into `count_cf_latest`
+    /// because it is a *diagnostic* read with different semantics: it never
+    /// consults the router, so a hold here is not evidence about the latest
+    /// view any caller actually serves from.
+    CountCfLatestTableOnly,
 }
 
 impl RowGuardSite {
     /// Every site, in declaration order. The census is indexed by position
     /// here, so this array is the contract that makes a zero-hold site
     /// reportable rather than invisible.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::ReadLatest,
         Self::ReadBatchLatest,
         Self::ScanCfLatest,
@@ -339,6 +346,7 @@ impl RowGuardSite {
         Self::PinSnapshotForPanel,
         Self::PanelContentSeqsSnapshot,
         Self::MigratePanelContentSeqsToAtLeast,
+        Self::CountCfLatestTableOnly,
     ];
 
     pub const COUNT: usize = Self::ALL.len();
@@ -368,6 +376,7 @@ impl RowGuardSite {
             Self::PinSnapshotForPanel => "pin_snapshot_for_panel",
             Self::PanelContentSeqsSnapshot => "panel_content_seqs_snapshot",
             Self::MigratePanelContentSeqsToAtLeast => "migrate_panel_content_seqs_to_at_least",
+            Self::CountCfLatestTableOnly => "count_cf_latest_table_only",
         }
     }
 

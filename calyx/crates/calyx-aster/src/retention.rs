@@ -93,25 +93,44 @@ where
     }
     let snapshot = vault.latest_seq();
     let mut expired = Vec::new();
-    for (_key, base) in vault.scan_cf_at(snapshot, ColumnFamily::Base)? {
-        let cx = encode::decode_constellation_base(&base)?;
-        if cx.vault_id != vault_ctx.vault_id() {
-            continue;
-        }
-        let Some(collection) = cx.metadata_value(METADATA_COLLECTION) else {
-            continue;
-        };
-        let Some(policy) = store.policy_for(collection) else {
-            continue;
-        };
-        let ingested_at = parse_ingested_at(cx.cx_id, cx.metadata_value(METADATA_INGESTED_AT))?;
-        if is_rollup_due(ingested_at, policy, now) {
-            return Err(retention_rollup_unsupported(collection));
-        }
-        if is_expired(ingested_at, policy, now) {
-            expired.push((cx.cx_id, collection.to_string()));
-        }
-    }
+    // Paged at the pinned snapshot rather than materialized whole (#1977).
+    //
+    // Deliberately the *pinned* pager and not the fail-closed atomic walk: an
+    // expiry census is an interval reading and that is acceptable here, because
+    // a record that becomes expired mid-walk is simply collected on the next
+    // pass, while making this fail closed on any concurrent commit would turn a
+    // slow pass into one that never completes on a busy daemon — a strictly
+    // worse outcome than the hold it replaces. The trade is stated rather than
+    // assumed (#1977 ask 2). The shape it replaces held the vault-wide
+    // row-table read guard across the whole of `Base` (#1950).
+    vault.scan_cf_pages_at(
+        snapshot,
+        ColumnFamily::Base,
+        crate::vault::ORPHAN_SLOT_GC_PAGE_ROWS,
+        |page| -> Result<()> {
+            for (_key, base) in page {
+                let cx = encode::decode_constellation_base(&base)?;
+                if cx.vault_id != vault_ctx.vault_id() {
+                    continue;
+                }
+                let Some(collection) = cx.metadata_value(METADATA_COLLECTION) else {
+                    continue;
+                };
+                let Some(policy) = store.policy_for(collection) else {
+                    continue;
+                };
+                let ingested_at =
+                    parse_ingested_at(cx.cx_id, cx.metadata_value(METADATA_INGESTED_AT))?;
+                if is_rollup_due(ingested_at, policy, now) {
+                    return Err(retention_rollup_unsupported(collection));
+                }
+                if is_expired(ingested_at, policy, now) {
+                    expired.push((cx.cx_id, collection.to_string()));
+                }
+            }
+            Ok(())
+        },
+    )?;
     expired.sort_by(|left, right| {
         left.1
             .cmp(&right.1)
