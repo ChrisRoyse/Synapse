@@ -717,6 +717,17 @@ pub struct TemporalMetadataBackfillReport {
     /// adjudication declined to decide (#1926). Non-zero here is a real signal:
     /// the corpus contains a result shape this code does not yet cover.
     pub outcome_unadjudicable_rows: u64,
+    /// Candidate rows this page walked before TTL filtering.
+    ///
+    /// On a TTL-managed source CF `examined_rows` can be 0 while the page did
+    /// real work, because every candidate it walked had expired. Without this
+    /// field those two states — "the page was all expired" and "the CF has no
+    /// more rows" — produce the identical report, and an operator reading
+    /// `examined=0 inserted=0` concludes the backfill is finished when it has
+    /// not started (#1965).
+    pub candidate_rows_examined: u64,
+    /// Candidate rows this page skipped because their TTL had passed.
+    pub expired_rows_skipped: u64,
     pub latest_seq: u64,
     pub resume_after_physical: Option<Vec<u8>>,
     pub more: bool,
@@ -2316,7 +2327,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: false,
             source_ttl_managed: true,
             superseded_versions: &[1_666_001],
-            backfill_source_cf: None,
+            backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
         PanelCatalogEntry {
             panel_name: SYN_REFLEX_PANEL_NAME,
@@ -2325,7 +2336,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: false,
             source_ttl_managed: true,
             superseded_versions: &[1_666_002],
-            backfill_source_cf: None,
+            backfill_source_cf: Some(cf::CF_REFLEX_AUDIT),
         },
         PanelCatalogEntry {
             panel_name: SYN_PROCESS_PANEL_NAME,
@@ -2334,7 +2345,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: false,
             source_ttl_managed: true,
             superseded_versions: &[1_666_003],
-            backfill_source_cf: None,
+            backfill_source_cf: Some(cf::CF_PROCESS_HISTORY),
         },
         PanelCatalogEntry {
             panel_name: SYN_OBSERVATION_PANEL_NAME,
@@ -2408,7 +2419,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             superseded_versions: &[],
             // No re-measure path exists for this CF (#1927 ask 2 reports the
             // shortfall rather than treating the absence as coverage).
-            backfill_source_cf: None,
+            backfill_source_cf: Some(cf::CF_AGENT_EVENTS),
         },
         PanelCatalogEntry {
             panel_name: SYN_AGENT_TRANSCRIPT_PANEL_NAME,

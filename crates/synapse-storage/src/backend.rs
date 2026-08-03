@@ -3469,20 +3469,27 @@ impl StorageBackend for CalyxBackend {
                     .to_owned(),
             });
         }
-        let (rows, resume_after_physical, more) = if let Some(key) = source_key {
-            self.get_cf(source_cf, key)?
-                .map(|value| (vec![(key.to_vec(), value)], None, false))
-                .ok_or_else(|| StorageError::ReadFailed {
-                    cf_name: source_cf.to_owned(),
-                    detail: format!(
-                        "temporal metadata backfill source row not found: key_hex={}",
-                        constellations::hex_encode(key)
-                    ),
-                })?
-        } else {
-            let page = self.scan_cf_physical_page(source_cf, after_physical, max_rows)?;
-            (page.rows, page.resume_after_physical, page.more)
-        };
+        let (rows, resume_after_physical, more, candidate_rows_examined, expired_rows_skipped) =
+            if let Some(key) = source_key {
+                self.get_cf(source_cf, key)?
+                    .map(|value| (vec![(key.to_vec(), value)], None, false, 1, 0))
+                    .ok_or_else(|| StorageError::ReadFailed {
+                        cf_name: source_cf.to_owned(),
+                        detail: format!(
+                            "temporal metadata backfill source row not found: key_hex={}",
+                            constellations::hex_encode(key)
+                        ),
+                    })?
+            } else {
+                let page = self.scan_cf_physical_page(source_cf, after_physical, max_rows)?;
+                (
+                    page.rows,
+                    page.resume_after_physical,
+                    page.more,
+                    page.candidate_rows_examined,
+                    page.expired_rows_skipped,
+                )
+            };
         let examined_rows = rows.len() as u64;
         let mut inserted_rows = 0_u64;
         let mut backfilled_rows = 0_u64;
@@ -3647,6 +3654,8 @@ impl StorageBackend for CalyxBackend {
             outcome_anchored_rows,
             outcome_absent_rows,
             outcome_unadjudicable_rows,
+            candidate_rows_examined: candidate_rows_examined as u64,
+            expired_rows_skipped: expired_rows_skipped as u64,
             latest_seq,
             resume_after_physical,
             more,
