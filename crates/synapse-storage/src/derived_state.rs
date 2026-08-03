@@ -345,6 +345,28 @@ pub(crate) fn run_derived_state_maintenance() {
                      to measure anything on them"
                 );
             }
+            // #1970: a lane that is constant over its corpus cannot rank, and no
+            // admission gate can see it — the encoder is graded, the *input* is
+            // never populated. Warned separately from a coverage deficiency
+            // because the remediation is different: coverage is fixed by
+            // backfilling rows, this is fixed by rebuilding or parking the lens.
+            if !coverage.degenerate_lanes.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_LENS_CONSTANT_BY_CORPUS",
+                    degenerate_lane_count = coverage.degenerate_lanes.len(),
+                    detail = %coverage
+                        .degenerate_lanes
+                        .iter()
+                        .map(|lane| format!(
+                            "panel {} slot {} constant across {} record(s)",
+                            lane.panel_version, lane.slot, lane.records_present
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    "one or more dense lanes took a single value across every measured record that \
+                     carries them, so they cannot rank and contribute no bits about any anchor"
+                );
+            }
             let mut guard = match DERIVED_STATE_LAST.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),

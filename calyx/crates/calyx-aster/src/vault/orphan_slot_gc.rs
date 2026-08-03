@@ -54,10 +54,84 @@ pub struct AsterOrphanSlotCfSkip {
     pub reason: String,
 }
 
+/// Rows per bounded page while deriving the live Base key set (#1968).
+///
+/// Matches the page size the Synapse-side walker settled on after sweeping the
+/// real 106,936-row `Base` CF: total CPU is nearly flat from 256 to 8,192 pages,
+/// so a smaller page buys a shorter hold almost for free, and the 25 ms
+/// row-guard budget has a cliff between 2,048 and 4,096. 256 lands the worst
+/// single hold at roughly 16% of budget.
+const ORPHAN_SLOT_GC_PAGE_ROWS: usize = 256;
+
 impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Folds every live `Base` row through `visit` in bounded pages, releasing
+    /// the row guard between pages, and fails closed if the vault committed
+    /// anything mid-walk (#1968).
+    ///
+    /// For callers whose decision must be taken against one instant. A paged
+    /// walk normally describes an *interval*, which is fine for a census and
+    /// wrong for anything destructive; this makes the difference explicit
+    /// instead of leaving it to a comment.
+    fn walk_base_pages_atomic<F>(
+        &self,
+        operation: &'static str,
+        page_rows: usize,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        if page_rows == 0 {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "{operation} needs a positive page size; zero rows per page cannot make forward \
+                 progress"
+            )));
+        }
+        let range = crate::cf::KeyRange::all();
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut first_seq: Option<u64> = None;
+        loop {
+            let page = self.scan_cf_range_page_latest(
+                ColumnFamily::Base,
+                &range,
+                cursor.as_deref(),
+                page_rows,
+            )?;
+            let opened_at = *first_seq.get_or_insert(page.snapshot_seq);
+            if page.snapshot_seq != opened_at {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "{operation} requires an atomic view of Base: the walk opened at committed \
+                     sequence {opened_at} but a later page served sequence {}, so a row committed \
+                     mid-walk may be missing from the derived live set. Retry when the vault is \
+                     quiescent; this decision must not be taken from a moving window",
+                    page.snapshot_seq
+                )));
+            }
+            for (key, value) in &page.rows {
+                visit(key, value)?;
+            }
+            if !page.more {
+                return Ok(());
+            }
+            let Some(resume) = page.resume_after.clone() else {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "{operation} paged Base reported more rows but returned no resume cursor, so \
+                     the walk cannot advance"
+                )));
+            };
+            if cursor.as_ref().is_some_and(|previous| *previous >= resume) {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "{operation} paged Base returned a resume cursor that does not advance, which \
+                     would re-read the same page forever"
+                )));
+            }
+            cursor = Some(resume);
+        }
+    }
+
     /// Retires orphaned physical slot column families.
     ///
     /// A slot CF is orphaned when no live Base row references its `SlotId`. Each
@@ -81,15 +155,35 @@ where
             ));
         }
         // Derive the legitimate slot set + live Base key set from physical truth.
-        let base = self.scan_cf_latest(ColumnFamily::Base)?;
-        let base_rows_scanned = base.len();
+        //
+        // Paged rather than materialized (#1968). Unlike the five maintenance
+        // folds that motivated that issue, this pass genuinely needs every Base
+        // key resident — `live_base_keys` is the fail-closed guard consulted per
+        // orphan candidate below — so the win here is only the *hold*, which
+        // `scan_cf_latest` kept for the whole 106k-row scan and measured at up to
+        // 2.65 s on the CF every constellation write lands in.
+        //
+        // Paging trades one long atomic view for many short ones, and this pass
+        // **deletes column families**. A row committed mid-walk could be missed,
+        // and a slot CF referencing it would then look orphaned. So the interval
+        // is asserted rather than assumed: `walk_base_pages_atomic` fails closed
+        // if any commit lands during the walk. Retrying under write load is the
+        // correct cost for a destructive decision; deciding it from a moving
+        // window is not.
+        let mut base_rows_scanned = 0usize;
         let mut live_slot_ids = BTreeSet::new();
         let mut live_base_keys = BTreeSet::new();
-        for (key, value) in &base {
-            live_base_keys.insert(key.clone());
-            let constellation = decode_constellation_base(value)?;
-            live_slot_ids.extend(constellation.slots.keys().map(|slot| slot.get()));
-        }
+        self.walk_base_pages_atomic(
+            "retire_orphan_slot_cfs",
+            ORPHAN_SLOT_GC_PAGE_ROWS,
+            |key, value| {
+                base_rows_scanned += 1;
+                live_base_keys.insert(key.to_vec());
+                let constellation = decode_constellation_base(value)?;
+                live_slot_ids.extend(constellation.slots.keys().map(|slot| slot.get()));
+                Ok(())
+            },
+        )?;
 
         let present = self.rows.present_slot_cf_ids()?;
         let present_slot_ids: Vec<u16> = present.iter().map(|slot| slot.get()).collect();
@@ -110,6 +204,10 @@ where
             }
             let quantized_cf = ColumnFamily::slot(*slot);
             let raw_cf = ColumnFamily::slot_raw(*slot);
+            // These stay materialized: the retirement report publishes their exact
+            // row counts and the live-reference check below needs every key. They
+            // are orphan *candidates*, so they are the CFs no live panel writes —
+            // unlike `Base`, nothing is queued behind this hold.
             let quantized_rows = self.scan_cf_latest(quantized_cf)?;
             let raw_rows = self.scan_cf_latest(raw_cf)?;
 

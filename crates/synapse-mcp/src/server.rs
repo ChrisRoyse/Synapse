@@ -243,6 +243,7 @@ mod browser_files;
 mod browser_frames;
 mod browser_network;
 mod browser_storage;
+pub(crate) mod build_provenance;
 mod capture_gif;
 mod data_cleaning;
 pub(crate) mod drain;

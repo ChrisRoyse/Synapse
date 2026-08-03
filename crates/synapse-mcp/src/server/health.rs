@@ -559,6 +559,14 @@ impl SynapseService {
             self.public_tool_registry_health(),
         );
         subsystems.insert("facade_contract".to_owned(), self.facade_contract_health());
+        // #1971 finding 1: the commit these bytes were built from, and whether
+        // the checkout has moved past it. Without this, a daemon running code
+        // many commits behind `main` is indistinguishable from a current one,
+        // and the whole accumulated delta ships on the next unrelated deploy.
+        subsystems.insert(
+            "build_provenance".to_owned(),
+            crate::server::build_provenance::health_subsystem(),
+        );
         subsystems.insert("shell_jobs".to_owned(), Self::shell_job_recovery_health());
         let tool_surface = self.tool_surface_fingerprint(session_id);
         if let Some(error) = &tool_surface.error {
@@ -576,7 +584,7 @@ impl SynapseService {
         Health {
             ok,
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            build: option_env!("VERGEN_GIT_SHA").unwrap_or("dev").to_owned(),
+            build: crate::server::build_provenance::short_commit(),
             pid: std::process::id(),
             uptime_s: self.started_at.elapsed().as_secs(),
             tool_count: tool_surface.names.len(),
@@ -1076,21 +1084,32 @@ impl SynapseService {
             .iter()
             .map(|panel| panel.blind_spot_records)
             .sum();
-        let status = if coverage.deficient_panels.is_empty() {
+        // A degenerate lane is not a coverage deficiency: the rows are there and
+        // the lens measured them. It is a lane that cannot rank, which is worth
+        // reporting without claiming the subsystem is broken (#1970).
+        let status = if !coverage.deficient_panels.is_empty() {
+            "error"
+        } else if coverage.degenerate_lanes.is_empty() {
             "ok"
         } else {
-            "error"
+            "degraded"
         };
+        let degenerate_lane_keys: Vec<String> = coverage
+            .degenerate_lanes
+            .iter()
+            .map(|lane| format!("{}:{}", lane.panel_version, lane.slot))
+            .collect();
         SubsystemHealth {
             status: status.to_owned(),
             detail: Some(format!(
                 "panels_measured={} deficient_panels={:?} blind_spot_ceiling={} \
-                 sample_records_per_panel={} measured_at_unix_ms={:?} panels=[{}]",
+                 sample_records_per_panel={} measured_at_unix_ms={:?}                  constant_by_corpus_lanes={:?} panels=[{}]",
                 coverage.panels.len(),
                 coverage.deficient_panels,
                 coverage.blind_spot_ceiling,
                 coverage.max_records_per_panel,
                 coverage.measured_at_unix_ms,
+                degenerate_lane_keys,
                 coverage
                     .panels
                     .iter()
@@ -1119,6 +1138,9 @@ impl SynapseService {
             calyx_lens_coverage_blind_spot_records: Some(blind_spot_records as u64),
             calyx_lens_coverage_records_measured: Some(records_measured as u64),
             calyx_lens_coverage_measured_at_unix_ms: coverage.measured_at_unix_ms,
+            calyx_lens_degenerate_lanes: Some(coverage.degenerate_lanes.len() as u64),
+            calyx_lens_degenerate_lane_keys: (!degenerate_lane_keys.is_empty())
+                .then_some(degenerate_lane_keys),
             ..SubsystemHealth::default()
         }
     }

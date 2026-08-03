@@ -121,6 +121,47 @@ pub struct CalyxRowGuardSiteStatus {
 pub struct SubsystemHealth {
     pub status: String,
     pub detail: Option<String>,
+    /// Full 40-hex commit the running binary was compiled from (#1971).
+    ///
+    /// `None` means the binary was built with
+    /// `SYNAPSE_BUILD_ALLOW_UNKNOWN_PROVENANCE=1` and genuinely cannot name its
+    /// own commit; the subsystem reports `error` in that case rather than
+    /// substituting a plausible-looking value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_ref: Option<String>,
+    /// `clean` | `dirty` | `unknown` at the moment the binary was compiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_tree_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_profile: Option<String>,
+    /// Checkout the binary was built from, recorded at compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_source_dir: Option<String>,
+    /// Commit that checkout is on *now*, read live from `.git` at health time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_checkout_commit: Option<String>,
+    /// Why the checkout's current commit could not be read, when it could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_checkout_unavailable_reason: Option<String>,
+    /// True exactly when the running bytes and the checkout are the same commit.
+    ///
+    /// This is the reading that was missing: a daemon many commits behind `main`
+    /// was indistinguishable from a current one, so the whole accumulated delta
+    /// shipped at once on the next unrelated deploy (#1971).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_matches_checkout: Option<bool>,
+    /// Path, size and mtime of the executable actually serving this payload, so
+    /// a redeploy that did not replace the installed bytes is visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_exe_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_exe_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_exe_modified_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<ProfileId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -451,6 +492,17 @@ pub struct SubsystemHealth {
     pub calyx_lens_coverage_records_measured: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_lens_coverage_measured_at_unix_ms: Option<u64>,
+    /// Dense lanes that took one value across every measured record carrying
+    /// them, so they cannot rank (#1970).
+    ///
+    /// Reported as `degraded`, not `error`: the lane is real and its rows are
+    /// intact, but it contributes nothing to recall, and finding those one at a
+    /// time whenever somebody thinks to look is how one stayed unnoticed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_degenerate_lanes: Option<u64>,
+    /// `panel:slot` for each degenerate lane, so remediation needs no log dive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_lens_degenerate_lane_keys: Option<Vec<String>>,
 
     // --- panel coverage and grounding census (issues #1927, #1920) ---
     // A panel version bump left the active generation measuring 1.7% of its

@@ -256,6 +256,11 @@ where
             retention_horizon: Mutex::new(retention_horizon),
             ledger_hook,
             read_only: options.read_only,
+            // The *effective* set, after the derived-content migration above may
+            // have extended what the caller asked for. Recording the requested
+            // set instead would refuse reads on CFs this handle really did open
+            // (issue #1969).
+            selected_cfs: selected_cfs.map(|cfs| cfs.into_iter().collect()),
             commit_lock: Mutex::new(()),
             commit_lock_waiters: std::sync::atomic::AtomicUsize::new(0),
             recurrence_write_lock: Mutex::new(()),

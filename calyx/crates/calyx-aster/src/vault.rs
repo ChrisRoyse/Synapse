@@ -119,6 +119,24 @@ pub struct AsterVault<C = SystemClock> {
     retention_horizon: Mutex<RetentionHorizon>,
     ledger_hook: Option<AsterLedgerHook>,
     read_only: bool,
+    /// Column families this handle actually opened, or `None` when it opened
+    /// every one (issue #1969).
+    ///
+    /// A partially-opened handle is a read-only inspection convenience: it skips
+    /// the recovery cost of families the caller does not need. Before this
+    /// field, the read path had no memory of that decision, so asking such a
+    /// handle for an unopened family resolved through `levels.get(&cf)` to
+    /// `unwrap_or_default()` and answered **zero rows** — indistinguishable from
+    /// a family that is genuinely empty. That produced a confident wrong number
+    /// in a readback harness, and its reverse polarity is worse: a phase
+    /// verifying that a purge or retire landed would read `0`, report success,
+    /// and never have looked at the data at all.
+    ///
+    /// RocksDB refuses to open a database at all unless every column family is
+    /// named. Calyx allows the partial open on purpose, so it pays for that
+    /// choice here instead: a read outside the selected set fails closed naming
+    /// the family and the set, and never resolves to empty.
+    selected_cfs: Option<BTreeSet<ColumnFamily>>,
     commit_lock: Mutex<()>,
     /// Threads currently queued for the durable commit lock (issue #1806).
     ///
@@ -180,6 +198,13 @@ pub const CALYX_ASTER_LEDGER_RAW_WRITE_FORBIDDEN: &str = "CALYX_ASTER_LEDGER_RAW
 /// Stable error code for attempts to forge Aster's internal raw-commitment CF.
 pub const CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN: &str =
     "CALYX_ASTER_RAW_COMMITMENT_WRITE_FORBIDDEN";
+/// Stable error code for a read addressed to a column family this handle never
+/// opened (issue #1969).
+///
+/// Named separately from every "empty" outcome on purpose: the whole point is
+/// that a caller can tell "this family holds nothing" from "this handle cannot
+/// see this family", which a `0` cannot express.
+pub const CALYX_ASTER_CF_NOT_SELECTED: &str = "CALYX_ASTER_CF_NOT_SELECTED";
 
 /// One physical CF revision precondition.
 ///
@@ -472,6 +497,9 @@ where
             clock,
             rows: VersionedCfStore::default(),
             durable: None,
+            // In-memory vault: every column family is reachable, so a miss
+            // genuinely means empty (#1969).
+            selected_cfs: None,
             dedup_policy: DedupPolicy::default(),
             retention_horizon: Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,
@@ -619,8 +647,55 @@ where
         &self.dedup_policy
     }
 
+    /// Column families this handle opened, or `None` when it opened every one.
+    #[must_use]
+    pub fn selected_cfs(&self) -> Option<Vec<ColumnFamily>> {
+        self.selected_cfs
+            .as_ref()
+            .map(|cfs| cfs.iter().copied().collect())
+    }
+
+    /// Refuses a read addressed to a column family this handle never opened
+    /// (issue #1969).
+    ///
+    /// Without this, such a read resolves to zero rows, which a caller cannot
+    /// distinguish from an empty family. The paging path already gets this right
+    /// — it fails closed with `CALYX_ASTER_SST_PAGE_INDEX_MISSING` naming the
+    /// file rather than answering zero — and this is the same discipline applied
+    /// to the family selection itself.
+    ///
+    /// Costs one `BTreeSet` lookup, and only on handles that were opened
+    /// partially: a fully-opened vault holds `None` here and returns
+    /// immediately. `selected_cfs` requires `read_only=true`, so no write path
+    /// can reach this.
+    fn assert_cf_selected(&self, cf: ColumnFamily, operation: &'static str) -> Result<()> {
+        let Some(selected) = &self.selected_cfs else {
+            return Ok(());
+        };
+        if selected.contains(&cf) {
+            return Ok(());
+        }
+        let selected_list = selected
+            .iter()
+            .map(|cf| format!("{cf:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(CalyxError {
+            code: CALYX_ASTER_CF_NOT_SELECTED,
+            message: format!(
+                "{operation} addressed column family {cf:?}, which this read-only handle did not \
+                 open; it opened only [{selected_list}]. Answering zero rows here would be \
+                 indistinguishable from the family being empty"
+            ),
+            remediation: "reopen the vault with this column family in selected_cfs (or open every \
+                          family); do not read the zero as evidence that the family is empty or \
+                          that a delete landed",
+        })
+    }
+
     /// Reads one raw CF row from one atomic view of the latest committed state.
     pub fn read_cf_latest(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.assert_cf_selected(cf, "read_cf_latest")?;
         self.rows.read_latest(cf, key)
     }
 
@@ -635,6 +710,7 @@ where
         cf: ColumnFamily,
         key: &[u8],
     ) -> Result<Option<(Vec<u8>, [u8; 32])>> {
+        self.assert_cf_selected(cf, "read_cf_latest_revisioned")?;
         self.rows.read_latest(cf, key).map(|value| {
             value.map(|value| {
                 let revision = value_revision(&value);
@@ -648,6 +724,9 @@ where
         &self,
         reads: &[crate::mvcc::CfRead],
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        for read in reads {
+            self.assert_cf_selected(read.cf, "read_cf_batch_latest")?;
+        }
         self.rows.read_batch_latest(reads)
     }
 
@@ -658,6 +737,7 @@ where
         cf: ColumnFamily,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        self.assert_cf_selected(cf, "read_cf_at")?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows.read_at(snapshot.snapshot(), cf, key, &self.clock)
     }
@@ -669,6 +749,7 @@ where
         cf: ColumnFamily,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        self.assert_cf_selected(cf, "read_cf_snapshot")?;
         self.rows.read_at(snapshot, cf, key, &self.clock)
     }
 
@@ -990,6 +1071,7 @@ where
 
     /// Scans visible raw CF rows at `snapshot`; use `scan_cf_pages_at` for large data CFs.
     pub fn scan_cf_at(&self, snapshot: Seq, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_at")?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows.scan_cf_at(snapshot.snapshot(), cf, &self.clock)
     }
@@ -1000,6 +1082,7 @@ where
         snapshot: Snapshot,
         cf: ColumnFamily,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_snapshot")?;
         self.rows.scan_cf_at(snapshot, cf, &self.clock)
     }
 
@@ -1012,6 +1095,7 @@ where
         cf: ColumnFamily,
         after_exclusive: Seq,
     ) -> Result<Vec<Vec<u8>>> {
+        self.assert_cf_selected(cf, "changed_cf_keys_after_snapshot")?;
         self.rows
             .changed_keys_after_at(snapshot, cf, after_exclusive, &self.clock)
     }
@@ -1030,6 +1114,10 @@ where
         after_exclusive: Seq,
         panel_version: u32,
     ) -> Result<crate::mvcc::PanelScopedChangedKeys> {
+        self.assert_cf_selected(
+            ColumnFamily::Base,
+            "changed_base_keys_after_snapshot_for_panel",
+        )?;
         self.rows.changed_base_keys_after_at_for_panel(
             snapshot,
             after_exclusive,
@@ -1040,6 +1128,7 @@ where
 
     /// Scans visible raw CF rows from one atomic latest committed view.
     pub fn scan_cf_latest(&self, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_latest")?;
         self.rows.scan_cf_latest(cf)
     }
 
@@ -1051,6 +1140,7 @@ where
     /// measured that hold reaching 1.4 s on this CF set, which stalls every
     /// committing writer for the duration.
     pub fn count_cf_latest(&self, cf: ColumnFamily) -> Result<usize> {
+        self.assert_cf_selected(cf, "count_cf_latest")?;
         self.rows.count_cf_latest(cf)
     }
 
@@ -1061,6 +1151,7 @@ where
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_range_at")?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows
             .scan_cf_range_at(snapshot.snapshot(), cf, range, &self.clock)
@@ -1073,6 +1164,7 @@ where
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_range_snapshot")?;
         self.rows.scan_cf_range_at(snapshot, cf, range, &self.clock)
     }
 
@@ -1082,6 +1174,7 @@ where
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_range_latest")?;
         self.rows.scan_cf_range_latest(cf, range)
     }
 
@@ -1093,6 +1186,7 @@ where
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<crate::mvcc::LatestCfRangePage> {
+        self.assert_cf_selected(cf, "scan_cf_range_page_latest")?;
         self.rows
             .scan_cf_range_page_latest(cf, range, after_key, limit)
     }
@@ -1104,6 +1198,7 @@ where
         cf: ColumnFamily,
         range: &KeyRange,
     ) -> Result<Vec<Vec<u8>>> {
+        self.assert_cf_selected(cf, "scan_cf_range_keys_at")?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows
             .scan_cf_range_keys_at(snapshot.snapshot(), cf, range, &self.clock)
@@ -1118,6 +1213,7 @@ where
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_range_page_at")?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows.scan_cf_range_page_at(
             snapshot.snapshot(),
@@ -1137,6 +1233,7 @@ where
         start: &[u8],
         upper: &[u8],
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "predecessor_cf_at")?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows
             .predecessor_cf_at(snapshot.snapshot(), cf, start, upper, &self.clock)

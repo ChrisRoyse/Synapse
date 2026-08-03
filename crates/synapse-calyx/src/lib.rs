@@ -2509,18 +2509,27 @@ pub struct SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxReadOnlyVault {
-    /// Opens an existing Calyx vault for physical inspection only.
+    /// Opens an existing Calyx vault for physical inspection of the **`Kv`
+    /// column family only**.
     ///
     /// This path does not create the vault directory, identity file, machine
     /// salt, lock file, or PID sidecar, and it does not acquire the Synapse
     /// exclusive writer lock. Mutating Aster operations fail closed because the
     /// underlying handle is opened with `read_only=true`.
     ///
+    /// Named for what it selects (#1969 ask 2). It used to be `open_existing`,
+    /// which reads as "open the vault" while opening one family of it, and a
+    /// read of any other family then answered **zero rows** — a number a caller
+    /// could not tell from "this family is empty". Reads outside `Kv` now fail
+    /// closed with `CALYX_ASTER_CF_NOT_SELECTED`, and the name says which family
+    /// you get at every call site. Use [`Self::open_existing_with_cfs`] for
+    /// anything that touches `Base`, a slot CF, or `Assay`.
+    ///
     /// # Errors
     ///
     /// Returns a structured error when the vault directory, identity, machine
     /// salt, or read-only Aster recovery cannot be read.
-    pub fn open_existing(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
+    pub fn open_existing_kv_only(config: SynapseCalyxConfig) -> Result<Self, SynapseCalyxError> {
         Self::open_existing_with_cfs(config, Some(vec![ColumnFamily::Kv]))
     }
 

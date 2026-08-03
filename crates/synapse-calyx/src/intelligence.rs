@@ -523,6 +523,7 @@ impl SynapseCalyxVault {
                 slot_states: corpus.slot_states(),
                 blind_spot_records,
                 blind_spot_fraction,
+                degenerate_lanes: degenerate_lanes(*panel_version, &corpus),
             });
         }
         let deficient_panels = panels
@@ -532,10 +533,15 @@ impl SynapseCalyxVault {
             })
             .map(|panel| panel.panel_version)
             .collect();
+        let degenerate_lanes: Vec<SynapseCalyxDegenerateLane> = panels
+            .iter()
+            .flat_map(|panel| panel.degenerate_lanes.iter().cloned())
+            .collect();
         Ok(SynapseCalyxLensCoverageStatus {
             panels,
             max_records_per_panel: max_records,
             deficient_panels,
+            degenerate_lanes,
             blind_spot_ceiling: SYNAPSE_LENS_BLIND_SPOT_CEILING,
             measured_at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -738,7 +744,6 @@ impl SynapseCalyxVault {
         max_records: usize,
         window: TimeWindowNs,
     ) -> Result<DenseCorpus, SynapseCalyxError> {
-        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
         // A Base row carries only `(slot_id, slot_hash)` pairs: every slot it
         // decodes to is `SlotVector::Absent`, by design, because the vectors live
         // in the per-slot CFs. Building the corpus straight from the decoded Base
@@ -752,40 +757,55 @@ impl SynapseCalyxVault {
         let mut records_outside_window = 0usize;
         let mut panel_slots: BTreeMap<SlotId, SynapseCalyxSlotKind> = BTreeMap::new();
         let mut sparse_support: BTreeMap<SlotId, BTreeSet<u32>> = BTreeMap::new();
-        for (_, value) in rows {
-            let base = decode_constellation_base(&value).map_err(|error| {
-                SynapseCalyxError::from_calyx("decode Base constellation", &error)
-            })?;
-            if base.panel_version != panel_version {
-                continue;
-            }
-            if !window.contains_created_at_ms(base.created_at) {
-                records_outside_window += 1;
-                continue;
-            }
-            records_scanned += 1;
-            if records.len() >= max_records {
-                continue;
-            }
-            let hydrated = self.hydrated_constellation(base.cx_id, snapshot)?;
-            for (slot, vector) in &hydrated.slots {
-                let kind = SynapseCalyxSlotKind::of(vector);
-                // A slot that is `Absent` on this record but present on another
-                // must not be recorded as absent for the panel: `Absent` is an
-                // explicit per-record absence, never a statement about the lens.
-                let entry = panel_slots.entry(*slot).or_insert(kind);
-                if *entry == SynapseCalyxSlotKind::Absent {
-                    *entry = kind;
+        // #1968: paged rather than materialized. This fold never needed the whole
+        // `Base` CF resident — it walks each row once — and holding the `Base`
+        // row-guard across a 106k-row materialization stalled every constellation
+        // writer behind it for ~204 ms.
+        self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let base = decode_constellation_base(value).map_err(|error| {
+                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                })?;
+                if base.panel_version != panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
                 }
-                if let SlotVector::Sparse { entries, .. } = vector {
-                    let support = sparse_support.entry(*slot).or_default();
-                    for entry in entries {
-                        support.insert(entry.idx);
+                if !window.contains_created_at_ms(base.created_at) {
+                    records_outside_window += 1;
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                records_scanned += 1;
+                if records.len() >= max_records {
+                    // Deliberately `Continue`, matching the pre-paging `continue`:
+                    // `records_scanned` is a count over the whole panel-and-window
+                    // population and `max_records` bounds only the *loaded*
+                    // subset, so the walk must reach the end of the CF for that
+                    // denominator to mean what it says.
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                let hydrated = self.hydrated_constellation(base.cx_id, snapshot)?;
+                for (slot, vector) in &hydrated.slots {
+                    let kind = SynapseCalyxSlotKind::of(vector);
+                    // A slot that is `Absent` on this record but present on
+                    // another must not be recorded as absent for the panel:
+                    // `Absent` is an explicit per-record absence, never a
+                    // statement about the lens.
+                    let entry = panel_slots.entry(*slot).or_insert(kind);
+                    if *entry == SynapseCalyxSlotKind::Absent {
+                        *entry = kind;
+                    }
+                    if let SlotVector::Sparse { entries, .. } = vector {
+                        let support = sparse_support.entry(*slot).or_default();
+                        for entry in entries {
+                            support.insert(entry.idx);
+                        }
                     }
                 }
-            }
-            records.push(DenseRecord::from_constellation(&hydrated));
-        }
+                records.push(DenseRecord::from_constellation(&hydrated));
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
 
         // Densify every sparse slot whose observed support fits the bound. This
         // happens after the scan because the support is a property of the
@@ -1709,6 +1729,44 @@ pub struct SynapseCalyxPanelLensCoverage {
     /// Measured records carrying fewer than two co-present measurable lenses.
     pub blind_spot_records: usize,
     pub blind_spot_fraction: f32,
+    /// Dense lanes that took the **same value on every record that carries
+    /// them**, so they cannot rank anything on this corpus (issue #1970).
+    pub degenerate_lanes: Vec<SynapseCalyxDegenerateLane>,
+}
+
+/// A dense lane that is constant *by corpus* (issue #1970).
+///
+/// Distinct from the two gates that already exist, and caught by neither:
+///
+/// - `CALYX_PANEL_SLOT_COSINE_CONSTANT` (#1963) refuses an encoder that is
+///   constant *by construction* — its image is a single direction whatever it is
+///   fed. It fires at admission, before any data exists.
+/// - `syn_record_vector_unit_fields` (#1964) refuses a *record vector* whose
+///   fields are on incomparable scales.
+///
+/// Neither can see a graded encoder fed an input this corpus never populates.
+/// `syn.agent_event.usage_total_log1p.v1` is the worked example: `syn_scalar_log1p`
+/// is graded by construction, but all four GenAI token fields it sums are absent
+/// on every one of the 8,241 rows in `CF_AGENT_EVENTS` — that CF is Synapse's
+/// agent *lifecycle* log, not model-completion telemetry — so the lane emits one
+/// value forever and contributes no bits about any anchor.
+///
+/// Measured off the hydrated vectors the coverage pass already holds, so naming
+/// every such lane on the vault costs no additional read. That is the point: the
+/// alternative is finding them one at a time, whenever someone thinks to look.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxDegenerateLane {
+    pub panel_version: u32,
+    pub slot: u16,
+    /// Measured records on which this lane was present at all.
+    pub records_present: usize,
+    /// Distinct vector values observed. Degenerate exactly when this is 1.
+    pub distinct_values: usize,
+    /// The single value every record projected to, when the lane is a scalar.
+    pub constant_scalar: Option<f32>,
+    pub code: String,
+    pub detail: String,
+    pub remediation: String,
 }
 
 /// Lens coverage across the panels a vault carries (issue #1894, ask 2).
@@ -1719,6 +1777,9 @@ pub struct SynapseCalyxLensCoverageStatus {
     /// Panels carrying fewer than two lenses, or whose blind-spot fraction is
     /// above [`SYNAPSE_LENS_BLIND_SPOT_CEILING`].
     pub deficient_panels: Vec<u32>,
+    /// Every dense lane on every measured panel that is constant over its
+    /// corpus, flattened for a one-glance read (issue #1970).
+    pub degenerate_lanes: Vec<SynapseCalyxDegenerateLane>,
     pub blind_spot_ceiling: f32,
     pub measured_at_unix_ms: Option<u64>,
 }
@@ -1794,6 +1855,88 @@ pub struct SynapseCalyxRedundancyReport {
     pub domain_grounded_fraction: f32,
     pub redundant_pairs: Vec<SynapseCalyxRedundancyPair>,
     pub assay_cf_rows_after: usize,
+}
+
+/// Rows a lane must be present on before "constant" is a claim about the corpus
+/// rather than about the sample size (issue #1970).
+///
+/// A lane observed on one or two records is trivially constant and says nothing.
+/// Two is the smallest count at which "every record agreed" is even capable of
+/// being false, so the floor is set above it: below this the lane is simply not
+/// reported, never reported as fine.
+const SYNAPSE_DEGENERATE_LANE_MIN_RECORDS: usize = 8;
+
+/// Names every dense lane that took one value across the whole measured corpus
+/// (issue #1970).
+///
+/// Reads the vectors the coverage pass already hydrated, so this costs no
+/// additional I/O — which is exactly why it can run over *every* lane on every
+/// maintainer tick instead of over the lanes someone thought to check.
+///
+/// Values are compared on their exact `f32` bit patterns rather than with a
+/// tolerance. A lane whose values differ only in the last mantissa bit is not
+/// constant, and calling it constant would be this instrument inventing a
+/// finding. `-0.0` is normalized to `+0.0` so the two do not read as distinct
+/// directions, and any NaN is treated as one value: a lane that is entirely NaN
+/// cannot rank either, and it should be reported rather than hidden by NaN's
+/// inequality with itself.
+fn degenerate_lanes(panel_version: u32, corpus: &DenseCorpus) -> Vec<SynapseCalyxDegenerateLane> {
+    let mut per_slot: BTreeMap<SlotId, (usize, BTreeSet<Vec<u32>>)> = BTreeMap::new();
+    for record in &corpus.records {
+        for (slot, vector) in &record.slots {
+            let key: Vec<u32> = vector
+                .iter()
+                .map(|value| {
+                    if value.is_nan() {
+                        f32::NAN.to_bits()
+                    } else if *value == 0.0 {
+                        0.0_f32.to_bits()
+                    } else {
+                        value.to_bits()
+                    }
+                })
+                .collect();
+            let entry = per_slot
+                .entry(*slot)
+                .or_insert_with(|| (0, BTreeSet::new()));
+            entry.0 += 1;
+            entry.1.insert(key);
+        }
+    }
+    per_slot
+        .into_iter()
+        .filter(|(_, (records_present, distinct))| {
+            *records_present >= SYNAPSE_DEGENERATE_LANE_MIN_RECORDS && distinct.len() == 1
+        })
+        .map(|(slot, (records_present, distinct))| {
+            let constant_scalar = distinct
+                .iter()
+                .next()
+                .filter(|bits| bits.len() == 1)
+                .map(|bits| f32::from_bits(bits[0]));
+            SynapseCalyxDegenerateLane {
+                panel_version,
+                slot: slot.get(),
+                records_present,
+                distinct_values: distinct.len(),
+                constant_scalar,
+                code: "CALYX_LENS_CONSTANT_BY_CORPUS".to_owned(),
+                detail: format!(
+                    "slot {} took one value across all {records_present} measured record(s) of \
+                     panel {panel_version} that carry it, so its nearest-neighbour cosine is \
+                     degenerate by construction on this corpus and it contributes no bits about \
+                     any anchor. The encoder may be perfectly graded — this is a statement about \
+                     the corpus, not the lens, and no admission gate can see it",
+                    slot.get()
+                ),
+                remediation:
+                    "measure the lens's input over its source CF (a field absent on every \
+                              row cannot be rescued by re-encoding), then either rebuild the lens \
+                              around what actually varies or park it under the capability gate"
+                        .to_owned(),
+            }
+        })
+        .collect()
 }
 
 struct AnchoredSlotSamples {
@@ -4513,47 +4656,56 @@ impl SynapseCalyxVault {
         let max_records = params
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
-        let rows = self.scan_cf_latest(ColumnFamily::Base)?;
         let mut records = Vec::new();
-        for (_, value) in rows {
-            let constellation = decode_constellation_base(&value).map_err(|error| {
-                SynapseCalyxError::from_calyx("decode Base constellation", &error)
-            })?;
-            if constellation.panel_version != params.panel_version {
-                continue;
-            }
-            let Some(secs) = constellation.source_event_time_secs() else {
-                continue;
-            };
-            if secs.unsigned_abs() > MAX_EXACT_I64_IN_F64 {
-                return Err(temporal_error(
-                    "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE",
-                    "a source event timestamp exceeds the exactly representable f64 integer range",
-                    "repair the source timestamp to a valid Unix-second value within +/- 2^53",
-                ));
-            }
-            let whole_secs = secs.to_f64().ok_or_else(|| {
-                temporal_error(
-                    "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
-                    "a validated source event timestamp could not be converted to f64",
-                    "inspect the persisted Base row and repair its source event timestamp",
-                )
-            })?;
-            // `activate_temporal_lane` writes the nanosecond stamp and its
-            // whole-second truncation together, so the sub-second part is
-            // already on this row. Reading only the truncation quantised every
-            // occurrence to a 1-second grid and manufactured ties that do not
-            // exist in the source (issue #1893). Prefer the full-precision
-            // stamp, and fail loudly rather than silently using the lossy one
-            // when the two disagree — that is a Base-row integrity defect.
-            let secs = sub_second_event_secs(&constellation, secs, whole_secs)?;
-            let group =
-                group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
-            records.push(EventRecord { secs, group });
-            if records.len() >= max_records {
-                break;
-            }
-        }
+        // #1968: paged rather than materialized. This is a streaming filter that
+        // stops at `max_records`, so it never needed a 106k-row `Vec` built under
+        // the `Base` row-guard before it looked at the first row.
+        self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let constellation = decode_constellation_base(value).map_err(|error| {
+                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                })?;
+                if constellation.panel_version != params.panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                let Some(secs) = constellation.source_event_time_secs() else {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                };
+                if secs.unsigned_abs() > MAX_EXACT_I64_IN_F64 {
+                    return Err(temporal_error(
+                        "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE",
+                        "a source event timestamp exceeds the exactly representable f64 integer range",
+                        "repair the source timestamp to a valid Unix-second value within +/- 2^53",
+                    ));
+                }
+                let whole_secs = secs.to_f64().ok_or_else(|| {
+                    temporal_error(
+                        "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
+                        "a validated source event timestamp could not be converted to f64",
+                        "inspect the persisted Base row and repair its source event timestamp",
+                    )
+                })?;
+                // `activate_temporal_lane` writes the nanosecond stamp and its
+                // whole-second truncation together, so the sub-second part is
+                // already on this row. Reading only the truncation quantised every
+                // occurrence to a 1-second grid and manufactured ties that do not
+                // exist in the source (issue #1893). Prefer the full-precision
+                // stamp, and fail loudly rather than silently using the lossy one
+                // when the two disagree — that is a Base-row integrity defect.
+                let secs = sub_second_event_secs(&constellation, secs, whole_secs)?;
+                let group =
+                    group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
+                records.push(EventRecord { secs, group });
+                // The pre-paging form `break`s here, after the push, so the walk
+                // stops on the same row with the same records loaded.
+                if records.len() >= max_records {
+                    return Ok(crate::SynapseCalyxWalkStep::Stop);
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
         records.sort_by(|a, b| a.secs.total_cmp(&b.secs));
         Ok(records)
     }
@@ -5354,50 +5506,63 @@ impl SynapseCalyxVault {
         let mut anchors: Vec<CxId> = Vec::new();
         let mut vault_corpus_size = 0usize;
         let snapshot = self.read_snapshot();
-        for (_, value) in self.scan_cf_latest(ColumnFamily::Base)? {
-            let base = decode_constellation_base(&value).map_err(|error| {
-                SynapseCalyxError::from_calyx("decode Base constellation", &error)
-            })?;
-            if base.panel_version != params.panel_version {
-                continue;
-            }
-            vault_corpus_size += 1;
-            // The Base row says whether the content slot exists on this record;
-            // it cannot supply the vector, which lives in the slot CF. Reading
-            // the vector straight off the Base row yielded `Absent` for every
-            // record, so every concept was excluded and the kernel reported
-            // `0 embedded concept(s)` over a panel full of measurements (#1894).
-            if !base.slots.contains_key(&content_slot.slot_id()) {
-                continue;
-            }
-            let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
-            let Some(vector) = constellation
-                .slots
-                .get(&content_slot.slot_id())
-                .and_then(dense_vector)
-            else {
-                // A record without the dense content-slot embedding is simply not
-                // a grounded concept in this domain; it is excluded, never faked.
-                continue;
-            };
-            // Domain scope: with `anchor_kind` set only that outcome axis
-            // anchors the kernel, so a per-domain sweep selects one kernel per
-            // domain instead of one blended kernel over every anchored concept.
-            let has_anchor = constellation.anchors.iter().any(|anchor| {
-                anchor.confidence > 0.0
-                    && params.anchor_kind.as_deref().is_none_or(|kind| {
-                        crate::grounding::anchor_kind_label(&anchor.kind) == kind
-                    })
-            });
-            let cx_id = constellation.cx_id;
-            rows.push(RecallQuery { cx_id, vector });
-            if has_anchor {
-                anchors.push(cx_id);
-            }
-            if rows.len() >= max_records {
-                break;
-            }
-        }
+        // #1968: paged rather than materialized. Each row is decoded once and
+        // then either hydrated or discarded, so the whole-CF `Vec` bought
+        // nothing and cost every constellation writer a ~204 ms `Base` row-guard
+        // stall for the duration.
+        self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let base = decode_constellation_base(value).map_err(|error| {
+                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                })?;
+                if base.panel_version != params.panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                vault_corpus_size += 1;
+                // The Base row says whether the content slot exists on this record;
+                // it cannot supply the vector, which lives in the slot CF. Reading
+                // the vector straight off the Base row yielded `Absent` for every
+                // record, so every concept was excluded and the kernel reported
+                // `0 embedded concept(s)` over a panel full of measurements (#1894).
+                if !base.slots.contains_key(&content_slot.slot_id()) {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
+                let Some(vector) = constellation
+                    .slots
+                    .get(&content_slot.slot_id())
+                    .and_then(dense_vector)
+                else {
+                    // A record without the dense content-slot embedding is simply not
+                    // a grounded concept in this domain; it is excluded, never faked.
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                };
+                // Domain scope: with `anchor_kind` set only that outcome axis
+                // anchors the kernel, so a per-domain sweep selects one kernel per
+                // domain instead of one blended kernel over every anchored concept.
+                let has_anchor = constellation.anchors.iter().any(|anchor| {
+                    anchor.confidence > 0.0
+                        && params.anchor_kind.as_deref().is_none_or(|kind| {
+                            crate::grounding::anchor_kind_label(&anchor.kind) == kind
+                        })
+                });
+                let cx_id = constellation.cx_id;
+                rows.push(RecallQuery { cx_id, vector });
+                if has_anchor {
+                    anchors.push(cx_id);
+                }
+                // The pre-paging form `break`s here, after both pushes, so
+                // `vault_corpus_size` is truncated at exactly the same row it was
+                // before. It counts the population the loader *reached*, not the
+                // whole panel, and that has not changed.
+                if rows.len() >= max_records {
+                    return Ok(crate::SynapseCalyxWalkStep::Stop);
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
         if rows.len() < 2 {
             return Err(SynapseCalyxError::new(
                 LodestarError::KernelEmptyResult.code(),

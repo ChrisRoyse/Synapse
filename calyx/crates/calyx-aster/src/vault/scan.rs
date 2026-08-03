@@ -15,6 +15,7 @@ where
         slot: calyx_core::SlotId,
         ids: &[CxId],
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.assert_cf_selected(ColumnFamily::slot(slot), "read_slot_cf_batch_snapshot")?;
         let reads = ids
             .iter()
             .map(|id| crate::mvcc::CfRead::new(ColumnFamily::slot(slot), crate::cf::slot_key(*id)))
@@ -34,6 +35,8 @@ where
         F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
         E: From<calyx_core::CalyxError>,
     {
+        self.assert_cf_selected(cf, "scan_cf_pages_at")
+            .map_err(E::from)?;
         let snapshot = self.snapshot_handle(snapshot);
         self.rows
             .scan_cf_pages_at(snapshot.snapshot(), cf, limit, &self.clock, on_page)
@@ -70,6 +73,8 @@ where
             Ok(())
         };
 
+        self.assert_cf_selected(cf, "scan_cf_pages_at_renewing_latest")
+            .map_err(E::from)?;
         ensure_latest()?;
         if limit == 0 {
             return Ok(());
@@ -145,6 +150,8 @@ where
         F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
         E: From<calyx_core::CalyxError>,
     {
+        self.assert_cf_selected(cf, "scan_cf_pages_snapshot")
+            .map_err(E::from)?;
         self.rows
             .scan_cf_pages_at(snapshot, cf, limit, &self.clock, on_page)
     }
@@ -158,6 +165,7 @@ where
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.assert_cf_selected(cf, "scan_cf_range_page_snapshot")?;
         self.rows
             .scan_cf_range_page_at(snapshot, cf, range, after_key, limit, &self.clock)
     }
@@ -175,6 +183,8 @@ where
         F: FnMut(Vec<(Vec<u8>, Vec<u8>)>) -> std::result::Result<(), E>,
         E: From<calyx_core::CalyxError>,
     {
+        self.assert_cf_selected(cf, "scan_cf_range_pages_snapshot")
+            .map_err(E::from)?;
         self.rows
             .scan_cf_range_pages_at(snapshot, cf, range, limit, &self.clock, on_page)
     }

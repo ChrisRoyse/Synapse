@@ -26,6 +26,9 @@ where
             retention_horizon: std::sync::Mutex::new(RetentionHorizon::default()),
             ledger_hook: None,
             read_only: false,
+            // A router handed in here is the caller's whole world; there is no
+            // partial-open decision for the read path to remember (#1969).
+            selected_cfs: None,
             commit_lock: std::sync::Mutex::new(()),
             commit_lock_waiters: std::sync::atomic::AtomicUsize::new(0),
             recurrence_write_lock: std::sync::Mutex::new(()),

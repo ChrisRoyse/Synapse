@@ -60,7 +60,8 @@ use crate::constellations::{
     SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION,
     SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
     SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, syn_active_panel_contract,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, assert_syn_lens_provenance_complete,
+    syn_active_panel_contract,
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
@@ -2115,8 +2116,27 @@ impl StorageBackend for CalyxBackend {
                 }
                 targets.sort_unstable();
                 targets.dedup();
+                // The active generation is swept **first**, not in version
+                // order. Per-panel isolation below already stops one panel's
+                // failure from costing another its maintenance; this is the
+                // second line of the same defence — if anything ever aborts the
+                // pass mid-loop, the one generation every recall path depends on
+                // has already been maintained rather than being whichever panel
+                // happened to sort last (#1971 finding 2).
+                if let Some(active) = active_panel_version
+                    && let Some(position) = targets.iter().position(|version| *version == active)
+                {
+                    targets[..=position].rotate_right(1);
+                }
 
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                // Genuinely pass-level, so it is checked once here rather than
+                // once per panel inside `syn_active_panel_contract`. An
+                // undeclared lens provenance is a property of the *code*, not of
+                // any one generation, and attributing it to whichever panel the
+                // loop happened to reach first would name the wrong culprit
+                // (#1971 finding 2).
+                assert_syn_lens_provenance_complete()?;
                 let mut generations = Vec::with_capacity(targets.len());
                 for panel_version in targets {
                     let is_active_panel = active_panel_version == Some(panel_version);
@@ -2124,14 +2144,46 @@ impl StorageBackend for CalyxBackend {
                     // code-declared contract. Resolving it here, before the
                     // attempt, turns "no contract" from a rebuild failure into a
                     // named terminal state (#1938 ask 2).
-                    let supplied =
-                        syn_active_panel_contract(panel_version, created_at_ms)?.map(|contract| {
-                            SynapseCalyxPanelState {
-                                panel: contract.panel,
-                                registry: contract.registry,
-                                registry_snapshot: None,
-                            }
-                        });
+                    //
+                    // Building the contract can itself *fail* — an admission
+                    // gate such as CALYX_PANEL_SLOT_COSINE_CONSTANT fires right
+                    // here. That failure belongs to the one panel that produced
+                    // it. Propagating it with `?` aborted the entire sweep, so
+                    // one legacy panel took the *active* panel's generation down
+                    // with it and recall went to zero (#1971 finding 2). It is
+                    // now recorded against its own generation exactly like a
+                    // rebuild failure, and the sweep continues.
+                    let supplied = match syn_active_panel_contract(panel_version, created_at_ms) {
+                        Ok(contract) => contract.map(|contract| SynapseCalyxPanelState {
+                            panel: contract.panel,
+                            registry: contract.registry,
+                            registry_snapshot: None,
+                        }),
+                        Err(error) => {
+                            tracing::error!(
+                                code = "STORAGE_SEARCH_GENERATION_CONTRACT_BUILD_FAILED",
+                                panel_version,
+                                is_active_panel,
+                                detail = %error,
+                                "building one panel's code-declared slot contract failed, so that \
+                                 generation cannot be maintained; the sweep continues with the \
+                                 remaining generations and the pass is recorded as failed"
+                            );
+                            generations.push(PanelGenerationMaintenance {
+                                panel_version,
+                                is_active_panel,
+                                disposition: GenerationDisposition::Failed {
+                                    code: "STORAGE_SEARCH_GENERATION_CONTRACT_BUILD_FAILED"
+                                        .to_owned(),
+                                    detail: format!(
+                                        "build the code-declared slot contract for panel \
+                                         {panel_version}: {error}"
+                                    ),
+                                },
+                            });
+                            continue;
+                        }
+                    };
                     if supplied.is_none() && !is_active_panel {
                         tracing::warn!(
                             code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
@@ -5205,7 +5257,7 @@ pub fn inspect_calyx_vault_read_only(
     schema_version: u32,
 ) -> StorageResult<CalyxVaultInspect> {
     let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
-    let vault = SynapseCalyxReadOnlyVault::open_existing(config)
+    let vault = SynapseCalyxReadOnlyVault::open_existing_kv_only(config)
         .map_err(|source| calyx_open_failed(path, &source))?;
     let actual = verify_calyx_schema_version_existing(&vault, path, schema_version)?;
     require_calyx_ordered_key_migration(&vault, path)?;
@@ -5219,7 +5271,7 @@ fn scan_calyx_cf_read_only(
 ) -> StorageResult<Vec<RawRow>> {
     require_known_cf_for_read(cf_name)?;
     let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
-    let vault = SynapseCalyxReadOnlyVault::open_existing(config)
+    let vault = SynapseCalyxReadOnlyVault::open_existing_kv_only(config)
         .map_err(|source| calyx_open_failed(path, &source))?;
     verify_calyx_schema_version_existing(&vault, path, schema_version)?;
     require_calyx_ordered_key_migration(&vault, path)?;
@@ -5233,7 +5285,7 @@ pub fn scan_calyx_cf_read_only_including_expired(
 ) -> StorageResult<Vec<RawRow>> {
     require_known_cf_for_read(cf_name)?;
     let config = SynapseCalyxConfig::from_vault_dir(path.to_path_buf());
-    let vault = SynapseCalyxReadOnlyVault::open_existing(config)
+    let vault = SynapseCalyxReadOnlyVault::open_existing_kv_only(config)
         .map_err(|source| calyx_open_failed(path, &source))?;
     verify_calyx_schema_version_existing(&vault, path, schema_version)?;
     require_calyx_ordered_key_migration(&vault, path)?;
