@@ -86,7 +86,8 @@ pub const SYN_EPISODE_PANEL_VERSION_PRE_1964: u32 = 1_904_002;
 /// The episode layout #1904 superseded.
 pub const SYN_EPISODE_PANEL_VERSION_PRE_1904: u32 = 1_664_002;
 pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
-pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_983_001;
+pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_965_001;
+pub const SYN_AGENT_EVENT_PANEL_VERSION_PRE_1965: u32 = 1_983_001;
 pub const SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983: u32 = 1_665_001;
 pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 /// Current agent-transcript slot layout.
@@ -96,7 +97,8 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 /// could see only 9.2% of the corpus, and added `AT_SLOT_TEXT_FULL_BM25` over
 /// the prose the record already carried but no lens had ever read. See the
 /// episode constant above for why a new lens is a new generation.
-pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_983_002;
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_965_002;
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1965: u32 = 1_983_002;
 pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1983: u32 = 1_921_001;
 /// The agent-transcript layout #1921 superseded — the one #1904 introduced.
 pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921: u32 = 1_904_003;
@@ -283,7 +285,8 @@ const AE_SLOT_END_STATE_ONEHOT: SlotId = SlotId::new(30);
 const AE_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(31);
 const AE_SLOT_DOW_CYCLIC: SlotId = SlotId::new(32);
 const AE_SLOT_USAGE_TOTAL_LOG1P: SlotId = SlotId::new(33);
-const AE_SLOT_RECORD_VECTOR: SlotId = SlotId::new(34);
+// Slot 34 remains reserved inside the agent-event block for the superseded
+// magnitude-weighted record vector. New generations must not write it (#1965).
 const AE_SLOT_HAS_END_STATE: SlotId = SlotId::new(114);
 
 const AT_SLOT_ROLE_ONEHOT: SlotId = SlotId::new(35);
@@ -298,7 +301,10 @@ const AT_SLOT_INPUT_TOKENS_LOG1P: SlotId = SlotId::new(43);
 const AT_SLOT_OUTPUT_TOKENS_LOG1P: SlotId = SlotId::new(44);
 const AT_SLOT_CACHE_READ_LOG1P: SlotId = SlotId::new(45);
 const AT_SLOT_CACHE_CREATION_LOG1P: SlotId = SlotId::new(46);
-const AT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(47);
+// Slot 47 remains reserved inside the transcript block for the superseded
+// magnitude-weighted record vector. Its replacement uses slot 110 (#1965).
+/// Comparable-scale replacement for the magnitude-weighted slot 47 (#1965).
+const AT_SLOT_RECORD_VECTOR_V2: SlotId = SlotId::new(110);
 /// Raw term-frequency lexical lane over the same transcript text
 /// `AT_SLOT_TEXT_SPARSE` hashes (#1904).
 ///
@@ -1927,7 +1933,6 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         AE_SLOT_USAGE_TOTAL_LOG1P,
         "syn.agent_event.usage_total_log1p.v1",
     ),
-    (AE_SLOT_RECORD_VECTOR, "syn.agent_event.record_vector.v1"),
     (AE_SLOT_HAS_END_STATE, "syn.agent_event.has_end_state.v1"),
     (AT_SLOT_ROLE_ONEHOT, "syn.agent_transcript.role_onehot.v1"),
     (
@@ -1968,8 +1973,8 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         "syn.agent_transcript.cache_creation_log1p.v1",
     ),
     (
-        AT_SLOT_RECORD_VECTOR,
-        "syn.agent_transcript.record_vector.v1",
+        AT_SLOT_RECORD_VECTOR_V2,
+        "syn.agent_transcript.record_vector.v2",
     ),
     (ACT_SLOT_KIND_ONEHOT, "syn.action.kind_onehot.v1"),
     (ACT_SLOT_TARGET_HASH, "syn.action.target_hash.v1"),
@@ -2478,9 +2483,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_AGENT_EVENTS),
             outcome_bearing: true,
             source_ttl_managed: false,
-            superseded_versions: &[],
-            // No re-measure path exists for this CF (#1927 ask 2 reports the
-            // shortfall rather than treating the absence as coverage).
+            superseded_versions: &[SYN_AGENT_EVENT_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_AGENT_EVENTS),
         },
         PanelCatalogEntry {
@@ -2490,6 +2493,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: true,
             source_ttl_managed: false,
             superseded_versions: &[
+                SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1965,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1983,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904,
@@ -3222,18 +3226,14 @@ pub fn syn_content_slot(
 /// slot at all, which is what makes the #1964 defect unreachable for anything
 /// new.
 const RECORD_VECTOR_MAGNITUDE_GRANDFATHERED: &[(u32, &str, u64)] = &[
-    (SYN_AGENT_EVENT_PANEL_VERSION, "syn-agent-event-v1", 8_004),
-    (
-        SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
-        "syn-agent-transcript-v1",
-        84_113,
-    ),
-    (SYN_ACTION_PANEL_VERSION, "syn-action-v1", 1_089),
-    (SYN_REFLEX_PANEL_VERSION, "syn-reflex-v1", 5),
-    (SYN_PROCESS_PANEL_VERSION, "syn-process-v1", 4),
-    (SYN_OBSERVATION_PANEL_VERSION, "syn-observation-v1", 2),
-    (SYN_OUTCOME_PANEL_VERSION, "syn-outcome-v1", 18),
-    (SYN_MCP_USAGE_PANEL_VERSION, "syn-mcp-usage-v1", 9_842),
+    (1_983_001, "syn-agent-event-v1", 9_091),
+    (1_983_002, "syn-agent-transcript-v1", 50_973),
+    (1_776_001, "syn-action-v1", 1_089),
+    (1_776_002, "syn-reflex-v1", 5),
+    (1_776_003, "syn-process-v1", 4),
+    (1_776_004, "syn-observation-v1", 2),
+    (1_776_005, "syn-outcome-v1", 18),
+    (1_776_006, "syn-mcp-usage-v1", 9_842),
 ];
 
 /// Refuses a content slot whose record vector weights fields by raw magnitude
@@ -3609,10 +3609,10 @@ fn agent_transcript_panel_slots(
             registry,
         )?,
         syn_content_slot(
-            AT_SLOT_RECORD_VECTOR,
-            "syn.agent_transcript.record_vector.v1",
-            RegistryAlgorithmicLens::syn_record_vector(
-                "syn.agent_transcript.record_vector.v1",
+            AT_SLOT_RECORD_VECTOR_V2,
+            "syn.agent_transcript.record_vector.v2",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.agent_transcript.record_vector.v2",
                 Modality::Structured,
                 96,
             ),
@@ -4249,19 +4249,6 @@ pub fn build_agent_event_constellation(
             agent_event_usage_total(record),
         )?,
     );
-    slots.insert(
-        AE_SLOT_RECORD_VECTOR,
-        measure_json(
-            SYN_AGENT_EVENT_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.agent_event.record_vector.v1",
-                Modality::Structured,
-                64,
-            ),
-            &agent_event_numeric_record(record),
-        )?,
-    );
-
     let scalars = agent_event_scalars(record, raw_bytes)?;
     let metadata = agent_event_metadata(source_key, raw_bytes, record)?;
     constellation(
@@ -4450,15 +4437,15 @@ pub fn build_agent_transcript_constellation(
         )?,
     );
     slots.insert(
-        AT_SLOT_RECORD_VECTOR,
+        AT_SLOT_RECORD_VECTOR_V2,
         measure_json(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.agent_transcript.record_vector.v1",
+            AlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.agent_transcript.record_vector.v2",
                 Modality::Structured,
                 96,
             ),
-            &agent_transcript_numeric_record(record),
+            &agent_transcript_numeric_record_v2(record),
         )?,
     );
 
@@ -7008,80 +6995,70 @@ fn episode_numeric_record(record: &EpisodeRecord) -> Value {
     })
 }
 
-fn agent_event_numeric_record(record: &AgentEventRecord) -> Value {
-    json!({
-        "usage_input_tokens": record.attributes.usage_input_tokens.unwrap_or(0),
-        "usage_output_tokens": record.attributes.usage_output_tokens.unwrap_or(0),
-        "usage_cache_read_input_tokens": record
-            .attributes
-            .usage_cache_read_input_tokens
-            .unwrap_or(0),
-        "usage_cache_creation_input_tokens": record
-            .attributes
-            .usage_cache_creation_input_tokens
-            .unwrap_or(0),
-        "usage_total_tokens": agent_event_usage_total(record).unwrap_or(0),
-        "duration_ms": payload_u64(&record.payload, &["duration_ms"]).unwrap_or(0),
-        "has_session_id": present_u64(record.session_id.as_deref()),
-        "has_spawn_id": present_u64(record.spawn_id.as_deref()),
-        "has_tool_name": present_u64(record.attributes.tool_name.as_deref()),
-        "has_error_type": present_u64(record.attributes.error_type.as_deref()),
-        "has_end_state": bool_u64(record.end_state.is_some()),
-        "ts_unix_ms": record.ts_ns / NS_PER_MS,
-    })
-}
+const AT_LINE_NO_SCALE: f64 = 1_000_000.0;
+const AT_TURN_INDEX_SCALE: f64 = 10_000.0;
+const AT_BYTES_SCALE: f64 = 1_000_000.0;
+const AT_TOOL_RESULT_BYTES_SCALE: f64 = 10_000_000.0;
+const AT_TOOL_CALL_COUNT_SCALE: f64 = 100.0;
+const AT_TOKEN_SCALE: f64 = 10_000_000.0;
+const AT_REASONING_TOKEN_SCALE: f64 = 1_000_000.0;
+const AT_COST_MICRO_USD_SCALE: f64 = 100_000_000.0;
+const AT_MODEL_USAGE_COUNT_SCALE: f64 = 100.0;
 
-fn agent_transcript_numeric_record(record: &AgentTranscriptRecord) -> Value {
+/// Comparable-scale transcript summary used by slot 110 (#1965).
+///
+/// Counts and byte lengths are log-bounded at frozen, corpus-sized ceilings;
+/// the absolute timestamp is deliberately excluded and represented only by
+/// periodic day/week position. `syn_record_vector_unit_fields` then enforces
+/// the `[0, 1]` contract at measurement time.
+fn agent_transcript_numeric_record_v2(record: &AgentTranscriptRecord) -> Value {
     json!({
-        "line_no": record.line_no,
-        "turn_index": record.turn_index.unwrap_or(0),
-        "raw_line_bytes": record.raw_line_bytes,
-        "content_bytes": record.content_bytes.unwrap_or(0),
-        "content_truncated": bool_u64(record.content_truncated),
-        "tool_call_count": record.tool_calls.len(),
-        "tool_argument_bytes_total": transcript_tool_argument_bytes_total(record),
-        "tool_result_bytes_total": transcript_tool_result_bytes_total(record),
-        "usage_input_tokens": record
+        "line_no_norm": count_norm(record.line_no, AT_LINE_NO_SCALE),
+        "turn_index_norm": count_norm(record.turn_index.unwrap_or(0), AT_TURN_INDEX_SCALE),
+        "raw_line_bytes_norm": count_norm(record.raw_line_bytes, AT_BYTES_SCALE),
+        "content_bytes_norm": count_norm(record.content_bytes.unwrap_or(0), AT_BYTES_SCALE),
+        "content_truncated": f64::from(u8::from(record.content_truncated)),
+        "tool_call_count_norm": count_norm(record.tool_calls.len() as u64, AT_TOOL_CALL_COUNT_SCALE),
+        "tool_argument_bytes_norm": count_norm(transcript_tool_argument_bytes_total(record), AT_BYTES_SCALE),
+        "tool_result_bytes_norm": count_norm(transcript_tool_result_bytes_total(record), AT_TOOL_RESULT_BYTES_SCALE),
+        "usage_input_tokens_norm": count_norm(record
             .usage
             .as_ref()
             .and_then(|usage| usage.input_tokens)
-            .unwrap_or(0),
-        "usage_output_tokens": record
+            .unwrap_or(0), AT_TOKEN_SCALE),
+        "usage_output_tokens_norm": count_norm(record
             .usage
             .as_ref()
             .and_then(|usage| usage.output_tokens)
-            .unwrap_or(0),
-        "usage_cache_read_input_tokens": record
+            .unwrap_or(0), AT_TOKEN_SCALE),
+        "usage_cache_read_input_tokens_norm": count_norm(record
             .usage
             .as_ref()
             .and_then(|usage| usage.cache_read_input_tokens)
-            .unwrap_or(0),
-        "usage_cache_creation_input_tokens": record
+            .unwrap_or(0), AT_TOKEN_SCALE),
+        "usage_cache_creation_input_tokens_norm": count_norm(record
             .usage
             .as_ref()
             .and_then(|usage| usage.cache_creation_input_tokens)
-            .unwrap_or(0),
-        "usage_reasoning_output_tokens": record
+            .unwrap_or(0), AT_TOKEN_SCALE),
+        "usage_reasoning_output_tokens_norm": count_norm(record
             .usage
             .as_ref()
             .and_then(|usage| usage.reasoning_output_tokens)
-            .unwrap_or(0),
-        "total_cost_micro_usd": record
+            .unwrap_or(0), AT_REASONING_TOKEN_SCALE),
+        "total_cost_micro_usd_norm": count_norm(record
             .usage
             .as_ref()
             .and_then(|usage| usage.total_cost_micro_usd)
-            .unwrap_or(0),
-        "model_usage_count": record
+            .unwrap_or(0), AT_COST_MICRO_USD_SCALE),
+        "model_usage_count_norm": count_norm(record
             .usage
             .as_ref()
-            .map_or(0, |usage| usage.model_usage.len()),
-        "usage_total_tokens": transcript_usage_total(record).unwrap_or(0),
-        "ts_unix_ms": record.ts_ns / NS_PER_MS,
+            .map_or(0, |usage| usage.model_usage.len()) as u64, AT_MODEL_USAGE_COUNT_SCALE),
+        "usage_total_tokens_norm": count_norm(transcript_usage_total(record).unwrap_or(0), AT_TOKEN_SCALE),
+        "day_fraction": day_fraction_of(record.ts_ns),
+        "week_fraction": week_fraction_of(record.ts_ns),
     })
-}
-
-fn present_u64(value: Option<&str>) -> u64 {
-    bool_u64(value.and_then(non_empty).is_some())
 }
 
 const fn bool_u64(value: bool) -> u64 {
