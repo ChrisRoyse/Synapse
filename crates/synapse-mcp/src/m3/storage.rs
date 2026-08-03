@@ -854,6 +854,11 @@ pub struct StoragePanelCoverageResponse {
     /// strict subset of `grounding_deficient_panels` whose results are undefined
     /// rather than provisional.
     pub no_outcome_axis_panels: Vec<String>,
+    /// **#1980.** Panels whose anchors were stranded on a superseded generation
+    /// by a panel-version bump: they WERE grounded and the bump lost it, which
+    /// is a different fault from never having been anchored and has a different
+    /// remedy (drive the backfill so the carry-forward runs).
+    pub anchors_stranded_panels: Vec<String>,
     /// Panels whose constellations outlive their TTL-expiring source rows.
     pub records_exceed_source_panels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -923,6 +928,9 @@ pub struct StoragePanelCoverageRow {
     /// Of `superseded_records`, how many carry a grounded anchor. Sacred: an
     /// anchor is an observed outcome and no re-measure regenerates it.
     pub superseded_grounded_records: u64,
+    /// Grounded records the superseded generation holds that the active one does
+    /// not: anchors orphaned by the version bump (#1980).
+    pub anchors_stranded_on_superseded: u64,
     /// UPPER BOUND on superseded records this panel could reclaim: ungrounded,
     /// on a closed generation, with a re-measure path, and with the active
     /// generation already covering its source CF.
@@ -1083,6 +1091,15 @@ pub struct StorageTemporalBackfillResponse {
     /// Rows this page examined that were observed tool results the declared
     /// adjudication declined to decide (#1926).
     pub outcome_unadjudicable_rows: u64,
+    /// Anchors carried across a panel-version bump on this page (#1980).
+    /// Separate from `outcome_anchored_rows`, which counts outcomes derived
+    /// from the source row rather than recovered from a superseded generation.
+    pub anchors_carried_forward: u64,
+    /// Rows on this page that received at least one carried anchor.
+    pub rows_anchor_carried: u64,
+    /// Superseded generations probed. Zero for a panel never bumped; zero on a
+    /// bumped panel with rows examined means the carry did not run.
+    pub anchor_carry_source_generations_read: u64,
     pub latest_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_after_physical_hex: Option<String>,
@@ -2652,6 +2669,7 @@ pub fn inspect_panel_coverage(
                 })
                 .collect(),
             superseded_grounded_records: panel.superseded_grounded_records as u64,
+            anchors_stranded_on_superseded: panel.anchors_stranded_on_superseded as u64,
             superseded_reclaim_candidates: panel.superseded_reclaim_candidates as u64,
             orphaned_records: panel.orphaned_records as u64,
             orphaned_source_evicted: panel.orphaned_source_evicted as u64,
@@ -2704,6 +2722,7 @@ pub fn inspect_panel_coverage(
         unbackfillable_deficient_panels: report.unbackfillable_deficient_panels.clone(),
         grounding_deficient_panels: report.grounding_deficient_panels.clone(),
         no_outcome_axis_panels: report.no_outcome_axis_panels.clone(),
+        anchors_stranded_panels: report.anchors_stranded_panels.clone(),
         records_exceed_source_panels: report.records_exceed_source_panels.clone(),
         measured_at_unix_ms: report.measured_at_unix_ms,
     })
@@ -3007,6 +3026,9 @@ pub fn run_temporal_backfill(
         outcome_anchored_rows: report.outcome_anchored_rows,
         outcome_absent_rows: report.outcome_absent_rows,
         outcome_unadjudicable_rows: report.outcome_unadjudicable_rows,
+        anchors_carried_forward: report.anchors_carried_forward,
+        rows_anchor_carried: report.rows_anchor_carried,
+        anchor_carry_source_generations_read: report.anchor_carry_source_generations_read,
         latest_seq: report.latest_seq,
         resume_after_physical_hex: report.resume_after_physical.as_deref().map(hex_encode),
         more: report.more,

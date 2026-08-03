@@ -206,6 +206,23 @@ pub struct PanelCoverageRow {
     /// means a reclaim would destroy grounded intelligence unless the anchors
     /// were carried on to the active generation first.
     pub superseded_grounded_records: usize,
+    /// Grounded records a superseded generation holds that the active one does
+    /// not — anchors **stranded by a panel-version bump** (#1980).
+    ///
+    /// `max(0, superseded_grounded_records - grounded_records)`. A record id is
+    /// a content address over `(input_bytes, panel_version, vault_salt)` and an
+    /// anchor is keyed by the `cx_id` it was written against, so a bump re-keys
+    /// every record and orphans every anchor on the previous generation. The
+    /// re-measured corpus is then born ungrounded.
+    ///
+    /// This is the difference between "this panel was never anchored" and "this
+    /// panel WAS anchored and the bump lost it" — two states with opposite
+    /// remedies, and until this field existed they produced the identical
+    /// report. `syn-episode-v1` sat at 171 stranded and read as an ordinary
+    /// grounding gap.
+    ///
+    /// Zero once the backfill's carry-forward has run over the panel.
+    pub anchors_stranded_on_superseded: usize,
     /// Upper bound on superseded records that hold nothing their source row
     /// could not produce again — an **upper bound, not a delete list**. See
     /// [`PanelCoverageReport::superseded_reclaim_candidates`] for why this
@@ -423,6 +440,19 @@ pub struct PanelCoverageReport {
     /// of the deficient panels is the one every operator-facing surface reads"
     /// is the operationally load-bearing half of the fact.
     pub no_outcome_axis_panels: Vec<String>,
+    /// Panels whose anchors were stranded on a superseded generation (#1980).
+    ///
+    /// A finding, not an observation: grounding is the axis every bits,
+    /// sufficiency and kernel result is defined against, so a panel that lost
+    /// its anchors to a version bump has silently become unmeasurable while
+    /// every coverage number stays green. `syn-episode-v1` reached the active
+    /// generation with 171 of 171 records re-measured, coverage 1.0, and 0 of
+    /// the 171 anchors it had the generation before.
+    ///
+    /// Named `panel@active_version` with the stranded count and the generation
+    /// holding them, because the remedy — drive the backfill so the carry-
+    /// forward runs — needs to know which generation to carry FROM.
+    pub anchors_stranded_panels: Vec<String>,
     /// Panels holding more constellations at the active generation than their
     /// source CF holds rows.
     ///
@@ -581,6 +611,7 @@ pub fn build_panel_coverage_report(
     let mut unbackfillable_deficient_panels = Vec::new();
     let mut grounding_deficient_panels = Vec::new();
     let mut no_outcome_axis_panels = Vec::new();
+    let mut anchors_stranded_panels: Vec<String> = Vec::new();
     let mut records_exceed_source_panels = Vec::new();
     let mut orphaned_source_missing_panels = Vec::new();
 
@@ -629,6 +660,37 @@ pub fn build_panel_coverage_report(
             .sum();
         superseded_records_total += superseded_records;
         superseded_grounded_records_total += superseded_grounded_records;
+
+        // #1980. Anchors a bump orphaned: the previous generation grounded more
+        // records than the current one does. Compared against the ACTIVE
+        // generation's grounded count rather than against zero, so a panel whose
+        // live writer keeps re-anchoring the new generation (agent-transcript
+        // holds 12,976 against 140 superseded) is correctly silent, and only a
+        // genuine regression is named.
+        let anchors_stranded_on_superseded =
+            superseded_grounded_records.saturating_sub(grounded_records);
+        if anchors_stranded_on_superseded > 0 {
+            let from = superseded_versions_present
+                .iter()
+                .filter(|generation| generation.grounded_records > 0)
+                .map(|generation| {
+                    format!(
+                        "{}({})",
+                        generation.panel_version, generation.grounded_records
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            anchors_stranded_panels.push(format!(
+                "{}@{} ({} anchored record(s) stranded; active holds {}, superseded generation(s) {} hold {})",
+                entry.panel_name,
+                entry.panel_version,
+                anchors_stranded_on_superseded,
+                grounded_records,
+                from,
+                superseded_grounded_records,
+            ));
+        }
         for generation in &superseded_versions_present {
             if !generation.closed && generation.records > 0 {
                 open_superseded_generations
@@ -786,6 +848,7 @@ pub fn build_panel_coverage_report(
             superseded_records,
             superseded_versions_present,
             superseded_grounded_records,
+            anchors_stranded_on_superseded,
             superseded_reclaim_candidates,
             orphaned_records,
             orphaned_source_evicted: probe.evicted,
@@ -847,6 +910,7 @@ pub fn build_panel_coverage_report(
         unbackfillable_deficient_panels,
         grounding_deficient_panels,
         no_outcome_axis_panels,
+        anchors_stranded_panels,
         records_exceed_source_panels,
         measured_at_unix_ms: census.measured_at_unix_ms,
     }

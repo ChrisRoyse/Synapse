@@ -1017,6 +1017,16 @@ impl SynapseService {
                 report.unknown_panel_versions
             ));
         }
+        // #1980. A stranded panel WAS grounded and the version bump lost it, so
+        // every bits/sufficiency/kernel result over it silently became
+        // undefined while coverage stayed at 1.0. That is a defect, not a gap,
+        // and it is loud here because it is invisible everywhere else.
+        if !report.anchors_stranded_panels.is_empty() {
+            reasons.push(format!(
+                "panels whose anchors a version bump stranded on a superseded generation: {:?};                  the grounded outcomes still exist one generation back and the active generation                  cannot ground anything until the backfill carries them across",
+                report.anchors_stranded_panels
+            ));
+        }
 
         let status = if reasons.is_empty() { "ok" } else { "error" };
 
@@ -1024,7 +1034,7 @@ impl SynapseService {
             status: status.to_owned(),
             detail: Some(format!(
                 "{}base_cf_rows={} records_total={} superseded_records={} \
-                 grounding_deficient_panels={:?} no_outcome_axis_panels={:?} \
+                 grounding_deficient_panels={:?} no_outcome_axis_panels={:?}                  anchors_stranded_panels={:?} \
                  records_exceed_source_panels={:?} \
                  backfill={} panel={} pages={} inserted={} \
                  anchored={} elapsed_ms={} panels=[{}]",
@@ -1038,6 +1048,7 @@ impl SynapseService {
                 report.superseded_records_total,
                 report.grounding_deficient_panels,
                 report.no_outcome_axis_panels,
+                report.anchors_stranded_panels,
                 report.records_exceed_source_panels,
                 readback.last_backfill_action.as_deref().unwrap_or("<none>"),
                 readback.last_backfill_panel.as_deref().unwrap_or("<none>"),
@@ -1059,6 +1070,8 @@ impl SynapseService {
             ),
             calyx_panel_no_outcome_axis_panels: Some(report.no_outcome_axis_panels.len() as u64),
             calyx_panel_no_outcome_axis_panel_names: Some(report.no_outcome_axis_panels.clone()),
+            calyx_panel_anchors_stranded_panels: Some(report.anchors_stranded_panels.len() as u64),
+            calyx_panel_anchors_stranded_panel_names: Some(report.anchors_stranded_panels.clone()),
             calyx_panel_coverage_min_fraction: min_fraction,
             calyx_panel_coverage_floor: Some(report.coverage_floor),
             calyx_panel_superseded_records: Some(report.superseded_records_total as u64),

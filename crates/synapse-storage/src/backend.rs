@@ -3660,6 +3660,13 @@ impl StorageBackend for CalyxBackend {
         let mut outcome_anchored_rows = 0_u64;
         let mut outcome_absent_rows = 0_u64;
         let mut outcome_unadjudicable_rows = 0_u64;
+        // #1980. Reported separately from `outcome_anchored_rows`, which counts
+        // outcomes DERIVED from the source row on this pass. These are outcomes
+        // the corpus already observed and would otherwise have lost, and
+        // conflating the two would hide a carry that silently stopped working.
+        let mut anchors_carried_forward = 0_u64;
+        let mut rows_anchor_carried = 0_u64;
+        let mut anchor_carry_source_generations_read = 0_u64;
         for (key, raw) in rows {
             let disposition = self.with_vault(
                 "calyx_temporal_metadata_backfill",
@@ -3764,9 +3771,30 @@ impl StorageBackend for CalyxBackend {
                                 &error,
                             )
                         })?;
-                    Ok((put.disposition, migration))
+                    // #1980: the constellation for this source row now exists
+                    // at the ACTIVE generation, which is the precondition an
+                    // anchor write has. Carry the grounded outcomes the same
+                    // source row already earned on a superseded generation
+                    // across to it, in this same pass — a re-measure that left
+                    // the row ungrounded is exactly how the corpus lost 171 of
+                    // 171 episode anchors on the 1_904_002 -> 1_964_001 bump.
+                    let carried = carry_forward_grounded_anchors(
+                        vault,
+                        source_cf,
+                        &key,
+                        &raw,
+                        expected.cx_id,
+                    )?;
+                    Ok((put.disposition, migration, carried))
                 },
             )?;
+            anchors_carried_forward =
+                anchors_carried_forward.saturating_add(disposition.2.anchors_written);
+            if disposition.2.anchors_written > 0 {
+                rows_anchor_carried = rows_anchor_carried.saturating_add(1);
+            }
+            anchor_carry_source_generations_read =
+                anchor_carry_source_generations_read.saturating_add(disposition.2.generations_read);
             if disposition.0.inserted() {
                 inserted_rows = inserted_rows.saturating_add(1);
             } else if disposition.1.changed() {
@@ -3817,6 +3845,9 @@ impl StorageBackend for CalyxBackend {
             outcome_anchored_rows,
             outcome_absent_rows,
             outcome_unadjudicable_rows,
+            anchors_carried_forward,
+            rows_anchor_carried,
+            anchor_carry_source_generations_read,
             candidate_rows_examined: candidate_rows_examined as u64,
             expired_rows_skipped: expired_rows_skipped as u64,
             latest_seq,
@@ -9995,6 +10026,192 @@ fn open_failed_detail_with_backend(
 /// same row, so the backfill would write a *second* constellation instead of
 /// re-measuring the existing one, and the coverage readback would climb while
 /// the old rows stayed stranded (#1965).
+/// What one row's anchor carry-forward did, reported rather than assumed.
+#[derive(Debug, Clone, Copy, Default)]
+struct AnchorCarryForward {
+    /// Anchors physically written onto the active generation's `cx_id`.
+    anchors_written: u64,
+    /// Superseded generations actually probed for this row.
+    generations_read: u64,
+}
+
+/// Carries a source row's already-observed grounded anchors across a panel bump.
+///
+/// **#1980.** `cx_id = hash(input_bytes, panel_version, vault_salt)` and an
+/// anchor is keyed by `(cx_id, kind)`, so a panel-version bump re-keys every
+/// record and orphans every anchor written against the previous generation. The
+/// re-measured corpus is then born ungrounded — measured on this vault as
+/// `syn-episode-v1` going from 171-of-171 grounded at 1_904_002 to 0-of-171 at
+/// 1_964_001, off the same 171 source rows.
+///
+/// That is a silent loss of the one thing the whole intelligence stack is
+/// defined against: bits are measured ABOUT anchors, and a panel with no anchor
+/// makes every bits/sufficiency/kernel result provisional at best and refused at
+/// worst.
+///
+/// An anchor is an observed real outcome **of the source row** — a label, a
+/// reward, a pass/fail — not a property of the lens layout that measured it. The
+/// source row is byte-identical across the bump (it is the very thing being
+/// re-measured), so the outcome remains true and is carried rather than
+/// re-derived. Nothing is invented: only anchors that physically exist on a
+/// declared superseded generation of *this* panel, for *this* source row, are
+/// copied.
+///
+/// Written through `put_grounding_anchors`, the same ledger-stamped path a fresh
+/// anchor takes, so a carried anchor gets its own provenance entry and there is
+/// no second way to create an anchor.
+///
+/// # Errors
+///
+/// Returns a storage error when the source CF has no declared generation
+/// history, when a superseded generation cannot be read, or when the anchor
+/// write or its physical readback fails. It never degrades to "carried nothing":
+/// a carry that cannot prove it ran is the failure being fixed.
+fn carry_forward_grounded_anchors(
+    vault: &SynapseCalyxVault,
+    source_cf: &str,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    active_cx_id: CxId,
+) -> StorageResult<AnchorCarryForward> {
+    let superseded = constellations::superseded_panel_versions_for_source_cf(source_cf)?;
+    if superseded.is_empty() {
+        return Ok(AnchorCarryForward::default());
+    }
+    let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
+    let input_bytes = constellations::source_constellation_input_bytes(
+        panel.input_mode,
+        source_cf,
+        source_key,
+        raw_bytes,
+    );
+
+    // Kinds the ACTIVE generation already carries are never overwritten. A
+    // freshly derived outcome is the better evidence: it was measured from the
+    // row as it stands now, where a carried one is a historical observation.
+    let mut present: BTreeSet<String> = vault
+        .scan_anchors_for_cx(active_cx_id)
+        .map_err(|error| {
+            calyx_read_failed(
+                "calyx_anchor_carry_forward",
+                "read the active generation's anchors before carrying",
+                &error,
+            )
+        })?
+        .into_iter()
+        .map(|row| synapse_calyx::anchor_kind_label(&row.anchor.kind))
+        .collect();
+
+    // Newest superseded generation first (the catalog declares that order), so
+    // the most recent observation of a kind wins and older ones are skipped.
+    let mut carry: Vec<Anchor> = Vec::new();
+    let mut generations_read = 0_u64;
+    for prior_version in superseded {
+        let prior_cx = vault.cx_id_for_input(&input_bytes, *prior_version);
+        let rows = vault.scan_anchors_for_cx(prior_cx).map_err(|error| {
+            calyx_read_failed(
+                "calyx_anchor_carry_forward",
+                "read a superseded generation's anchors",
+                &error,
+            )
+        })?;
+        generations_read = generations_read.saturating_add(1);
+        for row in rows {
+            // Ungrounded anchors are not carried: confidence must be finite and
+            // positive for an anchor to ground anything, and copying a zero-
+            // confidence row forward would inflate the grounded census with
+            // something that grounds nothing.
+            if !(row.anchor.confidence.is_finite() && row.anchor.confidence > 0.0) {
+                continue;
+            }
+            let kind = synapse_calyx::anchor_kind_label(&row.anchor.kind);
+            if present.contains(&kind) {
+                continue;
+            }
+            present.insert(kind);
+            carry.push(row.anchor);
+        }
+    }
+    if carry.is_empty() {
+        return Ok(AnchorCarryForward {
+            anchors_written: 0,
+            generations_read,
+        });
+    }
+
+    let carried_count = carry.len() as u64;
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "schema": "synapse_anchor_carry_forward/v1",
+        "issue": 1980,
+        "source_cf": source_cf,
+        "source_key_hex": constellations::hex_encode(source_key),
+        "panel_name": panel.panel_name,
+        "to_panel_version": panel.panel_version,
+        "from_panel_versions": superseded,
+        "anchor_count": carried_count,
+    }))
+    .map_err(|source| StorageError::EncodeJson {
+        type_name: "synapse_anchor_carry_forward_ledger_payload",
+        source,
+    })?;
+    vault
+        .put_grounding_anchors(
+            active_cx_id,
+            carry.clone(),
+            payload,
+            "synapse-anchor-carry-forward",
+        )
+        .map_err(|error| {
+            calyx_write_failed(
+                "calyx_anchor_carry_forward",
+                "carry grounded anchors forward across a panel-version bump",
+                &error,
+            )
+        })?;
+
+    // Physical readback of the Anchors CF, not the write's return value: the
+    // whole defect class here is a path that reports success while the corpus
+    // stays ungrounded.
+    let readback = vault.scan_anchors_for_cx(active_cx_id).map_err(|error| {
+        calyx_read_failed(
+            "calyx_anchor_carry_forward",
+            "read back the carried anchors",
+            &error,
+        )
+    })?;
+    for anchor in &carry {
+        if !readback.iter().any(|row| &row.anchor == anchor) {
+            return Err(calyx_write_failed_detail(
+                "calyx_anchor_carry_forward",
+                format!(
+                    "carried anchor is absent from the Anchors CF after the write: \
+                     cx_id={active_cx_id} kind={} source_cf={source_cf} source_key_hex={}; \
+                     the constellation would be reported re-measured while staying ungrounded",
+                    synapse_calyx::anchor_kind_label(&anchor.kind),
+                    constellations::hex_encode(source_key),
+                ),
+            ));
+        }
+    }
+
+    tracing::info!(
+        code = "CALYX_ANCHOR_CARRIED_FORWARD",
+        source_cf,
+        source_key_hex = %constellations::hex_encode(source_key),
+        panel_name = panel.panel_name,
+        to_panel_version = panel.panel_version,
+        from_panel_versions = ?superseded,
+        cx_id = %active_cx_id,
+        anchors_carried = carried_count,
+        anchors_present_after = readback.len(),
+        "grounded anchors carried across a panel-version bump with physical Anchors CF readback"
+    );
+    Ok(AnchorCarryForward {
+        anchors_written: carried_count,
+        generations_read,
+    })
+}
+
 fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {
     match source_cf {
         cf::CF_TIMELINE => Ok(SYN_TIMELINE_PANEL_VERSION),

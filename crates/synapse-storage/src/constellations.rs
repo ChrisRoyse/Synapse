@@ -717,6 +717,20 @@ pub struct TemporalMetadataBackfillReport {
     /// adjudication declined to decide (#1926). Non-zero here is a real signal:
     /// the corpus contains a result shape this code does not yet cover.
     pub outcome_unadjudicable_rows: u64,
+    /// Anchors this page carried forward from a superseded generation (#1980).
+    ///
+    /// Deliberately separate from `outcome_anchored_rows`: that counts outcomes
+    /// DERIVED from the source row on this pass, this counts outcomes the corpus
+    /// had already observed and would otherwise have lost to the panel bump.
+    /// Conflating them would hide a carry that silently stopped working behind a
+    /// derivation that still runs.
+    pub anchors_carried_forward: u64,
+    /// Rows on this page that received at least one carried anchor.
+    pub rows_anchor_carried: u64,
+    /// Superseded generations actually probed across this page. Zero while a
+    /// panel has never been bumped; a page with rows but zero generations read
+    /// on a panel that HAS been bumped is a broken carry, not a quiet one.
+    pub anchor_carry_source_generations_read: u64,
     /// Candidate rows this page walked before TTL filtering.
     ///
     /// On a TTL-managed source CF `examined_rows` can be 0 while the page did
@@ -2502,6 +2516,50 @@ pub fn panel_catalog_entry_for_version(panel_version: u32) -> Option<PanelCatalo
     builtin_panel_catalog().into_iter().find(|entry| {
         entry.panel_version == panel_version || entry.superseded_versions.contains(&panel_version)
     })
+}
+
+/// The superseded generations of the panel a source CF feeds, newest first.
+///
+/// **#1980.** A record id is a content address over `(input_bytes,
+/// panel_version, vault_salt)`, so bumping a panel version gives every record a
+/// NEW `cx_id` — and an anchor is keyed by the `cx_id` it was written against.
+/// A bump therefore strands every anchor the corpus had: the re-measured
+/// generation is born ungrounded, and nothing reads the old one.
+///
+/// That is not a hypothesis. On this vault `syn-episode-v1` bumped
+/// 1_904_002 -> 1_964_001 and the `Base` census reads 171 records grounded at
+/// the superseded generation and **0 of the same 171** at the active one, from
+/// the identical 171 `CF_EPISODES` source rows at coverage 1.0.
+///
+/// Grounding is not a property of the lens layout — it is an observed real
+/// outcome of the *source row*, and the source row did not change. So the
+/// anchors are carried across the bump rather than re-derived, and this is the
+/// declaration the carry walks.
+///
+/// # Errors
+///
+/// Returns a write-scoped storage error when the source CF has no native
+/// constellation contract. Fail-closed on purpose: silently returning "no prior
+/// generations" for an unknown CF would re-create the exact silent
+/// un-grounding this exists to stop.
+pub fn superseded_panel_versions_for_source_cf(source_cf: &str) -> StorageResult<&'static [u32]> {
+    let panel = anchor_panel_for_source_cf(source_cf)?;
+    builtin_panel_catalog()
+        .into_iter()
+        .find(|entry| entry.panel_name == panel.panel_name)
+        .map(|entry| entry.superseded_versions)
+        .ok_or_else(|| {
+            panel_lifecycle_error(
+                "CALYX_PANEL_CATALOG_ENTRY_ABSENT",
+                &format!(
+                    "source CF {source_cf} resolves to panel {} but builtin_panel_catalog has no \
+                     entry for that panel name",
+                    panel.panel_name
+                ),
+                "add the panel to builtin_panel_catalog; an anchor carry-forward cannot run \
+                 without its declared generation history",
+            )
+        })
 }
 
 fn validate_unit_metric(field: &str, value: f32, unit_range: bool) -> StorageResult<()> {

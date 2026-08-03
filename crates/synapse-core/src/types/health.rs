@@ -556,6 +556,22 @@ pub struct SubsystemHealth {
     /// a second call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_panel_no_outcome_axis_panel_names: Option<Vec<String>>,
+    /// Panels whose grounded anchors a panel-version bump stranded on a
+    /// superseded generation (#1980).
+    ///
+    /// Distinct from [`Self::calyx_panel_no_outcome_axis_panels`], which is the
+    /// symptom. This is the cause and it names a different remedy: the outcomes
+    /// still physically exist one generation back, so the panel is repaired by
+    /// driving the backfill's carry-forward rather than by re-observing
+    /// anything. `syn-episode-v1` reached the active generation with all 171
+    /// records re-measured at coverage 1.0 and none of its 171 anchors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_anchors_stranded_panels: Option<u64>,
+    /// The `panel@version` names behind
+    /// [`Self::calyx_panel_anchors_stranded_panels`], each carrying the stranded
+    /// count and the generation holding the anchors to carry FROM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_anchors_stranded_panel_names: Option<Vec<String>>,
     /// Lowest active-generation coverage fraction across every full-CF panel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_panel_coverage_min_fraction: Option<f32>,
