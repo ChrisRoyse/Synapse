@@ -3443,7 +3443,10 @@ fn agent_transcript_panel_slots(
             panel_version,
             registry,
         )?,
-        syn_content_slot(
+        // Retrieval-only since #1963: a dense `dim = 1` rank on `[0, 1]` has
+        // cosine identically +1, so it is a post-retrieval ordinate and never a
+        // similarity lane. `syn_content_slot` refuses it structurally.
+        syn_retrieval_only_slot(
             AT_SLOT_LINE_RANK,
             "syn.agent_transcript.line_rank.v1",
             RegistryAlgorithmicLens::syn_scalar_rank(
@@ -3733,7 +3736,10 @@ fn episode_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRe
             panel_version,
             registry,
         )?,
-        syn_content_slot(
+        // Retrieval-only since #1963: a dense `dim = 1` rank on `[0, 1]` has
+        // cosine identically +1, so it is a post-retrieval ordinate and never a
+        // similarity lane. `syn_content_slot` refuses it structurally.
+        syn_retrieval_only_slot(
             EP_SLOT_DURATION_RANK,
             "syn.episode.duration_rank.v1",
             RegistryAlgorithmicLens::syn_scalar_rank(
@@ -3944,7 +3950,10 @@ fn mcp_usage_panel_slots(panel_version: u32, registry: &mut Registry) -> Storage
             panel_version,
             registry,
         )?,
-        syn_content_slot(
+        // Retrieval-only since #1963: a dense `dim = 1` rank on `[0, 1]` has
+        // cosine identically +1, so it is a post-retrieval ordinate and never a
+        // similarity lane. `syn_content_slot` refuses it structurally.
+        syn_retrieval_only_slot(
             MU_SLOT_SESSION_SEQUENCE_RANK,
             "syn.mcp_usage.session_sequence_rank.v1",
             RegistryAlgorithmicLens::syn_scalar_rank(
