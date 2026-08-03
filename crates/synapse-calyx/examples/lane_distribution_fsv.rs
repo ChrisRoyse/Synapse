@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use synapse_calyx::{SynapseCalyxConfig, SynapseCalyxTuningConfig, SynapseCalyxVault};
 
-const PANELS: &[u32] = &[1_665_001, 1_921_001];
+const PANELS: &[u32] = &[1_665_001, 1_921_001, 1_983_001];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let vault_dir = std::env::args()
@@ -76,6 +76,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         || transcript.population_records <= transcript.records_present
     {
         return Err(format!("unexpected transcript verdict: {transcript:?}").into());
+    }
+    let end_state = coverage
+        .degenerate_lanes
+        .iter()
+        .find(|lane| lane.panel_version == 1_983_001 && lane.slot == 30)
+        .ok_or("panel 1983001 slot 30 was not classified")?;
+    if end_state.code != "CALYX_LENS_NEAR_ZERO_VARIANCE_BY_CORPUS"
+        || !end_state.census_complete
+        || end_state.distinct_values != 3
+        || end_state.lifecycle_action_allowed
+    {
+        return Err(format!("unexpected end-state verdict: {end_state:?}").into());
     }
     println!("verdict=PASS bounded physical evidence remained sample-qualified");
     Ok(())
