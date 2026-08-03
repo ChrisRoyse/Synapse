@@ -2480,12 +2480,44 @@ function Format-SynapseBuildOutputImageHolders {
 # use, so classify by shape instead: cargo orchestration failures are always
 # `error: failed to <filesystem/network verb>` or `error: could not <verb>`, and
 # never carry a rustc error code or a source span.
+#
+# `error: could not compile <crate>` belongs here too, and its absence is what
+# made #1975 misreport a crashed compiler as a source defect. That line is
+# ALWAYS cargo's wrapper around a rustc invocation that failed -- it is emitted
+# whether rustc printed diagnostics or died of a segfault, and it never carries
+# a source span. rustc's own diagnostics are separate `error[E....]:` / `error:`
+# lines, so excluding the wrapper can never hide a genuine compile error: a real
+# one still contributes its own line.
 $script:SynapseCargoOrchestrationErrorPatterns = @(
     '(?i)^error:\s+failed to (remove|write|copy|rename|hardlink|link|create|open|read|move)\b',
     '(?i)^error:\s+could not (remove|create|write|open|read|delete)\b',
+    '(?i)^error:\s+could not compile\b',
     '(?i)^error:\s+failed to (get|download|fetch|sync|update|load|select)\b',
     '(?i)^error:\s+the lock file needs to be updated',
     '(?i)^error:\s+no such command'
+)
+
+# A build tool that CRASHED is not a build that found errors. Cargo reports a
+# crashed child as
+#   process didn't exit successfully: `<tool> <args>` (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)
+# where the exit code is an NTSTATUS value rather than a small integer. That is
+# a subprocess crash signature, and it is mechanically distinguishable from a
+# diagnostic: rustc/lld emitted no error, the operating system killed them.
+#
+# The distinction is the whole point of #1975. Four archived deploy failures
+# reported `compiler_error=true` with the remediation "repair the compiler error
+# lines", against a build in which every crate compiled and zero diagnostics were
+# emitted -- sending the operator to hunt for source errors that did not exist,
+# after an hour-long build, four times.
+$script:SynapseToolchainCrashPatterns = @(
+    "(?i)process didn't exit successfully:.*\(exit code:\s*0x[0-9a-f]{8}",
+    '(?i)\(exit code:\s*0x[0-9a-f]{8},\s*STATUS_[A-Z_]+\s*\)',
+    '(?i)\bSTATUS_ACCESS_VIOLATION\b',
+    '(?i)\bSTATUS_STACK_OVERFLOW\b',
+    '(?i)\bSTATUS_STACK_BUFFER_OVERRUN\b',
+    '(?i)\bSTATUS_HEAP_CORRUPTION\b',
+    '(?i)\bSTATUS_IN_PAGE_ERROR\b',
+    '(?i)\bSTATUS_ILLEGAL_INSTRUCTION\b'
 )
 
 # `error: linking with `link.exe` failed` is rustc's wrapper around a separate
@@ -2534,6 +2566,11 @@ function Get-SynapseBuildLogSignal {
         cargo_orchestration_error_matches = @()
         has_linker_failure = $false
         linker_failure_matches = @()
+        has_toolchain_crash = $false
+        toolchain_crash_matches = @()
+        toolchain_crash_status = $null
+        toolchain_crash_exit_code = $null
+        toolchain_crash_tool = $null
         tail_80 = ''
     }
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
@@ -2542,19 +2579,42 @@ function Get-SynapseBuildLogSignal {
     $signal.exists = $true
     $signal.tail_80 = (Get-Content -LiteralPath $Path -Tail 80 -ErrorAction SilentlyContinue) -join "`n"
 
-    $candidates = @(Select-String -LiteralPath $Path -Pattern '(?i)(^error(\[.*\])?:|fatal error|could not compile|failed to run custom build command|panicked at|LNK\d{4}|Access is denied\.\s*\(os error 5\)|\(os error 32\)|rust-lld:\s*error:)' -ErrorAction SilentlyContinue |
+    # `process didn't exit successfully` is in the candidate set because the
+    # crash signature lives on THAT line, not on the `error:` line above it.
+    # Before #1975 it was never scanned at all, so the one fact that identifies a
+    # toolchain crash was invisible to this classifier.
+    $candidates = @(Select-String -LiteralPath $Path -Pattern "(?i)(^error(\[.*\])?:|fatal error|could not compile|failed to run custom build command|panicked at|LNK\d{4}|Access is denied\.\s*\(os error 5\)|\(os error 32\)|rust-lld:\s*error:|process didn't exit successfully|STATUS_[A-Z_]{4,})" -ErrorAction SilentlyContinue |
         Select-Object LineNumber, Line)
 
     $compilerMatches = @()
     $orchestrationMatches = @()
     $lockedMatches = @()
     $linkerMatches = @()
+    $crashMatches = @()
     $lockedPaths = @()
     foreach ($candidate in $candidates) {
         $line = [string]$candidate.Line
         $isLocked = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseBuildOutputLockedPatterns
         $isOrchestration = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseCargoOrchestrationErrorPatterns
         $isLinker = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseLinkerFailurePatterns
+        $isCrash = Test-SynapseLogLineMatchesAny -Line $line -Patterns $script:SynapseToolchainCrashPatterns
+        if ($isCrash) {
+            $crashMatches += $candidate
+            # Name the tool that died and the status it died of, so the
+            # remediation can be specific instead of generic.
+            $statusMatch = [regex]::Match($line, '(?i)\b(STATUS_[A-Z_]+)\b')
+            if ($statusMatch.Success -and -not $signal.toolchain_crash_status) {
+                $signal.toolchain_crash_status = $statusMatch.Groups[1].Value
+            }
+            $codeMatch = [regex]::Match($line, '(?i)exit code:\s*(0x[0-9a-f]{8})')
+            if ($codeMatch.Success -and -not $signal.toolchain_crash_exit_code) {
+                $signal.toolchain_crash_exit_code = $codeMatch.Groups[1].Value
+            }
+            $toolMatch = [regex]::Match($line, '(?i)`([^`]*?([A-Za-z0-9_.\-]+\.exe))')
+            if ($toolMatch.Success -and -not $signal.toolchain_crash_tool) {
+                $signal.toolchain_crash_tool = $toolMatch.Groups[2].Value
+            }
+        }
         if ($isLocked) {
             $lockedMatches += $candidate
             # Tools quote the offending path differently: cargo uses backticks,
@@ -2568,8 +2628,9 @@ function Get-SynapseBuildLogSignal {
         if ($isOrchestration) { $orchestrationMatches += $candidate }
         # A line only counts as a compiler diagnostic when it is none of the
         # non-source failure shapes above. Anything else reproduces the #1865
-        # misdirection where an ownership fault reads as compiler_error=true.
-        if ($isOrchestration -or $isLocked -or $isLinker) { continue }
+        # misdirection where an ownership fault reads as compiler_error=true,
+        # and the #1975 one where a crashed compiler did.
+        if ($isOrchestration -or $isLocked -or $isLinker -or $isCrash) { continue }
         $compilerMatches += $candidate
     }
 
@@ -2581,6 +2642,8 @@ function Get-SynapseBuildLogSignal {
     $signal.cargo_orchestration_error_matches = @($orchestrationMatches | Select-Object -First 20)
     $signal.linker_failure_matches = @($linkerMatches | Select-Object -First 20)
     $signal.has_linker_failure = (@($linkerMatches).Count -gt 0)
+    $signal.toolchain_crash_matches = @($crashMatches | Select-Object -First 20)
+    $signal.has_toolchain_crash = (@($crashMatches).Count -gt 0)
     return [pscustomobject]$signal
 }
 
@@ -2766,7 +2829,30 @@ function Get-SynapseRustToolchainReadback {
 }
 
 function Set-SynapseReleaseBuildCompilerEnvironment {
-    $minimumRustStack = 8 * 1024 * 1024
+    # 64 MiB, raised from 8 MiB on 2026-08-03 (#1975).
+    #
+    # The previous value was 8 MiB, which is EXACTLY rustc's own built-in
+    # default -- so this function set the variable to the value it already had
+    # and changed nothing. It looked like a mitigation was in place for the
+    # STATUS_ACCESS_VIOLATION crashes while none was.
+    #
+    # `std::thread` reads RUST_MIN_STACK for the default stack size of every
+    # thread rustc spawns, including the LLVM codegen workers that run the
+    # ThinLTO stage the crash logs place the fault in. Raising it costs nothing
+    # at runtime -- it changes no codegen flag and does not touch the shipped
+    # binary, only how much address space rustc's own worker threads reserve.
+    #
+    # This is a HYPOTHESIS UNDER TEST, not a proven fix. The mechanism is
+    # plausible (a deep recursion in a codegen worker on a ~189 MB binary) but
+    # unconfirmed: Windows reports a guard-page overrun as 0xC0000005 rather
+    # than 0xC00000FD when the handler itself cannot run, so a stack exhaustion
+    # and a genuine bad access are indistinguishable from the exit code alone.
+    # If deploys keep crashing with this raised, the stack hypothesis is dead
+    # and the next arm is the release profile's `lto = "thin"`. Either way the
+    # failure is now named correctly by SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED
+    # instead of being reported as a compiler error, so the evidence accrues on
+    # #1975 rather than being lost.
+    $minimumRustStack = 64 * 1024 * 1024
     $existing = $env:RUST_MIN_STACK
     $effective = $minimumRustStack
     $source = 'synapse_setup_default'
@@ -2827,16 +2913,36 @@ function Get-SynapseReleaseBuildFailureKind {
             remediation = 'inspect the process table for a build or scanner process holding the release artifact; do not close protected terminal/IDE/WSL host processes'
         }
     }
-    if ($job -and (Test-SynapseStatusAccessViolationExit -Job $job)) {
+    # Ranked above the compiler-error branch on purpose (#1975): a build tool
+    # killed by the operating system emitted no diagnostic, so "repair the
+    # compiler error lines" names a fault that does not exist. The crash is
+    # detected at the job level (cargo itself died) OR in the log (cargo
+    # survived and reported a crashed grandchild -- which is the shape that
+    # actually occurs here, because rustc is the process that dies).
+    $jobCrashed = ($job -and (Test-SynapseStatusAccessViolationExit -Job $job))
+    if ($jobCrashed -or $LogSignal.has_toolchain_crash) {
+        $status = if ($LogSignal.toolchain_crash_status) { $LogSignal.toolchain_crash_status } else { 'STATUS_ACCESS_VIOLATION' }
+        $hex = if ($LogSignal.toolchain_crash_exit_code) { $LogSignal.toolchain_crash_exit_code } elseif ($job) { [string]$job.exit_code_hex } else { '<unknown>' }
+        $tool = if ($LogSignal.toolchain_crash_tool) { $LogSignal.toolchain_crash_tool } elseif ($jobCrashed) { 'cargo.exe' } else { '<unnamed tool>' }
+        $diagCount = @($LogSignal.compiler_error_matches).Count
+        $diagNote = if ($diagCount -gt 0) {
+            "The log ALSO carries $diagCount source-diagnostic line(s) (see compiler_error_matches); read those too, but they did not cause this exit."
+        } else {
+            'ZERO source-diagnostic lines were emitted, so there is nothing in the source to repair.'
+        }
         return [pscustomobject]@{
-            code = 'SYNAPSE_RELEASE_BUILD_TOOLCHAIN_ACCESS_VIOLATION'
-            remediation = 'cargo/rustc/linker exited with 0xC0000005 STATUS_ACCESS_VIOLATION; inspect the per-attempt diagnostics/log archive plus WER crash-dump readback, and repair or update the Windows Rust/toolchain host before rerunning setup'
+            code = 'SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED'
+            remediation = ("$tool was killed by the operating system with $status (exit=$hex). This is a build-TOOL crash, not a compile error: the tool never reported a problem with the code, the OS terminated it. $diagNote " +
+                'Remediation, in order: (1) rerun setup -- this crash is probabilistic on this host and every crate other than the final one is already cached, so a retry costs a fraction of a full build; ' +
+                '(2) if it repeats, read toolchain_crash_matches in setup-build.log to see which tool and which stage died, and check compiler_environment.rust_min_stack in the diagnostics -- a rustc codegen worker running out of stack surfaces exactly like this on Windows; ' +
+                '(3) treat a change in the crashing stage, tool, or status as new evidence and record it on the tracking issue rather than assuming it is the same fault. Do NOT go looking for compiler error lines.')
         }
     }
     if ($LogSignal.has_compiler_error) {
+        $first = @($LogSignal.compiler_error_matches | ForEach-Object { "line $($_.LineNumber): $($_.Line)" } | Select-Object -First 5) -join ' | '
         return [pscustomobject]@{
             code = 'SYNAPSE_RELEASE_BUILD_COMPILER_FAILED'
-            remediation = 'repair the compiler error lines recorded in setup-build.log before rerunning setup'
+            remediation = ("repair the compiler error lines recorded in setup-build.log before rerunning setup. The classified diagnostics are: $first")
         }
     }
     # Ranked after the compiler branch: a genuine source defect can also fail the
@@ -11607,7 +11713,15 @@ if (-not $SkipBuild) {
         $recentWerDumpCount = if ($werCrashReadback) { [int]$werCrashReadback.recent_dump_count } else { 0 }
         $outputLocked = if ($buildLogSignal.has_output_locked_error) { 'true' } else { 'false' }
         $outputHolderText = Format-SynapseBuildOutputImageHolders -Readback $buildOutputImageHoldersAfter
-        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} output_locked={22} output_dir_live_images={23} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
+        # Printed beside compiler_error so the two can never be read as the same
+        # fact again (#1975): a crashed tool sets this and clears that.
+        $toolchainCrash = if ($buildLogSignal.has_toolchain_crash) {
+            "true(tool={0} status={1} exit={2})" -f `
+                ($(if ($buildLogSignal.toolchain_crash_tool) { $buildLogSignal.toolchain_crash_tool } else { '<unnamed>' })),
+                ($(if ($buildLogSignal.toolchain_crash_status) { $buildLogSignal.toolchain_crash_status } else { '<unnamed>' })),
+                ($(if ($buildLogSignal.toolchain_crash_exit_code) { $buildLogSignal.toolchain_crash_exit_code } else { '<unknown>' }))
+        } else { 'false' }
+        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} toolchain_crash={24} output_locked={22} output_dir_live_images={23} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
             $failureKind.code,
             $buildExit,
             $childPid,
@@ -11631,7 +11745,8 @@ if (-not $SkipBuild) {
             $failureKind.remediation,
             $buildLogSignal.tail_80,
             $outputLocked,
-            $outputHolderText)
+            $outputHolderText,
+            $toolchainCrash)
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
