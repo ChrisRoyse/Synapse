@@ -844,6 +844,30 @@ pub(super) async fn handle(
                 |out| out.backup = Some(response),
             )))
         }
+        StorageOperation::BackupStatus => {
+            let spec = params
+                .0
+                .backup_status
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "backup_status"))?;
+            let source_id = spec.target_dir.clone();
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_backup_status(&spec),
+            )?;
+            let response = crate::m3::storage::run_storage_backup_status(&spec)?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "backup target={} state={} final_exists={} manifest_exists={} staging_dirs={:?}",
+                    source_id,
+                    response.state,
+                    response.final_exists,
+                    response.manifest_exists,
+                    response.staging_dirs,
+                ),
+                |out| out.backup_status = Some(response),
+            )))
+        }
         StorageOperation::RestoreVerify => {
             let spec = params
                 .0

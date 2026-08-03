@@ -440,6 +440,23 @@ pub struct StorageBackupParams {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageBackupStatusParams {
+    /// Absolute final target path originally supplied to `backup`.
+    pub target_dir: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageBackupStatusResponse {
+    pub target_dir: String,
+    pub state: String,
+    pub final_exists: bool,
+    pub manifest_exists: bool,
+    pub staging_dirs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageRestoreVerifyParams {
     /// Absolute path to a vault directory to verify read-only (a backup's
     /// `vault/` sub-directory, or a restored daemon data dir's vault).
@@ -4061,11 +4078,88 @@ pub fn run_storage_restore_verify(
     params: &StorageRestoreVerifyParams,
 ) -> Result<StorageRestoreVerifyResponse, ErrorData> {
     let vault_path = validate_fs_path(&params.vault_path, "vault_path")?;
+    if vault_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .contains(".synapse-backup-in-progress-")
+    }) {
+        return Err(mcp_error(
+            error_codes::STORAGE_BACKUP_IN_PROGRESS,
+            format!(
+                "restore_verify refuses in-progress backup staging path {}",
+                vault_path.display()
+            ),
+        ));
+    }
     let report = db
         .verify_calyx_restore(&vault_path)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(StorageRestoreVerifyResponse {
         verify: storage_verify_report(&report),
+    })
+}
+
+#[must_use]
+pub fn required_permissions_backup_status(
+    _params: &StorageBackupStatusParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+pub fn run_storage_backup_status(
+    params: &StorageBackupStatusParams,
+) -> Result<StorageBackupStatusResponse, ErrorData> {
+    let target = validate_fs_path(&params.target_dir, "target_dir")?;
+    let parent = target.parent().ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("backup target {} has no parent", target.display()),
+        )
+    })?;
+    let name = target.file_name().ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("backup target {} has no directory name", target.display()),
+        )
+    })?;
+    let prefix = format!(".{}.synapse-backup-in-progress-", name.to_string_lossy());
+    let entries = std::fs::read_dir(parent).map_err(|error| {
+        mcp_error(
+            "SYNAPSE_STORAGE_BACKUP_STATUS_READ_FAILED",
+            format!("read backup target parent {}: {error}", parent.display()),
+        )
+    })?;
+    let mut staging_dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            mcp_error(
+                "SYNAPSE_STORAGE_BACKUP_STATUS_READ_FAILED",
+                format!(
+                    "read entry in backup target parent {}: {error}",
+                    parent.display()
+                ),
+            )
+        })?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            staging_dirs.push(entry.path().display().to_string());
+        }
+    }
+    staging_dirs.sort();
+    let final_exists = target.exists();
+    let manifest_exists = target.join("backup_manifest.json").is_file();
+    let state = match (final_exists, manifest_exists, staging_dirs.is_empty()) {
+        (true, true, true) => "completed",
+        (false, false, false) => "working",
+        (false, false, true) => "absent",
+        _ => "invalid",
+    };
+    Ok(StorageBackupStatusResponse {
+        target_dir: target.display().to_string(),
+        state: state.to_owned(),
+        final_exists,
+        manifest_exists,
+        staging_dirs,
     })
 }
 

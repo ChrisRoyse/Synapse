@@ -24,16 +24,17 @@ use crate::m3::{
     },
     storage::{
         StorageAnchorsParams, StorageAnchorsResponse, StorageBackupParams, StorageBackupResponse,
-        StorageCorpusHistogramParams, StorageCorpusHistogramResponse, StorageFindSimilarParams,
-        StorageFindSimilarResponse, StorageGcOnceParams, StorageGcOnceResponse,
-        StorageInspectParams, StorageInspectResponse, StorageIntelligenceParams,
-        StorageIntelligenceResponse, StoragePanelCoverageParams, StoragePanelCoverageResponse,
-        StorageRestoreVerifyParams, StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
-        StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
-        StorageRetireSearchGenerationResponse, StorageSearchRebuildParams,
-        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
-        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
-        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
+        StorageBackupStatusParams, StorageBackupStatusResponse, StorageCorpusHistogramParams,
+        StorageCorpusHistogramResponse, StorageFindSimilarParams, StorageFindSimilarResponse,
+        StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
+        StorageIntelligenceParams, StorageIntelligenceResponse, StoragePanelCoverageParams,
+        StoragePanelCoverageResponse, StorageRestoreVerifyParams, StorageRestoreVerifyResponse,
+        StorageRetireOrphanSlotCfsParams, StorageRetireOrphanSlotCfsResponse,
+        StorageRetireSearchGenerationParams, StorageRetireSearchGenerationResponse,
+        StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
+        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
+        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
+        StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -53,6 +54,7 @@ pub enum StorageOperation {
     RetireOrphanSlotCfs,
     RetireSearchGeneration,
     Backup,
+    BackupStatus,
     RestoreVerify,
     Intelligence,
 }
@@ -74,6 +76,7 @@ impl StorageOperation {
             Self::RetireOrphanSlotCfs => "retire_orphan_slot_cfs",
             Self::RetireSearchGeneration => "retire_search_generation",
             Self::Backup => "backup",
+            Self::BackupStatus => "backup_status",
             Self::RestoreVerify => "restore_verify",
             Self::Intelligence => "intelligence",
         }
@@ -112,6 +115,8 @@ pub struct StorageParams {
     pub retire_search_generation: Option<StorageRetireSearchGenerationParams>,
     #[serde(default)]
     pub backup: Option<StorageBackupParams>,
+    #[serde(default)]
+    pub backup_status: Option<StorageBackupStatusParams>,
     #[serde(default)]
     pub restore_verify: Option<StorageRestoreVerifyParams>,
     #[serde(default)]
@@ -152,6 +157,8 @@ pub struct StorageResponse {
     pub retire_search_generation: Option<StorageRetireSearchGenerationResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<StorageBackupResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_status: Option<StorageBackupStatusResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_verify: Option<StorageRestoreVerifyResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

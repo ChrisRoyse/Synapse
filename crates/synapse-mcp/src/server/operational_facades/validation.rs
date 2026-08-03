@@ -36,6 +36,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
                 params.retire_search_generation.is_some(),
             ),
             ("backup", params.backup.is_some()),
+            ("backup_status", params.backup_status.is_some()),
             ("restore_verify", params.restore_verify.is_some()),
             ("intelligence", params.intelligence.is_some()),
         ],

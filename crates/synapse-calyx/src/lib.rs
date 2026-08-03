@@ -5081,9 +5081,80 @@ impl SynapseCalyxVault {
         target_root: &Path,
         include_regenerable: bool,
     ) -> Result<SynapseCalyxBackupReport, SynapseCalyxError> {
+        let parent = target_root.parent().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_TARGET_INVALID",
+                format!(
+                    "backup target {} has no parent directory",
+                    target_root.display()
+                ),
+                "provide an absolute fresh backup target beneath an existing directory",
+            )
+        })?;
+        let name = target_root.file_name().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_TARGET_INVALID",
+                format!(
+                    "backup target {} has no final directory name",
+                    target_root.display()
+                ),
+                "provide an absolute fresh backup target beneath an existing directory",
+            )
+        })?;
+        if target_root.exists() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_TARGET_EXISTS",
+                format!(
+                    "backup final target {} already exists; a final path is reserved exclusively for a completely verified backup",
+                    target_root.display()
+                ),
+                "choose a fresh nonexistent target path; inspect or remove the existing artifact explicitly",
+            ));
+        }
+        let staging_root = parent.join(format!(
+            ".{}.synapse-backup-in-progress-{}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        if staging_root.exists() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_STAGING_EXISTS",
+                format!(
+                    "backup staging directory {} already exists, indicating an interrupted or live publication",
+                    staging_root.display()
+                ),
+                "inspect the named staging directory and daemon logs; remove it only after proving no backup owns it, then retry",
+            ));
+        }
+        let result =
+            self.backup_to_staging(target_root, &staging_root, parent, include_regenerable);
+        if let Err(original) = &result
+            && staging_root.exists()
+            && let Err(cleanup) = std::fs::remove_dir_all(&staging_root)
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BACKUP_STAGING_CLEANUP_FAILED",
+                format!(
+                    "backup failed with [{original}], then cleanup of staging directory {} also failed: {cleanup}",
+                    staging_root.display()
+                ),
+                "stop any process holding the named staging path, remove it explicitly, and retry the backup",
+            ));
+        }
+        result
+    }
+
+    fn backup_to_staging(
+        &self,
+        target_root: &Path,
+        staging_root: &Path,
+        publication_parent: &Path,
+        include_regenerable: bool,
+    ) -> Result<SynapseCalyxBackupReport, SynapseCalyxError> {
         // 1. Barrier the WAL group-committer so every accepted write is durable
         //    before the consistent copy reads the tree.
         self.flush()?;
+        let staging_vault_dir = staging_root.join(backup::BACKUP_VAULT_SUBDIR);
         let backup_vault_dir = target_root.join(backup::BACKUP_VAULT_SUBDIR);
         // 2. Enforce vault residency against the backup vault directory.
         let residency_enforced =
@@ -5099,15 +5170,17 @@ impl SynapseCalyxVault {
             .collect::<Vec<&str>>();
         let aster_report = self
             .vault
-            .backup_consistent(&backup_vault_dir, include_regenerable, &runtime_refs)
+            .backup_consistent(&staging_vault_dir, include_regenerable, &runtime_refs)
             .map_err(|error| SynapseCalyxError::from_calyx("back up Calyx vault", &error))?;
         let latest_seq = self.vault.latest_seq();
         // 4. Prove the copy restores byte-for-byte before publishing a manifest.
-        let verify = backup::verify_vault_restore(&backup_vault_dir)?;
+        let mut verify = backup::verify_vault_restore(&staging_vault_dir)?;
         backup::require_verified(&verify)?;
         // 5. Capture vault identity. The lineage journal lives outside the vault
         //    directory by design, so the tree copy cannot reach it.
-        let lineage = backup::capture_lineage(target_root, &self.lineage)?;
+        let mut lineage = backup::capture_lineage(staging_root, &self.lineage)?;
+        verify.vault_path.clone_from(&backup_vault_dir);
+        lineage.sidecar_path = target_root.join(backup::BACKUP_LINEAGE_FILE);
         let copied = backup::CopiedVaultState::from_aster(aster_report);
         let mut report = SynapseCalyxBackupReport {
             vault_id: self.vault.vault_id().to_string(),
@@ -5130,9 +5203,24 @@ impl SynapseCalyxVault {
             verify,
         };
         // 6. Publish the manifest and record its own hash.
-        let (manifest_path, manifest_sha256) = backup::write_manifest(target_root, &report)?;
-        report.manifest_path = manifest_path;
+        let (_, manifest_sha256) = backup::write_manifest(staging_root, &report)?;
+        report.manifest_path = target_root.join(backup::BACKUP_MANIFEST_FILE);
         report.manifest_sha256 = manifest_sha256;
+        std::fs::rename(staging_root, target_root).map_err(|error| {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_BACKUP_PUBLISH_FAILED",
+                &format!("atomically publish verified backup from {} to", staging_root.display()),
+                target_root,
+                &error,
+                "ensure the staging and final paths share one volume, the final path is absent, and the parent permits directory rename",
+            )
+        })?;
+        sync_dir(
+            publication_parent,
+            "backup publication",
+            "SYNAPSE_CALYX_BACKUP_PUBLISH_SYNC_FAILED",
+            "inspect the final backup and parent volume health; do not treat publication as durable until the parent directory sync succeeds",
+        )?;
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_BACKUP_COMPLETED",
             vault_dir = %report.source_vault_dir.display(),

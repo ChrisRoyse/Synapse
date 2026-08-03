@@ -28,6 +28,7 @@ pub(super) fn storage_response(
         retire_orphan_slot_cfs: None,
         retire_search_generation: None,
         backup: None,
+        backup_status: None,
         restore_verify: None,
         intelligence: None,
     };
