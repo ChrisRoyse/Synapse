@@ -120,3 +120,30 @@ the debt or panel generation changes.
 `cargo check --workspace` passed. `pwsh -File scripts/lint.ps1` passed all seven
 gates in both workspaces, including formatting, dependency policy, root and
 Calyx clippy, and the public API ratchet.
+
+## Installed daemon readback
+
+Commit `5e93e29c` was deployed through `scripts/synapse-setup.ps1`. Candidate
+validation passed, the installed executable SHA-256 was
+`0FCCE6F8508F22540CC22596316747B424985E795E9A62748D247A11203F5670`, and the
+OS/health readback named installed PID `12424`, build `5e93e29c6e31`, 40 public
+tools, and overall health `ok` before the maintenance trigger. CPU math selected
+AVX2; the host has no NVIDIA/CUDA device, and all row-guard over-budget and
+starvation counters were zero.
+
+The first unattended tick selected the transcript panel, processed 43 pages in
+its 60-second budget, reported `budget_exhausted`, inserted zero rows, and kept
+its cursor. The next tick resumed rather than restarting. No manual backfill was
+invoked. A separate public `storage panel_coverage` read then reported:
+
+```text
+Base rows=114525 records_total=114525 decode_failures=0 accounting_holds=true
+syn-agent-transcript-v1 active_version_records=50973
+anchors_stranded_on_superseded=0
+anchors_stranding_identity_unknown=0
+backfill_owed=false
+```
+
+The same installed read still named `syn-outcome-v1=6` and
+`syn-mcp-usage-v1=135` as stranded and unbackfillable. This is the expected
+fail-closed state until #1965 supplies those panels with a source path.

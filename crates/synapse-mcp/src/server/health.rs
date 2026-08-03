@@ -1036,7 +1036,7 @@ impl SynapseService {
                 "{}base_cf_rows={} records_total={} superseded_records={} \
                  grounding_deficient_panels={:?} no_outcome_axis_panels={:?}                  anchors_stranded_panels={:?} \
                  records_exceed_source_panels={:?} \
-                 backfill={} panel={} pages={} inserted={} \
+                 backfill={} reason={} panel={} pages={} inserted={} \
                  anchored={} elapsed_ms={} panels=[{}]",
                 if reasons.is_empty() {
                     String::new()
@@ -1051,6 +1051,7 @@ impl SynapseService {
                 report.anchors_stranded_panels,
                 report.records_exceed_source_panels,
                 readback.last_backfill_action.as_deref().unwrap_or("<none>"),
+                readback.last_backfill_reason.as_deref().unwrap_or("<none>"),
                 readback.last_backfill_panel.as_deref().unwrap_or("<none>"),
                 readback.last_backfill_pages.unwrap_or(0),
                 readback.last_backfill_inserted_rows.unwrap_or(0),
@@ -1079,6 +1080,7 @@ impl SynapseService {
             calyx_panel_census_decode_failures: Some(report.decode_failures as u64),
             calyx_panel_coverage_measured_at_unix_ms: report.measured_at_unix_ms,
             calyx_panel_backfill_action: readback.last_backfill_action,
+            calyx_panel_backfill_reason: readback.last_backfill_reason,
             calyx_panel_backfill_panel: readback.last_backfill_panel,
             calyx_panel_backfill_pages: readback.last_backfill_pages,
             calyx_panel_backfill_inserted_rows: readback.last_backfill_inserted_rows,

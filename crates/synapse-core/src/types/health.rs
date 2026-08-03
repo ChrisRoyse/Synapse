@@ -594,6 +594,10 @@ pub struct SubsystemHealth {
     /// `page_failed` | `cursor_absent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_panel_backfill_action: Option<String>,
+    /// Independent predicate that selected the panel: coverage debt, anchor
+    /// debt, or both. Kept separate from the execution outcome above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_panel_backfill_panel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

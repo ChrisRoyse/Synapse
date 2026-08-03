@@ -125,6 +125,7 @@ pub struct DerivedStateReadback {
     pub last_panel_coverage_unix_ms: Option<u64>,
     /// What the last pass did about the panel most owed a backfill (#1927 ask 2).
     pub last_backfill_action: Option<String>,
+    pub last_backfill_reason: Option<String>,
     pub last_backfill_panel: Option<String>,
     pub last_backfill_source_cf: Option<String>,
     pub last_backfill_pages: Option<u64>,
@@ -516,6 +517,7 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.last_backfill_action = Some(action.to_owned());
+        guard.last_backfill_reason = None;
         guard.last_backfill_panel = None;
         guard.last_backfill_source_cf = None;
         guard.last_backfill_pages = Some(0);
@@ -569,6 +571,7 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
                 Err(poisoned) => poisoned.into_inner(),
             };
             guard.last_backfill_action = Some("anchor_debt_no_progress".to_owned());
+            guard.last_backfill_reason = Some(backfill_reason.to_owned());
             guard.last_backfill_panel = Some(target.panel_name.clone());
             guard.last_backfill_source_cf = Some(source_cf);
             guard.last_backfill_pages = Some(0);
@@ -718,6 +721,7 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.last_backfill_action = Some(action.to_owned());
+    guard.last_backfill_reason = Some(backfill_reason.to_owned());
     guard.last_backfill_panel = Some(target.panel_name.clone());
     guard.last_backfill_source_cf = Some(source_cf);
     guard.last_backfill_pages = Some(pages);
