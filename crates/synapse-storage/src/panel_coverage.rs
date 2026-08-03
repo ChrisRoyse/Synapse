@@ -209,7 +209,8 @@ pub struct PanelCoverageRow {
     /// Grounded records a superseded generation holds that the active one does
     /// not — anchors **stranded by a panel-version bump** (#1980).
     ///
-    /// `max(0, superseded_grounded_records - grounded_records)`. A record id is
+    /// Exact source-row identities grounded on a superseded generation but not
+    /// on the active generation. A record id is
     /// a content address over `(input_bytes, panel_version, vault_salt)` and an
     /// anchor is keyed by the `cx_id` it was written against, so a bump re-keys
     /// every record and orphans every anchor on the previous generation. The
@@ -223,6 +224,10 @@ pub struct PanelCoverageRow {
     ///
     /// Zero once the backfill's carry-forward has run over the panel.
     pub anchors_stranded_on_superseded: usize,
+    /// Grounded superseded records with no source identity. They cannot be
+    /// compared across generations and are reported as unknown, never silently
+    /// treated as either stranded or carried.
+    pub anchors_stranding_identity_unknown: usize,
     /// Upper bound on superseded records that hold nothing their source row
     /// could not produce again — an **upper bound, not a delete list**. See
     /// [`PanelCoverageReport::superseded_reclaim_candidates`] for why this
@@ -322,7 +327,24 @@ impl PanelCoverageRow {
     /// about it. This is the maintainer's work predicate (#1927 ask 2).
     #[must_use]
     pub fn backfill_owed(&self) -> bool {
-        self.coverage_below_floor && self.backfill_source_cf.is_some()
+        (self.coverage_below_floor || self.anchors_stranded_on_superseded > 0)
+            && self.backfill_source_cf.is_some()
+    }
+
+    /// Why the maintainer must sweep this panel. Coverage and anchor debt are
+    /// independent: a completed version backfill is exactly when coverage is
+    /// 1.0 while historical anchors may still be stranded.
+    #[must_use]
+    pub const fn backfill_reason(&self) -> Option<&'static str> {
+        match (
+            self.coverage_below_floor,
+            self.anchors_stranded_on_superseded > 0,
+        ) {
+            (true, true) => Some("coverage_and_anchor_debt"),
+            (true, false) => Some("coverage_debt"),
+            (false, true) => Some("anchor_debt"),
+            (false, false) => None,
+        }
     }
 }
 
@@ -492,6 +514,8 @@ impl PanelCoverageReport {
             .filter(|panel| panel.backfill_owed())
             .max_by_key(|panel| {
                 (
+                    usize::from(panel.anchors_stranded_on_superseded > 0),
+                    panel.anchors_stranded_on_superseded,
                     panel.uncovered_rows().unwrap_or(0),
                     u32::MAX - panel.panel_version,
                 )
@@ -661,14 +685,37 @@ pub fn build_panel_coverage_report(
         superseded_records_total += superseded_records;
         superseded_grounded_records_total += superseded_grounded_records;
 
-        // #1980. Anchors a bump orphaned: the previous generation grounded more
-        // records than the current one does. Compared against the ACTIVE
-        // generation's grounded count rather than against zero, so a panel whose
-        // live writer keeps re-anchoring the new generation (agent-transcript
-        // holds 12,976 against 140 superseded) is correctly silent, and only a
-        // genuine regression is named.
-        let anchors_stranded_on_superseded =
-            superseded_grounded_records.saturating_sub(grounded_records);
+        // #1982. Compare source identities, not aggregate counts. The active
+        // and superseded counts describe different populations; a large live
+        // writer population can otherwise hide every stranded historical row.
+        let active_grounded_keys = active
+            .map(|row| &row.grounded_source_key_hexes)
+            .cloned()
+            .unwrap_or_default();
+        let mut superseded_grounded_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut anchors_stranding_identity_unknown = 0usize;
+        for version in entry.superseded_versions {
+            let Some(row) = census.entry(*version) else {
+                continue;
+            };
+            anchors_stranding_identity_unknown = anchors_stranding_identity_unknown
+                .saturating_add(row.grounded_unattributed_records);
+            for (source_cf, keys) in &row.grounded_source_key_hexes {
+                superseded_grounded_keys
+                    .entry(source_cf.clone())
+                    .or_default()
+                    .extend(keys.iter().cloned());
+            }
+        }
+        let anchors_stranded_on_superseded = superseded_grounded_keys
+            .iter()
+            .map(|(source_cf, keys)| {
+                let active_keys = active_grounded_keys.get(source_cf);
+                keys.iter()
+                    .filter(|key| active_keys.is_none_or(|active| !active.contains(*key)))
+                    .count()
+            })
+            .sum();
         if anchors_stranded_on_superseded > 0 {
             let from = superseded_versions_present
                 .iter()
@@ -849,6 +896,7 @@ pub fn build_panel_coverage_report(
             superseded_versions_present,
             superseded_grounded_records,
             anchors_stranded_on_superseded,
+            anchors_stranding_identity_unknown,
             superseded_reclaim_candidates,
             orphaned_records,
             orphaned_source_evicted: probe.evicted,

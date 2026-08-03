@@ -425,6 +425,14 @@ pub struct SynapseCalyxPanelCensusEntry {
     /// A set rather than a count because the question is membership — "does
     /// this record's own source row still exist" — and no count can answer it.
     pub source_key_hexes: BTreeMap<String, BTreeSet<String>>,
+    /// Source identities for the subset of records carrying at least one
+    /// grounded anchor. Kept separately because panel-version bumps change the
+    /// constellation id while preserving the source identity; exact set
+    /// difference is therefore the only sound stranded-anchor detector.
+    pub grounded_source_key_hexes: BTreeMap<String, BTreeSet<String>>,
+    /// Grounded records whose source identity is absent. They cannot be joined
+    /// across generations and must remain explicitly unknown.
+    pub grounded_unattributed_records: usize,
     /// Records at this generation carrying no source provenance at all, so the
     /// probe cannot even be attempted for them (#1940). Reported, never folded
     /// into either the covered or the orphaned count.
@@ -523,6 +531,88 @@ impl SynapseCalyxPanelCensus {
 }
 
 impl SynapseCalyxVault {
+    /// Builds the grounded anchor lineage for one source CF from physical Base
+    /// rows at the exact superseded generations supplied by the panel catalog.
+    ///
+    /// Mutable source rows cannot reconstruct an old `cx_id` from their current
+    /// bytes. The Base row is the source of truth for the historical id and the
+    /// anchor observation, so a panel-bump carry must join by stable source key
+    /// and read the old anchor from that row.
+    pub fn grounded_anchor_lineage_by_source_key(
+        &self,
+        source_cf: &str,
+        superseded_versions_newest_first: &[u32],
+    ) -> Result<BTreeMap<String, Vec<Anchor>>, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("grounded_anchor_lineage_by_source_key");
+        let rank: BTreeMap<u32, usize> = superseded_versions_newest_first
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(rank, version)| (version, rank))
+            .collect();
+        let mut indexed: BTreeMap<String, BTreeMap<String, (usize, Anchor)>> = BTreeMap::new();
+        let mut decode_failures = 0usize;
+        let mut first_failure = None::<String>;
+        self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |key, value| {
+                let base = match decode_constellation_base(value) {
+                    Ok(base) => base,
+                    Err(error) => {
+                        decode_failures += 1;
+                        first_failure.get_or_insert_with(|| {
+                            format!("key_hex={} error={error}", hex_lower(key))
+                        });
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                };
+                let Some(&generation_rank) = rank.get(&base.panel_version) else {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                };
+                if base.metadata.get(METADATA_SOURCE_CF).map(String::as_str) != Some(source_cf) {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                let Some(source_key) = base.metadata.get(METADATA_SOURCE_KEY_HEX) else {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                };
+                let by_kind = indexed.entry(source_key.clone()).or_default();
+                for anchor in base
+                    .anchors
+                    .iter()
+                    .filter(|anchor| anchor.confidence.is_finite() && anchor.confidence > 0.0)
+                {
+                    let kind = anchor_kind_label(&anchor.kind);
+                    match by_kind.get(&kind) {
+                        Some((seen_rank, _)) if *seen_rank <= generation_rank => {}
+                        _ => {
+                            by_kind.insert(kind, (generation_rank, anchor.clone()));
+                        }
+                    }
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
+        if decode_failures != 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ANCHOR_LINEAGE_DECODE_FAILED",
+                format!(
+                    "cannot build exact anchor lineage for source_cf={source_cf}: {decode_failures} Base row(s) failed to decode; first={first_failure:?}"
+                ),
+                "repair the named Base row corruption, verify the vault chain, and rerun the carry; never carry from a partial lineage index",
+            ));
+        }
+        Ok(indexed
+            .into_iter()
+            .map(|(source_key, kinds)| {
+                (
+                    source_key,
+                    kinds.into_values().map(|(_, anchor)| anchor).collect(),
+                )
+            })
+            .collect())
+    }
+
     /// Censuses every panel generation in the `Base` CF in one decode-only pass.
     ///
     /// Read-only and unbounded by design: it must see *every* row, because its
@@ -576,6 +666,8 @@ impl SynapseCalyxVault {
                         earliest_created_at_ms: None,
                         latest_created_at_ms: None,
                         source_key_hexes: BTreeMap::new(),
+                        grounded_source_key_hexes: BTreeMap::new(),
+                        grounded_unattributed_records: 0,
                         unattributed_records: 0,
                     }
                 });
@@ -615,6 +707,19 @@ impl SynapseCalyxVault {
                 let grounded_kinds = grounded_anchor_kinds(&base.anchors);
                 if !grounded_kinds.is_empty() {
                     entry.grounded_records += 1;
+                    match (
+                        base.metadata.get(METADATA_SOURCE_CF),
+                        base.metadata.get(METADATA_SOURCE_KEY_HEX),
+                    ) {
+                        (Some(source_cf), Some(source_key_hex)) => {
+                            entry
+                                .grounded_source_key_hexes
+                                .entry(source_cf.clone())
+                                .or_default()
+                                .insert(source_key_hex.clone());
+                        }
+                        _ => entry.grounded_unattributed_records += 1,
+                    }
                 }
                 for kind in grounded_kinds {
                     *entry.anchor_kind_records.entry(kind).or_default() += 1;

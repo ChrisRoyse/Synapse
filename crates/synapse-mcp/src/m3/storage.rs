@@ -931,6 +931,7 @@ pub struct StoragePanelCoverageRow {
     /// Grounded records the superseded generation holds that the active one does
     /// not: anchors orphaned by the version bump (#1980).
     pub anchors_stranded_on_superseded: u64,
+    pub anchors_stranding_identity_unknown: u64,
     /// UPPER BOUND on superseded records this panel could reclaim: ungrounded,
     /// on a closed generation, with a re-measure path, and with the active
     /// generation already covering its source CF.
@@ -2670,6 +2671,7 @@ pub fn inspect_panel_coverage(
                 .collect(),
             superseded_grounded_records: panel.superseded_grounded_records as u64,
             anchors_stranded_on_superseded: panel.anchors_stranded_on_superseded as u64,
+            anchors_stranding_identity_unknown: panel.anchors_stranding_identity_unknown as u64,
             superseded_reclaim_candidates: panel.superseded_reclaim_candidates as u64,
             orphaned_records: panel.orphaned_records as u64,
             orphaned_source_evicted: panel.orphaned_source_evicted as u64,

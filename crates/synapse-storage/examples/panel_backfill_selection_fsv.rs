@@ -58,6 +58,8 @@ fn entry(panel_version: u32, records: usize, grounded: usize) -> SynapseCalyxPan
         records,
         grounded_records: grounded,
         anchor_kind_records: BTreeMap::new(),
+        grounded_source_key_hexes: BTreeMap::new(),
+        grounded_unattributed_records: 0,
         earliest_created_at_ms: None,
         latest_created_at_ms: None,
         // These cases are about coverage and backfill selection, not the #1940

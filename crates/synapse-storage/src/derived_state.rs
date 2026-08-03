@@ -459,12 +459,21 @@ pub(crate) fn run_derived_state_maintenance() {
 /// was taken under is exactly how rows get silently skipped.
 static BACKFILL_CURSOR: LazyLock<Mutex<Option<BackfillCursor>>> =
     LazyLock::new(|| Mutex::new(None));
+static ANCHOR_DEBT_PROBE: LazyLock<Mutex<Option<AnchorDebtProbe>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, Debug)]
 struct BackfillCursor {
     panel_version: u32,
     source_cf: String,
     after_physical: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct AnchorDebtProbe {
+    panel_version: u32,
+    source_cf: String,
+    stranded_before: usize,
 }
 
 /// Drives `temporal_backfill` pages for the panel most owed one, under
@@ -489,7 +498,12 @@ struct BackfillCursor {
 fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCoverageReport) -> bool {
     let started = std::time::Instant::now();
     let Some(target) = report.most_owed_backfill() else {
-        let action = if report.coverage_deficient_panels.is_empty() {
+        let unbackfillable_anchor_debt = report.panels.iter().any(|panel| {
+            panel.anchors_stranded_on_superseded > 0 && panel.backfill_source_cf.is_none()
+        });
+        let action = if unbackfillable_anchor_debt {
+            "anchor_debt_unbackfillable"
+        } else if report.coverage_deficient_panels.is_empty() {
             "none_owed"
         } else {
             // Deficient, but no panel that is deficient has a re-measure path.
@@ -527,6 +541,48 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         );
         return true;
     };
+    let backfill_reason = target.backfill_reason().unwrap_or("unknown_debt");
+
+    // #1984: a completed whole-source sweep is one exact repair attempt. On
+    // the next census, prove it reduced the source-identity debt before ever
+    // starting another sweep. A missing lineage declaration cannot heal by
+    // retrying the same bytes forever, so latch the fault until the measured
+    // debt or panel generation changes.
+    if target.anchors_stranded_on_superseded > 0 {
+        let mut probe = match ANCHOR_DEBT_PROBE.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(previous) = probe.as_ref().filter(|previous| {
+            previous.panel_version == target.panel_version
+                && previous.source_cf == source_cf
+                && target.anchors_stranded_on_superseded >= previous.stranded_before
+        }) {
+            let detail = format!(
+                "panel {} completed a full anchor-debt sweep but exact stranded source identities did not decrease: before={} after={}; refusing an unattended retry until the debt or panel generation changes; inspect superseded_versions and historical Base source metadata",
+                target.panel_name, previous.stranded_before, target.anchors_stranded_on_superseded,
+            );
+            drop(probe);
+            record_failure("STORAGE_DERIVED_STATE_ANCHOR_DEBT_NO_PROGRESS", detail);
+            let mut guard = match DERIVED_STATE_LAST.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.last_backfill_action = Some("anchor_debt_no_progress".to_owned());
+            guard.last_backfill_panel = Some(target.panel_name.clone());
+            guard.last_backfill_source_cf = Some(source_cf);
+            guard.last_backfill_pages = Some(0);
+            guard.last_backfill_elapsed_ms = Some(0);
+            return true;
+        }
+        if probe.as_ref().is_some_and(|previous| {
+            previous.panel_version != target.panel_version
+                || previous.source_cf != source_cf
+                || target.anchors_stranded_on_superseded < previous.stranded_before
+        }) {
+            *probe = None;
+        }
+    }
 
     // A cursor taken under a different panel generation or a different CF says
     // nothing about where this sweep should resume, so it is discarded rather
@@ -625,6 +681,18 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         };
     }
 
+    if sweep_complete && target.anchors_stranded_on_superseded > 0 {
+        let mut probe = match ANCHOR_DEBT_PROBE.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *probe = Some(AnchorDebtProbe {
+            panel_version: target.panel_version,
+            source_cf: source_cf.clone(),
+            stranded_before: target.anchors_stranded_on_superseded,
+        });
+    }
+
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_BACKFILL_PASS",
@@ -632,6 +700,7 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         panel = %target.panel_name,
         panel_version = target.panel_version,
         source_cf = %source_cf,
+        reason = backfill_reason,
         coverage_fraction = ?target.coverage_fraction,
         uncovered_rows = ?target.uncovered_rows(),
         pages,

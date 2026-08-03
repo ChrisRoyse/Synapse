@@ -107,6 +107,8 @@ fn synthetic_census(
         records,
         grounded_records: grounded,
         anchor_kind_records: BTreeMap::new(),
+        grounded_source_key_hexes: BTreeMap::new(),
+        grounded_unattributed_records: 0,
         earliest_created_at_ms: Some(earliest),
         latest_created_at_ms: Some(latest),
         // Each record declares its own source key, so the #1940 orphan probe
@@ -380,6 +382,8 @@ fn run_synthetic_cases() -> Vec<String> {
         records: 40,
         grounded_records: 0,
         anchor_kind_records: BTreeMap::new(),
+        grounded_source_key_hexes: BTreeMap::new(),
+        grounded_unattributed_records: 0,
         earliest_created_at_ms: Some(900),
         latest_created_at_ms: Some(901),
         source_key_hexes: BTreeMap::from([(

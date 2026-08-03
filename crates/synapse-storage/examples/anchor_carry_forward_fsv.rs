@@ -42,7 +42,7 @@
 //! | 7 | edge cases fail closed | the returned `StorageError`, driven directly |
 //!
 //! ```text
-//! cargo run -p synapse-storage --example anchor_carry_forward_fsv -- <vault-parent-dir>
+//! cargo run -p synapse-storage --example anchor_carry_forward_fsv -- <exact-vault-dir>
 //! ```
 //!
 //! Needs a **copy**: this writes.
@@ -150,10 +150,9 @@ fn drive_backfill(db: &Db, source_cf: &str) -> Result<BTreeMap<String, u64>, Box
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut f = Failures(Vec::new());
-    let Some(parent) = std::env::args().nth(1).map(PathBuf::from) else {
-        return Err("usage: anchor_carry_forward_fsv <vault-parent-dir>".into());
+    let Some(vault_dir) = std::env::args().nth(1).map(PathBuf::from) else {
+        return Err("usage: anchor_carry_forward_fsv <exact-vault-dir>".into());
     };
-    let vault_dir = parent.join("db-daemon");
     if !vault_dir.is_dir() {
         return Err(format!("{} is not a directory", vault_dir.display()).into());
     }
