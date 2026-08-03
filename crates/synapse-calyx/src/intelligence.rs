@@ -1766,12 +1766,18 @@ pub struct SynapseCalyxPanelLensCoverage {
 pub struct SynapseCalyxDegenerateLane {
     pub panel_version: u32,
     pub slot: u16,
-    /// Measured records on which this lane was present at all.
+    /// Measured records on which this lane was present at all. Zero for an
+    /// `ABSENT_BY_CORPUS` lane, which was never measured on any record.
     pub records_present: usize,
-    /// Distinct vector values observed. Degenerate exactly when this is 1.
+    /// Distinct vector values observed for `CONSTANT_BY_CORPUS` (degenerate
+    /// exactly when 1); the densified support width for
+    /// `SINGLE_SUPPORT_BY_CORPUS`; zero for `ABSENT_BY_CORPUS`.
     pub distinct_values: usize,
-    /// The single value every record projected to, when the lane is a scalar.
+    /// The single value every record projected to, when the lane is a scalar
+    /// and the cause is `CONSTANT_BY_CORPUS`.
     pub constant_scalar: Option<f32>,
+    /// `CALYX_LENS_CONSTANT_BY_CORPUS` | `CALYX_LENS_ABSENT_BY_CORPUS` |
+    /// `CALYX_LENS_SINGLE_SUPPORT_BY_CORPUS`.
     pub code: String,
     pub detail: String,
     pub remediation: String,
@@ -1785,8 +1791,12 @@ pub struct SynapseCalyxLensCoverageStatus {
     /// Panels carrying fewer than two lenses, or whose blind-spot fraction is
     /// above [`SYNAPSE_LENS_BLIND_SPOT_CEILING`].
     pub deficient_panels: Vec<u32>,
-    /// Every dense lane on every measured panel that is constant over its
-    /// corpus, flattened for a one-glance read (issue #1970).
+    /// Every lane on every measured panel that cannot rank over its corpus,
+    /// flattened for a one-glance read (issue #1970). Carries all three causes
+    /// — `CALYX_LENS_CONSTANT_BY_CORPUS`, `CALYX_LENS_ABSENT_BY_CORPUS` and
+    /// `CALYX_LENS_SINGLE_SUPPORT_BY_CORPUS` — in one list, because an operator
+    /// asking "which lenses are dead" should not have to know which of three
+    /// ways they died to find them.
     pub degenerate_lanes: Vec<SynapseCalyxDegenerateLane>,
     pub blind_spot_ceiling: f32,
     pub measured_at_unix_ms: Option<u64>,
@@ -1889,6 +1899,143 @@ const SYNAPSE_DEGENERATE_LANE_MIN_RECORDS: usize = 8;
 /// cannot rank either, and it should be reported rather than hidden by NaN's
 /// inequality with itself.
 fn degenerate_lanes(panel_version: u32, corpus: &DenseCorpus) -> Vec<SynapseCalyxDegenerateLane> {
+    let mut lanes = constant_by_corpus_lanes(panel_version, corpus);
+    let already: BTreeSet<u16> = lanes.iter().map(|lane| lane.slot).collect();
+    lanes.extend(absent_by_corpus_lanes(panel_version, corpus));
+    lanes.extend(single_support_lanes(panel_version, corpus, &already));
+    lanes.sort_by_key(|lane| lane.slot);
+    lanes
+}
+
+/// A lane the panel declares but which is `Absent` on **every** measured record.
+///
+/// This is the second way a lane cannot rank, and the one that #1970 was filed
+/// about — yet the constant-by-corpus detector added for #1970 structurally
+/// cannot see it. `optional_log1p_slot` and its siblings emit
+/// `absent(AbsentReason::NotApplicable)` when their input field is `None`, so a
+/// lens whose input the corpus never populates is never *measured*, never lands
+/// in `record.slots`, and therefore can never reach the constant detector's
+/// `records_present >= SYNAPSE_DEGENERATE_LANE_MIN_RECORDS` floor. It fails the
+/// FIRST clause, not the second.
+///
+/// Absent is deliberately not folded into the constant detector by treating it
+/// as a zero vector: `Absent` is an explicit absence and reading it as a zero
+/// direction is the #1894 defect. It is a distinct finding with a distinct
+/// remediation — no re-encoding can rescue a field that is not there, so the
+/// lens must be parked or rebuilt around what the corpus actually carries.
+///
+/// `panel_slots` already holds exactly this fact: the loader only leaves a slot
+/// marked `Absent` when no record in the scan carried a real vector for it.
+fn absent_by_corpus_lanes(
+    panel_version: u32,
+    corpus: &DenseCorpus,
+) -> Vec<SynapseCalyxDegenerateLane> {
+    let records_measured = corpus.records.len();
+    // The same floor the constant detector uses. A lane absent across three
+    // records is not evidence about the lens; across thousands it is.
+    if records_measured < SYNAPSE_DEGENERATE_LANE_MIN_RECORDS {
+        return Vec::new();
+    }
+    corpus
+        .panel_slots
+        .iter()
+        .filter(|(_, kind)| **kind == SynapseCalyxSlotKind::Absent)
+        .map(|(slot, _)| SynapseCalyxDegenerateLane {
+            panel_version,
+            slot: slot.get(),
+            records_present: 0,
+            distinct_values: 0,
+            constant_scalar: None,
+            code: "CALYX_LENS_ABSENT_BY_CORPUS".to_owned(),
+            detail: format!(
+                "slot {} is declared by panel {panel_version} but is explicitly Absent on all \
+                 {records_measured} measured record(s), so it was never measured at all. It \
+                 contributes no bits about any anchor and cannot rank. This is NOT the same as \
+                 being constant: there is no value here to re-encode, so no change to the \
+                 encoder can rescue it. Absent is an explicit absence and is never read as a \
+                 zero vector (#1894)",
+                slot.get()
+            ),
+            remediation: "measure the lens's input over its source CF: a field absent on every \
+                          row means the lens is pointed at data this corpus does not carry. \
+                          Either park it under the capability gate, or rebuild it around a field \
+                          the source CF actually populates"
+                .to_owned(),
+        })
+        .collect()
+}
+
+/// A sparse lane whose corpus-observed support is a single index.
+///
+/// This one is provable rather than heuristic. Densification maps the lane onto
+/// its observed support, so a support of 1 yields a **one-dimensional** vector
+/// per record, and the cosine between any two same-sign one-dimensional vectors
+/// is `ab / (|a| * |b|) = 1` exactly, whatever `a` and `b` are. So the lane's
+/// nearest-neighbour ordering is degenerate even when its *values* vary — which
+/// is precisely why the constant-by-corpus detector misses it: the values are
+/// not constant, only the direction is.
+///
+/// Reported only when it is **not** already reported as constant. A width-1
+/// lane whose values are all equal is both things at once, and constant is the
+/// stricter, more directly actionable statement ("the field does not vary"), so
+/// it wins. `syn.agent_event.provider_hash.v1` is that case on the live vault:
+/// width 1 AND one distinct value over the 231 records carrying it. This cause
+/// therefore fires only for the genuinely distinct case — a collapsed lane whose
+/// values still vary, which no other detector can see.
+///
+/// Carries the same `SYNAPSE_DEGENERATE_LANE_MIN_RECORDS` floor as the constant
+/// detector, and for the same reason. Without it this reported
+/// `syn-observation-v1` slot 67 as dead from a corpus of **one** record — where
+/// a support of 1 is arithmetically unavoidable and says nothing whatsoever
+/// about the lens. A degeneracy claim needs a corpus to be a claim about.
+fn single_support_lanes(
+    panel_version: u32,
+    corpus: &DenseCorpus,
+    already_reported: &BTreeSet<u16>,
+) -> Vec<SynapseCalyxDegenerateLane> {
+    corpus
+        .densified_sparse_slots
+        .iter()
+        .filter(|(slot, width)| **width <= 1 && !already_reported.contains(&slot.get()))
+        .filter_map(|(slot, width)| {
+            let records_present = corpus
+                .records
+                .iter()
+                .filter(|record| record.slots.contains_key(slot))
+                .count();
+            if records_present < SYNAPSE_DEGENERATE_LANE_MIN_RECORDS {
+                return None;
+            }
+            Some(SynapseCalyxDegenerateLane {
+                panel_version,
+                slot: slot.get(),
+                records_present,
+                distinct_values: *width,
+                constant_scalar: None,
+                code: "CALYX_LENS_SINGLE_SUPPORT_BY_CORPUS".to_owned(),
+                detail: format!(
+                    "sparse slot {} occupies exactly {width} distinct index(es) across the \
+                     {records_present} measured record(s) that carry it, so it densifies to a \
+                     {width}-dimensional vector. The cosine between any two same-sign \
+                     one-dimensional vectors is exactly 1.0 regardless of their magnitudes, so \
+                     this lane cannot order neighbours even though its values are not constant \
+                     — which is why the constant-by-corpus check does not fire on it",
+                    slot.get()
+                ),
+                remediation: "every record fell into one bucket of a lane meant to discriminate \
+                              between them. Check the source field is populated and that the \
+                              hashing/bucketing is not collapsing it, then either widen the lens \
+                              or park it under the capability gate"
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn constant_by_corpus_lanes(
+    panel_version: u32,
+    corpus: &DenseCorpus,
+) -> Vec<SynapseCalyxDegenerateLane> {
     let mut per_slot: BTreeMap<SlotId, (usize, BTreeSet<Vec<u32>>)> = BTreeMap::new();
     for record in &corpus.records {
         for (slot, vector) in &record.slots {
