@@ -1826,6 +1826,21 @@ pub struct SynapseCalyxDegenerateLane {
     /// exactly when 1); the densified support width for
     /// `SINGLE_SUPPORT_BY_CORPUS`; zero for `ABSENT_BY_CORPUS`.
     pub distinct_values: usize,
+    /// Rows in the panel population, including rows not hydrated by this pass.
+    pub population_records: usize,
+    /// True only when every population row was hydrated. A sampled finding must
+    /// never be presented as a whole-corpus fact.
+    pub census_complete: bool,
+    /// Most-common value count divided by second-most-common value count. None
+    /// when fewer than two values were observed.
+    pub frequency_ratio: Option<f64>,
+    /// `100 * distinct_values / records_present`.
+    pub percent_unique: f64,
+    /// False until a grounded, stratified assay proves that no rare critical
+    /// outcome depends on this lane. Distribution shape alone never authorizes
+    /// parking a lens (#1983).
+    pub lifecycle_action_allowed: bool,
+    pub stratified_override_status: String,
     /// The single value every record projected to, when the lane is a scalar
     /// and the cause is `CONSTANT_BY_CORPUS`.
     pub constant_scalar: Option<f32>,
@@ -1936,6 +1951,8 @@ pub struct SynapseCalyxRedundancyReport {
 /// being false, so the floor is set above it: below this the lane is simply not
 /// reported, never reported as fine.
 const SYNAPSE_DEGENERATE_LANE_MIN_RECORDS: usize = 8;
+const SYNAPSE_NEAR_ZERO_VARIANCE_FREQUENCY_RATIO: f64 = 19.0;
+const SYNAPSE_NEAR_ZERO_VARIANCE_PERCENT_UNIQUE: f64 = 10.0;
 
 /// Names every dense lane that took one value across the whole measured corpus
 /// (issue #1970).
@@ -1958,6 +1975,25 @@ fn degenerate_lanes(panel_version: u32, corpus: &DenseCorpus) -> Vec<SynapseCaly
     lanes.extend(single_support_lanes(panel_version, corpus, &already));
     lanes.sort_by_key(|lane| lane.slot);
     lanes
+}
+
+fn distribution_evidence(
+    counts: &BTreeMap<Vec<u32>, usize>,
+    records_present: usize,
+) -> (usize, Option<f64>, f64) {
+    let distinct = counts.len();
+    let mut frequencies: Vec<usize> = counts.values().copied().collect();
+    frequencies.sort_unstable_by(|left, right| right.cmp(left));
+    let frequency_ratio = frequencies
+        .get(1)
+        .filter(|second| **second > 0)
+        .map(|second| frequencies[0] as f64 / *second as f64);
+    let percent_unique = if records_present == 0 {
+        0.0
+    } else {
+        100.0 * distinct as f64 / records_present as f64
+    };
+    (distinct, frequency_ratio, percent_unique)
 }
 
 /// A lane the panel declares but which is `Absent` on **every** measured record.
@@ -1984,6 +2020,7 @@ fn absent_by_corpus_lanes(
     corpus: &DenseCorpus,
 ) -> Vec<SynapseCalyxDegenerateLane> {
     let records_measured = corpus.records.len();
+    let census_complete = records_measured == corpus.records_scanned;
     // The same floor the constant detector uses. A lane absent across three
     // records is not evidence about the lens; across thousands it is.
     if records_measured < SYNAPSE_DEGENERATE_LANE_MIN_RECORDS {
@@ -1998,22 +2035,33 @@ fn absent_by_corpus_lanes(
             slot: slot.get(),
             records_present: 0,
             distinct_values: 0,
+            population_records: corpus.records_scanned,
+            census_complete,
+            frequency_ratio: None,
+            percent_unique: 0.0,
+            lifecycle_action_allowed: false,
+            stratified_override_status: "GROUNDED_STRATIFIED_ASSAY_REQUIRED".to_owned(),
             constant_scalar: None,
-            code: "CALYX_LENS_ABSENT_BY_CORPUS".to_owned(),
+            code: if census_complete {
+                "CALYX_LENS_ABSENT_BY_CORPUS"
+            } else {
+                "CALYX_LENS_ABSENT_BY_SAMPLE"
+            }
+            .to_owned(),
             detail: format!(
                 "slot {} is declared by panel {panel_version} but is explicitly Absent on all \
-                 {records_measured} measured record(s), so it was never measured at all. It \
+                 {records_measured} measured record(s) from a population of {}. census_complete={census_complete}. It \
                  contributes no bits about any anchor and cannot rank. This is NOT the same as \
                  being constant: there is no value here to re-encode, so no change to the \
                  encoder can rescue it. Absent is an explicit absence and is never read as a \
                  zero vector (#1894)",
-                slot.get()
+                slot.get(), corpus.records_scanned
             ),
-            remediation: "measure the lens's input over its source CF: a field absent on every \
-                          row means the lens is pointed at data this corpus does not carry. \
-                          Either park it under the capability gate, or rebuild it around a field \
-                          the source CF actually populates"
-                .to_owned(),
+            remediation: if census_complete {
+                "measure the lens input over its source CF and run a grounded stratified assay before any lifecycle change; rebuild it around a populated field if the absence is confirmed"
+            } else {
+                "run a full census before changing lens lifecycle; zero observations in a bounded sample does not prove population absence"
+            }.to_owned(),
         })
         .collect()
 }
@@ -2064,8 +2112,18 @@ fn single_support_lanes(
                 slot: slot.get(),
                 records_present,
                 distinct_values: *width,
+                population_records: corpus.records_scanned,
+                census_complete: corpus.records.len() == corpus.records_scanned,
+                frequency_ratio: None,
+                percent_unique: 100.0 * *width as f64 / records_present as f64,
+                lifecycle_action_allowed: false,
+                stratified_override_status: "GROUNDED_STRATIFIED_ASSAY_REQUIRED".to_owned(),
                 constant_scalar: None,
-                code: "CALYX_LENS_SINGLE_SUPPORT_BY_CORPUS".to_owned(),
+                code: if corpus.records.len() == corpus.records_scanned {
+                    "CALYX_LENS_SINGLE_SUPPORT_BY_CORPUS"
+                } else {
+                    "CALYX_LENS_SINGLE_SUPPORT_BY_SAMPLE"
+                }.to_owned(),
                 detail: format!(
                     "sparse slot {} occupies exactly {width} distinct index(es) across the \
                      {records_present} measured record(s) that carry it, so it densifies to a \
@@ -2075,11 +2133,11 @@ fn single_support_lanes(
                      — which is why the constant-by-corpus check does not fire on it",
                     slot.get()
                 ),
-                remediation: "every record fell into one bucket of a lane meant to discriminate \
-                              between them. Check the source field is populated and that the \
-                              hashing/bucketing is not collapsing it, then either widen the lens \
-                              or park it under the capability gate"
-                    .to_owned(),
+                remediation: if corpus.records.len() == corpus.records_scanned {
+                    "every record fell into one bucket; inspect source population and hashing, then run a grounded stratified assay before any lifecycle change"
+                } else {
+                    "run a full census before changing lens lifecycle; one observed support bucket in a bounded sample does not prove population collapse"
+                }.to_owned(),
             })
         })
         .collect()
@@ -2089,7 +2147,7 @@ fn constant_by_corpus_lanes(
     panel_version: u32,
     corpus: &DenseCorpus,
 ) -> Vec<SynapseCalyxDegenerateLane> {
-    let mut per_slot: BTreeMap<SlotId, (usize, BTreeSet<Vec<u32>>)> = BTreeMap::new();
+    let mut per_slot: BTreeMap<SlotId, (usize, BTreeMap<Vec<u32>, usize>)> = BTreeMap::new();
     for record in &corpus.records {
         for (slot, vector) in &record.slots {
             let key: Vec<u32> = vector
@@ -2106,42 +2164,65 @@ fn constant_by_corpus_lanes(
                 .collect();
             let entry = per_slot
                 .entry(*slot)
-                .or_insert_with(|| (0, BTreeSet::new()));
+                .or_insert_with(|| (0, BTreeMap::new()));
             entry.0 += 1;
-            entry.1.insert(key);
+            *entry.1.entry(key).or_insert(0) += 1;
         }
     }
     per_slot
         .into_iter()
-        .filter(|(_, (records_present, distinct))| {
-            *records_present >= SYNAPSE_DEGENERATE_LANE_MIN_RECORDS && distinct.len() == 1
+        .filter(|(_, (records_present, counts))| {
+            if *records_present < SYNAPSE_DEGENERATE_LANE_MIN_RECORDS {
+                return false;
+            }
+            let (_, frequency_ratio, percent_unique) =
+                distribution_evidence(counts, *records_present);
+            counts.len() == 1
+                || (frequency_ratio.is_some_and(|ratio| {
+                    ratio > SYNAPSE_NEAR_ZERO_VARIANCE_FREQUENCY_RATIO
+                }) && percent_unique < SYNAPSE_NEAR_ZERO_VARIANCE_PERCENT_UNIQUE)
         })
-        .map(|(slot, (records_present, distinct))| {
-            let constant_scalar = distinct
-                .iter()
-                .next()
+        .map(|(slot, (records_present, counts))| {
+            let (distinct_values, frequency_ratio, percent_unique) =
+                distribution_evidence(&counts, records_present);
+            let census_complete = corpus.records.len() == corpus.records_scanned;
+            let exact_constant = distinct_values == 1;
+            let constant_scalar = exact_constant.then(|| counts.keys().next()).flatten()
                 .filter(|bits| bits.len() == 1)
                 .map(|bits| f32::from_bits(bits[0]));
             SynapseCalyxDegenerateLane {
                 panel_version,
                 slot: slot.get(),
                 records_present,
-                distinct_values: distinct.len(),
+                distinct_values,
+                population_records: corpus.records_scanned,
+                census_complete,
+                frequency_ratio,
+                percent_unique,
+                lifecycle_action_allowed: false,
+                stratified_override_status: "GROUNDED_STRATIFIED_ASSAY_REQUIRED".to_owned(),
                 constant_scalar,
-                code: "CALYX_LENS_CONSTANT_BY_CORPUS".to_owned(),
+                code: if exact_constant && census_complete {
+                    "CALYX_LENS_CONSTANT_BY_CORPUS"
+                } else if exact_constant {
+                    "CALYX_LENS_CONSTANT_BY_SAMPLE"
+                } else if census_complete {
+                    "CALYX_LENS_NEAR_ZERO_VARIANCE_BY_CORPUS"
+                } else {
+                    "CALYX_LENS_NEAR_ZERO_VARIANCE_BY_SAMPLE"
+                }.to_owned(),
                 detail: format!(
-                    "slot {} took one value across all {records_present} measured record(s) of \
-                     panel {panel_version} that carry it, so its nearest-neighbour cosine is \
-                     degenerate by construction on this corpus and it contributes no bits about \
-                     any anchor. The encoder may be perfectly graded — this is a statement about \
-                     the corpus, not the lens, and no admission gate can see it",
-                    slot.get()
+                    "slot {} distribution evidence over {records_present}/{} record(s) of panel \
+                     {panel_version}: distinct_values={distinct_values} frequency_ratio={frequency_ratio:?} \
+                     percent_unique={percent_unique:.6} census_complete={census_complete} \
+                     exact_constant={exact_constant}",
+                    slot.get(), corpus.records_scanned
                 ),
-                remediation:
-                    "measure the lens's input over its source CF (a field absent on every \
-                              row cannot be rescued by re-encoding), then either rebuild the lens \
-                              around what actually varies or park it under the capability gate"
-                        .to_owned(),
+                remediation: if census_complete {
+                    "measure the lens input over its source CF and run a grounded stratified assay before any lifecycle change; rebuild around what varies when collision or collapse is confirmed"
+                } else {
+                    "run a full census before changing lens lifecycle; an exact-constant bounded sample does not prove a constant population"
+                }.to_owned(),
             }
         })
         .collect()

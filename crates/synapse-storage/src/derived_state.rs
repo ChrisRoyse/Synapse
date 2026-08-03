@@ -346,26 +346,33 @@ pub(crate) fn run_derived_state_maintenance() {
                      to measure anything on them"
                 );
             }
-            // #1970: a lane that is constant over its corpus cannot rank, and no
-            // admission gate can see it — the encoder is graded, the *input* is
-            // never populated. Warned separately from a coverage deficiency
-            // because the remediation is different: coverage is fixed by
-            // backfilling rows, this is fixed by rebuilding or parking the lens.
+            // Distributional findings are separate from structural coverage.
+            // Each lane carries its own sample/census-qualified code; do not
+            // promote bounded evidence into a whole-corpus claim here (#1983).
             if !coverage.degenerate_lanes.is_empty() {
                 tracing::warn!(
-                    code = "STORAGE_DERIVED_STATE_LENS_CONSTANT_BY_CORPUS",
+                    code = "STORAGE_DERIVED_STATE_LENS_DISTRIBUTION_FINDING",
                     degenerate_lane_count = coverage.degenerate_lanes.len(),
                     detail = %coverage
                         .degenerate_lanes
                         .iter()
                         .map(|lane| format!(
-                            "panel {} slot {} constant across {} record(s)",
-                            lane.panel_version, lane.slot, lane.records_present
+                            "panel {} slot {} code={} observed={}/{} distinct={} frequency_ratio={:?} percent_unique={:.6} census_complete={} lifecycle_action_allowed={} stratified_override_status={}",
+                            lane.panel_version,
+                            lane.slot,
+                            lane.code,
+                            lane.records_present,
+                            lane.population_records,
+                            lane.distinct_values,
+                            lane.frequency_ratio,
+                            lane.percent_unique,
+                            lane.census_complete,
+                            lane.lifecycle_action_allowed,
+                            lane.stratified_override_status
                         ))
                         .collect::<Vec<_>>()
                         .join("; "),
-                    "one or more dense lanes took a single value across every measured record that \
-                     carries them, so they cannot rank and contribute no bits about any anchor"
+                    "one or more lanes require distribution review; sampled findings are provisional and never authorize a lifecycle change"
                 );
             }
             let mut guard = match DERIVED_STATE_LAST.lock() {

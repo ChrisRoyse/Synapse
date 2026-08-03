@@ -1141,7 +1141,7 @@ impl SynapseService {
             status: status.to_owned(),
             detail: Some(format!(
                 "panels_measured={} deficient_panels={:?} blind_spot_ceiling={} \
-                 sample_records_per_panel={} measured_at_unix_ms={:?}                  constant_by_corpus_lanes={:?} panels=[{}]",
+                 sample_records_per_panel={} measured_at_unix_ms={:?} distribution_findings={:?} panels=[{}]",
                 coverage.panels.len(),
                 coverage.deficient_panels,
                 coverage.blind_spot_ceiling,
