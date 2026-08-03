@@ -2874,6 +2874,42 @@ function Set-SynapseReleaseBuildCompilerEnvironment {
     }
 }
 
+function Get-SynapseReleaseBuildToolchainCrashRetryBudget {
+    # How many EXTRA release-build attempts setup makes after rustc physically
+    # crashes (#1975 ask 3).
+    #
+    # This is not a fallback and it is not a retry-until-green loop. It fires on
+    # exactly one classification -- SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED, a
+    # named tool that died on an NTSTATUS having emitted zero source diagnostics
+    # -- and on nothing else. A real compiler error, a link failure, a locked
+    # output, or a timeout is deterministic and is still fatal on the first
+    # attempt, because retrying any of those would be exactly the "cover a break
+    # with a rerun" failure this codebase refuses.
+    #
+    # It is bounded, and every crashed attempt still writes its own immutable
+    # diagnostics archive, so a retried deploy accrues MORE evidence than a
+    # human-retried one rather than less. If the budget is exhausted the deploy
+    # dies with the whole per-attempt history attached.
+    #
+    # Budget of 2 (3 attempts total). The observed crash rate is ~4 in 7
+    # (#1975), so at p(crash) = 0.57 three independent attempts leave a
+    # 0.57^3 = 18.6% chance of exhausting the budget -- high enough that the
+    # exhaustion path is a real path that must report properly, and low enough
+    # that most deploys land unattended. A retry re-runs only the final crate:
+    # the measured successful retry took 14m54s against a 1.5-2h cold build.
+    $default = 2
+    $raw = $env:SYNAPSE_SETUP_TOOLCHAIN_CRASH_RETRIES
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return [pscustomobject]@{ budget = $default; source = 'synapse_setup_default' }
+    }
+    $parsed = 0
+    if (-not [int]::TryParse($raw, [ref]$parsed) -or $parsed -lt 0 -or $parsed -gt 10) {
+        Die ("SYNAPSE_SETUP_TOOLCHAIN_CRASH_RETRY_BUDGET_INVALID value={0} remediation=SYNAPSE_SETUP_TOOLCHAIN_CRASH_RETRIES must be an integer in [0,10]; unset it to use the default of {1}" -f `
+            $raw, $default)
+    }
+    return [pscustomobject]@{ budget = $parsed; source = 'env_override' }
+}
+
 function Get-SynapseReleaseBuildFailureKind {
     param(
         [Parameter(Mandatory=$true)]$Diagnostics,
@@ -11598,19 +11634,36 @@ if (-not $SkipBuild) {
     # each new failure also writes an immutable per-attempt archive below.
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     Info "Build process tree is job-owned; log: $buildLog"
-    $buildMemoryBefore = Get-SynapseWindowsMemoryReadback
-    Info ("Release build memory before: read_succeeded={0} commit_charge_bytes={1} commit_limit_bytes={2} commit_percent={3} available_physical_bytes={4}" -f `
-        $buildMemoryBefore.read_succeeded,
-        $buildMemoryBefore.commit_charge_bytes,
-        $buildMemoryBefore.commit_limit_bytes,
-        $buildMemoryBefore.commit_percent,
-        $buildMemoryBefore.available_physical_bytes)
     $buildInvocationDiagnostics = $null
     $cargoBuildArgs = @('build','--release','-p','synapse-mcp')
     if (@($cudaBuildCapability.cargo_features).Count -gt 0) {
         $cargoBuildArgs += @('--features', ($cudaBuildCapability.cargo_features -join ','))
     }
     Info ("Cargo invocation: {0} {1} (CARGO_TARGET_DIR={2})" -f $cargo, ($cargoBuildArgs -join ' '), $env:CARGO_TARGET_DIR)
+
+    # Bounded retry on a PHYSICALLY CRASHED toolchain only (#1975 ask 3). Every
+    # other failure classification is still fatal on the first attempt. See
+    # Get-SynapseReleaseBuildToolchainCrashRetryBudget for why this is a gate
+    # rather than a fallback.
+    $crashRetryBudget = Get-SynapseReleaseBuildToolchainCrashRetryBudget
+    $maxBuildAttempts = 1 + $crashRetryBudget.budget
+    $buildAttempt = 0
+    $toolchainCrashHistory = @()
+    Info ("Release build toolchain-crash retry budget: {0} extra attempt(s) (max_attempts={1} source={2}); retries fire ONLY on SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED" -f `
+        $crashRetryBudget.budget, $maxBuildAttempts, $crashRetryBudget.source)
+
+    while ($true) {
+    $buildAttempt++
+    $buildInvocationDiagnostics = $null
+    $buildMemoryBefore = Get-SynapseWindowsMemoryReadback
+    Info ("Release build attempt {0} of {1} (max). Memory before: read_succeeded={2} commit_charge_bytes={3} commit_limit_bytes={4} commit_percent={5} available_physical_bytes={6}" -f `
+        $buildAttempt,
+        $maxBuildAttempts,
+        $buildMemoryBefore.read_succeeded,
+        $buildMemoryBefore.commit_charge_bytes,
+        $buildMemoryBefore.commit_limit_bytes,
+        $buildMemoryBefore.commit_percent,
+        $buildMemoryBefore.available_physical_bytes)
     $buildExit = Invoke-SynapseProcessInKillOnCloseJob `
         -FilePath $cargo `
         -ArgumentList $cargoBuildArgs `
@@ -11636,7 +11689,21 @@ if (-not $SkipBuild) {
         Die "SYNAPSE_RELEASE_BUILD_INVOCATION_DIAGNOSTICS_INVALID path=$buildInvocationPath remediation=inspect filesystem integrity and setup process-job serialization"
     }
     Info "Build invocation diagnostics: $buildInvocationPath"
-    if ($buildExit -ne 0) {
+    if ($buildExit -eq 0) {
+        # A build that only succeeded after a crash is NOT reported as a clean
+        # build. The crash history is stated on success too, so the #1975 rate
+        # keeps accruing instead of disappearing the moment a retry works.
+        if (@($toolchainCrashHistory).Count -gt 0) {
+            Warn ("Release build SUCCEEDED on attempt {0} of {1} after {2} toolchain crash(es): {3}. This is #1975; the crash is probabilistic on this host and each crashed attempt archived its own diagnostics." -f `
+                $buildAttempt,
+                $maxBuildAttempts,
+                @($toolchainCrashHistory).Count,
+                (($toolchainCrashHistory | ForEach-Object { "attempt $($_.attempt): $($_.tool) $($_.status) $($_.exit_code) -> $($_.diagnostics_archive)" }) -join ' | '))
+        }
+        break
+    }
+
+    # ---- failure path: classify, archive, then decide retry vs die ----
         $buildLogSignal = Get-SynapseBuildLogSignal -Path $buildLog
         $artifactReadback = Get-SynapseArtifactReadback -Path $built
         # Re-enumerate at failure time: a process can have started running out of
@@ -11721,7 +11788,70 @@ if (-not $SkipBuild) {
                 ($(if ($buildLogSignal.toolchain_crash_status) { $buildLogSignal.toolchain_crash_status } else { '<unnamed>' })),
                 ($(if ($buildLogSignal.toolchain_crash_exit_code) { $buildLogSignal.toolchain_crash_exit_code } else { '<unknown>' }))
         } else { 'false' }
-        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} toolchain_crash={24} output_locked={22} output_dir_live_images={23} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
+
+        # The ONLY retryable state, and it takes TWO independent facts, not one.
+        #
+        # (1) the classification is TOOLCHAIN_CRASHED -- a named build tool was
+        #     killed by the OS on an NTSTATUS; and
+        # (2) the log carries ZERO source diagnostics.
+        #
+        # (2) is not redundant. TOOLCHAIN_CRASHED is also reached when cargo
+        #     ITSELF dies on an access violation, and that branch fires whether
+        #     or not the log already carried real `error[E....]` diagnostics --
+        #     the classifier says so explicitly ("The log ALSO carries N
+        #     source-diagnostic line(s)"). Retrying that would spend the whole
+        #     budget re-proving a deterministic source error. The retry must mean
+        #     "there is provably nothing here for a human to repair", so it is
+        #     gated on the absence of diagnostics rather than on the crash alone.
+        $sourceDiagnosticCount = @($buildLogSignal.compiler_error_matches).Count
+        if ($failureKind.code -eq 'SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED' -and
+            $sourceDiagnosticCount -eq 0 -and
+            $buildAttempt -lt $maxBuildAttempts) {
+            $toolchainCrashHistory += [pscustomobject]@{
+                attempt = $buildAttempt
+                observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+                tool = $(if ($buildLogSignal.toolchain_crash_tool) { $buildLogSignal.toolchain_crash_tool } else { '<unnamed>' })
+                status = $(if ($buildLogSignal.toolchain_crash_status) { $buildLogSignal.toolchain_crash_status } else { '<unnamed>' })
+                exit_code = $(if ($buildLogSignal.toolchain_crash_exit_code) { $buildLogSignal.toolchain_crash_exit_code } else { '<unknown>' })
+                build_exit = $buildExit
+                source_diagnostic_count = @($buildLogSignal.compiler_error_matches).Count
+                diagnostics_archive = $buildDiagnosticsArchivePath
+                log_archive = $buildLogArchivePath
+                rust_min_stack = $releaseBuildCompilerEnvironment.rust_min_stack
+            }
+            Warn ("SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED_RETRYING attempt={0} of {1} tool={2} status={3} exit={4} source_diagnostics={5} rust_min_stack={6} diagnostics_archive={7} log_archive={8} reason=the toolchain crashed with zero source diagnostics, which no source change can repair; retrying the build. Every dependency is cached, so this attempt rebuilds only the final crate." -f `
+                $buildAttempt,
+                $maxBuildAttempts,
+                $toolchainCrashHistory[-1].tool,
+                $toolchainCrashHistory[-1].status,
+                $toolchainCrashHistory[-1].exit_code,
+                $toolchainCrashHistory[-1].source_diagnostic_count,
+                $toolchainCrashHistory[-1].rust_min_stack,
+                $buildDiagnosticsArchivePath,
+                $buildLogArchivePath)
+            continue
+        }
+
+        # Falling through with a crash classification means the budget is spent.
+        # Say so explicitly and attach every attempt, so "it crashed 3 times" is
+        # distinguishable from "it crashed once" without reading the log dir.
+        $crashHistoryText = if (@($toolchainCrashHistory).Count -gt 0) {
+            "attempts_crashed={0} history={1}" -f `
+                (@($toolchainCrashHistory).Count + 1),
+                (($toolchainCrashHistory | ForEach-Object { "#$($_.attempt) $($_.tool) $($_.status) $($_.exit_code) archive=$($_.diagnostics_archive)" }) -join ' | ')
+        } else { 'attempts_crashed=0' }
+        if ($failureKind.code -eq 'SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED' -and $sourceDiagnosticCount -gt 0) {
+            Warn ("SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASH_NOT_RETRIED source_diagnostics={0} reason=a build tool crashed, but the log also carries real source diagnostics. Those are deterministic and a retry cannot clear them, so the crash-retry budget was deliberately NOT spent. Repair the diagnostics first; if the crash then persists on a clean tree it is the #1975 fault and will be retried." -f `
+                $sourceDiagnosticCount)
+        }
+        elseif ($failureKind.code -eq 'SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED') {
+            Warn ("SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASH_RETRY_BUDGET_EXHAUSTED max_attempts={0} budget_source={1} rust_min_stack={2} {3} conclusion=the crash reproduced on every attempt, so it is NOT the probabilistic #1975 fault this budget exists for; treat it as deterministic and investigate the toolchain (release profile lto/codegen-units, rustc version) rather than rerunning." -f `
+                $maxBuildAttempts,
+                $crashRetryBudget.source,
+                $releaseBuildCompilerEnvironment.rust_min_stack,
+                $crashHistoryText)
+        }
+        Die ("{0} attempt={25} of {26} crash_history=[{27}] exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} toolchain_crash={24} output_locked={22} output_dir_live_images={23} job_owned_build_tools_after={10} unrelated_build_tools_after={11} artifact_exists={12} artifact_sha256={13} artifact_exclusive_open={14} diagnostics={15} diagnostics_archive={16} log={17} log_archive={18} wer_recent_dumps={19} remediation={20}`nTail:`n{21}" -f `
             $failureKind.code,
             $buildExit,
             $childPid,
@@ -11746,7 +11876,10 @@ if (-not $SkipBuild) {
             $buildLogSignal.tail_80,
             $outputLocked,
             $outputHolderText,
-            $toolchainCrash)
+            $toolchainCrash,
+            $buildAttempt,
+            $maxBuildAttempts,
+            $crashHistoryText)
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
