@@ -86,7 +86,8 @@ pub const SYN_EPISODE_PANEL_VERSION_PRE_1964: u32 = 1_904_002;
 /// The episode layout #1904 superseded.
 pub const SYN_EPISODE_PANEL_VERSION_PRE_1904: u32 = 1_664_002;
 pub const SYN_AGENT_EVENT_PANEL_NAME: &str = "syn-agent-event-v1";
-pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_665_001;
+pub const SYN_AGENT_EVENT_PANEL_VERSION: u32 = 1_983_001;
+pub const SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983: u32 = 1_665_001;
 pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 /// Current agent-transcript slot layout.
 ///
@@ -95,7 +96,8 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_NAME: &str = "syn-agent-transcript-v1";
 /// could see only 9.2% of the corpus, and added `AT_SLOT_TEXT_FULL_BM25` over
 /// the prose the record already carried but no lens had ever read. See the
 /// episode constant above for why a new lens is a new generation.
-pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_921_001;
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION: u32 = 1_983_002;
+pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1983: u32 = 1_921_001;
 /// The agent-transcript layout #1921 superseded — the one #1904 introduced.
 pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921: u32 = 1_904_003;
 /// The agent-transcript layout #1904 superseded.
@@ -282,6 +284,7 @@ const AE_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(31);
 const AE_SLOT_DOW_CYCLIC: SlotId = SlotId::new(32);
 const AE_SLOT_USAGE_TOTAL_LOG1P: SlotId = SlotId::new(33);
 const AE_SLOT_RECORD_VECTOR: SlotId = SlotId::new(34);
+const AE_SLOT_HAS_END_STATE: SlotId = SlotId::new(114);
 
 const AT_SLOT_ROLE_ONEHOT: SlotId = SlotId::new(35);
 const AT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(36);
@@ -559,6 +562,11 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_AGENT_EVENT_PANEL_NAME,
         first: 23,
         last: 34,
+    },
+    PanelSlotBlock {
+        panel: SYN_AGENT_EVENT_PANEL_NAME,
+        first: 114,
+        last: 114,
     },
     PanelSlotBlock {
         panel: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
@@ -1911,7 +1919,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (AE_SLOT_ERROR_ONEHOT, "syn.agent_event.error_onehot.v1"),
     (
         AE_SLOT_END_STATE_ONEHOT,
-        "syn.agent_event.end_state_onehot.v1",
+        "syn.agent_event.end_state_onehot.v2",
     ),
     (AE_SLOT_HOUR_CYCLIC, "syn.agent_event.hour_cyclic.v1"),
     (AE_SLOT_DOW_CYCLIC, "syn.agent_event.dow_cyclic.v1"),
@@ -1920,10 +1928,11 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         "syn.agent_event.usage_total_log1p.v1",
     ),
     (AE_SLOT_RECORD_VECTOR, "syn.agent_event.record_vector.v1"),
+    (AE_SLOT_HAS_END_STATE, "syn.agent_event.has_end_state.v1"),
     (AT_SLOT_ROLE_ONEHOT, "syn.agent_transcript.role_onehot.v1"),
     (
         AT_SLOT_STATUS_ONEHOT,
-        "syn.agent_transcript.status_onehot.v1",
+        "syn.agent_transcript.status_onehot.v2",
     ),
     (
         AT_SLOT_SOURCE_ONEHOT,
@@ -2429,7 +2438,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::Derived,
             outcome_bearing: false,
             source_ttl_managed: false,
-            superseded_versions: &[],
+            superseded_versions: &[SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983],
             backfill_source_cf: None,
         },
         PanelCatalogEntry {
@@ -2481,6 +2490,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: true,
             source_ttl_managed: false,
             superseded_versions: &[
+                SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1983,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1921,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904,
             ],
@@ -3383,6 +3393,9 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
         RegistryAlgorithmicEncoder::SynOneHot { buckets } => {
             format!("syn_one_hot:{buckets}")
         }
+        RegistryAlgorithmicEncoder::SynOneHotIndex { levels } => {
+            format!("syn_one_hot_index:{levels}")
+        }
         RegistryAlgorithmicEncoder::SynHash { dim } => format!("syn_hash:{dim}"),
         RegistryAlgorithmicEncoder::SynSparseText { dim } => {
             format!("syn_sparse_text:{dim}")
@@ -3476,11 +3489,11 @@ fn agent_transcript_panel_slots(
         )?,
         syn_content_slot(
             AT_SLOT_STATUS_ONEHOT,
-            "syn.agent_transcript.status_onehot.v1",
-            RegistryAlgorithmicLens::syn_one_hot(
-                "syn.agent_transcript.status_onehot.v1",
+            "syn.agent_transcript.status_onehot.v2",
+            RegistryAlgorithmicLens::syn_one_hot_index(
+                "syn.agent_transcript.status_onehot.v2",
                 Modality::Structured,
-                8,
+                2,
             ),
             panel_version,
             registry,
@@ -4116,7 +4129,6 @@ pub fn build_agent_event_constellation(
 ) -> StorageResult<Constellation> {
     let mut slots = BTreeMap::new();
     let operation_name = optional_gen_ai_operation_name(record.attributes.operation_name)?;
-    let end_state_name = optional_agent_end_state_name(record.end_state)?;
     slots.insert(
         AE_SLOT_KIND_ONEHOT,
         measure_text(
@@ -4185,11 +4197,23 @@ pub fn build_agent_event_constellation(
     );
     slots.insert(
         AE_SLOT_END_STATE_ONEHOT,
-        optional_onehot_slot(
+        optional_onehot_index_slot(
             SYN_AGENT_EVENT_PANEL_NAME,
-            "syn.agent_event.end_state_onehot.v1",
-            end_state_name.as_deref(),
-            8,
+            "syn.agent_event.end_state_onehot.v2",
+            record.end_state.map(agent_end_state_index),
+            3,
+        )?,
+    );
+    slots.insert(
+        AE_SLOT_HAS_END_STATE,
+        measure_number(
+            SYN_AGENT_EVENT_PANEL_NAME,
+            AlgorithmicLens::syn_one_hot_index(
+                "syn.agent_event.has_end_state.v1",
+                Modality::Structured,
+                2,
+            ),
+            u8::from(record.end_state.is_some()),
         )?,
     );
     let (hour, dow) = utc_hour_and_dow(record.ts_ns);
@@ -4282,12 +4306,12 @@ pub fn build_agent_transcript_constellation(
         AT_SLOT_STATUS_ONEHOT,
         measure_text(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            AlgorithmicLens::syn_one_hot(
-                "syn.agent_transcript.status_onehot.v1",
+            AlgorithmicLens::syn_one_hot_index(
+                "syn.agent_transcript.status_onehot.v2",
                 Modality::Structured,
-                8,
+                2,
             ),
-            &transcript_parse_status_name(record.status)?,
+            &transcript_parse_status_index(record.status).to_string(),
         )?,
     );
     slots.insert(
@@ -6476,6 +6500,24 @@ fn optional_onehot_slot(
     )
 }
 
+fn optional_onehot_index_slot(
+    panel_name: &'static str,
+    lens_name: &'static str,
+    value: Option<u32>,
+    levels: u32,
+) -> StorageResult<SlotVector> {
+    value.map_or_else(
+        || Ok(absent(AbsentReason::NotApplicable)),
+        |value| {
+            measure_number(
+                panel_name,
+                AlgorithmicLens::syn_one_hot_index(lens_name, Modality::Structured, levels),
+                value,
+            )
+        },
+    )
+}
+
 fn optional_log1p_slot(
     panel_name: &'static str,
     lens_name: &'static str,
@@ -6662,6 +6704,14 @@ fn agent_end_state_name(end_state: AgentEndState) -> StorageResult<String> {
     snake_case_name(end_state, "AgentEndState")
 }
 
+const fn agent_end_state_index(end_state: AgentEndState) -> u32 {
+    match end_state {
+        AgentEndState::Indeterminate => 0,
+        AgentEndState::Success => 1,
+        AgentEndState::Error => 2,
+    }
+}
+
 fn optional_agent_end_state_name(
     end_state: Option<AgentEndState>,
 ) -> StorageResult<Option<String>> {
@@ -6684,6 +6734,13 @@ fn transcript_source_name(source: TranscriptSource) -> StorageResult<String> {
 
 fn transcript_parse_status_name(status: TranscriptParseStatus) -> StorageResult<String> {
     snake_case_name(status, "TranscriptParseStatus")
+}
+
+const fn transcript_parse_status_index(status: TranscriptParseStatus) -> u32 {
+    match status {
+        TranscriptParseStatus::Parsed => 0,
+        TranscriptParseStatus::Invalid => 1,
+    }
 }
 
 fn transcript_role_name(role: TranscriptRole) -> StorageResult<String> {

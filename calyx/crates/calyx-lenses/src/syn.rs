@@ -116,6 +116,24 @@ pub(super) fn one_hot(bytes: &[u8], buckets: u32) -> Result<SlotVector> {
     dense(data)
 }
 
+pub(super) fn one_hot_index(bytes: &[u8], levels: u32) -> Result<SlotVector> {
+    ensure_positive("syn onehot index levels", levels)?;
+    let value = parse_number(bytes, "syn onehot index input")?;
+    if value.fract() != 0.0 || value < 0.0 || value >= f64::from(levels) {
+        return Err(numerical(format!(
+            "syn onehot index input {value} must be a whole category index in [0, {levels})"
+        )));
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "range and integrality checked above"
+    )]
+    let index = value as usize;
+    let mut data = vec![0.0_f32; levels as usize];
+    data[index] = 1.0;
+    dense(data)
+}
+
 pub(super) fn hash(bytes: &[u8], dim: u32) -> Result<SlotVector> {
     let dim = ensure_power_of_two("syn hash dim", dim)?;
     let digest = content_address([b"syn-hash-v1".as_slice(), bytes]);

@@ -180,6 +180,9 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
         ["syn_one_hot", buckets] | ["syn_onehot", buckets] => AlgorithmicEncoder::SynOneHot {
             buckets: parse_u32(buckets)?,
         },
+        ["syn_one_hot_index", levels] => AlgorithmicEncoder::SynOneHotIndex {
+            levels: parse_u32(levels)?,
+        },
         ["syn_hash"] => AlgorithmicEncoder::SynHash {
             dim: sparse_dim(spec.output)?,
         },

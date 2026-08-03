@@ -120,6 +120,8 @@ pub enum AlgorithmicEncoder {
     SynScalarRankArc { min_micros: i64, max_micros: i64 },
     /// Content-addressed categorical one-hot feature.
     SynOneHot { buckets: u32 },
+    /// Collision-free one-hot over a caller-declared ordinal category index.
+    SynOneHotIndex { levels: u32 },
     /// Signed feature hash in a power-of-two sparse space.
     SynHash { dim: u32 },
     /// Signed sparse text hash in a power-of-two sparse space.
@@ -193,6 +195,7 @@ impl AlgorithmicEncoder {
                 }
             }
             Self::SynOneHot { buckets } | Self::SynBin { buckets, .. } => buckets,
+            Self::SynOneHotIndex { levels } => levels,
             Self::AstStyle => 8,
             Self::SparseKeywords { dim }
             | Self::SparseKeywordsTf { dim }
@@ -314,6 +317,7 @@ impl AlgorithmicEncoder {
             // bucket, so a match here would be fabricated, not measured.
             | Self::OneHot { .. }
             | Self::SynOneHot { .. }
+            | Self::SynOneHotIndex { .. }
             // Numeric, temporal and derived-statistic encoders: a phrase is not
             // one of their inputs.
             | Self::Scalar
@@ -436,6 +440,9 @@ impl AlgorithmicEncoder {
                 // otherwise, so the image is `buckets` orthogonal directions.
                 Self::OneHot { buckets } | Self::SynOneHot { buckets } => {
                     DenseCosineGrading::Finite(if buckets == 0 { 1 } else { buckets })
+                }
+                Self::SynOneHotIndex { levels } => {
+                    DenseCosineGrading::Finite(if levels == 0 { 1 } else { levels })
                 }
                 Self::SynBin { buckets, .. } => {
                     DenseCosineGrading::Finite(if buckets == 0 { 1 } else { buckets })
@@ -683,6 +690,14 @@ impl AlgorithmicLens {
         Self::new(name, modality, AlgorithmicEncoder::SynOneHot { buckets })
     }
 
+    pub fn syn_one_hot_index(name: impl Into<String>, modality: Modality, levels: u32) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynOneHotIndex { levels },
+        )
+    }
+
     pub fn syn_hash(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::SynHash { dim })
     }
@@ -897,6 +912,9 @@ impl AlgorithmicLens {
                 max_micros,
             } => syn::scalar_rank_arc(&input.bytes, min_micros, max_micros)?,
             AlgorithmicEncoder::SynOneHot { buckets } => syn::one_hot(&input.bytes, buckets)?,
+            AlgorithmicEncoder::SynOneHotIndex { levels } => {
+                syn::one_hot_index(&input.bytes, levels)?
+            }
             AlgorithmicEncoder::SynHash { dim } => syn::hash(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseText { dim } => syn::sparse_text(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseTextTf { dim } => syn::sparse_text_tf(&input.bytes, dim)?,

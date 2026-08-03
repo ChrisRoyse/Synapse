@@ -219,6 +219,9 @@ pub fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEn
         ["syn_one_hot", buckets] | ["syn_onehot", buckets] => Some(AlgorithmicEncoder::SynOneHot {
             buckets: parse_u32(buckets)?,
         }),
+        ["syn_one_hot_index", levels] => Some(AlgorithmicEncoder::SynOneHotIndex {
+            levels: parse_u32(levels)?,
+        }),
         ["syn_hash"] => Some(AlgorithmicEncoder::SynHash {
             dim: sparse_dim(shape)?,
         }),

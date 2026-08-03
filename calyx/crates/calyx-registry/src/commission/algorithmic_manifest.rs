@@ -196,6 +196,10 @@ fn syn_output_shape(kind: &str, dim: u32) -> Result<Option<SlotShape>> {
             let buckets = parse_u32_value(kind, buckets)?;
             checked_dense(kind, dim, buckets)?
         }
+        ["syn_one_hot_index", levels] => {
+            let levels = parse_u32_value(kind, levels)?;
+            checked_dense(kind, dim, levels)?
+        }
         ["syn_hash"]
         | ["syn_sparse_text"]
         | ["syn_sparse_text_tf"]
@@ -276,6 +280,9 @@ fn syn_encoder_from_kind(kind: &str, shape: SlotShape) -> Result<Option<Algorith
         },
         ["syn_one_hot", buckets] | ["syn_onehot", buckets] => AlgorithmicEncoder::SynOneHot {
             buckets: parse_u32_value(kind, buckets)?,
+        },
+        ["syn_one_hot_index", levels] => AlgorithmicEncoder::SynOneHotIndex {
+            levels: parse_u32_value(kind, levels)?,
         },
         ["syn_hash"] => AlgorithmicEncoder::SynHash {
             dim: sparse_shape_dim(kind, shape)?,

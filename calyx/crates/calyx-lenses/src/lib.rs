@@ -15,40 +15,70 @@ pub mod measure;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlgorithmicEncoder {
     /// Periodic time value encoded as sin/cos over a frozen period.
-    SynCyclicTime { period: u32 },
+    SynCyclicTime {
+        period: u32,
+    },
     /// Strict numeric scalar pass-through.
     SynScalarRaw,
     /// Strict numeric log1p scalar.
     SynScalarLog1p,
     /// Frozen z-score scalar transform with micro-unit parameters.
-    SynScalarZScore { mean_micros: i64, std_micros: u64 },
+    SynScalarZScore {
+        mean_micros: i64,
+        std_micros: u64,
+    },
     /// Frozen bounded rank scalar transform with micro-unit bounds.
-    SynScalarRank { min_micros: i64, max_micros: i64 },
+    SynScalarRank {
+        min_micros: i64,
+        max_micros: i64,
+    },
     /// Frozen bounded rank scalar placed on a unit half-circle (#1963).
     ///
     /// The graded-cosine sibling of [`Self::SynScalarRank`], whose 1-D image
     /// makes cosine identically `+1`. See the registry crate's variant for the
     /// full derivation and the range-sizing rule.
-    SynScalarRankArc { min_micros: i64, max_micros: i64 },
+    SynScalarRankArc {
+        min_micros: i64,
+        max_micros: i64,
+    },
     /// Content-addressed categorical one-hot feature.
-    SynOneHot { buckets: u32 },
+    SynOneHot {
+        buckets: u32,
+    },
+    SynOneHotIndex {
+        levels: u32,
+    },
     /// Signed feature hash in a power-of-two sparse space.
-    SynHash { dim: u32 },
+    SynHash {
+        dim: u32,
+    },
     /// Signed sparse text hash in a power-of-two sparse space.
-    SynSparseText { dim: u32 },
+    SynSparseText {
+        dim: u32,
+    },
     /// Raw hashed term frequencies over free text: unsigned, unnormalized, and
     /// therefore the only Syn* text lane a real BM25 scorer can rank (#1900).
-    SynSparseTextTf { dim: u32 },
+    SynSparseTextTf {
+        dim: u32,
+    },
     /// Hashed text token slots for multi-vector retrieval.
-    SynTokenSlots { token_dim: u32 },
+    SynTokenSlots {
+        token_dim: u32,
+    },
     /// Signed multi-hot flag hash in a power-of-two sparse space.
-    SynMultiHot { dim: u32 },
+    SynMultiHot {
+        dim: u32,
+    },
     /// Unit-normalized structured numeric record vector.
-    SynRecordVector { dim: u32 },
+    SynRecordVector {
+        dim: u32,
+    },
     /// Unit-normalized structured numeric record vector that requires every
     /// field on a comparable scale in `[-1, 1]` and refuses anything else
     /// (#1964).
-    SynRecordVectorUnitFields { dim: u32 },
+    SynRecordVectorUnitFields {
+        dim: u32,
+    },
     /// Frozen numeric bin one-hot feature with micro-unit bounds.
     SynBin {
         buckets: u32,
@@ -56,9 +86,14 @@ pub enum AlgorithmicEncoder {
         max_micros: i64,
     },
     /// Frozen ordinal level encoded on [0, 1].
-    SynOrdinal { levels: u32 },
+    SynOrdinal {
+        levels: u32,
+    },
     /// Frozen frequency statistic.
-    SynFrequency { count: u64, total: u64 },
+    SynFrequency {
+        count: u64,
+        total: u64,
+    },
     /// Frozen held-out target mean statistic.
     SynTargetMean {
         mean_micros: i64,
@@ -66,21 +101,33 @@ pub enum AlgorithmicEncoder {
         outcome_hash: u32,
     },
     /// Frozen-scale delta transform.
-    SynDelta { scale_micros: u64 },
+    SynDelta {
+        scale_micros: u64,
+    },
     /// Frozen-scale rate transform.
-    SynRate { scale_micros: u64 },
+    SynRate {
+        scale_micros: u64,
+    },
     /// Signed pairwise crossed features in a power-of-two sparse space.
-    SynCross { dim: u32 },
+    SynCross {
+        dim: u32,
+    },
     /// Dense deterministic aggregation summary over structured numerics.
-    SynAggregation { dim: u32 },
+    SynAggregation {
+        dim: u32,
+    },
     /// Frozen dense graph-structural position signature (degree/betweenness/
     /// eigenvector/PageRank/clustering) over a fingerprinted graph snapshot.
     /// The `snapshot` fingerprint pins the lens id so a new snapshot yields a
     /// new frozen lens version rather than silent drift.
-    SynGraphSignature { snapshot: u64 },
+    SynGraphSignature {
+        snapshot: u64,
+    },
     /// Frozen dense path/hierarchy position signature (depth/sibling-rank/
     /// subtree/ancestor/path-length) over a fingerprinted hierarchy snapshot.
-    SynPathSignature { snapshot: u64 },
+    SynPathSignature {
+        snapshot: u64,
+    },
 }
 
 /// Fixed output dimension of the graph-structural and path-hierarchy signatures.
@@ -101,6 +148,7 @@ impl AlgorithmicEncoder {
             | Self::SynDelta { .. }
             | Self::SynRate { .. } => 1,
             Self::SynOneHot { buckets } | Self::SynBin { buckets, .. } => buckets,
+            Self::SynOneHotIndex { levels } => levels,
             Self::SynHash { dim }
             | Self::SynSparseText { dim }
             | Self::SynSparseTextTf { dim }
@@ -209,6 +257,14 @@ impl AlgorithmicLens {
 
     pub fn syn_one_hot(name: impl Into<String>, modality: Modality, buckets: u32) -> Self {
         Self::new(name, modality, AlgorithmicEncoder::SynOneHot { buckets })
+    }
+
+    pub fn syn_one_hot_index(name: impl Into<String>, modality: Modality, levels: u32) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynOneHotIndex { levels },
+        )
     }
 
     pub fn syn_hash(name: impl Into<String>, modality: Modality, dim: u32) -> Self {
@@ -372,6 +428,9 @@ impl AlgorithmicLens {
                 max_micros,
             } => syn::scalar_rank_arc(&input.bytes, min_micros, max_micros)?,
             AlgorithmicEncoder::SynOneHot { buckets } => syn::one_hot(&input.bytes, buckets)?,
+            AlgorithmicEncoder::SynOneHotIndex { levels } => {
+                syn::one_hot_index(&input.bytes, levels)?
+            }
             AlgorithmicEncoder::SynHash { dim } => syn::hash(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseText { dim } => syn::sparse_text(&input.bytes, dim)?,
             AlgorithmicEncoder::SynSparseTextTf { dim } => syn::sparse_text_tf(&input.bytes, dim)?,
