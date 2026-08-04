@@ -724,6 +724,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "calyx-oracle"
+version = "0.1.0"
+dependencies = [
+ "calyx-anneal",
+ "calyx-assay",
+ "calyx-aster",
+ "calyx-core",
+ "calyx-forge",
+ "calyx-ledger",
+ "calyx-lodestar",
+ "calyx-paths",
+ "calyx-ward",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "calyx-paths"
 version = "0.1.0"
 dependencies = [
@@ -5210,6 +5227,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "calyx-core",
+ "calyx-oracle",
  "calyx-registry",
  "chrono",
  "clap",
@@ -5221,6 +5239,7 @@ dependencies = [
  "image",
  "metrics",
  "notify",
+ "num-traits",
  "portable-pty",
  "regex",
  "reqwest 0.13.3",

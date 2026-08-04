@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, Local, TimeZone};
+use num_traits::ToPrimitive as _;
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1168,6 +1169,52 @@ pub struct RoutineInspectResponse {
     /// Armed auto-run state written by `routine_update action=arm|disarm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed: Option<ArmedRoutineRecord>,
+    /// Oracle prediction derived from the physical native recurrence series.
+    /// Present only for an explicitly confirmed, currently mined identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_occurrence: Option<RoutineNextOccurrence>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineNextOccurrenceStatus {
+    Predicted,
+    Insufficient,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineNextOccurrence {
+    pub source_of_truth: &'static str,
+    pub status: RoutineNextOccurrenceStatus,
+    pub recurrence_cx_id: String,
+    pub latest_seq: u64,
+    pub support: u64,
+    pub active_support: u64,
+    pub rolled_support: u64,
+    pub tz_offset_secs: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_at_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_low_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_high_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_mad_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_ceiling: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub periodic_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 /// Lifecycle operations accepted by `routine_update`.
@@ -1483,6 +1530,14 @@ pub fn inspect_routine(
     let tainted = taint.is_some();
     let automation = load_routine_automation_record(db, &params.routine_id)?;
     let armed = load_armed_routine_record(db, &params.routine_id)?;
+    let next_occurrence = if state.lifecycle == RoutineLifecycle::Confirmed {
+        record
+            .as_ref()
+            .map(|record| predict_routine_next_occurrence(db, record))
+            .transpose()?
+    } else {
+        None
+    };
     Ok(RoutineInspectResponse {
         routine_id: params.routine_id.clone(),
         mined: record.is_some(),
@@ -1493,7 +1548,98 @@ pub fn inspect_routine(
         taint,
         automation,
         armed,
+        next_occurrence,
     })
+}
+
+fn predict_routine_next_occurrence(
+    db: &Db,
+    record: &RoutineRecord,
+) -> Result<RoutineNextOccurrence, ErrorData> {
+    let readback = db
+        .read_recurrence_subject_series(RecurrenceSubjectKind::Routine, &record.routine_id)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "CALYX_ORACLE_STORAGE_READ_FAILURE: failed to read the physical routine recurrence series for {}: {error}; remediation: repair the recurrence projection and rerun routine_mine before prediction",
+                    record.routine_id
+                ),
+            )
+        })?;
+    let series = &readback.series.series;
+    let active_support = u64::try_from(series.occurrences.len()).unwrap_or(u64::MAX);
+    let support = series.frequency.max(active_support);
+    let rolled_support = support.saturating_sub(active_support);
+    let tz_offset_secs = Local::now().offset().local_minus_utc();
+    let confidence_ceiling = record.confidence.to_f32().filter(|value| {
+        value.is_finite() && (0.0..=1.0).contains(value)
+    }).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "CALYX_ORACLE_CONFIDENCE_CEILING_INVALID: routine {} persisted confidence {} cannot be represented as a finite f32 in [0,1]; remediation: repair the corrupt routine row and rerun routine_mine",
+                record.routine_id, record.confidence
+            ),
+        )
+    })?;
+    match calyx_oracle::predict_next_occurrence_from_series_with_tz_offset(
+        series,
+        confidence_ceiling,
+        tz_offset_secs,
+    ) {
+        Ok(prediction) => Ok(RoutineNextOccurrence {
+            source_of_truth: "Calyx native Recurrence CF series",
+            status: RoutineNextOccurrenceStatus::Predicted,
+            recurrence_cx_id: readback.cx_id,
+            latest_seq: readback.latest_seq,
+            support: u64::try_from(prediction.support).unwrap_or(u64::MAX),
+            active_support: u64::try_from(prediction.active_support).unwrap_or(u64::MAX),
+            rolled_support: prediction.rolled_support,
+            tz_offset_secs: prediction.tz_offset_secs,
+            predicted_at_secs: Some(prediction.t_hat.0),
+            interval_low_secs: Some(prediction.interval.low.0),
+            interval_high_secs: Some(prediction.interval.high.0),
+            cadence_secs: Some(prediction.cadence_secs),
+            cadence_mad_secs: Some(prediction.cadence_mad_secs),
+            confidence: Some(prediction.confidence),
+            confidence_ceiling: Some(prediction.confidence_ceiling),
+            periodic_confidence: Some(prediction.periodic_confidence),
+            refusal_code: None,
+            refusal: None,
+            remediation: None,
+        }),
+        Err(error) if error.code == calyx_oracle::CALYX_ORACLE_INSUFFICIENT => {
+            Ok(RoutineNextOccurrence {
+                source_of_truth: "Calyx native Recurrence CF series",
+                status: RoutineNextOccurrenceStatus::Insufficient,
+                recurrence_cx_id: readback.cx_id,
+                latest_seq: readback.latest_seq,
+                support,
+                active_support,
+                rolled_support,
+                tz_offset_secs,
+                predicted_at_secs: None,
+                interval_low_secs: None,
+                interval_high_secs: None,
+                cadence_secs: None,
+                cadence_mad_secs: None,
+                confidence: None,
+                confidence_ceiling: Some(confidence_ceiling),
+                periodic_confidence: None,
+                refusal_code: Some(error.code.to_owned()),
+                refusal: Some(error.message),
+                remediation: Some(error.remediation.to_owned()),
+            })
+        }
+        Err(error) => Err(mcp_error(
+            error.code,
+            format!(
+                "routine {} next-occurrence prediction failed: {}; remediation: {}",
+                record.routine_id, error.message, error.remediation
+            ),
+        )),
+    }
 }
 
 /// Default and maximum sample occurrences carried in a label export.

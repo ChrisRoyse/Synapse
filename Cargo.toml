@@ -49,6 +49,7 @@ calyx-ledger = { version = "0.1.0", path = "calyx/crates/calyx-ledger" }
 calyx-lenses = { version = "0.1.0", path = "calyx/crates/calyx-lenses" }
 calyx-lodestar = { version = "0.1.0", path = "calyx/crates/calyx-lodestar" }
 calyx-loom = { version = "0.1.0", path = "calyx/crates/calyx-loom" }
+calyx-oracle = { version = "0.1.0", path = "calyx/crates/calyx-oracle" }
 calyx-paths = { version = "0.1.0", path = "calyx/crates/calyx-paths" }
 calyx-registry = { version = "0.1.0", path = "calyx/crates/calyx-registry" }
 calyx-search = { version = "0.1.0", path = "calyx/crates/calyx-search" }
