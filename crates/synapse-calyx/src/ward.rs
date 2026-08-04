@@ -122,7 +122,7 @@ use std::collections::BTreeMap;
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
-    AnchorKind, AnchorValue, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine,
+    AnchorKind, AnchorValue, CalyxError, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine,
 };
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_registry::load_vault_panel_state;
@@ -133,7 +133,10 @@ use calyx_ward::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault};
+use crate::{
+    SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxPersistedNoveltyFinding, SynapseCalyxVault,
+    drift::reactive_novelty_key,
+};
 
 /// Guard CF key of the default calibrated profile.
 ///
@@ -847,22 +850,6 @@ impl SynapseCalyxVault {
                 "inspect the GuardVerdict serialization contract; no verdict is returned without durable provenance",
             )
         })?;
-        let ledger_ref = self
-            .vault
-            .append_ledger_entry(
-                EntryKind::Guard,
-                SubjectId::Cx(query_cx),
-                verdict_payload,
-                ActorId::Service("calyx-ward".to_owned()),
-            )
-            .map_err(|error| {
-                guard_error(
-                    "SYNAPSE_CALYX_GUARD_VERDICT_LEDGER_FAILED",
-                    format!("append Ward verdict to the physical Ledger CF: {error}"),
-                    "repair the vault Ledger append path and verify its hash chain before retrying; the verdict was not released",
-                )
-            })?;
-
         let per_slot: Vec<SynapseCalyxGuardSlotVerdict> = verdict
             .per_slot
             .iter()
@@ -877,6 +864,58 @@ impl SynapseCalyxVault {
                     .unwrap_or_default(),
             })
             .collect();
+        let novelty_action = verdict.action.as_ref().and_then(|action| match action {
+            NoveltyAction::NewRegion => Some("new_region"),
+            NoveltyAction::Quarantine => Some("quarantine"),
+            NoveltyAction::RejectClosed => None,
+        });
+        let failing_slots = per_slot
+            .iter()
+            .filter(|slot| !slot.pass)
+            .map(|slot| slot.slot)
+            .collect::<Vec<_>>();
+        let query_cx_string = query_cx.to_string();
+        let guard_id_string = verdict.guard_id.to_string();
+        let ledger_ref = self
+            .vault
+            .append_ledger_entry_with_rows(
+                EntryKind::Guard,
+                SubjectId::Cx(query_cx),
+                verdict_payload,
+                ActorId::Service("calyx-ward".to_owned()),
+                |ledger_ref| {
+                    let Some(action) = novelty_action else {
+                        return Ok(Vec::new());
+                    };
+                    let finding = SynapseCalyxPersistedNoveltyFinding {
+                        panel_version: params.panel_version,
+                        query_cx_id: query_cx_string.clone(),
+                        guard_id: guard_id_string.clone(),
+                        action: action.to_owned(),
+                        failing_slots: failing_slots.clone(),
+                        ledger_seq: ledger_ref.seq,
+                        ledger_hash: crate::hex_bytes(&ledger_ref.hash),
+                    };
+                    let key = reactive_novelty_key(&finding).map_err(|error| {
+                        CalyxError::ledger_group_commit_failed(format!(
+                            "build Ward novelty outbox key: {error}"
+                        ))
+                    })?;
+                    let value = serde_json::to_vec(&finding).map_err(|error| {
+                        CalyxError::ledger_group_commit_failed(format!(
+                            "encode Ward novelty outbox row: {error}"
+                        ))
+                    })?;
+                    Ok(vec![(ColumnFamily::Reactive, key, value)])
+                },
+            )
+            .map_err(|error| {
+                guard_error(
+                    "SYNAPSE_CALYX_GUARD_VERDICT_LEDGER_FAILED",
+                    format!("append Ward verdict to the physical Ledger CF: {error}"),
+                    "repair the vault Ledger append path and verify its hash chain before retrying; the verdict was not released",
+                )
+            })?;
 
         Ok(SynapseCalyxGuardVerifyReport {
             panel_version: params.panel_version,

@@ -664,6 +664,13 @@ pub trait StorageBackend: Send + Sync {
         &self,
         finding: &SynapseCalyxPersistedNoveltyFinding,
     ) -> StorageResult<SynapseCalyxPersistedNoveltyFinding>;
+    fn persisted_novelty_findings(
+        &self,
+        after_ledger_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<Vec<SynapseCalyxPersistedNoveltyFinding>>;
+    fn novelty_delivery_cursor(&self) -> StorageResult<u64>;
+    fn persist_novelty_delivery_cursor(&self, ledger_seq: u64) -> StorageResult<u64>;
     fn persisted_region_findings(
         &self,
         after_observed_seq: u64,
@@ -3514,6 +3521,65 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn persisted_novelty_findings(
+        &self,
+        after_ledger_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<Vec<SynapseCalyxPersistedNoveltyFinding>> {
+        self.with_vault(
+            "calyx_reactive",
+            "read persisted Ward novelty findings",
+            false,
+            |vault| {
+                vault
+                    .persisted_novelty_findings(after_ledger_seq, max_rows)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_reactive",
+                            "read persisted Ward novelty findings",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn novelty_delivery_cursor(&self) -> StorageResult<u64> {
+        self.with_vault(
+            "calyx_reactive",
+            "read durable Ward novelty delivery cursor",
+            false,
+            |vault| {
+                vault.novelty_delivery_cursor().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_reactive",
+                        "read durable Ward novelty delivery cursor",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn persist_novelty_delivery_cursor(&self, ledger_seq: u64) -> StorageResult<u64> {
+        self.with_vault(
+            "calyx_reactive",
+            "persist durable Ward novelty delivery cursor",
+            false,
+            |vault| {
+                vault
+                    .persist_novelty_delivery_cursor(ledger_seq)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_reactive",
+                            "persist durable Ward novelty delivery cursor",
+                            &source,
+                        )
+                    })
             },
         )
     }

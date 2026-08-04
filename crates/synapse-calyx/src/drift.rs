@@ -43,7 +43,7 @@ use calyx_assay::{
     DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,
     gaussian_mmd_with_config,
 };
-use calyx_aster::cf::ColumnFamily;
+use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{CxId, SlotId, SlotVector};
 use calyx_forge::{Backend, KnnMetric};
@@ -76,6 +76,7 @@ const REACTIVE_RECURRENCE_PREFIX: &[u8; 8] = b"RRECUR1\0";
 const REACTIVE_NOVELTY_PREFIX: &[u8; 8] = b"RNOVEL1\0";
 const REACTIVE_REGION_PREFIX: &[u8; 8] = b"RREGION1";
 const REACTIVE_REGION_DELIVERY_CURSOR_KEY: &[u8] = b"reactive_delivery\0region_event_bus_v1";
+const REACTIVE_NOVELTY_DELIVERY_CURSOR_KEY: &[u8] = b"reactive_delivery\0ward_novelty_v1";
 
 /// Durable recurrence event stored in `Reactive` before live publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +115,79 @@ pub struct SynapseCalyxPersistedRegionFinding {
 }
 
 impl SynapseCalyxVault {
+    pub fn novelty_delivery_cursor(&self) -> Result<u64, SynapseCalyxError> {
+        self.read_cf_latest(ColumnFamily::Registry, REACTIVE_NOVELTY_DELIVERY_CURSOR_KEY)?
+            .map_or(Ok(0), |bytes| {
+                serde_json::from_slice::<u64>(&bytes).map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_CURSOR_CORRUPT",
+                        format!("decode Ward novelty delivery cursor: {error}"),
+                        "preserve the vault and repair the named Registry cursor from delivered notification and escalation evidence",
+                    )
+                })
+            })
+    }
+
+    pub fn persist_novelty_delivery_cursor(
+        &self,
+        ledger_seq: u64,
+    ) -> Result<u64, SynapseCalyxError> {
+        let current = self.novelty_delivery_cursor()?;
+        if ledger_seq < current {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_CURSOR_REGRESSION",
+                format!(
+                    "Ward novelty delivery cursor cannot regress from {current} to {ledger_seq}"
+                ),
+                "retain the greater committed cursor and inspect relay ordering before retrying",
+            ));
+        }
+        self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            cf: ColumnFamily::Registry,
+            key: REACTIVE_NOVELTY_DELIVERY_CURSOR_KEY.to_vec(),
+            value: encode_json(&ledger_seq)?,
+        }])?;
+        self.flush()?;
+        let readback = self.novelty_delivery_cursor()?;
+        if readback != ledger_seq {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_CURSOR_READBACK_MISMATCH",
+                format!("wrote Ward novelty delivery cursor {ledger_seq}, read back {readback}"),
+                "stop relay, preserve the vault, and inspect the Registry commit before retrying",
+            ));
+        }
+        Ok(readback)
+    }
+
+    pub fn persisted_novelty_findings(
+        &self,
+        after_ledger_seq: u64,
+        max_rows: usize,
+    ) -> Result<Vec<SynapseCalyxPersistedNoveltyFinding>, SynapseCalyxError> {
+        let rows = self.scan_cf_range_page_latest(
+            ColumnFamily::Reactive,
+            &prefix_range(REACTIVE_NOVELTY_PREFIX),
+            None,
+            max_rows.max(1),
+        )?;
+        let mut findings = Vec::with_capacity(rows.rows.len());
+        for (key, value) in rows.rows {
+            let finding: SynapseCalyxPersistedNoveltyFinding = serde_json::from_slice(&value)
+                .map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                        format!("decode Reactive CF Ward novelty row {}: {error}", crate::hex_bytes(&key)),
+                        "preserve the vault and repair only the named corrupt derived row before replay",
+                    )
+                })?;
+            if finding.ledger_seq > after_ledger_seq {
+                findings.push(finding);
+            }
+        }
+        findings.sort_by_key(|finding| finding.ledger_seq);
+        Ok(findings)
+    }
+
     /// Reads the durable event-bus relay cursor for exact region findings.
     pub fn region_delivery_cursor(&self) -> Result<u64, SynapseCalyxError> {
         self.read_cf_latest(ColumnFamily::Registry, REACTIVE_REGION_DELIVERY_CURSOR_KEY)?
@@ -200,28 +274,27 @@ impl SynapseCalyxVault {
         after_observed_seq: u64,
         max_rows: usize,
     ) -> Result<Vec<SynapseCalyxPersistedRegionFinding>, SynapseCalyxError> {
-        let mut findings = Vec::new();
-        self.walk_cf_latest(ColumnFamily::Reactive, max_rows.max(1), |key, value| {
-            if !key.starts_with(REACTIVE_REGION_PREFIX) {
-                return Ok(crate::SynapseCalyxWalkStep::Continue);
-            }
-            if findings.len() >= max_rows.max(1) {
-                return Ok(crate::SynapseCalyxWalkStep::Stop);
-            }
+        let rows = self.scan_cf_range_page_latest(
+            ColumnFamily::Reactive,
+            &prefix_range(REACTIVE_REGION_PREFIX),
+            None,
+            max_rows.max(1),
+        )?;
+        let mut findings = Vec::with_capacity(rows.rows.len());
+        for (key, value) in rows.rows {
             let finding: SynapseCalyxPersistedRegionFinding =
-                serde_json::from_slice(value).map_err(|error| {
+                serde_json::from_slice(&value).map_err(|error| {
                 SynapseCalyxError::new(
                     "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
-                    format!("decode Reactive CF region row {}: {error}", crate::hex_bytes(key)),
+                    format!("decode Reactive CF region row {}: {error}", crate::hex_bytes(&key)),
                     "preserve the vault and repair or remove only the named corrupt derived row before replay",
                 )
                 })?;
             if finding.observed_seq <= after_observed_seq {
-                return Ok(crate::SynapseCalyxWalkStep::Continue);
+                continue;
             }
             findings.push(finding);
-            Ok(crate::SynapseCalyxWalkStep::Continue)
-        })?;
+        }
         Ok(findings)
     }
 
@@ -229,11 +302,7 @@ impl SynapseCalyxVault {
         &self,
         finding: &SynapseCalyxPersistedNoveltyFinding,
     ) -> Result<SynapseCalyxPersistedNoveltyFinding, SynapseCalyxError> {
-        let mut key = Vec::with_capacity(32);
-        key.extend_from_slice(REACTIVE_NOVELTY_PREFIX);
-        key.extend_from_slice(&finding.ledger_seq.to_be_bytes());
-        let query_cx_id = crate::parse_cx_id(&finding.query_cx_id)?;
-        key.extend_from_slice(query_cx_id.as_bytes());
+        let key = reactive_novelty_key(finding)?;
         self.write_cf_batch(vec![SynapseCalyxCfWrite {
             cf: ColumnFamily::Reactive,
             key: key.clone(),
@@ -296,6 +365,17 @@ impl SynapseCalyxVault {
             )
         })
     }
+}
+
+pub(crate) fn reactive_novelty_key(
+    finding: &SynapseCalyxPersistedNoveltyFinding,
+) -> Result<Vec<u8>, SynapseCalyxError> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(REACTIVE_NOVELTY_PREFIX);
+    key.extend_from_slice(&finding.ledger_seq.to_be_bytes());
+    let query_cx_id = crate::parse_cx_id(&finding.query_cx_id)?;
+    key.extend_from_slice(query_cx_id.as_bytes());
+    Ok(key)
 }
 
 fn reactive_recurrence_key(finding: &SynapseCalyxPersistedRecurrenceFinding) -> Vec<u8> {

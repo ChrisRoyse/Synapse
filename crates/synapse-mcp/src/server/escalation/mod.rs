@@ -7910,6 +7910,141 @@ fn note_transition_locked(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct GuardQuarantineEscalationReadback {
+    pub escalation_id: String,
+    pub approval_id: String,
+    pub anchor: String,
+}
+
+pub(crate) fn ensure_guard_quarantine_escalation(
+    db: &Db,
+    finding: &synapse_calyx::SynapseCalyxPersistedNoveltyFinding,
+) -> Result<GuardQuarantineEscalationReadback, ErrorData> {
+    if finding.action != "quarantine" {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "Ward escalation requires action=quarantine, got {:?}",
+                finding.action
+            ),
+        ));
+    }
+    let now_unix_ms = checked_unix_time_ms("Ward quarantine escalation")?;
+    let revisioned_policy = load_policy_revisioned(db)?;
+    let policy = &revisioned_policy.policy;
+    let severity = Severity::Critical;
+    let anchor = format!("ward:{}:{}", finding.guard_id, finding.query_cx_id);
+    let attention_state = "quarantine";
+    let escalation_id = format!("{ESCALATION_ID_PREFIX}{}", Uuid::now_v7().simple());
+    let approval_id = format!("apr1-{}", Uuid::now_v7().simple());
+    let ttl = policy.ttl_for(severity);
+    let tier1_eligible = !policy.webhooks.is_empty() && severity >= policy.min_tier1_severity;
+    let item = EscalationItem {
+        schema_version: SCHEMA_VERSION,
+        escalation_id,
+        approval_id,
+        anchor: anchor.clone(),
+        spawn_id: None,
+        session_id: None,
+        severity,
+        attention_state: attention_state.to_owned(),
+        reason_code: Some("ward_guard_quarantine".to_owned()),
+        context: EscalationContext {
+            action: "Ward quarantined an out-of-distribution record".to_owned(),
+            reason: format!(
+                "guard {} rejected record {} on slots {:?}",
+                finding.guard_id, finding.query_cx_id, finding.failing_slots
+            ),
+            reversible: false,
+            alternatives: vec![
+                "inspect the Ward verdict and matched exemplars".to_owned(),
+                "acknowledge only after the record identity is resolved".to_owned(),
+            ],
+            waiting_for: Some("operator quarantine review".to_owned()),
+            agent_detail_deep_link: format!("/calyx/guard/{}", finding.guard_id),
+            approval_deadline_unix_ms: now_unix_ms.saturating_add(ttl),
+            evidence: serde_json::to_value(finding).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("encode Ward quarantine evidence: {error}"),
+                )
+            })?,
+        },
+        status: EscalationStatus::Pending,
+        created_at_unix_ms: now_unix_ms,
+        updated_at_unix_ms: now_unix_ms,
+        expires_at_unix_ms: now_unix_ms.saturating_add(ttl),
+        tier0_fired: false,
+        tier0_delivery: Tier0ToastDelivery::NotRequested,
+        tier0_payload_sha256: None,
+        tier0_prepared_payload: None,
+        tier0_toast_removed: None,
+        tier0_quiet_digest: false,
+        tier0_suppressed_reason: None,
+        tier1_quiet_suppressed: false,
+        tier1_suppressed_reason: None,
+        approval_suppressed_reason: None,
+        tier1_eligible,
+        webhook_channel_ids: policy
+            .webhooks
+            .iter()
+            .map(|channel| channel.channel_id.clone())
+            .collect(),
+        ladder_index: 0,
+        next_escalate_at_unix_ms: tier1_eligible.then_some(now_unix_ms),
+        channel_attempts: Vec::new(),
+        acked_at_unix_ms: None,
+        acked_via: None,
+        closed_reason: None,
+    };
+    for attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
+        let prior_index = read_open_index(db, &anchor, attention_state)?;
+        if let Some(index) = &prior_index
+            && index.record.is_open
+        {
+            let winner = indexed_open_item(db, index)?;
+            return Ok(GuardQuarantineEscalationReadback {
+                escalation_id: winner.escalation_id,
+                approval_id: winner.approval_id,
+                anchor: winner.anchor,
+            });
+        }
+        let expected_index_revision = prior_index.as_ref().map(|index| index.revision_sha256);
+        let mut extra_rows = approval_rows_for_opened_escalation(&item, now_unix_ms)?;
+        extra_rows.extend(open_index_row(&item, true, expected_index_revision)?);
+        match create_item_and_audit_with_extra_rows(
+            db,
+            &item,
+            "opened",
+            json!({
+                "source": "ward_guard_quarantine",
+                "ledger_seq": finding.ledger_seq,
+                "ledger_hash": finding.ledger_hash,
+                "approval_id": item.approval_id,
+                "attempt": attempt,
+            }),
+            extra_rows,
+        )? {
+            ItemWriteOutcome::Applied { .. } => {
+                wake_worker();
+                return Ok(GuardQuarantineEscalationReadback {
+                    escalation_id: item.escalation_id,
+                    approval_id: item.approval_id,
+                    anchor: item.anchor,
+                });
+            }
+            ItemWriteOutcome::Conflict { .. } => {}
+        }
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "Ward quarantine escalation for anchor {anchor:?} could not acquire a stable item/index revision after {ACK_REVISION_MAX_ATTEMPTS} attempts"
+        ),
+    ))
+}
+
 fn open_escalation(
     db: &Db,
     transition: &StateTransition,

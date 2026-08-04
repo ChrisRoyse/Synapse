@@ -914,6 +914,54 @@ impl M3State {
                 dropped: report.dropped,
             })
         });
+        let novelty_event_bus = self.sse_state.event_bus();
+        let novelty_db = Arc::clone(&db);
+        synapse_storage::derived_state::register_novelty_delivery_sink(move |finding| {
+            let quarantine_escalated = if finding.action == "quarantine" {
+                let readback = crate::server::escalation::ensure_guard_quarantine_escalation(
+                    &novelty_db,
+                    finding,
+                )
+                .map_err(|error| {
+                    format!(
+                        "persist Ward quarantine escalation for ledger_seq={}: {error:?}; remediation=inspect CF_KV escalation/audit/open-index rows and rerun maintenance",
+                        finding.ledger_seq
+                    )
+                })?;
+                tracing::info!(
+                    code = "WARD_QUARANTINE_ESCALATED",
+                    ledger_seq = finding.ledger_seq,
+                    escalation_id = %readback.escalation_id,
+                    approval_id = %readback.approval_id,
+                    anchor = %readback.anchor,
+                    "Ward quarantine is present in the durable escalation source of truth"
+                );
+                true
+            } else {
+                false
+            };
+            let data = serde_json::to_value(finding).map_err(|error| {
+                format!(
+                    "serialize committed Ward novelty finding for delivery: {error}; remediation=inspect the typed finding and preserve its Reactive row"
+                )
+            })?;
+            let report = novelty_event_bus.publish(synapse_core::types::Event {
+                seq: finding.ledger_seq,
+                at: chrono::Utc::now(),
+                source: synapse_core::types::EventSource::System,
+                kind: format!("calyx.reactive.{}", finding.action),
+                data,
+                correlations: Vec::new(),
+            });
+            Ok(synapse_storage::derived_state::NoveltyDeliveryReadback {
+                notification: synapse_storage::derived_state::ReactiveDeliveryReadback {
+                    matched: report.matched as u64,
+                    queued: report.queued as u64,
+                    dropped: report.dropped,
+                },
+                quarantine_escalated,
+            })
+        });
         self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample

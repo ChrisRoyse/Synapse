@@ -497,9 +497,44 @@ where
         payload: Vec<u8>,
         actor: ActorId,
     ) -> Result<LedgerRef> {
+        self.append_ledger_entry_with_rows(kind, subject, payload, actor, |_ledger_ref| {
+            Ok(Vec::new())
+        })
+    }
+
+    /// Appends a provenance entry and caller-owned rows in one durable commit.
+    /// The builder receives the staged ledger reference while the durable
+    /// commit lock is held, so an outbox row can carry the exact sequence/hash
+    /// without a second-write crash gap.
+    pub fn append_ledger_entry_with_rows<F>(
+        &self,
+        kind: EntryKind,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+        build_rows: F,
+    ) -> Result<LedgerRef>
+    where
+        F: FnOnce(LedgerRef) -> Result<Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>>,
+    {
         self.with_durable_commit_lock(|| {
             let Some(hook) = &self.ledger_hook else {
-                return self.append_ledger_entry_without_hook(kind, subject, payload, actor);
+                let store = AsterRawLedgerStore { vault: self };
+                let appender = LedgerAppender::open(store, SystemClock)?;
+                let prepared = appender.prepare(kind, subject, payload, actor)?;
+                let ledger_ref = prepared.ledger_ref();
+                let mut rows = vec![encode::WriteRow {
+                    cf: ColumnFamily::Ledger,
+                    key: ledger_key(prepared.seq()),
+                    value: prepared.bytes().to_vec(),
+                }];
+                rows.extend(
+                    build_rows(ledger_ref.clone())?
+                        .into_iter()
+                        .map(|(cf, key, value)| encode::WriteRow { cf, key, value }),
+                );
+                self.commit_rows_locked(&rows)?;
+                return Ok(ledger_ref);
             };
             let guard = ledger_hook::lock_hook(hook)?;
             let staged = guard.stage_with_checkpoints(kind, subject, payload, actor)?;
@@ -507,7 +542,7 @@ where
                 .first()
                 .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))?
                 .ledger_ref();
-            let rows = staged
+            let mut rows = staged
                 .iter()
                 .map(|row| encode::WriteRow {
                     cf: ColumnFamily::Ledger,
@@ -515,6 +550,11 @@ where
                     value: row.value().to_vec(),
                 })
                 .collect::<Vec<_>>();
+            rows.extend(
+                build_rows(ledger_ref.clone())?
+                    .into_iter()
+                    .map(|(cf, key, value)| encode::WriteRow { cf, key, value }),
+            );
             self.commit_rows_locked(&rows)?;
             self.commit_persistent_ledger_staged_locked(guard, &staged, "append_ledger_entry")?;
             Ok(ledger_ref)
@@ -545,26 +585,6 @@ where
             ActorId::Service("calyx-reproduce".to_string()),
         )?;
         Ok(result)
-    }
-
-    fn append_ledger_entry_without_hook(
-        &self,
-        kind: EntryKind,
-        subject: SubjectId,
-        payload: Vec<u8>,
-        actor: ActorId,
-    ) -> Result<LedgerRef> {
-        let store = AsterRawLedgerStore { vault: self };
-        let appender = LedgerAppender::open(store, SystemClock)?;
-        let prepared = appender.prepare(kind, subject, payload, actor)?;
-        let ledger_ref = prepared.ledger_ref();
-        let rows = [encode::WriteRow {
-            cf: ColumnFamily::Ledger,
-            key: ledger_key(prepared.seq()),
-            value: prepared.bytes().to_vec(),
-        }];
-        self.commit_rows_locked(&rows)?;
-        Ok(ledger_ref)
     }
 
     /// Decodes and admits one already-framed Ledger row against the exact

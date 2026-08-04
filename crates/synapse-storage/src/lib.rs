@@ -963,6 +963,23 @@ impl Db {
         self.backend.persist_novelty_finding(finding)
     }
 
+    pub fn persisted_novelty_findings(
+        &self,
+        after_ledger_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<Vec<synapse_calyx::SynapseCalyxPersistedNoveltyFinding>> {
+        self.backend
+            .persisted_novelty_findings(after_ledger_seq, max_rows)
+    }
+
+    pub fn novelty_delivery_cursor(&self) -> StorageResult<u64> {
+        self.backend.novelty_delivery_cursor()
+    }
+
+    pub fn persist_novelty_delivery_cursor(&self, ledger_seq: u64) -> StorageResult<u64> {
+        self.backend.persist_novelty_delivery_cursor(ledger_seq)
+    }
+
     /// Reads a bounded set of typed exact-identity new-region outbox rows.
     pub fn persisted_region_findings(
         &self,

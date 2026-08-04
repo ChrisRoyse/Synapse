@@ -38,7 +38,8 @@ use std::sync::{
 use synapse_calyx::{
     SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS, SEARCH_GENERATION_REFRESH_DELTA_KEYS,
     SynapseCalyxLensCoverageStatus, SynapseCalyxPersistedDriftFinding,
-    SynapseCalyxPersistedRegionFinding, SynapseCalyxSearchGenerationStatus, hot_context,
+    SynapseCalyxPersistedNoveltyFinding, SynapseCalyxPersistedRegionFinding,
+    SynapseCalyxSearchGenerationStatus, hot_context,
 };
 
 use crate::Db;
@@ -129,12 +130,23 @@ type RegionDeliverySink = dyn Fn(&SynapseCalyxPersistedRegionFinding) -> Result<
     + Sync;
 static REGION_DELIVERY_SINK: LazyLock<Mutex<Option<Arc<RegionDeliverySink>>>> =
     LazyLock::new(|| Mutex::new(None));
+type NoveltyDeliverySink = dyn Fn(&SynapseCalyxPersistedNoveltyFinding) -> Result<NoveltyDeliveryReadback, String>
+    + Send
+    + Sync;
+static NOVELTY_DELIVERY_SINK: LazyLock<Mutex<Option<Arc<NoveltyDeliverySink>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReactiveDeliveryReadback {
     pub matched: u64,
     pub queued: u64,
     pub dropped: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoveltyDeliveryReadback {
+    pub notification: ReactiveDeliveryReadback,
+    pub quarantine_escalated: bool,
 }
 
 static DERIVED_STATE_LAST: LazyLock<Mutex<DerivedStateReadback>> =
@@ -208,6 +220,12 @@ pub struct DerivedStateReadback {
     pub last_region_notifications_queued: u64,
     pub last_region_notifications_dropped: u64,
     pub last_region_delivery_watermark: u64,
+    pub last_novelty_rows_read: u64,
+    pub last_novelty_notifications_matched: u64,
+    pub last_novelty_notifications_queued: u64,
+    pub last_novelty_notifications_dropped: u64,
+    pub last_novelty_delivery_watermark: u64,
+    pub last_novelty_quarantines_escalated: u64,
     /// Last scheduled per-panel kernel outcome, including the physical Kernel
     /// CF row count returned after persistence.
     pub last_kernel_actions: BTreeMap<u32, String>,
@@ -292,6 +310,20 @@ where
 {
     let sink: Arc<RegionDeliverySink> = Arc::new(sink);
     match REGION_DELIVERY_SINK.lock() {
+        Ok(mut guard) => *guard = Some(sink),
+        Err(poisoned) => *poisoned.into_inner() = Some(sink),
+    }
+}
+
+pub fn register_novelty_delivery_sink<F>(sink: F)
+where
+    F: Fn(&SynapseCalyxPersistedNoveltyFinding) -> Result<NoveltyDeliveryReadback, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    let sink: Arc<NoveltyDeliverySink> = Arc::new(sink);
+    match NOVELTY_DELIVERY_SINK.lock() {
         Ok(mut guard) => *guard = Some(sink),
         Err(poisoned) => *poisoned.into_inner() = Some(sink),
     }
@@ -666,6 +698,10 @@ pub(crate) fn run_derived_state_maintenance() {
         any_failed = true;
         record_failure("STORAGE_DERIVED_STATE_REACTIVE_REGION_FAILED", error);
     }
+    if let Err(error) = drive_novelty_relay(&db) {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_WARD_NOVELTY_FAILED", error);
+    }
 
     if let Err(error) = drive_scheduled_kernels(&db) {
         any_failed = true;
@@ -1024,6 +1060,82 @@ fn drive_region_relay(db: &Arc<Db>) -> Result<(), String> {
         "persisted exact-identity new-region findings were relayed in durable sequence order"
     );
     Ok(())
+}
+
+fn drive_novelty_relay(db: &Arc<Db>) -> Result<(), String> {
+    const MAX_DELIVERIES_PER_TICK: usize = 256;
+    let after = db
+        .novelty_delivery_cursor()
+        .map_err(|error| format!("read durable Ward novelty delivery cursor: {error}"))?;
+    let findings = db
+        .persisted_novelty_findings(after, MAX_DELIVERIES_PER_TICK)
+        .map_err(|error| format!("read persisted Ward novelty rows after {after}: {error}"))?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let sink = match NOVELTY_DELIVERY_SINK.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+    .ok_or_else(|| {
+        format!(
+            "{} persisted Ward novelty row(s) await delivery after ledger seq {after}, but no daemon novelty sink is registered; remediation=repair startup registration and rerun maintenance",
+            findings.len()
+        )
+    })?;
+    let mut aggregate = ReactiveDeliveryReadback::default();
+    let mut escalated = 0_u64;
+    let mut watermark = after;
+    for finding in &findings {
+        let readback = sink(finding)?;
+        aggregate.matched = aggregate
+            .matched
+            .saturating_add(readback.notification.matched);
+        aggregate.queued = aggregate
+            .queued
+            .saturating_add(readback.notification.queued);
+        aggregate.dropped = aggregate
+            .dropped
+            .saturating_add(readback.notification.dropped);
+        if readback.notification.dropped > 0 {
+            return Err(format!(
+                "Ward novelty delivery at ledger_seq={} dropped {} item(s); watermark remains at {watermark}; remediation=consume or recreate the saturated subscription and rerun maintenance",
+                finding.ledger_seq, readback.notification.dropped
+            ));
+        }
+        if finding.action == "quarantine" && !readback.quarantine_escalated {
+            return Err(format!(
+                "Ward quarantine at ledger_seq={} was not durably escalated; watermark remains at {watermark}; remediation=repair escalation persistence and rerun maintenance",
+                finding.ledger_seq
+            ));
+        }
+        if readback.notification.matched == 0 {
+            break;
+        }
+        escalated = escalated.saturating_add(u64::from(readback.quarantine_escalated));
+        watermark = db
+            .persist_novelty_delivery_cursor(finding.ledger_seq)
+            .map_err(|error| format!("persist durable Ward novelty delivery cursor: {error}"))?;
+    }
+    let mut state = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.last_novelty_rows_read = findings.len() as u64;
+    state.last_novelty_notifications_matched = aggregate.matched;
+    state.last_novelty_notifications_queued = aggregate.queued;
+    state.last_novelty_notifications_dropped = aggregate.dropped;
+    state.last_novelty_delivery_watermark = watermark;
+    state.last_novelty_quarantines_escalated = escalated;
+    Ok(())
+}
+
+/// Runs only the Ward novelty outbox relay and returns its physical-delivery
+/// counters. This is used by the synchronous guard facade so its response does
+/// not race the background maintenance interval.
+pub fn run_novelty_relay_once(db: &Arc<Db>) -> Result<DerivedStateReadback, String> {
+    drive_novelty_relay(db)?;
+    Ok(derived_state_readback())
 }
 
 /// Where the last backfill page stopped, so the next tick resumes instead of
