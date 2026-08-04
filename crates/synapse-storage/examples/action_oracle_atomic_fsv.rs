@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &oversized_record,
         event_time_ns + 1,
         oversized_key,
-        &vec![b'x'; 257],
+        &vec![b'x'; 513],
     );
     println!(
         "OVERSIZED error_code={} after_latest_seq={} source_present={}",

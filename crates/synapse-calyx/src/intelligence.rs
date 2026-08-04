@@ -1424,6 +1424,9 @@ const ASSAY_CORPUS_SHARD: &str = "synapse-intelligence";
 #[derive(Clone, Debug)]
 pub struct SynapseCalyxAssayParams {
     pub panel_version: u32,
+    /// Exact persisted Assay scope. Oracle consumers use their domain id;
+    /// general intelligence reports use `synapse-intelligence`.
+    pub corpus_shard: String,
     /// Grounded outcome anchor to measure bits about. Synapse writes outcome
     /// anchors as `AnchorKind::Label(<name>)`; a few canonical names map to the
     /// native kinds.
@@ -1469,6 +1472,7 @@ impl SynapseCalyxAssayParams {
     pub fn new(panel_version: u32, anchor_kind: String) -> Self {
         Self {
             panel_version,
+            corpus_shard: ASSAY_CORPUS_SHARD.to_owned(),
             anchor_kind,
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             ksg_k: SYNAPSE_KSG_DEFAULT_K,
@@ -1490,6 +1494,12 @@ impl SynapseCalyxAssayParams {
     #[must_use]
     pub fn with_lens_names(mut self, lens_names: BTreeMap<u16, String>) -> Self {
         self.lens_names = lens_names;
+        self
+    }
+
+    #[must_use]
+    pub fn with_corpus_shard(mut self, corpus_shard: String) -> Self {
+        self.corpus_shard = corpus_shard;
         self
     }
 
@@ -1774,6 +1784,8 @@ pub struct SynapseCalyxSufficiencyReport {
     pub panel_floor_applied: bool,
     /// Slots excluded from the attribution because they could not be measured.
     pub unmeasured_slots: usize,
+    /// Exact physical slots represented by persisted per-lens Assay rows.
+    pub measured_slots: Vec<SlotId>,
     pub anchor_entropy_bits: f32,
     /// `false` whenever [`Self::anchor_leakage`] is non-empty, regardless of
     /// the bits: a panel that contains its own label has not been shown to
@@ -2404,7 +2416,7 @@ impl SynapseCalyxVault {
             store.put(
                 AssayCacheKey::scoped(
                     params.panel_version,
-                    ASSAY_CORPUS_SHARD,
+                    &params.corpus_shard,
                     vault_id,
                     anchor_kind.clone(),
                 ),
@@ -2680,7 +2692,7 @@ impl SynapseCalyxVault {
         let seq = self.latest_seq();
         let cache_key = AssayCacheKey::scoped(
             params.panel_version,
-            ASSAY_CORPUS_SHARD,
+            &params.corpus_shard,
             vault_id,
             anchor_kind,
         );
@@ -2781,6 +2793,7 @@ impl SynapseCalyxVault {
                 panel_measured,
                 panel_floor_applied,
                 unmeasured_slots,
+                measured_slots: usable_slots.iter().copied().collect(),
                 anchor_entropy_bits,
                 sufficient: panel_measured && sufficiency.sufficient && anchor_leakage.is_empty(),
                 deficit_bits: if panel_measured {
@@ -2806,6 +2819,7 @@ impl SynapseCalyxVault {
             panel_measured,
             panel_floor_applied,
             unmeasured_slots,
+            measured_slots: usable_slots.iter().copied().collect(),
             anchor_entropy_bits,
             sufficient: panel_measured
                 && panel_bits >= anchor_entropy_bits
@@ -3044,7 +3058,7 @@ impl SynapseCalyxVault {
                     store.put(
                         AssayCacheKey::scoped(
                             params.panel_version,
-                            ASSAY_CORPUS_SHARD,
+                            &params.corpus_shard,
                             vault_id,
                             AnchorKind::Reward,
                         ),
@@ -3318,7 +3332,7 @@ impl SynapseCalyxVault {
                     store.put(
                         AssayCacheKey::scoped(
                             params.panel_version,
-                            ASSAY_CORPUS_SHARD,
+                            &params.corpus_shard,
                             vault_id,
                             anchor_kind.clone(),
                         ),
@@ -3659,16 +3673,26 @@ impl SynapseCalyxVault {
         let card = ensemble_card(&lenses, &labels, None, &config)
             .map_err(|error| loom_math_error("measure the ensemble capability card", &error))?;
 
-        // Durable evidence that the pass ran, under the subject the Assay store
-        // reserves for it: the panel estimate the card was built from.
+        // Persist the complete calibrated evidence contract consumed by the
+        // Oracle honesty gate, plus the card itself. Storing only the card made
+        // its measured panel/lens evidence invisible to downstream consumers.
         let mut store = AssayStore::default();
+        let cache_key = AssayCacheKey::scoped(
+            params.panel_version,
+            &params.corpus_shard,
+            self.vault_id_value(),
+            anchor_kind,
+        );
+        let calibration = card.sufficiency.power_calibration.clone().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_ASSAY_CALIBRATION_ABSENT",
+                "ensemble card returned no planted-signal power calibration",
+                "preserve the corpus and inspect the calibrated logistic estimator",
+            )
+        })?;
+        let trust = card.sufficiency.trust;
         store.put(
-            AssayCacheKey::scoped(
-                params.panel_version,
-                ASSAY_CORPUS_SHARD,
-                self.vault_id_value(),
-                anchor_kind,
-            ),
+            cache_key.clone(),
             AssaySubject::EnsembleCard,
             MiEstimate::new(
                 card.panel_bits,
@@ -3681,6 +3705,49 @@ impl SynapseCalyxVault {
             "synapse-assay-ensemble",
             self.read_snapshot(),
         );
+        store.put(
+            cache_key.clone(),
+            AssaySubject::Panel,
+            MiEstimate::new(
+                card.panel_bits,
+                card.panel_ci[0],
+                card.panel_ci[1],
+                card.n_samples,
+                EstimatorKind::LogisticProbe,
+                trust,
+            )
+            .with_power_calibration(calibration),
+            "synapse-assay-ensemble",
+            self.read_snapshot(),
+        );
+        store.put(
+            cache_key.clone(),
+            AssaySubject::OutcomeEntropy,
+            MiEstimate::point(
+                card.anchor_entropy_bits,
+                card.n_samples,
+                EstimatorKind::OutcomeEntropy,
+                trust,
+            ),
+            "synapse-assay-ensemble",
+            self.read_snapshot(),
+        );
+        for lens in &card.lenses {
+            store.put(
+                cache_key.clone(),
+                AssaySubject::Lens { slot: lens.slot },
+                MiEstimate::new(
+                    lens.solo_bits,
+                    lens.solo_ci[0],
+                    lens.solo_ci[1],
+                    card.n_samples,
+                    EstimatorKind::LogisticProbe,
+                    trust,
+                ),
+                "synapse-assay-ensemble",
+                self.read_snapshot(),
+            );
+        }
         let assay_rows = self.persist_assay_store(&store)?;
         Ok(SynapseCalyxEnsembleCardReport {
             card,

@@ -111,7 +111,8 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904: u32 = 1_665_002;
 // would be reinterpreted under the new meaning. The `_1776` generation is the
 // first that writes into the panel's own block.
 pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
-pub const SYN_ACTION_PANEL_VERSION: u32 = 1_965_003;
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_006_001;
+pub const SYN_ACTION_PANEL_VERSION_PRE_2006: u32 = 1_965_003;
 pub const SYN_ACTION_PANEL_VERSION_PRE_1965: u32 = 1_776_001;
 pub const SYN_REFLEX_PANEL_NAME: &str = "syn-reflex-v1";
 pub const SYN_REFLEX_PANEL_VERSION: u32 = 1_965_004;
@@ -462,6 +463,7 @@ const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 // recomputed.
 const ACT_SLOT_KIND_ONEHOT: SlotId = SlotId::new(48);
 const ACT_SLOT_TARGET_HASH: SlotId = SlotId::new(49);
+const ACT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(50);
 // Slot 50 is reserved for the magnitude-weighted vector retired by #1965.
 const ACT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(51);
 const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(52);
@@ -2026,8 +2028,9 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         AT_SLOT_RECORD_VECTOR_V2,
         "syn.agent_transcript.record_vector.v2",
     ),
-    (ACT_SLOT_KIND_ONEHOT, "syn.action.kind_onehot.v1"),
+    (ACT_SLOT_KIND_ONEHOT, "syn.action.kind_onehot.v2"),
     (ACT_SLOT_TARGET_HASH, "syn.action.target_hash.v1"),
+    (ACT_SLOT_RECORD_VECTOR, "syn.action.record_vector.v1"),
     (ACT_SLOT_HOUR_CYCLIC, "syn.action.hour_cyclic.v1"),
     (ACT_SLOT_DOW_CYCLIC, "syn.action.dow_cyclic.v1"),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
@@ -2435,7 +2438,11 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_ACTION_LOG),
             outcome_bearing: false,
             source_ttl_managed: true,
-            superseded_versions: &[1_666_001, SYN_ACTION_PANEL_VERSION_PRE_1965],
+            superseded_versions: &[
+                1_666_001,
+                SYN_ACTION_PANEL_VERSION_PRE_1965,
+                SYN_ACTION_PANEL_VERSION_PRE_2006,
+            ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
         PanelCatalogEntry {
@@ -3035,6 +3042,7 @@ pub fn syn_active_panel_contract(
         SYN_AGENT_TRANSCRIPT_PANEL_VERSION => {
             agent_transcript_panel_slots(panel_version, &mut registry)?
         }
+        SYN_ACTION_PANEL_VERSION => action_panel_slots(panel_version, &mut registry)?,
         _ => return Ok(None),
     };
     // #1963 ask 3: a panel that cannot support a neighbourhood analysis says so
@@ -4519,8 +4527,8 @@ pub fn build_action_constellation(
         ACT_SLOT_KIND_ONEHOT,
         measure_text(
             SYN_ACTION_PANEL_NAME,
-            AlgorithmicLens::syn_one_hot("syn.action.kind_onehot.v1", Modality::Structured, 64),
-            &action_kind(record),
+            AlgorithmicLens::syn_one_hot("syn.action.kind_onehot.v2", Modality::Structured, 64),
+            &action_identity(record),
         )?,
     );
     slots.insert(
@@ -4530,6 +4538,18 @@ pub fn build_action_constellation(
             "syn.action.target_hash.v1",
             action_target_text(record).as_deref(),
             2048,
+        )?,
+    );
+    slots.insert(
+        ACT_SLOT_RECORD_VECTOR,
+        measure_json(
+            SYN_ACTION_PANEL_NAME,
+            AlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.action.record_vector.v1",
+                Modality::Structured,
+                32,
+            ),
+            &action_numeric_record(record),
         )?,
     );
     insert_time_slots(
@@ -6054,7 +6074,7 @@ fn action_metadata(
         source_key,
         raw_bytes,
     );
-    metadata.insert("action_kind".to_owned(), action_kind(record));
+    metadata.insert("action_kind".to_owned(), action_identity(record));
     insert_optional_metadata(
         &mut metadata,
         "action_tool",
@@ -6461,6 +6481,66 @@ fn optional_onehot_slot(
             )
         },
     )
+}
+
+fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
+    Ok(vec![
+        syn_content_slot(
+            ACT_SLOT_KIND_ONEHOT,
+            "syn.action.kind_onehot.v2",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.action.kind_onehot.v2",
+                Modality::Structured,
+                64,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            ACT_SLOT_TARGET_HASH,
+            "syn.action.target_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.action.target_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            ACT_SLOT_RECORD_VECTOR,
+            "syn.action.record_vector.v1",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.action.record_vector.v1",
+                Modality::Structured,
+                32,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            ACT_SLOT_HOUR_CYCLIC,
+            "syn.action.hour_cyclic.v1",
+            RegistryAlgorithmicLens::syn_cyclic_time(
+                "syn.action.hour_cyclic.v1",
+                Modality::Structured,
+                24,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            ACT_SLOT_DOW_CYCLIC,
+            "syn.action.dow_cyclic.v1",
+            RegistryAlgorithmicLens::syn_cyclic_time(
+                "syn.action.dow_cyclic.v1",
+                Modality::Structured,
+                7,
+            ),
+            panel_version,
+            registry,
+        )?,
+    ])
 }
 
 fn optional_onehot_index_slot(
@@ -7441,17 +7521,14 @@ fn transcript_tool_result_bytes_total(record: &AgentTranscriptRecord) -> u64 {
     })
 }
 
-fn action_kind(record: &Value) -> String {
+fn action_identity(record: &Value) -> String {
     let tool = json_string(record, &["tool"]);
     let verb = json_string(record, &["verb"]);
-    let status = json_string(record, &["status", "outcome", "phase"]);
-    match (tool, verb, status) {
-        (Some(tool), Some(verb), _) => format!("{tool}:{verb}"),
-        (Some(tool), None, Some(status)) => format!("{tool}:{status}"),
-        (Some(tool), None, None) => tool,
-        (None, Some(verb), _) => verb,
-        (None, None, Some(status)) => status,
-        (None, None, None) => {
+    match (tool, verb) {
+        (Some(tool), Some(verb)) => format!("{tool}:{verb}"),
+        (Some(tool), None) => tool,
+        (None, Some(verb)) => verb,
+        (None, None) => {
             json_string(record, &["row_kind"]).unwrap_or_else(|| "unknown_action".to_owned())
         }
     }
@@ -7699,6 +7776,23 @@ fn mcp_usage_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
         "has_session": bool_u64(json_string(record, &["mcp_session_id_sha256"]).is_some()),
         "has_error": bool_u64(json_string(record, &["error_type"]).is_some()),
         "steering_emitted": bool_u64(json_bool(record, &["steering_emitted"]).unwrap_or(false)),
+    })
+}
+
+fn action_numeric_record(record: &Value) -> Value {
+    let scaled = |value: u64, ceiling: u64| (value.min(ceiling) as f64) / (ceiling as f64);
+    let ts_ns = json_u64(record, &["ts_ns"]).unwrap_or(0);
+    let week_ns = 7 * 86_400_000_000_000_u64;
+    json!({
+        "sequence_scaled": scaled(json_u64(record, &["seq"]).unwrap_or(0), 1_000_000),
+        "week_phase": (ts_ns % week_ns) as f64 / week_ns as f64,
+        "has_tool": bool_u64(json_string(record, &["tool"]).is_some()),
+        "has_verb": bool_u64(json_string(record, &["verb"]).is_some()),
+        "has_target": bool_u64(action_target_text(record).is_some()),
+        "detail_fields_scaled": scaled(
+            record.get("details").and_then(Value::as_object).map_or(0, |value| value.len() as u64),
+            32,
+        ),
     })
 }
 

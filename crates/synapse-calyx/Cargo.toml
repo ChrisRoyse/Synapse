@@ -34,6 +34,7 @@ calyx-forge = { workspace = true }
 calyx-ledger = { workspace = true }
 calyx-lodestar = { workspace = true }
 calyx-loom = { workspace = true }
+calyx-oracle = { workspace = true }
 calyx-paths = { workspace = true }
 calyx-registry = { workspace = true }
 calyx-search = { workspace = true }

@@ -5169,6 +5169,7 @@ dependencies = [
  "calyx-ledger",
  "calyx-lodestar",
  "calyx-loom",
+ "calyx-oracle",
  "calyx-paths",
  "calyx-registry",
  "calyx-search",

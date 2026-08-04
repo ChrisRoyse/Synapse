@@ -394,6 +394,16 @@ impl SynapseService {
                 "outcome_anchor": {
                     "value": { "bool": outcome }
                 },
+                "ground_truth_anchor": {
+                    "value": { "bool": outcome }
+                },
+                "consequence": {
+                    "action_or_event": "terminal_outcome",
+                    "domain": "synapse.action",
+                    "outcome": { "value": { "bool": outcome } },
+                    "grounded": true,
+                    "provisional": false
+                },
                 "source_action_audit_key_hex": synapse_storage::constellations::hex_encode(&audit_key),
             }))
             .map_err(|error| {

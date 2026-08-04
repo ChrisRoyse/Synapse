@@ -675,6 +675,8 @@ pub trait StorageBackend: Send + Sync {
         occurrence_identity: &[u8],
         context: &[u8],
     ) -> StorageResult<ActionOraclePublicationReport>;
+    fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value>;
+    fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value>;
     fn persist_recurrence_finding(
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
@@ -1073,6 +1075,68 @@ impl CalyxVaultRuntime {
         )
     }
 
+    fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value> {
+        let action_id = validate_recurrence_subject_id(action_id)?;
+        self.with_vault(
+            "calyx_oracle",
+            "predict terminal action outcome",
+            true,
+            |vault| {
+                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
+                let mut panel = syn_active_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
+                    .ok_or_else(|| {
+                        calyx_write_failed_detail(
+                            "calyx_oracle",
+                            "syn-action panel contract is absent",
+                        )
+                    })?
+                    .panel;
+                let assay = synapse_calyx::SynapseCalyxAssayParams::new(
+                    SYN_ACTION_PANEL_VERSION,
+                    "reward".to_owned(),
+                )
+                .with_corpus_shard("synapse.action".to_owned())
+                .with_lens_names(crate::constellations::syn_slot_lens_names());
+                let capability = vault.assay_ensemble_card(&assay, 2).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_oracle",
+                        "measure calibrated action-panel capability before prediction",
+                        &source,
+                    )
+                })?;
+                panel
+                    .slots
+                    .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
+                if panel.slots.is_empty() {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_oracle",
+                        "action-panel sufficiency produced no measured slots; anchor at least 50 diverse terminal outcomes before prediction",
+                    ));
+                }
+                vault
+                    .oracle_predict_action(&action_id, "synapse.action", panel)
+                    .map_err(|source| {
+                        calyx_write_failed("calyx_oracle", "predict action outcome", &source)
+                    })
+            },
+        )
+    }
+
+    fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value> {
+        self.with_vault(
+            "calyx_oracle",
+            "reverse terminal action outcome",
+            true,
+            |vault| {
+                vault
+                    .oracle_reverse_action(AnchorValue::Bool(outcome), "synapse.action")
+                    .map_err(|source| {
+                        calyx_write_failed("calyx_oracle", "reverse action outcome", &source)
+                    })
+            },
+        )
+    }
+
     fn put_action_oracle_publication_inner(
         &self,
         source_key: &[u8],
@@ -1138,7 +1202,7 @@ impl CalyxVaultRuntime {
                     })?;
 
                 let action_cx_id = vault.cx_id_for_input(raw_bytes, SYN_ACTION_PANEL_VERSION);
-                let action_constellation = constellations::build_action_constellation(
+                let mut action_constellation = constellations::build_action_constellation(
                     NativeConstellationContext {
                         vault_id: vault.vault_id_value(),
                         cx_id: action_cx_id,
@@ -1149,6 +1213,32 @@ impl CalyxVaultRuntime {
                     raw_bytes,
                     record,
                 )?;
+                let outcome = record.get("status").and_then(Value::as_str) == Some("ok");
+                let action_anchor = Anchor {
+                    kind: AnchorKind::Reward,
+                    value: AnchorValue::Bool(outcome),
+                    source: format!(
+                        "synapse://{}/{}",
+                        cf::CF_ACTION_LOG,
+                        constellations::hex_encode(source_key)
+                    ),
+                    observed_at: created_at_ms,
+                    confidence: 1.0,
+                };
+                action_anchor.validate_schema().map_err(|error| {
+                    calyx_write_failed_detail(
+                        "calyx_action_oracle_publication",
+                        format!("terminal action outcome anchor is invalid: {error}"),
+                    )
+                })?;
+                action_constellation.anchors.push(action_anchor);
+                action_constellation
+                    .metadata
+                    .insert("oracle.domain".to_owned(), "synapse.action".to_owned());
+                action_constellation
+                    .metadata
+                    .insert("oracle.action".to_owned(), action.to_owned());
+                action_constellation.flags.ungrounded = false;
                 let event_time_secs =
                     i64::try_from(event_time_ns / 1_000_000_000).map_err(|error| {
                         calyx_write_failed_detail(
@@ -3657,6 +3747,14 @@ impl StorageBackend for CalyxBackend {
             occurrence_identity,
             context,
         )
+    }
+
+    fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value> {
+        self.vault.oracle_predict_action(action_id)
+    }
+
+    fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value> {
+        self.vault.oracle_reverse_action(outcome)
     }
 
     fn persist_recurrence_finding(

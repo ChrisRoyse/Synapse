@@ -1435,6 +1435,8 @@ pub enum StorageIntelligenceOperation {
     Hazard,
     Kernel,
     KernelAnswer,
+    OraclePredict,
+    OracleReverse,
     /// The ensemble capability card: per-lens marginal value, the PID triple,
     /// the A37 associational-diversity gate, and a keep/park/retire verdict
     /// (#1668's admission gate; wired for #1944 ask 1).
@@ -1457,6 +1459,8 @@ impl StorageIntelligenceOperation {
             Self::Hazard => "hazard",
             Self::Kernel => "kernel",
             Self::KernelAnswer => "kernel_answer",
+            Self::OraclePredict => "oracle_predict",
+            Self::OracleReverse => "oracle_reverse",
             Self::EnsembleCard => "ensemble_card",
         }
     }
@@ -1572,6 +1576,14 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 64))]
     pub max_hops: Option<u32>,
+    /// Stable action/tool identifier whose grounded outcome is predicted
+    /// (`oracle_predict`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    /// Grounded outcome whose most likely action cause is requested
+    /// (`oracle_reverse`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
@@ -1839,6 +1851,7 @@ pub struct StorageIntelligenceSufficiencyReport {
     /// the marginal estimator could not measure them. Cross-reference the
     /// `state` field on the `bits` report for the per-slot reason.
     pub unmeasured_slots: u64,
+    pub measured_slots: Vec<u32>,
     pub anchor_entropy_bits: f32,
     pub sufficient: bool,
     pub deficit_bits: f32,
@@ -2311,6 +2324,9 @@ pub struct StorageIntelligenceResponse {
     pub kernel: Option<StorageIntelligenceKernelReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_answer: Option<StorageIntelligenceKernelAnswerReport>,
+    /// Native Calyx Oracle result for `oracle_predict`/`oracle_reverse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle: Option<serde_json::Value>,
     /// Populated by `operation=ensemble_card`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_card: Option<StorageIntelligenceEnsembleCardReport>,
@@ -3743,6 +3759,11 @@ pub fn run_intelligence_sufficiency(
         panel_measured: report.panel_measured,
         panel_floor_applied: report.panel_floor_applied,
         unmeasured_slots: report.unmeasured_slots as u64,
+        measured_slots: report
+            .measured_slots
+            .into_iter()
+            .map(|slot| u32::from(slot.get()))
+            .collect(),
         anchor_entropy_bits: report.anchor_entropy_bits,
         sufficient: report.sufficient,
         deficit_bits: report.deficit_bits,
@@ -4350,6 +4371,62 @@ pub fn run_intelligence_kernel_answer(
         recall_ratio: report.recall_ratio,
         min_recall_ratio: report.min_recall_ratio,
     })
+}
+
+/// Predicts the grounded consequence of one stable action identifier.
+pub fn run_intelligence_oracle_predict(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<serde_json::Value, ErrorData> {
+    require_action_panel(params, "oracle_predict")?;
+    let action_id = params
+        .action_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "storage operation=intelligence sub_operation=oracle_predict requires a nonblank action_id"
+                    .to_owned(),
+            )
+        })?;
+    db.oracle_predict_action(action_id)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+/// Walks grounded evidence backward from an outcome to its likely action cause.
+pub fn run_intelligence_oracle_reverse(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<serde_json::Value, ErrorData> {
+    require_action_panel(params, "oracle_reverse")?;
+    let outcome = params.outcome.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=intelligence sub_operation=oracle_reverse requires outcome"
+                .to_owned(),
+        )
+    })?;
+    db.oracle_reverse_action(outcome)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+fn require_action_panel(
+    params: &StorageIntelligenceParams,
+    operation: &str,
+) -> Result<(), ErrorData> {
+    if params.panel_version == synapse_storage::SYN_ACTION_PANEL_VERSION {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!(
+            "storage operation=intelligence sub_operation={operation} requires action panel_version {}; received {}",
+            synapse_storage::SYN_ACTION_PANEL_VERSION,
+            params.panel_version
+        ),
+    ))
 }
 
 fn storage_intelligence_agreement_edge(

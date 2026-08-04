@@ -1096,6 +1096,7 @@ pub(super) async fn handle(
                     hazard: None,
                     kernel: None,
                     kernel_answer: None,
+                    oracle: None,
                     ensemble_card: None,
                 };
                 match sub_operation {
@@ -1191,6 +1192,22 @@ pub(super) async fn handle(
                         crate::m3::storage::run_intelligence_kernel_answer(&db, &spec).map(
                             |kernel_answer| StorageIntelligenceResponse {
                                 kernel_answer: Some(kernel_answer),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::OraclePredict => {
+                        crate::m3::storage::run_intelligence_oracle_predict(&db, &spec).map(
+                            |oracle| StorageIntelligenceResponse {
+                                oracle: Some(oracle),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::OracleReverse => {
+                        crate::m3::storage::run_intelligence_oracle_reverse(&db, &spec).map(
+                            |oracle| StorageIntelligenceResponse {
+                                oracle: Some(oracle),
                                 ..base
                             },
                         )

@@ -48,9 +48,9 @@ use calyx_aster::vault::{
 };
 pub use calyx_core::TemporalPolicy;
 use calyx_core::{
-    Anchor, AnchorKind, CalyxError, Clock, Constellation, CxId, METADATA_SOURCE_EVENT_TIME_RAW,
-    METADATA_SOURCE_EVENT_TIME_SECS, METADATA_TEMPORAL_LANE_STATE, Panel, Seq, SystemClock,
-    TEMPORAL_LANE_ACTIVE, Ts, VaultId, VaultStore,
+    Anchor, AnchorKind, AnchorValue, CalyxError, Clock, Constellation, CxId,
+    METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS, METADATA_TEMPORAL_LANE_STATE,
+    Panel, Seq, SystemClock, TEMPORAL_LANE_ACTIVE, Ts, VaultId, VaultStore,
 };
 use calyx_forge::{
     HostGpuReservation, HostGpuReservationRequest, HostGpuReservationSnapshot,
@@ -4561,6 +4561,59 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Runs honesty-gated Oracle consequence prediction over persisted action
+    /// evidence and returns the exact serializable Calyx report.
+    pub fn oracle_predict_action(
+        &self,
+        action_id: &str,
+        domain: &str,
+        panel: Panel,
+    ) -> Result<serde_json::Value, SynapseCalyxError> {
+        let action_id = nonblank(action_id, "Oracle action id")?;
+        let domain = nonblank(domain, "Oracle domain")?;
+        let prediction = calyx_oracle::oracle_predict(
+            &self.vault,
+            &calyx_oracle::Action {
+                action_id: action_id.to_owned(),
+                panel,
+                guard: None,
+            },
+            calyx_oracle::DomainId::new(domain),
+            &SystemClock,
+        )
+        .map_err(oracle_error)?;
+        serde_json::to_value(prediction).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ORACLE_RESPONSE_ENCODE_FAILED",
+                format!("encode Oracle prediction response: {error}"),
+                "preserve the vault and inspect the Oracle result schema",
+            )
+        })
+    }
+
+    /// Runs the persisted reverse Oracle walk for one exact outcome value.
+    pub fn oracle_reverse_action(
+        &self,
+        outcome: AnchorValue,
+        domain: &str,
+    ) -> Result<serde_json::Value, SynapseCalyxError> {
+        let domain = nonblank(domain, "Oracle domain")?;
+        let causes = calyx_oracle::reverse_query(
+            &self.vault,
+            &outcome,
+            calyx_oracle::DomainId::new(domain),
+            &SystemClock,
+        )
+        .map_err(oracle_error)?;
+        serde_json::to_value(causes).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ORACLE_RESPONSE_ENCODE_FAILED",
+                format!("encode Oracle reverse response: {error}"),
+                "preserve the vault and inspect the Oracle result schema",
+            )
+        })
+    }
+
     /// Appends one occurrence and, only when it is the subject's first, commits
     /// its exact region outbox row in the same durable batch.
     #[allow(clippy::too_many_arguments)]
@@ -7016,6 +7069,22 @@ fn read_anchor_exact_from_vault<C: Clock>(
             Ok(SynapseCalyxAnchorReadback { key, anchor })
         })
         .transpose()
+}
+
+fn nonblank<'a>(value: &'a str, label: &str) -> Result<&'a str, SynapseCalyxError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_ORACLE_INVALID_INPUT",
+            format!("{label} must not be blank"),
+            "supply the exact persisted Oracle domain and action identity",
+        ));
+    }
+    Ok(value)
+}
+
+fn oracle_error(error: calyx_oracle::OracleError) -> SynapseCalyxError {
+    SynapseCalyxError::new(error.code(), error.to_string(), error.remediation())
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

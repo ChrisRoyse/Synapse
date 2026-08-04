@@ -968,6 +968,18 @@ impl Db {
         )
     }
 
+    /// Predicts one action's grounded terminal outcome through Calyx Oracle's
+    /// persisted sufficiency and provenance gates.
+    pub fn oracle_predict_action(&self, action_id: &str) -> StorageResult<serde_json::Value> {
+        self.backend.oracle_predict_action(action_id)
+    }
+
+    /// Walks backward from a terminal success/failure outcome to grounded
+    /// action causes in the persisted Oracle corpus.
+    pub fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<serde_json::Value> {
+        self.backend.oracle_reverse_action(outcome)
+    }
+
     /// Commits one validated recurrence notification intent to Calyx
     /// `Reactive` and independently reads the exact bytes back.
     ///
