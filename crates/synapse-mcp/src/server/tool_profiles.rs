@@ -68,7 +68,7 @@ pub(super) struct ImmutableToolSurface {
     /// #1936: the profile-derived half of `tool_profile_snapshot`, computed
     /// once per `(profile, session_scoped)` at construction.
     ///
-    /// Every field it holds is a pure function of the immutable surface above
+    /// Every cached field is a pure function of the immutable surface above
     /// and the profile, but it was being recomputed on *every* tool call --
     /// deep-cloning all 40 sanitized tools with their schemas, re-fingerprinting
     /// them, and re-validating the registry and facade contract. Measured at
@@ -89,8 +89,8 @@ pub(super) struct ImmutableToolSurface {
 }
 
 /// One memoized `(profile, session_scoped)` snapshot. `snapshot` carries the
-/// profile-derived fields only; the per-session fields (`session_id`, `source`,
-/// `policy_row`, `foreground_route`) are overwritten by every caller.
+/// immutable profile-derived fields; per-session fields and the external Codex
+/// host-state diagnostic are refreshed by every caller.
 #[derive(Debug)]
 struct ProfileSnapshotTemplate {
     profile: ToolProfileKind,
@@ -4030,9 +4030,10 @@ impl SynapseService {
                 None,
             ),
         };
-        // #1936: the profile-derived fields were recomputed per call at a
-        // measured 20-22 ms. They are memoized at construction; only the
-        // per-session fields below are resolved here.
+        // #1936: immutable profile-derived fields took 20-22 ms to rebuild and
+        // remain memoized. #2007: codex_client_surface reads files/processes
+        // which setup changes after daemon construction, so caching that field
+        // made profile/telemetry report the previous installation forever.
         let session_scoped = session_id.is_some();
         let template = self
             .immutable_tool_surface
@@ -4051,6 +4052,18 @@ impl SynapseService {
                 )
             })?;
         let mut snapshot = template.snapshot.clone();
+        snapshot.codex_client_surface = codex_client_surface_snapshot(
+            &snapshot.public_tool_registry.public_tool_names,
+            snapshot.codex_client_surface.live_tool_count,
+            snapshot
+                .codex_client_surface
+                .live_tool_surface_sha256
+                .clone(),
+            snapshot
+                .codex_client_surface
+                .live_tool_surface_error
+                .clone(),
+        );
         snapshot.session_id = session_id.map(ToOwned::to_owned);
         snapshot.source = source;
         snapshot.foreground_route = foreground_route_readiness(session_id, profile);
