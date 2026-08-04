@@ -301,6 +301,15 @@ const AE_SLOT_USAGE_TOTAL_LOG1P: SlotId = SlotId::new(33);
 // magnitude-weighted record vector. New generations must not write it (#1965).
 const AE_SLOT_HAS_END_STATE: SlotId = SlotId::new(114);
 
+/// Cold grounding-kernel maintenance contracts for the three operator-history
+/// domains named by #1675. These live beside the slot declarations so a panel
+/// bump cannot silently leave the scheduler targeting a retired lane.
+pub(crate) const SYN_KERNEL_MAINTENANCE_TARGETS: &[(u32, u16)] = &[
+    (SYN_TIMELINE_PANEL_VERSION, TL_SLOT_RECORD_VECTOR.get()),
+    (SYN_EPISODE_PANEL_VERSION, EP_SLOT_RECORD_VECTOR.get()),
+    (SYN_AGENT_EVENT_PANEL_VERSION, AE_SLOT_KIND_ONEHOT.get()),
+];
+
 const AT_SLOT_ROLE_ONEHOT: SlotId = SlotId::new(35);
 const AT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(36);
 const AT_SLOT_SOURCE_ONEHOT: SlotId = SlotId::new(37);

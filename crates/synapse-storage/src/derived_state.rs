@@ -92,6 +92,11 @@ pub const WEAVE_INTERVAL_MAX_RECORDS: usize = 2_000;
 /// Wall-clock budget for one panel's incremental weave in one maintenance tick.
 pub const WEAVE_PANEL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Kernel construction includes all-pairs graph work, so it runs daily rather
+/// than on every five-minute maintenance tick.
+pub const KERNEL_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
+pub const KERNEL_REBUILD_MAX_RECORDS: usize = 2_000;
+
 /// Maximum bisection work items accepted for one panel interval.
 const WEAVE_MAX_INTERVAL_PARTS: usize = 1_024;
 
@@ -99,6 +104,7 @@ static DERIVED_STATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_FAILURE: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static LAST_KERNEL_REBUILD_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Storage handle the derived-state pass reads the vault from.
 ///
@@ -167,6 +173,12 @@ pub struct DerivedStateReadback {
     pub last_weave_records: BTreeMap<u32, u64>,
     pub last_weave_xterm_rows: BTreeMap<u32, usize>,
     pub last_weave_graph_rows: BTreeMap<u32, usize>,
+    /// Last scheduled per-panel kernel outcome, including the physical Kernel
+    /// CF row count returned after persistence.
+    pub last_kernel_actions: BTreeMap<u32, String>,
+    pub last_kernel_recall: BTreeMap<u32, f32>,
+    pub last_kernel_cf_rows: BTreeMap<u32, usize>,
+    pub last_kernel_rebuild_unix_ms: Option<u64>,
     /// The last failure, retained across later successes so a lifetime failure
     /// counter can never outlive its own evidence (the #1889 lesson).
     pub last_failure_code: Option<String>,
@@ -514,6 +526,11 @@ pub(crate) fn run_derived_state_maintenance() {
         }
     }
 
+    if let Err(error) = drive_scheduled_kernels(&db) {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_KERNEL_REBUILD_FAILED", error);
+    }
+
     let mut guard = match DERIVED_STATE_LAST.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -525,6 +542,82 @@ pub(crate) fn run_derived_state_maintenance() {
         guard.last_skip_code = None;
         guard.last_skip_detail = None;
     }
+}
+
+fn drive_scheduled_kernels(db: &Arc<Db>) -> Result<(), String> {
+    let now = now_unix_ms().ok_or_else(|| "system clock precedes Unix epoch".to_owned())?;
+    let last = LAST_KERNEL_REBUILD_UNIX_MS.load(Ordering::Acquire);
+    let interval_ms = u64::try_from(KERNEL_REBUILD_INTERVAL.as_millis())
+        .map_err(|_| "kernel rebuild interval exceeds u64 milliseconds".to_owned())?;
+    if last != 0 && now.saturating_sub(last) < interval_ms {
+        return Ok(());
+    }
+    // Record the attempt before the expensive work. Re-running a broken
+    // all-pairs build every five minutes would starve unrelated maintenance.
+    LAST_KERNEL_REBUILD_UNIX_MS.store(now, Ordering::Release);
+
+    let mut failures = Vec::new();
+    for &(panel_version, content_slot) in crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS {
+        let mut params =
+            synapse_calyx::SynapseCalyxKernelRebuildParams::new(panel_version, content_slot);
+        params.max_records = KERNEL_REBUILD_MAX_RECORDS;
+        let report = match db.rebuild_domain_kernels_intelligence(&params) {
+            Ok(report) => report,
+            Err(error) => {
+                failures.push(format!(
+                    "panel={panel_version} slot={content_slot}: {error}"
+                ));
+                continue;
+            }
+        };
+        let min_recall = report
+            .domains
+            .iter()
+            .filter(|domain| domain.built)
+            .map(|domain| domain.recall_ratio)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        if report.domains_built == 0 {
+            failures.push(format!(
+                "panel={panel_version} slot={content_slot}: persisted no grounded domain"
+            ));
+            continue;
+        }
+        let mut readback = match DERIVED_STATE_LAST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        readback.last_kernel_actions.insert(
+            panel_version,
+            format!("built_domains={}", report.domains_built),
+        );
+        readback
+            .last_kernel_recall
+            .insert(panel_version, min_recall);
+        readback
+            .last_kernel_cf_rows
+            .insert(panel_version, report.kernel_cf_rows_after);
+    }
+    let mut readback = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    readback.last_kernel_rebuild_unix_ms = Some(now);
+    drop(readback);
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} scheduled kernel target(s) failed while independent targets continued: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_KERNEL_REBUILD_PASS",
+        targets = crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS.len(),
+        max_records = KERNEL_REBUILD_MAX_RECORDS,
+        "scheduled grounding kernels persisted and physically counted"
+    );
+    Ok(())
 }
 
 fn calyx_time_boundary_ns_now() -> Result<i64, String> {

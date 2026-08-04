@@ -36,7 +36,8 @@ use calyx_lodestar::{
     AnswerDerivation, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelGraphParams, KernelIndex,
     KernelParams, LodestarError, LpRoundParams, RecallEvalParams, RecallQuery, build_kernel_index,
     build_kernel_pipeline, derive_kernel_answer, derive_kernel_answer_from_ranked_members,
-    measure_kernel_recall, measure_ranked_kernel_recall, write_kernel_artifact,
+    full_topk_support_set, measure_kernel_recall, measure_ranked_kernel_recall,
+    refine_kernel_with_recall_support, seal_completed_kernel_identity, write_kernel_artifact,
 };
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
@@ -6178,7 +6179,7 @@ impl SynapseCalyxVault {
             kernel_graph: KernelGraphParams::default(),
             lp_round: LpRoundParams::default(),
         };
-        let kernel = build_kernel_pipeline(&graph, &anchors, &kernel_params)
+        let mut kernel = build_kernel_pipeline(&graph, &anchors, &kernel_params)
             .map_err(|error| kernel_math_error("select domain kernel", &error))?;
         if kernel.members.is_empty() {
             return Err(SynapseCalyxError::new(
@@ -6195,27 +6196,49 @@ impl SynapseCalyxVault {
             min_recall_ratio: params.min_recall_ratio,
             ..RecallEvalParams::default()
         };
-        let (kernel_index, recall) = match &rows {
+        let (kernel_index, mut recall) = match &rows {
             KernelContentRows::Dense(dense) => {
                 let embeddings = dense
                     .iter()
                     .map(|row| (row.cx_id, row.vector.clone()))
                     .collect::<BTreeMap<_, _>>();
-                let kernel_index = build_kernel_index(&kernel, &embeddings)
+                let mut kernel_index = build_kernel_index(&kernel, &embeddings)
                     .map_err(|error| kernel_math_error("build dense kernel index", &error))?;
                 let full = InMemoryAnnIndex::new(dense.clone())
                     .map_err(|error| kernel_math_error("build dense full-corpus index", &error))?;
                 let corpus = InMemoryCorpus::new("synapse-domain-kernel-dense", dense.clone());
-                let recall = measure_kernel_recall(&kernel_index, &full, &corpus, &recall_params)
-                    .map_err(|error| {
-                    kernel_math_error("measure dense kernel-only recall", &error)
-                })?;
+                let mut recall =
+                    measure_kernel_recall(&kernel_index, &full, &corpus, &recall_params).map_err(
+                        |error| kernel_math_error("measure dense kernel-only recall", &error),
+                    )?;
+                if recall.ratio < params.min_recall_ratio {
+                    let support =
+                        full_topk_support_set(&full, &corpus, &recall_params).map_err(|error| {
+                            kernel_math_error("collect dense recall support", &error)
+                        })?;
+                    kernel = refine_kernel_with_recall_support(
+                        kernel,
+                        &support.members,
+                        &graph,
+                        &anchors,
+                        &kernel_params,
+                        "held-out exact dense top-k support",
+                    )
+                    .map_err(|error| kernel_math_error("refine dense kernel for recall", &error))?;
+                    kernel_index = build_kernel_index(&kernel, &embeddings).map_err(|error| {
+                        kernel_math_error("rebuild refined dense kernel index", &error)
+                    })?;
+                    recall = measure_kernel_recall(&kernel_index, &full, &corpus, &recall_params)
+                        .map_err(|error| {
+                        kernel_math_error("remeasure refined dense kernel recall", &error)
+                    })?;
+                }
                 (Some(kernel_index), recall)
             }
             KernelContentRows::Sparse(index) => {
                 let ids = rows.ids();
-                let members = kernel.members.iter().copied().collect::<BTreeSet<_>>();
-                let recall = measure_ranked_kernel_recall(
+                let mut members = kernel.members.iter().copied().collect::<BTreeSet<_>>();
+                let mut recall = measure_ranked_kernel_recall(
                     "synapse-domain-kernel-sparse-cosine",
                     &ids,
                     &recall_params,
@@ -6235,9 +6258,74 @@ impl SynapseCalyxVault {
                     },
                 )
                 .map_err(|error| kernel_math_error("measure sparse kernel-only recall", &error))?;
+                if recall.ratio < params.min_recall_ratio {
+                    let mut support = BTreeSet::new();
+                    for query in &recall.held_out {
+                        for (candidate, _score) in
+                            index.search(*query, recall_params.top_k, None)?
+                        {
+                            support.insert(candidate);
+                        }
+                    }
+                    let support = support.into_iter().collect::<Vec<_>>();
+                    kernel = refine_kernel_with_recall_support(
+                        kernel,
+                        &support,
+                        &graph,
+                        &anchors,
+                        &kernel_params,
+                        "held-out exact sparse-cosine top-k support",
+                    )
+                    .map_err(|error| {
+                        kernel_math_error("refine sparse kernel for recall", &error)
+                    })?;
+                    members = kernel.members.iter().copied().collect();
+                    recall = measure_ranked_kernel_recall(
+                        "synapse-domain-kernel-sparse-cosine",
+                        &ids,
+                        &recall_params,
+                        |query, top_k| {
+                            index.search(query, top_k, None).map_err(|error| {
+                                LodestarError::KernelIndexBuild {
+                                    detail: error.to_string(),
+                                }
+                            })
+                        },
+                        |query, top_k| {
+                            index.search(query, top_k, Some(&members)).map_err(|error| {
+                                LodestarError::KernelIndexBuild {
+                                    detail: error.to_string(),
+                                }
+                            })
+                        },
+                    )
+                    .map_err(|error| {
+                        kernel_math_error("remeasure refined sparse kernel recall", &error)
+                    })?;
+                }
                 (None, recall)
             }
         };
+
+        // Preserve the selection algorithm's DFVS provenance while replacing
+        // its placeholder recall fields with the value actually measured over
+        // this physical corpus. The completed identity is sealed only after
+        // refinement and recall are final, so health cannot read a default
+        // report from an id minted for a different semantic artifact (#1999).
+        recall.approx_factor = kernel.recall.approx_factor;
+        recall.tau_star_estimate = kernel.recall.tau_star_estimate;
+        recall.tau_star_exact = kernel.recall.tau_star_exact;
+        kernel.recall = recall.clone();
+        let mut physical_contract = Sha256::new();
+        physical_contract.update(b"synapse-domain-kernel-physical-contract-v1");
+        physical_contract.update(params.panel_version.to_be_bytes());
+        physical_contract.update(params.content_slot.to_be_bytes());
+        physical_contract.update(u64::try_from(params.knn).unwrap_or(u64::MAX).to_be_bytes());
+        physical_contract.update(params.edge_cos_threshold.to_bits().to_be_bytes());
+        physical_contract.update(corpus_hash_bytes(&rows));
+        let physical_contract: [u8; 32] = physical_contract.finalize().into();
+        seal_completed_kernel_identity(&mut kernel, &physical_contract)
+            .map_err(|error| kernel_math_error("seal completed domain kernel identity", &error))?;
 
         Ok(DomainKernelInputs {
             rows,
