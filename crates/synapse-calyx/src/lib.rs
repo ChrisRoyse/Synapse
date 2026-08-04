@@ -2582,6 +2582,16 @@ pub struct SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxReadOnlyVault {
+    /// Reads native TimeSeries rows for physical analytics verification.
+    pub fn scan_timeseries_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_latest(ColumnFamily::TimeSeries)
+    }
+
+    /// Reads immutable collection descriptors for physical analytics verification.
+    pub fn scan_collections_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_latest(ColumnFamily::Collections)
+    }
+
     /// Opens an existing vault with only the native Reactive outbox selected.
     pub fn open_existing_reactive_only(
         config: SynapseCalyxConfig,

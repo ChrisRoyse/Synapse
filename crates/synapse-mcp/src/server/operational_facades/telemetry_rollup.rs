@@ -1,5 +1,6 @@
 //! Native Aster TimeSeries storage for telemetry samples and bounded trends.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use serde::Serialize;
@@ -11,10 +12,9 @@ use tokio::sync::Semaphore;
 use crate::m1::mcp_error;
 use crate::server::ErrorData;
 
-const COLLECTION: &str = "syn-telemetry-v2";
-const METRIC_OWNER_PREFIX: &str = "telemetry/native/v2/series/";
-const EVENT_PROGRESS_KEY: &[u8] = b"telemetry/native/v2/agent-event-progress";
-const EVENT_POINT_OWNER_PREFIX: &str = "telemetry/native/v2/agent-event-point/";
+const COLLECTION: &str = "syn-telemetry-v3";
+const METRIC_OWNER_PREFIX: &str = "telemetry/native/v3/series/";
+const EVENT_PROGRESS_KEY: &[u8] = b"telemetry/native/v3/agent-event-progress";
 const EVENT_SCAN_ROWS: usize = 4_096;
 const NANOS_PER_HOUR: u64 = 60 * 60 * 1_000_000_000;
 const NANOS_PER_DAY: u64 = 24 * NANOS_PER_HOUR;
@@ -106,7 +106,8 @@ pub(crate) fn materialize_telemetry_rollups(
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
         .map_or_else(Vec::new, |key| key_after(&key));
     let mut points_scanned = 0_u64;
-    loop {
+    let mut hours = BTreeMap::<u64, (u64, u64, Vec<u8>)>::new();
+    'pages: loop {
         let (rows, more) = db
             .scan_cf_from(cf::CF_AGENT_EVENTS, &start, EVENT_SCAN_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -123,12 +124,16 @@ pub(crate) fn materialize_telemetry_rollups(
                     ),
                 )
             })?;
-            publish_agent_event_metric(db, key, METRIC_AGENT_EVENTS_TOTAL, record.ts_ns)?;
-            if record.end_state == Some(AgentEndState::Error) {
-                publish_agent_event_metric(db, key, METRIC_AGENT_EVENTS_ERROR, record.ts_ns)?;
+            if record.ts_ns >= sealed_horizon_ns {
+                break 'pages;
             }
-            db.put_batch_pressure_bypass(cf::CF_KV, [(EVENT_PROGRESS_KEY.to_vec(), key.clone())])
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            let hour = floor(record.ts_ns, NANOS_PER_HOUR);
+            let entry = hours.entry(hour).or_insert_with(|| (0, 0, key.clone()));
+            entry.0 = entry.0.saturating_add(1);
+            if record.end_state == Some(AgentEndState::Error) {
+                entry.1 = entry.1.saturating_add(1);
+            }
+            key.clone_into(&mut entry.2);
             points_scanned = points_scanned.saturating_add(1);
         }
         let Some((last_key, _)) = rows.last() else {
@@ -139,44 +144,43 @@ pub(crate) fn materialize_telemetry_rollups(
             break;
         }
     }
+    let mut cells_written = 0_u64;
+    for (hour, (total, errors, last_key)) in hours {
+        publish_sealed_event_hour(db, METRIC_AGENT_EVENTS_TOTAL, hour, total)?;
+        cells_written = cells_written.saturating_add(1);
+        if errors != 0 {
+            publish_sealed_event_hour(db, METRIC_AGENT_EVENTS_ERROR, hour, errors)?;
+            cells_written = cells_written.saturating_add(1);
+        }
+        db.put_batch_pressure_bypass(cf::CF_KV, [(EVENT_PROGRESS_KEY.to_vec(), last_key)])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    }
     Ok(TelemetryMaterializeReport {
         built_at_ns,
         sealed_horizon_ns,
         materialized_through_ns: sealed_horizon_ns,
         points_scanned,
-        cells_written: 0,
+        cells_written,
     })
 }
 
-fn publish_agent_event_metric(
+fn publish_sealed_event_hour(
     db: &Db,
-    event_key: &[u8],
     metric: &str,
-    ts_ns: u64,
+    hour_start_ns: u64,
+    count: u64,
 ) -> Result<(), ErrorData> {
+    if count > (1_u64 << 53) {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "TELEMETRY_EVENT_COUNT_INEXACT: metric={metric} hour={hour_start_ns} count={count} exceeds exact f64 integer range"
+            ),
+        ));
+    }
     let series = metric_series(metric);
     verify_metric_owner(db, series, metric)?;
-    let owner_key = format!("{EVENT_POINT_OWNER_PREFIX}{series:016x}/{ts_ns:016x}");
-    match db
-        .get_cf(cf::CF_KV, owner_key.as_bytes())
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?
-    {
-        Some(owner) if owner == event_key => {}
-        Some(owner) => {
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "TELEMETRY_EVENT_TIMESTAMP_COLLISION: metric={metric} ts_ns={ts_ns} is owned by event key {}, not {}; event timestamps must be unique per metric",
-                    encode_hex(&owner),
-                    encode_hex(event_key)
-                ),
-            ));
-        }
-        None => db
-            .put_batch_pressure_bypass(cf::CF_KV, [(owner_key.into_bytes(), event_key.to_vec())])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?,
-    }
-    db.timeseries_write(COLLECTION, series, ts_ns, 1.0)
+    db.timeseries_write(COLLECTION, series, hour_start_ns, count as f64)
         .map(|_| ())
         .map_err(|error| mcp_error(error.code(), error.to_string()))
 }
@@ -302,7 +306,7 @@ fn verify_metric_owner(db: &Db, series: u64, metric: &str) -> Result<(), ErrorDa
 
 fn metric_series(metric: &str) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(b"synapse:telemetry:series:v2\0");
+    hasher.update(b"synapse:telemetry:series:v3\0");
     hasher.update(metric.as_bytes());
     let digest = hasher.finalize();
     let mut id = [0_u8; 8];

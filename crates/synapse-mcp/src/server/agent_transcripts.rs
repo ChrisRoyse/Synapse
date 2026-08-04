@@ -2911,8 +2911,8 @@ fn run_telemetry_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
         0,
     );
     if let (Ok(total), Ok(errors)) = (total, errors) {
-        let total_events: u64 = total.windows.iter().map(|window| window.count).sum();
-        let error_events: u64 = errors.windows.iter().map(|window| window.count).sum();
+        let total_events = total.windows.iter().map(|window| window.sum).sum::<f64>();
+        let error_events = errors.windows.iter().map(|window| window.sum).sum::<f64>();
         tracing::info!(
             code = "TELEMETRY_HEALTH_TREND",
             window_start_ns = last_hour_start,
