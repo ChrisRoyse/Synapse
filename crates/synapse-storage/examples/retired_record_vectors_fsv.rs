@@ -1,4 +1,4 @@
-//! Physical Base-CF proof for #1965's action/reflex/process vector retirement.
+//! Physical Base-CF proof for #1965's retired aggregate vectors.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -10,9 +10,11 @@ use calyx_core::SlotId;
 const ACTION_PANEL: u32 = 1_965_003;
 const REFLEX_PANEL: u32 = 1_965_004;
 const PROCESS_PANEL: u32 = 1_965_005;
+const OBSERVATION_PANEL: u32 = 1_965_006;
 const ACTION_RETIRED_SLOT: u16 = 50;
 const REFLEX_RETIRED_SLOT: u16 = 59;
 const PROCESS_RETIRED_SLOT: u16 = 66;
+const OBSERVATION_RETIRED_SLOTS: [u16; 2] = [70, 74];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let vault_dir = std::env::args()
@@ -39,28 +41,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut action_rows = 0u64;
     let mut reflex_rows = 0u64;
     let mut process_rows = 0u64;
+    let mut observation_rows = 0u64;
     let mut retired_declarations = Vec::new();
     for (key, raw) in vault.scan_cf_latest(ColumnFamily::Base)? {
         let base = decode_constellation_base(&raw)?;
-        let retired_slot = match base.panel_version {
+        let retired_slots: &[u16] = match base.panel_version {
             ACTION_PANEL => {
                 action_rows += 1;
-                Some(ACTION_RETIRED_SLOT)
+                std::slice::from_ref(&ACTION_RETIRED_SLOT)
             }
             REFLEX_PANEL => {
                 reflex_rows += 1;
-                Some(REFLEX_RETIRED_SLOT)
+                std::slice::from_ref(&REFLEX_RETIRED_SLOT)
             }
             PROCESS_PANEL => {
                 process_rows += 1;
-                Some(PROCESS_RETIRED_SLOT)
+                std::slice::from_ref(&PROCESS_RETIRED_SLOT)
             }
-            _ => None,
+            OBSERVATION_PANEL => {
+                observation_rows += 1;
+                &OBSERVATION_RETIRED_SLOTS
+            }
+            _ => &[],
         };
-        if let Some(slot) = retired_slot
-            && base.slots.contains_key(&SlotId::new(slot))
-        {
-            retired_declarations.push(format!("{}:slot_{slot}", hex(&key)));
+        for slot in retired_slots {
+            if base.slots.contains_key(&SlotId::new(*slot)) {
+                retired_declarations.push(format!("{}:slot_{slot}", hex(&key)));
+            }
         }
     }
     println!("source_of_truth={}", vault_dir.display());
@@ -72,6 +79,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "process panel={PROCESS_PANEL} base_rows={process_rows} rows_declaring_retired_slot_{PROCESS_RETIRED_SLOT}=0"
+    );
+    println!(
+        "observation panel={OBSERVATION_PANEL} base_rows={observation_rows} rows_declaring_retired_slots_70_74=0"
     );
     if action_rows == 0 || reflex_rows == 0 {
         return Err("action/reflex migration produced no physical Base rows".into());
