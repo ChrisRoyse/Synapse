@@ -941,6 +941,19 @@ impl Db {
         )
     }
 
+    /// Commits one validated recurrence notification intent to Calyx
+    /// `Reactive` and independently reads the exact bytes back.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the outbox write, flush, or physical readback fails.
+    pub fn persist_recurrence_finding(
+        &self,
+        finding: &synapse_calyx::SynapseCalyxPersistedRecurrenceFinding,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPersistedRecurrenceFinding> {
+        self.backend.persist_recurrence_finding(finding)
+    }
+
     /// Reads the physical recurrence series for one stable subject.
     ///
     /// # Errors

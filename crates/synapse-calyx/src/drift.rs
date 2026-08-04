@@ -52,6 +52,7 @@ use calyx_loom::{
     SimilarityDiscrimination, detect_blind_spot_calibrated,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 use crate::{
     SYNAPSE_INTELLIGENCE_MAX_RECORDS, SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault,
@@ -71,6 +72,69 @@ pub const SYNAPSE_DRIFT_MAX_WINDOW: usize = 1_024;
 pub const SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION: f32 = 0.3;
 
 const REACTIVE_DRIFT_PREFIX: &[u8; 8] = b"RDRIFT1\0";
+const REACTIVE_RECURRENCE_PREFIX: &[u8; 8] = b"RRECUR1\0";
+
+/// Durable recurrence event stored in `Reactive` before live publication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxPersistedRecurrenceFinding {
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub subject_cx_id: String,
+    pub occurrence_id: u64,
+    pub frequency: u64,
+    pub observed_seq: u64,
+}
+
+impl SynapseCalyxVault {
+    /// Persists one caller-validated recurrence as a replay-stable outbox row
+    /// and proves the committed bytes by an independent point read.
+    pub fn persist_recurrence_finding(
+        &self,
+        finding: &SynapseCalyxPersistedRecurrenceFinding,
+    ) -> Result<SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxError> {
+        let key = reactive_recurrence_key(finding);
+        self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            cf: ColumnFamily::Reactive,
+            key: key.clone(),
+            value: encode_json(finding)?,
+        }])?;
+        self.flush()?;
+        let bytes = self.read_cf_latest(ColumnFamily::Reactive, &key)?.ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_READBACK_MISSING",
+                format!(
+                    "Reactive CF recurrence row disappeared after commit: kind={} subject={} occurrence={}",
+                    finding.subject_kind, finding.subject_id, finding.occurrence_id
+                ),
+                "stop writers, preserve the vault, and inspect the Reactive CF commit before retrying recurrence delivery",
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                format!(
+                    "decode committed Reactive CF recurrence row for kind={} subject={} occurrence={}: {error}",
+                    finding.subject_kind, finding.subject_id, finding.occurrence_id
+                ),
+                "stop writers, preserve the vault, and inspect the named Reactive CF row",
+            )
+        })
+    }
+}
+
+fn reactive_recurrence_key(finding: &SynapseCalyxPersistedRecurrenceFinding) -> Vec<u8> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(finding.subject_kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(finding.subject_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(REACTIVE_RECURRENCE_PREFIX);
+    key.extend_from_slice(&finding.observed_seq.to_be_bytes());
+    key.extend_from_slice(&digest[..8]);
+    key.extend_from_slice(&finding.occurrence_id.to_be_bytes());
+    key
+}
 
 // ---------------------------------------------------------------------------
 // Blind spots

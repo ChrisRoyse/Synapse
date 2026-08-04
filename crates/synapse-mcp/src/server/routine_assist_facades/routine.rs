@@ -136,7 +136,7 @@ pub(super) async fn handle(
         RoutineOperation::Mine => {
             let spec = params.0.mine.ok_or_else(|| missing_routine_spec("mine"))?;
             let source_id = routine_range_source_id(spec.start_ts_ns, spec.end_ts_ns);
-            let response = service
+            let mut response = service
                     .routine_mine(Parameters(spec))
                     .await
                     .map_err(|error| {
@@ -148,6 +148,43 @@ pub(super) async fn handle(
                         )
                     })?
                     .0;
+            let event_bus = service.sse_state()?.event_bus();
+            for finding in &response.recurrence_findings {
+                let report = event_bus.publish(synapse_core::types::Event {
+                    seq: finding.observed_seq,
+                    at: chrono::Utc::now(),
+                    source: synapse_core::types::EventSource::System,
+                    kind: "calyx.reactive.recurs".to_owned(),
+                    data: serde_json::to_value(finding).map_err(|error| {
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!(
+                                "serialize committed Reactive CF recurrence finding for delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
+                            ),
+                        )
+                    })?,
+                    correlations: Vec::new(),
+                });
+                response.recurrence_notifications_matched = response
+                    .recurrence_notifications_matched
+                    .saturating_add(report.matched as u64);
+                response.recurrence_notifications_queued = response
+                    .recurrence_notifications_queued
+                    .saturating_add(report.queued as u64);
+                response.recurrence_notifications_dropped = response
+                    .recurrence_notifications_dropped
+                    .saturating_add(report.dropped);
+            }
+            if response.recurrence_notifications_dropped > 0 {
+                return Err(crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "reactive recurrence delivery dropped {} subscription notification(s) after persisting {} Reactive CF trigger row(s); remediation=consume or recreate the saturated subscription, then read the durable Reactive CF findings before retrying delivery",
+                        response.recurrence_notifications_dropped,
+                        response.recurrence_findings.len()
+                    ),
+                ));
+            }
             Ok(Json(routine_response(
                 operation,
                 format!(

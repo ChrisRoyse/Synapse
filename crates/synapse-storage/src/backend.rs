@@ -34,7 +34,8 @@ use synapse_calyx::{
     SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
-    SynapseCalyxPeriodicityReport, SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxPeriodicityReport, SynapseCalyxPersistedRecurrenceFinding,
+    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration, SynapseCalyxRevisionGuard,
     SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
@@ -654,6 +655,10 @@ pub trait StorageBackend: Send + Sync {
         occurrence_identity: &[u8],
         context: &[u8],
     ) -> StorageResult<CalyxRecurrenceSubjectReport>;
+    fn persist_recurrence_finding(
+        &self,
+        finding: &SynapseCalyxPersistedRecurrenceFinding,
+    ) -> StorageResult<SynapseCalyxPersistedRecurrenceFinding>;
     fn read_recurrence_subject_series(
         &self,
         kind: RecurrenceSubjectKind,
@@ -3456,6 +3461,26 @@ impl StorageBackend for CalyxBackend {
                     occurrence_identity,
                     context,
                 )
+            },
+        )
+    }
+
+    fn persist_recurrence_finding(
+        &self,
+        finding: &SynapseCalyxPersistedRecurrenceFinding,
+    ) -> StorageResult<SynapseCalyxPersistedRecurrenceFinding> {
+        self.with_vault(
+            "calyx_reactive",
+            "persist and read back routine recurrence finding",
+            true,
+            |vault| {
+                vault.persist_recurrence_finding(finding).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_reactive",
+                        "persist and read back routine recurrence finding",
+                        &source,
+                    )
+                })
             },
         )
     }

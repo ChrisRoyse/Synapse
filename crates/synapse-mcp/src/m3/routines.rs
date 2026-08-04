@@ -35,6 +35,9 @@ use num_traits::ToPrimitive as _;
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use synapse_calyx::{
+    SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxRecurrenceAppendDisposition,
+};
 use synapse_core::error_codes;
 use synapse_core::routines::{MiningDay, RoutineMiningConfig, mine_routines};
 use synapse_core::types::{
@@ -156,9 +159,24 @@ pub struct RoutineMineResponse {
     /// Confirmed identities moved to fail-closed quarantine because their
     /// canonical digest changed or no durable lock existed.
     pub state_rows_identity_quarantined: u64,
+    /// Newly inserted occurrences durably admitted after lifecycle reconcile.
+    pub recurrence_findings: Vec<RoutineRecurrenceFinding>,
+    pub recurrence_notifications_matched: u64,
+    pub recurrence_notifications_queued: u64,
+    pub recurrence_notifications_dropped: u64,
     pub dry_run: bool,
     /// The mined routines, strongest first (full persisted records).
     pub routines: Vec<RoutineRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineRecurrenceFinding {
+    pub routine_id: String,
+    pub subject_cx_id: String,
+    pub occurrence_id: u64,
+    pub frequency: u64,
+    pub observed_seq: u64,
 }
 
 #[must_use]
@@ -822,6 +840,10 @@ pub fn mine_and_store_routines(
                     state_rows_updated: state_counters.updated,
                     state_rows_marked_unmined: state_counters.marked_unmined,
                     state_rows_identity_quarantined: state_counters.identity_quarantined,
+                    recurrence_findings: Vec::new(),
+                    recurrence_notifications_matched: 0,
+                    recurrence_notifications_queued: 0,
+                    recurrence_notifications_dropped: 0,
                     dry_run: params.dry_run,
                     routines: Vec::new(),
                 });
@@ -861,6 +883,7 @@ pub fn mine_and_store_routines(
     let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
     let mut deleted = 0_u64;
     let mut state_counters = StateReconcileCounters::default();
+    let mut recurrence_findings = Vec::new();
     if params.dry_run {
         tracing::info!(
             code = "ROUTINE_MINE_DRY_RUN",
@@ -870,7 +893,7 @@ pub fn mine_and_store_routines(
             "routine_mine dry run computed without mutating CF_ROUTINES"
         );
     } else {
-        project_routine_recurrence_series(db, &mining.routines)?;
+        let recurrence_candidates = project_routine_recurrence_series(db, &mining.routines)?;
         let stale_keys = existing_routine_keys(db, &mut scanned_rows)?;
         deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         db.mutate_batch_pressure_bypass(cf::CF_ROUTINES, stale_keys, new_rows)
@@ -887,6 +910,27 @@ pub fn mine_and_store_routines(
         // this reconcile fails the error is loud, lifecycle rows are intact,
         // and the next mining run repairs the presence bookkeeping.
         state_counters = reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
+        for candidate in recurrence_candidates {
+            let Some(state) = load_state_row(db, &candidate.subject_id)? else {
+                return Err(internal(format!(
+                    "CALYX_ROUTINE_RECURRENCE_STATE_MISSING: reconciled routine={} has no CF_ROUTINE_STATE row",
+                    candidate.subject_id
+                )));
+            };
+            if state.lifecycle != RoutineLifecycle::Confirmed {
+                continue;
+            }
+            let persisted = db
+                .persist_recurrence_finding(&candidate)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            recurrence_findings.push(RoutineRecurrenceFinding {
+                routine_id: persisted.subject_id,
+                subject_cx_id: persisted.subject_cx_id,
+                occurrence_id: persisted.occurrence_id,
+                frequency: persisted.frequency,
+                observed_seq: persisted.observed_seq,
+            });
+        }
         reindex_armed_routine_schedule_due_indexes(db)?;
         tracing::info!(
             code = "ROUTINE_MINE_REPLACED",
@@ -928,12 +972,20 @@ pub fn mine_and_store_routines(
         state_rows_updated: state_counters.updated,
         state_rows_marked_unmined: state_counters.marked_unmined,
         state_rows_identity_quarantined: state_counters.identity_quarantined,
+        recurrence_findings,
+        recurrence_notifications_matched: 0,
+        recurrence_notifications_queued: 0,
+        recurrence_notifications_dropped: 0,
         dry_run: params.dry_run,
         routines: mining.routines,
     })
 }
 
-fn project_routine_recurrence_series(db: &Db, routines: &[RoutineRecord]) -> Result<(), ErrorData> {
+fn project_routine_recurrence_series(
+    db: &Db,
+    routines: &[RoutineRecord],
+) -> Result<Vec<SynapseCalyxPersistedRecurrenceFinding>, ErrorData> {
+    let mut inserted = Vec::new();
     for routine in routines {
         for evidence in &routine.evidence {
             let event_time_ns = evidence
@@ -962,7 +1014,7 @@ fn project_routine_recurrence_series(db: &Db, routines: &[RoutineRecord]) -> Res
                     routine.routine_id, evidence.day_start_ns
                 ))
             })?;
-            db.put_recurrence_subject_occurrence(
+            let report = db.put_recurrence_subject_occurrence(
                 RecurrenceSubjectKind::Routine,
                 &routine.routine_id,
                 event_time_ns,
@@ -978,9 +1030,21 @@ fn project_routine_recurrence_series(db: &Db, routines: &[RoutineRecord]) -> Res
                     ),
                 )
             })?;
+            if report.occurrence.disposition == SynapseCalyxRecurrenceAppendDisposition::Inserted
+                && report.occurrence.frequency >= 2
+            {
+                inserted.push(SynapseCalyxPersistedRecurrenceFinding {
+                    subject_kind: report.subject_kind,
+                    subject_id: report.subject_id,
+                    subject_cx_id: report.subject_cx_id,
+                    occurrence_id: report.occurrence.occurrence_id,
+                    frequency: report.occurrence.frequency,
+                    observed_seq: report.occurrence.latest_seq,
+                });
+            }
         }
     }
-    Ok(())
+    Ok(inserted)
 }
 
 /// Default and maximum `routine_list` page sizes.
