@@ -123,7 +123,8 @@ pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
 pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_965_006;
 pub const SYN_OBSERVATION_PANEL_VERSION_PRE_1965: u32 = 1_776_004;
 pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
-pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_776_005;
+pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_965_008;
+pub const SYN_OUTCOME_PANEL_VERSION_PRE_1965: u32 = 1_776_005;
 pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
 pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_965_007;
 pub const SYN_MCP_USAGE_PANEL_VERSION_PRE_1965: u32 = 1_776_006;
@@ -159,6 +160,8 @@ pub const SYN_GRAPHPOS_PROCESS_PANEL_VERSION: u32 = 1_685_002;
 pub const SYN_PATH_HIERARCHY_PANEL_NAME: &str = "syn-path-hierarchy-v1";
 pub const SYN_PATH_HIERARCHY_PANEL_VERSION: u32 = 1_685_003;
 pub const SYN_MCP_USAGE_KEY_PREFIX: &[u8] = b"mcp-usage/v1/";
+pub const SYN_OUTCOME_KEY_PREFIX: &[u8] = b"escalation/v1/audit/";
+pub const SYN_OUTCOME_BACKFILL_SOURCE: &str = "CF_KV:escalation/v1/audit/";
 /// Logical backfill source for the MCP-usage subset of the shared KV family.
 /// This is deliberately not `CF_KV`: using the whole family would reinterpret
 /// unrelated outcome rows as MCP usage and make a bounded migration impossible.
@@ -486,7 +489,8 @@ const OUT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(77);
 const OUT_SLOT_TARGET_HASH: SlotId = SlotId::new(78);
 const OUT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(79);
 const OUT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(80);
-const OUT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(81);
+// Slot 81 is reserved for the magnitude-weighted vector retired by #1965.
+const OUT_SLOT_RECORD_VECTOR_V2: SlotId = SlotId::new(116);
 
 const MU_SLOT_TOOL_ONEHOT: SlotId = SlotId::new(82);
 const MU_SLOT_OPERATION_ONEHOT: SlotId = SlotId::new(83);
@@ -631,6 +635,11 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_OUTCOME_PANEL_NAME,
         first: 75,
         last: 81,
+    },
+    PanelSlotBlock {
+        panel: SYN_OUTCOME_PANEL_NAME,
+        first: 116,
+        last: 116,
     },
     PanelSlotBlock {
         panel: SYN_MCP_USAGE_PANEL_NAME,
@@ -1057,6 +1066,11 @@ pub fn anchor_panel_for_source_cf(cf_name: &str) -> StorageResult<CalyxAnchorPan
             panel_name: SYN_MCP_USAGE_PANEL_NAME,
             panel_version: SYN_MCP_USAGE_PANEL_VERSION,
             input_mode: CalyxConstellationInputMode::McpUsageFramedSourceRow,
+        },
+        SYN_OUTCOME_BACKFILL_SOURCE => CalyxAnchorPanel {
+            panel_name: SYN_OUTCOME_PANEL_NAME,
+            panel_version: SYN_OUTCOME_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::FramedSourceRow,
         },
         cf::CF_KV | cf::CF_ROUTINE_STATE => CalyxAnchorPanel {
             panel_name: SYN_OUTCOME_PANEL_NAME,
@@ -2031,7 +2045,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (OUT_SLOT_TARGET_HASH, "syn.outcome.target_hash.v1"),
     (OUT_SLOT_HOUR_CYCLIC, "syn.outcome.hour_cyclic.v1"),
     (OUT_SLOT_DOW_CYCLIC, "syn.outcome.dow_cyclic.v1"),
-    (OUT_SLOT_RECORD_VECTOR, "syn.outcome.record_vector.v1"),
+    (OUT_SLOT_RECORD_VECTOR_V2, "syn.outcome.record_vector.v2"),
     (MU_SLOT_TOOL_ONEHOT, "syn.mcp_usage.tool_onehot.v1"),
     (
         MU_SLOT_OPERATION_ONEHOT,
@@ -2521,8 +2535,8 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::SubsetOfCf(cf::CF_KV),
             outcome_bearing: true,
             source_ttl_managed: false,
-            superseded_versions: &[1_669_001],
-            backfill_source_cf: None,
+            superseded_versions: &[1_669_001, SYN_OUTCOME_PANEL_VERSION_PRE_1965],
+            backfill_source_cf: Some(SYN_OUTCOME_BACKFILL_SOURCE),
         },
         PanelCatalogEntry {
             panel_name: SYN_MCP_USAGE_PANEL_NAME,
@@ -4815,15 +4829,15 @@ pub fn build_outcome_constellation(
         outcome_ts_ns(record),
     )?;
     slots.insert(
-        OUT_SLOT_RECORD_VECTOR,
+        OUT_SLOT_RECORD_VECTOR_V2,
         measure_json(
             SYN_OUTCOME_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.outcome.record_vector.v1",
+            AlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.outcome.record_vector.v2",
                 Modality::Structured,
                 128,
             ),
-            &outcome_numeric_record(record, raw_bytes),
+            &outcome_numeric_record_v2(record, raw_bytes),
         )?,
     );
 
@@ -7636,15 +7650,16 @@ fn mcp_usage_ts_ns(record: &Value) -> Option<u64> {
         .map(|ms| ms.saturating_mul(NS_PER_MS))
 }
 
-fn outcome_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
+fn outcome_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
+    let scaled = |value: u64, ceiling: u64| (value.min(ceiling) as f64) / (ceiling as f64);
     json!({
-        "raw_len_bytes": u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
+        "raw_len_scaled": scaled(u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX), 10_000),
         "has_event": bool_u64(outcome_event(record).is_some()),
         "has_status": bool_u64(outcome_status(record).is_some()),
         "has_target": bool_u64(outcome_target(record).is_some()),
         "has_timestamp": bool_u64(outcome_ts_ns(record).is_some()),
-        "code_count": json_u64(record, &["code_count"]).unwrap_or(0),
-        "ladder_index": json_u64(record, &["ladder_index"]).unwrap_or(0),
+        "code_count_scaled": scaled(json_u64(record, &["code_count"]).unwrap_or(0), 10),
+        "ladder_index_scaled": scaled(json_u64(record, &["ladder_index"]).unwrap_or(0), 10),
     })
 }
 

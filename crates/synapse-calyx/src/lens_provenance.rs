@@ -417,16 +417,16 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (72, 1965006, "syn.observation.hour_cyclic.v1", &["ts_ns"]),
     (73, 1965006, "syn.observation.dow_cyclic.v1", &["ts_ns"]),
-    (75, 1776005, "syn.outcome.source_cf_onehot.v1", &[]),
+    (75, 1965008, "syn.outcome.source_cf_onehot.v1", &[]),
     (
         76,
-        1776005,
+        1965008,
         "syn.outcome.event_onehot.v1",
         &["action", "event", "kind"],
     ),
     (
         77,
-        1776005,
+        1965008,
         "syn.outcome.status_onehot.v1",
         &[
             "after_status",
@@ -440,7 +440,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         78,
-        1776005,
+        1965008,
         "syn.outcome.target_hash.v1",
         &[
             "approval_id",
@@ -458,7 +458,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         79,
-        1776005,
+        1965008,
         "syn.outcome.hour_cyclic.v1",
         &[
             "at_unix_ms",
@@ -471,7 +471,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         80,
-        1776005,
+        1965008,
         "syn.outcome.dow_cyclic.v1",
         &[
             "at_unix_ms",
@@ -483,9 +483,9 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
         ],
     ),
     (
-        81,
-        1776005,
-        "syn.outcome.record_vector.v1",
+        116,
+        1965008,
+        "syn.outcome.record_vector.v2",
         &[
             "action",
             "after_status",
@@ -634,16 +634,16 @@ pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
         &["interruption_count", "interrupted_ms", "ended_because"],
     ),
     // `readback.code_count > 0` on the audit row.
-    ("synapse:verification_outcome", 1776005, &["code_count"]),
+    ("synapse:verification_outcome", 1965008, &["code_count"]),
     // `approval_anchor_value(audit.after_status)`.
-    ("synapse:approval_decision", 1776005, &["after_status"]),
+    ("synapse:approval_decision", 1965008, &["after_status"]),
     // The escalation `event` recorded on the audit row.
-    ("synapse:escalation_event", 1776005, &["event"]),
+    ("synapse:escalation_event", 1965008, &["event"]),
     // `routine_transition_anchor_value(action)`, which the state row records as
     // its lifecycle.
     (
         "synapse:routine_transition",
-        1776005,
+        1965008,
         &["lifecycle", "action"],
     ),
 ];

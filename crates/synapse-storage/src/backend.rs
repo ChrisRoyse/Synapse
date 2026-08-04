@@ -59,11 +59,12 @@ use crate::constellations::{
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
     SYN_MCP_USAGE_BACKFILL_SOURCE, SYN_MCP_USAGE_KEY_PREFIX, SYN_MCP_USAGE_PANEL_NAME,
     SYN_MCP_USAGE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
-    SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
-    SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
-    SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
-    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, SupersededPanelLineage,
-    assert_syn_lens_provenance_complete, superseded_panel_lineage, syn_active_panel_contract,
+    SYN_OUTCOME_BACKFILL_SOURCE, SYN_OUTCOME_KEY_PREFIX, SYN_OUTCOME_PANEL_NAME,
+    SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION,
+    SYN_RECURRENCE_SUBJECT_PANEL_NAME, SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME,
+    SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
+    SupersededPanelLineage, assert_syn_lens_provenance_complete, superseded_panel_lineage,
+    syn_active_panel_contract,
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
@@ -3722,6 +3723,7 @@ impl StorageBackend for CalyxBackend {
                 | cf::CF_PROCESS_HISTORY
                 | cf::CF_OBSERVATIONS
                 | SYN_MCP_USAGE_BACKFILL_SOURCE
+                | SYN_OUTCOME_BACKFILL_SOURCE
         ) {
             return Err(StorageError::BackendInvalidConfig {
                 value: source_cf.to_owned(),
@@ -3747,6 +3749,15 @@ impl StorageBackend for CalyxBackend {
                             .to_owned(),
                     });
                 }
+                if source_cf == SYN_OUTCOME_BACKFILL_SOURCE
+                    && !key.starts_with(SYN_OUTCOME_KEY_PREFIX)
+                {
+                    return Err(StorageError::BackendInvalidConfig {
+                        value: constellations::hex_encode(key),
+                        detail: "exact outcome backfill key is outside escalation/v1/audit/; remediation=pass a key from the declared prefix"
+                            .to_owned(),
+                    });
+                }
                 let physical_source_cf = backfill_physical_source_cf(source_cf);
                 self.get_cf(physical_source_cf, key)?
                     .map(|value| (vec![(key.to_vec(), value)], None, false, 1, 0))
@@ -3758,7 +3769,12 @@ impl StorageBackend for CalyxBackend {
                         ),
                     })?
             } else {
-                let page = if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
+                let prefix = match source_cf {
+                    SYN_MCP_USAGE_BACKFILL_SOURCE => Some(SYN_MCP_USAGE_KEY_PREFIX),
+                    SYN_OUTCOME_BACKFILL_SOURCE => Some(SYN_OUTCOME_KEY_PREFIX),
+                    _ => None,
+                };
+                let page = if let Some(prefix) = prefix {
                     self.with_vault(
                         cf::CF_KV,
                         "scan candidate-bounded MCP-usage prefix page",
@@ -3767,7 +3783,7 @@ impl StorageBackend for CalyxBackend {
                             read_physical_prefix_page_from_vault(
                                 vault,
                                 cf::CF_KV,
-                                SYN_MCP_USAGE_KEY_PREFIX,
+                                prefix,
                                 after_physical,
                                 max_rows,
                             )
@@ -3826,6 +3842,8 @@ impl StorageBackend for CalyxBackend {
         for (key, raw) in rows {
             let identity_input = if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
                 constellations::mcp_usage_constellation_input_bytes(cf::CF_KV, &key, &raw)
+            } else if source_cf == SYN_OUTCOME_BACKFILL_SOURCE {
+                constellations::outcome_constellation_input_bytes(cf::CF_KV, &key, &raw)
             } else {
                 raw.clone()
             };
@@ -3908,6 +3926,18 @@ impl StorageBackend for CalyxBackend {
                                 .map_err(|error| decode_failed(&error, "MCP usage"))?;
                             constellations::build_mcp_usage_constellation(
                                 context,
+                                &key,
+                                &raw,
+                                &identity_input,
+                                &record,
+                            )?
+                        }
+                        SYN_OUTCOME_BACKFILL_SOURCE => {
+                            let record: Value = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "outcome"))?;
+                            constellations::build_outcome_constellation(
+                                context,
+                                cf::CF_KV,
                                 &key,
                                 &raw,
                                 &identity_input,
@@ -10470,6 +10500,7 @@ fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {
         cf::CF_PROCESS_HISTORY => Ok(SYN_PROCESS_PANEL_VERSION),
         cf::CF_OBSERVATIONS => Ok(SYN_OBSERVATION_PANEL_VERSION),
         SYN_MCP_USAGE_BACKFILL_SOURCE => Ok(SYN_MCP_USAGE_PANEL_VERSION),
+        SYN_OUTCOME_BACKFILL_SOURCE => Ok(SYN_OUTCOME_PANEL_VERSION),
         other => Err(StorageError::BackendInvalidConfig {
             value: other.to_owned(),
             detail: "no active panel generation is declared for this backfill source CF".to_owned(),
@@ -10478,7 +10509,10 @@ fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {
 }
 
 fn backfill_physical_source_cf(source_cf: &str) -> &str {
-    if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
+    if matches!(
+        source_cf,
+        SYN_MCP_USAGE_BACKFILL_SOURCE | SYN_OUTCOME_BACKFILL_SOURCE
+    ) {
         cf::CF_KV
     } else {
         source_cf
