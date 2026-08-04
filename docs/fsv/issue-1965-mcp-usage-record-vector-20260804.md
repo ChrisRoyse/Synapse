@@ -22,10 +22,9 @@ token rather than whether the filtered result is empty.
 - Authoritative inputs: physical Calyx KV rows under `mcp-usage/v1/`.
 - Result: Calyx Base rows at panel `1965007`, physical slot CF 115 rows, Anchors CF
   rows, Ledger chain, panel-coverage census, installed daemon image, and backup bytes.
-- Pre-change verified backup:
-  `issue-1965-observation-vectors-20260804T0240Z`.
-- Post-change verified backup:
-  `issue-1965-mcp-usage-vectors-20260804T0320Z`.
+- The tranche backups were verified at the time recorded below and were removed
+  only after the final all-panels backup in the outcome FSV independently passed,
+  reclaiming 4,384,361,033 bytes.
 
 ## Execute and inspect
 
