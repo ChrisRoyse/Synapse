@@ -111,11 +111,14 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904: u32 = 1_665_002;
 // would be reinterpreted under the new meaning. The `_1776` generation is the
 // first that writes into the panel's own block.
 pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
-pub const SYN_ACTION_PANEL_VERSION: u32 = 1_776_001;
+pub const SYN_ACTION_PANEL_VERSION: u32 = 1_965_003;
+pub const SYN_ACTION_PANEL_VERSION_PRE_1965: u32 = 1_776_001;
 pub const SYN_REFLEX_PANEL_NAME: &str = "syn-reflex-v1";
-pub const SYN_REFLEX_PANEL_VERSION: u32 = 1_776_002;
+pub const SYN_REFLEX_PANEL_VERSION: u32 = 1_965_004;
+pub const SYN_REFLEX_PANEL_VERSION_PRE_1965: u32 = 1_776_002;
 pub const SYN_PROCESS_PANEL_NAME: &str = "syn-process-v1";
-pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_776_003;
+pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_965_005;
+pub const SYN_PROCESS_PANEL_VERSION_PRE_1965: u32 = 1_776_003;
 pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
 pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_776_004;
 pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
@@ -441,7 +444,7 @@ const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 // recomputed.
 const ACT_SLOT_KIND_ONEHOT: SlotId = SlotId::new(48);
 const ACT_SLOT_TARGET_HASH: SlotId = SlotId::new(49);
-const ACT_SLOT_PARAMS_RECORD_VECTOR: SlotId = SlotId::new(50);
+// Slot 50 is reserved for the magnitude-weighted vector retired by #1965.
 const ACT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(51);
 const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(52);
 
@@ -451,7 +454,7 @@ const RF_SLOT_LATENCY_LOG1P: SlotId = SlotId::new(55);
 const RF_SLOT_STEP_COUNT_LOG1P: SlotId = SlotId::new(56);
 const RF_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(57);
 const RF_SLOT_DOW_CYCLIC: SlotId = SlotId::new(58);
-const RF_SLOT_RECORD_VECTOR: SlotId = SlotId::new(59);
+// Slot 59 is reserved for the magnitude-weighted vector retired by #1965.
 
 const PR_SLOT_PROCESS_HASH: SlotId = SlotId::new(60);
 const PR_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(61);
@@ -459,7 +462,7 @@ const PR_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(62);
 const PR_SLOT_DOW_CYCLIC: SlotId = SlotId::new(63);
 const PR_SLOT_UPTIME_LOG1P: SlotId = SlotId::new(64);
 const PR_SLOT_RECENCY_RANK: SlotId = SlotId::new(65);
-const PR_SLOT_RECORD_VECTOR: SlotId = SlotId::new(66);
+// Slot 66 is reserved for the magnitude-weighted vector retired by #1965.
 
 const OB_SLOT_APP_HASH: SlotId = SlotId::new(67);
 const OB_SLOT_ROLE_HISTOGRAM: SlotId = SlotId::new(68);
@@ -1978,10 +1981,6 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     ),
     (ACT_SLOT_KIND_ONEHOT, "syn.action.kind_onehot.v1"),
     (ACT_SLOT_TARGET_HASH, "syn.action.target_hash.v1"),
-    (
-        ACT_SLOT_PARAMS_RECORD_VECTOR,
-        "syn.action.params_record_vector.v1",
-    ),
     (ACT_SLOT_HOUR_CYCLIC, "syn.action.hour_cyclic.v1"),
     (ACT_SLOT_DOW_CYCLIC, "syn.action.dow_cyclic.v1"),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
@@ -1990,14 +1989,12 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (RF_SLOT_STEP_COUNT_LOG1P, "syn.reflex.step_count_log1p.v1"),
     (RF_SLOT_HOUR_CYCLIC, "syn.reflex.hour_cyclic.v1"),
     (RF_SLOT_DOW_CYCLIC, "syn.reflex.dow_cyclic.v1"),
-    (RF_SLOT_RECORD_VECTOR, "syn.reflex.record_vector.v1"),
     (PR_SLOT_PROCESS_HASH, "syn.process.process_hash.v1"),
     (PR_SLOT_EVENT_ONEHOT, "syn.process.event_onehot.v1"),
     (PR_SLOT_HOUR_CYCLIC, "syn.process.hour_cyclic.v1"),
     (PR_SLOT_DOW_CYCLIC, "syn.process.dow_cyclic.v1"),
     (PR_SLOT_UPTIME_LOG1P, "syn.process.uptime_ms_log1p.v1"),
     (PR_SLOT_RECENCY_RANK, "syn.process.event_time_rank.v1"),
-    (PR_SLOT_RECORD_VECTOR, "syn.process.record_vector.v1"),
     (OB_SLOT_APP_HASH, "syn.observation.app_hash.v1"),
     (OB_SLOT_ROLE_HISTOGRAM, "syn.observation.role_histogram.v1"),
     (
@@ -2393,7 +2390,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_ACTION_LOG),
             outcome_bearing: false,
             source_ttl_managed: true,
-            superseded_versions: &[1_666_001],
+            superseded_versions: &[1_666_001, SYN_ACTION_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
         PanelCatalogEntry {
@@ -2402,7 +2399,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_REFLEX_AUDIT),
             outcome_bearing: false,
             source_ttl_managed: true,
-            superseded_versions: &[1_666_002],
+            superseded_versions: &[1_666_002, SYN_REFLEX_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_REFLEX_AUDIT),
         },
         PanelCatalogEntry {
@@ -2411,7 +2408,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_PROCESS_HISTORY),
             outcome_bearing: false,
             source_ttl_managed: true,
-            superseded_versions: &[1_666_003],
+            superseded_versions: &[1_666_003, SYN_PROCESS_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_PROCESS_HISTORY),
         },
         PanelCatalogEntry {
@@ -3228,9 +3225,6 @@ pub fn syn_content_slot(
 const RECORD_VECTOR_MAGNITUDE_GRANDFATHERED: &[(u32, &str, u64)] = &[
     (1_983_001, "syn-agent-event-v1", 9_091),
     (1_983_002, "syn-agent-transcript-v1", 50_973),
-    (1_776_001, "syn-action-v1", 1_089),
-    (1_776_002, "syn-reflex-v1", 5),
-    (1_776_003, "syn-process-v1", 4),
     (1_776_004, "syn-observation-v1", 2),
     (1_776_005, "syn-outcome-v1", 18),
     (1_776_006, "syn-mcp-usage-v1", 9_842),
@@ -4494,18 +4488,6 @@ pub fn build_action_constellation(
             2048,
         )?,
     );
-    slots.insert(
-        ACT_SLOT_PARAMS_RECORD_VECTOR,
-        measure_json(
-            SYN_ACTION_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.action.params_record_vector.v1",
-                Modality::Structured,
-                96,
-            ),
-            &action_numeric_record(record),
-        )?,
-    );
     insert_time_slots(
         &mut slots,
         SYN_ACTION_PANEL_NAME,
@@ -4584,18 +4566,6 @@ pub fn build_reflex_audit_constellation(
         "syn.reflex.dow_cyclic.v1",
         Some(record.ts_ns),
     )?;
-    slots.insert(
-        RF_SLOT_RECORD_VECTOR,
-        measure_json(
-            SYN_REFLEX_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.reflex.record_vector.v1",
-                Modality::Structured,
-                64,
-            ),
-            &reflex_numeric_record(record),
-        )?,
-    );
 
     let scalars = reflex_scalars(record, raw_bytes)?;
     let metadata = reflex_metadata(source_key, raw_bytes, record)?;
@@ -4667,18 +4637,6 @@ pub fn build_process_constellation(
             ts_ns.map(|value| value / NS_PER_MS),
             0,
             RECENCY_RANK_MAX_UNIX_MS_MICROS,
-        )?,
-    );
-    slots.insert(
-        PR_SLOT_RECORD_VECTOR,
-        measure_json(
-            SYN_PROCESS_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.process.record_vector.v1",
-                Modality::Structured,
-                64,
-            ),
-            &process_numeric_record(record),
         )?,
     );
 
@@ -7491,20 +7449,6 @@ fn action_target_text(record: &Value) -> Option<String> {
     )
 }
 
-fn action_numeric_record(record: &Value) -> Value {
-    json!({
-        "record_present": 1,
-        "schema_version": json_u64(record, &["schema_version"]).unwrap_or(0),
-        "ts_unix_ms": json_u64(record, &["ts_ns"]).map_or(0, |value| value / NS_PER_MS),
-        "seq": json_u64(record, &["seq"]).unwrap_or(0),
-        "payload_bytes": json_u64(record, &["payload_bytes"]).unwrap_or(0),
-        "payload_truncated": bool_u64(json_bool(record, &["payload_truncated"]).unwrap_or(false)),
-        "has_target": bool_u64(action_target_text(record).as_deref().and_then(non_empty).is_some()),
-        "has_error": bool_u64(json_non_null(record, &["error"]) || json_non_null(record, &["error_code"])),
-        "redacted": bool_u64(json_bool(record, &["redacted"]).unwrap_or(false)),
-    })
-}
-
 fn reflex_latency_ms(record: &StoredReflexAudit) -> Option<u64> {
     json_u64(
         &record.details,
@@ -7516,19 +7460,6 @@ fn reflex_latency_ms(record: &StoredReflexAudit) -> Option<u64> {
             "total_latency_ms",
         ],
     )
-}
-
-fn reflex_numeric_record(record: &StoredReflexAudit) -> Value {
-    json!({
-        "record_present": 1,
-        "schema_version": record.schema_version,
-        "ts_unix_ms": record.ts_ns / NS_PER_MS,
-        "step_count": record.steps.len(),
-        "latency_ms": reflex_latency_ms(record).unwrap_or(0),
-        "has_event_id": bool_u64(record.event_id.as_deref().and_then(non_empty).is_some()),
-        "has_error": bool_u64(record.error_code.as_deref().and_then(non_empty).is_some()),
-        "redacted": bool_u64(record.redacted),
-    })
 }
 
 fn process_event_kind(record: &Value) -> String {
@@ -7552,21 +7483,6 @@ fn process_identity_text(record: &Value) -> Option<String> {
 fn process_ts_ns(record: &Value) -> Option<u64> {
     json_u64(record, &["ts_ns"]).or_else(|| {
         json_u64(record, &["launched_at_unix_ms"]).map(|value| value.saturating_mul(NS_PER_MS))
-    })
-}
-
-fn process_numeric_record(record: &Value) -> Value {
-    json!({
-        "record_present": 1,
-        "schema_version": json_u64(record, &["schema_version"]).unwrap_or(0),
-        "ts_unix_ms": process_ts_ns(record).map_or(0, |value| value / NS_PER_MS),
-        "pid": json_u64(record, &["pid"]).unwrap_or(0),
-        "window_owner_pid": json_u64(record, &["window_owner_pid"]).unwrap_or(0),
-        "has_hwnd": bool_u64(json_non_null(record, &["hwnd"])),
-        "reused_existing_window": bool_u64(json_bool(record, &["reused_existing_window"]).unwrap_or(false)),
-        "uptime_ms": json_u64(record, &["uptime_ms", "duration_ms"]).unwrap_or(0),
-        "has_cdp_debug_port": bool_u64(json_non_null(record, &["cdp_debug_port"])),
-        "has_desktop": bool_u64(json_non_null(record, &["desktop"])),
     })
 }
 
