@@ -295,7 +295,7 @@ pub fn gate_decision(
 ) -> GateOutcome {
     if matches!(
         lifecycle,
-        RoutineLifecycle::Disabled | RoutineLifecycle::Archived
+        RoutineLifecycle::Disabled | RoutineLifecycle::Archived | RoutineLifecycle::Quarantined
     ) {
         return GateOutcome::DisabledRoutine;
     }

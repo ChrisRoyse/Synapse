@@ -577,7 +577,7 @@ fn evaluate_armed_record_due(
     if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
         && matches!(
             state.lifecycle,
-            RoutineLifecycle::Disabled | RoutineLifecycle::Archived
+            RoutineLifecycle::Disabled | RoutineLifecycle::Archived | RoutineLifecycle::Quarantined
         )
     {
         skipped.push(skip(&record.routine_id, "routine_lifecycle_disabled"));
@@ -1241,7 +1241,7 @@ fn build_schedule_due_index_record(
     if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
         && matches!(
             state.lifecycle,
-            RoutineLifecycle::Disabled | RoutineLifecycle::Archived
+            RoutineLifecycle::Disabled | RoutineLifecycle::Archived | RoutineLifecycle::Quarantined
         )
     {
         return Ok(None);

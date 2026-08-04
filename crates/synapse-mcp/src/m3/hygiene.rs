@@ -2008,6 +2008,7 @@ fn lifecycle_label(lifecycle: RoutineLifecycle) -> String {
         RoutineLifecycle::Confirmed => "confirmed",
         RoutineLifecycle::Disabled => "disabled",
         RoutineLifecycle::Archived => "archived",
+        RoutineLifecycle::Quarantined => "quarantined",
     }
     .to_owned()
 }

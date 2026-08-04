@@ -11,7 +11,7 @@ pub const ROUTINE_RECORD_VERSION: u32 = 1;
 /// `#[serde(default)]`, so v1 rows written before #856 deserialize cleanly as
 /// "no feedback yet"; the next `routine_feedback`/`routine_update`/re-mine
 /// write upgrades the row to v2 in place.
-pub const ROUTINE_STATE_RECORD_VERSION: u32 = 2;
+pub const ROUTINE_STATE_RECORD_VERSION: u32 = 3;
 
 /// Newest-last cap on [`RoutineStateRecord::feedback_events`].
 pub const ROUTINE_STATE_MAX_FEEDBACK_EVENTS: usize = 200;
@@ -138,6 +138,10 @@ pub enum RoutineLifecycle {
     Candidate,
     /// Operator confirmed the routine as real and useful.
     Confirmed,
+    /// The mined identity no longer matches the exact identity the operator
+    /// confirmed. Quarantined routines are excluded from matching, suggestion,
+    /// and execution until an operator explicitly confirms the new identity.
+    Quarantined,
     /// Operator disabled it: the miner keeps re-deriving the record, but
     /// intent matching and suggestion surfaces must ignore it, and nothing
     /// may re-promote it automatically.
@@ -157,6 +161,21 @@ pub enum RoutineStateAction {
     Enable,
     Archive,
     Rename,
+    /// The identity-lock verifier quarantined a changed or unprovable routine.
+    IdentityQuarantine,
+}
+
+/// Exact operator-confirmed identity bound to one derived routine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineIdentityLock {
+    /// SHA-256 over the canonical identity-bearing projection of the mined row.
+    pub canonical_sha256: String,
+    pub confirmed_ts_ns: u64,
+    pub confirmed_by: String,
+    /// Last identity digest observed by reconciliation.
+    pub last_observed_sha256: String,
+    pub last_verified_ts_ns: u64,
 }
 
 /// One audit entry in a routine's lifecycle history: what happened, when,
@@ -232,6 +251,10 @@ pub struct RoutineStateRecord {
     pub record_version: u32,
     pub routine_id: String,
     pub lifecycle: RoutineLifecycle,
+    /// Present only after an explicit operator confirmation. A confirmed row
+    /// without this lock fails closed into `quarantined` on reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_lock: Option<RoutineIdentityLock>,
     /// Operator-assigned display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,

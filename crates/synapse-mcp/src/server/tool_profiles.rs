@@ -2092,6 +2092,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "switch to an explicit maintenance profile before running GC",
             ),
             op(
+                "put_probe_rows",
+                true,
+                false,
+                "one allowlisted storage CF populated through its real codec and synchronous storage write path",
+                Some("exact before/after CF row counts and physical CF byte size"),
+                error_codes::SAFETY_PERMISSION_DENIED,
+                "grant WRITE_STORAGE explicitly and use only the bounded allowlisted diagnostic CF/key modes",
+            ),
+            op(
                 "anchors",
                 false,
                 false,
@@ -6221,10 +6230,11 @@ mod facade_schema_parity_tests {
         // catch an *unlisted* operation had itself been failing, and every new
         // operation since then went unverified. A count that restates the
         // length of the list above it cannot drift from it.
-        const EXPECTED_OPERATIONS: [&str; 18] = [
+        const EXPECTED_OPERATIONS: [&str; 19] = [
             "inspect",
             "summary",
             "gc_once",
+            "put_probe_rows",
             "anchors",
             "temporal_panels",
             "corpus_histogram",

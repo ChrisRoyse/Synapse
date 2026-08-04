@@ -12,8 +12,9 @@
 //! audit trail, confidence history) keyed by the same stable routine id.
 //! The miner reconciles it after every replace-all — creating candidate
 //! rows for new routines, appending confidence change-points, and flagging
-//! rows whose routine vanished — but NEVER changes a lifecycle the operator
-//! set, so a disabled routine stays disabled across every re-mine.
+//! rows whose routine vanished. It never promotes lifecycle state, but it
+//! fail-closed quarantines confirmed routines whose locked canonical identity
+//! drifts or disappears. Disabled routines stay disabled across every re-mine.
 //!
 //! The same mining entry point serves the on-demand MCP tool and the
 //! periodic in-daemon batch job ([`super::routine_miner_job`]); a
@@ -32,14 +33,15 @@ use std::sync::{Arc, Mutex};
 use chrono::{Datelike, Local, TimeZone};
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 use synapse_core::routines::{MiningDay, RoutineMiningConfig, mine_routines};
 use synapse_core::types::{
     EpisodeRecord, ROUTINE_STATE_MAX_CONFIDENCE_POINTS, ROUTINE_STATE_MAX_FEEDBACK_EVENTS,
     ROUTINE_STATE_MAX_TRANSITIONS, ROUTINE_STATE_RECORD_VERSION, RoutineConfidencePoint,
     RoutineDowClass, RoutineFeedbackEvent, RoutineFeedbackOutcome, RoutineGranularity,
-    RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord, RoutineStep,
-    RoutineTransition,
+    RoutineIdentityLock, RoutineLifecycle, RoutineRecord, RoutineStateAction, RoutineStateRecord,
+    RoutineStep, RoutineTransition,
 };
 use synapse_storage::{
     Db, RecurrenceSubjectKind, cf, decode_json, encode_json, routines as routine_codec,
@@ -150,6 +152,9 @@ pub struct RoutineMineResponse {
     /// `CF_ROUTINE_STATE` rows flagged `present_in_last_mine=false` because
     /// this run no longer derived their routine (0 on dry runs).
     pub state_rows_marked_unmined: u64,
+    /// Confirmed identities moved to fail-closed quarantine because their
+    /// canonical digest changed or no durable lock existed.
+    pub state_rows_identity_quarantined: u64,
     pub dry_run: bool,
     /// The mined routines, strongest first (full persisted records).
     pub routines: Vec<RoutineRecord>,
@@ -568,6 +573,7 @@ struct StateReconcileCounters {
     created: u64,
     updated: u64,
     marked_unmined: u64,
+    identity_quarantined: u64,
 }
 
 /// Reconciles `CF_ROUTINE_STATE` with the routines a mining run just
@@ -593,6 +599,54 @@ fn reconcile_state_rows(
             opportunity_days: routine.opportunity_days,
         };
         if let Some(mut state) = existing.remove(&routine.routine_id) {
+            let observed_identity = routine_identity_sha256(routine)?;
+            if matches!(
+                state.lifecycle,
+                RoutineLifecycle::Confirmed | RoutineLifecycle::Quarantined
+            ) {
+                let lock_matches = state
+                    .identity_lock
+                    .as_ref()
+                    .is_some_and(|lock| lock.canonical_sha256 == observed_identity);
+                if state.lifecycle == RoutineLifecycle::Confirmed && !lock_matches {
+                    let reason = match state.identity_lock.as_ref() {
+                        Some(lock) => format!(
+                            "confirmed routine identity drift: canonical_sha256={} observed_sha256={observed_identity}",
+                            lock.canonical_sha256
+                        ),
+                        None => format!(
+                            "confirmed routine has no durable identity lock after schema upgrade; observed_sha256={observed_identity}"
+                        ),
+                    };
+                    state.lifecycle = RoutineLifecycle::Quarantined;
+                    push_transition(
+                        &mut state,
+                        RoutineTransition {
+                            ts_ns: mined_at,
+                            action: RoutineStateAction::IdentityQuarantine,
+                            from: Some(RoutineLifecycle::Confirmed),
+                            to: RoutineLifecycle::Quarantined,
+                            by: MINER_ACTOR.to_owned(),
+                            label_before: None,
+                            label_after: None,
+                            note: Some(reason.clone()),
+                        },
+                    );
+                    counters.identity_quarantined += 1;
+                    tracing::error!(
+                        code = "ROUTINE_IDENTITY_DRIFT",
+                        routine_id = %routine.routine_id,
+                        observed_sha256 = %observed_identity,
+                        remediation = "inspect the mined routine and its evidence; if the new identity is intended, explicitly confirm it through routine_update",
+                        reason,
+                        "confirmed routine identity failed closed into quarantine"
+                    );
+                }
+                if let Some(lock) = state.identity_lock.as_mut() {
+                    lock.last_observed_sha256 = observed_identity;
+                    lock.last_verified_ts_ns = mined_at;
+                }
+            }
             state.present_in_last_mine = true;
             state.last_mined_ts_ns = Some(mined_at);
             state.updated_ts_ns = mined_at;
@@ -604,6 +658,7 @@ fn reconcile_state_rows(
                 record_version: ROUTINE_STATE_RECORD_VERSION,
                 routine_id: routine.routine_id.clone(),
                 lifecycle: RoutineLifecycle::Candidate,
+                identity_lock: None,
                 label: None,
                 created_ts_ns: mined_at,
                 updated_ts_ns: mined_at,
@@ -641,6 +696,36 @@ fn reconcile_state_rows(
         if state.present_in_last_mine {
             state.present_in_last_mine = false;
             state.updated_ts_ns = mined_at;
+            if state.lifecycle == RoutineLifecycle::Confirmed {
+                state.lifecycle = RoutineLifecycle::Quarantined;
+                push_transition(
+                    &mut state,
+                    RoutineTransition {
+                        ts_ns: mined_at,
+                        action: RoutineStateAction::IdentityQuarantine,
+                        from: Some(RoutineLifecycle::Confirmed),
+                        to: RoutineLifecycle::Quarantined,
+                        by: MINER_ACTOR.to_owned(),
+                        label_before: None,
+                        label_after: None,
+                        note: Some(
+                            "confirmed routine disappeared from the complete mining result; canonical identity is no longer present"
+                                .to_owned(),
+                        ),
+                    },
+                );
+                counters.identity_quarantined += 1;
+                tracing::error!(
+                    code = "ROUTINE_IDENTITY_DRIFT",
+                    routine_id = %state.routine_id,
+                    canonical_sha256 = state
+                        .identity_lock
+                        .as_ref()
+                        .map_or("<missing>", |lock| lock.canonical_sha256.as_str()),
+                    remediation = "inspect the current mining result and episode evidence; explicitly confirm the intended replacement rather than reusing this missing identity",
+                    "confirmed routine disappeared and failed closed into quarantine"
+                );
+            }
             counters.marked_unmined += 1;
             writes.push(state);
         }
@@ -735,6 +820,7 @@ pub fn mine_and_store_routines(
                     state_rows_created: state_counters.created,
                     state_rows_updated: state_counters.updated,
                     state_rows_marked_unmined: state_counters.marked_unmined,
+                    state_rows_identity_quarantined: state_counters.identity_quarantined,
                     dry_run: params.dry_run,
                     routines: Vec::new(),
                 });
@@ -812,6 +898,7 @@ pub fn mine_and_store_routines(
             state_rows_created = state_counters.created,
             state_rows_updated = state_counters.updated,
             state_rows_marked_unmined = state_counters.marked_unmined,
+            state_rows_identity_quarantined = state_counters.identity_quarantined,
             "routine_mine replaced the routine store"
         );
     }
@@ -839,6 +926,7 @@ pub fn mine_and_store_routines(
         state_rows_created: state_counters.created,
         state_rows_updated: state_counters.updated,
         state_rows_marked_unmined: state_counters.marked_unmined,
+        state_rows_identity_quarantined: state_counters.identity_quarantined,
         dry_run: params.dry_run,
         routines: mining.routines,
     })
@@ -908,6 +996,7 @@ fn synthesized_default_state(routine: &RoutineRecord) -> RoutineStateRecord {
         record_version: ROUTINE_STATE_RECORD_VERSION,
         routine_id: routine.routine_id.clone(),
         lifecycle: RoutineLifecycle::Candidate,
+        identity_lock: None,
         label: None,
         created_ts_ns: routine.ts_ns,
         updated_ts_ns: routine.ts_ns,
@@ -1509,6 +1598,34 @@ fn step_identity(step: &RoutineStep) -> String {
     }
 }
 
+#[derive(Serialize)]
+struct RoutineIdentityProjection<'a> {
+    routine_id: &'a str,
+    granularity: RoutineGranularity,
+    steps: &'a [RoutineStep],
+    dow_class: &'a RoutineDowClass,
+    mean_minute_of_day: u32,
+    tolerance_minutes: u32,
+}
+
+fn routine_identity_sha256(record: &RoutineRecord) -> Result<String, ErrorData> {
+    let projection = RoutineIdentityProjection {
+        routine_id: &record.routine_id,
+        granularity: record.granularity,
+        steps: &record.steps,
+        dow_class: &record.dow_class,
+        mean_minute_of_day: record.mean_minute_of_day,
+        tolerance_minutes: record.tolerance_minutes,
+    };
+    let bytes = serde_json::to_vec(&projection).map_err(|error| {
+        internal(format!(
+            "ROUTINE_IDENTITY_ENCODE_FAILED: routine_id={} could not encode its canonical identity projection: {error}",
+            record.routine_id
+        ))
+    })?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
 fn render_dow_class(dow: &RoutineDowClass) -> String {
     match dow {
         RoutineDowClass::Daily => "daily".to_owned(),
@@ -1964,9 +2081,9 @@ fn transition_target(
     action: RoutineUpdateAction,
     current: RoutineLifecycle,
 ) -> Result<RoutineLifecycle, ErrorData> {
-    use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled};
+    use RoutineLifecycle::{Archived, Candidate, Confirmed, Disabled, Quarantined};
     let target = match (action, current) {
-        (RoutineUpdateAction::Confirm, Candidate) => Confirmed,
+        (RoutineUpdateAction::Confirm, Candidate | Quarantined) => Confirmed,
         (RoutineUpdateAction::Disable, Candidate | Confirmed) => Disabled,
         (RoutineUpdateAction::Enable, Disabled | Archived) => Candidate,
         (RoutineUpdateAction::Archive, Candidate | Confirmed | Disabled) => Archived,
@@ -1975,7 +2092,7 @@ fn transition_target(
         (action, current) => {
             return Err(invalid(format!(
                 "ROUTINE_TRANSITION_INVALID: action {action:?} is not legal from lifecycle \
-                 {current:?} (confirm: candidate→confirmed; disable: candidate|confirmed→\
+                 {current:?} (confirm: candidate|quarantined→confirmed; disable: candidate|confirmed→\
                  disabled; enable: disabled|archived→candidate; archive: candidate|confirmed|\
                  disabled→archived)"
             )));
@@ -2159,6 +2276,22 @@ pub fn update_routine(
 
     let now = now_ts_ns();
     state.lifecycle = lifecycle_after;
+    if params.action == RoutineUpdateAction::Confirm {
+        let record = load_routine_record(db, &params.routine_id)?.ok_or_else(|| {
+            invalid(format!(
+                "ROUTINE_IDENTITY_SOURCE_ABSENT: routine_id {} cannot be confirmed because its canonical CF_ROUTINES row is absent; run routine_mine and inspect the derived identity first",
+                params.routine_id
+            ))
+        })?;
+        let canonical_sha256 = routine_identity_sha256(&record)?;
+        state.identity_lock = Some(RoutineIdentityLock {
+            canonical_sha256: canonical_sha256.clone(),
+            confirmed_ts_ns: now,
+            confirmed_by: by_session.to_owned(),
+            last_observed_sha256: canonical_sha256,
+            last_verified_ts_ns: now,
+        });
+    }
     state.label.clone_from(&label_after);
     state.updated_ts_ns = now;
     push_transition(
