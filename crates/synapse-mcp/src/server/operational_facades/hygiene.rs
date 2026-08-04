@@ -751,7 +751,7 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let response = tokio::task::spawn_blocking(move || {
+            let mut response = tokio::task::spawn_blocking(move || {
                 crate::m3::hygiene::run_guard_verify(&db, &spec)
             })
             .await
@@ -768,17 +768,50 @@ pub(super) async fn handle(
                     "inspect daemon logs; the guard-verification task terminated abnormally",
                 )
             })??;
+            if let Some(finding) = &response.persisted_novelty {
+                let event_bus = service.sse_state()?.event_bus();
+                let report = event_bus.publish(synapse_core::types::Event {
+                    seq: finding.ledger_seq,
+                    at: chrono::Utc::now(),
+                    source: synapse_core::types::EventSource::System,
+                    kind: format!("calyx.reactive.{}", finding.action),
+                    data: serde_json::to_value(finding).map_err(|error| {
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!(
+                                "serialize committed Reactive CF novelty finding for delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
+                            ),
+                        )
+                    })?,
+                    correlations: Vec::new(),
+                });
+                response.notifications_matched = report.matched as u64;
+                response.notifications_queued = report.queued as u64;
+                response.notifications_dropped = report.dropped;
+                if report.dropped > 0 {
+                    return Err(crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "reactive novelty delivery dropped {} subscription notification(s) after persisting the Reactive CF row at ledger_seq={}; remediation=consume or recreate the saturated subscription, then read the durable Reactive CF finding before retrying delivery",
+                            report.dropped, finding.ledger_seq
+                        ),
+                    ));
+                }
+            }
             Ok(Json(hygiene_response(
                 operation,
                 format!(
-                    "guard_id={} overall_pass={} provisional={} policy={} required_slots={} failing_slots={} trusted_exemplars={}",
+                    "guard_id={} overall_pass={} provisional={} policy={} required_slots={} failing_slots={} trusted_exemplars={} reactive_persisted={} notifications_matched={} notifications_queued={}",
                     response.guard_id,
                     response.overall_pass,
                     response.provisional,
                     response.policy,
                     response.required_slots.len(),
                     response.failing_slots.len(),
-                    response.trusted_exemplars
+                    response.trusted_exemplars,
+                    response.persisted_novelty.is_some(),
+                    response.notifications_matched,
+                    response.notifications_queued,
                 ),
                 |out| out.guard_verify = Some(response),
             )))

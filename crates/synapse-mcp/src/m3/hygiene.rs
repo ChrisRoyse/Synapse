@@ -844,6 +844,18 @@ pub struct HygieneGuardCalibrateParams {
     /// written.
     #[serde(default)]
     pub persist: Option<bool>,
+    /// OOD disposition persisted in the calibrated profile. Omitted keeps the
+    /// existing fail-closed `reject_closed` policy.
+    #[serde(default)]
+    pub novelty_action: Option<HygieneGuardNoveltyAction>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HygieneGuardNoveltyAction {
+    RejectClosed,
+    NewRegion,
+    Quarantine,
 }
 
 /// One slot's calibration evidence.
@@ -872,6 +884,7 @@ pub struct HygieneGuardCalibrateResponse {
     pub domain: String,
     pub guard_id: String,
     pub alpha: f32,
+    pub novelty_action: String,
     pub records_scanned: u64,
     pub adjudicated_good: u64,
     pub adjudicated_bad: u64,
@@ -909,6 +922,18 @@ pub struct HygieneGuardSlotVerdict {
     pub matched_cx_id: String,
 }
 
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygienePersistedNoveltyFinding {
+    pub panel_version: u32,
+    pub query_cx_id: String,
+    pub guard_id: String,
+    pub action: String,
+    pub failing_slots: Vec<u32>,
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
+}
+
 /// A Ward `GuardVerdict` produced against the persisted profile.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -930,6 +955,12 @@ pub struct HygieneGuardVerifyResponse {
     pub calibration_frr: Option<f32>,
     pub calibration_confidence: Option<f32>,
     pub trusted_exemplars: u64,
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
+    pub persisted_novelty: Option<HygienePersistedNoveltyFinding>,
+    pub notifications_matched: u64,
+    pub notifications_queued: u64,
+    pub notifications_dropped: u64,
 }
 
 #[must_use]
@@ -960,7 +991,9 @@ pub fn required_permissions_guard_calibrate(
 pub fn required_permissions_guard_verify(
     _params: &HygieneGuardVerifyParams,
 ) -> RequiredPermissions {
-    required([Permission::ReadStorage])
+    // Ward verification always appends its security verdict to Ledger and a
+    // configured novelty disposition also commits a Reactive outbox row.
+    required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
 /// Reports the health of one persisted domain kernel by reading its Kernel
@@ -1100,6 +1133,14 @@ pub fn run_guard_calibrate(
     spec.target_far = params.target_far;
     spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
     spec.persist = params.persist.unwrap_or(true);
+    spec.novelty_action = match params
+        .novelty_action
+        .unwrap_or(HygieneGuardNoveltyAction::RejectClosed)
+    {
+        HygieneGuardNoveltyAction::RejectClosed => calyx_ward::NoveltyAction::RejectClosed,
+        HygieneGuardNoveltyAction::NewRegion => calyx_ward::NoveltyAction::NewRegion,
+        HygieneGuardNoveltyAction::Quarantine => calyx_ward::NoveltyAction::Quarantine,
+    };
     let report = db
         .guard_calibrate_intelligence(&spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -1109,6 +1150,7 @@ pub fn run_guard_calibrate(
         domain: report.domain,
         guard_id: report.guard_id,
         alpha: report.alpha,
+        novelty_action: report.novelty_action,
         records_scanned: report.records_scanned as u64,
         adjudicated_good: report.adjudicated_good as u64,
         adjudicated_bad: report.adjudicated_bad as u64,
@@ -1159,8 +1201,23 @@ pub fn run_guard_verify(
     let report = db
         .guard_verify_intelligence(&spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let persisted_novelty = match report.action.as_deref() {
+        Some(action @ ("new_region" | "quarantine")) => Some(
+            db.persist_novelty_finding(&synapse_calyx::SynapseCalyxPersistedNoveltyFinding {
+                panel_version: report.panel_version,
+                query_cx_id: report.query_cx_id.clone(),
+                guard_id: report.guard_id.clone(),
+                action: action.to_owned(),
+                failing_slots: report.failing_slots.clone(),
+                ledger_seq: report.ledger_seq,
+                ledger_hash: report.ledger_hash.clone(),
+            })
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?,
+        ),
+        _ => None,
+    };
     Ok(HygieneGuardVerifyResponse {
-        source_of_truth: "Calyx Guard CF calibrated profile row",
+        source_of_truth: "Calyx Guard profile + Ledger verdict + optional Reactive novelty row",
         panel_version: report.panel_version,
         query_cx_id: report.query_cx_id,
         guard_id: report.guard_id,
@@ -1187,6 +1244,20 @@ pub fn run_guard_verify(
         calibration_frr: report.calibration_frr,
         calibration_confidence: report.calibration_confidence,
         trusted_exemplars: report.trusted_exemplars as u64,
+        ledger_seq: report.ledger_seq,
+        ledger_hash: report.ledger_hash,
+        persisted_novelty: persisted_novelty.map(|finding| HygienePersistedNoveltyFinding {
+            panel_version: finding.panel_version,
+            query_cx_id: finding.query_cx_id,
+            guard_id: finding.guard_id,
+            action: finding.action,
+            failing_slots: finding.failing_slots.into_iter().map(u32::from).collect(),
+            ledger_seq: finding.ledger_seq,
+            ledger_hash: finding.ledger_hash,
+        }),
+        notifications_matched: 0,
+        notifications_queued: 0,
+        notifications_dropped: 0,
     })
 }
 

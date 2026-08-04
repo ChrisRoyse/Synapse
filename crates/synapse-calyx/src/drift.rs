@@ -73,6 +73,7 @@ pub const SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION: f32 = 0.3;
 
 const REACTIVE_DRIFT_PREFIX: &[u8; 8] = b"RDRIFT1\0";
 const REACTIVE_RECURRENCE_PREFIX: &[u8; 8] = b"RRECUR1\0";
+const REACTIVE_NOVELTY_PREFIX: &[u8; 8] = b"RNOVEL1\0";
 
 /// Durable recurrence event stored in `Reactive` before live publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +86,55 @@ pub struct SynapseCalyxPersistedRecurrenceFinding {
     pub observed_seq: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxPersistedNoveltyFinding {
+    pub panel_version: u32,
+    pub query_cx_id: String,
+    pub guard_id: String,
+    pub action: String,
+    pub failing_slots: Vec<u16>,
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
+}
+
 impl SynapseCalyxVault {
+    pub fn persist_novelty_finding(
+        &self,
+        finding: &SynapseCalyxPersistedNoveltyFinding,
+    ) -> Result<SynapseCalyxPersistedNoveltyFinding, SynapseCalyxError> {
+        let mut key = Vec::with_capacity(32);
+        key.extend_from_slice(REACTIVE_NOVELTY_PREFIX);
+        key.extend_from_slice(&finding.ledger_seq.to_be_bytes());
+        let query_cx_id = crate::parse_cx_id(&finding.query_cx_id)?;
+        key.extend_from_slice(query_cx_id.as_bytes());
+        self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            cf: ColumnFamily::Reactive,
+            key: key.clone(),
+            value: encode_json(finding)?,
+        }])?;
+        self.flush()?;
+        let bytes = self.read_cf_latest(ColumnFamily::Reactive, &key)?.ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_READBACK_MISSING",
+                format!(
+                    "Reactive CF novelty row disappeared after commit: panel={} query={} ledger_seq={}",
+                    finding.panel_version, finding.query_cx_id, finding.ledger_seq
+                ),
+                "stop writers, preserve the vault, and inspect the Reactive CF commit before retrying novelty delivery",
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                format!(
+                    "decode committed Reactive CF novelty row for panel={} query={} ledger_seq={}: {error}",
+                    finding.panel_version, finding.query_cx_id, finding.ledger_seq
+                ),
+                "stop writers, preserve the vault, and inspect the named Reactive CF row",
+            )
+        })
+    }
+
     /// Persists one caller-validated recurrence as a replay-stable outbox row
     /// and proves the committed bytes by an independent point read.
     pub fn persist_recurrence_finding(

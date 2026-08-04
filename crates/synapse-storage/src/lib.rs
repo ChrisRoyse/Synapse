@@ -954,6 +954,15 @@ impl Db {
         self.backend.persist_recurrence_finding(finding)
     }
 
+    /// Commits one Ward novelty disposition to Calyx `Reactive` and reads the
+    /// exact bytes back before returning it.
+    pub fn persist_novelty_finding(
+        &self,
+        finding: &synapse_calyx::SynapseCalyxPersistedNoveltyFinding,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPersistedNoveltyFinding> {
+        self.backend.persist_novelty_finding(finding)
+    }
+
     /// Reads the physical recurrence series for one stable subject.
     ///
     /// # Errors

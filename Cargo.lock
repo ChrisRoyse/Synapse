@@ -5229,6 +5229,7 @@ dependencies = [
  "calyx-core",
  "calyx-oracle",
  "calyx-registry",
+ "calyx-ward",
  "chrono",
  "clap",
  "ed25519-dalek",

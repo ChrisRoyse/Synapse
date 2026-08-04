@@ -107,7 +107,8 @@ pub use drift::{
     SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION, SYNAPSE_DRIFT_MAX_WINDOW, SYNAPSE_DRIFT_MIN_WINDOW,
     SynapseCalyxBlindSpotAlert, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
     SynapseCalyxLensDrift, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
-    SynapseCalyxPersistedDriftFinding, SynapseCalyxPersistedRecurrenceFinding,
+    SynapseCalyxPersistedDriftFinding, SynapseCalyxPersistedNoveltyFinding,
+    SynapseCalyxPersistedRecurrenceFinding,
 };
 pub use find::{
     SYNAPSE_FIND_GUARD_DISABLED_CODE, SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_K,

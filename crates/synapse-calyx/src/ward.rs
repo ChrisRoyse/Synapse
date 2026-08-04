@@ -202,6 +202,10 @@ pub struct SynapseCalyxGuardCalibrateParams {
     /// When false the calibration is computed and reported but the Guard CF is
     /// not written (a dry run for operators sizing a corpus).
     pub persist: bool,
+    /// Explicit disposition for an otherwise valid calibrated OOD verdict.
+    /// Security-sensitive callers keep `RejectClosed`; learning panels may
+    /// select `NewRegion`, and identity boundaries may select `Quarantine`.
+    pub novelty_action: NoveltyAction,
     /// The panel definition to validate the named slots against, when the
     /// requested panel is **not** the durable active one (#1919).
     ///
@@ -235,6 +239,7 @@ impl SynapseCalyxGuardCalibrateParams {
             target_far: None,
             max_records: crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS,
             persist: true,
+            novelty_action: NoveltyAction::RejectClosed,
             calibration_panel: None,
         }
     }
@@ -267,6 +272,7 @@ pub struct SynapseCalyxGuardCalibrateReport {
     pub domain: String,
     pub guard_id: String,
     pub alpha: f32,
+    pub novelty_action: String,
     pub records_scanned: usize,
     pub adjudicated_good: usize,
     pub adjudicated_bad: usize,
@@ -543,7 +549,7 @@ impl SynapseCalyxVault {
             required_slots: Vec::new(),
             policy: GuardPolicy::AllRequired,
             calibration: None,
-            novelty_action: NoveltyAction::RejectClosed,
+            novelty_action: params.novelty_action.clone(),
         };
         let profile = calibrate(template, inputs.clone(), params.alpha, &clock).map_err(|error| {
             guard_error(
@@ -667,6 +673,11 @@ impl SynapseCalyxVault {
             domain: params.domain.clone(),
             guard_id: profile.guard_id.to_string(),
             alpha: params.alpha,
+            novelty_action: match params.novelty_action {
+                NoveltyAction::NewRegion => "new_region".to_owned(),
+                NoveltyAction::Quarantine => "quarantine".to_owned(),
+                NoveltyAction::RejectClosed => "reject_closed".to_owned(),
+            },
             records_scanned: corpus.records_scanned,
             adjudicated_good: corpus.good.len(),
             adjudicated_bad: corpus.bad.len(),
@@ -762,6 +773,7 @@ impl SynapseCalyxVault {
             target_far: None,
             max_records: params.max_records,
             persist: false,
+            novelty_action: profile.novelty_action.clone(),
             // Verification never validates slots against a panel definition —
             // the required slots come from the persisted profile, which was
             // already validated at calibration time. Only the corpus scan and

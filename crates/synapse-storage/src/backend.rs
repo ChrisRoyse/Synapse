@@ -34,15 +34,15 @@ use synapse_calyx::{
     SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
-    SynapseCalyxPeriodicityReport, SynapseCalyxPersistedRecurrenceFinding,
-    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
-    SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
-    SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration, SynapseCalyxRevisionGuard,
-    SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
-    SynapseCalyxTemporalParams, SynapseCalyxTemporalRerankReadback, SynapseCalyxVault,
-    SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport,
-    SynapseCalyxVerifyReport, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
-    VaultTemporalPanelRegistration,
+    SynapseCalyxPeriodicityReport, SynapseCalyxPersistedNoveltyFinding,
+    SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxReadOnlyVault,
+    SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
+    SynapseCalyxRedundancyReport, SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration,
+    SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport,
+    SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams, SynapseCalyxTemporalRerankReadback,
+    SynapseCalyxVault, SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus,
+    SynapseCalyxVaultVerifyReport, SynapseCalyxVerifyReport, SynapseCalyxWeaveParams,
+    SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -659,6 +659,10 @@ pub trait StorageBackend: Send + Sync {
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
     ) -> StorageResult<SynapseCalyxPersistedRecurrenceFinding>;
+    fn persist_novelty_finding(
+        &self,
+        finding: &SynapseCalyxPersistedNoveltyFinding,
+    ) -> StorageResult<SynapseCalyxPersistedNoveltyFinding>;
     fn read_recurrence_subject_series(
         &self,
         kind: RecurrenceSubjectKind,
@@ -3478,6 +3482,26 @@ impl StorageBackend for CalyxBackend {
                     calyx_write_failed(
                         "calyx_reactive",
                         "persist and read back routine recurrence finding",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn persist_novelty_finding(
+        &self,
+        finding: &SynapseCalyxPersistedNoveltyFinding,
+    ) -> StorageResult<SynapseCalyxPersistedNoveltyFinding> {
+        self.with_vault(
+            "calyx_reactive",
+            "persist and read back Ward novelty finding",
+            true,
+            |vault| {
+                vault.persist_novelty_finding(finding).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_reactive",
+                        "persist and read back Ward novelty finding",
                         &source,
                     )
                 })
