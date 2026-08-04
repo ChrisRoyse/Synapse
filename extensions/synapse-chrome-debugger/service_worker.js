@@ -1826,6 +1826,7 @@ async function restoreDurableOwnerLedger() {
       for (const tabId of DURABLE_OWNER_LEDGER.clockTabs) {
         CLOCK_INSTALLED_TABS.add(tabId);
       }
+      hydrateDurableOverrideMaps();
     }
     if (DURABLE_OWNER_LEDGER.inFlightMutation) {
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
@@ -1841,6 +1842,38 @@ async function restoreDurableOwnerLedger() {
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
   }
+}
+
+function hydrateDurableOverrideMaps() {
+  const hydrate = (field, map, valueName = "baseline") => {
+    for (const entry of DURABLE_OWNER_LEDGER[field]) {
+      if (!Object.prototype.hasOwnProperty.call(entry, valueName) ||
+          entry[valueName] === null || entry[valueName] === undefined) {
+        throw new Error(
+          `durable owner ledger ${field} row for tab ${entry.tabId} has no ${valueName}; ` +
+          "the pre-override source of truth cannot be reconstructed"
+        );
+      }
+      const durableValue = entry[valueName];
+      if (map.has(entry.tabId) &&
+          JSON.stringify(map.get(entry.tabId)) !== JSON.stringify(durableValue)) {
+        throw new Error(
+          `durable owner ledger ${field} conflicts with live override owner for tab ${entry.tabId}; ` +
+          `durable_${valueName}=${JSON.stringify(durableValue)} live_${valueName}=${JSON.stringify(map.get(entry.tabId))}`
+        );
+      }
+      const restored = typeof globalThis.structuredClone === "function"
+        ? globalThis.structuredClone(durableValue)
+        : JSON.parse(JSON.stringify(durableValue));
+      map.set(entry.tabId, restored);
+    }
+  };
+  hydrate("viewportOverrides", VIEWPORT_BASELINE_BY_TAB);
+  hydrate("deviceOverrides", DEVICE_BASELINE_BY_TAB);
+  hydrate("geolocationOverrides", GEOLOCATION_OVERRIDE_BY_TAB, "origin");
+  hydrate("localeOverrides", LOCALE_BASELINE_BY_TAB);
+  hydrate("mediaOverrides", MEDIA_BASELINE_BY_TAB);
+  hydrate("networkOverrides", NETWORK_BASELINE_BY_TAB);
 }
 
 function mergeLiveOwnersIntoDurableLedger() {

@@ -1115,7 +1115,7 @@ fn validate_dimension(field: &str, value: u32) -> Result<(), ErrorData> {
 fn validate_scale_factor(value: f64) -> Result<(), ErrorData> {
     if !value.is_finite() || value <= 0.0 || value > synapse_a11y::CDP_DEVICE_SCALE_FACTOR_MAX {
         return Err(invalid(format!(
-            "device_scale_factor must be finite and in 0..={}",
+            "device_scale_factor must be finite, greater than 0, and at most {}",
             synapse_a11y::CDP_DEVICE_SCALE_FACTOR_MAX
         )));
     }
