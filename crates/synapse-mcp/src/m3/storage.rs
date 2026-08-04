@@ -3002,6 +3002,16 @@ pub fn run_temporal_backfill(
     db: &synapse_storage::Db,
     params: &StorageTemporalBackfillParams,
 ) -> Result<StorageTemporalBackfillResponse, ErrorData> {
+    if !(1..=1000).contains(&params.max_rows) {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=temporal_backfill max_rows={} is outside the accepted range 1..=1000",
+                params.max_rows
+            ),
+            "set max_rows to an integer from 1 through 1000; no storage operation was attempted",
+        ));
+    }
     let key = params
         .key_hex
         .as_deref()
