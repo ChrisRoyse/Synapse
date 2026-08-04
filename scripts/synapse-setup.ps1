@@ -7891,6 +7891,111 @@ function New-SynapseCandidateBind {
     return "127.0.0.1:$port"
 }
 
+function Get-SynapseCandidateExitReadback {
+    param([AllowNull()][System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) {
+        return [pscustomobject]@{ HasExited = $null; ExitCodeSigned = $null; ExitCodeHex = $null }
+    }
+    try {
+        $Process.Refresh()
+        if (-not $Process.HasExited) {
+            return [pscustomobject]@{ HasExited = $false; ExitCodeSigned = $null; ExitCodeHex = $null }
+        }
+        # Complete redirected-stream processing before reading retained exit metadata.
+        $Process.WaitForExit()
+        $signed = [int]$Process.ExitCode
+        $unsigned = [BitConverter]::ToUInt32([BitConverter]::GetBytes($signed), 0)
+        return [pscustomobject]@{
+            HasExited = $true
+            ExitCodeSigned = $signed
+            ExitCodeHex = ('0x{0:X8}' -f $unsigned)
+        }
+    } catch {
+        return [pscustomobject]@{
+            HasExited = $null
+            ExitCodeSigned = $null
+            ExitCodeHex = $null
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+function Write-SynapseCandidateFailureEvidence {
+    param(
+        [Parameter(Mandatory=$true)][string]$CandidateRoot,
+        [AllowNull()][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory=$true)][string]$FailureMessage,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$ExecutablePath,
+        [Parameter(Mandatory=$true)][string]$ExecutableSha256
+    )
+
+    $exit = Get-SynapseCandidateExitReadback -Process $Process
+    $evidence = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $CandidateRoot -File -Recurse -Force -ErrorAction Stop | Sort-Object FullName)) {
+        $relative = [System.IO.Path]::GetRelativePath($CandidateRoot, $file.FullName)
+        $evidence += [ordered]@{
+            relative_path = $relative
+            length = [int64]$file.Length
+            sha256 = Get-SynapseFileSha256 -Path $file.FullName
+        }
+    }
+    $manifestPath = Join-Path $CandidateRoot 'candidate-diagnostic.json'
+    $manifest = [ordered]@{
+        schema = 'synapse_candidate_failure/v1'
+        retained_at_utc = [DateTime]::UtcNow.ToString('o')
+        failure = $FailureMessage
+        candidate_pid = if ($null -eq $Process) { $null } else { [int]$Process.Id }
+        process_has_exited = $exit.HasExited
+        exit_code_signed = $exit.ExitCodeSigned
+        exit_code_hex = $exit.ExitCodeHex
+        exit_read_error = if ($exit.PSObject.Properties.Name -contains 'Error') { $exit.Error } else { $null }
+        bind = $Bind
+        executable_path = $ExecutablePath
+        executable_sha256 = $ExecutableSha256
+        evidence = @($evidence)
+        retention_policy = 'newest 5 verified candidate failure bundles'
+    }
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 10) + "`n"), $encoding)
+    $manifestHash = Get-SynapseFileSha256 -Path $manifestPath
+    return [pscustomobject]@{
+        Path = $manifestPath
+        Sha256 = $manifestHash
+        Exit = $exit
+        EvidenceCount = $evidence.Count
+    }
+}
+
+function Remove-SynapseExpiredCandidateFailureEvidence {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [ValidateRange(1, 20)][int]$Keep = 5
+    )
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return }
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $verified = @(Get-ChildItem -LiteralPath $rootFull -Directory -Force -ErrorAction Stop |
+        Where-Object {
+            $_.Name -match '^candidate-\d{8}T\d{9}Z-\d+$' -and
+            -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName 'candidate-diagnostic.json') -PathType Leaf)
+        } |
+        Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($expired in @($verified | Select-Object -Skip $Keep)) {
+        $parent = [System.IO.Path]::GetFullPath((Split-Path -Parent $expired.FullName)).TrimEnd('\')
+        if (-not $parent.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Die "SYNAPSE_CANDIDATE_EVIDENCE_RETENTION_SCOPE_INVALID path=$($expired.FullName) expected_parent=$rootFull actual_parent=$parent remediation=do not delete anything; inspect candidate evidence paths"
+        }
+        Remove-Item -LiteralPath $expired.FullName -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $expired.FullName) {
+            Die "SYNAPSE_CANDIDATE_EVIDENCE_RETENTION_CLEANUP_UNVERIFIED path=$($expired.FullName) remediation=inspect filesystem permissions; the expired verified failure bundle still exists"
+        }
+        Info "Expired candidate failure evidence removed path=$($expired.FullName) retention_keep=$Keep"
+    }
+}
+
 function Stop-SynapseExactCandidateProcess {
     param(
         [Parameter(Mandatory=$true)][int]$ProcessId,
@@ -8071,6 +8176,8 @@ function Test-SynapseCandidateDaemon {
     New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
+    $candidateStdout = Join-Path $candidateRoot 'candidate-stdout.log'
+    $candidateStderr = Join-Path $candidateRoot 'candidate-stderr.log'
     $candidateCalyxConfig = if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) { '<defaults>' } else { $CalyxConfigPath }
     Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb calyx_vault=$candidateCalyxVault calyx_config=$candidateCalyxConfig shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
 
@@ -8078,6 +8185,8 @@ function Test-SynapseCandidateDaemon {
     $health = $null
     $lastHealthError = $null
     $surface = $null
+    $candidateSucceeded = $false
+    $candidateFailureMessage = $null
     try {
         $previousShellJobRoot = Get-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
         $replacementEnvName = 'SYNAPSE_CALYX_GPU_REPLACEMENT_RESERVATION_ID'
@@ -8101,6 +8210,8 @@ function Test-SynapseCandidateDaemon {
                 -FilePath $CandidateExePath `
                 -ArgumentList $candidateArgs `
                 -WindowStyle Hidden `
+                -RedirectStandardOutput $candidateStdout `
+                -RedirectStandardError $candidateStderr `
                 -PassThru
         } finally {
             if ($previousShellJobRoot) {
@@ -8127,16 +8238,26 @@ function Test-SynapseCandidateDaemon {
 
         if ($null -eq $health) {
             $alive = [bool](Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)
+            $exit = Get-SynapseCandidateExitReadback -Process $candidate
             $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $candidateBind)
             $candidatePhysicalState = Format-SynapseDaemonStartupPhysicalState -DbPath $candidateDb -CalyxVaultPath $candidateCalyxVault
-            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} last_error={6}`nphysical_storage_state:`n{7}`nremediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
+            $stdoutHash = if (Test-Path -LiteralPath $candidateStdout -PathType Leaf) { Get-SynapseFileSha256 -Path $candidateStdout } else { '<missing>' }
+            $stderrHash = if (Test-Path -LiteralPath $candidateStderr -PathType Leaf) { Get-SynapseFileSha256 -Path $candidateStderr } else { '<missing>' }
+            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} exit_code_signed={4} exit_code_hex={5} bind={6} listeners={7} last_error={8} evidence_root={9} stdout={10} stdout_sha256={11} stderr={12} stderr_sha256={13}`nphysical_storage_state:`n{14}`nremediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect retained candidate-diagnostic.json, stdout, stderr, and isolated lifecycle ledgers." -f `
                 $CandidateExePath,
                 $candidateHash,
                 $candidate.Id,
                 $alive,
+                $(if ($null -eq $exit.ExitCodeSigned) { '<running-or-unavailable>' } else { $exit.ExitCodeSigned }),
+                $(if ($null -eq $exit.ExitCodeHex) { '<running-or-unavailable>' } else { $exit.ExitCodeHex }),
                 $candidateBind,
                 (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
                 $lastHealthError,
+                $candidateRoot,
+                $candidateStdout,
+                $stdoutHash,
+                $candidateStderr,
+                $stderrHash,
                 $candidatePhysicalState)
         }
 
@@ -8159,6 +8280,7 @@ function Test-SynapseCandidateDaemon {
             Die "SYNAPSE_CANDIDATE_TOOL_SURFACE_EMPTY pid=$healthPid bind=$candidateBind remediation=tools/list returned no tools; refusing handoff"
         }
         Info "Candidate daemon health preflight passed pid=$healthPid bind=$candidateBind tool_count=$($surface.tool_count) tool_surface_sha256=$($surface.tool_surface_sha256)"
+        $candidateSucceeded = $true
         return [pscustomobject]@{
             Ok = $true
             Pid = $healthPid
@@ -8178,13 +8300,30 @@ function Test-SynapseCandidateDaemon {
             tool_schemas = $surface.tool_schemas
             daemon_pid = $healthPid
         }
+    } catch {
+        $candidateFailureMessage = $_.Exception.Message
+        throw
     } finally {
         if ($candidate -and (Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)) {
             Stop-SynapseExactCandidateProcess -ProcessId ([int]$candidate.Id) -Bind $candidateBind -Token $tokenRead.Token -Reason 'candidate_health'
         } elseif ($candidateBind) {
             Wait-SynapseBindReleased -Reason 'candidate_health' -Bind $candidateBind -TimeoutSeconds 5
         }
-        if (Test-Path -LiteralPath $candidateRoot) {
+        if ((Test-Path -LiteralPath $candidateRoot) -and -not $candidateSucceeded) {
+            try {
+                $diagnostic = Write-SynapseCandidateFailureEvidence `
+                    -CandidateRoot $candidateRoot `
+                    -Process $candidate `
+                    -FailureMessage $(if ([string]::IsNullOrWhiteSpace($candidateFailureMessage)) { 'candidate validation failed without a captured exception message' } else { $candidateFailureMessage }) `
+                    -Bind $candidateBind `
+                    -ExecutablePath $CandidateExePath `
+                    -ExecutableSha256 $candidateHash
+                Info "Candidate failure evidence retained path=$($diagnostic.Path) sha256=$($diagnostic.Sha256) evidence_count=$($diagnostic.EvidenceCount) exit_code_signed=$($diagnostic.Exit.ExitCodeSigned) exit_code_hex=$($diagnostic.Exit.ExitCodeHex)"
+                Remove-SynapseExpiredCandidateFailureEvidence -Root (Join-Path $LogDir 'setup-candidates') -Keep 5
+            } catch {
+                throw "SYNAPSE_CANDIDATE_EVIDENCE_WRITE_FAILED path=$candidateRoot error=$($_.Exception.Message) original_failure=[$candidateFailureMessage] remediation=preserve the exact candidate directory and repair log-directory permissions before rerunning setup"
+            }
+        } elseif (Test-Path -LiteralPath $candidateRoot) {
             $candidateParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $candidateRoot)).TrimEnd('\')
             $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $LogDir 'setup-candidates')).TrimEnd('\')
             if (-not $candidateParent.Equals($expectedParent, [System.StringComparison]::OrdinalIgnoreCase)) {
