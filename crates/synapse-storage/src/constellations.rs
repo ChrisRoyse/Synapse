@@ -125,7 +125,8 @@ pub const SYN_OBSERVATION_PANEL_VERSION_PRE_1965: u32 = 1_776_004;
 pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
 pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_776_005;
 pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
-pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_776_006;
+pub const SYN_MCP_USAGE_PANEL_VERSION: u32 = 1_965_007;
+pub const SYN_MCP_USAGE_PANEL_VERSION_PRE_1965: u32 = 1_776_006;
 pub const SYN_RECURRENCE_SUBJECT_PANEL_NAME: &str = "syn-recurrence-subject-v1";
 pub const SYN_RECURRENCE_SUBJECT_PANEL_VERSION: u32 = 1_776_007;
 
@@ -158,6 +159,10 @@ pub const SYN_GRAPHPOS_PROCESS_PANEL_VERSION: u32 = 1_685_002;
 pub const SYN_PATH_HIERARCHY_PANEL_NAME: &str = "syn-path-hierarchy-v1";
 pub const SYN_PATH_HIERARCHY_PANEL_VERSION: u32 = 1_685_003;
 pub const SYN_MCP_USAGE_KEY_PREFIX: &[u8] = b"mcp-usage/v1/";
+/// Logical backfill source for the MCP-usage subset of the shared KV family.
+/// This is deliberately not `CF_KV`: using the whole family would reinterpret
+/// unrelated outcome rows as MCP usage and make a bounded migration impossible.
+pub const SYN_MCP_USAGE_BACKFILL_SOURCE: &str = "CF_KV:mcp-usage/v1/";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_ENV: &str = "SYNAPSE_CALYX_OBSERVATION_SAMPLE_EVERY_N";
 pub const SYN_OBSERVATION_SAMPLE_EVERY_N_DEFAULT: u64 = 10;
 
@@ -494,7 +499,8 @@ const MU_SLOT_SURFACE_HASH: SlotId = SlotId::new(89);
 const MU_SLOT_SESSION_SEQUENCE_RANK: SlotId = SlotId::new(90);
 const MU_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(91);
 const MU_SLOT_DOW_CYCLIC: SlotId = SlotId::new(92);
-const MU_SLOT_RECORD_VECTOR: SlotId = SlotId::new(93);
+// Slot 93 is reserved for the uncalibrated unit-vector lens retired by #1965.
+const MU_SLOT_RECORD_VECTOR_V2: SlotId = SlotId::new(115);
 
 const RS_SLOT_KIND_ONEHOT: SlotId = SlotId::new(94);
 const RS_SLOT_SUBJECT_HASH: SlotId = SlotId::new(95);
@@ -630,6 +636,11 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_MCP_USAGE_PANEL_NAME,
         first: 82,
         last: 93,
+    },
+    PanelSlotBlock {
+        panel: SYN_MCP_USAGE_PANEL_NAME,
+        first: 115,
+        last: 115,
     },
     PanelSlotBlock {
         panel: SYN_RECURRENCE_SUBJECT_PANEL_NAME,
@@ -1041,6 +1052,11 @@ pub fn anchor_panel_for_source_cf(cf_name: &str) -> StorageResult<CalyxAnchorPan
             panel_name: SYN_OBSERVATION_PANEL_NAME,
             panel_version: SYN_OBSERVATION_PANEL_VERSION,
             input_mode: CalyxConstellationInputMode::SourceValue,
+        },
+        SYN_MCP_USAGE_BACKFILL_SOURCE => CalyxAnchorPanel {
+            panel_name: SYN_MCP_USAGE_PANEL_NAME,
+            panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+            input_mode: CalyxConstellationInputMode::McpUsageFramedSourceRow,
         },
         cf::CF_KV | cf::CF_ROUTINE_STATE => CalyxAnchorPanel {
             panel_name: SYN_OUTCOME_PANEL_NAME,
@@ -2036,7 +2052,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     ),
     (MU_SLOT_HOUR_CYCLIC, "syn.mcp_usage.hour_cyclic.v1"),
     (MU_SLOT_DOW_CYCLIC, "syn.mcp_usage.dow_cyclic.v1"),
-    (MU_SLOT_RECORD_VECTOR, "syn.mcp_usage.record_vector.v1"),
+    (MU_SLOT_RECORD_VECTOR_V2, "syn.mcp_usage.record_vector.v2"),
     (RS_SLOT_KIND_ONEHOT, "syn.recurrence_subject.kind_onehot.v1"),
     (
         RS_SLOT_SUBJECT_HASH,
@@ -2515,8 +2531,8 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::SubsetOfCf(cf::CF_KV),
             outcome_bearing: true,
             source_ttl_managed: false,
-            superseded_versions: &[1_691_001],
-            backfill_source_cf: None,
+            superseded_versions: &[1_691_001, SYN_MCP_USAGE_PANEL_VERSION_PRE_1965],
+            backfill_source_cf: Some(SYN_MCP_USAGE_BACKFILL_SOURCE),
         },
     ]
 }
@@ -4091,10 +4107,10 @@ fn mcp_usage_panel_slots(panel_version: u32, registry: &mut Registry) -> Storage
             registry,
         )?,
         syn_content_slot(
-            MU_SLOT_RECORD_VECTOR,
-            "syn.mcp_usage.record_vector.v1",
-            RegistryAlgorithmicLens::syn_record_vector(
-                "syn.mcp_usage.record_vector.v1",
+            MU_SLOT_RECORD_VECTOR_V2,
+            "syn.mcp_usage.record_vector.v2",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.mcp_usage.record_vector.v2",
                 Modality::Structured,
                 128,
             ),
@@ -4946,15 +4962,15 @@ pub fn build_mcp_usage_constellation(
         mcp_usage_ts_ns(record),
     )?;
     slots.insert(
-        MU_SLOT_RECORD_VECTOR,
+        MU_SLOT_RECORD_VECTOR_V2,
         measure_json(
             SYN_MCP_USAGE_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.mcp_usage.record_vector.v1",
+            AlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.mcp_usage.record_vector.v2",
                 Modality::Structured,
                 128,
             ),
-            &mcp_usage_numeric_record(record, raw_bytes),
+            &mcp_usage_numeric_record_v2(record, raw_bytes),
         )?,
     );
 
@@ -7632,17 +7648,16 @@ fn outcome_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
     })
 }
 
-fn mcp_usage_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
+fn mcp_usage_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
+    let scaled = |value: u64, ceiling: u64| (value.min(ceiling) as f64) / (ceiling as f64);
     json!({
-        "raw_len_bytes": u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX),
-        "schema_version": json_u64(record, &["schema_version"]).unwrap_or(0),
-        "seq": json_u64(record, &["seq"]).unwrap_or(0),
-        "session_sequence_position": json_u64(record, &["session_sequence_position"]).unwrap_or(0),
-        "duration_ms": json_u64(record, &["duration_ms"]).unwrap_or(0),
-        "response_size_bytes": json_u64(record, &["response_size_bytes"]).unwrap_or(0),
-        "response_content_count": json_u64(record, &["response_content_count"]).unwrap_or(0),
-        "argument_top_level_key_count": json_u64(record, &["argument_top_level_key_count"]).unwrap_or(0),
-        "argument_nested_path_count": json_u64(record, &["argument_nested_path_count"]).unwrap_or(0),
+        // Rounded ceilings above the live 2026-08-04 p99 bound each independent
+        // magnitude. Rare extremes clamp instead of dominating cosine geometry.
+        "raw_len_scaled": scaled(u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX), 10_000),
+        "duration_scaled": scaled(json_u64(record, &["duration_ms"]).unwrap_or(0), 100_000),
+        "response_size_scaled": scaled(json_u64(record, &["response_size_bytes"]).unwrap_or(0), 1_000_000),
+        "argument_top_level_scaled": scaled(json_u64(record, &["argument_top_level_key_count"]).unwrap_or(0), 10),
+        "argument_nested_scaled": scaled(json_u64(record, &["argument_nested_path_count"]).unwrap_or(0), 10),
         "has_tool": bool_u64(json_string(record, &["tool"]).is_some()),
         "has_operation": bool_u64(json_string(record, &["operation"]).is_some()),
         "has_route_id": bool_u64(json_string(record, &["route_id"]).is_some()),
@@ -7651,7 +7666,6 @@ fn mcp_usage_numeric_record(record: &Value, raw_bytes: &[u8]) -> Value {
         "has_session": bool_u64(json_string(record, &["mcp_session_id_sha256"]).is_some()),
         "has_error": bool_u64(json_string(record, &["error_type"]).is_some()),
         "steering_emitted": bool_u64(json_bool(record, &["steering_emitted"]).unwrap_or(false)),
-        "finished_unix_ms": json_u64(record, &["finished_at_unix_ms"]).unwrap_or(0),
     })
 }
 

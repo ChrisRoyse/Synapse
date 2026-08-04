@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 /// `H(anchor)` at matching cardinality — a signature only a lens that **is** the
 /// label can meet. A lens that merely *contains* the label, as one component of
 /// a dense vector or as a field that determines it, meets neither condition and
-/// passes cleanly. Measured on `syn-mcp-usage-v1 @ 1776006` against
+/// passes cleanly. Measured on `syn-mcp-usage-v1 @ 1965007` against
 /// `synapse:mcp_tool_call_outcome`, the statistical detector found slot 86 and
 /// missed slots 87 and 93, both of which carry the answer.
 ///
@@ -517,71 +517,66 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "updated_at_unix_ms",
         ],
     ),
-    (82, 1776006, "syn.mcp_usage.tool_onehot.v1", &["tool"]),
+    (82, 1965007, "syn.mcp_usage.tool_onehot.v1", &["tool"]),
     (
         83,
-        1776006,
+        1965007,
         "syn.mcp_usage.operation_onehot.v1",
         &["operation"],
     ),
-    (84, 1776006, "syn.mcp_usage.route_hash.v1", &["route_id"]),
+    (84, 1965007, "syn.mcp_usage.route_hash.v1", &["route_id"]),
     (
         85,
-        1776006,
+        1965007,
         "syn.mcp_usage.param_shape_hash.v1",
         &["argument_shape_sha256"],
     ),
-    (86, 1776006, "syn.mcp_usage.status_onehot.v1", &["status"]),
+    (86, 1965007, "syn.mcp_usage.status_onehot.v1", &["status"]),
     (
         87,
-        1776006,
+        1965007,
         "syn.mcp_usage.error_onehot.v1",
         &["error_type"],
     ),
-    (88, 1776006, "syn.mcp_usage.profile_hash.v1", &["profile"]),
+    (88, 1965007, "syn.mcp_usage.profile_hash.v1", &["profile"]),
     (
         89,
-        1776006,
+        1965007,
         "syn.mcp_usage.tool_surface_hash.v1",
         &["tool_surface_sha256"],
     ),
     (
         90,
-        1776006,
+        1965007,
         "syn.mcp_usage.session_sequence_rank.v1",
         &["session_sequence_position"],
     ),
     (
         91,
-        1776006,
+        1965007,
         "syn.mcp_usage.hour_cyclic.v1",
         &["finished_at_unix_ms", "started_at_unix_ms"],
     ),
     (
         92,
-        1776006,
+        1965007,
         "syn.mcp_usage.dow_cyclic.v1",
         &["finished_at_unix_ms", "started_at_unix_ms"],
     ),
     (
-        93,
-        1776006,
-        "syn.mcp_usage.record_vector.v1",
+        115,
+        1965007,
+        "syn.mcp_usage.record_vector.v2",
         &[
             "argument_nested_path_count",
             "argument_top_level_key_count",
             "duration_ms",
             "error_type",
-            "finished_at_unix_ms",
             "mcp_session_id_sha256",
             "operation",
             "profile",
-            "response_content_count",
             "response_size_bytes",
             "route_id",
-            "schema_version",
-            "seq",
-            "session_sequence_position",
             "steering_emitted",
             "tool",
             "tool_surface_sha256",
@@ -603,7 +598,7 @@ pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // failed (`mcp_usage.rs`, `finish_tool_call`).
     (
         "synapse:mcp_tool_call_outcome",
-        1776006,
+        1965007,
         &["status", "error_type"],
     ),
     // NOTE (#1962): there is deliberately no entry for panel 1900001
@@ -617,9 +612,9 @@ pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // declarations` now refuses any anchor declared on a panel the catalog
     // declares observation-shaped, so this cannot silently reappear.
     // `policy.enabled` on a policy snapshot row. No mcp-usage lens reads it.
-    ("synapse:mcp_steering_enabled", 1776006, &[]),
+    ("synapse:mcp_steering_enabled", 1965007, &[]),
     // `state` on a promotion-ledger row. No mcp-usage lens reads it.
-    ("synapse:mcp_default_promotion_state", 1776006, &[]),
+    ("synapse:mcp_default_promotion_state", 1965007, &[]),
     // `!tool_call_error_present(record)` — `agent_events.rs` reads all three of
     // these, so all three determine the anchor.
     (

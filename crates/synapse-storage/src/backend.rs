@@ -57,9 +57,10 @@ use crate::constellations::{
     SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION, SYN_AGENT_EVENT_PANEL_NAME,
     SYN_AGENT_EVENT_PANEL_VERSION, SYN_AGENT_TRANSCRIPT_PANEL_NAME,
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
-    SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME,
-    SYN_OBSERVATION_PANEL_VERSION, SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION,
-    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+    SYN_MCP_USAGE_BACKFILL_SOURCE, SYN_MCP_USAGE_KEY_PREFIX, SYN_MCP_USAGE_PANEL_NAME,
+    SYN_MCP_USAGE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
+    SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME,
+    SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
     SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
     SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, SupersededPanelLineage,
     assert_syn_lens_provenance_complete, superseded_panel_lineage, syn_active_panel_contract,
@@ -1239,7 +1240,10 @@ impl CalyxBackend {
             false,
             |vault| {
                 vault
-                    .grounded_anchor_lineage_by_source_key(source_cf, superseded)
+                    .grounded_anchor_lineage_by_source_key(
+                        backfill_physical_source_cf(source_cf),
+                        superseded,
+                    )
                     .map_err(|error| {
                         calyx_read_failed(
                             "calyx_anchor_carry_lineage",
@@ -3717,10 +3721,11 @@ impl StorageBackend for CalyxBackend {
                 | cf::CF_REFLEX_AUDIT
                 | cf::CF_PROCESS_HISTORY
                 | cf::CF_OBSERVATIONS
+                | SYN_MCP_USAGE_BACKFILL_SOURCE
         ) {
             return Err(StorageError::BackendInvalidConfig {
                 value: source_cf.to_owned(),
-                detail: "temporal metadata backfill accepts only CF_TIMELINE, CF_EPISODES,                          CF_AGENT_TRANSCRIPTS, CF_AGENT_EVENTS, CF_ACTION_LOG, CF_REFLEX_AUDIT,                          CF_PROCESS_HISTORY or sampled CF_OBSERVATIONS rows"
+                detail: "temporal metadata backfill source is not a declared rebuildable panel population"
                     .to_owned(),
             });
         }
@@ -3733,7 +3738,17 @@ impl StorageBackend for CalyxBackend {
         }
         let (rows, resume_after_physical, more, candidate_rows_examined, expired_rows_skipped) =
             if let Some(key) = source_key {
-                self.get_cf(source_cf, key)?
+                if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE
+                    && !key.starts_with(SYN_MCP_USAGE_KEY_PREFIX)
+                {
+                    return Err(StorageError::BackendInvalidConfig {
+                        value: constellations::hex_encode(key),
+                        detail: "exact MCP-usage backfill key is outside mcp-usage/v1/; remediation=pass a key from the declared prefix"
+                            .to_owned(),
+                    });
+                }
+                let physical_source_cf = backfill_physical_source_cf(source_cf);
+                self.get_cf(physical_source_cf, key)?
                     .map(|value| (vec![(key.to_vec(), value)], None, false, 1, 0))
                     .ok_or_else(|| StorageError::ReadFailed {
                         cf_name: source_cf.to_owned(),
@@ -3743,7 +3758,24 @@ impl StorageBackend for CalyxBackend {
                         ),
                     })?
             } else {
-                let page = self.scan_cf_physical_page(source_cf, after_physical, max_rows)?;
+                let page = if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
+                    self.with_vault(
+                        cf::CF_KV,
+                        "scan candidate-bounded MCP-usage prefix page",
+                        false,
+                        |vault| {
+                            read_physical_prefix_page_from_vault(
+                                vault,
+                                cf::CF_KV,
+                                SYN_MCP_USAGE_KEY_PREFIX,
+                                after_physical,
+                                max_rows,
+                            )
+                        },
+                    )?
+                } else {
+                    self.scan_cf_physical_page(source_cf, after_physical, max_rows)?
+                };
                 (
                     page.rows,
                     page.resume_after_physical,
@@ -3792,6 +3824,11 @@ impl StorageBackend for CalyxBackend {
             constellations::superseded_panel_versions_for_source_cf(source_cf)?.len() as u64;
         let mut carry_targets = Vec::with_capacity(rows.len());
         for (key, raw) in rows {
+            let identity_input = if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
+                constellations::mcp_usage_constellation_input_bytes(cf::CF_KV, &key, &raw)
+            } else {
+                raw.clone()
+            };
             let disposition = self.with_vault(
                 "calyx_temporal_metadata_backfill",
                 "backfill Calyx temporal metadata",
@@ -3799,11 +3836,11 @@ impl StorageBackend for CalyxBackend {
                 |vault| {
                     let context = NativeConstellationContext {
                         vault_id: vault.vault_id_value(),
-                        cx_id: vault.cx_id_for_input(
-                            &raw,
-                            backfill_panel_version(source_cf)?,
-                        ),
-                        created_at_ms: calyx_clock_now_for_write(vault, source_cf)?,
+                        cx_id: vault.cx_id_for_input(&identity_input, backfill_panel_version(source_cf)?),
+                        created_at_ms: calyx_clock_now_for_write(
+                            vault,
+                            backfill_physical_source_cf(source_cf),
+                        )?,
                         next_ledger_seq: vault.latest_seq().saturating_add(1),
                     };
                     let decode_failed = |error: &serde_json::Error, label: &str| {
@@ -3864,6 +3901,17 @@ impl StorageBackend for CalyxBackend {
                                 .map_err(|error| decode_failed(&error, "observation"))?;
                             constellations::build_observation_constellation(
                                 context, &key, &raw, &record,
+                            )?
+                        }
+                        SYN_MCP_USAGE_BACKFILL_SOURCE => {
+                            let record: Value = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "MCP usage"))?;
+                            constellations::build_mcp_usage_constellation(
+                                context,
+                                &key,
+                                &raw,
+                                &identity_input,
+                                &record,
                             )?
                         }
                         // Exhaustive over the guard above, so a CF added there
@@ -7746,6 +7794,82 @@ fn read_physical_page_from_vault(
     })
 }
 
+fn read_physical_prefix_page_from_vault(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    prefix: &[u8],
+    after_physical: Option<&[u8]>,
+    max_rows: usize,
+) -> StorageResult<PhysicalScanPage> {
+    validate_physical_page_request(cf_name, after_physical, max_rows)?;
+    if max_rows == 0 {
+        return Ok(PhysicalScanPage::empty());
+    }
+    let candidate_budget = max_rows
+        .checked_add(1)
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "candidate-bounded prefix page max_rows cannot be usize::MAX".to_owned(),
+        })?;
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = calyx_ordered_prefix_from_range(collection_id, prefix, prefix)?.ok_or_else(|| {
+        StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "CALYX_PREFIX_RANGE_EMPTY: declared MCP-usage prefix produced no ordered key range; remediation=inspect the physical key codec"
+                .to_owned(),
+        }
+    })?;
+    if let Some(cursor) = after_physical {
+        let logical = decode_calyx_user_key_for_read(cf_name, collection_id, cursor)?;
+        if !logical.starts_with(prefix) {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "CALYX_PREFIX_CURSOR_OUTSIDE_SCOPE: opaque cursor is outside the declared prefix; cursor_hex={}; remediation=restart this prefix sweep without a cursor",
+                    hex_prefix_for_log(cursor)
+                ),
+            });
+        }
+    }
+    let page = vault
+        .scan_kv_range_page_latest(&range, after_physical, max_rows)
+        .map_err(|source| {
+            calyx_read_failed(
+                cf_name,
+                "scan candidate-bounded physical Calyx prefix page",
+                &source,
+            )
+        })?;
+    validate_physical_page_shape(
+        cf_name,
+        collection_id,
+        after_physical,
+        max_rows,
+        candidate_budget,
+        &page,
+    )?;
+    let now_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
+    let (rows, expired_rows_skipped) =
+        decode_physical_page_rows(cf_name, collection_id, after_physical, now_ms, &page)?;
+    if rows.iter().any(|(key, _)| !key.starts_with(prefix)) {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "CALYX_PREFIX_PAGE_ESCAPED_SCOPE: physical range returned a row outside its declared prefix; remediation=inspect the ordered prefix range codec"
+                .to_owned(),
+        });
+    }
+    Ok(PhysicalScanPage {
+        rows,
+        resume_after_physical: page.resume_after,
+        more: page.more,
+        snapshot_seq: Some(page.snapshot_seq),
+        candidate_rows_examined: page.examined_rows,
+        expired_rows_skipped,
+    })
+}
+
 fn validate_physical_page_shape(
     cf_name: &str,
     collection_id: u64,
@@ -10345,9 +10469,18 @@ fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {
         cf::CF_REFLEX_AUDIT => Ok(SYN_REFLEX_PANEL_VERSION),
         cf::CF_PROCESS_HISTORY => Ok(SYN_PROCESS_PANEL_VERSION),
         cf::CF_OBSERVATIONS => Ok(SYN_OBSERVATION_PANEL_VERSION),
+        SYN_MCP_USAGE_BACKFILL_SOURCE => Ok(SYN_MCP_USAGE_PANEL_VERSION),
         other => Err(StorageError::BackendInvalidConfig {
             value: other.to_owned(),
             detail: "no active panel generation is declared for this backfill source CF".to_owned(),
         }),
+    }
+}
+
+fn backfill_physical_source_cf(source_cf: &str) -> &str {
+    if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
+        cf::CF_KV
+    } else {
+        source_cf
     }
 }
