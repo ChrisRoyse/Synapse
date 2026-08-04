@@ -264,6 +264,11 @@ pub struct SynapseCalyxWeaveReport {
     pub cross_terms_materialized: usize,
     pub agreement_edges_persisted: usize,
     pub between_record_edges_persisted: usize,
+    /// Valid exact measurements that have no direction and therefore cannot
+    /// enter a cosine graph. They remain present for structured analysis and
+    /// within-record cross-terms; only the geometric lane excludes them.
+    #[serde(default)]
+    pub knn_zero_norm_exclusions: Vec<SynapseCalyxKnnZeroNormExclusion>,
     pub xterm_cf_rows_after: usize,
     pub graph_cf_rows_after: usize,
     /// Effective half-open time window applied to `Base` rows, echoed back.
@@ -292,6 +297,15 @@ pub struct SynapseCalyxWeaveReport {
     pub blind_spot_pair_details: Vec<SynapseCalyxWeaveBlindSpotPair>,
     pub agreement_edges: Vec<SynapseCalyxAgreementEdge>,
     pub abundance: SynapseCalyxAbundanceReport,
+}
+
+/// Per-slot evidence that zero-valued vectors were explicitly classified out
+/// of cosine kNN rather than silently dropped or rewritten as `Absent`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxKnnZeroNormExclusion {
+    pub slot: u16,
+    pub records: usize,
+    pub sample_cx_ids: Vec<String>,
 }
 
 impl SynapseCalyxVault {
@@ -403,7 +417,8 @@ impl SynapseCalyxVault {
             agreement_edges.push(out);
         }
 
-        let between_record_edges = self.build_between_record_edges(&corpus, params.knn_k)?;
+        let (between_record_edges, knn_zero_norm_exclusions) =
+            self.build_between_record_edges(&corpus, params.knn_k)?;
         for edge in &between_record_edges {
             writes.push(SynapseCalyxCfWrite {
                 cf: ColumnFamily::Graph,
@@ -447,6 +462,7 @@ impl SynapseCalyxVault {
             cross_terms_materialized,
             agreement_edges_persisted: agreement_edges.len(),
             between_record_edges_persisted: between_record_edges.len(),
+            knn_zero_norm_exclusions,
             xterm_cf_rows_after,
             graph_cf_rows_after,
             since_ts_ns: params.since_ts_ns,
@@ -879,7 +895,13 @@ impl SynapseCalyxVault {
         &self,
         corpus: &DenseCorpus,
         knn_k: usize,
-    ) -> Result<Vec<SynapseCalyxBetweenRecordEdge>, SynapseCalyxError> {
+    ) -> Result<
+        (
+            Vec<SynapseCalyxBetweenRecordEdge>,
+            Vec<SynapseCalyxKnnZeroNormExclusion>,
+        ),
+        SynapseCalyxError,
+    > {
         let knn_k = knn_k.clamp(1, 64);
         let backend = self.math_runtime.backend();
         let mut by_slot: BTreeMap<SlotId, Vec<(CxId, &Vec<f32>)>> = BTreeMap::new();
@@ -892,6 +914,7 @@ impl SynapseCalyxVault {
             }
         }
         let mut edges = Vec::new();
+        let mut zero_norm_exclusions = Vec::new();
         for (slot, members) in by_slot {
             if edges.len() >= SYNAPSE_KNN_MAX_EDGES {
                 break;
@@ -902,17 +925,50 @@ impl SynapseCalyxVault {
                 by_dim.entry(vector.len()).or_default().push((cx, vector));
             }
             for (dim, group) in by_dim {
-                if dim == 0 || group.len() < 2 {
+                if dim == 0 {
                     continue;
                 }
-                append_slot_knn_edges(backend, slot, dim, &group, knn_k, &mut edges)?;
+                let mut geometric = Vec::with_capacity(group.len());
+                let mut excluded = Vec::new();
+                for (cx_id, vector) in group {
+                    let norm_squared = vector.iter().try_fold(0.0f64, |sum, value| {
+                        if !value.is_finite() {
+                            return Err(SynapseCalyxError::new(
+                                "SYNAPSE_CALYX_KNN_VECTOR_NON_FINITE",
+                                format!(
+                                    "panel slot {} record {cx_id} contains a non-finite value in its {dim}-dimensional between-record kNN vector",
+                                    slot.get()
+                                ),
+                                "repair or re-measure the named physical slot row; non-finite measurements cannot enter any association calculation",
+                            ));
+                        }
+                        let value = f64::from(*value);
+                        Ok(sum + value * value)
+                    })?;
+                    if norm_squared == 0.0 {
+                        excluded.push(cx_id);
+                    } else {
+                        geometric.push((cx_id, vector));
+                    }
+                }
+                if !excluded.is_empty() {
+                    zero_norm_exclusions.push(SynapseCalyxKnnZeroNormExclusion {
+                        slot: slot.get(),
+                        records: excluded.len(),
+                        sample_cx_ids: excluded.iter().take(8).map(ToString::to_string).collect(),
+                    });
+                }
+                if geometric.len() < 2 {
+                    continue;
+                }
+                append_slot_knn_edges(backend, slot, dim, &geometric, knn_k, &mut edges)?;
                 if edges.len() >= SYNAPSE_KNN_MAX_EDGES {
                     break;
                 }
             }
         }
         edges.truncate(SYNAPSE_KNN_MAX_EDGES);
-        Ok(edges)
+        Ok((edges, zero_norm_exclusions))
     }
 }
 
